@@ -1,0 +1,20 @@
+[package]
+name = "lutum-model2vec-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lutum-lancedb-core = { workspace = true }
+nuillu-module = { workspace = true }
+
+async-trait = { workspace = true }
+model2vec-rs = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

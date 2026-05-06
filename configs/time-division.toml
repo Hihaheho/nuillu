@@ -1,0 +1,45 @@
+# Configuration for time-based XML tags
+# Format: tag name and time range with unit
+
+# Fallback tag for items outside the defined time ranges
+fallback_longest_tag = "before_24hour"
+
+[[tags]]
+tag = "now"
+range = { Sec = 3 }
+
+[[tags]]
+tag = "last_30sec"
+range = { Sec = 30 }
+
+[[tags]]
+tag = "last_2min"
+range = { Min = 2.0 }
+
+[[tags]]
+tag = "last_5min"
+range = { Min = 5.0 }
+
+[[tags]]
+tag = "last_15min"
+range = { Min = 15.0 }
+
+[[tags]]
+tag = "last_45min"
+range = { Min = 45.0 }
+
+[[tags]]
+tag = "last_2hour"
+range = { Hour = 2.0 }
+
+[[tags]]
+tag = "last_6hour"
+range = { Hour = 6.0 }
+
+[[tags]]
+tag = "last_12hour"
+range = { Hour = 12.0 }
+
+[[tags]]
+tag = "last_24hour"
+range = { Hour = 24.0 }

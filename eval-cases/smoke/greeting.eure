@@ -1,0 +1,41 @@
+id = "smoke-greeting"
+description = "A minimal rubric-first eval case shape for nuillu drivers."
+target = "query"
+prompt = "Greet the user briefly and identify yourself as nuillu."
+
+@ checks[] {
+  $variant: artifact-text-contains
+  must-pass = true
+  contains = "nuillu"
+}
+
+@ checks[] {
+  $variant: trace-span
+  must-pass = true
+  span-name = "echo-driver"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "brief-nuillu-greeting"
+  must-pass = true
+  pass-score = 0.8
+  rubric = ```
+  Pass if the artifact output is a brief greeting and clearly identifies the assistant as nuillu.
+  Fail if it does not greet, is needlessly long, or invents unrelated capabilities.
+  ```
+
+  @ criteria[] {
+    name = "greeting"
+    weight = 1
+    pass-score = 0.8
+    description = "The output greets the user in a natural way."
+  }
+
+  @ criteria[] {
+    name = "identity"
+    weight = 2
+    pass-score = 0.9
+    description = "The output identifies the assistant as nuillu without conflicting identity claims."
+  }
+}

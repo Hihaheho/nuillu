@@ -1,0 +1,10 @@
+// Eure project configuration
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-config.schema.eure"
+
+@ targets.eval-cases
+globs = ["eval-cases/**/*.eure"]
+schema = "schemas/eval-case.schema.eure"
+
+@ cli
+default-targets = ["eval-cases"]

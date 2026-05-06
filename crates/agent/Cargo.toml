@@ -1,0 +1,29 @@
+[package]
+name = "nuillu-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nuillu-types = { workspace = true }
+nuillu-blackboard = { workspace = true }
+nuillu-module = { workspace = true }
+
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+lutum = { workspace = true }
+nuillu-memory = { workspace = true }
+nuillu-predict = { workspace = true }
+nuillu-surprise = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "test-util"] }
+tracing-subscriber = "0.3"

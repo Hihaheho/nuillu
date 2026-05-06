@@ -1,0 +1,34 @@
+id = "smoke-memory-identity"
+description = "The driver should seed permanent memory before asking the query."
+target = "query"
+prompt = "Who are you?"
+
+@ memories[] {
+  key = "identity"
+  rank = "permanent"
+  content = "I'm a Lutum, a blue frog."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  must-pass = true
+  contains = "blue frog"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "identity-from-memory"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the answer uses the seeded permanent memory to identify itself as a Lutum and a blue frog.
+  Fail if the answer ignores memory, claims a different identity, or hedges as if it does not know.
+  ```
+
+  @ criteria[] {
+    name = "uses-seeded-memory"
+    weight = 2
+    pass-score = 0.9
+    description = "The output reflects the exact seeded memory instead of generic assistant identity."
+  }
+}

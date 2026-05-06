@@ -1,0 +1,12 @@
+//! Agent runtime.
+//!
+//! The runtime spawns one persistent task per module on a single-threaded
+//! `LocalSet` and waits for a shutdown signal. Modules drive their own
+//! input loops via typed inbox capabilities and perform side effects
+//! through other capabilities.
+
+pub mod event_loop;
+pub mod scheduler;
+
+pub use event_loop::AgentEventLoop;
+pub use scheduler::{SchedulerError, run};

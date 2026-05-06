@@ -1,0 +1,19 @@
+[package]
+name = "lutum-in-memory-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nuillu-blackboard = { workspace = true }
+nuillu-module = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

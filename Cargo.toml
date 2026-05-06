@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/types",
+    "crates/blackboard",
+    "crates/module",
+    "crates/agent",
+    "crates/adapters/in-memory",
+    "crates/adapters/lancedb",
+    "crates/adapters/lancedb-core",
+    "crates/adapters/local-memory",
+    "crates/adapters/model2vec",
+    "crates/modules/*",
+    "crates/eval",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/Hihaheho/nuillu"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+[workspace.dependencies]
+lutum = { git = "https://github.com/Hihaheho/lutum" }
+lutum-protocol = { git = "https://github.com/Hihaheho/lutum" }
+lutum-eval = { git = "https://github.com/Hihaheho/lutum" }
+lutum-trace = { git = "https://github.com/Hihaheho/lutum" }
+
+async-trait = "0.1"
+arrow-array = "=57.2.0"
+arrow-schema = "=57.2.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
+lancedb = "0.27.2"
+model2vec-rs = { version = "0.1.4", default-features = false, features = ["onig"] }
+schemars = { version = "1", features = ["chrono04"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+eure = "0.1.6"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+# workspace-internal crates
+nuillu-types = { path = "crates/types" }
+nuillu-blackboard = { path = "crates/blackboard" }
+nuillu-module = { path = "crates/module" }
+nuillu-agent = { path = "crates/agent" }
+lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
+lutum-lancedb-adapter = { path = "crates/adapters/lancedb" }
+lutum-lancedb-core = { path = "crates/adapters/lancedb-core" }
+lutum-local-memory-adapter = { path = "crates/adapters/local-memory" }
+lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
+
+nuillu-summarize = { path = "crates/modules/summarize" }
+nuillu-attention-controller = { path = "crates/modules/attention-controller" }
+nuillu-attention-schema = { path = "crates/modules/attention-schema" }
+nuillu-query-vector = { path = "crates/modules/query-vector" }
+nuillu-query-agentic = { path = "crates/modules/query-agentic" }
+nuillu-memory = { path = "crates/modules/memory" }
+nuillu-memory-compaction = { path = "crates/modules/memory-compaction" }
+nuillu-predict = { path = "crates/modules/predict" }
+nuillu-surprise = { path = "crates/modules/surprise" }
+nuillu-sensory = { path = "crates/modules/sensory" }
+nuillu-speak = { path = "crates/modules/speak" }
+nuillu-eval = { path = "crates/eval" }
