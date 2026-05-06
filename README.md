@@ -10,7 +10,7 @@ Build a **lightweight cognitive agent that runs locally**, inspired by [Attentio
 
 ## Design
 
-The agent is built as a small society of cooperating cognitive modules: perception, summarization, memory, prediction, surprise, an attention controller, and an internal self-model. The modules share an *attention stream*, the agent's running picture of what it is currently attending to, and the agent maintains a coarse internal model of that attention (its **attention schema**) rather than a complete description of its own inner workings.
+The agent is built as a small society of cooperating cognitive modules: sensory, summarize, attention-controller, attention-schema, query-vector, query-agentic, memory, memory-compaction, predict, surprise, and speak. The modules share an *attention stream*, the agent's running picture of what it is currently attending to. That stream drives resource allocation: the attention-controller uses it to decide which modules are enabled, how often they run, and what model tier and context budget they receive. The agent also maintains a coarse internal model of its own attention through the **attention-schema** module rather than a complete description of its inner workings.
 
 Two characteristics shape the implementation:
 
