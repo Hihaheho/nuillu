@@ -1,12 +1,8 @@
 # Nuillu
 
-## Name and pronunciation
+Build a **lightweight cognitive agent that runs locally**, inspired by [Attention Schema Theory](https://en.wikipedia.org/wiki/Attention_schema_theory) (AST).
 
 **Nuillu** is pronounced like *nu-illusion*. In Japanese, ぬイリュージョン (*nu-iryūjon*). The name is a portmanteau of **nu** and **illusion**.
-
-## Project goals
-
-Build a **lightweight cognitive agent that runs locally**, inspired by [Attention Schema Theory](https://en.wikipedia.org/wiki/Attention_schema_theory) (AST).
 
 ## Design
 
