@@ -20,9 +20,9 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::MemoryModule;
 use nuillu_module::{
-    AllocatedModules, CapabilityFactory, LutumTiers, Memo, MemoryImportance, MemoryRequest, Module,
-    ModuleCapabilityFactory, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest,
-    SelfModelRequest,
+    AllocatedModules, CapabilityProviders, LutumTiers, Memo, MemoryImportance, MemoryRequest,
+    Module, ModuleCapabilityProviders, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox,
+    QueryRequest, SelfModelRequest,
     ports::{
         AttentionRepository, FileSearchHit, FileSearchProvider, FileSearchQuery, IndexedMemory,
         MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError, SystemClock, Utterance,
@@ -185,55 +185,55 @@ fn capture_caps(
     registry: ModuleRegistry,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> (ModuleRegistry, Rc<RefCell<Vec<ModuleCapabilityFactory>>>) {
+) -> (ModuleRegistry, Rc<RefCell<Vec<ModuleCapabilityProviders>>>) {
     let captured = Rc::new(RefCell::new(Vec::new()));
     let captured_for_builder = Rc::clone(&captured);
     let registry = registry
         .register(module, cap_range, move |caps| {
             captured_for_builder.borrow_mut().push(caps);
-            Box::new(CapturedCapsModule)
+            CapturedCapsModule
         })
         .unwrap();
     (registry, captured)
 }
 
 async fn module_caps(
-    factory: &CapabilityFactory,
+    caps: &CapabilityProviders,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> Vec<ModuleCapabilityFactory> {
+) -> Vec<ModuleCapabilityProviders> {
     let (registry, captured) = capture_caps(ModuleRegistry::new(), module, cap_range);
-    let _modules = registry.build(factory).await.unwrap();
+    let _modules = registry.build(caps).await.unwrap();
     std::mem::take(&mut *captured.borrow_mut())
 }
 
 async fn module_cap(
-    factory: &CapabilityFactory,
+    caps: &CapabilityProviders,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> ModuleCapabilityFactory {
-    let mut caps = module_caps(factory, module, cap_range).await;
+) -> ModuleCapabilityProviders {
+    let mut caps = module_caps(caps, module, cap_range).await;
     assert_eq!(caps.len(), 1);
     caps.pop().unwrap()
 }
 
 async fn memory_modules_with_publisher(
-    factory: &CapabilityFactory,
-) -> (AllocatedModules, ModuleCapabilityFactory) {
+    caps: &CapabilityProviders,
+) -> (AllocatedModules, ModuleCapabilityProviders) {
     let (registry, surprise_caps) = capture_caps(ModuleRegistry::new(), builtin::surprise(), 0..=1);
     let modules = registry
         .register(builtin::memory(), 0..=1, |caps| {
-            Box::new(MemoryModule::new(
+            MemoryModule::new(
                 caps.periodic_inbox(),
                 caps.memory_request_inbox(),
                 caps.activation_gate(),
                 caps.blackboard_reader(),
                 caps.memory_writer(),
                 caps.llm_access(),
-            ))
+            )
         })
         .unwrap()
-        .build(factory)
+        .build(caps)
         .await
         .unwrap();
     let mut surprise_caps = std::mem::take(&mut *surprise_caps.borrow_mut());
@@ -269,8 +269,8 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
             );
 
             let blackboard = Blackboard::with_allocation(alloc);
-            let factory = test_factory(blackboard.clone());
-            let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+            let caps = test_caps(blackboard.clone());
+            let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
 
             let (done_tx, done_rx) = oneshot::channel();
             let done_tx = Rc::new(RefCell::new(Some(done_tx)));
@@ -282,21 +282,21 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
                             .borrow_mut()
                             .take()
                             .expect("ticker module should be built once");
-                        Box::new(TickerModule::new(
+                        TickerModule::new(
                             caps.periodic_inbox(),
                             caps.memo(),
                             caps.query_mailbox(),
                             3,
                             done_tx,
-                        ))
+                        )
                     }
                 })
                 .unwrap()
                 .register(echo_id(), 0..=1, |caps| {
-                    Box::new(EchoModule::new(caps.query_inbox(), caps.memo()))
+                    EchoModule::new(caps.query_inbox(), caps.memo())
                 })
                 .unwrap()
-                .build(&factory)
+                .build(&caps)
                 .await
                 .unwrap();
 
@@ -353,23 +353,21 @@ async fn attention_writer_capability_appends_to_stream() {
             );
 
             let blackboard = Blackboard::with_allocation(alloc);
-            let factory = test_factory(blackboard.clone());
-            let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+            let caps = test_caps(blackboard.clone());
+            let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
 
             let fired = Arc::new(Mutex::new(false));
             let modules = ModuleRegistry::new()
                 .register(builtin::summarize(), 0..=1, {
                     let fired = fired.clone();
-                    move |caps| {
-                        Box::new(SummarizeStub {
-                            periodic: caps.periodic_inbox(),
-                            writer: caps.attention_writer(),
-                            fired: fired.clone(),
-                        })
+                    move |caps| SummarizeStub {
+                        periodic: caps.periodic_inbox(),
+                        writer: caps.attention_writer(),
+                        fired: fired.clone(),
                     }
                 })
                 .unwrap()
-                .build(&factory)
+                .build(&caps)
                 .await
                 .unwrap();
 
@@ -460,21 +458,19 @@ async fn ready_periodic_ticks_can_be_collapsed_by_module_prelude() {
             );
 
             let blackboard = Blackboard::with_allocation(alloc);
-            let factory = test_factory(blackboard);
-            let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+            let caps = test_caps(blackboard);
+            let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
             let count = Arc::new(Mutex::new(0));
             let modules = ModuleRegistry::new()
                 .register(ticker_id(), 0..=1, {
                     let count = count.clone();
-                    move |caps| {
-                        Box::new(BatchingPeriodicCounter {
-                            periodic: caps.periodic_inbox(),
-                            count: count.clone(),
-                        })
+                    move |caps| BatchingPeriodicCounter {
+                        periodic: caps.periodic_inbox(),
+                        count: count.clone(),
                     }
                 })
                 .unwrap()
-                .build(&factory)
+                .build(&caps)
                 .await
                 .unwrap();
 
@@ -569,21 +565,19 @@ async fn periodic_tick_only_targets_modules_with_periodic_inbox() {
             );
 
             let blackboard = Blackboard::with_allocation(alloc);
-            let factory = test_factory(blackboard);
-            let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+            let caps = test_caps(blackboard);
+            let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
             let count = Arc::new(Mutex::new(0));
             let modules = ModuleRegistry::new()
                 .register(ticker_id(), 0..=1, {
                     let count = count.clone();
-                    move |caps| {
-                        Box::new(PeriodicCounter {
-                            periodic: caps.periodic_inbox(),
-                            count: count.clone(),
-                        })
+                    move |caps| PeriodicCounter {
+                        periodic: caps.periodic_inbox(),
+                        count: count.clone(),
                     }
                 })
                 .unwrap()
-                .build(&factory)
+                .build(&caps)
                 .await
                 .unwrap();
 
@@ -604,10 +598,9 @@ async fn capabilities_are_non_exclusive() {
     local
         .run_until(async {
             let blackboard = Blackboard::default();
-            let factory = test_factory(blackboard);
-            let summarize_caps = module_cap(&factory, builtin::summarize(), 0..=1).await;
-            let controller_caps =
-                module_cap(&factory, builtin::attention_controller(), 0..=1).await;
+            let caps = test_caps(blackboard);
+            let summarize_caps = module_cap(&caps, builtin::summarize(), 0..=1).await;
+            let controller_caps = module_cap(&caps, builtin::attention_controller(), 0..=1).await;
             let _w1 = summarize_caps.attention_writer();
             let _w2 = summarize_caps.attention_writer();
             let _a1 = controller_caps.allocation_writer();
@@ -618,10 +611,10 @@ async fn capabilities_are_non_exclusive() {
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
-    let factory = test_factory(Blackboard::default());
-    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-    let vector_caps = module_cap(&factory, builtin::query_vector(), 0..=1).await;
-    let agentic_caps = module_cap(&factory, builtin::query_agentic(), 0..=1).await;
+    let caps = test_caps(Blackboard::default());
+    let publisher_caps = module_cap(&caps, ticker_id(), 0..=1).await;
+    let vector_caps = module_cap(&caps, builtin::query_vector(), 0..=1).await;
+    let agentic_caps = module_cap(&caps, builtin::query_agentic(), 0..=1).await;
     let publisher = publisher_caps.query_mailbox();
     let mut vector = vector_caps.query_inbox();
     let mut agentic = agentic_caps.query_inbox();
@@ -648,11 +641,11 @@ async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn self_model_mailbox_is_a_separate_typed_topic() {
-    let factory = test_factory(Blackboard::default());
-    let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-    let echo_caps = module_cap(&factory, echo_id(), 0..=1).await;
-    let query_caps = module_cap(&factory, builtin::query_vector(), 0..=1).await;
-    let schema_caps = module_cap(&factory, builtin::attention_schema(), 0..=1).await;
+    let caps = test_caps(Blackboard::default());
+    let ticker_caps = module_cap(&caps, ticker_id(), 0..=1).await;
+    let echo_caps = module_cap(&caps, echo_id(), 0..=1).await;
+    let query_caps = module_cap(&caps, builtin::query_vector(), 0..=1).await;
+    let schema_caps = module_cap(&caps, builtin::attention_schema(), 0..=1).await;
     let query_publisher = ticker_caps.query_mailbox();
     let self_publisher = echo_caps.self_model_mailbox();
     let mut query_inbox = query_caps.query_inbox();
@@ -681,9 +674,9 @@ async fn self_model_mailbox_is_a_separate_typed_topic() {
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn memory_request_mailbox_fans_out_with_owner_stamp() {
-    let factory = test_factory(Blackboard::default());
-    let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
-    let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+    let caps = test_caps(Blackboard::default());
+    let surprise_caps = module_cap(&caps, builtin::surprise(), 0..=1).await;
+    let memory_caps = module_cap(&caps, builtin::memory(), 0..=1).await;
     let publisher = surprise_caps.memory_request_mailbox();
     let mut memory = memory_caps.memory_request_inbox();
 
@@ -724,10 +717,10 @@ async fn role_topics_load_balance_across_active_replicas() {
             ..Default::default()
         },
     );
-    let factory = test_factory(Blackboard::with_allocation(alloc));
-    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-    let vector_caps = module_caps(&factory, builtin::query_vector(), 0..=3).await;
-    let agentic_caps = module_caps(&factory, builtin::query_agentic(), 0..=1).await;
+    let caps = test_caps(Blackboard::with_allocation(alloc));
+    let publisher_caps = module_cap(&caps, ticker_id(), 0..=1).await;
+    let vector_caps = module_caps(&caps, builtin::query_vector(), 0..=3).await;
+    let agentic_caps = module_caps(&caps, builtin::query_agentic(), 0..=1).await;
     let publisher = publisher_caps.query_mailbox();
     let mut vector_0 = vector_caps[0].query_inbox();
     let mut vector_1 = vector_caps[1].query_inbox();
@@ -761,9 +754,9 @@ async fn role_topics_do_not_route_to_disabled_replicas() {
             ..Default::default()
         },
     );
-    let factory = test_factory(Blackboard::with_allocation(alloc));
-    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-    let vector_caps = module_caps(&factory, builtin::query_vector(), 0..=2).await;
+    let caps = test_caps(Blackboard::with_allocation(alloc));
+    let publisher_caps = module_cap(&caps, ticker_id(), 0..=1).await;
+    let vector_caps = module_caps(&caps, builtin::query_vector(), 0..=2).await;
     let publisher = publisher_caps.query_mailbox();
     let mut vector_0 = vector_caps[0].query_inbox();
     let mut vector_1 = vector_caps[1].query_inbox();
@@ -791,12 +784,12 @@ async fn periodic_activation_targets_active_replicas_only() {
             ..Default::default()
         },
     );
-    let factory = test_factory(Blackboard::with_allocation(alloc));
-    let ticker_caps = module_caps(&factory, ticker_id(), 0..=3).await;
+    let caps = test_caps(Blackboard::with_allocation(alloc));
+    let ticker_caps = module_caps(&caps, ticker_id(), 0..=3).await;
     let mut replica_0 = ticker_caps[0].periodic_inbox();
     let mut replica_1 = ticker_caps[1].periodic_inbox();
     let mut replica_2 = ticker_caps[2].periodic_inbox();
-    let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+    let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
 
     event_loop.tick(Duration::from_millis(10)).await;
 
@@ -819,8 +812,8 @@ async fn activation_gate_blocks_until_replica_is_enabled() {
                 },
             );
             let blackboard = Blackboard::with_allocation(alloc);
-            let factory = test_factory(blackboard.clone());
-            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+            let caps = test_caps(blackboard.clone());
+            let ticker_caps = module_cap(&caps, ticker_id(), 0..=1).await;
             let gate = ticker_caps.activation_gate();
             let passed = Arc::new(Mutex::new(false));
             let passed_for_task = passed.clone();
@@ -850,25 +843,24 @@ async fn activation_gate_blocks_until_replica_is_enabled() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
-async fn factory_issues_split_search_capabilities() {
-    let factory = test_factory(Blackboard::default());
-    let _vector = factory.vector_memory_searcher();
-    let _content = factory.memory_content_reader();
-    let _file = factory.file_searcher();
+async fn providers_issue_split_search_capabilities() {
+    let caps = test_caps(Blackboard::default());
+    let _vector = caps.vector_memory_searcher();
+    let _content = caps.memory_content_reader();
+    let _file = caps.file_searcher();
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn file_searcher_exposes_only_rg_like_controls_and_clamps_bounds() {
     let file_search = RecordingFileSearchProvider::default();
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         Blackboard::default(),
         Arc::new(NoopMemoryStore),
         Vec::new(),
         Arc::new(file_search.clone()),
     );
 
-    factory
-        .file_searcher()
+    caps.file_searcher()
         .search(FileSearchQuery {
             pattern: "fn main".into(),
             regex: true,
@@ -905,14 +897,14 @@ async fn memory_writer_fans_out_and_writes_single_metadata_after_primary_success
         fail_put: true,
         ..Default::default()
     };
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary.clone()),
         vec![Arc::new(secondary.clone())],
         Arc::new(NoopFileSearchProvider),
     );
 
-    let written = factory
+    let written = caps
         .memory_writer()
         .insert("replicated memory".into(), MemoryRank::LongTerm, 30)
         .await
@@ -936,14 +928,14 @@ async fn memory_writer_fans_out_to_secondary_on_happy_path() {
         ..Default::default()
     };
     let secondary = RecordingMemoryStore::default();
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary.clone()),
         vec![Arc::new(secondary.clone())],
         Arc::new(NoopFileSearchProvider),
     );
 
-    let written = factory
+    let written = caps
         .memory_writer()
         .insert("replicated memory".into(), MemoryRank::LongTerm, 30)
         .await
@@ -964,14 +956,14 @@ async fn memory_writer_primary_failure_prevents_metadata_and_secondary_writes() 
         ..Default::default()
     };
     let secondary = RecordingMemoryStore::default();
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary.clone()),
         vec![Arc::new(secondary.clone())],
         Arc::new(NoopFileSearchProvider),
     );
 
-    let result = factory
+    let result = caps
         .memory_writer()
         .insert("not durable".into(), MemoryRank::ShortTerm, 5)
         .await;
@@ -1006,14 +998,14 @@ async fn vector_memory_searcher_records_access_for_hits_only() {
         }],
         ..Default::default()
     };
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary),
         Vec::new(),
         Arc::new(NoopFileSearchProvider),
     );
 
-    let hits = factory
+    let hits = caps
         .vector_memory_searcher()
         .search("matched", 10, None)
         .await
@@ -1046,14 +1038,14 @@ async fn memory_compactor_uses_atomic_compaction_and_updates_metadata() {
         ..Default::default()
     };
     let secondary = RecordingMemoryStore::default();
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary.clone()),
         vec![Arc::new(secondary.clone())],
         Arc::new(NoopFileSearchProvider),
     );
 
-    let result = factory
+    let result = caps
         .memory_compactor()
         .merge(
             std::slice::from_ref(&source),
@@ -1085,14 +1077,14 @@ async fn memory_compactor_primary_compact_failure_prevents_metadata_and_replica_
         ..Default::default()
     };
     let secondary = RecordingMemoryStore::default();
-    let factory = test_factory_with_stores(
+    let caps = test_caps_with_stores(
         blackboard.clone(),
         Arc::new(primary.clone()),
         vec![Arc::new(secondary.clone())],
         Arc::new(NoopFileSearchProvider),
     );
 
-    let result = factory
+    let result = caps
         .memory_compactor()
         .merge(&[source], "merged content".into(), MemoryRank::LongTerm, 30)
         .await;
@@ -1112,13 +1104,13 @@ async fn memory_request_does_not_insert_without_llm_tool_decision() {
         .run_until(async {
             let blackboard = Blackboard::default();
             let primary = RecordingMemoryStore::default();
-            let factory = test_factory_with_stores(
+            let caps = test_caps_with_stores(
                 blackboard,
                 Arc::new(primary.clone()),
                 Vec::new(),
                 Arc::new(NoopFileSearchProvider),
             );
-            let (modules, surprise_caps) = memory_modules_with_publisher(&factory).await;
+            let (modules, surprise_caps) = memory_modules_with_publisher(&caps).await;
             let publisher = surprise_caps.memory_request_mailbox();
 
             run(modules, async {
@@ -1155,14 +1147,14 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
                     "Ryo wants inbox batching implemented.",
                 ))
                 .with_text_scenario(final_text_scenario("memory-complete"));
-            let factory = test_factory_with_stores_and_adapter(
+            let caps = test_caps_with_stores_and_adapter(
                 blackboard,
                 Arc::new(primary.clone()),
                 Vec::new(),
                 Arc::new(NoopFileSearchProvider),
                 adapter,
             );
-            let (modules, surprise_caps) = memory_modules_with_publisher(&factory).await;
+            let (modules, surprise_caps) = memory_modules_with_publisher(&caps).await;
             let publisher = surprise_caps.memory_request_mailbox();
 
             run(modules, async {
@@ -1201,9 +1193,9 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn predict_and_surprise_constructor_shapes_match_capabilities() {
-    let factory = test_factory(Blackboard::default());
-    let predict_caps = module_cap(&factory, builtin::predict(), 0..=1).await;
-    let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
+    let caps = test_caps(Blackboard::default());
+    let predict_caps = module_cap(&caps, builtin::predict(), 0..=1).await;
+    let surprise_caps = module_cap(&caps, builtin::surprise(), 0..=1).await;
 
     let _predict = PredictModule::new(
         predict_caps.attention_stream_updated_inbox(),
@@ -1247,21 +1239,19 @@ async fn periodic_counter_setup(
     );
 
     let blackboard = Blackboard::with_allocation(alloc);
-    let factory = test_factory(blackboard.clone());
-    let event_loop = AgentEventLoop::new(factory.periodic_activation());
+    let caps = test_caps(blackboard.clone());
+    let event_loop = AgentEventLoop::new(caps.periodic_activation());
     let count = Arc::new(Mutex::new(0));
     let modules = ModuleRegistry::new()
         .register(ticker_id(), 0..=1, {
             let count = count.clone();
-            move |caps| {
-                Box::new(PeriodicCounter {
-                    periodic: caps.periodic_inbox(),
-                    count: count.clone(),
-                })
+            move |caps| PeriodicCounter {
+                periodic: caps.periodic_inbox(),
+                count: count.clone(),
             }
         })
         .unwrap()
-        .build(&factory)
+        .build(&caps)
         .await
         .unwrap();
 
@@ -1548,8 +1538,8 @@ fn final_text_scenario(text: &str) -> MockTextScenario {
     ])
 }
 
-fn test_factory(blackboard: Blackboard) -> CapabilityFactory {
-    test_factory_with_stores(
+fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
+    test_caps_with_stores(
         blackboard,
         Arc::new(NoopMemoryStore),
         Vec::new(),
@@ -1557,13 +1547,13 @@ fn test_factory(blackboard: Blackboard) -> CapabilityFactory {
     )
 }
 
-fn test_factory_with_stores(
+fn test_caps_with_stores(
     blackboard: Blackboard,
     primary_memory_store: Arc<dyn MemoryStore>,
     memory_replicas: Vec<Arc<dyn MemoryStore>>,
     file_search: Arc<dyn FileSearchProvider>,
-) -> CapabilityFactory {
-    test_factory_with_stores_and_adapter(
+) -> CapabilityProviders {
+    test_caps_with_stores_and_adapter(
         blackboard,
         primary_memory_store,
         memory_replicas,
@@ -1572,17 +1562,17 @@ fn test_factory_with_stores(
     )
 }
 
-fn test_factory_with_stores_and_adapter(
+fn test_caps_with_stores_and_adapter(
     blackboard: Blackboard,
     primary_memory_store: Arc<dyn MemoryStore>,
     memory_replicas: Vec<Arc<dyn MemoryStore>>,
     file_search: Arc<dyn FileSearchProvider>,
     adapter: MockLlmAdapter,
-) -> CapabilityFactory {
+) -> CapabilityProviders {
     let adapter = Arc::new(adapter);
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
     let lutum = Lutum::new(adapter, budget);
-    CapabilityFactory::new(
+    CapabilityProviders::new(
         blackboard,
         Arc::new(NoopAttentionRepo),
         primary_memory_store,

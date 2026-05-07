@@ -1,14 +1,14 @@
 //! Outbound traits used by capability handles.
 //!
 //! Adapters provide concrete implementations of these traits and inject
-//! them into the [`CapabilityFactory`] at boot; modules should prefer the
+//! them into the [`CapabilityProviders`] at boot; modules should prefer the
 //! capability handles that wrap them.
 //!
 //! All async traits use `?Send` so the agent can run on a single-threaded
 //! runtime (current-thread tokio / wasm32) without requiring `Send`
 //! bounds.
 //!
-//! [`CapabilityFactory`]: crate::CapabilityFactory
+//! [`CapabilityProviders`]: crate::CapabilityProviders
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

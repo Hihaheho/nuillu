@@ -12,11 +12,11 @@ This document is the implementation source of truth. It describes the desired ar
 1. **Runtime shape** — Each module runs as a persistent task spawned via `tokio::task::spawn_local`. The scheduler waits for shutdown and does not interpret module state.
 2. **Single-thread / WASM-compatible futures** — Module futures use `#[async_trait(?Send)]`; the runtime is current-thread / `LocalSet` oriented.
 3. **Capability-based design** — A module's possible side effects are exactly the capability handles passed to its constructor. Without a capability, there is no API path to the operation.
-4. **Owner-stamped operations** — Identity-bearing capabilities bake a hidden `ModuleInstanceId = (ModuleId, replica)` in at construction. Module constructors receive only a replica-scoped capability factory, so modules cannot claim to send, memo-write, append, or request as another module instance.
+4. **Owner-stamped operations** — Identity-bearing capabilities bake a hidden `ModuleInstanceId = (ModuleId, replica)` in at construction. Module constructors receive only replica-scoped capability providers, so modules cannot claim to send, memo-write, append, or request as another module instance.
 5. **Typed channels, not generic payloads** — Module communication uses typed channel capabilities. There is no central `MailboxPayload`, no `serde_json::Value` mailbox, and no request/response correlation protocol.
 6. **Memo-authoritative results** — Query-module and self-model answers are written to the producing module's `Memo`. Channel messages wake modules or submit work; they are not durable output.
 7. **Kebab-case module ids** — `ModuleId(String)` accepts only `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`. Builtins live in `nuillu_types::builtin::*`.
-8. **Non-exclusive capabilities** — Root and replica-scoped capability factories issue handles without uniqueness checks; any capability may be granted to multiple module instances. Single-writer roles are upheld by boot-time wiring and replica-owned state, not by factory enforcement.
+8. **Non-exclusive capabilities** — Root and replica-scoped capability providers issue handles without uniqueness checks; any capability may be granted to multiple module instances. Single-writer roles are upheld by boot-time wiring and replica-owned state, not by provider enforcement.
 9. **Elapsed-tick periodic activation** — The app advances elapsed time explicitly. Periodic activation is allocation-aware, replica-aware, accumulator-based, and available only to instances whose registration builder requests `PeriodicInbox`.
 10. **Sensory/action boundaries** — Full-agent runs receive external observations through a `sensory` module and emit user-visible text through a `speak` module. Module-level eval targets may still drive `query-*` or `attention-schema` directly.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
@@ -35,7 +35,7 @@ This document is the implementation source of truth. It describes the desired ar
 crates/
   types/                      # newtypes only (ModuleId, ReplicaIndex, MemoryRank, ModelTier, ...)
   blackboard/                 # Blackboard state + commands
-  module/                     # Module trait, port traits, capability handles, typed channels, factory
+  module/                     # Module trait, port traits, capability handles, typed channels, providers
   modules/
     sensory/                  # observations -> deterministic salience + LLM-filtered memo
     summarize/                # non-cognitive snapshot -> attention stream
@@ -53,7 +53,7 @@ crates/
   app/                        # boot wiring
 ```
 
-Modules each live in their own crate. Their constructor signatures are the role boundary: boot wiring grants only the capabilities a module is allowed to hold. Replica identity is not passed to constructors; it is captured by the replica-scoped capability factory used to issue owner-stamped handles.
+Modules each live in their own crate. Their constructor signatures are the role boundary: boot wiring grants only the capabilities a module is allowed to hold. Replica identity is not passed to constructors; it is captured by the replica-scoped capability providers used to issue owner-stamped handles.
 
 ---
 
@@ -94,20 +94,20 @@ Application boot registers modules as `(module_id, cap_range, builder)`:
 
 ```rust
 let registry = ModuleRegistry::new().register(builtin::query_vector(), 0..=3, |caps| {
-    Box::new(QueryVectorModule::new(
+    QueryVectorModule::new(
         caps.query_inbox(),
         caps.periodic_inbox(),
         caps.blackboard_reader(),
         caps.vector_memory_searcher(),
         caps.memo(),
         caps.llm_access(),
-    ))
+    )
 })?;
 ```
 
-The builder receives `ModuleCapabilityFactory`, a replica-scoped view over the root `CapabilityFactory`. It is already bound to the hidden `ModuleInstanceId`, so owner-stamped capability methods take no owner argument. Module constructors never receive `ModuleInstanceId`, `ReplicaIndex`, or `ModuleId` for self-stamping.
+The builder receives `ModuleCapabilityProviders`, a replica-scoped view over the root `CapabilityProviders`. It is already bound to the hidden `ModuleInstanceId`, so owner-stamped capability methods take no owner argument. Module constructors never receive `ModuleInstanceId`, `ReplicaIndex`, or `ModuleId` for self-stamping.
 
-Root/shared capabilities such as `BlackboardReader`, `AttentionReader`, memory search/write ports, file search, `Clock`, and `TimeDivision` may still be issued through the scoped factory. Owner-stamped capabilities such as `Memo`, `LlmAccess`, `PeriodicInbox`, typed inboxes/mailboxes, `AttentionWriter`, and `UtteranceWriter` always stamp the hidden instance.
+Root/shared capabilities such as `BlackboardReader`, `AttentionReader`, memory search/write ports, file search, `Clock`, and `TimeDivision` may still be issued through the scoped providers. Owner-stamped capabilities such as `Memo`, `LlmAccess`, `PeriodicInbox`, typed inboxes/mailboxes, `AttentionWriter`, and `UtteranceWriter` always stamp the hidden instance.
 
 Replica identity is visible in runtime state and diagnostics, not in ordinary module code. Compact views preserve the current shape: if a module has exactly one relevant replica, prompt serialization and observations should not label it as `replica 0`.
 
@@ -245,7 +245,7 @@ pub struct UtteranceDelta {
 
 ### Periodic activation
 
-`PeriodicInbox` is per-module-instance `mpsc`. Requesting it from a replica-scoped factory registers that instance for periodic activation:
+`PeriodicInbox` is per-module-instance `mpsc`. Requesting it from replica-scoped providers registers that instance for periodic activation:
 
 ```rust
 let periodic = caps.periodic_inbox();
@@ -342,11 +342,11 @@ Memory metadata remains keyed by `MemoryIndex`. Storage-level memory replicas ar
 
 ### Other capability handles
 
-All capabilities are non-exclusive: the factories do not enforce uniqueness on any handle. The "Owner-stamped" column indicates capabilities whose hidden `ModuleInstanceId` is baked in at construction so it cannot be forged by module code.
+All capabilities are non-exclusive: the providers do not enforce uniqueness on any handle. The "Owner-stamped" column indicates capabilities whose hidden `ModuleInstanceId` is baked in at construction so it cannot be forged by module code.
 
 | Handle | Owner-stamped | Purpose |
 |---|---:|---|
-| `ModuleCapabilityFactory` | yes | replica-scoped issuer of owner-stamped handles |
+| `ModuleCapabilityProviders` | yes | replica-scoped issuer of owner-stamped handles |
 | `PeriodicInbox` | yes | allocation-aware periodic activations for one module instance |
 | `ActivationGate` | yes | owner-scoped block that returns only when the holder replica is active |
 | `SensoryInputMailbox` | yes | publish external observations into the agent boundary |
@@ -380,20 +380,20 @@ Boot expands registered modules into persistent replica loops before the schedul
 ```rust
 let modules = ModuleRegistry::new()
     .register(builtin::query_vector(), 0..=3, |caps| {
-        Box::new(QueryVectorModule::new(
+        QueryVectorModule::new(
             caps.query_inbox(),
             caps.periodic_inbox(),
             caps.blackboard_reader(),
             caps.vector_memory_searcher(),
             caps.memo(),
             caps.llm_access(),
-        ))
+        )
     })?
-    .build(&factory)
+    .build(&caps)
     .await?;
 ```
 
-`ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityFactory` per replica index in `0..cap_range.max`, calls the builder once per scoped factory, and records cap metadata for routing, periodic activation, activation gates, and attention-controller schema generation.
+`ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityProviders` per replica index in `0..cap_range.max`, calls the builder once per scoped providers, and records cap metadata for routing, periodic activation, activation gates, and attention-controller schema generation.
 
 The scheduler only spawns the built loops:
 
@@ -414,30 +414,31 @@ pub async fn run(
 The app owns an `AgentEventLoop` and advances time explicitly:
 
 ```rust
-let mut loop_handle = AgentEventLoop::new(factory.periodic_activation());
+let mut loop_handle = AgentEventLoop::new(caps.periodic_activation());
 loop_handle.tick(Duration::from_millis(20)).await;
 ```
 
 Production convenience wrappers may call `tick(interval)` from a timer, but wall-clock sleep does not live inside module inboxes. Replica activation gates and topic routing consult the same effective allocation snapshot as periodic activation.
 
-The boot layer injects time through `CapabilityFactory`:
+The boot layer injects time through `CapabilityProviders`:
 
 ```rust
-let factory = CapabilityFactory::new(
+let caps = CapabilityProviders::new(
     blackboard,
     attention_port,
     primary_memory_store,
     memory_replicas,
     file_search,
-    tiers,
+    utterance_sink,
     Arc::new(SystemClock),
+    tiers,
 );
 
 // Eval/sandbox boot may instead pass:
-let factory = CapabilityFactory::new(..., Arc::new(FixedClock::new(observed_now)));
+let caps = CapabilityProviders::new(..., Arc::new(FixedClock::new(observed_now)), tiers);
 ```
 
-`CapabilityFactory` stores `Arc<dyn Clock>` and exposes `clock()` for modules that need current time. Capability handles that stamp time, such as `AttentionWriter` and `UtteranceWriter`, also receive the same clock. This keeps sandboxed eval deterministic and avoids direct `Utc::now()` calls in module code.
+`CapabilityProviders` stores `Arc<dyn Clock>` and exposes `clock()` for modules that need current time. Capability handles that stamp time, such as `AttentionWriter` and `UtteranceWriter`, also receive the same clock. This keeps sandboxed eval deterministic and avoids direct `Utc::now()` calls in module code.
 
 ---
 
@@ -672,8 +673,8 @@ This keeps realistic artifacts observable without adding request/response correl
 
 | Invariant | Enforcement |
 |---|---|
-| Capabilities are non-exclusive | root and scoped factories issue handles without uniqueness checks; any capability may be granted to multiple module instances |
-| Module constructors cannot forge replica identity | constructors receive only `ModuleCapabilityFactory`; hidden `ModuleInstanceId` is captured inside owner-stamped handles |
+| Capabilities are non-exclusive | root and scoped providers issue handles without uniqueness checks; any capability may be granted to multiple module instances |
+| Module constructors cannot forge replica identity | constructors receive only `ModuleCapabilityProviders`; hidden `ModuleInstanceId` is captured inside owner-stamped handles |
 | Replica caps are boot policy | `ModuleRegistry::register` validates `cap_range`; effective allocation clamps `replicas` to that range |
 | Lowering replicas never kills loops | boot spawns `cap_range.max` persistent loops and allocation only changes routing, periodic eligibility, and `ActivationGate` state |
 | Disabled replicas perform no semantic work | routed topics/periodic ticks target active replicas only, and already-received work blocks at `gate.block()` before LLM calls, memo writes, or side effects |
@@ -702,7 +703,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Predict and surprise are separate modules | separate crates and separate constructor capabilities |
 | Predict has no memory-request path | it receives no `MemoryRequestMailbox` |
 | Surprise has no forward-modeling responsibility | it receives no memo path from predict; reads grouped predict memos only via `BlackboardReader` |
-| Surprise is the only module that sends `MemoryRequest` | boot-time wiring convention; factory does not enforce uniqueness |
+| Surprise is the only module that sends `MemoryRequest` | boot-time wiring convention; providers do not enforce uniqueness |
 | Predict and surprise ablations are wiring-only | boot wiring may include predict, surprise, both, or neither |
 | Conversation artifacts are boundary observations | eval collects utterances from `UtteranceSink`, not channel responses |
 

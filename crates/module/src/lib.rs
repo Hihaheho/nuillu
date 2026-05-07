@@ -17,8 +17,8 @@
 mod activation;
 mod allocation_writer;
 mod attention;
+mod capabilities;
 mod channels;
-mod factory;
 mod llm;
 mod memo;
 mod memory_caps;
@@ -33,15 +33,15 @@ mod utterance;
 pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;
+pub use capabilities::{
+    AllocatedModules, CapabilityProviders, ModuleCapabilityProviders, ModuleRegisterer,
+    ModuleRegistry, ModuleRegistryError,
+};
 pub use channels::{
     AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope,
     MemoryImportance, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, QueryInbox,
     QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox, SelfModelMailbox, SelfModelRequest,
     SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
-};
-pub use factory::{
-    AllocatedModules, CapabilityFactory, ModuleCapabilityFactory, ModuleRegistry,
-    ModuleRegistryError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;

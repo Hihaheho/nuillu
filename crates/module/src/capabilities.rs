@@ -22,17 +22,17 @@ use crate::{
     TopicInbox, TopicMailbox, VectorMemorySearcher,
 };
 
-/// Builds and dispenses [capabilities](crate) at agent boot.
+/// Provides [capabilities](crate) at agent boot.
 ///
 /// Owner-stamped capabilities carry a hidden [`ModuleInstanceId`]. The root
-/// factory is a boot object; ordinary module constructors should receive a
-/// [`ModuleCapabilityFactory`] so they cannot choose another owner.
+/// provider set is a boot object; ordinary module constructors should receive
+/// [`ModuleCapabilityProviders`] so they cannot choose another owner.
 #[derive(Clone)]
-pub struct CapabilityFactory {
-    inner: Arc<FactoryInner>,
+pub struct CapabilityProviders {
+    inner: Arc<CapabilityProvidersInner>,
 }
 
-struct FactoryInner {
+struct CapabilityProvidersInner {
     blackboard: Blackboard,
     periodic_registry: Arc<PeriodicRegistry>,
     query_topic: Topic<QueryRequest>,
@@ -50,7 +50,7 @@ struct FactoryInner {
     tiers: LutumTiers,
 }
 
-impl CapabilityFactory {
+impl CapabilityProviders {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         blackboard: Blackboard,
@@ -63,7 +63,7 @@ impl CapabilityFactory {
         tiers: LutumTiers,
     ) -> Self {
         Self {
-            inner: Arc::new(FactoryInner {
+            inner: Arc::new(CapabilityProvidersInner {
                 periodic_registry: Arc::new(PeriodicRegistry::new()),
                 query_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 self_model_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
@@ -90,8 +90,8 @@ impl CapabilityFactory {
         )
     }
 
-    fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
-        ModuleCapabilityFactory {
+    fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityProviders {
+        ModuleCapabilityProviders {
             owner,
             root: self.clone(),
         }
@@ -160,12 +160,12 @@ impl CapabilityFactory {
 }
 
 #[derive(Clone)]
-pub struct ModuleCapabilityFactory {
+pub struct ModuleCapabilityProviders {
     owner: ModuleInstanceId,
-    root: CapabilityFactory,
+    root: CapabilityProviders,
 }
 
-impl ModuleCapabilityFactory {
+impl ModuleCapabilityProviders {
     pub fn activation_gate(&self) -> ActivationGate {
         ActivationGate::new(self.owner.clone(), self.root.inner.blackboard.clone())
     }
@@ -343,7 +343,7 @@ impl fmt::Debug for ModuleRegistry {
 struct ModuleRegistration {
     module: ModuleId,
     cap_range: ReplicaCapRange,
-    builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn Module>>,
+    builder: Box<dyn Fn(ModuleCapabilityProviders) -> Box<dyn Module>>,
 }
 
 impl fmt::Debug for ModuleRegistration {
@@ -353,6 +353,22 @@ impl fmt::Debug for ModuleRegistration {
             .field("cap_range", &self.cap_range)
             .finish_non_exhaustive()
     }
+}
+
+/// Builds one module replica from its replica-scoped capability providers.
+///
+/// Closures that return a concrete `Module` implement this automatically, so
+/// registration call sites do not need to allocate `Box<dyn Module>`.
+pub trait ModuleRegisterer: Fn(ModuleCapabilityProviders) -> Self::Module {
+    type Module: crate::Module + 'static;
+}
+
+impl<F, M> ModuleRegisterer for F
+where
+    F: Fn(ModuleCapabilityProviders) -> M,
+    M: Module + 'static,
+{
+    type Module = M;
 }
 
 impl ModuleRegistry {
@@ -366,7 +382,7 @@ impl ModuleRegistry {
         mut self,
         module: ModuleId,
         cap_range: RangeInclusive<u8>,
-        builder: impl Fn(ModuleCapabilityFactory) -> Box<dyn Module> + 'static,
+        builder: impl ModuleRegisterer + 'static,
     ) -> Result<Self, ModuleRegistryError> {
         if self
             .registrations
@@ -379,30 +395,29 @@ impl ModuleRegistry {
         self.registrations.push(ModuleRegistration {
             module,
             cap_range: range,
-            builder: Box::new(builder),
+            builder: Box::new(move |caps| Box::new(builder(caps))),
         });
         Ok(self)
     }
 
     pub async fn build(
         &self,
-        factory: &CapabilityFactory,
+        caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
-        factory
-            .set_replica_caps(
-                self.registrations
-                    .iter()
-                    .map(|registration| (registration.module.clone(), registration.cap_range))
-                    .collect(),
-            )
-            .await;
+        caps.set_replica_caps(
+            self.registrations
+                .iter()
+                .map(|registration| (registration.module.clone(), registration.cap_range))
+                .collect(),
+        )
+        .await;
 
         let mut modules = Vec::new();
         for registration in &self.registrations {
             // Build every possible replica up to the registered max; allocation
             // and `ActivationGate` decide which replicas are active at runtime.
             for replica in 0..registration.cap_range.max {
-                let scoped = factory.scoped(ModuleInstanceId::new(
+                let scoped = caps.scoped(ModuleInstanceId::new(
                     registration.module.clone(),
                     ReplicaIndex::new(replica),
                 ));
@@ -441,8 +456,8 @@ mod tests {
         async fn run(&mut self) {}
     }
 
-    fn noop_builder(_: ModuleCapabilityFactory) -> Box<dyn Module> {
-        Box::new(NoopModule)
+    fn noop_builder(_: ModuleCapabilityProviders) -> NoopModule {
+        NoopModule
     }
 
     #[test]
