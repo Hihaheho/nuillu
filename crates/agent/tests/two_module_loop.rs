@@ -21,7 +21,7 @@ use nuillu_blackboard::{
 use nuillu_memory::MemoryModule;
 use nuillu_module::{
     AllocatedModules, CapabilityProviders, LutumTiers, Memo, MemoryImportance, MemoryRequest,
-    Module, ModuleCapabilityProviders, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox,
+    Module, ModuleCapabilityFactory, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox,
     QueryRequest, SelfModelRequest,
     ports::{
         AttentionRepository, FileSearchHit, FileSearchProvider, FileSearchQuery, IndexedMemory,
@@ -185,7 +185,7 @@ fn capture_caps(
     registry: ModuleRegistry,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> (ModuleRegistry, Rc<RefCell<Vec<ModuleCapabilityProviders>>>) {
+) -> (ModuleRegistry, Rc<RefCell<Vec<ModuleCapabilityFactory>>>) {
     let captured = Rc::new(RefCell::new(Vec::new()));
     let captured_for_builder = Rc::clone(&captured);
     let registry = registry
@@ -201,7 +201,7 @@ async fn module_caps(
     caps: &CapabilityProviders,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> Vec<ModuleCapabilityProviders> {
+) -> Vec<ModuleCapabilityFactory> {
     let (registry, captured) = capture_caps(ModuleRegistry::new(), module, cap_range);
     let _modules = registry.build(caps).await.unwrap();
     std::mem::take(&mut *captured.borrow_mut())
@@ -211,7 +211,7 @@ async fn module_cap(
     caps: &CapabilityProviders,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> ModuleCapabilityProviders {
+) -> ModuleCapabilityFactory {
     let mut caps = module_caps(caps, module, cap_range).await;
     assert_eq!(caps.len(), 1);
     caps.pop().unwrap()
@@ -219,7 +219,7 @@ async fn module_cap(
 
 async fn memory_modules_with_publisher(
     caps: &CapabilityProviders,
-) -> (AllocatedModules, ModuleCapabilityProviders) {
+) -> (AllocatedModules, ModuleCapabilityFactory) {
     let (registry, surprise_caps) = capture_caps(ModuleRegistry::new(), builtin::surprise(), 0..=1);
     let modules = registry
         .register(builtin::memory(), 0..=1, |caps| {

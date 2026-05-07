@@ -4,7 +4,7 @@ use nuillu_types::ModuleInstanceId;
 /// Read-write handle for the activating module's own memo slot.
 ///
 /// The owner identity is stamped at construction time by
-/// [`ModuleCapabilityProviders`](crate::ModuleCapabilityProviders); the module cannot
+/// [`ModuleCapabilityFactory`](crate::ModuleCapabilityFactory); the module cannot
 /// change it. A module that does not hold a `Memo` has no memo slot
 /// allocated on the blackboard at all (slot creation is lazy and only
 /// `Memo::write` ever inserts one).

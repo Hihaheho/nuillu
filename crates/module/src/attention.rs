@@ -8,7 +8,7 @@ use crate::{AttentionStreamUpdated, AttentionStreamUpdatedMailbox};
 
 /// Append-only access to the cognitive attention stream.
 ///
-/// The providers do not enforce uniqueness: capabilities are non-exclusive.
+/// Capability issuers do not enforce uniqueness: capabilities are non-exclusive.
 /// By boot-time wiring convention only the summarize module receives this
 /// handle, but multiple writers are structurally permitted.
 pub struct AttentionWriter {

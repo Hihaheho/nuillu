@@ -34,7 +34,7 @@ pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;
 pub use capabilities::{
-    AllocatedModules, CapabilityProviders, ModuleCapabilityProviders, ModuleRegisterer,
+    AllocatedModules, CapabilityProviders, ModuleCapabilityFactory, ModuleRegisterer,
     ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{

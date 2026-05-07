@@ -26,7 +26,7 @@ use crate::{
 ///
 /// Owner-stamped capabilities carry a hidden [`ModuleInstanceId`]. The root
 /// provider set is a boot object; ordinary module constructors should receive
-/// [`ModuleCapabilityProviders`] so they cannot choose another owner.
+/// [`ModuleCapabilityFactory`] so they cannot choose another owner.
 #[derive(Clone)]
 pub struct CapabilityProviders {
     inner: Arc<CapabilityProvidersInner>,
@@ -90,8 +90,8 @@ impl CapabilityProviders {
         )
     }
 
-    fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityProviders {
-        ModuleCapabilityProviders {
+    fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
+        ModuleCapabilityFactory {
             owner,
             root: self.clone(),
         }
@@ -160,12 +160,12 @@ impl CapabilityProviders {
 }
 
 #[derive(Clone)]
-pub struct ModuleCapabilityProviders {
+pub struct ModuleCapabilityFactory {
     owner: ModuleInstanceId,
     root: CapabilityProviders,
 }
 
-impl ModuleCapabilityProviders {
+impl ModuleCapabilityFactory {
     pub fn activation_gate(&self) -> ActivationGate {
         ActivationGate::new(self.owner.clone(), self.root.inner.blackboard.clone())
     }
@@ -343,7 +343,7 @@ impl fmt::Debug for ModuleRegistry {
 struct ModuleRegistration {
     module: ModuleId,
     cap_range: ReplicaCapRange,
-    builder: Box<dyn Fn(ModuleCapabilityProviders) -> Box<dyn Module>>,
+    builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn Module>>,
 }
 
 impl fmt::Debug for ModuleRegistration {
@@ -355,17 +355,17 @@ impl fmt::Debug for ModuleRegistration {
     }
 }
 
-/// Builds one module replica from its replica-scoped capability providers.
+/// Builds one module replica from its replica-scoped capability factory.
 ///
 /// Closures that return a concrete `Module` implement this automatically, so
 /// registration call sites do not need to allocate `Box<dyn Module>`.
-pub trait ModuleRegisterer: Fn(ModuleCapabilityProviders) -> Self::Module {
+pub trait ModuleRegisterer: Fn(ModuleCapabilityFactory) -> Self::Module {
     type Module: crate::Module + 'static;
 }
 
 impl<F, M> ModuleRegisterer for F
 where
-    F: Fn(ModuleCapabilityProviders) -> M,
+    F: Fn(ModuleCapabilityFactory) -> M,
     M: Module + 'static,
 {
     type Module = M;
@@ -456,7 +456,7 @@ mod tests {
         async fn run(&mut self) {}
     }
 
-    fn noop_builder(_: ModuleCapabilityProviders) -> NoopModule {
+    fn noop_builder(_: ModuleCapabilityFactory) -> NoopModule {
         NoopModule
     }
 
