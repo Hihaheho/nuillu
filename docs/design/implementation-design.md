@@ -23,6 +23,7 @@ This document is the implementation source of truth. It describes the desired ar
 12. **Streaming for user-visible output, collect for internal decisions** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules (structured decision turns and tool loops) use `.collect()` because their output is memo-authoritative and has no value until complete and validated. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
 13. **Attention-stream interruption of speak streaming** — If `AttentionStreamUpdated` arrives while speak is generating, the current text stream is cancelled and generation restarts with a fresh attention snapshot. The in-progress delta sequence is abandoned; the sink detects abandonment via a `generation_id` change on `UtteranceDelta`. This ensures speak's utterances always reflect the latest attended state rather than a stale snapshot taken at stream start.
 14. **Local deterministic inbox batching** — Modules may batch transient inbox activations immediately before LLM work. Batching is module-local, bounded by boot-time module config, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership.
+15. **Full activation gating** — `ResourceAllocation.enabled` means the module is eligible to run any activation, not only periodic ticks. A disabled module may receive transient inbox messages, but it must defer or coalesce them without semantic LLM work, memo writes, or side effects until it is re-enabled.
 
 ---
 
@@ -170,7 +171,8 @@ let periodic = factory.periodic_inbox_for(builtin::query_vector());
 `PeriodicActivation::tick(elapsed)` reads the current allocation and sends at most one tick per registered module when accumulated elapsed time reaches the module period.
 
 Rules:
-- `period: None`, `period == 0`, or `enabled == false` sends no tick and clears that module's accumulator.
+- `period: None` or `period == 0` sends no tick and clears that module's accumulator.
+- `enabled == false` sends no tick and clears that module's accumulator as the periodic side of the full activation gate.
 - Allocation changes take effect on the next `tick`.
 - One `tick(elapsed)` emits at most one activation per module.
 - Remainder elapsed carries forward.
@@ -178,13 +180,35 @@ Rules:
 
 `PeriodicInbox` exposes `next_tick().await` for the first awaited activation and `take_ready_ticks()` for nonblocking batching after that first activation. Closed periodic inboxes are application-shutdown signals and propagate as `PeriodicRecvError::Closed`.
 
+### Full activation gate
+
+`ModuleConfig.enabled` is the allocation-controlled gate for all activation sources: periodic ticks, typed topic messages, attention-stream updates, and any future wake channel. This is an eligibility bit, not a durability mechanism.
+
+Modules that consume activations receive an owner-stamped `ActivationGate` capability. The gate exposes only `block().await`, which returns immediately when the holder is enabled and otherwise waits until the holder is re-enabled. It does not expose the full allocation snapshot. This preserves module boundaries: `speak`, query modules, and other workers can block until they may run without gaining access to allocation policy. `LlmAccess::lutum()` continues to resolve only the holder's model tier; it does not enforce enabled state.
+
+The activation prelude is:
+
+1. await one activation,
+2. collect already-ready transient activations into the module-local batch,
+3. call `ActivationGate::block().await`,
+4. collect ready activations once more to coalesce work that arrived while blocked,
+5. run one normal module-specific semantic activation from the pending batch and a fresh source-of-truth read.
+
+Wake-only activations such as `AttentionStreamUpdated` and periodic ticks may be collapsed into a single pending wake because the source of truth is durable state such as the attention stream or blackboard. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `MemoryRequest`, and `SensoryInput` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until enabled. If a future bounded queue policy is introduced, overflow behavior must be explicit per topic and must not be hidden inside `ActivationGate`.
+
+Re-enabling a module with pending activation acts as a wake; the module must not require a new domain event just to notice that it can now process the latest durable state. Allocation changes do not preempt an already-running activation unless that module has its own interruption rule; speak's existing attention-update interruption remains the only v1 preemption behavior.
+
+Boot policy should keep `attention-controller` enabled. If the controller is disabled, only the host or explicit boot wiring can recover allocation.
+
 ### Inbox batching
 
-Inbox batching is a per-module activation prelude, not a scheduler feature. A module waits for exactly one activation event, collects already-ready events without awaiting, and then deterministically converts those events into a module-local `NextBatch` before any LLM call or side effect:
+Inbox batching is a per-module activation prelude, not a scheduler feature. A module waits for exactly one activation event, collects already-ready events without awaiting, blocks on its activation gate, then deterministically converts those events into a module-local `NextBatch` before any LLM call or side effect:
 
 ```rust
 async fn next_batch(&mut self) -> Result<NextBatch> {
     let mut batch = self.await_first_batch().await?;
+    self.collect_ready_events_into_batch(&mut batch)?;
+    self.gate.block().await?;
     self.collect_ready_events_into_batch(&mut batch)?;
     Ok(batch)
 }
@@ -194,6 +218,7 @@ Rules:
 - The first event is the only awaited receive. The ready collection must use `take_ready_items()` / `take_ready_ticks()` and must not wait for more work.
 - `TopicInbox::next_item()` and `TopicInbox::take_ready_items()` hide transport details from modules. Closed inboxes are application-shutdown signals and propagate as `TopicRecvError::Closed`.
 - `PeriodicInbox::next_tick()` and `PeriodicInbox::take_ready_ticks()` do the same for periodic activation.
+- After the deterministic batch is collected, the module calls `ActivationGate::block()` before semantic processing. If disabled, the module performs no LLM call, memo write, or side effect while the pending batch remains in the suspended `next_batch` future. After the gate opens, the module collects ready events once more and returns the batch.
 - v1 does not impose a shared `max_ready_events` limit. If a future module needs burst limits, that policy should be added as module-local domain logic rather than as a scheduler allocation field.
 - There is no shared `ActivationBatch`, `Incoming`, or `NextBatch` type in `crates/module`. Each module defines the private event and batch shape that matches its capability set.
 - Cross-inbox event ordering has no runtime-wide meaning. Each module defines whether `calculate_next_batch` preserves order, groups by source, or reduces wake signals into booleans.
@@ -216,6 +241,7 @@ All capabilities are non-exclusive: the factory does not enforce uniqueness on a
 | Handle | Owner-stamped | Purpose |
 |---|---:|---|
 | `PeriodicInbox` | yes | allocation-aware periodic activations |
+| `ActivationGate` | yes | owner-scoped block that returns only when the holder may run an activation |
 | `SensoryInputMailbox` | yes | publish external observations into the agent boundary |
 | `SensoryInputInbox` | yes | subscribe to external observations |
 | `QueryMailbox` / `SelfModelMailbox` | yes | publish typed work requests |
@@ -288,6 +314,8 @@ let factory = CapabilityFactory::new(..., Arc::new(FixedClock::new(observed_now)
 
 ## 4. Module Responsibilities
 
+The role-specific capability lists below omit the ubiquitous `ActivationGate`. Every module that consumes activations receives its own owner-stamped gate and blocks on it after batching but before semantic work. The gate is not a side-effect capability and does not expose the full allocation snapshot.
+
 ### Sensory
 
 Capabilities: `SensoryInputInbox`, `Memo`, `Clock`, `LlmAccess`.
@@ -309,6 +337,10 @@ Reads the non-cognitive blackboard snapshot and appends concise, novel, currentl
 Capabilities: `AttentionStreamUpdatedInbox`, optional `PeriodicInbox`, `AttentionReader`, `AllocationReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
 
 Reads only the attention stream and allocation. Writes the next allocation snapshot.
+
+When the current attention suggests that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it sets `speak.enabled = false`, keeps or raises query-module eligibility/cadence/tier, and records the rationale in its memo. Query modules continue to write memo-authoritative results; summarize may later promote useful query memo content into the attention stream. Once the attention stream indicates that enough evidence is available for a user-visible answer, the controller writes `speak.enabled = true`.
+
+This is not a request/response wait and not a query-completion correlation protocol. The controller judges readiness from attended state and allocation, while query results remain durable only through query-module memos.
 
 ### Attention Schema
 
@@ -370,6 +402,8 @@ Emits user-visible text. The module is named `speak`, not `talk`, because it rep
 
 Speak reads only the attention stream — it has no `BlackboardReader` and does not inspect other modules' memos. This keeps the utterance boundary narrow: speak distills what is attended, not the full blackboard state.
 
+Speak is allocation-suppressed during evidence gathering. If it receives an attention update or periodic wake while `speak.enabled = false`, it records a pending speak wake without a decision turn, generation turn, memo write, delta, or complete utterance. When the controller later re-enables speak, that pending wake runs once against a fresh attention snapshot; it does not need another attention update just to start speaking.
+
 Speak uses a two-stage LLM interaction:
 
 1. **Decision turn** — `structured_turn::<SpeakDecision>().collect()`. Reads the current attention stream snapshot and determines whether a response is warranted (`should_respond`, `rationale`, optional generation hint). If `should_respond` is false, speak writes the decision to its memo and emits nothing.
@@ -414,7 +448,7 @@ loop {
 }
 ```
 
-Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, speak may remain silent and wait for later attention updates, or produce a bounded clarification/failure utterance according to boot-time policy.
+Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, the preferred control path is for attention-controller to suppress speak while query and summarization work progresses. If speak is enabled and the attended state is still insufficient, it may remain silent or produce a bounded clarification/failure utterance according to boot-time policy.
 
 ---
 
@@ -515,7 +549,10 @@ This keeps realistic artifacts observable without adding request/response correl
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `AttentionWriter`, `AllocationWriter`, or memory capabilities |
 | Speak reads only the attention stream | it receives `AttentionReader`, not `BlackboardReader` |
+| Speak suppression is allocation-controlled | attention-controller writes `speak.enabled`; speak defers pending wakes through `ActivationGate` before decision/generation and emits only when enabled |
+| Speak still does not route query work | evidence gathering is driven by allocation, query memos, and attention updates; speak receives no `QueryMailbox` |
 | Speak interrupts streaming on attention updates | speak holds `AttentionStreamUpdatedInbox` and cancels the generation stream on receipt; generation restarts from step 1 with a fresh attention snapshot |
+| `ResourceAllocation.enabled` gates all activations | periodic dispatch suppresses ticks, and modules defer or coalesce typed/attention activations after batching when their `ActivationGate` is disabled |
 | Summarize is the only path to attention stream append | boot-time wiring (only summarize is granted `AttentionWriter`) |
 | Only controller writes allocation | boot-time wiring (only attention-controller is granted `AllocationWriter`) |
 | Query vector is memory/RAG only | it receives `VectorMemorySearcher`, not file or self-model capabilities |
