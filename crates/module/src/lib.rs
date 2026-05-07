@@ -30,6 +30,9 @@ mod time_division;
 mod r#trait;
 mod utterance;
 
+#[cfg(test)]
+mod test_support;
+
 pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;

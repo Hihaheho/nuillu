@@ -8,5 +8,8 @@
 pub mod event_loop;
 pub mod scheduler;
 
+#[cfg(test)]
+mod testing;
+
 pub use event_loop::AgentEventLoop;
 pub use scheduler::{SchedulerError, run};

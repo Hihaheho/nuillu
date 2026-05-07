@@ -90,14 +90,14 @@ impl CapabilityProviders {
         )
     }
 
-    fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
+    pub(crate) fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
         ModuleCapabilityFactory {
             owner,
             root: self.clone(),
         }
     }
 
-    async fn set_replica_caps(&self, caps: Vec<(ModuleId, ReplicaCapRange)>) {
+    pub(crate) async fn set_replica_caps(&self, caps: Vec<(ModuleId, ReplicaCapRange)>) {
         self.inner
             .blackboard
             .apply(BlackboardCommand::SetReplicaCaps { caps })
@@ -447,7 +447,10 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
+    use nuillu_blackboard::Blackboard;
     use nuillu_types::builtin;
+
+    use crate::test_support::{scoped, test_caps};
 
     struct NoopModule;
 
@@ -474,5 +477,16 @@ mod tests {
             err,
             ModuleRegistryError::DuplicateModule { module } if module == builtin::summarize()
         ));
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_non_exclusive() {
+        let caps = test_caps(Blackboard::default());
+        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let _w1 = summarize.attention_writer();
+        let _w2 = summarize.attention_writer();
+        let _a1 = controller.allocation_writer();
+        let _a2 = controller.allocation_writer();
     }
 }

@@ -183,3 +183,41 @@ impl PeriodicActivation {
         }
     }
 }
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+
+    use nuillu_blackboard::{Blackboard, ModuleConfig, ResourceAllocation};
+    use nuillu_types::ModuleId;
+
+    use crate::test_support::{scoped, test_caps};
+
+    fn ticker_id() -> ModuleId {
+        ModuleId::new("ticker").unwrap()
+    }
+
+    #[tokio::test]
+    async fn periodic_activation_targets_active_replicas_only() {
+        let mut alloc = ResourceAllocation::default();
+        alloc.set(
+            ticker_id(),
+            ModuleConfig {
+                replicas: 2,
+                period: Some(Duration::from_millis(10)),
+                ..Default::default()
+            },
+        );
+        let caps = test_caps(Blackboard::with_allocation(alloc));
+        let mut replica_0 = scoped(&caps, ticker_id(), 0).periodic_inbox();
+        let mut replica_1 = scoped(&caps, ticker_id(), 1).periodic_inbox();
+        let mut replica_2 = scoped(&caps, ticker_id(), 2).periodic_inbox();
+        let mut periodic = caps.periodic_activation();
+
+        periodic.tick(Duration::from_millis(10)).await;
+
+        assert_eq!(replica_0.take_ready_ticks().unwrap(), 1);
+        assert_eq!(replica_1.take_ready_ticks().unwrap(), 1);
+        assert_eq!(replica_2.take_ready_ticks().unwrap(), 0);
+    }
+}

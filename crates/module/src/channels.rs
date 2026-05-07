@@ -251,3 +251,145 @@ pub enum SensoryInput {
 
 pub type SensoryInputMailbox = TopicMailbox<SensoryInput>;
 pub type SensoryInputInbox = TopicInbox<SensoryInput>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use nuillu_blackboard::{ModuleConfig, ResourceAllocation};
+    use nuillu_types::builtin;
+
+    use crate::test_support::{scoped, test_caps};
+
+    fn ticker_id() -> ModuleId {
+        ModuleId::new("ticker").unwrap()
+    }
+
+    fn echo_id() -> ModuleId {
+        ModuleId::new("echo").unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
+        let caps = test_caps(Blackboard::default());
+        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
+        let mut vector = scoped(&caps, builtin::query_vector(), 0).query_inbox();
+        let mut agentic = scoped(&caps, builtin::query_agentic(), 0).query_inbox();
+
+        publisher
+            .publish(QueryRequest::new("find memories about rust"))
+            .await
+            .expect("query topic should have subscribers");
+
+        let vector_env = vector
+            .next_item()
+            .await
+            .expect("vector subscriber receives query");
+        let agentic_env = agentic
+            .next_item()
+            .await
+            .expect("agentic subscriber receives query");
+
+        assert_eq!(vector_env.sender, agentic_env.sender);
+        assert_eq!(vector_env.sender.module, ticker_id());
+        assert_eq!(vector_env.body.question, "find memories about rust");
+        assert_eq!(agentic_env.body.question, "find memories about rust");
+    }
+
+    #[tokio::test]
+    async fn self_model_mailbox_is_a_separate_typed_topic() {
+        let caps = test_caps(Blackboard::default());
+        let query_publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
+        let self_publisher = scoped(&caps, echo_id(), 0).self_model_mailbox();
+        let mut query_inbox = scoped(&caps, builtin::query_vector(), 0).query_inbox();
+        let mut self_inbox = scoped(&caps, builtin::attention_schema(), 0).self_model_inbox();
+
+        query_publisher
+            .publish(QueryRequest::new("memory only"))
+            .await
+            .expect("query subscriber exists");
+        self_publisher
+            .publish(SelfModelRequest::new("what are you aware of?"))
+            .await
+            .expect("self-model subscriber exists");
+
+        assert_eq!(
+            query_inbox.next_item().await.unwrap().body.question,
+            "memory only"
+        );
+        assert_eq!(
+            self_inbox.next_item().await.unwrap().body.question,
+            "what are you aware of?"
+        );
+        assert!(query_inbox.take_ready_items().unwrap().items.is_empty());
+        assert!(self_inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn role_topics_load_balance_across_active_replicas() {
+        let mut alloc = ResourceAllocation::default();
+        alloc.set(
+            builtin::query_vector(),
+            ModuleConfig {
+                replicas: 2,
+                ..Default::default()
+            },
+        );
+        alloc.set(
+            builtin::query_agentic(),
+            ModuleConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+        );
+        let caps = test_caps(Blackboard::with_allocation(alloc));
+        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
+        let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
+        let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();
+        let mut agentic_0 = scoped(&caps, builtin::query_agentic(), 0).query_inbox();
+
+        publisher.publish(QueryRequest::new("first")).await.unwrap();
+        publisher
+            .publish(QueryRequest::new("second"))
+            .await
+            .unwrap();
+
+        assert_eq!(vector_0.next_item().await.unwrap().body.question, "first");
+        assert_eq!(vector_1.next_item().await.unwrap().body.question, "second");
+        let agentic = agentic_0
+            .take_ready_items()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.body.question)
+            .collect::<Vec<_>>();
+        assert_eq!(agentic, vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn role_topics_do_not_route_to_disabled_replicas() {
+        let mut alloc = ResourceAllocation::default();
+        alloc.set(
+            builtin::query_vector(),
+            ModuleConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+        );
+        let caps = test_caps(Blackboard::with_allocation(alloc));
+        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
+        let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
+        let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();
+
+        publisher
+            .publish(QueryRequest::new("active only"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vector_0.next_item().await.unwrap().body.question,
+            "active only"
+        );
+        assert!(vector_1.take_ready_items().unwrap().items.is_empty());
+    }
+}

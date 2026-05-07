@@ -161,3 +161,263 @@ impl Module for MemoryModule {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use lutum::{
+        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+    };
+    use nuillu_module::ports::{
+        IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NoopAttentionRepository,
+        NoopFileSearchProvider, NoopUtteranceSink, PortError, SystemClock,
+    };
+    use nuillu_module::{CapabilityProviders, LutumTiers, MemoryImportance, ModuleRegistry};
+    use nuillu_types::{MemoryIndex, builtin};
+    use tokio::sync::Mutex;
+    use tokio::task::LocalSet;
+
+    fn test_caps_with_adapter(
+        primary: Arc<dyn MemoryStore>,
+        adapter: MockLlmAdapter,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(adapter);
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        CapabilityProviders::new(
+            nuillu_blackboard::Blackboard::default(),
+            Arc::new(NoopAttentionRepository),
+            primary,
+            Vec::new(),
+            Arc::new(NoopFileSearchProvider),
+            Arc::new(NoopUtteranceSink),
+            Arc::new(SystemClock),
+            LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        )
+    }
+
+    #[derive(Default, Clone)]
+    struct RecordingMemoryStore {
+        inserted: Arc<Mutex<Vec<MemoryIndex>>>,
+        next_index: Arc<AtomicU64>,
+    }
+
+    impl RecordingMemoryStore {
+        async fn inserted_indexes(&self) -> Vec<MemoryIndex> {
+            self.inserted.lock().await.clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl MemoryStore for RecordingMemoryStore {
+        async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
+            let id = self
+                .next_index
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let index = MemoryIndex::new(format!("recorded-{id}"));
+            self.inserted.lock().await.push(index.clone());
+            Ok(index)
+        }
+        async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
+            Ok(())
+        }
+        async fn compact(
+            &self,
+            mem: NewMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<MemoryIndex, PortError> {
+            self.insert(mem).await
+        }
+        async fn put_compacted(
+            &self,
+            _mem: IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+            Ok(None)
+        }
+        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    struct PublisherStub;
+
+    #[async_trait(?Send)]
+    impl Module for PublisherStub {
+        async fn run(&mut self) {}
+    }
+
+    fn memory_insert_tool_scenario(content: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("memory-tool".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "insert-1".into(),
+                name: "insert_memory".into(),
+                arguments_json_delta: format!(
+                    r#"{{"content":"{content}","rank":"ShortTerm","decay_secs":86400}}"#
+                ),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("memory-tool".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn final_text_scenario(text: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("memory-final".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("memory-final".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    async fn build_memory_with_publisher(
+        caps: &CapabilityProviders,
+    ) -> (Vec<Box<dyn Module>>, nuillu_module::MemoryRequestMailbox) {
+        let publisher_cell: Rc<RefCell<Option<nuillu_module::MemoryRequestMailbox>>> =
+            Rc::new(RefCell::new(None));
+        let publisher_clone = Rc::clone(&publisher_cell);
+        let modules = ModuleRegistry::new()
+            .register(builtin::surprise(), 0..=1, move |caps| {
+                *publisher_clone.borrow_mut() = Some(caps.memory_request_mailbox());
+                PublisherStub
+            })
+            .unwrap()
+            .register(builtin::memory(), 0..=1, |caps| {
+                MemoryModule::new(
+                    caps.periodic_inbox(),
+                    caps.memory_request_inbox(),
+                    caps.activation_gate(),
+                    caps.blackboard_reader(),
+                    caps.memory_writer(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let publisher = publisher_cell
+            .borrow_mut()
+            .take()
+            .expect("publisher captured");
+        (modules.into_modules().collect(), publisher)
+    }
+
+    async fn run_modules<F: std::future::Future<Output = ()>>(
+        modules: Vec<Box<dyn Module>>,
+        body: F,
+    ) {
+        for mut module in modules {
+            tokio::task::spawn_local(async move {
+                module.run().await;
+            });
+        }
+        body.await;
+    }
+
+    #[tokio::test]
+    async fn memory_request_does_not_insert_without_llm_tool_decision() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let primary = RecordingMemoryStore::default();
+                let caps = test_caps_with_adapter(Arc::new(primary.clone()), MockLlmAdapter::new());
+                let (modules, publisher) = build_memory_with_publisher(&caps).await;
+
+                run_modules(modules, async {
+                    publisher
+                        .publish(MemoryRequest {
+                            content: "candidate memory".into(),
+                            importance: MemoryImportance::High,
+                            reason: "test request".into(),
+                        })
+                        .await
+                        .expect("memory module subscribed");
+
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+
+                assert!(primary.inserted_indexes().await.is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let primary = RecordingMemoryStore::default();
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(memory_insert_tool_scenario(
+                        "Ryo wants inbox batching implemented.",
+                    ))
+                    .with_text_scenario(final_text_scenario("memory-complete"));
+                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
+                let (modules, publisher) = build_memory_with_publisher(&caps).await;
+
+                run_modules(modules, async {
+                    publisher
+                        .publish(MemoryRequest {
+                            content: "Ryo wants inbox batching implemented".into(),
+                            importance: MemoryImportance::Normal,
+                            reason: "first signal".into(),
+                        })
+                        .await
+                        .expect("memory module subscribed");
+                    publisher
+                        .publish(MemoryRequest {
+                            content: "Inbox batching implementation is important to Ryo".into(),
+                            importance: MemoryImportance::High,
+                            reason: "duplicate signal".into(),
+                        })
+                        .await
+                        .expect("memory module subscribed");
+
+                    for _ in 0..20 {
+                        if primary.inserted_indexes().await.len() == 1 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+
+                let indexes = primary.inserted_indexes().await;
+                assert_eq!(indexes.len(), 1);
+            })
+            .await;
+    }
+}

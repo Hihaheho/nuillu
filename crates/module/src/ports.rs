@@ -136,6 +136,97 @@ impl Clock for SystemClock {
     }
 }
 
+/// Memory store that accepts every write, returns empty reads, and assigns
+/// a unique synthetic [`MemoryIndex`] to each insert.
+#[derive(Debug, Default)]
+pub struct NoopMemoryStore;
+
+#[async_trait(?Send)]
+impl MemoryStore for NoopMemoryStore {
+    async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(MemoryIndex::new(format!("noop-memory-{id}")))
+    }
+
+    async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn compact(
+        &self,
+        mem: NewMemory,
+        _sources: &[MemoryIndex],
+    ) -> Result<MemoryIndex, PortError> {
+        self.insert(mem).await
+    }
+
+    async fn put_compacted(
+        &self,
+        _mem: IndexedMemory,
+        _sources: &[MemoryIndex],
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+        Ok(None)
+    }
+
+    async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+/// File search provider that returns no hits.
+#[derive(Debug, Default)]
+pub struct NoopFileSearchProvider;
+
+#[async_trait(?Send)]
+impl FileSearchProvider for NoopFileSearchProvider {
+    async fn search(&self, _query: &FileSearchQuery) -> Result<Vec<FileSearchHit>, PortError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Attention repository that discards appends and reports no history.
+#[derive(Debug, Default)]
+pub struct NoopAttentionRepository;
+
+#[async_trait(?Send)]
+impl AttentionRepository for NoopAttentionRepository {
+    async fn append(
+        &self,
+        _stream: ModuleInstanceId,
+        _event: AttentionStreamEvent,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn since(
+        &self,
+        _stream: &ModuleInstanceId,
+        _from: DateTime<Utc>,
+    ) -> Result<Vec<AttentionStreamEvent>, PortError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Utterance sink that drops every event.
+#[derive(Debug, Default)]
+pub struct NoopUtteranceSink;
+
+#[async_trait(?Send)]
+impl UtteranceSink for NoopUtteranceSink {
+    async fn on_complete(&self, _utterance: Utterance) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
 /// A single user-visible utterance emitted by the speak module.
 pub struct Utterance {
     pub sender: ModuleInstanceId,
