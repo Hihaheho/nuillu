@@ -1,0 +1,1438 @@
+//! Local libSQL-backed memory adapter.
+//!
+//! Memory content is stored separately from embeddings. Each embedding
+//! profile owns a dimension-specific table so one memory can carry multiple
+//! embedding versions without losing libSQL's `F32_BLOB(N)` typing.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use libsql::{Connection, Transaction, params};
+pub use lutum_lancedb_core::LanceDbEmbedder;
+use nuillu_module::ports::{
+    IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError,
+};
+use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+const DEFAULT_MEMORY_TABLE: &str = "memories";
+const PROFILE_REGISTRY_TABLE: &str = "memory_embedding_profiles";
+const MAX_VECTOR_DIMS: usize = 65_536;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddingProfile {
+    pub name: String,
+    pub version: String,
+    pub dimensions: usize,
+}
+
+impl EmbeddingProfile {
+    pub fn new(name: impl Into<String>, version: impl Into<String>, dimensions: usize) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            dimensions,
+        }
+    }
+
+    pub fn default_for_dimensions(dimensions: usize) -> Self {
+        Self::new("default", "v1", dimensions)
+    }
+
+    pub fn profile_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.version.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.dimensions.to_string().as_bytes());
+        let digest = hasher.finalize();
+        format!("p{}", short_hex(&digest[..8]))
+    }
+
+    fn validate(&self) -> Result<(), PortError> {
+        if self.name.trim().is_empty() {
+            return Err(PortError::InvalidInput(
+                "embedding profile name must not be empty".into(),
+            ));
+        }
+        if self.version.trim().is_empty() {
+            return Err(PortError::InvalidInput(
+                "embedding profile version must not be empty".into(),
+            ));
+        }
+        validate_dimensions("embedding profile dimensions", self.dimensions)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LibsqlMemoryStoreConfig {
+    pub path: PathBuf,
+    pub table_name: String,
+    pub active_profile: EmbeddingProfile,
+}
+
+impl LibsqlMemoryStoreConfig {
+    pub fn local(path: impl Into<PathBuf>, vector_dims: usize) -> Self {
+        Self {
+            path: path.into(),
+            table_name: DEFAULT_MEMORY_TABLE.to_owned(),
+            active_profile: EmbeddingProfile::default_for_dimensions(vector_dims),
+        }
+    }
+
+    pub fn with_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
+        self.active_profile = active_profile;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct LibsqlMemoryStore {
+    conn: Connection,
+    table_name: String,
+    active_profile: EmbeddingProfile,
+    profile_id: String,
+    embedding_table_name: String,
+    embedder: Arc<dyn LanceDbEmbedder>,
+}
+
+impl LibsqlMemoryStore {
+    pub async fn connect(
+        config: LibsqlMemoryStoreConfig,
+        embedder: Arc<dyn LanceDbEmbedder>,
+    ) -> Result<Self, PortError> {
+        let database = libsql::Builder::new_local(config.path)
+            .build()
+            .await
+            .map_err(map_libsql_error)?;
+        let conn = database.connect().map_err(map_libsql_error)?;
+        Self::from_connection(conn, config.table_name, config.active_profile, embedder).await
+    }
+
+    pub async fn from_connection(
+        conn: Connection,
+        table_name: impl Into<String>,
+        active_profile: EmbeddingProfile,
+        embedder: Arc<dyn LanceDbEmbedder>,
+    ) -> Result<Self, PortError> {
+        let table_name = table_name.into();
+        validate_identifier("memory table name", &table_name)?;
+        active_profile.validate()?;
+
+        let embedder_dims = embedder.dimensions();
+        if embedder_dims != active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "libSQL embedding dimension mismatch: profile={}, embedder={embedder_dims}",
+                active_profile.dimensions
+            )));
+        }
+
+        let profile_id = active_profile.profile_id();
+        let embedding_table_name = format!("{table_name}_embeddings_{profile_id}");
+        validate_identifier("embedding table name", &embedding_table_name)?;
+
+        let store = Self {
+            conn,
+            table_name,
+            active_profile,
+            profile_id,
+            embedding_table_name,
+            embedder,
+        };
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    pub fn active_profile(&self) -> &EmbeddingProfile {
+        &self.active_profile
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    pub fn embedding_table_name(&self) -> &str {
+        &self.embedding_table_name
+    }
+
+    pub async fn backfill_active_profile(&self, limit: usize) -> Result<usize, PortError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let sql = format!(
+            r#"
+            SELECT m.id, m.content, m.updated_at_ms
+            FROM {memories} AS m
+            LEFT JOIN {embeddings} AS e ON e.memory_id = m.id
+            WHERE m.deleted_at_ms IS NULL
+              AND (
+                e.memory_id IS NULL
+                OR e.content_updated_at_ms != m.updated_at_ms
+              )
+            ORDER BY m.id ASC
+            LIMIT ?1
+            "#,
+            memories = self.table_name,
+            embeddings = self.embedding_table_name,
+        );
+
+        let mut rows = self
+            .conn
+            .query(&sql, [limit_to_i64(limit)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            pending.push(PendingEmbedding {
+                memory_id: row.get(0).map_err(map_libsql_error)?,
+                content: row.get(1).map_err(map_libsql_error)?,
+                content_updated_at_ms: row.get(2).map_err(map_libsql_error)?,
+            });
+        }
+
+        let mut written = 0;
+        for item in pending {
+            let embedding_json = self.embed_json(&item.content).await?;
+            self.upsert_embedding_conn(
+                item.memory_id,
+                &embedding_json,
+                now_ms(),
+                item.content_updated_at_ms,
+            )
+            .await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    async fn migrate(&self) -> Result<(), PortError> {
+        let memory_rank_idx = format!("{}_rank_live_idx", self.table_name);
+        validate_identifier("memory rank index name", &memory_rank_idx)?;
+
+        let ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {memories} (
+              id INTEGER PRIMARY KEY,
+              memory_index TEXT NOT NULL UNIQUE,
+              content TEXT NOT NULL,
+              rank INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              source_ids TEXT,
+              metadata_json TEXT,
+              deleted_at_ms INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS {memory_rank_idx}
+            ON {memories}(rank)
+            WHERE deleted_at_ms IS NULL;
+
+            CREATE TABLE IF NOT EXISTS {profiles} (
+              profile_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              dimensions INTEGER NOT NULL,
+              table_name TEXT NOT NULL UNIQUE,
+              created_at_ms INTEGER NOT NULL
+            );
+            "#,
+            memories = self.table_name,
+            memory_rank_idx = memory_rank_idx,
+            profiles = PROFILE_REGISTRY_TABLE,
+        );
+        self.conn
+            .execute_batch(&ddl)
+            .await
+            .map_err(map_libsql_error)?;
+
+        self.register_active_profile().await?;
+        self.create_active_embedding_table().await
+    }
+
+    async fn register_active_profile(&self) -> Result<(), PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT name, version, dimensions, table_name
+                    FROM {PROFILE_REGISTRY_TABLE}
+                    WHERE profile_id = ?1
+                    LIMIT 1
+                    "#
+                ),
+                [self.profile_id.as_str()],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+
+        if let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let name: String = row.get(0).map_err(map_libsql_error)?;
+            let version: String = row.get(1).map_err(map_libsql_error)?;
+            let dimensions: i64 = row.get(2).map_err(map_libsql_error)?;
+            let table_name: String = row.get(3).map_err(map_libsql_error)?;
+            let expected_dimensions = self.active_profile.dimensions as i64;
+            if name != self.active_profile.name
+                || version != self.active_profile.version
+                || dimensions != expected_dimensions
+                || table_name != self.embedding_table_name
+            {
+                return Err(PortError::InvalidData(format!(
+                    "embedding profile registry conflict for {}",
+                    self.profile_id
+                )));
+            }
+            return Ok(());
+        }
+        drop(rows);
+
+        self.conn
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {PROFILE_REGISTRY_TABLE} (
+                      profile_id,
+                      name,
+                      version,
+                      dimensions,
+                      table_name,
+                      created_at_ms
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#
+                ),
+                params![
+                    self.profile_id.as_str(),
+                    self.active_profile.name.as_str(),
+                    self.active_profile.version.as_str(),
+                    self.active_profile.dimensions as i64,
+                    self.embedding_table_name.as_str(),
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn create_active_embedding_table(&self) -> Result<(), PortError> {
+        let ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {embeddings} (
+              memory_id INTEGER PRIMARY KEY,
+              embedding F32_BLOB({dimensions}) NOT NULL,
+              embedded_at_ms INTEGER NOT NULL,
+              content_updated_at_ms INTEGER NOT NULL,
+              FOREIGN KEY(memory_id) REFERENCES {memories}(id)
+            );
+            "#,
+            embeddings = self.embedding_table_name,
+            dimensions = self.active_profile.dimensions,
+            memories = self.table_name,
+        );
+        self.conn
+            .execute_batch(&ddl)
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn embed_json(&self, text: &str) -> Result<String, PortError> {
+        let embedding = self.embedder.embed(text).await?;
+        self.validate_embedding(&embedding)?;
+        serde_json::to_string(&embedding).map_err(|error| PortError::Backend(error.to_string()))
+    }
+
+    fn validate_embedding(&self, embedding: &[f32]) -> Result<(), PortError> {
+        if embedding.len() != self.active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "embedding dimension mismatch: expected {}, got {}",
+                self.active_profile.dimensions,
+                embedding.len()
+            )));
+        }
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return Err(PortError::InvalidData(
+                "embedding contains NaN or infinity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn upsert_memory_tx(
+        &self,
+        tx: &Transaction,
+        index: &MemoryIndex,
+        content: &str,
+        rank: MemoryRank,
+        source_ids_json: Option<&str>,
+        now: i64,
+    ) -> Result<(i64, i64), PortError> {
+        let sql = format!(
+            r#"
+            INSERT INTO {memories} (
+              memory_index,
+              content,
+              rank,
+              created_at_ms,
+              updated_at_ms,
+              source_ids,
+              metadata_json,
+              deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
+            ON CONFLICT(memory_index) DO UPDATE SET
+              content = excluded.content,
+              rank = excluded.rank,
+              updated_at_ms = excluded.updated_at_ms,
+              source_ids = excluded.source_ids,
+              deleted_at_ms = NULL
+            "#,
+            memories = self.table_name,
+        );
+        tx.execute(
+            &sql,
+            params![
+                index.as_str(),
+                content,
+                rank_to_i64(rank),
+                now,
+                now,
+                source_ids_json,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+
+        self.memory_id_and_updated_at_tx(tx, index).await
+    }
+
+    async fn memory_id_and_updated_at_tx(
+        &self,
+        tx: &Transaction,
+        index: &MemoryIndex,
+    ) -> Result<(i64, i64), PortError> {
+        let sql = format!(
+            r#"
+            SELECT id, updated_at_ms
+            FROM {memories}
+            WHERE memory_index = ?1
+            LIMIT 1
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = tx
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        let Some(row) = rows.next().await.map_err(map_libsql_error)? else {
+            return Err(PortError::Backend(format!(
+                "memory row was not found after upsert: {}",
+                index.as_str()
+            )));
+        };
+        Ok((
+            row.get(0).map_err(map_libsql_error)?,
+            row.get(1).map_err(map_libsql_error)?,
+        ))
+    }
+
+    async fn upsert_embedding_tx(
+        &self,
+        tx: &Transaction,
+        memory_id: i64,
+        embedding_json: &str,
+        embedded_at_ms: i64,
+        content_updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let sql = self.upsert_embedding_sql();
+        tx.execute(
+            &sql,
+            params![
+                memory_id,
+                embedding_json,
+                embedded_at_ms,
+                content_updated_at_ms,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn upsert_embedding_conn(
+        &self,
+        memory_id: i64,
+        embedding_json: &str,
+        embedded_at_ms: i64,
+        content_updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let sql = self.upsert_embedding_sql();
+        self.conn
+            .execute(
+                &sql,
+                params![
+                    memory_id,
+                    embedding_json,
+                    embedded_at_ms,
+                    content_updated_at_ms,
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    fn upsert_embedding_sql(&self) -> String {
+        format!(
+            r#"
+            INSERT INTO {embeddings} (
+              memory_id,
+              embedding,
+              embedded_at_ms,
+              content_updated_at_ms
+            )
+            VALUES (?1, vector32(?2), ?3, ?4)
+            ON CONFLICT(memory_id) DO UPDATE SET
+              embedding = excluded.embedding,
+              embedded_at_ms = excluded.embedded_at_ms,
+              content_updated_at_ms = excluded.content_updated_at_ms
+            "#,
+            embeddings = self.embedding_table_name,
+        )
+    }
+
+    async fn soft_delete_many_tx(
+        &self,
+        tx: &Transaction,
+        indexes: &[MemoryIndex],
+        now: i64,
+    ) -> Result<(), PortError> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+
+        let sql = format!(
+            r#"
+            UPDATE {memories}
+            SET deleted_at_ms = ?2,
+                updated_at_ms = ?2
+            WHERE memory_index = ?1
+            "#,
+            memories = self.table_name,
+        );
+        for index in indexes {
+            tx.execute(&sql, params![index.as_str(), now])
+                .await
+                .map_err(map_libsql_error)?;
+        }
+        Ok(())
+    }
+
+    fn row_to_record(row: &libsql::Row) -> Result<MemoryRecord, PortError> {
+        let index: String = row.get(0).map_err(map_libsql_error)?;
+        let content: String = row.get(1).map_err(map_libsql_error)?;
+        let rank: i64 = row.get(2).map_err(map_libsql_error)?;
+        Ok(MemoryRecord {
+            index: MemoryIndex::new(index),
+            content: MemoryContent::new(content),
+            rank: rank_from_i64(rank)?,
+        })
+    }
+
+    async fn put_indexed(
+        &self,
+        mem: IndexedMemory,
+        source_ids_json: Option<String>,
+    ) -> Result<(), PortError> {
+        let embedding_json = self.embed_json(mem.content.as_str()).await?;
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let (memory_id, updated_at_ms) = self
+            .upsert_memory_tx(
+                &tx,
+                &mem.index,
+                mem.content.as_str(),
+                mem.rank,
+                source_ids_json.as_deref(),
+                now,
+            )
+            .await?;
+        self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
+            .await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl MemoryStore for LibsqlMemoryStore {
+    async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError> {
+        let index = MemoryIndex::new(Uuid::now_v7().to_string());
+        let embedding_json = self.embed_json(mem.content.as_str()).await?;
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let (memory_id, updated_at_ms) = self
+            .upsert_memory_tx(&tx, &index, mem.content.as_str(), mem.rank, None, now)
+            .await?;
+        self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
+            .await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(index)
+    }
+
+    async fn put(&self, mem: IndexedMemory) -> Result<(), PortError> {
+        self.put_indexed(mem, None).await
+    }
+
+    async fn compact(
+        &self,
+        mem: NewMemory,
+        sources: &[MemoryIndex],
+    ) -> Result<MemoryIndex, PortError> {
+        let index = MemoryIndex::new(Uuid::now_v7().to_string());
+        let embedding_json = self.embed_json(mem.content.as_str()).await?;
+        let source_ids_json = source_ids_json(sources)?;
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let (memory_id, updated_at_ms) = self
+            .upsert_memory_tx(
+                &tx,
+                &index,
+                mem.content.as_str(),
+                mem.rank,
+                Some(&source_ids_json),
+                now,
+            )
+            .await?;
+        self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
+            .await?;
+        self.soft_delete_many_tx(&tx, sources, now).await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(index)
+    }
+
+    async fn put_compacted(
+        &self,
+        mem: IndexedMemory,
+        sources: &[MemoryIndex],
+    ) -> Result<(), PortError> {
+        let source_ids_json = source_ids_json(sources)?;
+        let embedding_json = self.embed_json(mem.content.as_str()).await?;
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let (memory_id, updated_at_ms) = self
+            .upsert_memory_tx(
+                &tx,
+                &mem.index,
+                mem.content.as_str(),
+                mem.rank,
+                Some(&source_ids_json),
+                now,
+            )
+            .await?;
+        self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
+            .await?;
+        self.soft_delete_many_tx(&tx, sources, now).await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT memory_index, content, rank
+            FROM {memories}
+            WHERE memory_index = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Ok(Some(Self::row_to_record(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+        if q.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let embedding_json = self.embed_json(&q.text).await?;
+        let mut out = Vec::new();
+
+        match q.filter_rank {
+            Some(rank) => {
+                let sql = format!(
+                    r#"
+                    SELECT m.memory_index, m.content, m.rank
+                    FROM {memories} AS m
+                    JOIN {embeddings} AS e ON e.memory_id = m.id
+                    WHERE m.deleted_at_ms IS NULL
+                      AND e.content_updated_at_ms = m.updated_at_ms
+                      AND m.rank = ?2
+                    ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
+                             m.id ASC
+                    LIMIT ?3
+                    "#,
+                    memories = self.table_name,
+                    embeddings = self.embedding_table_name,
+                );
+                let mut rows = self
+                    .conn
+                    .query(
+                        &sql,
+                        params![embedding_json, rank_to_i64(rank), limit_to_i64(q.limit)],
+                    )
+                    .await
+                    .map_err(map_libsql_error)?;
+                while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+                    out.push(Self::row_to_record(&row)?);
+                }
+            }
+            None => {
+                let sql = format!(
+                    r#"
+                    SELECT m.memory_index, m.content, m.rank
+                    FROM {memories} AS m
+                    JOIN {embeddings} AS e ON e.memory_id = m.id
+                    WHERE m.deleted_at_ms IS NULL
+                      AND e.content_updated_at_ms = m.updated_at_ms
+                    ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
+                             m.id ASC
+                    LIMIT ?2
+                    "#,
+                    memories = self.table_name,
+                    embeddings = self.embedding_table_name,
+                );
+                let mut rows = self
+                    .conn
+                    .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
+                    .await
+                    .map_err(map_libsql_error)?;
+                while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+                    out.push(Self::row_to_record(&row)?);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError> {
+        let now = now_ms();
+        let sql = format!(
+            r#"
+            UPDATE {memories}
+            SET deleted_at_ms = ?2,
+                updated_at_ms = ?2
+            WHERE memory_index = ?1
+            "#,
+            memories = self.table_name,
+        );
+        self.conn
+            .execute(&sql, params![index.as_str(), now])
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingEmbedding {
+    memory_id: i64,
+    content: String,
+    content_updated_at_ms: i64,
+}
+
+fn validate_dimensions(label: &str, dimensions: usize) -> Result<(), PortError> {
+    if dimensions == 0 {
+        return Err(PortError::InvalidInput(format!(
+            "{label} must be greater than zero"
+        )));
+    }
+    if dimensions > MAX_VECTOR_DIMS {
+        return Err(PortError::InvalidInput(format!(
+            "{label} must be <= {MAX_VECTOR_DIMS}, got {dimensions}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_identifier(label: &str, value: &str) -> Result<(), PortError> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(PortError::InvalidInput(format!(
+            "{label} must not be empty"
+        )));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(PortError::InvalidInput(format!(
+            "{label} must start with an ASCII letter or underscore: {value}"
+        )));
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        return Err(PortError::InvalidInput(format!(
+            "{label} must contain only ASCII letters, digits, and underscores: {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn source_ids_json(ids: &[MemoryIndex]) -> Result<String, PortError> {
+    let source_ids = ids
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    serde_json::to_string(&source_ids).map_err(|error| PortError::Backend(error.to_string()))
+}
+
+fn rank_to_i64(rank: MemoryRank) -> i64 {
+    match rank {
+        MemoryRank::ShortTerm => 0,
+        MemoryRank::MidTerm => 1,
+        MemoryRank::LongTerm => 2,
+        MemoryRank::Permanent => 3,
+    }
+}
+
+fn rank_from_i64(value: i64) -> Result<MemoryRank, PortError> {
+    match value {
+        0 => Ok(MemoryRank::ShortTerm),
+        1 => Ok(MemoryRank::MidTerm),
+        2 => Ok(MemoryRank::LongTerm),
+        3 => Ok(MemoryRank::Permanent),
+        _ => Err(PortError::InvalidData(format!(
+            "invalid memory rank: {value}"
+        ))),
+    }
+}
+
+fn limit_to_i64(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+fn short_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn map_libsql_error(error: libsql::Error) -> PortError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("does not exist") {
+        PortError::NotFound(message)
+    } else if lower.contains("invalid") || lower.contains("constraint") {
+        PortError::InvalidInput(message)
+    } else {
+        PortError::Backend(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct TestEmbedder {
+        dims: usize,
+    }
+
+    impl TestEmbedder {
+        fn new(dims: usize) -> Arc<Self> {
+            Arc::new(Self { dims })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LanceDbEmbedder for TestEmbedder {
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
+            let mut out = vec![0.001; self.dims];
+            for token in text.split_whitespace() {
+                match token {
+                    "alpha" => out[0] += 1.0,
+                    "beta" if self.dims > 1 => out[1] += 1.0,
+                    "gamma" if self.dims > 2 => out[2] += 1.0,
+                    _ => {
+                        let index = token.bytes().fold(0_usize, |acc, byte| {
+                            acc.wrapping_mul(31).wrapping_add(byte as usize)
+                        }) % self.dims;
+                        out[index] += 0.25;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrongDimEmbedder;
+
+    #[async_trait(?Send)]
+    impl LanceDbEmbedder for WrongDimEmbedder {
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, PortError> {
+            Ok(vec![1.0, 0.0])
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_creates_schema() {
+        let store = store_for_profile(test_db_path(), profile("a", "v1", 3)).await;
+
+        let profiles = count_rows(&store, PROFILE_REGISTRY_TABLE).await;
+        let memories = count_rows(&store, DEFAULT_MEMORY_TABLE).await;
+
+        assert_eq!(profiles, 1);
+        assert_eq!(memories, 0);
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_dimension_mismatch() {
+        let result = LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(test_db_path(), 2),
+            TestEmbedder::new(3),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PortError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_roundtrips_content_and_rank() {
+        let store = store().await;
+        let id = store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha beta"),
+                rank: MemoryRank::LongTerm,
+            })
+            .await
+            .unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.index, id);
+        assert_eq!(got.content.as_str(), "alpha beta");
+        assert_eq!(got.rank, MemoryRank::LongTerm);
+    }
+
+    #[tokio::test]
+    async fn put_inserts_replaces_and_revives() {
+        let store = store().await;
+        let id = MemoryIndex::new("replica-1");
+        store
+            .put(IndexedMemory {
+                index: id.clone(),
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+        store.delete(&id).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_none());
+
+        store
+            .put(IndexedMemory {
+                index: id.clone(),
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::Permanent,
+            })
+            .await
+            .unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.content.as_str(), "beta");
+        assert_eq!(got.rank, MemoryRank::Permanent);
+    }
+
+    #[tokio::test]
+    async fn search_uses_cosine_order_limit_and_rank_filter() {
+        let store = store().await;
+        let alpha = store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+        let beta = store
+            .insert(NewMemory {
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::LongTerm,
+            })
+            .await
+            .unwrap();
+        store
+            .insert(NewMemory {
+                content: MemoryContent::new("gamma"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&MemoryQuery {
+                text: "alpha".into(),
+                limit: 1,
+                filter_rank: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].index, alpha);
+
+        let filtered = store
+            .search(&MemoryQuery {
+                text: "alpha".into(),
+                limit: 10,
+                filter_rank: Some(MemoryRank::LongTerm),
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].index, beta);
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_for_zero_limit() {
+        let store = store().await;
+        store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&MemoryQuery {
+                text: "alpha".into(),
+                limit: 0,
+                filter_rank: None,
+            })
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_hides_rows_and_is_idempotent() {
+        let store = store().await;
+        let id = store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        store.delete(&id).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        assert!(store.get(&id).await.unwrap().is_none());
+        let hits = store
+            .search(&MemoryQuery {
+                text: "alpha".into(),
+                limit: 10,
+                filter_rank: None,
+            })
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_inserts_merged_row_preserves_sources_and_hides_sources() {
+        let store = store().await;
+        let first = store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+        let second = store
+            .insert(NewMemory {
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let merged = store
+            .compact(
+                NewMemory {
+                    content: MemoryContent::new("alpha beta"),
+                    rank: MemoryRank::LongTerm,
+                },
+                &[first.clone(), second.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.get(&first).await.unwrap().is_none());
+        assert!(store.get(&second).await.unwrap().is_none());
+        let got = store.get(&merged).await.unwrap().unwrap();
+        assert_eq!(got.content.as_str(), "alpha beta");
+        assert_eq!(got.rank, MemoryRank::LongTerm);
+
+        let parsed = source_ids_for(&store, &merged).await;
+        assert_eq!(parsed, vec![first.to_string(), second.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn put_compacted_mirrors_replica_flow() {
+        let store = store().await;
+        let first = MemoryIndex::new("first");
+        let second = MemoryIndex::new("second");
+        store
+            .put(IndexedMemory {
+                index: first.clone(),
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                index: second.clone(),
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let merged = MemoryIndex::new("merged");
+        store
+            .put_compacted(
+                IndexedMemory {
+                    index: merged.clone(),
+                    content: MemoryContent::new("alpha beta"),
+                    rank: MemoryRank::LongTerm,
+                },
+                &[first.clone(), second.clone()],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.get(&first).await.unwrap().is_none());
+        assert!(store.get(&second).await.unwrap().is_none());
+        assert_eq!(
+            store.get(&merged).await.unwrap().unwrap().content.as_str(),
+            "alpha beta"
+        );
+
+        let parsed = source_ids_for(&store, &merged).await;
+        assert_eq!(parsed, vec![first.to_string(), second.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn wrong_embedding_dimensions_are_rejected_on_write() {
+        let store = LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(test_db_path(), 3),
+            Arc::new(WrongDimEmbedder),
+        )
+        .await
+        .unwrap();
+
+        let error = store
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, PortError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn same_memory_can_hold_multiple_profiles_with_different_dimensions() {
+        let path = test_db_path();
+        let profile_a = profile("test", "a", 3);
+        let profile_b = profile("test", "b", 2);
+        let store_a = store_for_profile(path.clone(), profile_a).await;
+        let id = store_a
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let store_b = store_for_profile(path, profile_b).await;
+        assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
+
+        assert_eq!(
+            count_rows(&store_a, store_a.embedding_table_name()).await,
+            1
+        );
+        assert_eq!(
+            count_rows(&store_b, store_b.embedding_table_name()).await,
+            1
+        );
+        assert!(store_b.get(&id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn search_uses_only_active_profile_embeddings() {
+        let path = test_db_path();
+        let store_a = store_for_profile(path.clone(), profile("test", "a", 3)).await;
+        let alpha = store_a
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let store_b = store_for_profile(path, profile("test", "b", 2)).await;
+        store_b
+            .put(IndexedMemory {
+                index: MemoryIndex::new("beta-only-b"),
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let hits_a = store_a
+            .search(&MemoryQuery {
+                text: "beta".into(),
+                limit: 10,
+                filter_rank: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits_a.len(), 1);
+        assert_eq!(hits_a[0].index, alpha);
+
+        let hits_b = store_b
+            .search(&MemoryQuery {
+                text: "beta".into(),
+                limit: 10,
+                filter_rank: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits_b.len(), 1);
+        assert_eq!(hits_b[0].index, MemoryIndex::new("beta-only-b"));
+    }
+
+    #[tokio::test]
+    async fn profile_embeddings_become_stale_until_backfilled() {
+        let path = test_db_path();
+        let store_a = store_for_profile(path.clone(), profile("test", "a", 3)).await;
+        let id = store_a
+            .insert(NewMemory {
+                content: MemoryContent::new("alpha"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        let store_b = store_for_profile(path, profile("test", "b", 2)).await;
+        assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
+        assert_eq!(
+            store_b
+                .search(&MemoryQuery {
+                    text: "alpha".into(),
+                    limit: 10,
+                    filter_rank: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store_a
+            .put(IndexedMemory {
+                index: id,
+                content: MemoryContent::new("beta"),
+                rank: MemoryRank::ShortTerm,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store_b
+                .search(&MemoryQuery {
+                    text: "beta".into(),
+                    limit: 10,
+                    filter_rank: None,
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
+        assert_eq!(
+            store_b
+                .search(&MemoryQuery {
+                    text: "beta".into(),
+                    limit: 10,
+                    filter_rank: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_registry_rejects_conflicting_metadata() {
+        let path = test_db_path();
+        let profile = profile("test", "a", 3);
+        let store = store_for_profile(path.clone(), profile.clone()).await;
+        let profile_id = store.profile_id().to_owned();
+
+        store
+            .conn
+            .execute(
+                &format!(
+                    r#"
+                    UPDATE {PROFILE_REGISTRY_TABLE}
+                    SET dimensions = ?2
+                    WHERE profile_id = ?1
+                    "#
+                ),
+                params![profile_id, 99_i64],
+            )
+            .await
+            .unwrap();
+
+        let result = LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(path, profile.dimensions).with_active_profile(profile),
+            TestEmbedder::new(3),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PortError::InvalidData(_))));
+    }
+
+    #[tokio::test]
+    async fn invalid_rank_data_is_reported() {
+        let store = store().await;
+        let id = MemoryIndex::new("bad-rank");
+        store
+            .conn
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {DEFAULT_MEMORY_TABLE} (
+                      memory_index,
+                      content,
+                      rank,
+                      created_at_ms,
+                      updated_at_ms
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#
+                ),
+                params![id.as_str(), "bad", 99_i64, now_ms(), now_ms()],
+            )
+            .await
+            .unwrap();
+
+        let error = store.get(&id).await.unwrap_err();
+        assert!(matches!(error, PortError::InvalidData(_)));
+    }
+
+    async fn store() -> LibsqlMemoryStore {
+        LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(test_db_path(), 3),
+            TestEmbedder::new(3),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn store_for_profile(path: PathBuf, profile: EmbeddingProfile) -> LibsqlMemoryStore {
+        let dims = profile.dimensions;
+        LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(path, dims).with_active_profile(profile),
+            TestEmbedder::new(dims),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn profile(name: &str, version: &str, dimensions: usize) -> EmbeddingProfile {
+        EmbeddingProfile::new(name, version, dimensions)
+    }
+
+    async fn count_rows(store: &LibsqlMemoryStore, table: &str) -> i64 {
+        let mut rows = store
+            .conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    async fn source_ids_for(store: &LibsqlMemoryStore, index: &MemoryIndex) -> Vec<String> {
+        let mut rows = store
+            .conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT source_ids
+                    FROM {DEFAULT_MEMORY_TABLE}
+                    WHERE memory_index = ?1
+                    "#
+                ),
+                [index.as_str()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let source_ids: String = row.get(0).unwrap();
+        serde_json::from_str(&source_ids).unwrap()
+    }
+
+    fn test_db_path() -> PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join("lutum-libsql-adapter-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("memory.db")
+    }
+}

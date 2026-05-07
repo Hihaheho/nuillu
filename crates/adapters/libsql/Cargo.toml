@@ -1,5 +1,5 @@
 [package]
-name = "lutum-local-memory-adapter"
+name = "lutum-libsql-adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,12 +9,16 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+lutum-lancedb-core = { workspace = true }
 nuillu-module = { workspace = true }
 nuillu-types = { workspace = true }
 
 async-trait = { workspace = true }
-regex = { workspace = true }
+chrono = { workspace = true }
+libsql = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-chrono = { workspace = true }

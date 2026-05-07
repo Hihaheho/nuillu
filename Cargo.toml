@@ -8,6 +8,7 @@ members = [
     "crates/adapters/in-memory",
     "crates/adapters/lancedb",
     "crates/adapters/lancedb-core",
+    "crates/adapters/libsql",
     "crates/adapters/local-memory",
     "crates/adapters/model2vec",
     "crates/modules/*",
@@ -40,6 +41,7 @@ arrow-schema = "=57.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 lancedb = "0.27.2"
+libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 model2vec-rs = { version = "0.1.4", default-features = false, features = ["onig"] }
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["derive"] }
@@ -50,7 +52,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["sync", "time", "rt", "macros"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
 eure = "0.1.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -63,6 +65,7 @@ nuillu-agent = { path = "crates/agent" }
 lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-lancedb-adapter = { path = "crates/adapters/lancedb" }
 lutum-lancedb-core = { path = "crates/adapters/lancedb-core" }
+lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-local-memory-adapter = { path = "crates/adapters/local-memory" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 
