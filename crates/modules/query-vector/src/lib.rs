@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
 use nuillu_module::{
-    BlackboardReader, LlmAccess, Memo, Module, PeriodicInbox, QueryInbox, QueryRequest,
-    VectorMemorySearcher,
+    ActivationGate, BlackboardReader, LlmAccess, Memo, Module, PeriodicInbox, QueryInbox,
+    QueryRequest, VectorMemorySearcher,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -69,6 +69,7 @@ pub enum QueryVectorTools {
 pub struct QueryVectorModule {
     query: QueryInbox,
     periodic: PeriodicInbox,
+    gate: ActivationGate,
     blackboard: BlackboardReader,
     memory: VectorMemorySearcher,
     memo: Memo,
@@ -79,6 +80,7 @@ impl QueryVectorModule {
     pub fn new(
         query: QueryInbox,
         periodic: PeriodicInbox,
+        gate: ActivationGate,
         blackboard: BlackboardReader,
         memory: VectorMemorySearcher,
         memo: Memo,
@@ -87,6 +89,7 @@ impl QueryVectorModule {
         Self {
             query,
             periodic,
+            gate,
             blackboard,
             memory,
             memo,

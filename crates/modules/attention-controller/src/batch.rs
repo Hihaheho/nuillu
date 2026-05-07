@@ -17,8 +17,13 @@ impl AttentionControllerModule {
 
             let _ = updates.take_ready_items()?;
             let _ = periodic.take_ready_ticks()?;
+            self.gate.block().await;
+            let _ = updates.take_ready_items()?;
+            let _ = periodic.take_ready_ticks()?;
         } else {
             let _ = updates.next_item().await?;
+            let _ = updates.take_ready_items()?;
+            self.gate.block().await;
             let _ = updates.take_ready_items()?;
         }
 

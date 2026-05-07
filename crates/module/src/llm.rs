@@ -1,6 +1,6 @@
 use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
-use nuillu_types::ModuleId;
+use nuillu_types::ModuleInstanceId;
 
 use crate::LutumTiers;
 
@@ -18,22 +18,18 @@ use crate::LutumTiers;
 /// module's own concern.
 #[derive(Clone)]
 pub struct LlmAccess {
-    owner: ModuleId,
+    owner: ModuleInstanceId,
     tiers: LutumTiers,
     blackboard: Blackboard,
 }
 
 impl LlmAccess {
-    pub(crate) fn new(owner: ModuleId, tiers: LutumTiers, blackboard: Blackboard) -> Self {
+    pub(crate) fn new(owner: ModuleInstanceId, tiers: LutumTiers, blackboard: Blackboard) -> Self {
         Self {
             owner,
             tiers,
             blackboard,
         }
-    }
-
-    pub fn owner(&self) -> &ModuleId {
-        &self.owner
     }
 
     /// The [`Lutum`] for the owner module's currently allocated tier.
@@ -43,7 +39,7 @@ impl LlmAccess {
     pub async fn lutum(&self) -> Lutum {
         let cfg = self
             .blackboard
-            .read(|bb| bb.allocation().for_module(&self.owner))
+            .read(|bb| bb.allocation().for_module(&self.owner.module))
             .await;
         self.tiers.pick(cfg.tier)
     }

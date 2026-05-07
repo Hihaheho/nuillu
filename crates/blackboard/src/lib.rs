@@ -22,7 +22,9 @@ mod memory;
 mod state;
 
 pub use allocation::{ModuleConfig, ResourceAllocation};
-pub use attention_stream::{AttentionStream, AttentionStreamEvent};
+pub use attention_stream::{
+    AttentionStream, AttentionStreamEvent, AttentionStreamRecord, AttentionStreamSet,
+};
 pub use command::BlackboardCommand;
 pub use memory::{MemoryMetaPatch, MemoryMetadata};
 pub use state::{Blackboard, BlackboardInner};

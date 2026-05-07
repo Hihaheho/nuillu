@@ -14,6 +14,7 @@
 //! - LLM tier is read from allocation per-call inside [`LlmAccess`];
 //!   modules don't pick tiers themselves.
 
+mod activation;
 mod allocation_writer;
 mod attention;
 mod channels;
@@ -25,9 +26,11 @@ mod periodic;
 pub mod ports;
 mod readers;
 mod tiers;
+mod time_division;
 mod r#trait;
 mod utterance;
 
+pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;
 pub use channels::{
@@ -36,7 +39,9 @@ pub use channels::{
     QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox, SelfModelMailbox, SelfModelRequest,
     SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
-pub use factory::CapabilityFactory;
+pub use factory::{
+    CapabilityFactory, ModuleCapabilityFactory, ModuleRegistry, ModuleRegistryError,
+};
 pub use llm::LlmAccess;
 pub use memo::Memo;
 pub use memory_caps::{
@@ -45,5 +50,6 @@ pub use memory_caps::{
 pub use periodic::{PeriodicActivation, PeriodicInbox, PeriodicRecvError, PeriodicTick};
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
 pub use tiers::LutumTiers;
+pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::Module;
 pub use utterance::UtteranceWriter;

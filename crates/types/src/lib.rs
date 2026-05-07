@@ -11,7 +11,10 @@ mod memory;
 mod model;
 mod scalars;
 
-pub use ids::{ModuleId, ModuleIdParseError, builtin};
+pub use ids::{
+    ModuleId, ModuleIdParseError, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError,
+    ReplicaIndex, builtin,
+};
 pub use memory::{MemoryContent, MemoryIndex, MemoryRank};
 pub use model::{ModelTier, TokenBudget};
 pub use scalars::{UnitF32, UnitF32Error};

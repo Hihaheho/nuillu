@@ -109,7 +109,7 @@ The builder receives `ModuleCapabilityFactory`, a replica-scoped view over the r
 
 Root/shared capabilities such as `BlackboardReader`, `AttentionReader`, memory search/write ports, file search, `Clock`, and `TimeDivision` may still be issued through the scoped factory. Owner-stamped capabilities such as `Memo`, `LlmAccess`, `PeriodicInbox`, typed inboxes/mailboxes, `AttentionWriter`, and `UtteranceWriter` always stamp the hidden instance.
 
-Replica identity is visible in runtime state and diagnostics, not in ordinary module code. Singleton views preserve the current shape: if a module has exactly one relevant replica, prompt serialization and observations should not label it as `replica 0`.
+Replica identity is visible in runtime state and diagnostics, not in ordinary module code. Compact views preserve the current shape: if a module has exactly one relevant replica, prompt serialization and observations should not label it as `replica 0`.
 
 ### Resource allocation and proposals
 
@@ -132,7 +132,7 @@ pub struct ResourceAllocation {
 
 Attention-controller replicas do not directly replace the effective allocation. `AllocationWriter` records the holder's proposal. The runtime computes effective allocation from active controller proposals:
 
-- `replicas`: rounded arithmetic mean, then `clamp(cap_range.min, cap_range.max)`.
+- `replicas`: clamp each controller proposal to `cap_range.min..=cap_range.max`, then take the rounded arithmetic mean. The final effective value is clamped again at the trust boundary.
 - `tier`: ordinal mean over `Cheap < Default < Premium`, rounded to nearest tier, then mapped back to `ModelTier`.
 - `period`: if `None` is the majority, use `None`; otherwise average positive periods and round to milliseconds.
 - `context_budget`: rounded arithmetic mean.
@@ -241,7 +241,7 @@ pub struct UtteranceDelta {
 - `emit(text)` — stamps `emitted_at`, owner, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
 - `emit_delta(generation_id, sequence, delta)` — sends a `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
 
-`UtteranceDelta` carries no durability semantics. When generation is interrupted (attention-stream update or LLM retry), `generation_id` is incremented and `sequence` resets to 0. Sinks use the `generation_id` change to detect abandonment and discard their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
+`UtteranceDelta` carries no durability semantics. When generation is interrupted (attention-stream update or LLM retry), speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Sinks append resumed chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
 
 ### Periodic activation
 
@@ -355,7 +355,7 @@ All capabilities are non-exclusive: the factories do not enforce uniqueness on a
 | `QueryInbox` / `SelfModelInbox` | yes | subscribe to typed work requests |
 | `Memo` | yes | read/write holder instance's own memo slot |
 | `LlmAccess` | yes | get the current-tier `lutum::Lutum` for the holder's module allocation |
-| `BlackboardReader` | no | read whole blackboard through singleton-compatible grouped views |
+| `BlackboardReader` | no | read whole blackboard through compact grouped views |
 | `AttentionReader` | no | read the attention-stream set only |
 | `AllocationReader` | no | read effective allocation snapshot and, for controller prompts, registry cap metadata |
 | `VectorMemorySearcher` | no | primary-store memory search + access metadata patch |
@@ -621,17 +621,17 @@ fallback-longest-tag = "before_24hour"
 
 @ tags[] {
   tag = "now"
-  range = { sec = 3 }
+  range-sec = 3.0
 }
 
 @ tags[] {
   tag = "last_30sec"
-  range = { sec = 30 }
+  range-sec = 30.0
 }
 
 @ tags[] {
   tag = "last_2min"
-  range = { min = 2.0 }
+  range-sec = 120.0
 }
 ```
 
@@ -640,7 +640,7 @@ Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` in
 `UtteranceSink` is not a query response channel. It is an observable action log for host applications and eval harnesses. It exposes two notification surfaces:
 
 - `on_complete(utterance: Utterance)` — a complete, timestamped utterance. Every compliant sink must implement this.
-- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. When `generation_id` changes between successive deltas, the sink discards its in-progress buffer and starts fresh — this is how interruption (attention-stream update or LLM retry) propagates to the display layer.
+- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. If generation is interrupted by an attention-stream update or LLM retry, speak resumes the same utterance with the same `generation_id` and the next `sequence`; sinks append those resumed chunks to the partial text they already accepted.
 
 Implementations may persist utterances, stream deltas to UI, or both. The `on_complete` call always follows the full `on_delta` sequence for the same `generation_id`, so a UI adapter that consumed deltas can use `on_complete` as a framing signal rather than re-rendering the text.
 

@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::ModuleConfig;
 use nuillu_module::{
-    AllocationReader, AllocationWriter, AttentionReader, AttentionStreamUpdatedInbox, LlmAccess,
-    Memo, Module, PeriodicInbox,
+    ActivationGate, AllocationReader, AllocationWriter, AttentionReader,
+    AttentionStreamUpdatedInbox, LlmAccess, Memo, Module, PeriodicInbox,
 };
 use nuillu_types::{ModelTier, ModuleId, TokenBudget};
 use schemars::JsonSchema;
@@ -27,7 +27,7 @@ pub struct AllocationDecision {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AllocationPatch {
     pub module_id: String,
-    pub enabled: Option<bool>,
+    pub replicas: Option<u8>,
     pub tier: Option<ModelTier>,
     pub period_ms: Option<u64>,
     pub message_only: bool,
@@ -37,6 +37,7 @@ pub struct AllocationPatch {
 pub struct AttentionControllerModule {
     updates: AttentionStreamUpdatedInbox,
     periodic: Option<PeriodicInbox>,
+    gate: ActivationGate,
     attention: AttentionReader,
     allocation_reader: AllocationReader,
     allocation_writer: AllocationWriter,
@@ -48,6 +49,7 @@ impl AttentionControllerModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
         periodic: Option<PeriodicInbox>,
+        gate: ActivationGate,
         attention: AttentionReader,
         allocation_reader: AllocationReader,
         allocation_writer: AllocationWriter,
@@ -57,6 +59,7 @@ impl AttentionControllerModule {
         Self {
             updates,
             periodic,
+            gate,
             attention,
             allocation_reader,
             allocation_writer,
@@ -89,6 +92,7 @@ impl AttentionControllerModule {
             .read(|stream| stream.entries().to_vec())
             .await;
         let current = allocation_reader.snapshot().await;
+        let controller_schema = allocation_reader.controller_schema_json().await;
 
         let lutum = llm.lutum().await;
         let mut session = Session::new(lutum);
@@ -97,6 +101,7 @@ impl AttentionControllerModule {
             serde_json::json!({
                 "attention_stream": attention,
                 "allocation": current,
+                "controller_schema": controller_schema,
             })
             .to_string(),
         );
@@ -118,8 +123,8 @@ impl AttentionControllerModule {
                 continue;
             };
             let mut config: ModuleConfig = next.for_module(&id);
-            if let Some(enabled) = patch.enabled {
-                config.enabled = enabled;
+            if let Some(replicas) = patch.replicas {
+                config.replicas = replicas;
             }
             if let Some(tier) = patch.tier {
                 config.tier = tier;

@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::AttentionStreamEvent;
 use nuillu_module::ports::{AttentionRepository, PortError};
+use nuillu_types::ModuleInstanceId;
 
 #[derive(Debug, Default)]
 pub struct InMemoryAttentionRepository {
-    events: Mutex<Vec<AttentionStreamEvent>>,
+    events: Mutex<Vec<(ModuleInstanceId, AttentionStreamEvent)>>,
 }
 
 impl InMemoryAttentionRepository {
@@ -20,23 +21,31 @@ impl InMemoryAttentionRepository {
 
 #[async_trait(?Send)]
 impl AttentionRepository for InMemoryAttentionRepository {
-    async fn append(&self, event: AttentionStreamEvent) -> Result<(), PortError> {
+    async fn append(
+        &self,
+        stream: ModuleInstanceId,
+        event: AttentionStreamEvent,
+    ) -> Result<(), PortError> {
         self.events
             .lock()
             .map_err(|_| PortError::Backend("attention repository lock poisoned".into()))?
-            .push(event);
+            .push((stream, event));
         Ok(())
     }
 
-    async fn since(&self, from: DateTime<Utc>) -> Result<Vec<AttentionStreamEvent>, PortError> {
+    async fn since(
+        &self,
+        stream: &ModuleInstanceId,
+        from: DateTime<Utc>,
+    ) -> Result<Vec<AttentionStreamEvent>, PortError> {
         let events = self
             .events
             .lock()
             .map_err(|_| PortError::Backend("attention repository lock poisoned".into()))?;
         Ok(events
             .iter()
-            .filter(|event| event.at >= from)
-            .cloned()
+            .filter(|(owner, event)| owner == stream && event.at >= from)
+            .map(|(_, event)| event.clone())
             .collect())
     }
 }
@@ -44,26 +53,34 @@ impl AttentionRepository for InMemoryAttentionRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuillu_types::{ReplicaIndex, builtin};
 
     #[tokio::test]
     async fn attention_repo_filters_by_time() {
         let repo = InMemoryAttentionRepository::new();
+        let stream = ModuleInstanceId::new(builtin::summarize(), ReplicaIndex::ZERO);
         let old = Utc::now();
-        repo.append(AttentionStreamEvent {
-            at: old,
-            text: "old".into(),
-        })
+        repo.append(
+            stream.clone(),
+            AttentionStreamEvent {
+                at: old,
+                text: "old".into(),
+            },
+        )
         .await
         .unwrap();
         let cutoff = Utc::now();
-        repo.append(AttentionStreamEvent {
-            at: cutoff,
-            text: "new".into(),
-        })
+        repo.append(
+            stream.clone(),
+            AttentionStreamEvent {
+                at: cutoff,
+                text: "new".into(),
+            },
+        )
         .await
         .unwrap();
 
-        let events = repo.since(cutoff).await.unwrap();
+        let events = repo.since(&stream, cutoff).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].text, "new");
     }

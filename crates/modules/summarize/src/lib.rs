@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
-use nuillu_module::{AttentionWriter, BlackboardReader, LlmAccess, Memo, Module, PeriodicInbox};
+use nuillu_module::{
+    ActivationGate, AttentionWriter, BlackboardReader, LlmAccess, Memo, Module, PeriodicInbox,
+    TimeDivision,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +12,9 @@ mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the summarize module.
 Read the non-cognitive blackboard snapshot and decide whether anything should enter the
-cognitive attention stream. Append only concise, novel, currently relevant events."#;
+cognitive attention stream. Append only concise, novel, currently relevant events.
+When promoting sensory memo content, convert detailed observation ages to one of the provided
+time-division tags before writing attention text."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SummaryDecision {
@@ -20,25 +25,31 @@ pub struct SummaryDecision {
 
 pub struct SummarizeModule {
     periodic: PeriodicInbox,
+    gate: ActivationGate,
     blackboard: BlackboardReader,
     attention: AttentionWriter,
     memo: Memo,
+    time_division: TimeDivision,
     llm: LlmAccess,
 }
 
 impl SummarizeModule {
     pub fn new(
         periodic: PeriodicInbox,
+        gate: ActivationGate,
         blackboard: BlackboardReader,
         attention: AttentionWriter,
         memo: Memo,
+        time_division: TimeDivision,
         llm: LlmAccess,
     ) -> Self {
         Self {
             periodic,
+            gate,
             blackboard,
             attention,
             memo,
+            time_division,
             llm,
         }
     }
@@ -52,6 +63,7 @@ impl SummarizeModule {
                     "memos": bb.memos(),
                     "attention_stream": bb.attention_stream().entries(),
                     "memory_metadata": bb.memory_metadata(),
+                    "time_division": self.time_division.as_prompt_json(),
                 })
             })
             .await;

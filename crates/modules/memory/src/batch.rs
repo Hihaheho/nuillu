@@ -47,6 +47,8 @@ impl MemoryModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
         let mut batch = self.await_first_batch().await?;
         self.collect_ready_events_into_batch(&mut batch)?;
+        self.gate.block().await;
+        self.collect_ready_events_into_batch(&mut batch)?;
         Ok(batch)
     }
 

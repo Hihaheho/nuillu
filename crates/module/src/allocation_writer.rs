@@ -1,4 +1,5 @@
 use nuillu_blackboard::{Blackboard, BlackboardCommand, ResourceAllocation};
+use nuillu_types::ModuleInstanceId;
 
 /// Replace the agent's resource-allocation snapshot.
 ///
@@ -6,17 +7,23 @@ use nuillu_blackboard::{Blackboard, BlackboardCommand, ResourceAllocation};
 /// By boot-time wiring convention only the attention controller receives
 /// this handle, but multiple writers are structurally permitted.
 pub struct AllocationWriter {
+    owner: ModuleInstanceId,
     blackboard: Blackboard,
 }
 
 impl AllocationWriter {
-    pub(crate) fn new(blackboard: Blackboard) -> Self {
-        Self { blackboard }
+    pub(crate) fn new(owner: ModuleInstanceId, blackboard: Blackboard) -> Self {
+        Self { owner, blackboard }
     }
 
+    /// Record this controller replica's proposal. The runtime derives the
+    /// effective allocation from active controller proposals.
     pub async fn set(&self, allocation: ResourceAllocation) {
         self.blackboard
-            .apply(BlackboardCommand::SetAllocation(allocation))
+            .apply(BlackboardCommand::RecordAllocationProposal {
+                controller: self.owner.clone(),
+                proposal: allocation,
+            })
             .await;
     }
 }

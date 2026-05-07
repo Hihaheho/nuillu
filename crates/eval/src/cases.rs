@@ -83,6 +83,7 @@ impl Default for EvalCaseFile {
 pub enum CaseTarget {
     Query,
     SelfModel,
+    Conversation,
     Periodic,
     Custom,
 }

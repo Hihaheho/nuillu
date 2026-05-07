@@ -1,6 +1,9 @@
 //! Foundation integration test: trivial modules driven by their own
 //! inbox loops, verifying the capability layer end-to-end.
 
+use std::cell::RefCell;
+use std::ops::RangeInclusive;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +20,9 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::MemoryModule;
 use nuillu_module::{
-    CapabilityFactory, LutumTiers, Memo, MemoryImportance, MemoryRequest, Module, PeriodicInbox,
-    QueryInbox, QueryMailbox, QueryRequest, SelfModelRequest,
+    CapabilityFactory, LutumTiers, Memo, MemoryImportance, MemoryRequest, Module,
+    ModuleCapabilityFactory, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest,
+    SelfModelRequest,
     ports::{
         AttentionRepository, FileSearchHit, FileSearchProvider, FileSearchQuery, IndexedMemory,
         MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError, SystemClock, Utterance,
@@ -27,7 +31,9 @@ use nuillu_module::{
 };
 use nuillu_predict::PredictModule;
 use nuillu_surprise::SurpriseModule;
-use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank, ModelTier, ModuleId, builtin};
+use nuillu_types::{
+    MemoryContent, MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, builtin,
+};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::LocalSet;
 
@@ -79,7 +85,8 @@ impl Module for TickerModule {
             self.memo.write(format!("sent {counter} pings")).await;
             let _ = self
                 .query_mailbox
-                .publish(QueryRequest::new(format!("ping {counter}")));
+                .publish(QueryRequest::new(format!("ping {counter}")))
+                .await;
             if counter >= self.target_ticks
                 && let Some(tx) = self.on_done.take()
             {
@@ -167,6 +174,50 @@ impl Module for BatchingPeriodicCounter {
     }
 }
 
+struct CapturedCapsModule;
+
+#[async_trait(?Send)]
+impl Module for CapturedCapsModule {
+    async fn run(&mut self) {}
+}
+
+fn capture_caps(
+    registry: &mut ModuleRegistry,
+    module: ModuleId,
+    cap_range: RangeInclusive<u8>,
+) -> Rc<RefCell<Vec<ModuleCapabilityFactory>>> {
+    let captured = Rc::new(RefCell::new(Vec::new()));
+    let captured_for_builder = Rc::clone(&captured);
+    registry
+        .register(module, cap_range, move |caps| {
+            captured_for_builder.borrow_mut().push(caps);
+            Box::new(CapturedCapsModule)
+        })
+        .unwrap();
+    captured
+}
+
+async fn module_caps(
+    factory: &CapabilityFactory,
+    module: ModuleId,
+    cap_range: RangeInclusive<u8>,
+) -> Vec<ModuleCapabilityFactory> {
+    let mut registry = ModuleRegistry::new();
+    let captured = capture_caps(&mut registry, module, cap_range);
+    let _modules = registry.build(factory).await.unwrap();
+    std::mem::take(&mut *captured.borrow_mut())
+}
+
+async fn module_cap(
+    factory: &CapabilityFactory,
+    module: ModuleId,
+    cap_range: RangeInclusive<u8>,
+) -> ModuleCapabilityFactory {
+    let mut caps = module_caps(factory, module, cap_range).await;
+    assert_eq!(caps.len(), 1);
+    caps.pop().unwrap()
+}
+
 // ---------- tests ----------
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
@@ -178,7 +229,7 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
             alloc.set(
                 ticker_id(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: Some(Duration::from_millis(20)),
                     ..Default::default()
@@ -187,7 +238,7 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
             alloc.set(
                 echo_id(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: None,
                     ..Default::default()
@@ -199,19 +250,18 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
 
             let (done_tx, done_rx) = oneshot::channel();
+            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+            let echo_caps = module_cap(&factory, echo_id(), 0..=1).await;
 
             let modules: Vec<Box<dyn Module>> = vec![
                 Box::new(TickerModule::new(
-                    factory.periodic_inbox_for(ticker_id()),
-                    factory.memo(ticker_id()),
-                    factory.query_mailbox(ticker_id()),
+                    ticker_caps.periodic_inbox(),
+                    ticker_caps.memo(),
+                    ticker_caps.query_mailbox(),
                     3,
                     done_tx,
                 )),
-                Box::new(EchoModule::new(
-                    factory.query_inbox_for(echo_id()),
-                    factory.memo(echo_id()),
-                )),
+                Box::new(EchoModule::new(echo_caps.query_inbox(), echo_caps.memo())),
             ];
 
             run(modules, async move {
@@ -259,7 +309,7 @@ async fn attention_writer_capability_appends_to_stream() {
             alloc.set(
                 builtin::summarize(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: Some(Duration::from_millis(15)),
                     ..Default::default()
@@ -271,9 +321,10 @@ async fn attention_writer_capability_appends_to_stream() {
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
 
             let fired = Arc::new(Mutex::new(false));
+            let summarize_caps = module_cap(&factory, builtin::summarize(), 0..=1).await;
             let summarize = SummarizeStub {
-                periodic: factory.periodic_inbox_for(builtin::summarize()),
-                writer: factory.attention_writer(builtin::summarize()),
+                periodic: summarize_caps.periodic_inbox(),
+                writer: summarize_caps.attention_writer(),
                 fired: fired.clone(),
             };
 
@@ -307,7 +358,7 @@ async fn periodic_tick_accumulates_until_period() {
     local
         .run_until(async {
             let (blackboard, modules, count, mut event_loop) =
-                periodic_counter_setup(Duration::from_millis(10), true);
+                periodic_counter_setup(Duration::from_millis(10), true).await;
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(6)).await;
@@ -332,7 +383,7 @@ async fn periodic_tick_emits_at_most_once_and_carries_remainder() {
     local
         .run_until(async {
             let (_blackboard, modules, count, mut event_loop) =
-                periodic_counter_setup(Duration::from_millis(10), true);
+                periodic_counter_setup(Duration::from_millis(10), true).await;
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(25)).await;
@@ -358,7 +409,7 @@ async fn ready_periodic_ticks_can_be_collapsed_by_module_prelude() {
             alloc.set(
                 ticker_id(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: Some(Duration::from_millis(10)),
                     ..Default::default()
@@ -369,8 +420,9 @@ async fn ready_periodic_ticks_can_be_collapsed_by_module_prelude() {
             let factory = test_factory(blackboard);
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
             let count = Arc::new(Mutex::new(0));
+            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
             let modules: Vec<Box<dyn Module>> = vec![Box::new(BatchingPeriodicCounter {
-                periodic: factory.periodic_inbox_for(ticker_id()),
+                periodic: ticker_caps.periodic_inbox(),
                 count: count.clone(),
             })];
 
@@ -393,7 +445,7 @@ async fn periodic_tick_clears_elapsed_while_disabled() {
     local
         .run_until(async {
             let (blackboard, modules, count, mut event_loop) =
-                periodic_counter_setup(Duration::from_millis(10), false);
+                periodic_counter_setup(Duration::from_millis(10), false).await;
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(50)).await;
@@ -421,7 +473,7 @@ async fn periodic_tick_uses_latest_allocation_period() {
     local
         .run_until(async {
             let (blackboard, modules, count, mut event_loop) =
-                periodic_counter_setup(Duration::from_millis(20), true);
+                periodic_counter_setup(Duration::from_millis(20), true).await;
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(15)).await;
@@ -448,7 +500,7 @@ async fn periodic_tick_only_targets_modules_with_periodic_inbox() {
             alloc.set(
                 ticker_id(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: Some(Duration::from_millis(10)),
                     ..Default::default()
@@ -457,7 +509,7 @@ async fn periodic_tick_only_targets_modules_with_periodic_inbox() {
             alloc.set(
                 echo_id(),
                 ModuleConfig {
-                    enabled: true,
+                    replicas: 1,
                     tier: ModelTier::Default,
                     period: Some(Duration::from_millis(10)),
                     ..Default::default()
@@ -468,8 +520,9 @@ async fn periodic_tick_only_targets_modules_with_periodic_inbox() {
             let factory = test_factory(blackboard);
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
             let count = Arc::new(Mutex::new(0));
+            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
             let modules: Vec<Box<dyn Module>> = vec![Box::new(PeriodicCounter {
-                periodic: factory.periodic_inbox_for(ticker_id()),
+                periodic: ticker_caps.periodic_inbox(),
                 count: count.clone(),
             })];
 
@@ -491,10 +544,13 @@ async fn capabilities_are_non_exclusive() {
         .run_until(async {
             let blackboard = Blackboard::default();
             let factory = test_factory(blackboard);
-            let _w1 = factory.attention_writer(builtin::summarize());
-            let _w2 = factory.attention_writer(builtin::summarize());
-            let _a1 = factory.allocation_writer();
-            let _a2 = factory.allocation_writer();
+            let summarize_caps = module_cap(&factory, builtin::summarize(), 0..=1).await;
+            let controller_caps =
+                module_cap(&factory, builtin::attention_controller(), 0..=1).await;
+            let _w1 = summarize_caps.attention_writer();
+            let _w2 = summarize_caps.attention_writer();
+            let _a1 = controller_caps.allocation_writer();
+            let _a2 = controller_caps.allocation_writer();
         })
         .await;
 }
@@ -502,12 +558,16 @@ async fn capabilities_are_non_exclusive() {
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
     let factory = test_factory(Blackboard::default());
-    let publisher = factory.query_mailbox(ticker_id());
-    let mut vector = factory.query_inbox_for(builtin::query_vector());
-    let mut agentic = factory.query_inbox_for(builtin::query_agentic());
+    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+    let vector_caps = module_cap(&factory, builtin::query_vector(), 0..=1).await;
+    let agentic_caps = module_cap(&factory, builtin::query_agentic(), 0..=1).await;
+    let publisher = publisher_caps.query_mailbox();
+    let mut vector = vector_caps.query_inbox();
+    let mut agentic = agentic_caps.query_inbox();
 
     publisher
         .publish(QueryRequest::new("find memories about rust"))
+        .await
         .expect("query topic should have subscribers");
 
     let vector_env = vector
@@ -519,8 +579,8 @@ async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
         .await
         .expect("agentic subscriber receives query");
 
-    assert_eq!(vector_env.sender, ticker_id());
-    assert_eq!(agentic_env.sender, ticker_id());
+    assert_eq!(vector_env.sender, agentic_env.sender);
+    assert_eq!(vector_env.sender.module, ticker_id());
     assert_eq!(vector_env.body.question, "find memories about rust");
     assert_eq!(agentic_env.body.question, "find memories about rust");
 }
@@ -528,16 +588,22 @@ async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn self_model_mailbox_is_a_separate_typed_topic() {
     let factory = test_factory(Blackboard::default());
-    let query_publisher = factory.query_mailbox(ticker_id());
-    let self_publisher = factory.self_model_mailbox(echo_id());
-    let mut query_inbox = factory.query_inbox_for(builtin::query_vector());
-    let mut self_inbox = factory.self_model_inbox_for(builtin::attention_schema());
+    let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+    let echo_caps = module_cap(&factory, echo_id(), 0..=1).await;
+    let query_caps = module_cap(&factory, builtin::query_vector(), 0..=1).await;
+    let schema_caps = module_cap(&factory, builtin::attention_schema(), 0..=1).await;
+    let query_publisher = ticker_caps.query_mailbox();
+    let self_publisher = echo_caps.self_model_mailbox();
+    let mut query_inbox = query_caps.query_inbox();
+    let mut self_inbox = schema_caps.self_model_inbox();
 
     query_publisher
         .publish(QueryRequest::new("memory only"))
+        .await
         .expect("query subscriber exists");
     self_publisher
         .publish(SelfModelRequest::new("what are you aware of?"))
+        .await
         .expect("self-model subscriber exists");
 
     assert_eq!(
@@ -555,8 +621,10 @@ async fn self_model_mailbox_is_a_separate_typed_topic() {
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn memory_request_mailbox_fans_out_with_owner_stamp() {
     let factory = test_factory(Blackboard::default());
-    let publisher = factory.memory_request_mailbox(builtin::surprise());
-    let mut memory = factory.memory_request_inbox_for(builtin::memory());
+    let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
+    let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+    let publisher = surprise_caps.memory_request_mailbox();
+    let mut memory = memory_caps.memory_request_inbox();
 
     publisher
         .publish(MemoryRequest {
@@ -564,6 +632,7 @@ async fn memory_request_mailbox_fans_out_with_owner_stamp() {
             importance: MemoryImportance::High,
             reason: "prediction diverged".into(),
         })
+        .await
         .expect("memory request subscriber exists");
 
     let envelope = memory
@@ -571,10 +640,152 @@ async fn memory_request_mailbox_fans_out_with_owner_stamp() {
         .await
         .expect("memory request subscriber receives request");
 
-    assert_eq!(envelope.sender, builtin::surprise());
+    assert_eq!(envelope.sender.module, builtin::surprise());
     assert_eq!(envelope.body.content, "remember unexpected turn");
     assert_eq!(envelope.body.importance, MemoryImportance::High);
     assert_eq!(envelope.body.reason, "prediction diverged");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = false)]
+async fn role_topics_load_balance_across_active_replicas() {
+    let mut alloc = ResourceAllocation::default();
+    alloc.set(
+        builtin::query_vector(),
+        ModuleConfig {
+            replicas: 2,
+            ..Default::default()
+        },
+    );
+    alloc.set(
+        builtin::query_agentic(),
+        ModuleConfig {
+            replicas: 1,
+            ..Default::default()
+        },
+    );
+    let factory = test_factory(Blackboard::with_allocation(alloc));
+    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+    let vector_caps = module_caps(&factory, builtin::query_vector(), 0..=3).await;
+    let agentic_caps = module_caps(&factory, builtin::query_agentic(), 0..=1).await;
+    let publisher = publisher_caps.query_mailbox();
+    let mut vector_0 = vector_caps[0].query_inbox();
+    let mut vector_1 = vector_caps[1].query_inbox();
+    let mut agentic_0 = agentic_caps[0].query_inbox();
+
+    publisher.publish(QueryRequest::new("first")).await.unwrap();
+    publisher
+        .publish(QueryRequest::new("second"))
+        .await
+        .unwrap();
+
+    assert_eq!(vector_0.next_item().await.unwrap().body.question, "first");
+    assert_eq!(vector_1.next_item().await.unwrap().body.question, "second");
+    let agentic = agentic_0
+        .take_ready_items()
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.body.question)
+        .collect::<Vec<_>>();
+    assert_eq!(agentic, vec!["first", "second"]);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = false)]
+async fn role_topics_do_not_route_to_disabled_replicas() {
+    let mut alloc = ResourceAllocation::default();
+    alloc.set(
+        builtin::query_vector(),
+        ModuleConfig {
+            replicas: 1,
+            ..Default::default()
+        },
+    );
+    let factory = test_factory(Blackboard::with_allocation(alloc));
+    let publisher_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+    let vector_caps = module_caps(&factory, builtin::query_vector(), 0..=2).await;
+    let publisher = publisher_caps.query_mailbox();
+    let mut vector_0 = vector_caps[0].query_inbox();
+    let mut vector_1 = vector_caps[1].query_inbox();
+
+    publisher
+        .publish(QueryRequest::new("active only"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        vector_0.next_item().await.unwrap().body.question,
+        "active only"
+    );
+    assert!(vector_1.take_ready_items().unwrap().items.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = false)]
+async fn periodic_activation_targets_active_replicas_only() {
+    let mut alloc = ResourceAllocation::default();
+    alloc.set(
+        ticker_id(),
+        ModuleConfig {
+            replicas: 2,
+            period: Some(Duration::from_millis(10)),
+            ..Default::default()
+        },
+    );
+    let factory = test_factory(Blackboard::with_allocation(alloc));
+    let ticker_caps = module_caps(&factory, ticker_id(), 0..=3).await;
+    let mut replica_0 = ticker_caps[0].periodic_inbox();
+    let mut replica_1 = ticker_caps[1].periodic_inbox();
+    let mut replica_2 = ticker_caps[2].periodic_inbox();
+    let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
+
+    event_loop.tick(Duration::from_millis(10)).await;
+
+    assert_eq!(replica_0.take_ready_ticks().unwrap(), 1);
+    assert_eq!(replica_1.take_ready_ticks().unwrap(), 1);
+    assert_eq!(replica_2.take_ready_ticks().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = false)]
+async fn activation_gate_blocks_until_replica_is_enabled() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mut alloc = ResourceAllocation::default();
+            alloc.set(
+                ticker_id(),
+                ModuleConfig {
+                    replicas: 0,
+                    ..Default::default()
+                },
+            );
+            let blackboard = Blackboard::with_allocation(alloc);
+            let factory = test_factory(blackboard.clone());
+            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
+            let gate = ticker_caps.activation_gate();
+            let passed = Arc::new(Mutex::new(false));
+            let passed_for_task = passed.clone();
+
+            let handle = tokio::task::spawn_local(async move {
+                gate.block().await;
+                *passed_for_task.lock().await = true;
+            });
+
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!*passed.lock().await);
+
+            set_counter_allocation(&blackboard, Duration::from_millis(10), true).await;
+            for _ in 0..10 {
+                if *passed.lock().await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            assert!(*passed.lock().await);
+            handle.await.unwrap();
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = false)]
@@ -722,6 +933,7 @@ async fn vector_memory_searcher_records_access_for_hits_only() {
             index: miss_index.clone(),
             rank_if_new: MemoryRank::MidTerm,
             decay_if_new_secs: 0,
+            now: Utc::now(),
             patch: MemoryMetaPatch::default(),
         })
         .await;
@@ -845,13 +1057,16 @@ async fn memory_request_does_not_insert_without_llm_tool_decision() {
                 Vec::new(),
                 Arc::new(NoopFileSearchProvider),
             );
-            let publisher = factory.memory_request_mailbox(builtin::surprise());
+            let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
+            let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+            let publisher = surprise_caps.memory_request_mailbox();
             let memory = MemoryModule::new(
-                factory.periodic_inbox_for(builtin::memory()),
-                factory.memory_request_inbox_for(builtin::memory()),
-                factory.blackboard_reader(),
-                factory.memory_writer(),
-                factory.llm_access(builtin::memory()),
+                memory_caps.periodic_inbox(),
+                memory_caps.memory_request_inbox(),
+                memory_caps.activation_gate(),
+                memory_caps.blackboard_reader(),
+                memory_caps.memory_writer(),
+                memory_caps.llm_access(),
             );
             let modules: Vec<Box<dyn Module>> = vec![Box::new(memory)];
 
@@ -862,6 +1077,7 @@ async fn memory_request_does_not_insert_without_llm_tool_decision() {
                         importance: MemoryImportance::High,
                         reason: "test request".into(),
                     })
+                    .await
                     .expect("memory module subscribed");
 
                 for _ in 0..10 {
@@ -895,13 +1111,16 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
                 Arc::new(NoopFileSearchProvider),
                 adapter,
             );
-            let publisher = factory.memory_request_mailbox(builtin::surprise());
+            let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
+            let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+            let publisher = surprise_caps.memory_request_mailbox();
             let memory = MemoryModule::new(
-                factory.periodic_inbox_for(builtin::memory()),
-                factory.memory_request_inbox_for(builtin::memory()),
-                factory.blackboard_reader(),
-                factory.memory_writer(),
-                factory.llm_access(builtin::memory()),
+                memory_caps.periodic_inbox(),
+                memory_caps.memory_request_inbox(),
+                memory_caps.activation_gate(),
+                memory_caps.blackboard_reader(),
+                memory_caps.memory_writer(),
+                memory_caps.llm_access(),
             );
             let modules: Vec<Box<dyn Module>> = vec![Box::new(memory)];
 
@@ -912,6 +1131,7 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
                         importance: MemoryImportance::Normal,
                         reason: "first signal".into(),
                     })
+                    .await
                     .expect("memory module subscribed");
                 publisher
                     .publish(MemoryRequest {
@@ -919,6 +1139,7 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
                         importance: MemoryImportance::High,
                         reason: "duplicate signal".into(),
                     })
+                    .await
                     .expect("memory module subscribed");
 
                 for _ in 0..20 {
@@ -940,27 +1161,31 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
 #[tokio::test(flavor = "current_thread", start_paused = false)]
 async fn predict_and_surprise_constructor_shapes_match_capabilities() {
     let factory = test_factory(Blackboard::default());
+    let predict_caps = module_cap(&factory, builtin::predict(), 0..=1).await;
+    let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
 
     let _predict = PredictModule::new(
-        factory.attention_stream_updated_inbox_for(builtin::predict()),
-        factory.periodic_inbox_for(builtin::predict()),
-        factory.attention_reader(),
-        factory.blackboard_reader(),
-        factory.memo(builtin::predict()),
-        factory.llm_access(builtin::predict()),
+        predict_caps.attention_stream_updated_inbox(),
+        predict_caps.periodic_inbox(),
+        predict_caps.activation_gate(),
+        predict_caps.attention_reader(),
+        predict_caps.blackboard_reader(),
+        predict_caps.memo(),
+        predict_caps.llm_access(),
     );
 
     let _surprise = SurpriseModule::new(
-        factory.attention_stream_updated_inbox_for(builtin::surprise()),
-        factory.attention_reader(),
-        factory.blackboard_reader(),
-        factory.memory_request_mailbox(builtin::surprise()),
-        factory.memo(builtin::surprise()),
-        factory.llm_access(builtin::surprise()),
+        surprise_caps.attention_stream_updated_inbox(),
+        surprise_caps.activation_gate(),
+        surprise_caps.attention_reader(),
+        surprise_caps.blackboard_reader(),
+        surprise_caps.memory_request_mailbox(),
+        surprise_caps.memo(),
+        surprise_caps.llm_access(),
     );
 }
 
-fn periodic_counter_setup(
+async fn periodic_counter_setup(
     period: Duration,
     enabled: bool,
 ) -> (
@@ -973,7 +1198,7 @@ fn periodic_counter_setup(
     alloc.set(
         ticker_id(),
         ModuleConfig {
-            enabled,
+            replicas: u8::from(enabled),
             tier: ModelTier::Default,
             period: Some(period),
             ..Default::default()
@@ -984,8 +1209,9 @@ fn periodic_counter_setup(
     let factory = test_factory(blackboard.clone());
     let event_loop = AgentEventLoop::new(factory.periodic_activation());
     let count = Arc::new(Mutex::new(0));
+    let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
     let modules: Vec<Box<dyn Module>> = vec![Box::new(PeriodicCounter {
-        periodic: factory.periodic_inbox_for(ticker_id()),
+        periodic: ticker_caps.periodic_inbox(),
         count: count.clone(),
     })];
 
@@ -997,7 +1223,7 @@ async fn set_counter_allocation(blackboard: &Blackboard, period: Duration, enabl
     alloc.set(
         ticker_id(),
         ModuleConfig {
-            enabled,
+            replicas: u8::from(enabled),
             tier: ModelTier::Default,
             period: Some(period),
             ..Default::default()
@@ -1014,10 +1240,18 @@ struct NoopAttentionRepo;
 
 #[async_trait(?Send)]
 impl AttentionRepository for NoopAttentionRepo {
-    async fn append(&self, _event: AttentionStreamEvent) -> Result<(), PortError> {
+    async fn append(
+        &self,
+        _stream: ModuleInstanceId,
+        _event: AttentionStreamEvent,
+    ) -> Result<(), PortError> {
         Ok(())
     }
-    async fn since(&self, _from: DateTime<Utc>) -> Result<Vec<AttentionStreamEvent>, PortError> {
+    async fn since(
+        &self,
+        _stream: &ModuleInstanceId,
+        _from: DateTime<Utc>,
+    ) -> Result<Vec<AttentionStreamEvent>, PortError> {
         Ok(vec![])
     }
 }
@@ -1195,7 +1429,7 @@ struct NoopUtteranceSink;
 
 #[async_trait(?Send)]
 impl UtteranceSink for NoopUtteranceSink {
-    async fn append(&self, _: Utterance) -> Result<(), PortError> {
+    async fn on_complete(&self, _: Utterance) -> Result<(), PortError> {
         Ok(())
     }
 }

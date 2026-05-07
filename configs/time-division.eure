@@ -1,0 +1,26 @@
+fallback-longest-tag = "before_24hour"
+
+@ tags[] {
+  tag = "now"
+  range-sec = 3.0
+}
+
+@ tags[] {
+  tag = "last_30sec"
+  range-sec = 30.0
+}
+
+@ tags[] {
+  tag = "last_2min"
+  range-sec = 120.0
+}
+
+@ tags[] {
+  tag = "last_1hour"
+  range-sec = 3600.0
+}
+
+@ tags[] {
+  tag = "last_24hour"
+  range-sec = 86400.0
+}

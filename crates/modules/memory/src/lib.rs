@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    BlackboardReader, LlmAccess, MemoryRequest, MemoryRequestInbox, MemoryWriter, Module,
-    PeriodicInbox,
+    ActivationGate, BlackboardReader, LlmAccess, MemoryRequest, MemoryRequestInbox, MemoryWriter,
+    Module, PeriodicInbox,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
@@ -42,6 +42,7 @@ pub enum MemoryTools {
 pub struct MemoryModule {
     periodic: PeriodicInbox,
     requests: MemoryRequestInbox,
+    gate: ActivationGate,
     blackboard: BlackboardReader,
     memory: MemoryWriter,
     llm: LlmAccess,
@@ -51,6 +52,7 @@ impl MemoryModule {
     pub fn new(
         periodic: PeriodicInbox,
         requests: MemoryRequestInbox,
+        gate: ActivationGate,
         blackboard: BlackboardReader,
         memory: MemoryWriter,
         llm: LlmAccess,
@@ -58,6 +60,7 @@ impl MemoryModule {
         Self {
             periodic,
             requests,
+            gate,
             blackboard,
             memory,
             llm,

@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use nuillu_types::{ModelTier, ModuleId, TokenBudget};
+use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, TokenBudget};
 use serde::{Deserialize, Serialize};
 
 /// Per-module knobs the attention controller writes to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModuleConfig {
-    pub enabled: bool,
+    #[serde(default = "default_replicas")]
+    pub replicas: u8,
     pub tier: ModelTier,
     /// Periodic activation period. `None` means message-only — the module
     /// runs only when its inbox receives an envelope.
@@ -19,12 +20,16 @@ pub struct ModuleConfig {
 impl Default for ModuleConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            replicas: default_replicas(),
             tier: ModelTier::default(),
             period: None,
             context_budget: TokenBudget::new(8192),
         }
     }
+}
+
+fn default_replicas() -> u8 {
+    1
 }
 
 /// Snapshot of the resource allocation across all modules.
@@ -38,8 +43,16 @@ impl ResourceAllocation {
         self.per_module.get(id).cloned().unwrap_or_default()
     }
 
-    pub fn is_enabled(&self, id: &ModuleId) -> bool {
-        self.for_module(id).enabled
+    pub fn get(&self, id: &ModuleId) -> Option<&ModuleConfig> {
+        self.per_module.get(id)
+    }
+
+    pub fn active_replicas(&self, id: &ModuleId) -> u8 {
+        self.for_module(id).replicas
+    }
+
+    pub fn is_replica_active(&self, owner: &ModuleInstanceId) -> bool {
+        owner.replica.get() < self.active_replicas(&owner.module)
     }
 
     pub fn set(&mut self, id: ModuleId, config: ModuleConfig) {
@@ -48,6 +61,15 @@ impl ResourceAllocation {
 
     pub fn iter(&self) -> impl Iterator<Item = (&ModuleId, &ModuleConfig)> {
         self.per_module.iter()
+    }
+
+    pub fn clamped(mut self, caps: &HashMap<ModuleId, ReplicaCapRange>) -> Self {
+        for (id, range) in caps {
+            let mut cfg = self.for_module(id);
+            cfg.replicas = range.clamp(cfg.replicas);
+            self.set(id.clone(), cfg);
+        }
+        self
     }
 }
 

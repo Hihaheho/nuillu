@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AttentionReader, LlmAccess, Memo, Module, PeriodicInbox, SelfModelInbox, SelfModelRequest,
+    ActivationGate, AttentionReader, LlmAccess, Memo, Module, PeriodicInbox, SelfModelInbox,
+    SelfModelRequest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ pub struct SelfReportBatch {
 pub struct AttentionSchemaModule {
     self_model: SelfModelInbox,
     periodic: PeriodicInbox,
+    gate: ActivationGate,
     attention: AttentionReader,
     memo: Memo,
     llm: LlmAccess,
@@ -50,6 +52,7 @@ impl AttentionSchemaModule {
     pub fn new(
         self_model: SelfModelInbox,
         periodic: PeriodicInbox,
+        gate: ActivationGate,
         attention: AttentionReader,
         memo: Memo,
         llm: LlmAccess,
@@ -57,6 +60,7 @@ impl AttentionSchemaModule {
         Self {
             self_model,
             periodic,
+            gate,
             attention,
             memo,
             llm,

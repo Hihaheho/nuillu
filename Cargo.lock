@@ -3602,6 +3602,7 @@ dependencies = [
  "chrono",
  "nuillu-blackboard",
  "nuillu-module",
+ "nuillu-types",
  "tokio",
 ]
 
@@ -4100,12 +4101,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "eure",
  "futures",
  "lutum",
  "nuillu-blackboard",
  "nuillu-types",
  "schemars 1.2.1",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -4182,6 +4185,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "lutum",
  "nuillu-module",
  "nuillu-types",

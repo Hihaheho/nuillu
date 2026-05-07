@@ -1,16 +1,18 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use nuillu_types::ModuleId;
+use nuillu_blackboard::Blackboard;
+use nuillu_types::{ModuleId, ModuleInstanceId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Owner-stamped message delivered over a typed topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Envelope<T> {
-    pub sender: ModuleId,
+    pub sender: ModuleInstanceId,
     pub body: T,
 }
 
@@ -25,64 +27,124 @@ pub struct ReadyItems<T> {
     pub items: Vec<Envelope<T>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopicPolicy {
+    Fanout,
+    RoleLoadBalanced,
+}
+
 #[derive(Clone)]
 pub(crate) struct Topic<T: Clone> {
-    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<Envelope<T>>>>>,
+    inner: Arc<Mutex<TopicInner<T>>>,
+    blackboard: Blackboard,
+    policy: TopicPolicy,
 }
 
 impl<T: Clone> Topic<T> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(blackboard: Blackboard, policy: TopicPolicy) -> Self {
         Self {
-            subscribers: Arc::new(Mutex::new(Vec::new())),
+            inner: Arc::new(Mutex::new(TopicInner::default())),
+            blackboard,
+            policy,
         }
     }
 
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<Envelope<T>> {
+    fn subscribe(&self, owner: ModuleInstanceId) -> mpsc::UnboundedReceiver<Envelope<T>> {
         let (sender, receiver) = mpsc::unbounded();
-        self.subscribers
+        self.inner
             .lock()
-            .expect("Topic subscribers poisoned")
-            .push(sender);
+            .expect("Topic inner poisoned")
+            .subscribers
+            .push(TopicSubscriber { owner, sender });
         receiver
     }
 }
 
-/// Publish capability for one typed fanout topic.
+struct TopicInner<T: Clone> {
+    subscribers: Vec<TopicSubscriber<T>>,
+    next_by_role: HashMap<ModuleId, usize>,
+}
+
+impl<T: Clone> Default for TopicInner<T> {
+    fn default() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            next_by_role: HashMap::new(),
+        }
+    }
+}
+
+struct TopicSubscriber<T: Clone> {
+    owner: ModuleInstanceId,
+    sender: mpsc::UnboundedSender<Envelope<T>>,
+}
+
+/// Publish capability for one typed topic.
 #[derive(Clone)]
 pub struct TopicMailbox<T: Clone> {
-    owner: ModuleId,
+    owner: ModuleInstanceId,
     topic: Topic<T>,
 }
 
 impl<T: Clone> TopicMailbox<T> {
-    pub(crate) fn new(owner: ModuleId, topic: Topic<T>) -> Self {
+    pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
         Self { owner, topic }
     }
 
-    pub fn owner(&self) -> &ModuleId {
-        &self.owner
-    }
-
-    pub fn publish(&self, body: T) -> Result<usize, Envelope<T>> {
+    pub async fn publish(&self, body: T) -> Result<usize, Envelope<T>> {
         let envelope = Envelope {
             sender: self.owner.clone(),
             body,
         };
-        let mut delivered = 0;
-        let mut subscribers = self
+        let allocation = self
             .topic
-            .subscribers
-            .lock()
-            .expect("Topic subscribers poisoned");
+            .blackboard
+            .read(|bb| bb.allocation().clone())
+            .await;
+        let mut delivered = 0;
+        let mut inner = self.topic.inner.lock().expect("Topic inner poisoned");
 
-        subscribers.retain(|subscriber| {
-            if subscriber.unbounded_send(envelope.clone()).is_ok() {
-                delivered += 1;
-                true
-            } else {
-                false
+        inner
+            .subscribers
+            .retain(|subscriber| !subscriber.sender.is_closed());
+
+        match self.topic.policy {
+            TopicPolicy::Fanout => {
+                for subscriber in inner
+                    .subscribers
+                    .iter()
+                    .filter(|subscriber| allocation.is_replica_active(&subscriber.owner))
+                {
+                    if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
+                        delivered += 1;
+                    }
+                }
             }
-        });
+            TopicPolicy::RoleLoadBalanced => {
+                let mut by_role = HashMap::<ModuleId, Vec<usize>>::new();
+                for (idx, subscriber) in inner.subscribers.iter().enumerate() {
+                    if allocation.is_replica_active(&subscriber.owner) {
+                        by_role
+                            .entry(subscriber.owner.module.clone())
+                            .or_default()
+                            .push(idx);
+                    }
+                }
+
+                for (role, indexes) in by_role {
+                    let next = inner.next_by_role.entry(role).or_default();
+                    let chosen = indexes[*next % indexes.len()];
+                    *next = next.wrapping_add(1);
+                    if inner.subscribers[chosen]
+                        .sender
+                        .unbounded_send(envelope.clone())
+                        .is_ok()
+                    {
+                        delivered += 1;
+                    }
+                }
+            }
+        }
 
         if delivered == 0 {
             Err(envelope)
@@ -92,22 +154,16 @@ impl<T: Clone> TopicMailbox<T> {
     }
 }
 
-/// Subscribe capability for one typed fanout topic.
+/// Subscribe capability for one typed topic.
 pub struct TopicInbox<T: Clone> {
-    owner: ModuleId,
     receiver: mpsc::UnboundedReceiver<Envelope<T>>,
 }
 
 impl<T: Clone> TopicInbox<T> {
-    pub(crate) fn new(owner: ModuleId, topic: Topic<T>) -> Self {
+    pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
         Self {
-            owner,
-            receiver: topic.subscribe(),
+            receiver: topic.subscribe(owner.clone()),
         }
-    }
-
-    pub fn owner(&self) -> &ModuleId {
-        &self.owner
     }
 
     pub async fn next_item(&mut self) -> Result<Envelope<T>, TopicRecvError> {
@@ -165,8 +221,10 @@ pub struct MemoryRequest {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AttentionStreamUpdated;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AttentionStreamUpdated {
+    pub stream: ModuleInstanceId,
+}
 
 pub type QueryMailbox = TopicMailbox<QueryRequest>;
 pub type QueryInbox = TopicInbox<QueryRequest>;

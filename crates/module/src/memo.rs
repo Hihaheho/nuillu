@@ -1,5 +1,5 @@
 use nuillu_blackboard::{Blackboard, BlackboardCommand};
-use nuillu_types::ModuleId;
+use nuillu_types::ModuleInstanceId;
 
 /// Read-write handle for the activating module's own memo slot.
 ///
@@ -10,24 +10,20 @@ use nuillu_types::ModuleId;
 /// `Memo::write` ever inserts one).
 #[derive(Clone)]
 pub struct Memo {
-    owner: ModuleId,
+    owner: ModuleInstanceId,
     blackboard: Blackboard,
 }
 
 impl Memo {
-    pub(crate) fn new(owner: ModuleId, blackboard: Blackboard) -> Self {
+    pub(crate) fn new(owner: ModuleInstanceId, blackboard: Blackboard) -> Self {
         Self { owner, blackboard }
-    }
-
-    pub fn owner(&self) -> &ModuleId {
-        &self.owner
     }
 
     /// Replace the owner module's memo. Allocates the slot on first call.
     pub async fn write(&self, memo: impl Into<String>) {
         self.blackboard
             .apply(BlackboardCommand::UpdateMemo {
-                module: self.owner.clone(),
+                owner: self.owner.clone(),
                 memo: memo.into(),
             })
             .await;
@@ -36,6 +32,6 @@ impl Memo {
     /// Read the owner module's own memo, or `None` if it has never been
     /// written.
     pub async fn read(&self) -> Option<String> {
-        self.blackboard.memo(&self.owner).await
+        self.blackboard.memo_for_instance(&self.owner).await
     }
 }

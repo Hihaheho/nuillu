@@ -19,20 +19,24 @@ pub struct MemoryMetadata {
 }
 
 impl MemoryMetadata {
-    pub fn new(index: MemoryIndex, rank: MemoryRank, decay_remaining_secs: i64) -> Self {
+    pub fn new_at(
+        index: MemoryIndex,
+        rank: MemoryRank,
+        decay_remaining_secs: i64,
+        now: DateTime<Utc>,
+    ) -> Self {
         Self {
             index,
             rank,
             decay_remaining_secs,
             remember_tokens: 0,
-            last_accessed: Utc::now(),
+            last_accessed: now,
             access_count: 0,
             query_history: VecDeque::new(),
         }
     }
 
-    pub fn record_access(&mut self) {
-        let now = Utc::now();
+    pub fn record_access_at(&mut self, now: DateTime<Utc>) {
         self.last_accessed = now;
         self.access_count += 1;
         self.query_history.push_back(now);
@@ -53,7 +57,7 @@ pub struct MemoryMetaPatch {
 }
 
 impl MemoryMetaPatch {
-    pub fn apply(&self, meta: &mut MemoryMetadata) {
+    pub fn apply_at(&self, meta: &mut MemoryMetadata, now: DateTime<Utc>) {
         if let Some(r) = self.rank {
             meta.rank = r;
         }
@@ -64,7 +68,7 @@ impl MemoryMetaPatch {
             meta.remember_tokens = meta.remember_tokens.saturating_add(n);
         }
         if self.record_access {
-            meta.record_access();
+            meta.record_access_at(now);
         }
     }
 }

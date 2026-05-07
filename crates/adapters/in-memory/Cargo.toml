@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 nuillu-blackboard = { workspace = true }
 nuillu-module = { workspace = true }
+nuillu-types = { workspace = true }
 
 async-trait = { workspace = true }
 chrono = { workspace = true }

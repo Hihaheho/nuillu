@@ -60,6 +60,86 @@ impl fmt::Display for ModuleId {
     }
 }
 
+/// Zero-based index of one persistent replica for a module role.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct ReplicaIndex(u8);
+
+impl ReplicaIndex {
+    pub const ZERO: Self = Self(0);
+
+    pub fn new(index: u8) -> Self {
+        Self(index)
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for ReplicaIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// One persistent module loop. Owner-stamped capabilities carry this value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleInstanceId {
+    pub module: ModuleId,
+    pub replica: ReplicaIndex,
+}
+
+impl ModuleInstanceId {
+    pub fn new(module: ModuleId, replica: ReplicaIndex) -> Self {
+        Self { module, replica }
+    }
+}
+
+impl fmt::Display for ModuleInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.replica == ReplicaIndex::ZERO {
+            self.module.fmt(f)
+        } else {
+            write!(f, "{}[{}]", self.module, self.replica)
+        }
+    }
+}
+
+/// Boot-time policy limiting the replicas a module role may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplicaCapRange {
+    pub min: u8,
+    pub max: u8,
+}
+
+impl ReplicaCapRange {
+    pub const V1_MAX: u8 = 3;
+
+    pub fn new(min: u8, max: u8) -> Result<Self, ReplicaCapRangeError> {
+        if min > max {
+            return Err(ReplicaCapRangeError::MinGreaterThanMax);
+        }
+        if max > Self::V1_MAX {
+            return Err(ReplicaCapRangeError::AboveV1Max { max });
+        }
+        Ok(Self { min, max })
+    }
+
+    pub fn clamp(self, replicas: u8) -> u8 {
+        replicas.clamp(self.min, self.max)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReplicaCapRangeError {
+    #[error("replica cap range min must be <= max")]
+    MinGreaterThanMax,
+    #[error("replica cap range max {max} exceeds v1 limit")]
+    AboveV1Max { max: u8 },
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModuleIdParseError {
     #[error("module id must not be empty")]
@@ -154,5 +234,21 @@ mod tests {
         let _ = builtin::attention_schema();
         let _ = builtin::query_vector();
         let _ = builtin::query_agentic();
+    }
+
+    #[test]
+    fn replica_cap_range_validates_order_and_v1_limit() {
+        assert_eq!(
+            ReplicaCapRange::new(2, 1),
+            Err(ReplicaCapRangeError::MinGreaterThanMax)
+        );
+        assert_eq!(
+            ReplicaCapRange::new(0, 4),
+            Err(ReplicaCapRangeError::AboveV1Max { max: 4 })
+        );
+        assert_eq!(
+            ReplicaCapRange::new(0, 3).unwrap(),
+            ReplicaCapRange { min: 0, max: 3 }
+        );
     }
 }

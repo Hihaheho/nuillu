@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
-use nuillu_module::{BlackboardReader, LlmAccess, MemoryCompactor, Module, PeriodicInbox};
+use nuillu_module::{
+    ActivationGate, BlackboardReader, LlmAccess, MemoryCompactor, Module, PeriodicInbox,
+};
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,7 @@ pub enum CompactionTools {
 
 pub struct MemoryCompactionModule {
     periodic: PeriodicInbox,
+    gate: ActivationGate,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
     llm: LlmAccess,
@@ -61,12 +64,14 @@ pub struct MemoryCompactionModule {
 impl MemoryCompactionModule {
     pub fn new(
         periodic: PeriodicInbox,
+        gate: ActivationGate,
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
         llm: LlmAccess,
     ) -> Self {
         Self {
             periodic,
+            gate,
             blackboard,
             compactor,
             llm,

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo,
-    MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
+    ActivationGate, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -45,6 +45,7 @@ pub struct SurpriseMemoryRequest {
 
 pub struct SurpriseModule {
     updates: AttentionStreamUpdatedInbox,
+    gate: ActivationGate,
     attention: AttentionReader,
     blackboard: BlackboardReader,
     memory_requests: MemoryRequestMailbox,
@@ -55,6 +56,7 @@ pub struct SurpriseModule {
 impl SurpriseModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
+        gate: ActivationGate,
         attention: AttentionReader,
         blackboard: BlackboardReader,
         memory_requests: MemoryRequestMailbox,
@@ -63,6 +65,7 @@ impl SurpriseModule {
     ) -> Self {
         Self {
             updates,
+            gate,
             attention,
             blackboard,
             memory_requests,
@@ -117,11 +120,14 @@ impl SurpriseModule {
             && let Some(request) = &assessment.memory_request
             && !request.content.trim().is_empty()
         {
-            let _ = self.memory_requests.publish(MemoryRequest {
-                content: request.content.trim().to_owned(),
-                importance: request.importance,
-                reason: request.reason.trim().to_owned(),
-            });
+            let _ = self
+                .memory_requests
+                .publish(MemoryRequest {
+                    content: request.content.trim().to_owned(),
+                    importance: request.importance,
+                    reason: request.reason.trim().to_owned(),
+                })
+                .await;
         }
 
         let serialized = serde_json::to_string(&assessment).context("serialize surprise memo")?;

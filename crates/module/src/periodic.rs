@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use nuillu_blackboard::Blackboard;
-use nuillu_types::ModuleId;
+use nuillu_types::ModuleInstanceId;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,17 +21,12 @@ pub enum PeriodicRecvError {
 /// Holding this capability is what makes a module eligible for allocation-
 /// controlled periodic activations.
 pub struct PeriodicInbox {
-    owner: ModuleId,
     receiver: mpsc::Receiver<PeriodicTick>,
 }
 
 impl PeriodicInbox {
-    pub(crate) fn new(owner: ModuleId, receiver: mpsc::Receiver<PeriodicTick>) -> Self {
-        Self { owner, receiver }
-    }
-
-    pub fn owner(&self) -> &ModuleId {
-        &self.owner
+    pub(crate) fn new(receiver: mpsc::Receiver<PeriodicTick>) -> Self {
+        Self { receiver }
     }
 
     pub async fn next_tick(&mut self) -> Result<(), PeriodicRecvError> {
@@ -58,7 +53,7 @@ impl PeriodicInbox {
 
 /// Registry of modules that were explicitly granted [`PeriodicInbox`].
 pub struct PeriodicRegistry {
-    senders: RwLock<HashMap<ModuleId, mpsc::Sender<PeriodicTick>>>,
+    senders: RwLock<HashMap<ModuleInstanceId, mpsc::Sender<PeriodicTick>>>,
 }
 
 impl PeriodicRegistry {
@@ -68,16 +63,16 @@ impl PeriodicRegistry {
         }
     }
 
-    pub(crate) fn register(&self, owner: ModuleId, capacity: usize) -> PeriodicInbox {
+    pub(crate) fn register(&self, owner: ModuleInstanceId, capacity: usize) -> PeriodicInbox {
         let (tx, rx) = mpsc::channel(capacity);
         self.senders
             .write()
             .expect("PeriodicRegistry poisoned")
             .insert(owner.clone(), tx);
-        PeriodicInbox::new(owner, rx)
+        PeriodicInbox::new(rx)
     }
 
-    fn module_ids(&self) -> Vec<ModuleId> {
+    fn instances(&self) -> Vec<ModuleInstanceId> {
         self.senders
             .read()
             .expect("PeriodicRegistry poisoned")
@@ -86,7 +81,7 @@ impl PeriodicRegistry {
             .collect()
     }
 
-    fn try_send(&self, module: &ModuleId) -> Result<(), PeriodicTick> {
+    fn try_send(&self, module: &ModuleInstanceId) -> Result<(), PeriodicTick> {
         let map = self.senders.read().expect("PeriodicRegistry poisoned");
         let Some(sender) = map.get(module) else {
             return Err(PeriodicTick);
@@ -101,14 +96,10 @@ impl PeriodicRegistry {
 mod tests {
     use super::*;
 
-    fn test_id() -> ModuleId {
-        ModuleId::new("test-module").unwrap()
-    }
-
     #[test]
     fn take_ready_ticks_counts_ready_ticks_and_stops_on_empty() {
         let (tx, rx) = mpsc::channel(4);
-        let mut inbox = PeriodicInbox::new(test_id(), rx);
+        let mut inbox = PeriodicInbox::new(rx);
         tx.try_send(PeriodicTick).unwrap();
         tx.try_send(PeriodicTick).unwrap();
 
@@ -119,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn next_tick_distinguishes_ready_and_closed() {
         let (tx, rx) = mpsc::channel(1);
-        let mut inbox = PeriodicInbox::new(test_id(), rx);
+        let mut inbox = PeriodicInbox::new(rx);
         tx.try_send(PeriodicTick).unwrap();
 
         assert_eq!(inbox.next_tick().await, Ok(()));
@@ -136,7 +127,7 @@ mod tests {
 pub struct PeriodicActivation {
     blackboard: Blackboard,
     registry: Arc<PeriodicRegistry>,
-    elapsed_by_module: HashMap<ModuleId, Duration>,
+    elapsed_by_module: HashMap<ModuleInstanceId, Duration>,
 }
 
 impl PeriodicActivation {
@@ -154,16 +145,16 @@ impl PeriodicActivation {
     /// current allocation, do not receive periodic triggers and have
     /// their accumulated elapsed time cleared.
     pub async fn tick(&mut self, elapsed: Duration) {
-        let ids = self.registry.module_ids();
+        let ids = self.registry.instances();
         let allocation = self.blackboard.read(|bb| bb.allocation().clone()).await;
 
         for id in ids {
-            let cfg = allocation.for_module(&id);
+            let cfg = allocation.for_module(&id.module);
             let Some(period) = cfg.period else {
                 self.elapsed_by_module.remove(&id);
                 continue;
             };
-            if !cfg.enabled || period == Duration::ZERO {
+            if id.replica.get() >= cfg.replicas || period == Duration::ZERO {
                 self.elapsed_by_module.remove(&id);
                 continue;
             }

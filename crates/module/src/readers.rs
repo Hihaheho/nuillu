@@ -44,7 +44,16 @@ impl AttentionReader {
     }
 
     pub async fn read<R>(&self, f: impl FnOnce(&AttentionStream) -> R) -> R {
-        self.blackboard.read(|bb| f(bb.attention_stream())).await
+        self.blackboard
+            .read(|bb| {
+                let stream = bb.attention_stream();
+                f(&stream)
+            })
+            .await
+    }
+
+    pub async fn snapshot(&self) -> nuillu_blackboard::AttentionStreamSet {
+        self.blackboard.read(|bb| bb.attention_stream_set()).await
     }
 }
 
@@ -67,5 +76,49 @@ impl AllocationReader {
 
     pub async fn snapshot(&self) -> ResourceAllocation {
         self.blackboard.read(|bb| bb.allocation().clone()).await
+    }
+
+    pub async fn replica_caps(
+        &self,
+    ) -> std::collections::HashMap<nuillu_types::ModuleId, nuillu_types::ReplicaCapRange> {
+        self.blackboard.read(|bb| bb.replica_caps().clone()).await
+    }
+
+    pub async fn controller_schema_json(&self) -> serde_json::Value {
+        let caps = self.replica_caps().await;
+        let mut modules = serde_json::Map::new();
+        for (id, range) in caps {
+            modules.insert(
+                id.as_str().to_owned(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "replicas": {
+                            "type": "integer",
+                            "minimum": range.min,
+                            "maximum": range.max,
+                        },
+                        "tier": {
+                            "enum": ["Cheap", "Default", "Premium"],
+                        },
+                        "period_ms": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                        },
+                        "message_only": {
+                            "type": "boolean",
+                        },
+                        "context_budget_tokens": {
+                            "type": ["integer", "null"],
+                            "minimum": 0,
+                        },
+                    },
+                }),
+            );
+        }
+        serde_json::json!({
+            "type": "object",
+            "registered_modules": modules,
+        })
     }
 }

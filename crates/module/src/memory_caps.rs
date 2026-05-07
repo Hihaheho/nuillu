@@ -9,8 +9,8 @@ use nuillu_blackboard::{Blackboard, BlackboardCommand, MemoryMetaPatch};
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 
 use crate::ports::{
-    FileSearchHit, FileSearchProvider, FileSearchQuery, IndexedMemory, MemoryQuery, MemoryRecord,
-    MemoryStore, NewMemory, PortError,
+    Clock, FileSearchHit, FileSearchProvider, FileSearchQuery, IndexedMemory, MemoryQuery,
+    MemoryRecord, MemoryStore, NewMemory, PortError,
 };
 
 /// Vector search over the primary memory store + automatic access patching.
@@ -18,13 +18,19 @@ use crate::ports::{
 pub struct VectorMemorySearcher {
     primary_store: Arc<dyn MemoryStore>,
     blackboard: Blackboard,
+    clock: Arc<dyn Clock>,
 }
 
 impl VectorMemorySearcher {
-    pub(crate) fn new(primary_store: Arc<dyn MemoryStore>, blackboard: Blackboard) -> Self {
+    pub(crate) fn new(
+        primary_store: Arc<dyn MemoryStore>,
+        blackboard: Blackboard,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             primary_store,
             blackboard,
+            clock,
         }
     }
 
@@ -48,6 +54,7 @@ impl VectorMemorySearcher {
                         index: hit.index.clone(),
                         rank_if_new: hit.rank,
                         decay_if_new_secs: 0,
+                        now: self.clock.now(),
                         patch: MemoryMetaPatch {
                             record_access: true,
                             ..Default::default()
@@ -104,6 +111,7 @@ pub struct MemoryWriter {
     primary_store: Arc<dyn MemoryStore>,
     replicas: Vec<Arc<dyn MemoryStore>>,
     blackboard: Blackboard,
+    clock: Arc<dyn Clock>,
 }
 
 impl MemoryWriter {
@@ -111,11 +119,13 @@ impl MemoryWriter {
         primary_store: Arc<dyn MemoryStore>,
         replicas: Vec<Arc<dyn MemoryStore>>,
         blackboard: Blackboard,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
             replicas,
             blackboard,
+            clock,
         }
     }
 
@@ -152,6 +162,7 @@ impl MemoryWriter {
                 index: index.clone(),
                 rank_if_new: rank,
                 decay_if_new_secs: decay_secs,
+                now: self.clock.now(),
                 patch: MemoryMetaPatch {
                     rank: Some(rank),
                     decay_remaining_secs: Some(decay_secs),
@@ -170,6 +181,7 @@ pub struct MemoryCompactor {
     primary_store: Arc<dyn MemoryStore>,
     replicas: Vec<Arc<dyn MemoryStore>>,
     blackboard: Blackboard,
+    clock: Arc<dyn Clock>,
 }
 
 impl MemoryCompactor {
@@ -177,11 +189,13 @@ impl MemoryCompactor {
         primary_store: Arc<dyn MemoryStore>,
         replicas: Vec<Arc<dyn MemoryStore>>,
         blackboard: Blackboard,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
             replicas,
             blackboard,
+            clock,
         }
     }
 
@@ -222,6 +236,7 @@ impl MemoryCompactor {
                 index: id.clone(),
                 rank_if_new: merged_rank,
                 decay_if_new_secs: decay_secs,
+                now: self.clock.now(),
                 patch: MemoryMetaPatch {
                     rank: Some(merged_rank),
                     decay_remaining_secs: Some(decay_secs),
