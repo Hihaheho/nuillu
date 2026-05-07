@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, params};
-pub use lutum_lancedb_core::LanceDbEmbedder;
+pub use nuillu_module::ports::Embedder;
 use nuillu_module::ports::{
     IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError,
 };
@@ -96,13 +96,13 @@ pub struct LibsqlMemoryStore {
     active_profile: EmbeddingProfile,
     profile_id: String,
     embedding_table_name: String,
-    embedder: Arc<dyn LanceDbEmbedder>,
+    embedder: Arc<dyn Embedder>,
 }
 
 impl LibsqlMemoryStore {
     pub async fn connect(
         config: LibsqlMemoryStoreConfig,
-        embedder: Arc<dyn LanceDbEmbedder>,
+        embedder: Box<dyn Embedder>,
     ) -> Result<Self, PortError> {
         let database = libsql::Builder::new_local(config.path)
             .build()
@@ -116,12 +116,13 @@ impl LibsqlMemoryStore {
         conn: Connection,
         table_name: impl Into<String>,
         active_profile: EmbeddingProfile,
-        embedder: Arc<dyn LanceDbEmbedder>,
+        embedder: Box<dyn Embedder>,
     ) -> Result<Self, PortError> {
         let table_name = table_name.into();
         validate_identifier("memory table name", &table_name)?;
         active_profile.validate()?;
 
+        let embedder: Arc<dyn Embedder> = Arc::from(embedder);
         let embedder_dims = embedder.dimensions();
         if embedder_dims != active_profile.dimensions {
             return Err(PortError::InvalidInput(format!(
@@ -862,13 +863,13 @@ mod tests {
     }
 
     impl TestEmbedder {
-        fn new(dims: usize) -> Arc<Self> {
-            Arc::new(Self { dims })
+        fn new(dims: usize) -> Box<dyn Embedder> {
+            Box::new(Self { dims })
         }
     }
 
     #[async_trait(?Send)]
-    impl LanceDbEmbedder for TestEmbedder {
+    impl Embedder for TestEmbedder {
         fn dimensions(&self) -> usize {
             self.dims
         }
@@ -896,7 +897,7 @@ mod tests {
     struct WrongDimEmbedder;
 
     #[async_trait(?Send)]
-    impl LanceDbEmbedder for WrongDimEmbedder {
+    impl Embedder for WrongDimEmbedder {
         fn dimensions(&self) -> usize {
             3
         }
@@ -1159,7 +1160,7 @@ mod tests {
     async fn wrong_embedding_dimensions_are_rejected_on_write() {
         let store = LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(test_db_path(), 3),
-            Arc::new(WrongDimEmbedder),
+            Box::new(WrongDimEmbedder) as Box<dyn Embedder>,
         )
         .await
         .unwrap();

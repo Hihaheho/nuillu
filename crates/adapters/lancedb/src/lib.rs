@@ -1,8 +1,8 @@
 //! LanceDB-backed memory adapter.
 //!
 //! The public `nuillu-module` memory port deals only in content and query
-//! text. This crate owns the adapter-local embedding boundary needed to
-//! store and search vectors in LanceDB.
+//! text. This crate uses the shared module embedding boundary to store and
+//! search vectors in LanceDB.
 
 mod schema;
 
@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use lancedb::Table;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
-pub use lutum_lancedb_core::LanceDbEmbedder;
+pub use nuillu_module::ports::Embedder;
 use nuillu_module::ports::{
     IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError,
 };
@@ -54,19 +54,20 @@ pub struct LanceDbMemoryStore {
     table: Table,
     schema: SchemaRef,
     vector_dims: usize,
-    embedder: Arc<dyn LanceDbEmbedder>,
+    embedder: Arc<dyn Embedder>,
 }
 
 impl LanceDbMemoryStore {
     pub async fn connect(
         config: LanceDbMemoryStoreConfig,
-        embedder: Arc<dyn LanceDbEmbedder>,
+        embedder: Box<dyn Embedder>,
     ) -> Result<Self, PortError> {
         if config.vector_dims == 0 {
             return Err(PortError::InvalidInput(
                 "LanceDB vector_dims must be greater than zero".into(),
             ));
         }
+        let embedder: Arc<dyn Embedder> = Arc::from(embedder);
         let embedder_dims = embedder.dimensions();
         if embedder_dims != config.vector_dims {
             return Err(PortError::InvalidInput(format!(
@@ -536,13 +537,13 @@ mod tests {
     }
 
     impl TestEmbedder {
-        fn new(dims: usize) -> Arc<Self> {
-            Arc::new(Self { dims })
+        fn new(dims: usize) -> Box<dyn Embedder> {
+            Box::new(Self { dims })
         }
     }
 
     #[async_trait(?Send)]
-    impl LanceDbEmbedder for TestEmbedder {
+    impl Embedder for TestEmbedder {
         fn dimensions(&self) -> usize {
             self.dims
         }
@@ -570,7 +571,7 @@ mod tests {
     struct WrongDimEmbedder;
 
     #[async_trait(?Send)]
-    impl LanceDbEmbedder for WrongDimEmbedder {
+    impl Embedder for WrongDimEmbedder {
         fn dimensions(&self) -> usize {
             3
         }
@@ -627,16 +628,15 @@ mod tests {
     #[tokio::test]
     async fn connect_rejects_bad_dimensions() {
         let dir = test_dir();
-        let embedder = TestEmbedder::new(3);
         let zero = LanceDbMemoryStoreConfig::local(&dir, 0);
         assert!(matches!(
-            expect_connect_error(LanceDbMemoryStore::connect(zero, embedder.clone()).await),
+            expect_connect_error(LanceDbMemoryStore::connect(zero, TestEmbedder::new(3)).await),
             PortError::InvalidInput(_)
         ));
 
         let mismatch = LanceDbMemoryStoreConfig::local(dir, 2);
         assert!(matches!(
-            expect_connect_error(LanceDbMemoryStore::connect(mismatch, embedder).await),
+            expect_connect_error(LanceDbMemoryStore::connect(mismatch, TestEmbedder::new(3)).await),
             PortError::InvalidInput(_)
         ));
     }
@@ -738,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn embedding_dimension_mismatch_is_rejected() {
         let dir = test_dir();
-        let embedder = Arc::new(WrongDimEmbedder);
+        let embedder: Box<dyn Embedder> = Box::new(WrongDimEmbedder);
         let mut config = LanceDbMemoryStoreConfig::local(dir, 3);
         config.create_indices = false;
         let store = LanceDbMemoryStore::connect(config, embedder).await.unwrap();

@@ -52,6 +52,7 @@ pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
 pub use periodic::{PeriodicActivation, PeriodicInbox, PeriodicRecvError, PeriodicTick};
+pub use ports::Embedder;
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};

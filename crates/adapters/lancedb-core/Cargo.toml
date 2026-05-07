@@ -10,5 +10,3 @@ workspace = true
 
 [dependencies]
 nuillu-module = { workspace = true }
-
-async-trait = { workspace = true }

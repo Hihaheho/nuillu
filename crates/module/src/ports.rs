@@ -28,6 +28,13 @@ pub enum PortError {
     Backend(String),
 }
 
+/// Text embedding provider used by vector-capable memory adapters.
+#[async_trait(?Send)]
+pub trait Embedder {
+    fn dimensions(&self) -> usize;
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError>;
+}
+
 /// Content-store for memory entries. Metadata (rank, decay, access counts)
 /// is mirrored on the blackboard; this trait owns durable content and any
 /// adapter-local search/indexing state.

@@ -1,4 +1,4 @@
-//! Model2Vec-backed LanceDB embedder.
+//! Model2Vec-backed text embedder.
 //!
 //! This crate intentionally loads only local Model2Vec assets. Constructors
 //! validate the local model files before calling into `model2vec-rs`, so this
@@ -10,9 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lutum_lancedb_core::LanceDbEmbedder;
 use model2vec_rs::model::StaticModel;
-use nuillu_module::ports::PortError;
+use nuillu_module::ports::{Embedder, PortError};
 use sha2::{Digest, Sha256};
 
 pub const POTION_BASE_8M_EXPECTED_DIMENSIONS: usize = 256;
@@ -156,7 +155,7 @@ impl PotionBase8MEmbedder {
 }
 
 #[async_trait(?Send)]
-impl LanceDbEmbedder for PotionBase8MEmbedder {
+impl Embedder for PotionBase8MEmbedder {
     fn dimensions(&self) -> usize {
         self.dimensions
     }
