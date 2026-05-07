@@ -333,11 +333,6 @@ impl BlackboardInner {
             .keys()
             .cloned()
             .chain(self.base_allocation.iter().map(|(id, _)| id.clone()))
-            .chain(
-                active_proposals
-                    .iter()
-                    .flat_map(|proposal| proposal.iter().map(|(id, _)| id.clone())),
-            )
             .collect();
 
         let mut effective = ResourceAllocation::default();
@@ -427,7 +422,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use nuillu_types::{ModelTier, ReplicaIndex, TokenBudget, builtin};
+    use nuillu_types::{ModelTier, ModuleId, ReplicaIndex, TokenBudget, builtin};
 
     #[tokio::test]
     async fn memo_round_trip() {
@@ -593,5 +588,46 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         assert_eq!(effective.for_module(&builtin::speak()).replicas, 0);
+    }
+
+    #[tokio::test]
+    async fn allocation_proposals_do_not_add_unregistered_modules() {
+        let mut base = ResourceAllocation::default();
+        base.set(
+            builtin::attention_controller(),
+            crate::ModuleConfig {
+                replicas: 1,
+                ..Default::default()
+            },
+        );
+        let bb = Blackboard::with_allocation(base);
+        bb.apply(BlackboardCommand::SetReplicaCaps {
+            caps: vec![(
+                builtin::attention_controller(),
+                ReplicaCapRange { min: 1, max: 1 },
+            )],
+        })
+        .await;
+
+        let unknown = ModuleId::new("invented-module").unwrap();
+        let mut proposal = ResourceAllocation::default();
+        proposal.set(
+            unknown.clone(),
+            crate::ModuleConfig {
+                replicas: 1,
+                tier: ModelTier::Premium,
+                period: Some(Duration::from_millis(10)),
+                context_budget: TokenBudget::new(1234),
+            },
+        );
+
+        bb.apply(BlackboardCommand::RecordAllocationProposal {
+            controller: ModuleInstanceId::new(builtin::attention_controller(), ReplicaIndex::ZERO),
+            proposal,
+        })
+        .await;
+
+        let effective = bb.read(|bb| bb.allocation().clone()).await;
+        assert!(effective.get(&unknown).is_none());
     }
 }

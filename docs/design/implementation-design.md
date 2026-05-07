@@ -93,16 +93,16 @@ pub struct ModuleInstanceId {
 Application boot registers modules as `(module_id, cap_range, builder)`:
 
 ```rust
-registry.register(builtin::query_vector(), 0..=3, |caps| {
-    QueryVectorModule::new(
+let registry = ModuleRegistry::new().register(builtin::query_vector(), 0..=3, |caps| {
+    Box::new(QueryVectorModule::new(
         caps.query_inbox(),
         caps.periodic_inbox(),
         caps.blackboard_reader(),
         caps.vector_memory_searcher(),
         caps.memo(),
         caps.llm_access(),
-    )
-});
+    ))
+})?;
 ```
 
 The builder receives `ModuleCapabilityFactory`, a replica-scoped view over the root `CapabilityFactory`. It is already bound to the hidden `ModuleInstanceId`, so owner-stamped capability methods take no owner argument. Module constructors never receive `ModuleInstanceId`, `ReplicaIndex`, or `ModuleId` for self-stamping.
@@ -378,19 +378,19 @@ All capabilities are non-exclusive: the factories do not enforce uniqueness on a
 Boot expands registered modules into persistent replica loops before the scheduler starts:
 
 ```rust
-let mut registry = ModuleRegistry::new();
-registry.register(builtin::query_vector(), 0..=3, |caps| {
-    QueryVectorModule::new(
-        caps.query_inbox(),
-        caps.periodic_inbox(),
-        caps.blackboard_reader(),
-        caps.vector_memory_searcher(),
-        caps.memo(),
-        caps.llm_access(),
-    )
-});
-
-let modules = registry.build(&factory)?;
+let modules = ModuleRegistry::new()
+    .register(builtin::query_vector(), 0..=3, |caps| {
+        Box::new(QueryVectorModule::new(
+            caps.query_inbox(),
+            caps.periodic_inbox(),
+            caps.blackboard_reader(),
+            caps.vector_memory_searcher(),
+            caps.memo(),
+            caps.llm_access(),
+        ))
+    })?
+    .build(&factory)
+    .await?;
 ```
 
 `ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityFactory` per replica index in `0..cap_range.max`, calls the builder once per scoped factory, and records cap metadata for routing, periodic activation, activation gates, and attention-controller schema generation.
@@ -399,15 +399,17 @@ The scheduler only spawns the built loops:
 
 ```rust
 pub async fn run(
-    modules: Vec<Box<dyn Module>>,
+    modules: AllocatedModules,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
-    for mut module in modules {
+    for mut module in modules.into_modules() {
         spawn_local(async move { module.run().await });
     }
     // wait for shutdown or task completion policy
 }
 ```
+
+`AllocatedModules` is an opaque newtype returned by `ModuleRegistry::build`; public boot paths do not accept a raw `Vec<Box<dyn Module>>`. This keeps scheduler startup tied to the registry step that records replica caps for allocation, routing, periodic activation, activation gates, and attention-controller schema generation.
 
 The app owns an `AgentEventLoop` and advances time explicitly:
 

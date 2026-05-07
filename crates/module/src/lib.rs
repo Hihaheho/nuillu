@@ -40,7 +40,8 @@ pub use channels::{
     SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use factory::{
-    CapabilityFactory, ModuleCapabilityFactory, ModuleRegistry, ModuleRegistryError,
+    AllocatedModules, CapabilityFactory, ModuleCapabilityFactory, ModuleRegistry,
+    ModuleRegistryError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;

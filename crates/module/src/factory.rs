@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
@@ -305,14 +306,53 @@ impl ModuleCapabilityFactory {
     }
 }
 
+pub struct AllocatedModules {
+    modules: Vec<Box<dyn Module>>,
+}
+
+impl AllocatedModules {
+    fn new(modules: Vec<Box<dyn Module>>) -> Self {
+        Self { modules }
+    }
+
+    pub fn len(&self) -> usize {
+        self.modules.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    pub fn into_modules(self) -> impl Iterator<Item = Box<dyn Module>> {
+        self.modules.into_iter()
+    }
+}
+
 pub struct ModuleRegistry {
     registrations: Vec<ModuleRegistration>,
+}
+
+impl fmt::Debug for ModuleRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleRegistry")
+            .field("registrations", &self.registrations)
+            .finish()
+    }
 }
 
 struct ModuleRegistration {
     module: ModuleId,
     cap_range: ReplicaCapRange,
     builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn Module>>,
+}
+
+impl fmt::Debug for ModuleRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleRegistration")
+            .field("module", &self.module)
+            .field("cap_range", &self.cap_range)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ModuleRegistry {
@@ -323,11 +363,11 @@ impl ModuleRegistry {
     }
 
     pub fn register(
-        &mut self,
+        mut self,
         module: ModuleId,
         cap_range: RangeInclusive<u8>,
         builder: impl Fn(ModuleCapabilityFactory) -> Box<dyn Module> + 'static,
-    ) -> Result<(), ModuleRegistryError> {
+    ) -> Result<Self, ModuleRegistryError> {
         if self
             .registrations
             .iter()
@@ -341,13 +381,13 @@ impl ModuleRegistry {
             cap_range: range,
             builder: Box::new(builder),
         });
-        Ok(())
+        Ok(self)
     }
 
     pub async fn build(
         &self,
         factory: &CapabilityFactory,
-    ) -> Result<Vec<Box<dyn Module>>, ModuleRegistryError> {
+    ) -> Result<AllocatedModules, ModuleRegistryError> {
         factory
             .set_replica_caps(
                 self.registrations
@@ -369,7 +409,7 @@ impl ModuleRegistry {
                 modules.push((registration.builder)(scoped));
             }
         }
-        Ok(modules)
+        Ok(AllocatedModules::new(modules))
     }
 }
 
@@ -407,8 +447,7 @@ mod tests {
 
     #[test]
     fn register_rejects_duplicate_module_ids() {
-        let mut registry = ModuleRegistry::new();
-        registry
+        let registry = ModuleRegistry::new()
             .register(builtin::summarize(), 0..=1, noop_builder)
             .unwrap();
 

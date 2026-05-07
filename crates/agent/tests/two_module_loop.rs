@@ -20,7 +20,7 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::MemoryModule;
 use nuillu_module::{
-    CapabilityFactory, LutumTiers, Memo, MemoryImportance, MemoryRequest, Module,
+    AllocatedModules, CapabilityFactory, LutumTiers, Memo, MemoryImportance, MemoryRequest, Module,
     ModuleCapabilityFactory, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest,
     SelfModelRequest,
     ports::{
@@ -182,19 +182,19 @@ impl Module for CapturedCapsModule {
 }
 
 fn capture_caps(
-    registry: &mut ModuleRegistry,
+    registry: ModuleRegistry,
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
-) -> Rc<RefCell<Vec<ModuleCapabilityFactory>>> {
+) -> (ModuleRegistry, Rc<RefCell<Vec<ModuleCapabilityFactory>>>) {
     let captured = Rc::new(RefCell::new(Vec::new()));
     let captured_for_builder = Rc::clone(&captured);
-    registry
+    let registry = registry
         .register(module, cap_range, move |caps| {
             captured_for_builder.borrow_mut().push(caps);
             Box::new(CapturedCapsModule)
         })
         .unwrap();
-    captured
+    (registry, captured)
 }
 
 async fn module_caps(
@@ -202,8 +202,7 @@ async fn module_caps(
     module: ModuleId,
     cap_range: RangeInclusive<u8>,
 ) -> Vec<ModuleCapabilityFactory> {
-    let mut registry = ModuleRegistry::new();
-    let captured = capture_caps(&mut registry, module, cap_range);
+    let (registry, captured) = capture_caps(ModuleRegistry::new(), module, cap_range);
     let _modules = registry.build(factory).await.unwrap();
     std::mem::take(&mut *captured.borrow_mut())
 }
@@ -216,6 +215,30 @@ async fn module_cap(
     let mut caps = module_caps(factory, module, cap_range).await;
     assert_eq!(caps.len(), 1);
     caps.pop().unwrap()
+}
+
+async fn memory_modules_with_publisher(
+    factory: &CapabilityFactory,
+) -> (AllocatedModules, ModuleCapabilityFactory) {
+    let (registry, surprise_caps) = capture_caps(ModuleRegistry::new(), builtin::surprise(), 0..=1);
+    let modules = registry
+        .register(builtin::memory(), 0..=1, |caps| {
+            Box::new(MemoryModule::new(
+                caps.periodic_inbox(),
+                caps.memory_request_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.memory_writer(),
+                caps.llm_access(),
+            ))
+        })
+        .unwrap()
+        .build(factory)
+        .await
+        .unwrap();
+    let mut surprise_caps = std::mem::take(&mut *surprise_caps.borrow_mut());
+    assert_eq!(surprise_caps.len(), 1);
+    (modules, surprise_caps.pop().unwrap())
 }
 
 // ---------- tests ----------
@@ -250,19 +273,32 @@ async fn typed_query_fanout_and_periodic_capabilities_work_together() {
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
 
             let (done_tx, done_rx) = oneshot::channel();
-            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-            let echo_caps = module_cap(&factory, echo_id(), 0..=1).await;
-
-            let modules: Vec<Box<dyn Module>> = vec![
-                Box::new(TickerModule::new(
-                    ticker_caps.periodic_inbox(),
-                    ticker_caps.memo(),
-                    ticker_caps.query_mailbox(),
-                    3,
-                    done_tx,
-                )),
-                Box::new(EchoModule::new(echo_caps.query_inbox(), echo_caps.memo())),
-            ];
+            let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+            let modules = ModuleRegistry::new()
+                .register(ticker_id(), 0..=1, {
+                    let done_tx = Rc::clone(&done_tx);
+                    move |caps| {
+                        let done_tx = done_tx
+                            .borrow_mut()
+                            .take()
+                            .expect("ticker module should be built once");
+                        Box::new(TickerModule::new(
+                            caps.periodic_inbox(),
+                            caps.memo(),
+                            caps.query_mailbox(),
+                            3,
+                            done_tx,
+                        ))
+                    }
+                })
+                .unwrap()
+                .register(echo_id(), 0..=1, |caps| {
+                    Box::new(EchoModule::new(caps.query_inbox(), caps.memo()))
+                })
+                .unwrap()
+                .build(&factory)
+                .await
+                .unwrap();
 
             run(modules, async move {
                 for _ in 0..3 {
@@ -321,14 +357,21 @@ async fn attention_writer_capability_appends_to_stream() {
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
 
             let fired = Arc::new(Mutex::new(false));
-            let summarize_caps = module_cap(&factory, builtin::summarize(), 0..=1).await;
-            let summarize = SummarizeStub {
-                periodic: summarize_caps.periodic_inbox(),
-                writer: summarize_caps.attention_writer(),
-                fired: fired.clone(),
-            };
-
-            let modules: Vec<Box<dyn Module>> = vec![Box::new(summarize)];
+            let modules = ModuleRegistry::new()
+                .register(builtin::summarize(), 0..=1, {
+                    let fired = fired.clone();
+                    move |caps| {
+                        Box::new(SummarizeStub {
+                            periodic: caps.periodic_inbox(),
+                            writer: caps.attention_writer(),
+                            fired: fired.clone(),
+                        })
+                    }
+                })
+                .unwrap()
+                .build(&factory)
+                .await
+                .unwrap();
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(15)).await;
@@ -420,11 +463,20 @@ async fn ready_periodic_ticks_can_be_collapsed_by_module_prelude() {
             let factory = test_factory(blackboard);
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
             let count = Arc::new(Mutex::new(0));
-            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-            let modules: Vec<Box<dyn Module>> = vec![Box::new(BatchingPeriodicCounter {
-                periodic: ticker_caps.periodic_inbox(),
-                count: count.clone(),
-            })];
+            let modules = ModuleRegistry::new()
+                .register(ticker_id(), 0..=1, {
+                    let count = count.clone();
+                    move |caps| {
+                        Box::new(BatchingPeriodicCounter {
+                            periodic: caps.periodic_inbox(),
+                            count: count.clone(),
+                        })
+                    }
+                })
+                .unwrap()
+                .build(&factory)
+                .await
+                .unwrap();
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(10)).await;
@@ -520,11 +572,20 @@ async fn periodic_tick_only_targets_modules_with_periodic_inbox() {
             let factory = test_factory(blackboard);
             let mut event_loop = AgentEventLoop::new(factory.periodic_activation());
             let count = Arc::new(Mutex::new(0));
-            let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-            let modules: Vec<Box<dyn Module>> = vec![Box::new(PeriodicCounter {
-                periodic: ticker_caps.periodic_inbox(),
-                count: count.clone(),
-            })];
+            let modules = ModuleRegistry::new()
+                .register(ticker_id(), 0..=1, {
+                    let count = count.clone();
+                    move |caps| {
+                        Box::new(PeriodicCounter {
+                            periodic: caps.periodic_inbox(),
+                            count: count.clone(),
+                        })
+                    }
+                })
+                .unwrap()
+                .build(&factory)
+                .await
+                .unwrap();
 
             run(modules, async move {
                 event_loop.tick(Duration::from_millis(10)).await;
@@ -1057,18 +1118,8 @@ async fn memory_request_does_not_insert_without_llm_tool_decision() {
                 Vec::new(),
                 Arc::new(NoopFileSearchProvider),
             );
-            let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
-            let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+            let (modules, surprise_caps) = memory_modules_with_publisher(&factory).await;
             let publisher = surprise_caps.memory_request_mailbox();
-            let memory = MemoryModule::new(
-                memory_caps.periodic_inbox(),
-                memory_caps.memory_request_inbox(),
-                memory_caps.activation_gate(),
-                memory_caps.blackboard_reader(),
-                memory_caps.memory_writer(),
-                memory_caps.llm_access(),
-            );
-            let modules: Vec<Box<dyn Module>> = vec![Box::new(memory)];
 
             run(modules, async {
                 publisher
@@ -1111,18 +1162,8 @@ async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
                 Arc::new(NoopFileSearchProvider),
                 adapter,
             );
-            let surprise_caps = module_cap(&factory, builtin::surprise(), 0..=1).await;
-            let memory_caps = module_cap(&factory, builtin::memory(), 0..=1).await;
+            let (modules, surprise_caps) = memory_modules_with_publisher(&factory).await;
             let publisher = surprise_caps.memory_request_mailbox();
-            let memory = MemoryModule::new(
-                memory_caps.periodic_inbox(),
-                memory_caps.memory_request_inbox(),
-                memory_caps.activation_gate(),
-                memory_caps.blackboard_reader(),
-                memory_caps.memory_writer(),
-                memory_caps.llm_access(),
-            );
-            let modules: Vec<Box<dyn Module>> = vec![Box::new(memory)];
 
             run(modules, async {
                 publisher
@@ -1190,7 +1231,7 @@ async fn periodic_counter_setup(
     enabled: bool,
 ) -> (
     Blackboard,
-    Vec<Box<dyn Module>>,
+    AllocatedModules,
     Arc<Mutex<u32>>,
     AgentEventLoop,
 ) {
@@ -1209,11 +1250,20 @@ async fn periodic_counter_setup(
     let factory = test_factory(blackboard.clone());
     let event_loop = AgentEventLoop::new(factory.periodic_activation());
     let count = Arc::new(Mutex::new(0));
-    let ticker_caps = module_cap(&factory, ticker_id(), 0..=1).await;
-    let modules: Vec<Box<dyn Module>> = vec![Box::new(PeriodicCounter {
-        periodic: ticker_caps.periodic_inbox(),
-        count: count.clone(),
-    })];
+    let modules = ModuleRegistry::new()
+        .register(ticker_id(), 0..=1, {
+            let count = count.clone();
+            move |caps| {
+                Box::new(PeriodicCounter {
+                    periodic: caps.periodic_inbox(),
+                    count: count.clone(),
+                })
+            }
+        })
+        .unwrap()
+        .build(&factory)
+        .await
+        .unwrap();
 
     (blackboard, modules, count, event_loop)
 }

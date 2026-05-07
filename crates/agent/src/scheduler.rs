@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::pin;
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_module::Module;
+use nuillu_module::AllocatedModules;
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
 
@@ -21,12 +21,12 @@ pub enum SchedulerError {
 /// Awaited inside `tokio::task::LocalSet::run_until` (or `spawn_local`
 /// on a `LocalSet`) so spawned tasks have an executor.
 pub async fn run(
-    modules: Vec<Box<dyn Module>>,
+    modules: AllocatedModules,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
     let mut handles: FuturesUnordered<JoinHandle<()>> = FuturesUnordered::new();
 
-    for mut module in modules {
+    for mut module in modules.into_modules() {
         handles.push(spawn_local(async move {
             module.run().await;
         }));

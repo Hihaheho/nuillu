@@ -86,20 +86,26 @@ impl AllocationReader {
 
     pub async fn controller_schema_json(&self) -> serde_json::Value {
         let caps = self.replica_caps().await;
-        let mut modules = serde_json::Map::new();
-        for (id, range) in caps {
-            modules.insert(
-                id.as_str().to_owned(),
+        let mut caps = caps.into_iter().collect::<Vec<_>>();
+        caps.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+
+        let patch_branches = caps
+            .into_iter()
+            .map(|(id, range)| {
                 serde_json::json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
+                        "module_id": {
+                            "enum": [id.as_str()],
+                        },
                         "replicas": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "minimum": range.min,
                             "maximum": range.max,
                         },
                         "tier": {
-                            "enum": ["Cheap", "Default", "Premium"],
+                            "enum": ["Cheap", "Default", "Premium", null],
                         },
                         "period_ms": {
                             "type": ["integer", "null"],
@@ -113,12 +119,153 @@ impl AllocationReader {
                             "minimum": 0,
                         },
                     },
-                }),
-            );
-        }
+                    "required": [
+                        "module_id",
+                        "replicas",
+                        "tier",
+                        "period_ms",
+                        "message_only",
+                        "context_budget_tokens",
+                    ],
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let patch_items = if patch_branches.is_empty() {
+            serde_json::Value::Bool(false)
+        } else {
+            serde_json::json!({ "anyOf": patch_branches })
+        };
+
         serde_json::json!({
             "type": "object",
-            "registered_modules": modules,
+            "additionalProperties": false,
+            "properties": {
+                "memo": {
+                    "type": "string",
+                },
+                "patches": {
+                    "type": "array",
+                    "items": patch_items,
+                },
+            },
+            "required": ["memo", "patches"],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use nuillu_blackboard::BlackboardCommand;
+    use nuillu_types::{ReplicaCapRange, builtin};
+
+    #[tokio::test]
+    async fn controller_schema_enumerates_registered_modules_with_cap_ranges() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetReplicaCaps {
+                caps: vec![
+                    (builtin::query_vector(), ReplicaCapRange { min: 0, max: 3 }),
+                    (builtin::speak(), ReplicaCapRange { min: 0, max: 1 }),
+                ],
+            })
+            .await;
+        let reader = AllocationReader::new(blackboard);
+
+        let schema = reader.controller_schema_json().await;
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "memo": {
+                        "type": "string",
+                    },
+                    "patches": {
+                        "type": "array",
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "module_id": {
+                                            "enum": ["query-vector"],
+                                        },
+                                        "replicas": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                            "maximum": 3,
+                                        },
+                                        "tier": {
+                                            "enum": ["Cheap", "Default", "Premium", null],
+                                        },
+                                        "period_ms": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                        },
+                                        "message_only": {
+                                            "type": "boolean",
+                                        },
+                                        "context_budget_tokens": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                        },
+                                    },
+                                    "required": [
+                                        "module_id",
+                                        "replicas",
+                                        "tier",
+                                        "period_ms",
+                                        "message_only",
+                                        "context_budget_tokens",
+                                    ],
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "module_id": {
+                                            "enum": ["speak"],
+                                        },
+                                        "replicas": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                            "maximum": 1,
+                                        },
+                                        "tier": {
+                                            "enum": ["Cheap", "Default", "Premium", null],
+                                        },
+                                        "period_ms": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                        },
+                                        "message_only": {
+                                            "type": "boolean",
+                                        },
+                                        "context_budget_tokens": {
+                                            "type": ["integer", "null"],
+                                            "minimum": 0,
+                                        },
+                                    },
+                                    "required": [
+                                        "module_id",
+                                        "replicas",
+                                        "tier",
+                                        "period_ms",
+                                        "message_only",
+                                        "context_budget_tokens",
+                                    ],
+                                },
+                            ],
+                        },
+                    },
+                },
+                "required": ["memo", "patches"],
+            })
+        );
     }
 }
