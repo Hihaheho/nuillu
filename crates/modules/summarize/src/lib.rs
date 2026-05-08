@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AttentionWriter, BlackboardReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
-    TimeDivision,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionWriter, BlackboardReader,
+    LlmAccess, Module, TimeDivision,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -11,36 +11,35 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the summarize module.
-Read the non-cognitive blackboard snapshot and decide whether anything should enter the
-cognitive attention stream. Append only concise, novel, currently relevant events.
+Read the non-cognitive blackboard snapshot and allocation guidance, then decide whether anything
+should enter the cognitive attention stream. Append only concise, novel, currently relevant events.
 When promoting sensory memo content, convert detailed observation ages to one of the provided
 time-division tags before writing attention text. Return only raw JSON for the structured object;
 do not wrap it in Markdown or code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SummaryDecision {
-    pub memo: String,
     pub append_attention: bool,
     pub attention_text: Option<String>,
 }
 
 pub struct SummarizeModule {
-    updates: MemoUpdatedInbox,
+    updates: AllocationUpdatedInbox,
     gate: ActivationGate,
     blackboard: BlackboardReader,
+    allocation: AllocationReader,
     attention: AttentionWriter,
-    memo: Memo,
     time_division: TimeDivision,
     llm: LlmAccess,
 }
 
 impl SummarizeModule {
     pub fn new(
-        updates: MemoUpdatedInbox,
+        updates: AllocationUpdatedInbox,
         gate: ActivationGate,
         blackboard: BlackboardReader,
+        allocation: AllocationReader,
         attention: AttentionWriter,
-        memo: Memo,
         time_division: TimeDivision,
         llm: LlmAccess,
     ) -> Self {
@@ -48,8 +47,8 @@ impl SummarizeModule {
             updates,
             gate,
             blackboard,
+            allocation,
             attention,
-            memo,
             time_division,
             llm,
         }
@@ -68,11 +67,18 @@ impl SummarizeModule {
                 })
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
         session.push_system(SYSTEM_PROMPT);
-        session.push_user(snapshot.to_string());
+        session.push_user(
+            serde_json::json!({
+                "blackboard": snapshot,
+                "allocation": allocation,
+            })
+            .to_string(),
+        );
 
         let result = session
             .structured_turn::<SummaryDecision>()
@@ -84,7 +90,6 @@ impl SummarizeModule {
             anyhow::bail!("summarize structured turn refused");
         };
 
-        self.memo.write(decision.memo).await;
         if decision.append_attention
             && let Some(text) = decision.attention_text
             && !text.trim().is_empty()

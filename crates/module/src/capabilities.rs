@@ -9,18 +9,18 @@ use nuillu_types::{
 
 use crate::activation::ActivationGate;
 use crate::channels::{Topic, TopicPolicy};
-use crate::periodic::PeriodicRegistry;
 use crate::ports::{AttentionRepository, Clock, FileSearchProvider, MemoryStore, UtteranceSink};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::utterance::UtteranceWriter;
 use crate::{
-    AllocationReader, AllocationWriter, AttentionReader, AttentionStreamUpdated,
-    AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader,
-    FileSearcher, LlmAccess, LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor,
-    MemoryContentReader, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter,
-    Module, PeriodicActivation, PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest,
-    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
+    AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
+    AllocationWriter, AttentionReader, AttentionStreamUpdated, AttentionStreamUpdatedInbox,
+    AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader, FileSearcher, LlmAccess,
+    LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor, MemoryContentReader,
+    MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, QueryInbox,
+    QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput,
+    SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox,
+    VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -35,11 +35,11 @@ pub struct CapabilityProviders {
 
 struct CapabilityProvidersInner {
     blackboard: Blackboard,
-    periodic_registry: Arc<PeriodicRegistry>,
     query_topic: Topic<QueryRequest>,
     self_model_topic: Topic<SelfModelRequest>,
     memory_request_topic: Topic<MemoryRequest>,
     attention_updates: Topic<AttentionStreamUpdated>,
+    allocation_updates: Topic<AllocationUpdated>,
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
     attention_port: Arc<dyn AttentionRepository>,
@@ -92,11 +92,11 @@ impl CapabilityProviders {
     ) -> Self {
         Self {
             inner: Arc::new(CapabilityProvidersInner {
-                periodic_registry: Arc::new(PeriodicRegistry::new()),
                 query_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 self_model_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 memory_request_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 attention_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
+                allocation_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
                 memo_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
                 sensory_input_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 blackboard,
@@ -111,13 +111,6 @@ impl CapabilityProviders {
                 runtime_events: RuntimeEventEmitter::new(runtime_event_sink),
             }),
         }
-    }
-
-    pub fn periodic_activation(&self) -> PeriodicActivation {
-        PeriodicActivation::new(
-            self.inner.blackboard.clone(),
-            self.inner.periodic_registry.clone(),
-        )
     }
 
     pub(crate) fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
@@ -251,13 +244,6 @@ impl ModuleCapabilityFactory {
         ActivationGate::new(self.owner.clone(), self.root.inner.blackboard.clone())
     }
 
-    pub fn periodic_inbox(&self) -> PeriodicInbox {
-        self.root
-            .inner
-            .periodic_registry
-            .register(self.owner.clone(), 64)
-    }
-
     pub fn query_mailbox(&self) -> QueryMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
     }
@@ -292,6 +278,13 @@ impl ModuleCapabilityFactory {
         TopicInbox::new(
             self.owner.clone(),
             self.root.inner.attention_updates.clone(),
+        )
+    }
+
+    pub fn allocation_updated_inbox(&self) -> AllocationUpdatedInbox {
+        TopicInbox::new(
+            self.owner.clone(),
+            self.root.inner.allocation_updates.clone(),
         )
     }
 
@@ -377,7 +370,14 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn allocation_writer(&self) -> AllocationWriter {
-        AllocationWriter::new(self.owner.clone(), self.root.inner.blackboard.clone())
+        AllocationWriter::new(
+            self.owner.clone(),
+            self.root.inner.blackboard.clone(),
+            AllocationUpdatedMailbox::new(
+                self.owner.clone(),
+                self.root.inner.allocation_updates.clone(),
+            ),
+        )
     }
 
     pub fn utterance_writer(&self) -> UtteranceWriter {
@@ -538,8 +538,10 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use nuillu_blackboard::Blackboard;
-    use nuillu_types::builtin;
+    use nuillu_blackboard::{
+        ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation,
+    };
+    use nuillu_types::{ModelTier, ReplicaCapRange, builtin};
 
     use crate::test_support::{scoped, test_caps};
 
@@ -595,5 +597,73 @@ mod tests {
         assert_eq!(event.sender.module, builtin::sensory());
         assert_eq!(event.body.owner.module, builtin::sensory());
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allocation_writer_publishes_guidance_changes_once() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetReplicaCaps {
+                caps: vec![
+                    (
+                        builtin::attention_controller(),
+                        ReplicaCapRange { min: 1, max: 1 },
+                    ),
+                    (builtin::summarize(), ReplicaCapRange { min: 0, max: 1 }),
+                ],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let writer = controller.allocation_writer();
+        let mut inbox = summarize.allocation_updated_inbox();
+
+        let mut proposal = ResourceAllocation::default();
+        proposal.set(
+            builtin::summarize(),
+            ModuleConfig {
+                activation_ratio: ActivationRatio::ONE,
+                guidance: "summarize current sensory memo".into(),
+                tier: ModelTier::Default,
+            },
+        );
+
+        writer.set(proposal.clone()).await;
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::attention_controller());
+        assert_eq!(event.body, crate::AllocationUpdated);
+
+        writer.set(proposal).await;
+        assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attention_stream_updates_do_not_wake_controller_memo_inbox() {
+        let caps = test_caps(Blackboard::default());
+        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let mut memo_updates = controller.memo_updated_inbox();
+
+        summarize
+            .attention_writer()
+            .append("user question needs a summary")
+            .await;
+
+        assert!(memo_updates.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn speak_completion_memo_wakes_controller() {
+        let caps = test_caps(Blackboard::default());
+        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let speak = scoped(&caps, builtin::speak(), 0);
+        let mut memo_updates = controller.memo_updated_inbox();
+
+        speak.memo().write("utterance completed").await;
+
+        let event = memo_updates.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::speak());
+        assert_eq!(event.body.owner.module, builtin::speak());
     }
 }

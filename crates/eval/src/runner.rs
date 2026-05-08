@@ -23,10 +23,10 @@ use lutum_in_memory_adapter::InMemoryAttentionRepository;
 use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
-use nuillu_agent::{AgentEventLoop, run as run_agent};
+use nuillu_agent::run as run_agent;
 use nuillu_blackboard::{
-    AttentionStreamEvent, Blackboard, BlackboardInner, MemoryMetadata, ModuleConfig,
-    ResourceAllocation,
+    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardInner, MemoryMetadata,
+    ModuleConfig, ResourceAllocation,
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchProvider, NoopFileSearchProvider, PortError, SystemClock, Utterance,
@@ -475,7 +475,6 @@ async fn execute_full_agent_case(
     .await?;
     seed_memories(&env.caps, &case.memories).await?;
 
-    let mut event_loop = AgentEventLoop::new(env.caps.periodic_activation());
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
@@ -524,7 +523,6 @@ async fn execute_full_agent_case(
             if utterances.has_completed() || events.stop_requested() {
                 break;
             }
-            event_loop.tick(Duration::from_millis(limits.tick_ms)).await;
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
             let _ = allocation_reporter
@@ -601,7 +599,6 @@ async fn execute_module_case(
     let prompt = case.prompt.content.clone();
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
-    let mut event_loop = AgentEventLoop::new(env.caps.periodic_activation());
 
     run_agent(modules, async move {
         match target {
@@ -625,7 +622,6 @@ async fn execute_module_case(
             if events.stop_requested() || blackboard.memo(&shutdown_target_module).await.is_some() {
                 break;
             }
-            event_loop.tick(Duration::from_millis(limits.tick_ms)).await;
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
         }
@@ -807,6 +803,7 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_sensory::SensoryModule::new(
                 caps.sensory_input_inbox(),
                 caps.activation_gate(),
+                caps.allocation_reader(),
                 caps.memo(),
                 caps.clock(),
                 caps.llm_access(),
@@ -815,11 +812,11 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::summarize(), 0..=1, |caps| {
             nuillu_summarize::SummarizeModule::new(
-                caps.memo_updated_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
                 caps.blackboard_reader(),
+                caps.allocation_reader(),
                 caps.attention_writer(),
-                caps.memo(),
                 caps.time_division(),
                 caps.llm_access(),
             )
@@ -827,9 +824,9 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::attention_controller(), 0..=1, |caps| {
             nuillu_attention_controller::AttentionControllerModule::new(
-                caps.attention_stream_updated_inbox(),
-                Some(caps.periodic_inbox()),
+                caps.memo_updated_inbox(),
                 caps.activation_gate(),
+                caps.blackboard_reader(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.allocation_writer(),
@@ -841,9 +838,10 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::attention_schema(), 0..=1, |caps| {
             nuillu_attention_schema::AttentionSchemaModule::new(
                 caps.self_model_inbox(),
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
                 caps.attention_reader(),
+                caps.allocation_reader(),
                 caps.memo(),
                 caps.llm_access(),
             )
@@ -852,8 +850,9 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::query_vector(), 0..=1, |caps| {
             nuillu_query_vector::QueryVectorModule::new(
                 caps.query_inbox(),
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.vector_memory_searcher(),
                 caps.memo(),
@@ -864,8 +863,9 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::query_agentic(), 0..=1, |caps| {
             nuillu_query_agentic::QueryAgenticModule::new(
                 caps.query_inbox(),
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.file_searcher(),
                 caps.memo(),
@@ -875,9 +875,10 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::memory(), 0..=1, |caps| {
             nuillu_memory::MemoryModule::new(
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.memory_request_inbox(),
                 caps.activation_gate(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memory_writer(),
                 caps.llm_access(),
@@ -886,8 +887,9 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::memory_compaction(), 0..=1, |caps| {
             nuillu_memory_compaction::MemoryCompactionModule::new(
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memory_compactor(),
                 caps.llm_access(),
@@ -897,9 +899,10 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::predict(), 0..=1, |caps| {
             nuillu_predict::PredictModule::new(
                 caps.attention_stream_updated_inbox(),
-                caps.periodic_inbox(),
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
                 caps.attention_reader(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memo(),
                 caps.llm_access(),
@@ -911,6 +914,7 @@ fn full_agent_registry() -> ModuleRegistry {
                 caps.attention_stream_updated_inbox(),
                 caps.activation_gate(),
                 caps.attention_reader(),
+                caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memory_request_mailbox(),
                 caps.memo(),
@@ -921,9 +925,10 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::speak(), 0..=1, |caps| {
             nuillu_speak::SpeakModule::new(
                 caps.attention_stream_updated_inbox(),
-                None,
+                caps.allocation_updated_inbox(),
                 caps.activation_gate(),
                 caps.attention_reader(),
+                caps.allocation_reader(),
                 caps.memo(),
                 caps.utterance_writer(),
                 caps.llm_access(),
@@ -938,8 +943,9 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
             .register(builtin::query_vector(), 0..=1, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
-                    caps.periodic_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.activation_gate(),
+                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.vector_memory_searcher(),
                     caps.memo(),
@@ -951,8 +957,9 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
             .register(builtin::query_agentic(), 0..=1, |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.query_inbox(),
-                    caps.periodic_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.activation_gate(),
+                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.file_searcher(),
                     caps.memo(),
@@ -964,9 +971,10 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
             .register(builtin::attention_schema(), 0..=1, |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.self_model_inbox(),
-                    caps.periodic_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.activation_gate(),
                     caps.attention_reader(),
+                    caps.allocation_reader(),
                     caps.memo(),
                     caps.llm_access(),
                 )
@@ -981,79 +989,79 @@ fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocati
     set_allocation_module(
         &mut allocation,
         builtin::sensory(),
-        1,
+        1.0,
         ModelTier::Cheap,
-        None,
+        "Filter incoming observations into sensory memo.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::summarize(),
-        1,
+        0.0,
         ModelTier::Cheap,
-        None,
+        "Wait for controller guidance before promoting memos into attention.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::attention_controller(),
-        1,
+        1.0,
         ModelTier::Premium,
-        None,
+        "Allocate modules from memo updates and write natural-language guidance.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::attention_schema(),
-        0,
+        0.0,
         ModelTier::Default,
-        None,
+        "Idle until self-model guidance or request requires work.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::query_vector(),
-        0,
+        0.0,
         ModelTier::Cheap,
-        None,
+        "Idle until memory retrieval is needed.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::query_agentic(),
-        0,
+        0.0,
         ModelTier::Premium,
-        None,
+        "Idle until file search is needed.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::memory(),
-        0,
+        0.0,
         ModelTier::Cheap,
-        None,
+        "Idle until preservation guidance or memory requests arrive.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::memory_compaction(),
-        0,
+        0.0,
         ModelTier::Cheap,
-        None,
+        "Idle until compaction guidance arrives.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::predict(),
-        0,
+        0.0,
         ModelTier::Cheap,
-        None,
+        "Idle until prediction guidance arrives.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::surprise(),
-        0,
+        0.0,
         ModelTier::Default,
-        None,
+        "Idle until surprise detection is useful.",
     );
     set_allocation_module(
         &mut allocation,
         builtin::speak(),
-        1,
+        1.0,
         ModelTier::Premium,
-        None,
+        "Wait until the attention stream contains answer-ready content, then respond.",
     );
     allocation
 }
@@ -1066,9 +1074,9 @@ fn module_allocation(
     allocation.set(
         module_id_for_target(target),
         ModuleConfig {
-            replicas: 1,
+            activation_ratio: ActivationRatio::ONE,
+            guidance: "Handle the module eval request.".into(),
             tier: module_tier_for_target(target),
-            period: None,
             ..Default::default()
         },
     );
@@ -1078,16 +1086,16 @@ fn module_allocation(
 fn set_allocation_module(
     allocation: &mut ResourceAllocation,
     id: ModuleId,
-    replicas: u8,
+    activation_ratio: f64,
     tier: ModelTier,
-    period: Option<Duration>,
+    guidance: impl Into<String>,
 ) {
     allocation.set(
         id,
         ModuleConfig {
-            replicas,
+            activation_ratio: ActivationRatio::from_f64(activation_ratio),
+            guidance: guidance.into(),
             tier,
-            period,
             ..Default::default()
         },
     );
@@ -1281,21 +1289,19 @@ impl AllocationChangeReporter {
 fn allocation_live_summary(allocation: &BTreeMap<String, ModuleConfig>) -> String {
     let active = allocation
         .iter()
-        .filter(|(_, config)| config.replicas > 0)
+        .filter(|(_, config)| config.activation_ratio > ActivationRatio::ZERO)
         .map(|(module, config)| {
-            let period = config
-                .period
-                .map(|period| format!("{}ms", period.as_millis()))
-                .unwrap_or_else(|| "msg".to_string());
             format!(
-                "{}:{}x/{:?}/{}",
-                module, config.replicas, config.tier, period
+                "{}:{:.2}/{:?}",
+                module,
+                config.activation_ratio.as_f64(),
+                config.tier
             )
         })
         .collect::<Vec<_>>();
     let inactive = allocation
         .values()
-        .filter(|config| config.replicas == 0)
+        .filter(|config| config.activation_ratio == ActivationRatio::ZERO)
         .count();
     format!("active=[{}] inactive={inactive}", active.join(","))
 }
@@ -1775,10 +1781,9 @@ limits {{
         allocation.set(
             builtin::query_vector(),
             ModuleConfig {
-                replicas: 1,
+                activation_ratio: ActivationRatio::ONE,
+                guidance: "test guidance".into(),
                 tier: ModelTier::Default,
-                period: None,
-                context_budget: nuillu_types::TokenBudget::new(8192),
             },
         );
         let blackboard = Blackboard::with_allocation(allocation.clone());
@@ -1846,19 +1851,17 @@ limits {{
             }],
             "allocation": {
                 "query-vector": {
-                    "replicas": 1,
+                    "activation_ratio": 1.0,
+                    "guidance": "test guidance",
                     "tier": "Default",
-                    "period": null,
-                    "context_budget": 8192,
                 },
             },
             "allocation_proposals": {
                 "attention-controller": {
                     "query-vector": {
-                        "replicas": 1,
+                        "activation_ratio": 1.0,
+                        "guidance": "test guidance",
                         "tier": "Default",
-                        "period": null,
-                        "context_budget": 8192,
                     },
                 },
             },
@@ -1893,24 +1896,20 @@ limits {{
         });
 
         let sensory = allocation.for_module(&builtin::sensory());
-        assert_eq!(sensory.replicas, 1);
+        assert_eq!(sensory.activation_ratio, ActivationRatio::ONE);
         assert_eq!(sensory.tier, ModelTier::Cheap);
-        assert_eq!(sensory.period, None);
 
         let summarize = allocation.for_module(&builtin::summarize());
-        assert_eq!(summarize.replicas, 1);
+        assert_eq!(summarize.activation_ratio, ActivationRatio::ZERO);
         assert_eq!(summarize.tier, ModelTier::Cheap);
-        assert_eq!(summarize.period, None);
 
         let controller = allocation.for_module(&builtin::attention_controller());
-        assert_eq!(controller.replicas, 1);
+        assert_eq!(controller.activation_ratio, ActivationRatio::ONE);
         assert_eq!(controller.tier, ModelTier::Premium);
-        assert_eq!(controller.period, None);
 
         let speak = allocation.for_module(&builtin::speak());
-        assert_eq!(speak.replicas, 1);
+        assert_eq!(speak.activation_ratio, ActivationRatio::ONE);
         assert_eq!(speak.tier, ModelTier::Premium);
-        assert_eq!(speak.period, None);
 
         for module in [
             builtin::attention_schema(),
@@ -1921,8 +1920,10 @@ limits {{
             builtin::predict(),
             builtin::surprise(),
         ] {
-            assert_eq!(allocation.for_module(&module).replicas, 0);
-            assert_eq!(allocation.for_module(&module).period, None);
+            assert_eq!(
+                allocation.for_module(&module).activation_ratio,
+                ActivationRatio::ZERO
+            );
         }
     }
 }

@@ -44,8 +44,8 @@ impl AttentionSchemaModule {
 
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
         let batch = tokio::select! {
-            tick = self.periodic.next_tick() => {
-                tick?;
+            update = self.allocation_updates.next_item() => {
+                let _ = update?;
                 NextBatch::model_update()
             }
             request = self.self_model.next_item() => {
@@ -65,7 +65,7 @@ impl AttentionSchemaModule {
                 .map(|envelope| envelope.body),
         );
 
-        if self.periodic.take_ready_ticks()? > 0 {
+        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
             batch.mark_model_update();
         }
 

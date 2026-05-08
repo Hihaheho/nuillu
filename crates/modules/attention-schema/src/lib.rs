@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AttentionReader, LlmAccess, Memo, Module, PeriodicInbox, SelfModelInbox,
-    SelfModelRequest,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader, LlmAccess, Memo,
+    Module, SelfModelInbox, SelfModelRequest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -43,9 +43,10 @@ pub struct SelfReportBatch {
 
 pub struct AttentionSchemaModule {
     self_model: SelfModelInbox,
-    periodic: PeriodicInbox,
+    allocation_updates: AllocationUpdatedInbox,
     gate: ActivationGate,
     attention: AttentionReader,
+    allocation: AllocationReader,
     memo: Memo,
     llm: LlmAccess,
 }
@@ -53,17 +54,19 @@ pub struct AttentionSchemaModule {
 impl AttentionSchemaModule {
     pub fn new(
         self_model: SelfModelInbox,
-        periodic: PeriodicInbox,
+        allocation_updates: AllocationUpdatedInbox,
         gate: ActivationGate,
         attention: AttentionReader,
+        allocation: AllocationReader,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
         Self {
             self_model,
-            periodic,
+            allocation_updates,
             gate,
             attention,
+            allocation,
             memo,
             llm,
         }
@@ -75,10 +78,17 @@ impl AttentionSchemaModule {
             .attention
             .read(|stream| stream.entries().to_vec())
             .await;
+        let allocation = self.allocation.snapshot().await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
         session.push_system(MODEL_PROMPT);
-        session.push_user(serde_json::json!({ "attention_stream": attention }).to_string());
+        session.push_user(
+            serde_json::json!({
+                "attention_stream": attention,
+                "allocation": allocation,
+            })
+            .to_string(),
+        );
 
         let result = session
             .structured_turn::<SelfModel>()
@@ -101,6 +111,7 @@ impl AttentionSchemaModule {
             .read(|stream| stream.entries().to_vec())
             .await;
         let model = self.memo.read().await.unwrap_or_default();
+        let allocation = self.allocation.snapshot().await;
         let questions = requests
             .into_iter()
             .map(|request| request.question)
@@ -112,6 +123,7 @@ impl AttentionSchemaModule {
             serde_json::json!({
                 "questions": questions,
                 "attention_stream": attention,
+                "allocation": allocation,
                 "self_model": model,
             })
             .to_string(),

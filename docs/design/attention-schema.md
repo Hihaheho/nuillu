@@ -26,7 +26,7 @@ The non-cognitive blackboard holds:
 
 - **per-module memos** — each module owns one slot and writes only its own slot,
 - **memory metadata** — rank, decay, access counts, and remember tokens,
-- **resource allocation** — enabled/period/model-tier/context-budget per module.
+- **resource allocation** — activation ratio, controller guidance, and model tier per module.
 
 Module results that should be durable live in memos or other blackboard state. Channel messages are transient activation signals and are not persisted.
 
@@ -61,35 +61,46 @@ Rank can rise through access or remember-token accumulation and fall when decay 
 A module can be activated by any inbox capability it holds:
 
 - typed fanout topics, such as external `SensoryInputInbox` or internal `QueryInbox` / `SelfModelInbox`,
-- `PeriodicInbox`, driven by elapsed application ticks and current allocation,
+- `MemoUpdatedInbox`, published by memo writes and filtered so a holder does not wake on its own writes,
+- `AllocationUpdatedInbox`, published when effective allocation or guidance changes,
 - `AttentionStreamUpdatedInbox`, published by attention-stream writes.
 
-Periodic activation is opt-in. A module becomes periodic only when boot wiring grants it `PeriodicInbox`. The event loop is elapsed-time based; it does not sleep inside inboxes.
+There is no periodic wake mechanism. Allocation guidance is the controller's durable control plane: modules read the current allocation snapshot and decide whether a wake should produce work, defer silently, or only update local state.
+
+Guidance-based allocation flow:
+
+```text
+Sensory memo -> AttentionController -> AllocationUpdated -> Summary -> AttentionStreamUpdated -> Speak
+Query/Speak/etc memo -> AttentionController -> AllocationUpdated -> modules
+```
+
+Summary does not write a memo. Attention appended by Summary wakes attention consumers such as Speak, Predict, and Surprise, but does not directly wake the controller. Speak writes a completion memo after a finished utterance; that memo wakes the controller so it can reduce `speak.activation_ratio` and reallocate resources.
 
 ## Capabilities
 
-| Module | Read blackboard | Read attention stream | Memo | Periodic | Clock | LLM | Special capabilities |
+| Module | Read blackboard | Read attention stream | Read allocation | Memo | Clock | LLM | Special capabilities |
 |---|---|---|---|---|---|---|---|
-| sensory | — | — | ✓ | — | ✓ | ✓ | `SensoryInputInbox` |
-| summarize | ✓ | — | ✓ | ✓ | — | ✓ | `AttentionWriter`, `TimeDivision` |
-| attention-controller | — | ✓ | ✓ | optional | — | ✓ | `AttentionStreamUpdatedInbox`, `AllocationReader`, `AllocationWriter` |
-| attention-schema | — | ✓ | ✓ | ✓ | — | ✓ | `SelfModelInbox` |
-| query-vector | ✓ | — | ✓ | ✓ | — | ✓ | `QueryInbox`, `VectorMemorySearcher` |
-| query-agentic | ✓ | — | ✓ | ✓ | — | ✓ | `QueryInbox`, `FileSearcher` |
-| memory | ✓ | — | optional | ✓ | — | ✓ | `MemoryWriter`, `MemoryRequestInbox` |
-| memory-compaction | ✓ | — | optional | ✓ | — | ✓ | `MemoryCompactor` |
-| predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox` |
-| surprise | ✓ | ✓ | ✓ | — | — | ✓ | `AttentionStreamUpdatedInbox`, `MemoryRequestMailbox` |
-| speak | — | ✓ | ✓ | optional | ✓ | ✓ | `AttentionStreamUpdatedInbox`, `UtteranceWriter` |
+| sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox` |
+| summarize | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `AttentionWriter`, `TimeDivision` |
+| attention-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AllocationWriter` |
+| attention-schema | — | ✓ | ✓ | ✓ | — | ✓ | `SelfModelInbox`, `AllocationUpdatedInbox` |
+| query-vector | ✓ | — | ✓ | ✓ | — | ✓ | `QueryInbox`, `AllocationUpdatedInbox`, `VectorMemorySearcher` |
+| query-agentic | ✓ | — | ✓ | ✓ | — | ✓ | `QueryInbox`, `AllocationUpdatedInbox`, `FileSearcher` |
+| memory | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryWriter`, `MemoryRequestInbox` |
+| memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
+| predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox`, `AllocationUpdatedInbox` |
+| surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox`, `MemoryRequestMailbox` |
+| speak | — | ✓ | ✓ | ✓ | ✓ | ✓ | `AttentionStreamUpdatedInbox`, `AllocationUpdatedInbox`, `UtteranceWriter` |
 
 Notable absences:
 
-- The attention controller cannot read the non-cognitive blackboard.
-- The attention schema module cannot read allocation and does not drive resource policy.
+- The attention schema module can read allocation guidance, but has no allocation-write path and does not drive resource policy.
 - Query modules do not receive self-model requests and do not answer self-referential questions.
 - The sensory module is the app-facing observation boundary; it cannot write attention, publish work requests, or emit utterances.
 - The speak module is the app-facing output boundary; it cannot write attention, allocation, memory, or query/self-model requests.
 - Only summarize can write the attention stream.
+- Summary cannot write memo, so attention appends cannot wake the controller directly.
+- The attention controller wakes only on memo updates, excluding its own memo writes; it reads the attention stream but is not woken by `AttentionStreamUpdated`.
 - Only the attention controller can write resource allocation.
 - The memory module cannot increment remember tokens; that belongs to memory compaction.
 - Predict does not send memory requests; that belongs to surprise.
@@ -120,13 +131,15 @@ The sensory memo is the only output. It should contain the filtered, normalized 
 
 ### Summarize
 
-Reads the non-cognitive blackboard snapshot and appends to the attention stream when something is novel, unresolved, or strongly changed. It is the only bridge from the non-cognitive blackboard to the cognitive surface.
+Reads the non-cognitive blackboard snapshot and current allocation guidance, then appends to the attention stream when something is novel, unresolved, strongly changed, or requested by controller guidance. It is the only bridge from the non-cognitive blackboard to the cognitive surface, and it has no memo capability.
 
 When sensory memo content is promoted, summarize rounds the detailed memo age through `configs/time-division.eure` before appending the attention event. Detailed timing stays in the sensory memo; rounded timing belongs to the attention stream.
 
 ### Attention Controller
 
-Reads the attention stream and current allocation, then writes the next resource allocation: enabled state, periodic cadence, model tier, and context budget. It is intentionally unaware of non-cognitive detail.
+Wakes only on memo updates from other modules. It reads the blackboard memo set, memory metadata, attention stream, and current allocation, then writes the next resource allocation for every registered module: `activation_ratio`, natural-language `guidance`, and `tier`.
+
+The controller uses guidance rather than request/response correlation. For example, if Speak should wait for query or summary work, the controller raises the relevant modules and gives Speak guidance to wait silently until attended evidence is sufficient.
 
 ### Attention Schema
 
@@ -136,32 +149,29 @@ The self-model is a simplification. It may diverge from the controller's interna
 
 ### Query Vector
 
-Handles vector-memory/RAG queries only. Explicit internal query requests arrive through `QueryInbox`; periodic activation can refresh memory-oriented context. Output is written to the query-vector module's memo.
+Handles vector-memory/RAG queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Output is written to the query-vector module's memo.
 
 ### Query Agentic
 
-Handles read-only file-search queries only. Explicit internal query requests arrive through `QueryInbox`; periodic activation can refresh file-oriented context. Output is written to the query-agentic module's memo.
+Handles read-only file-search queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Output is written to the query-agentic module's memo.
 
 ### Memory
 
-Preserves useful information by inserting memory entries based on the blackboard snapshot. Explicit
-`MemoryRequest` messages are preservation candidates, not writes. The memory module may reject,
-normalize, merge, or deduplicate candidates, and only persists records through its own
-`insert_memory` tool decision.
+Preserves useful information by inserting memory entries based on the blackboard snapshot and allocation guidance. Explicit `MemoryRequest` messages are preservation candidates, not writes. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision.
 
 ### Memory Compaction
 
-Fetches related memory contents and merges redundant memories, accumulating remember tokens.
+Fetches related memory contents and merges redundant memories, accumulating remember tokens. Allocation updates wake it to consider compaction guidance.
 
 ### Predict
 
-Maintains forward predictions about the current attention targets. On each attention stream update or periodic tick, reads the attention stream and blackboard context, then uses an LLM to generate predictions about the likely near-future states of whatever is currently attended — external subjects (people, objects, events), conversational trajectory, or the agent's own mental state when attention-schema reports that the agent is attending to its own mind. Each prediction entry includes the attended subject, predicted state, and an estimated validity horizon.
+Maintains forward predictions about the current attention targets. On each attention stream update or allocation update, reads the attention stream, blackboard context, and allocation guidance, then uses an LLM to generate predictions about the likely near-future states of whatever is currently attended — external subjects (people, objects, events), conversational trajectory, or the agent's own mental state when attention-schema reports that the agent is attending to its own mind. Each prediction entry includes the attended subject, predicted state, and an estimated validity horizon.
 
 Predictions are written to the predict memo. Predict does not detect whether its predictions were correct and does not send memory requests — divergence detection belongs to surprise.
 
 ### Surprise
 
-Detects unexpected attention events by comparing new attention stream entries against the predict memo (if present) or against recent attention history alone (if predict is absent). Uses an LLM to assess the degree of divergence or novelty. When surprise is significant, sends a `MemoryRequest` candidate to the memory module and records the surprise assessment in its memo.
+Detects unexpected attention events by comparing new attention stream entries against the predict memo (if present) or against recent attention history alone (if predict is absent). Uses an LLM to assess the degree of divergence or novelty with allocation guidance in context. When surprise is significant, sends a `MemoryRequest` candidate to the memory module and records the surprise assessment in its memo.
 
 Surprise-triggered requests carry `Normal` / `High` importance as memory-module hints, not storage commands. The memory module owns the final preservation decision.
 
@@ -171,16 +181,15 @@ Surprise does not generate predictions. When the predict memo is absent, surpris
 
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
-Speak reads the attention stream, decides whether a user-facing response is warranted, writes the chosen utterance to its memo, and emits it through `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact.
+Speak reads the attention stream and allocation guidance, decides whether a user-facing response is warranted, writes the chosen utterance to its memo, and emits it through `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact.
 
-Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. If required information is not yet available in attended state or memos, it should remain silent or emit a bounded clarification/failure utterance according to application policy.
+Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. If allocation guidance indicates query or summary work is still in progress, Speak may wait silently. Completed utterance memos wake the controller so resources can be reclaimed.
 
 ## Invariants
 
 These invariants are upheld by boot-time capability wiring and owner-stamped handles:
 
 - The attention controller and attention schema module are separate modules.
-- The attention controller cannot directly read the non-cognitive blackboard.
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
 - Query and self-model messages are internal; they are only driven directly by module-level eval harnesses or internal modules that hold those mailbox capabilities.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
@@ -188,8 +197,9 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - Query modules and self-model questions are separated by typed channels.
 - Durable answers are memo-authoritative, not mailbox responses.
 - A module cannot impersonate another module.
-- Periodic activation is granted explicitly.
-- All modules are detachable.
+- Summary has no memo capability and cannot wake the controller by appending attention.
+- The attention controller is not woken by attention stream updates.
+- Allocation activation ratios respect boot-time `cap_range.min/max`; modules with `cap_range.min = 0` are detachable by allocation.
 - Query-vector and query-agentic are independently detachable for ablation.
 - Predict and surprise are independently detachable for ablation.
 - Ablating the attention schema module should degrade self-report specifically while task performance largely survives.

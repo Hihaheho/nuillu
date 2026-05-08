@@ -4,10 +4,10 @@ use crate::MemoryCompactionModule;
 
 impl MemoryCompactionModule {
     pub(crate) async fn next_batch(&mut self) -> Result<()> {
-        self.periodic.next_tick().await?;
-        let _ = self.periodic.take_ready_ticks()?;
+        let _ = self.allocation_updates.next_item().await?;
+        let _ = self.allocation_updates.take_ready_items()?;
         self.gate.block().await;
-        let _ = self.periodic.take_ready_ticks()?;
+        let _ = self.allocation_updates.take_ready_items()?;
         Ok(())
     }
 }

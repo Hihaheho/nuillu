@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
-    Memo, Module, PeriodicInbox,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader,
+    AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,10 @@ pub struct PredictionEntry {
 
 pub struct PredictModule {
     updates: AttentionStreamUpdatedInbox,
-    periodic: PeriodicInbox,
+    allocation_updates: AllocationUpdatedInbox,
     gate: ActivationGate,
     attention: AttentionReader,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     memo: Memo,
     llm: LlmAccess,
@@ -44,18 +45,20 @@ pub struct PredictModule {
 impl PredictModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
-        periodic: PeriodicInbox,
+        allocation_updates: AllocationUpdatedInbox,
         gate: ActivationGate,
         attention: AttentionReader,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
         Self {
             updates,
-            periodic,
+            allocation_updates,
             gate,
             attention,
+            allocation,
             blackboard,
             memo,
             llm,
@@ -77,6 +80,7 @@ impl PredictModule {
                 })
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
@@ -85,6 +89,7 @@ impl PredictModule {
             serde_json::json!({
                 "attention_stream": attention,
                 "blackboard_context": context,
+                "allocation": allocation,
             })
             .to_string(),
         );

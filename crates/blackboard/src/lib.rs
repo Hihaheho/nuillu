@@ -21,7 +21,7 @@ mod command;
 mod memory;
 mod state;
 
-pub use allocation::{ModuleConfig, ResourceAllocation};
+pub use allocation::{ActivationRatio, ModuleConfig, ResourceAllocation};
 pub use attention_stream::{
     AttentionStream, AttentionStreamEvent, AttentionStreamRecord, AttentionStreamSet,
 };

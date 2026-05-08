@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    ActivationGate, BlackboardReader, LlmAccess, MemoryCompactor, Module, PeriodicInbox,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess,
+    MemoryCompactor, Module,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -54,8 +55,9 @@ pub enum CompactionTools {
 }
 
 pub struct MemoryCompactionModule {
-    periodic: PeriodicInbox,
+    allocation_updates: AllocationUpdatedInbox,
     gate: ActivationGate,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
     llm: LlmAccess,
@@ -63,15 +65,17 @@ pub struct MemoryCompactionModule {
 
 impl MemoryCompactionModule {
     pub fn new(
-        periodic: PeriodicInbox,
+        allocation_updates: AllocationUpdatedInbox,
         gate: ActivationGate,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
         llm: LlmAccess,
     ) -> Self {
         Self {
-            periodic,
+            allocation_updates,
             gate,
+            allocation,
             blackboard,
             compactor,
             llm,
@@ -89,11 +93,18 @@ impl MemoryCompactionModule {
                 })
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
         session.push_system(SYSTEM_PROMPT);
-        session.push_user(snapshot.to_string());
+        session.push_user(
+            serde_json::json!({
+                "blackboard": snapshot,
+                "allocation": allocation,
+            })
+            .to_string(),
+        );
 
         for _ in 0..6 {
             let outcome = session

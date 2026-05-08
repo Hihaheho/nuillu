@@ -22,7 +22,6 @@ mod channels;
 mod llm;
 mod memo;
 mod memory_caps;
-mod periodic;
 pub mod ports;
 mod readers;
 mod runtime_events;
@@ -42,18 +41,18 @@ pub use capabilities::{
     ModuleRegisterer, ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{
-    AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope,
-    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest,
-    MemoryRequestInbox, MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems,
-    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
+    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AttentionStreamUpdated,
+    AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope, MemoUpdated,
+    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox,
+    MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox,
+    SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
-pub use periodic::{PeriodicActivation, PeriodicInbox, PeriodicRecvError, PeriodicTick};
 pub use ports::Embedder;
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};

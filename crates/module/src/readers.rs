@@ -57,9 +57,9 @@ impl AttentionReader {
     }
 }
 
-/// Read-only access to the resource-allocation snapshot. Issued to
-/// modules that need to consult allocation for their own decisions
-/// (typically only the attention controller).
+/// Read-only access to the resource-allocation snapshot. Modules may inspect
+/// allocation guidance for themselves and for other modules, but only holders
+/// of `AllocationWriter` can change it.
 #[derive(Clone)]
 pub struct AllocationReader {
     blackboard: Blackboard,
@@ -99,33 +99,24 @@ impl AllocationReader {
                         "module_id": {
                             "enum": [id.as_str()],
                         },
-                        "replicas": {
-                            "type": ["integer", "null"],
-                            "minimum": range.min,
-                            "maximum": range.max,
+                        "activation_ratio": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": format!("Runtime derives active replicas by ceil(ratio * {}) clamped to {}..={}.", range.max, range.min, range.max),
+                        },
+                        "guidance": {
+                            "type": "string",
                         },
                         "tier": {
-                            "enum": ["Cheap", "Default", "Premium", null],
-                        },
-                        "period_ms": {
-                            "type": ["integer", "null"],
-                            "minimum": 0,
-                        },
-                        "message_only": {
-                            "type": "boolean",
-                        },
-                        "context_budget_tokens": {
-                            "type": ["integer", "null"],
-                            "minimum": 0,
+                            "enum": ["Cheap", "Default", "Premium"],
                         },
                     },
                     "required": [
                         "module_id",
-                        "replicas",
+                        "activation_ratio",
+                        "guidance",
                         "tier",
-                        "period_ms",
-                        "message_only",
-                        "context_budget_tokens",
                     ],
                 })
             })
@@ -144,12 +135,12 @@ impl AllocationReader {
                 "memo": {
                     "type": "string",
                 },
-                "patches": {
+                "allocations": {
                     "type": "array",
                     "items": patch_items,
                 },
             },
-            "required": ["memo", "patches"],
+            "required": ["memo", "allocations"],
         })
     }
 }
@@ -184,7 +175,7 @@ mod tests {
                     "memo": {
                         "type": "string",
                     },
-                    "patches": {
+                    "allocations": {
                         "type": "array",
                         "items": {
                             "anyOf": [
@@ -195,33 +186,24 @@ mod tests {
                                         "module_id": {
                                             "enum": ["query-vector"],
                                         },
-                                        "replicas": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
-                                            "maximum": 3,
+                                        "activation_ratio": {
+                                            "type": "number",
+                                            "minimum": 0.0,
+                                            "maximum": 1.0,
+                                            "description": "Runtime derives active replicas by ceil(ratio * 3) clamped to 0..=3.",
+                                        },
+                                        "guidance": {
+                                            "type": "string",
                                         },
                                         "tier": {
-                                            "enum": ["Cheap", "Default", "Premium", null],
-                                        },
-                                        "period_ms": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
-                                        },
-                                        "message_only": {
-                                            "type": "boolean",
-                                        },
-                                        "context_budget_tokens": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
+                                            "enum": ["Cheap", "Default", "Premium"],
                                         },
                                     },
                                     "required": [
                                         "module_id",
-                                        "replicas",
+                                        "activation_ratio",
+                                        "guidance",
                                         "tier",
-                                        "period_ms",
-                                        "message_only",
-                                        "context_budget_tokens",
                                     ],
                                 },
                                 {
@@ -231,40 +213,31 @@ mod tests {
                                         "module_id": {
                                             "enum": ["speak"],
                                         },
-                                        "replicas": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
-                                            "maximum": 1,
+                                        "activation_ratio": {
+                                            "type": "number",
+                                            "minimum": 0.0,
+                                            "maximum": 1.0,
+                                            "description": "Runtime derives active replicas by ceil(ratio * 1) clamped to 0..=1.",
+                                        },
+                                        "guidance": {
+                                            "type": "string",
                                         },
                                         "tier": {
-                                            "enum": ["Cheap", "Default", "Premium", null],
-                                        },
-                                        "period_ms": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
-                                        },
-                                        "message_only": {
-                                            "type": "boolean",
-                                        },
-                                        "context_budget_tokens": {
-                                            "type": ["integer", "null"],
-                                            "minimum": 0,
+                                            "enum": ["Cheap", "Default", "Premium"],
                                         },
                                     },
                                     "required": [
                                         "module_id",
-                                        "replicas",
+                                        "activation_ratio",
+                                        "guidance",
                                         "tier",
-                                        "period_ms",
-                                        "message_only",
-                                        "context_budget_tokens",
                                     ],
                                 },
                             ],
                         },
                     },
                 },
-                "required": ["memo", "patches"],
+                "required": ["memo", "allocations"],
             })
         );
     }

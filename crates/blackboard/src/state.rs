@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use nuillu_types::{
-    MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, TokenBudget,
-    builtin,
+    MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
 use tokio::sync::{RwLock, oneshot};
 
@@ -336,17 +335,17 @@ impl BlackboardInner {
     fn recompute_effective_allocation(&mut self) {
         let active_controller_replicas = self
             .allocation
-            .for_module(&builtin::attention_controller())
-            .replicas;
-        let active_proposals = self
+            .active_replicas(&builtin::attention_controller());
+        let mut active_proposals = self
             .allocation_proposals
             .iter()
             .filter(|(owner, _)| {
                 owner.module == builtin::attention_controller()
                     && owner.replica.get() < active_controller_replicas
             })
-            .map(|(_, proposal)| proposal)
+            .map(|(owner, proposal)| (owner, proposal))
             .collect::<Vec<_>>();
+        active_proposals.sort_by_key(|(owner, _)| owner.replica);
 
         if active_proposals.is_empty() {
             self.allocation = self.base_allocation.clone().clamped(&self.replica_caps);
@@ -364,53 +363,37 @@ impl BlackboardInner {
         for id in module_ids {
             let configs = active_proposals
                 .iter()
-                .map(|proposal| {
-                    let mut cfg = proposal
+                .map(|(_, proposal)| {
+                    proposal
                         .get(&id)
                         .cloned()
-                        .unwrap_or_else(|| self.base_allocation.for_module(&id));
-                    if let Some(range) = self.replica_caps.get(&id) {
-                        cfg.replicas = range.clamp(cfg.replicas);
-                    }
-                    cfg
+                        .unwrap_or_else(|| self.base_allocation.for_module(&id))
                 })
                 .collect::<Vec<_>>();
             let count = configs.len() as u32;
-            let replica_sum = configs.iter().map(|cfg| cfg.replicas as u32).sum::<u32>();
+            let activation_sum = configs
+                .iter()
+                .map(|cfg| u32::from(cfg.activation_ratio.raw()))
+                .sum::<u32>();
             let tier_sum = configs
                 .iter()
                 .map(|cfg| tier_to_ordinal(cfg.tier))
                 .sum::<u32>();
-            let budget_sum = configs.iter().map(|cfg| cfg.context_budget.0).sum::<u32>();
+            let guidance =
+                combine_guidance(active_proposals.iter().filter_map(|(owner, proposal)| {
+                    proposal
+                        .get(&id)
+                        .map(|cfg| (owner.to_string(), cfg.guidance.trim().to_owned()))
+                }));
 
-            let none_periods = configs.iter().filter(|cfg| cfg.period.is_none()).count();
-            let positive_periods = configs
-                .iter()
-                .filter_map(|cfg| cfg.period)
-                .filter(|period| !period.is_zero())
-                .collect::<Vec<_>>();
-            // Ties keep the positive average; only a strict majority of `None`
-            // proposals turns the module back into message-only activation.
-            let period = if none_periods * 2 > configs.len() || positive_periods.is_empty() {
-                None
-            } else {
-                let millis = positive_periods
-                    .iter()
-                    .map(|period| period.as_millis())
-                    .sum::<u128>()
-                    / positive_periods.len() as u128;
-                Some(std::time::Duration::from_millis(millis as u64))
-            };
-
-            let mut cfg = crate::ModuleConfig {
-                replicas: rounded_div(replica_sum, count) as u8,
+            let cfg = crate::ModuleConfig {
+                activation_ratio: crate::ActivationRatio::from_raw(rounded_div(
+                    activation_sum,
+                    count,
+                ) as u16),
                 tier: ordinal_to_tier(rounded_div(tier_sum, count)),
-                period,
-                context_budget: TokenBudget::new(rounded_div(budget_sum, count)),
+                guidance,
             };
-            if let Some(range) = self.replica_caps.get(&id) {
-                cfg.replicas = range.clamp(cfg.replicas);
-            }
             effective.set(id, cfg);
         }
 
@@ -423,6 +406,21 @@ fn rounded_div(sum: u32, count: u32) -> u32 {
         return 0;
     }
     (sum + count / 2) / count
+}
+
+fn combine_guidance(items: impl IntoIterator<Item = (String, String)>) -> String {
+    let mut items = items
+        .into_iter()
+        .filter(|(_, guidance)| !guidance.is_empty())
+        .collect::<Vec<_>>();
+    if items.len() == 1 {
+        return items.remove(0).1;
+    }
+    items
+        .into_iter()
+        .map(|(owner, guidance)| format!("{owner}: {guidance}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn tier_to_ordinal(tier: ModelTier) -> u32 {
@@ -445,9 +443,8 @@ fn ordinal_to_tier(ordinal: u32) -> ModelTier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    use nuillu_types::{ModelTier, ModuleId, ReplicaIndex, TokenBudget, builtin};
+    use nuillu_types::{ModelTier, ModuleId, ReplicaIndex, builtin};
 
     #[tokio::test]
     async fn memo_round_trip() {
@@ -462,12 +459,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_proposals_clamp_each_proposal_before_averaging() {
+    async fn allocation_proposals_average_ratio_before_active_replica_derivation() {
         let mut base = ResourceAllocation::default();
         base.set(
             builtin::attention_controller(),
             crate::ModuleConfig {
-                replicas: 2,
+                activation_ratio: crate::ActivationRatio::ONE,
                 ..Default::default()
             },
         );
@@ -488,16 +485,16 @@ mod tests {
         proposal_a.set(
             builtin::query_vector(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::from_f64(1.0 / 3.0),
+                guidance: "query cheaply".into(),
                 tier: ModelTier::Cheap,
-                period: Some(Duration::from_millis(10)),
-                context_budget: TokenBudget::new(1000),
             },
         );
         proposal_a.set(
             builtin::speak(),
             crate::ModuleConfig {
-                replicas: 0,
+                activation_ratio: crate::ActivationRatio::ZERO,
+                guidance: "wait".into(),
                 ..Default::default()
             },
         );
@@ -506,16 +503,16 @@ mod tests {
         proposal_b.set(
             builtin::query_vector(),
             crate::ModuleConfig {
-                replicas: 5,
+                activation_ratio: crate::ActivationRatio::ONE,
+                guidance: "query deeply".into(),
                 tier: ModelTier::Premium,
-                period: Some(Duration::from_millis(30)),
-                context_budget: TokenBudget::new(3000),
             },
         );
         proposal_b.set(
             builtin::speak(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::ONE,
+                guidance: "respond if attention is ready".into(),
                 ..Default::default()
             },
         );
@@ -539,11 +536,14 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         let query = effective.for_module(&builtin::query_vector());
-        assert_eq!(query.replicas, 2);
+        assert_eq!(effective.active_replicas(&builtin::query_vector()), 3);
+        assert!((query.activation_ratio.as_f64() - 0.6667).abs() < 0.001);
         assert_eq!(query.tier, ModelTier::Default);
-        assert_eq!(query.period, Some(Duration::from_millis(20)));
-        assert_eq!(query.context_budget, TokenBudget::new(2000));
-        assert_eq!(effective.for_module(&builtin::speak()).replicas, 1);
+        assert_eq!(
+            query.guidance,
+            "attention-controller: query cheaply\nattention-controller[1]: query deeply"
+        );
+        assert_eq!(effective.active_replicas(&builtin::speak()), 1);
     }
 
     #[tokio::test]
@@ -552,14 +552,14 @@ mod tests {
         base.set(
             builtin::attention_controller(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::from_f64(0.5),
                 ..Default::default()
             },
         );
         base.set(
             builtin::speak(),
             crate::ModuleConfig {
-                replicas: 0,
+                activation_ratio: crate::ActivationRatio::ZERO,
                 ..Default::default()
             },
         );
@@ -580,7 +580,7 @@ mod tests {
         active.set(
             builtin::speak(),
             crate::ModuleConfig {
-                replicas: 0,
+                activation_ratio: crate::ActivationRatio::ZERO,
                 ..Default::default()
             },
         );
@@ -589,7 +589,7 @@ mod tests {
         inactive.set(
             builtin::speak(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::ONE,
                 ..Default::default()
             },
         );
@@ -612,7 +612,7 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        assert_eq!(effective.for_module(&builtin::speak()).replicas, 0);
+        assert_eq!(effective.active_replicas(&builtin::speak()), 0);
     }
 
     #[tokio::test]
@@ -621,7 +621,7 @@ mod tests {
         base.set(
             builtin::attention_controller(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::ONE,
                 ..Default::default()
             },
         );
@@ -639,10 +639,9 @@ mod tests {
         proposal.set(
             unknown.clone(),
             crate::ModuleConfig {
-                replicas: 1,
+                activation_ratio: crate::ActivationRatio::ONE,
+                guidance: "ignore me".into(),
                 tier: ModelTier::Premium,
-                period: Some(Duration::from_millis(10)),
-                context_budget: TokenBudget::new(1234),
             },
         );
 
@@ -654,5 +653,25 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         assert!(effective.get(&unknown).is_none());
+    }
+
+    #[test]
+    fn activation_ratio_respects_cap_range_min_and_max() {
+        let range = ReplicaCapRange { min: 1, max: 3 };
+
+        assert_eq!(crate::ActivationRatio::ZERO.active_replicas(range), 1);
+        assert_eq!(
+            crate::ActivationRatio::from_f64(0.01).active_replicas(range),
+            1
+        );
+        assert_eq!(
+            crate::ActivationRatio::from_f64(0.5).active_replicas(range),
+            2
+        );
+        assert_eq!(crate::ActivationRatio::ONE.active_replicas(range), 3);
+        assert_eq!(
+            crate::ActivationRatio::ONE.active_replicas(ReplicaCapRange { min: 0, max: 0 }),
+            0
+        );
     }
 }

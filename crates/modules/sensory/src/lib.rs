@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, LlmAccess, Memo, Module, SensoryInput, SensoryInputInbox, ports::Clock,
+    ActivationGate, AllocationReader, LlmAccess, Memo, Module, SensoryInput, SensoryInputInbox,
+    ports::Clock,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,7 @@ struct StimulusState {
 pub struct SensoryModule {
     inbox: SensoryInputInbox,
     gate: ActivationGate,
+    allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
     llm: LlmAccess,
@@ -70,6 +72,7 @@ impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
         gate: ActivationGate,
+        allocation: AllocationReader,
         memo: Memo,
         clock: Arc<dyn Clock>,
         llm: LlmAccess,
@@ -77,6 +80,7 @@ impl SensoryModule {
         Self {
             inbox,
             gate,
+            allocation,
             memo,
             clock,
             llm,
@@ -133,6 +137,7 @@ impl SensoryModule {
         let relative_age = Self::format_age(now, observed_at);
         let salience =
             self.salience_features(kind, direction.as_deref(), &raw_content, observed_at);
+        let allocation = self.allocation.snapshot().await;
 
         let prompt = serde_json::json!({
             "kind": kind,
@@ -140,6 +145,7 @@ impl SensoryModule {
             "content": raw_content,
             "relative_age": relative_age,
             "salience": salience,
+            "allocation": allocation,
         });
 
         let lutum = self.llm.lutum().await;

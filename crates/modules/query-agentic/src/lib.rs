@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
 use nuillu_module::{
-    ActivationGate, BlackboardReader, FileSearcher, LlmAccess, Memo, Module, PeriodicInbox,
-    QueryInbox, QueryRequest, ports::FileSearchQuery,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher,
+    LlmAccess, Memo, Module, QueryInbox, QueryRequest, ports::FileSearchQuery,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -73,8 +73,9 @@ pub enum QueryAgenticTools {
 
 pub struct QueryAgenticModule {
     query: QueryInbox,
-    periodic: PeriodicInbox,
+    allocation_updates: AllocationUpdatedInbox,
     gate: ActivationGate,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     files: FileSearcher,
     memo: Memo,
@@ -84,8 +85,9 @@ pub struct QueryAgenticModule {
 impl QueryAgenticModule {
     pub fn new(
         query: QueryInbox,
-        periodic: PeriodicInbox,
+        allocation_updates: AllocationUpdatedInbox,
         gate: ActivationGate,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         files: FileSearcher,
         memo: Memo,
@@ -93,8 +95,9 @@ impl QueryAgenticModule {
     ) -> Self {
         Self {
             query,
-            periodic,
+            allocation_updates,
             gate,
+            allocation,
             blackboard,
             files,
             memo,
@@ -120,8 +123,8 @@ impl QueryAgenticModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_periodic(&self) -> Result<()> {
-        let question = "Review current blackboard state for useful file context.";
+    async fn activate_guidance(&self) -> Result<()> {
+        let question = "Act on current allocation guidance for useful file context.";
         let (answers, hits) = self.answer_batch_with_files(&[question.to_owned()]).await?;
         self.write_result(QueryAgenticBatchResultMemo {
             answers,
@@ -151,6 +154,7 @@ impl QueryAgenticModule {
                 })
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
         session.push_system(SYSTEM_PROMPT);
@@ -158,6 +162,7 @@ impl QueryAgenticModule {
             serde_json::json!({
                 "questions": questions,
                 "blackboard": snapshot,
+                "allocation": allocation,
             })
             .to_string(),
         );
@@ -231,8 +236,8 @@ impl QueryAgenticModule {
             if !batch.queries.is_empty() {
                 self.handle_queries(batch.queries).await?;
             }
-            if batch.periodic {
-                self.activate_periodic().await?;
+            if batch.guidance {
+                self.activate_guidance().await?;
             }
         }
     }

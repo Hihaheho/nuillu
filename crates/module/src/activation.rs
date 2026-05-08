@@ -28,9 +28,10 @@ impl ActivationGate {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
-    use nuillu_blackboard::{Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{
+        ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation,
+    };
     use nuillu_types::{ModelTier, ModuleId};
     use tokio::sync::Mutex;
     use tokio::task::LocalSet;
@@ -46,9 +47,8 @@ mod tests {
         alloc.set(
             ticker_id(),
             ModuleConfig {
-                replicas: 1,
+                activation_ratio: ActivationRatio::ONE,
                 tier: ModelTier::Default,
-                period: Some(Duration::from_millis(10)),
                 ..Default::default()
             },
         );
@@ -66,7 +66,7 @@ mod tests {
                 alloc.set(
                     ticker_id(),
                     ModuleConfig {
-                        replicas: 0,
+                        activation_ratio: ActivationRatio::ZERO,
                         ..Default::default()
                     },
                 );

@@ -252,6 +252,9 @@ pub struct AttentionStreamUpdated {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AllocationUpdated;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoUpdated {
     pub owner: ModuleInstanceId,
 }
@@ -264,6 +267,8 @@ pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
 pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
 pub type AttentionStreamUpdatedMailbox = TopicMailbox<AttentionStreamUpdated>;
 pub type AttentionStreamUpdatedInbox = TopicInbox<AttentionStreamUpdated>;
+pub type AllocationUpdatedMailbox = TopicMailbox<AllocationUpdated>;
+pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;
 pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 
@@ -288,8 +293,8 @@ pub type SensoryInputInbox = TopicInbox<SensoryInput>;
 mod tests {
     use super::*;
 
-    use nuillu_blackboard::{ModuleConfig, ResourceAllocation};
-    use nuillu_types::builtin;
+    use nuillu_blackboard::{ActivationRatio, ModuleConfig, ResourceAllocation};
+    use nuillu_types::{ReplicaCapRange, builtin};
 
     use crate::test_support::{scoped, test_caps};
 
@@ -363,17 +368,21 @@ mod tests {
         alloc.set(
             builtin::query_vector(),
             ModuleConfig {
-                replicas: 2,
+                activation_ratio: ActivationRatio::ONE,
                 ..Default::default()
             },
         );
         alloc.set(
             builtin::query_agentic(),
             ModuleConfig {
-                replicas: 1,
+                activation_ratio: ActivationRatio::ONE,
                 ..Default::default()
             },
         );
+        let alloc = alloc.clamped(&std::collections::HashMap::from([
+            (builtin::query_vector(), ReplicaCapRange { min: 0, max: 2 }),
+            (builtin::query_agentic(), ReplicaCapRange { min: 0, max: 1 }),
+        ]));
         let caps = test_caps(Blackboard::with_allocation(alloc));
         let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
         let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
@@ -404,10 +413,14 @@ mod tests {
         alloc.set(
             builtin::query_vector(),
             ModuleConfig {
-                replicas: 1,
+                activation_ratio: ActivationRatio::from_f64(0.5),
                 ..Default::default()
             },
         );
+        let alloc = alloc.clamped(&std::collections::HashMap::from([(
+            builtin::query_vector(),
+            ReplicaCapRange { min: 0, max: 2 },
+        )]));
         let caps = test_caps(Blackboard::with_allocation(alloc));
         let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
         let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();

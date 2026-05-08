@@ -77,61 +77,24 @@ pub async fn run(
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     use async_trait::async_trait;
     use nuillu_blackboard::{Blackboard, ModuleConfig, ResourceAllocation};
-    use nuillu_module::{
-        AttentionWriter, Memo, Module, ModuleRegistry, PeriodicInbox, QueryInbox, QueryMailbox,
-        QueryRequest,
-    };
+    use nuillu_module::{AttentionWriter, Memo, Module, ModuleRegistry, QueryInbox, QueryRequest};
     use nuillu_types::{ModelTier, ModuleId, builtin};
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    use crate::AgentEventLoop;
     use crate::testing::test_caps;
-
-    fn ticker_id() -> ModuleId {
-        ModuleId::new("ticker").unwrap()
-    }
 
     fn echo_id() -> ModuleId {
         ModuleId::new("echo").unwrap()
     }
 
-    struct TickerModule {
-        periodic: PeriodicInbox,
-        memo: Memo,
-        query_mailbox: QueryMailbox,
-        target_ticks: u32,
-        on_done: Option<oneshot::Sender<()>>,
-    }
-
-    #[async_trait(?Send)]
-    impl Module for TickerModule {
-        async fn run(&mut self) {
-            let mut counter: u32 = 0;
-            while self.periodic.next_tick().await.is_ok() {
-                counter += 1;
-                self.memo.write(format!("sent {counter} pings")).await;
-                let _ = self
-                    .query_mailbox
-                    .publish(QueryRequest::new(format!("ping {counter}")))
-                    .await;
-                if counter >= self.target_ticks
-                    && let Some(tx) = self.on_done.take()
-                {
-                    let _ = tx.send(());
-                }
-            }
-        }
-    }
-
     struct EchoModule {
         query_inbox: QueryInbox,
         memo: Memo,
+        on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
@@ -141,93 +104,67 @@ mod tests {
                 self.memo
                     .write(format!("echoed {}", env.body.question))
                     .await;
+                if let Some(tx) = self.on_done.take() {
+                    let _ = tx.send(());
+                }
             }
         }
     }
 
     struct SummarizeStub {
-        periodic: PeriodicInbox,
         writer: AttentionWriter,
-        fired: Arc<Mutex<bool>>,
+        on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
     impl Module for SummarizeStub {
         async fn run(&mut self) {
-            while self.periodic.next_tick().await.is_ok() {
-                let mut fired = self.fired.lock().await;
-                if *fired {
-                    continue;
-                }
-                *fired = true;
-                self.writer.append("novel-event").await;
+            self.writer.append("novel-event").await;
+            if let Some(tx) = self.on_done.take() {
+                let _ = tx.send(());
             }
         }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn typed_query_fanout_and_periodic_capabilities_work_together() {
+    async fn typed_query_fanout_reaches_active_module() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
-                    ticker_id(),
-                    ModuleConfig {
-                        replicas: 1,
-                        tier: ModelTier::Default,
-                        period: Some(Duration::from_millis(20)),
-                        ..Default::default()
-                    },
-                );
-                alloc.set(
                     echo_id(),
                     ModuleConfig {
-                        replicas: 1,
+                        activation_ratio: nuillu_blackboard::ActivationRatio::ONE,
                         tier: ModelTier::Default,
-                        period: None,
                         ..Default::default()
                     },
                 );
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
-                let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
-
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(ticker_id(), 0..=1, {
+                    .register(echo_id(), 0..=1, {
                         let done_tx = Rc::clone(&done_tx);
-                        move |caps| {
-                            let done_tx = done_tx
-                                .borrow_mut()
-                                .take()
-                                .expect("ticker module should be built once");
-                            TickerModule {
-                                periodic: caps.periodic_inbox(),
-                                memo: caps.memo(),
-                                query_mailbox: caps.query_mailbox(),
-                                target_ticks: 3,
-                                on_done: Some(done_tx),
-                            }
+                        move |caps| EchoModule {
+                            query_inbox: caps.query_inbox(),
+                            memo: caps.memo(),
+                            on_done: done_tx.borrow_mut().take(),
                         }
-                    })
-                    .unwrap()
-                    .register(echo_id(), 0..=1, |caps| EchoModule {
-                        query_inbox: caps.query_inbox(),
-                        memo: caps.memo(),
                     })
                     .unwrap()
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().query_mailbox();
 
                 super::run(modules, async move {
-                    for _ in 0..3 {
-                        event_loop.tick(Duration::from_millis(20)).await;
-                        tokio::task::yield_now().await;
-                    }
+                    mailbox
+                        .publish(QueryRequest::new("ping"))
+                        .await
+                        .expect("query should route to echo");
                     let _ = done_rx.await;
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
@@ -238,20 +175,12 @@ mod tests {
 
                 blackboard
                     .read(|bb| {
-                        let ticker_memo = bb.memo(&ticker_id()).expect("ticker memo missing");
                         let echo_memo = bb.memo(&echo_id()).expect("echo memo missing");
-                        assert!(
-                            ticker_memo.starts_with("sent "),
-                            "unexpected ticker memo: {ticker_memo}",
-                        );
-                        assert!(
-                            echo_memo.starts_with("echoed ping "),
-                            "unexpected echo memo: {echo_memo}",
-                        );
+                        assert_eq!(echo_memo, "echoed ping");
                         assert_eq!(
                             bb.attention_stream().len(),
                             0,
-                            "neither test module holds AttentionWriter",
+                            "echo does not hold AttentionWriter",
                         );
                     })
                     .await;
@@ -268,25 +197,22 @@ mod tests {
                 alloc.set(
                     builtin::summarize(),
                     ModuleConfig {
-                        replicas: 1,
+                        activation_ratio: nuillu_blackboard::ActivationRatio::ONE,
                         tier: ModelTier::Default,
-                        period: Some(Duration::from_millis(15)),
                         ..Default::default()
                     },
                 );
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
-                let mut event_loop = AgentEventLoop::new(caps.periodic_activation());
-
-                let fired = Arc::new(Mutex::new(false));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(builtin::summarize(), 0..=1, {
-                        let fired = fired.clone();
+                        let done_tx = Rc::clone(&done_tx);
                         move |caps| SummarizeStub {
-                            periodic: caps.periodic_inbox(),
                             writer: caps.attention_writer(),
-                            fired: fired.clone(),
+                            on_done: done_tx.borrow_mut().take(),
                         }
                     })
                     .unwrap()
@@ -295,13 +221,7 @@ mod tests {
                     .unwrap();
 
                 super::run(modules, async move {
-                    event_loop.tick(Duration::from_millis(15)).await;
-                    for _ in 0..10 {
-                        if *fired.lock().await {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
+                    let _ = done_rx.await;
                 })
                 .await
                 .expect("scheduler returned err");

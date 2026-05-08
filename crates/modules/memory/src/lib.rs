@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    ActivationGate, BlackboardReader, LlmAccess, MemoryRequest, MemoryRequestInbox, MemoryWriter,
-    Module, PeriodicInbox,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess,
+    MemoryRequest, MemoryRequestInbox, MemoryWriter, Module,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
@@ -14,7 +14,7 @@ mod batch;
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
 Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
 MemoryRequest messages are candidates from other modules, not write commands. Evaluate them before
-any periodic scan work. You may reject, normalize, or merge candidates, including deduplicating
+any allocation-guidance scan work. You may reject, normalize, or merge candidates, including deduplicating
 multiple requests in the same batch. Use insert_memory only for concrete information likely to
 matter later."#;
 
@@ -40,9 +40,10 @@ pub enum MemoryTools {
 }
 
 pub struct MemoryModule {
-    periodic: PeriodicInbox,
+    allocation_updates: AllocationUpdatedInbox,
     requests: MemoryRequestInbox,
     gate: ActivationGate,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: MemoryWriter,
     llm: LlmAccess,
@@ -50,17 +51,19 @@ pub struct MemoryModule {
 
 impl MemoryModule {
     pub fn new(
-        periodic: PeriodicInbox,
+        allocation_updates: AllocationUpdatedInbox,
         requests: MemoryRequestInbox,
         gate: ActivationGate,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: MemoryWriter,
         llm: LlmAccess,
     ) -> Self {
         Self {
-            periodic,
+            allocation_updates,
             requests,
             gate,
+            allocation,
             blackboard,
             memory,
             llm,
@@ -68,8 +71,8 @@ impl MemoryModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self, requests: Vec<MemoryRequest>, periodic_scan: bool) -> Result<()> {
-        if requests.is_empty() && !periodic_scan {
+    async fn activate(&self, requests: Vec<MemoryRequest>, guidance_scan: bool) -> Result<()> {
+        if requests.is_empty() && !guidance_scan {
             return Ok(());
         }
         let snapshot = self
@@ -82,6 +85,7 @@ impl MemoryModule {
                 })
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
@@ -89,8 +93,9 @@ impl MemoryModule {
         session.push_user(
             serde_json::json!({
                 "blackboard": snapshot,
+                "allocation": allocation,
                 "memory_requests": requests,
-                "periodic_scan": periodic_scan,
+                "guidance_scan": guidance_scan,
                 "request_policy": {
                     "normal_request_default_decay_secs": NORMAL_REQUEST_DECAY_SECS,
                     "high_request_default_decay_secs": HIGH_REQUEST_DECAY_SECS,
@@ -148,7 +153,7 @@ impl MemoryModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             let batch = self.next_batch().await?;
-            self.activate(batch.requests, batch.periodic).await?;
+            self.activate(batch.requests, batch.guidance).await?;
         }
     }
 }
@@ -313,9 +318,10 @@ mod tests {
             .unwrap()
             .register(builtin::memory(), 0..=1, |caps| {
                 MemoryModule::new(
-                    caps.periodic_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.memory_request_inbox(),
                     caps.activation_gate(),
+                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memory_writer(),
                     caps.llm_access(),

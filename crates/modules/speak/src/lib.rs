@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use lutum::{Session, StructuredTurnOutcome, TextTurnEvent};
 use nuillu_module::{
-    ActivationGate, AttentionReader, AttentionStreamUpdatedInbox, LlmAccess, Memo, Module,
-    PeriodicInbox, UtteranceWriter,
+    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader,
+    AttentionStreamUpdatedInbox, LlmAccess, Memo, Module, UtteranceWriter,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,15 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const DECISION_PROMPT: &str = r#"You are the speak module.
-Read only the current cognitive attention-stream set. Decide whether a user-visible utterance is
-warranted right now. Do not inspect memos, route work, write attention, or change allocation.
+Read only the current cognitive attention-stream set and allocation guidance. Decide whether a
+user-visible utterance is warranted right now. If guidance says summary/query work is still needed
+or the attention stream lacks answer-ready content, wait silently and explain the wait in rationale.
+Do not inspect memos, route work, write attention, or change allocation.
 Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
-Generate concise user-visible text from the current cognitive attention-stream set. Use only the
-provided attention context and the generation hint. If partial_utterance is present, continue that
+Generate concise user-visible text from the current cognitive attention-stream set and allocation
+guidance. Use only the provided attention context and the generation hint. If partial_utterance is present, continue that
 utterance from exactly where it stopped; do not repeat, rewrite, or replace the already emitted
 partial text. Do not mention hidden state or unavailable module results."#;
 
@@ -62,10 +64,12 @@ impl GenerationDraft {
 
 fn generation_input(
     attention_json: serde_json::Value,
+    allocation_json: serde_json::Value,
     draft: &GenerationDraft,
 ) -> serde_json::Value {
     let mut input = serde_json::json!({
         "attention_streams": attention_json,
+        "allocation": allocation_json,
         "generation_hint": draft.generation_hint.as_deref(),
     });
     if !draft.accumulated.is_empty() {
@@ -76,9 +80,10 @@ fn generation_input(
 
 pub struct SpeakModule {
     updates: AttentionStreamUpdatedInbox,
-    periodic: Option<PeriodicInbox>,
+    allocation_updates: AllocationUpdatedInbox,
     gate: ActivationGate,
     attention: AttentionReader,
+    allocation: AllocationReader,
     memo: Memo,
     utterance: UtteranceWriter,
     llm: LlmAccess,
@@ -87,18 +92,20 @@ pub struct SpeakModule {
 impl SpeakModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
-        periodic: Option<PeriodicInbox>,
+        allocation_updates: AllocationUpdatedInbox,
         gate: ActivationGate,
         attention: AttentionReader,
+        allocation: AllocationReader,
         memo: Memo,
         utterance: UtteranceWriter,
         llm: LlmAccess,
     ) -> Self {
         Self {
             updates,
-            periodic,
+            allocation_updates,
             gate,
             attention,
+            allocation,
             memo,
             utterance,
             llm,
@@ -109,6 +116,8 @@ impl SpeakModule {
     async fn activate(&mut self) -> Result<()> {
         let attention = self.attention.snapshot().await;
         let mut attention_json = attention.compact_json();
+        let mut allocation_json = serde_json::to_value(self.allocation.snapshot().await)
+            .context("serialize allocation for speak decision")?;
 
         let lutum = self.llm.lutum().await;
         let mut decision_session = Session::new(lutum.clone());
@@ -116,6 +125,7 @@ impl SpeakModule {
         decision_session.push_user(
             serde_json::json!({
                 "attention_streams": attention_json,
+                "allocation": allocation_json,
             })
             .to_string(),
         );
@@ -142,23 +152,28 @@ impl SpeakModule {
         );
 
         loop {
-            let interrupted = self.stream_generation(attention_json, &mut draft).await?;
+            let interrupted = self
+                .stream_generation(attention_json, allocation_json, &mut draft)
+                .await?;
             if !interrupted {
                 return Ok(());
             }
             attention_json = self.attention.snapshot().await.compact_json();
+            allocation_json = serde_json::to_value(self.allocation.snapshot().await)
+                .context("serialize allocation for speak restart")?;
         }
     }
 
     async fn stream_generation(
         &mut self,
         attention_json: serde_json::Value,
+        allocation_json: serde_json::Value,
         draft: &mut GenerationDraft,
     ) -> Result<bool> {
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
         session.push_system(GENERATION_PROMPT);
-        session.push_user(generation_input(attention_json, draft).to_string());
+        session.push_user(generation_input(attention_json, allocation_json, draft).to_string());
 
         let mut stream = session
             .text_turn()
@@ -199,6 +214,13 @@ impl SpeakModule {
                 update = self.updates.next_item() => {
                     let _ = update?;
                     let _ = self.updates.take_ready_items()?;
+                    let _ = self.allocation_updates.take_ready_items()?;
+                    return Ok(true);
+                }
+                update = self.allocation_updates.next_item() => {
+                    let _ = update?;
+                    let _ = self.allocation_updates.take_ready_items()?;
+                    let _ = self.updates.take_ready_items()?;
                     return Ok(true);
                 }
             }
@@ -221,7 +243,11 @@ mod tests {
     fn fresh_generation_omits_partial_utterance() {
         let draft = GenerationDraft::new(7, Some("be concise".into()), "respond".into());
 
-        let input = generation_input(serde_json::json!({"streams": []}), &draft);
+        let input = generation_input(
+            serde_json::json!({"streams": []}),
+            serde_json::json!({"speak": {"guidance": "respond"}}),
+            &draft,
+        );
 
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
@@ -235,7 +261,11 @@ mod tests {
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        let input = generation_input(serde_json::json!({"streams": []}), &draft);
+        let input = generation_input(
+            serde_json::json!({"streams": []}),
+            serde_json::json!({"speak": {"guidance": "respond"}}),
+            &draft,
+        );
 
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);

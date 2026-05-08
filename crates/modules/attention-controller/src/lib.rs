@@ -1,25 +1,25 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
-use nuillu_blackboard::ModuleConfig;
+use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationWriter, AttentionReader,
-    AttentionStreamUpdatedInbox, LlmAccess, Memo, Module, PeriodicInbox,
+    ActivationGate, AllocationReader, AllocationWriter, AttentionReader, BlackboardReader,
+    LlmAccess, Memo, MemoUpdatedInbox, Module,
 };
-use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, TokenBudget};
+use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
-You may only use the attention stream and current allocation. Return conservative patches for
-module replica count, cadence, tier, and context budget. Do not invent module ids.
-Every patch field must be present; use null for optional fields you are not changing.
+You wake only on memo updates. Use blackboard memos, the attention stream, current allocation,
+and registry schema to write guidance-based allocation for registered modules.
+Return one allocation entry for every registered module. Use guidance to tell modules what work
+should be done now and what other module work should be considered. Do not invent module ids.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 tokio::task_local! {
@@ -29,7 +29,7 @@ tokio::task_local! {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllocationDecision {
     pub memo: String,
-    pub patches: Vec<AllocationPatch>,
+    pub allocations: Vec<AllocationEntry>,
 }
 
 impl JsonSchema for AllocationDecision {
@@ -53,19 +53,17 @@ impl JsonSchema for AllocationDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct AllocationPatch {
+pub struct AllocationEntry {
     pub module_id: String,
-    pub replicas: Option<u8>,
-    pub tier: Option<ModelTier>,
-    pub period_ms: Option<u64>,
-    pub message_only: bool,
-    pub context_budget_tokens: Option<u32>,
+    pub activation_ratio: f64,
+    pub guidance: String,
+    pub tier: ModelTier,
 }
 
 pub struct AttentionControllerModule {
-    updates: AttentionStreamUpdatedInbox,
-    periodic: Option<PeriodicInbox>,
+    updates: MemoUpdatedInbox,
     gate: ActivationGate,
+    blackboard: BlackboardReader,
     attention: AttentionReader,
     allocation_reader: AllocationReader,
     allocation_writer: AllocationWriter,
@@ -75,9 +73,9 @@ pub struct AttentionControllerModule {
 
 impl AttentionControllerModule {
     pub fn new(
-        updates: AttentionStreamUpdatedInbox,
-        periodic: Option<PeriodicInbox>,
+        updates: MemoUpdatedInbox,
         gate: ActivationGate,
+        blackboard: BlackboardReader,
         attention: AttentionReader,
         allocation_reader: AllocationReader,
         allocation_writer: AllocationWriter,
@@ -86,8 +84,8 @@ impl AttentionControllerModule {
     ) -> Self {
         Self {
             updates,
-            periodic,
             gate,
+            blackboard,
             attention,
             allocation_reader,
             allocation_writer,
@@ -100,6 +98,7 @@ impl AttentionControllerModule {
     async fn activate(&self) -> Result<()> {
         Self::activate_with(
             &self.attention,
+            &self.blackboard,
             &self.allocation_reader,
             &self.allocation_writer,
             &self.memo,
@@ -111,6 +110,7 @@ impl AttentionControllerModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_with(
         attention_reader: &AttentionReader,
+        blackboard_reader: &BlackboardReader,
         allocation_reader: &AllocationReader,
         allocation_writer: &AllocationWriter,
         memo: &Memo,
@@ -118,6 +118,14 @@ impl AttentionControllerModule {
     ) -> Result<()> {
         let attention = attention_reader
             .read(|stream| stream.entries().to_vec())
+            .await;
+        let blackboard = blackboard_reader
+            .read(|bb| {
+                serde_json::json!({
+                    "memos": bb.memos(),
+                    "memory_metadata": bb.memory_metadata(),
+                })
+            })
             .await;
         let current = allocation_reader.snapshot().await;
         let controller_schema = allocation_reader.controller_schema_json().await;
@@ -131,6 +139,7 @@ impl AttentionControllerModule {
         session.push_user(
             serde_json::json!({
                 "attention_stream": attention,
+                "blackboard": blackboard,
                 "allocation": current,
                 "controller_schema": controller_schema,
             })
@@ -177,30 +186,19 @@ fn apply_decision(
     decision: AllocationDecision,
 ) -> AppliedDecision {
     let mut next = current;
-    for patch in decision.patches {
-        let Ok(id) = ModuleId::new(patch.module_id) else {
+    for entry in decision.allocations {
+        let Ok(id) = ModuleId::new(entry.module_id) else {
             tracing::warn!("attention-controller ignored invalid module id");
             continue;
         };
-        let Some(range) = caps.get(&id) else {
+        let Some(_range) = caps.get(&id) else {
             tracing::warn!(module = %id, "attention-controller ignored unregistered module id");
             continue;
         };
         let mut config: ModuleConfig = next.for_module(&id);
-        if let Some(replicas) = patch.replicas {
-            config.replicas = range.clamp(replicas);
-        }
-        if let Some(tier) = patch.tier {
-            config.tier = tier;
-        }
-        if patch.message_only {
-            config.period = None;
-        } else if let Some(ms) = patch.period_ms {
-            config.period = Some(Duration::from_millis(ms));
-        }
-        if let Some(tokens) = patch.context_budget_tokens {
-            config.context_budget = TokenBudget::new(tokens);
-        }
+        config.activation_ratio = ActivationRatio::from_f64(entry.activation_ratio);
+        config.guidance = entry.guidance;
+        config.tier = entry.tier;
         next.set(id, config);
     }
 
@@ -218,12 +216,12 @@ fn fallback_allocation_decision_schema() -> Schema {
             "memo": {
                 "type": "string",
             },
-            "patches": {
+            "allocations": {
                 "type": "array",
                 "items": false,
             },
         },
-        "required": ["memo", "patches"],
+        "required": ["memo", "allocations"],
     }))
     .expect("fallback allocation decision schema must be a JSON object")
 }
@@ -236,7 +234,7 @@ mod tests {
     use nuillu_types::builtin;
 
     #[test]
-    fn apply_decision_ignores_unregistered_modules_and_clamps_replicas() {
+    fn apply_decision_ignores_unregistered_modules_and_clamps_activation_ratio() {
         let mut caps = HashMap::new();
         caps.insert(builtin::speak(), ReplicaCapRange { min: 0, max: 1 });
 
@@ -245,22 +243,18 @@ mod tests {
             &caps,
             AllocationDecision {
                 memo: "checked".into(),
-                patches: vec![
-                    AllocationPatch {
+                allocations: vec![
+                    AllocationEntry {
                         module_id: "invented-module".into(),
-                        replicas: Some(1),
-                        tier: Some(ModelTier::Premium),
-                        period_ms: Some(1),
-                        message_only: false,
-                        context_budget_tokens: Some(1),
+                        activation_ratio: 1.0,
+                        guidance: "ignore".into(),
+                        tier: ModelTier::Premium,
                     },
-                    AllocationPatch {
+                    AllocationEntry {
                         module_id: "speak".into(),
-                        replicas: Some(9),
-                        tier: None,
-                        period_ms: None,
-                        message_only: true,
-                        context_budget_tokens: None,
+                        activation_ratio: 9.0,
+                        guidance: "respond from attention when ready".into(),
+                        tier: ModelTier::Premium,
                     },
                 ],
             },
@@ -274,8 +268,9 @@ mod tests {
                 .is_none()
         );
         let speak = applied.allocation.for_module(&builtin::speak());
-        assert_eq!(speak.replicas, 1);
-        assert_eq!(speak.period, None);
+        assert_eq!(speak.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(speak.guidance, "respond from attention when ready");
+        assert_eq!(speak.tier, ModelTier::Premium);
     }
 }
 

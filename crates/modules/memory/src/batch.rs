@@ -6,26 +6,26 @@ use crate::MemoryModule;
 #[derive(Debug, Default)]
 pub(crate) struct NextBatch {
     pub(crate) requests: Vec<MemoryRequest>,
-    pub(crate) periodic: bool,
+    pub(crate) guidance: bool,
 }
 
 impl NextBatch {
-    fn periodic() -> Self {
+    fn guidance() -> Self {
         Self {
             requests: Vec::new(),
-            periodic: true,
+            guidance: true,
         }
     }
 
     fn request(request: MemoryRequest) -> Option<Self> {
         Some(Self {
             requests: vec![Self::accepted_request(request)?],
-            periodic: false,
+            guidance: false,
         })
     }
 
-    fn mark_periodic(&mut self) {
-        self.periodic = true;
+    fn mark_guidance(&mut self) {
+        self.guidance = true;
     }
 
     fn accepted_request(request: MemoryRequest) -> Option<MemoryRequest> {
@@ -55,9 +55,9 @@ impl MemoryModule {
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
         loop {
             let batch = tokio::select! {
-                tick = self.periodic.next_tick() => {
-                    tick?;
-                    NextBatch::periodic()
+                update = self.allocation_updates.next_item() => {
+                    let _ = update?;
+                    NextBatch::guidance()
                 }
                 request = self.requests.next_item() => {
                     let envelope = request?;
@@ -77,8 +77,8 @@ impl MemoryModule {
             batch.push_request(envelope.body);
         }
 
-        if self.periodic.take_ready_ticks()? > 0 {
-            batch.mark_periodic();
+        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_guidance();
         }
 
         Ok(())
@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_memory_requests_are_not_actionable_without_periodic_work() {
+    fn empty_memory_requests_are_not_actionable_without_guidance_work() {
         assert!(NextBatch::request(request("  ")).is_none());
     }
 
@@ -118,12 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn periodic_scan_survives_empty_request_filtering() {
-        let mut batch = NextBatch::periodic();
+    fn guidance_scan_survives_empty_request_filtering() {
+        let mut batch = NextBatch::guidance();
         batch.push_request(request(""));
-        batch.mark_periodic();
+        batch.mark_guidance();
 
-        assert!(batch.periodic);
+        assert!(batch.guidance);
         assert!(batch.requests.is_empty());
     }
 }

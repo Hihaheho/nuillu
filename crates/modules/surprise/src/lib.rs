@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
-    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
+    ActivationGate, AllocationReader, AttentionReader, AttentionStreamUpdatedInbox,
+    BlackboardReader, LlmAccess, Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox,
+    Module,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -48,6 +49,7 @@ pub struct SurpriseModule {
     updates: AttentionStreamUpdatedInbox,
     gate: ActivationGate,
     attention: AttentionReader,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory_requests: MemoryRequestMailbox,
     memo: Memo,
@@ -59,6 +61,7 @@ impl SurpriseModule {
         updates: AttentionStreamUpdatedInbox,
         gate: ActivationGate,
         attention: AttentionReader,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory_requests: MemoryRequestMailbox,
         memo: Memo,
@@ -68,6 +71,7 @@ impl SurpriseModule {
             updates,
             gate,
             attention,
+            allocation,
             blackboard,
             memory_requests,
             memo,
@@ -94,6 +98,7 @@ impl SurpriseModule {
                 )
             })
             .await;
+        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
@@ -103,6 +108,7 @@ impl SurpriseModule {
                 "recent_attention": recent_attention,
                 "predict_memo": predict_memo,
                 "memos": memos,
+                "allocation": allocation,
             })
             .to_string(),
         );
