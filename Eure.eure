@@ -6,6 +6,10 @@ $schema = "https://eure.dev/v0.1.7/schemas/eure-config.schema.eure"
 globs = ["eval-cases/full-agent/**/*.eure"]
 schema = "schemas/eval-full-agent-case.schema.eure"
 
+@ targets.eval-full-agent-last-state
+globs = [".tmp/eval/**/last-state.eure"]
+schema = "schemas/eval-full-agent-last-state.schema.eure"
+
 @ targets.eval-query-vector-cases
 globs = ["eval-cases/modules/query-vector/**/*.eure"]
 schema = "schemas/eval-query-vector-case.schema.eure"

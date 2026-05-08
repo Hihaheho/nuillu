@@ -1,0 +1,105 @@
+/// Schema for full-agent eval last-state.eure output files.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+case = `$types.full-agent-last-state-case`
+blackboard = `$types.blackboard-last-state`
+memory = `$types.memory-last-state`
+utterances = [`$types.utterance`]
+
+@ $types.full-agent-last-state-case
+id {
+  $variant: text
+  min-length = 1
+}
+dumped-at = `text`
+event-count = `integer`
+output = `text`
+output.$optional = true
+failure = `text`
+failure.$optional = true
+
+@ $types.blackboard-last-state
+memos = [`$types.memo`]
+attention-streams = [`$types.attention-stream`]
+agentic-deadlock = `$types.agentic-deadlock`
+agentic-deadlock.$optional = true
+base-allocation = [`$types.allocation-module`]
+allocation = [`$types.allocation-module`]
+allocation-proposals = [`$types.allocation-proposal`]
+replica-caps = [`$types.replica-cap`]
+
+@ $types.memo
+module = `text`
+replica = `integer`
+memo = `text`
+
+@ $types.attention-stream
+stream = `$types.module-instance`
+entries = [`$types.attention-entry`]
+
+@ $types.attention-entry
+at = `text`
+text = `text`
+
+@ $types.agentic-deadlock
+at = `text`
+idle-for-ms = `integer`
+
+@ $types.allocation-module
+module = `text`
+activation-ratio = `float`
+active-replicas = `integer`
+tier = `$types.model-tier`
+guidance = `text`
+
+@ $types.allocation-proposal
+controller = `$types.module-instance`
+modules = [`$types.allocation-module`]
+
+@ $types.replica-cap
+module = `text`
+min = `integer`
+max = `integer`
+
+@ $types.module-instance
+module = `text`
+replica = `integer`
+
+@ $types.memory-last-state
+entries = [`$types.memory-entry`]
+
+@ $types.memory-entry
+index = `text`
+content = `text`
+content.$optional = true
+content-rank = `$types.memory-rank`
+content-rank.$optional = true
+metadata = `$types.memory-metadata`
+missing-content = `boolean`
+
+@ $types.memory-metadata
+rank = `$types.memory-rank`
+decay-remaining-secs = `integer`
+remember-tokens = `integer`
+last-accessed = `text`
+access-count = `integer`
+query-history = [`text`]
+
+@ $types.utterance
+sender = `text`
+text = `text`
+emitted-at = `text`
+
+@ $types.memory-rank
+$variant: union
+variants.short-term = { = "short-term", $variant => "literal" }
+variants.mid-term = { = "mid-term", $variant => "literal" }
+variants.long-term = { = "long-term", $variant => "literal" }
+variants.permanent = { = "permanent", $variant => "literal" }
+
+@ $types.model-tier
+$variant: union
+variants.cheap = { = "cheap", $variant => "literal" }
+variants.default = { = "default", $variant => "literal" }
+variants.premium = { = "premium", $variant => "literal" }

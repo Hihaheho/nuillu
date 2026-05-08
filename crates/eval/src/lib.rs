@@ -10,6 +10,7 @@ pub mod evaluation;
 pub mod judge;
 pub mod model_set;
 pub mod runner;
+pub mod state_dump;
 pub mod trace_json;
 
 pub use artifact::CaseArtifact;
@@ -33,5 +34,12 @@ pub use model_set::{
 pub use runner::{
     CaseRunOutput, LlmBackendConfig, RunnerConfig, RunnerError, default_run_id,
     install_lutum_trace_subscriber, run_case_detailed, run_suite,
+};
+pub use state_dump::{
+    AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
+    AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
+    FullAgentLastStateDump, MemoDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
+    ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
+    render_full_agent_last_state_eure,
 };
 pub use trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json};

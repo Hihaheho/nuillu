@@ -529,7 +529,10 @@ fn should_skip_case_file(path: &Path) -> bool {
 }
 
 fn is_persisted_eval_output_file_name(name: &str) -> bool {
-    matches!(name, "result.eure" | "report.eure" | "artifact.eure")
+    matches!(
+        name,
+        "result.eure" | "report.eure" | "artifact.eure" | "last-state.eure"
+    )
 }
 
 fn is_full_agent_case_path(path: &Path) -> bool {

@@ -29,8 +29,8 @@ use nuillu_blackboard::{
     ModuleConfig, ResourceAllocation,
 };
 use nuillu_module::ports::{
-    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, NoopFileSearchProvider,
-    PortError, SystemClock, Utterance, UtteranceSink,
+    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryStore,
+    NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
     CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent, RuntimeEventSink, SensoryInput,
@@ -51,6 +51,12 @@ use crate::{
     evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
     judge::{LlmRubricJudge, RubricJudge},
     model_set::ReasoningEffort,
+    state_dump::{
+        AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
+        AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
+        FullAgentLastStateDump, MemoDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
+        ModuleInstanceDump, ReplicaCapDump, UtteranceDump, render_full_agent_last_state_eure,
+    },
     trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
 };
 
@@ -584,10 +590,19 @@ async fn execute_full_agent_case(
         CaseArtifact::failed("no utterance before max-ticks")
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
-    Ok(CaseExecution {
-        artifact,
-        events: env.events.snapshot(),
-    })
+    let events = env.events.snapshot();
+    let last_state = build_full_agent_last_state_dump(
+        case_id,
+        &artifact,
+        &env.blackboard,
+        env.memory.as_ref(),
+        &env.utterances,
+        events.len(),
+    )
+    .await?;
+    add_last_state_observation(&mut artifact, &last_state)?;
+    write_full_agent_last_state_eure(output_dir, last_state)?;
+    Ok(CaseExecution { artifact, events })
 }
 
 async fn execute_module_case(
@@ -680,6 +695,7 @@ async fn execute_module_case(
 struct EvalEnvironment {
     blackboard: Blackboard,
     caps: CapabilityProviders,
+    memory: Arc<dyn MemoryStore>,
     utterances: Arc<RecordingUtteranceSink>,
     events: Arc<RecordingRuntimeEventSink>,
     clock: Arc<dyn Clock>,
@@ -705,12 +721,12 @@ async fn build_eval_environment(
         reporter.clone(),
     ));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let memory = Arc::new(connect_memory_store(output_dir, config).await?);
+    let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
     let tiers = build_tiers(config)?;
     let caps = CapabilityProviders::new_with_runtime_events(
         blackboard.clone(),
         Arc::new(InMemoryAttentionRepository::new()),
-        memory,
+        memory.clone(),
         Vec::new(),
         file_search,
         utterances.clone(),
@@ -722,6 +738,7 @@ async fn build_eval_environment(
     Ok(EvalEnvironment {
         blackboard,
         caps,
+        memory,
         utterances,
         events,
         clock,
@@ -1242,6 +1259,217 @@ async fn add_observations(
         .insert("agent".to_string(), observations);
 }
 
+async fn build_full_agent_last_state_dump(
+    case_id: &str,
+    artifact: &CaseArtifact,
+    blackboard: &Blackboard,
+    memory: &dyn MemoryStore,
+    utterances: &RecordingUtteranceSink,
+    event_count: usize,
+) -> Result<FullAgentLastStateDump> {
+    let (blackboard_dump, memory_metadata) = blackboard
+        .read(|bb| {
+            (
+                blackboard_last_state_dump(bb),
+                memory_metadata_dump_records(bb),
+            )
+        })
+        .await;
+    let memory_dump = memory_last_state_dump(memory_metadata, memory).await?;
+    Ok(FullAgentLastStateDump {
+        case: FullAgentLastStateCaseDump {
+            id: case_id.to_string(),
+            dumped_at: Utc::now().to_rfc3339(),
+            event_count: event_count as u64,
+            output: (!artifact.output.is_empty()).then(|| DumpText::new(artifact.output.clone())),
+            failure: artifact.failure.clone().map(DumpText::new),
+        },
+        blackboard: blackboard_dump,
+        memory: memory_dump,
+        utterances: utterance_dumps(utterances.snapshot()),
+    })
+}
+
+fn add_last_state_observation(
+    artifact: &mut CaseArtifact,
+    last_state: &FullAgentLastStateDump,
+) -> Result<()> {
+    let value = serde_json::to_value(last_state).context("serialize last state observation")?;
+    artifact
+        .observations
+        .insert("last_state".to_string(), value);
+    Ok(())
+}
+
+fn write_full_agent_last_state_eure(
+    output_dir: &Path,
+    last_state: FullAgentLastStateDump,
+) -> Result<()> {
+    let path = output_dir.join("last-state.eure");
+    let rendered = render_full_agent_last_state_eure(last_state)
+        .context("render full-agent last state Eure")?;
+    std::fs::write(&path, rendered)
+        .with_context(|| format!("write full-agent last state dump to {}", path.display()))
+}
+
+fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
+    let attention_stream_set = bb.attention_stream_set();
+    BlackboardLastStateDump {
+        memos: memo_dumps(bb),
+        attention_streams: attention_stream_set
+            .streams()
+            .iter()
+            .map(|record| AttentionStreamDump {
+                stream: module_instance_dump(&record.stream),
+                entries: record
+                    .entries
+                    .iter()
+                    .map(|event| AttentionEntryDump {
+                        at: event.at.to_rfc3339(),
+                        text: DumpText::new(event.text.clone()),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        agentic_deadlock: attention_stream_set
+            .agentic_deadlock_marker()
+            .map(|marker| AgenticDeadlockDump {
+                at: marker.at.to_rfc3339(),
+                idle_for_ms: duration_millis_u64(marker.idle_for),
+            }),
+        base_allocation: allocation_module_dumps(bb.base_allocation()),
+        allocation: allocation_module_dumps(bb.allocation()),
+        allocation_proposals: allocation_proposal_dumps(bb),
+        replica_caps: replica_cap_dumps(bb),
+    }
+}
+
+fn memo_dumps(bb: &BlackboardInner) -> Vec<MemoDump> {
+    bb.memo_records()
+        .into_iter()
+        .map(|record| MemoDump {
+            module: record.owner.module.as_str().to_owned(),
+            replica: record.owner.replica.get(),
+            memo: DumpText::new(record.memo),
+        })
+        .collect()
+}
+
+fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationModuleDump> {
+    let mut modules = allocation
+        .iter()
+        .map(|(module, config)| AllocationModuleDump {
+            module: module.as_str().to_owned(),
+            activation_ratio: config.activation_ratio.as_f64(),
+            active_replicas: allocation.active_replicas(module),
+            tier: model_tier_name(config.tier).to_owned(),
+            guidance: DumpText::new(config.guidance.clone()),
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| left.module.cmp(&right.module));
+    modules
+}
+
+fn allocation_proposal_dumps(bb: &BlackboardInner) -> Vec<AllocationProposalDump> {
+    let mut proposals = bb
+        .allocation_proposals()
+        .iter()
+        .map(|(controller, proposal)| AllocationProposalDump {
+            controller: module_instance_dump(controller),
+            modules: allocation_module_dumps(proposal),
+        })
+        .collect::<Vec<_>>();
+    proposals.sort_by(|left, right| {
+        left.controller
+            .module
+            .cmp(&right.controller.module)
+            .then_with(|| left.controller.replica.cmp(&right.controller.replica))
+    });
+    proposals
+}
+
+fn replica_cap_dumps(bb: &BlackboardInner) -> Vec<ReplicaCapDump> {
+    let mut caps = bb
+        .replica_caps()
+        .iter()
+        .map(|(module, range)| ReplicaCapDump {
+            module: module.as_str().to_owned(),
+            min: range.min,
+            max: range.max,
+        })
+        .collect::<Vec<_>>();
+    caps.sort_by(|left, right| left.module.cmp(&right.module));
+    caps
+}
+
+fn memory_metadata_dump_records(bb: &BlackboardInner) -> Vec<(String, MemoryMetadataDump)> {
+    let mut records = bb
+        .memory_metadata()
+        .iter()
+        .map(|(index, metadata)| {
+            (
+                index.as_str().to_owned(),
+                MemoryMetadataDump {
+                    rank: memory_rank_name(metadata.rank).to_owned(),
+                    decay_remaining_secs: metadata.decay_remaining_secs,
+                    remember_tokens: metadata.remember_tokens,
+                    last_accessed: metadata.last_accessed.to_rfc3339(),
+                    access_count: metadata.access_count,
+                    query_history: metadata
+                        .query_history
+                        .iter()
+                        .map(|at| at.to_rfc3339())
+                        .collect(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    records
+}
+
+async fn memory_last_state_dump(
+    metadata_records: Vec<(String, MemoryMetadataDump)>,
+    memory: &dyn MemoryStore,
+) -> Result<MemoryLastStateDump> {
+    let mut entries = Vec::with_capacity(metadata_records.len());
+    for (index, metadata) in metadata_records {
+        let memory_index = nuillu_types::MemoryIndex::new(index.clone());
+        let record = memory
+            .get(&memory_index)
+            .await
+            .with_context(|| format!("read memory content for {index}"))?;
+        entries.push(match record {
+            Some(record) => MemoryEntryDump {
+                index,
+                content: Some(DumpText::new(record.content.as_str().to_owned())),
+                content_rank: Some(memory_rank_name(record.rank).to_owned()),
+                metadata,
+                missing_content: false,
+            },
+            None => MemoryEntryDump {
+                index,
+                content: None,
+                content_rank: None,
+                metadata,
+                missing_content: true,
+            },
+        });
+    }
+    Ok(MemoryLastStateDump { entries })
+}
+
+fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
+    utterances
+        .into_iter()
+        .map(|utterance| UtteranceDump {
+            sender: utterance.sender,
+            text: DumpText::new(utterance.text),
+            emitted_at: utterance.emitted_at,
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AgentObservation {
     memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
@@ -1379,6 +1607,30 @@ fn module_instance_observation(owner: &ModuleInstanceId) -> ModuleInstanceObserv
     ModuleInstanceObservation {
         module: owner.module.as_str().to_owned(),
         replica: owner.replica.get(),
+    }
+}
+
+fn module_instance_dump(owner: &ModuleInstanceId) -> ModuleInstanceDump {
+    ModuleInstanceDump {
+        module: owner.module.as_str().to_owned(),
+        replica: owner.replica.get(),
+    }
+}
+
+fn memory_rank_name(rank: MemoryRank) -> &'static str {
+    match rank {
+        MemoryRank::ShortTerm => "short-term",
+        MemoryRank::MidTerm => "mid-term",
+        MemoryRank::LongTerm => "long-term",
+        MemoryRank::Permanent => "permanent",
+    }
+}
+
+fn model_tier_name(tier: ModelTier) -> &'static str {
+    match tier {
+        ModelTier::Cheap => "cheap",
+        ModelTier::Default => "default",
+        ModelTier::Premium => "premium",
     }
 }
 

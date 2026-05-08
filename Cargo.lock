@@ -4320,6 +4320,8 @@ dependencies = [
  "chrono",
  "clap",
  "eure",
+ "eure-document",
+ "eure-fmt",
  "futures",
  "lutum",
  "lutum-eval",

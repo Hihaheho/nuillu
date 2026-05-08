@@ -54,6 +54,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 eure = "0.1.6"
+eure-document = "0.1.9"
+eure-fmt = "0.1.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 
