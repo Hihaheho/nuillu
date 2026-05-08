@@ -23,7 +23,7 @@ mod command;
 mod memory;
 mod state;
 
-pub use allocation::{ActivationRatio, ModuleConfig, ResourceAllocation};
+pub use allocation::{ActivationRatio, AllocationLimits, ModuleConfig, ResourceAllocation};
 pub use attention_stream::{
     AgenticDeadlockMarker, AttentionStream, AttentionStreamEvent, AttentionStreamRecord,
     AttentionStreamSet,
@@ -31,6 +31,6 @@ pub use attention_stream::{
 pub use command::BlackboardCommand;
 pub use memory::{MemoryMetaPatch, MemoryMetadata};
 pub use state::{
-    Blackboard, BlackboardInner, MemoRecord, ModuleRunStatus, ModuleRunStatusRecord,
+    Blackboard, BlackboardInner, MemoLogRecord, MemoRecord, ModuleRunStatus, ModuleRunStatusRecord,
     UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
 };

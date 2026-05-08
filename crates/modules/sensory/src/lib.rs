@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, LlmAccess, Memo, Module, SensoryInput, SensoryInputInbox, ports::Clock,
+    AllocationReader, LlmAccess, Memo, Module, SensoryDetailRequest, SensoryDetailRequestInbox,
+    SensoryInput, SensoryInputInbox, ports::Clock,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,16 @@ Do not write to the attention stream, memory, or emit utterances. Do not return 
 the only textual observation belongs in the normalized field. Return only raw JSON for the
 structured object; do not wrap it in Markdown or code fences."#;
 
+const DETAIL_PROMPT: &str = r#"You are the sensory module answering a detailed sensory request.
+Use only the currently retained sensory observations. If the observations do not contain the
+requested detail, say that the detail is unavailable. Do not infer hidden causes, intentions, or
+facts outside sensory observations.
+Return a structured SensoryDetailAnswer object:
+- answer: concise sensory-detail answer grounded in observations.
+- evidence: observation snippets used.
+- enough_detail: whether the retained observations answer the question.
+Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+
 const MAX_OBSERVATIONS: usize = 20;
 const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
 
@@ -30,6 +41,13 @@ const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
 struct SensoryDecision {
     notable: bool,
     normalized: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct SensoryDetailAnswer {
+    answer: String,
+    evidence: Vec<String>,
+    enough_detail: bool,
 }
 
 struct ObservationRecord {
@@ -58,6 +76,7 @@ struct StimulusState {
 
 pub struct SensoryModule {
     inbox: SensoryInputInbox,
+    detail_requests: SensoryDetailRequestInbox,
     allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
@@ -69,6 +88,7 @@ pub struct SensoryModule {
 impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
+        detail_requests: SensoryDetailRequestInbox,
         allocation: AllocationReader,
         memo: Memo,
         clock: Arc<dyn Clock>,
@@ -76,6 +96,7 @@ impl SensoryModule {
     ) -> Self {
         Self {
             inbox,
+            detail_requests,
             allocation,
             memo,
             clock,
@@ -177,6 +198,55 @@ impl SensoryModule {
         Ok(())
     }
 
+    async fn handle_detail_request(&self, request: SensoryDetailRequest) -> Result<()> {
+        let observations = self
+            .observations
+            .iter()
+            .map(|observation| {
+                serde_json::json!({
+                    "kind": observation.kind,
+                    "direction": observation.direction,
+                    "content": observation.content,
+                    "relative_age": observation.relative_age,
+                })
+            })
+            .collect::<Vec<_>>();
+        let allocation = self.allocation.snapshot().await;
+
+        let lutum = self.llm.lutum().await;
+        let mut session = Session::new(lutum);
+        session.push_system(DETAIL_PROMPT);
+        session.push_user(
+            serde_json::json!({
+                "question": request.question,
+                "observations": observations,
+                "allocation": allocation,
+            })
+            .to_string(),
+        );
+
+        let result = session
+            .structured_turn::<SensoryDetailAnswer>()
+            .collect()
+            .await
+            .context("sensory detail structured turn failed")?;
+
+        let StructuredTurnOutcome::Structured(answer) = result.semantic else {
+            anyhow::bail!("sensory detail structured turn refused");
+        };
+
+        self.memo
+            .write(
+                serde_json::json!({
+                    "kind": "sensory_detail_response",
+                    "answer": answer,
+                })
+                .to_string(),
+            )
+            .await;
+        Ok(())
+    }
+
     fn salience_features(
         &mut self,
         kind: &str,
@@ -244,11 +314,26 @@ impl SensoryModule {
             .join("\n")
     }
 
-    async fn next_batch(&mut self) -> Result<Vec<SensoryInput>> {
-        let first = self.inbox.next_item().await?.body;
-        let mut batch = vec![first];
-        batch.extend(
+    async fn next_batch(&mut self) -> Result<SensoryBatch> {
+        let mut batch = tokio::select! {
+            input = self.inbox.next_item() => SensoryBatch {
+                inputs: vec![input?.body],
+                detail_requests: Vec::new(),
+            },
+            request = self.detail_requests.next_item() => SensoryBatch {
+                inputs: Vec::new(),
+                detail_requests: vec![request?.body],
+            },
+        };
+        batch.inputs.extend(
             self.inbox
+                .take_ready_items()?
+                .items
+                .into_iter()
+                .map(|envelope| envelope.body),
+        );
+        batch.detail_requests.extend(
+            self.detail_requests
                 .take_ready_items()?
                 .items
                 .into_iter()
@@ -256,6 +341,12 @@ impl SensoryModule {
         );
         Ok(batch)
     }
+}
+
+#[derive(Debug, Default)]
+pub struct SensoryBatch {
+    inputs: Vec<SensoryInput>,
+    detail_requests: Vec<SensoryDetailRequest>,
 }
 
 fn plural(n: u64) -> &'static str {
@@ -311,15 +402,18 @@ mod tests {
 
 #[async_trait(?Send)]
 impl Module for SensoryModule {
-    type Batch = Vec<SensoryInput>;
+    type Batch = SensoryBatch;
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SensoryModule::next_batch(self).await
     }
 
     async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
-        for input in batch.iter().cloned() {
+        for input in batch.inputs.iter().cloned() {
             self.handle(input).await?;
+        }
+        for request in batch.detail_requests.iter().cloned() {
+            self.handle_detail_request(request).await?;
         }
         Ok(())
     }

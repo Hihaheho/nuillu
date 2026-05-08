@@ -1046,6 +1046,7 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::sensory(), 0..=1, |caps| {
             nuillu_sensory::SensoryModule::new(
                 caps.sensory_input_inbox(),
+                caps.sensory_detail_inbox(),
                 caps.allocation_reader(),
                 caps.memo(),
                 caps.clock(),
@@ -1055,7 +1056,7 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::attention_gate(), 0..=1, |caps| {
             nuillu_attention_gate::AttentionGateModule::new(
-                caps.allocation_updated_inbox(),
+                caps.memo_updated_inbox(),
                 caps.blackboard_reader(),
                 caps.allocation_reader(),
                 caps.attention_writer(),
@@ -1097,7 +1098,7 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::query_vector(), 0..=1, |caps| {
             nuillu_query_vector::QueryVectorModule::new(
                 caps.query_inbox(),
-                caps.allocation_updated_inbox(),
+                caps.attention_stream_updated_inbox(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.vector_memory_searcher(),
@@ -1106,21 +1107,9 @@ fn full_agent_registry() -> ModuleRegistry {
             )
         })
         .unwrap()
-        .register(builtin::query_agentic(), 0..=1, |caps| {
-            nuillu_query_agentic::QueryAgenticModule::new(
-                caps.query_inbox(),
-                caps.allocation_updated_inbox(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.file_searcher(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
         .register(builtin::memory(), 0..=1, |caps| {
             nuillu_memory::MemoryModule::new(
-                caps.allocation_updated_inbox(),
+                caps.attention_stream_updated_inbox(),
                 caps.memory_request_inbox(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
@@ -1142,7 +1131,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::predict(), 0..=1, |caps| {
             nuillu_predict::PredictModule::new(
                 caps.attention_stream_updated_inbox(),
-                caps.allocation_updated_inbox(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
@@ -1169,6 +1157,9 @@ fn full_agent_registry() -> ModuleRegistry {
                 caps.attention_reader(),
                 caps.blackboard_reader(),
                 caps.module_status_reader(),
+                caps.query_mailbox(),
+                caps.self_model_mailbox(),
+                caps.sensory_detail_mailbox(),
                 caps.memo(),
                 caps.speak_mailbox(),
                 caps.llm_access(),
@@ -1193,7 +1184,7 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
             .register(builtin::query_vector(), 0..=1, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
-                    caps.allocation_updated_inbox(),
+                    caps.attention_stream_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.vector_memory_searcher(),
@@ -1282,13 +1273,6 @@ fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocati
         0.0,
         ModelTier::Cheap,
         "Idle until memory retrieval is needed.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::query_agentic(),
-        0.0,
-        ModelTier::Premium,
-        "Idle until file search is needed.",
     );
     set_allocation_module(
         &mut allocation,
@@ -2420,6 +2404,7 @@ limits {{
             .apply(BlackboardCommand::UpdateMemo {
                 owner: owner.clone(),
                 memo: "memo".to_string(),
+                written_at: now,
             })
             .await;
         blackboard
@@ -2586,7 +2571,6 @@ prompt = "What am I attending to?"
             builtin::attention_schema(),
             builtin::self_model(),
             builtin::query_vector(),
-            builtin::query_agentic(),
             builtin::memory(),
             builtin::memory_compaction(),
             builtin::predict(),
@@ -2597,5 +2581,6 @@ prompt = "What am I attending to?"
                 ActivationRatio::ZERO
             );
         }
+        assert!(allocation.get(&builtin::query_agentic()).is_none());
     }
 }

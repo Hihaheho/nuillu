@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
+    AllocationReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
     QueryInbox, QueryRequest, VectorMemorySearcher,
 };
-use nuillu_types::{MemoryIndex, MemoryRank, builtin};
+use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,7 @@ pub enum QueryVectorTools {
 
 pub struct QueryVectorModule {
     query: QueryInbox,
-    allocation_updates: AllocationUpdatedInbox,
+    attention_updates: AttentionStreamUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: VectorMemorySearcher,
@@ -68,7 +68,7 @@ pub struct QueryVectorModule {
 impl QueryVectorModule {
     pub fn new(
         query: QueryInbox,
-        allocation_updates: AllocationUpdatedInbox,
+        attention_updates: AttentionStreamUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: VectorMemorySearcher,
@@ -77,7 +77,7 @@ impl QueryVectorModule {
     ) -> Self {
         Self {
             query,
-            allocation_updates,
+            attention_updates,
             allocation,
             blackboard,
             memory,
@@ -100,10 +100,18 @@ impl QueryVectorModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_guidance(&self) -> Result<()> {
-        let allocation = self.allocation.snapshot().await;
-        let guidance = allocation.for_module(&builtin::query_vector()).guidance;
-        let question = guidance_question(&guidance, "memory");
+    async fn activate_attention_update(&self) -> Result<()> {
+        let question = self
+            .blackboard
+            .read(|bb| {
+                let entries = bb.attention_stream().entries().to_vec();
+                let latest = entries
+                    .last()
+                    .map(|entry| entry.text.as_str())
+                    .unwrap_or("current attention stream");
+                format!("Find stable memory that clarifies this attended context: {latest}")
+            })
+            .await;
         let hits = self.search_with_memory(&[question]).await?;
         self.write_hits(&hits).await
     }
@@ -221,32 +229,6 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     contents.join("\n\n")
 }
 
-fn guidance_question(guidance: &str, context_kind: &str) -> String {
-    let trimmed = guidance.trim();
-    if trimmed.is_empty() {
-        return format!("Act on current allocation guidance for useful {context_kind} context.");
-    }
-    format!("Act on this allocation guidance for {context_kind} lookup: {trimmed}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guidance_question_carries_concrete_guidance() {
-        let question = guidance_question(
-            "speech-evidence request: question=what body do I have; needed_fact=frog body",
-            "memory",
-        );
-
-        assert_eq!(
-            question,
-            "Act on this allocation guidance for memory lookup: speech-evidence request: question=what body do I have; needed_fact=frog body"
-        );
-    }
-}
-
 #[async_trait(?Send)]
 impl Module for QueryVectorModule {
     type Batch = QueryVectorBatch;
@@ -259,8 +241,8 @@ impl Module for QueryVectorModule {
         if !batch.queries.is_empty() {
             self.handle_queries(batch.queries.clone()).await?;
         }
-        if batch.guidance {
-            self.activate_guidance().await?;
+        if batch.attention_updated {
+            self.activate_attention_update().await?;
         }
         Ok(())
     }

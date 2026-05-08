@@ -1,13 +1,18 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use lutum::{Session, StructuredTurnOutcome, TextTurnEvent};
+use lutum::{
+    Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, TextTurnEvent, ToolResult,
+};
 use nuillu_module::{
     AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
-    ModuleRunStatus, ModuleStatusReader, SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress,
-    UtteranceProgressState, UtteranceWriter,
+    ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest, SelfModelMailbox,
+    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox, SpeakInbox, SpeakMailbox,
+    SpeakRequest, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
 };
-use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
+use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +21,8 @@ mod batch;
 const READINESS_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Decide whether the speak module may emit a user-visible utterance now. You may read the current
 cognitive attention-stream set, blackboard memos, memory metadata, scheduler-owned module status,
-and utterance progress. You must not write attention, publish query/self-model requests, emit
-utterances, or change allocation.
+and utterance progress. You may call evidence tools during this decision turn. You must not write
+attention, emit utterances, or change allocation.
 
 Speak is not currently streaming. Use a strict readiness gate before setting should_speak=true:
 - The attention stream must contain the facts needed for the utterance, not only raw sensory
@@ -25,9 +30,8 @@ Speak is not currently streaming. Use a strict readiness gate before setting sho
 - If the current topic asks for stored memory, a self/peer/world model, file evidence, or a rule,
   do not let speak use memo-only facts directly. If a memo contains the needed fact but attention
   does not, request attention-promotion.
-- For questions about the speaker's own action or body/capability (for example why I/Nui did
-  something), wait for self/body-model evidence in attention unless attention already contains that
-  evidence.
+- For ordinary peer-directed replies, do not require self-model role clarity. Require self-model
+  evidence only for caregiver escalation, authority claims, or self/body capability claims.
 - Do not wait merely because analysis memos exist. Wait only when a named retrieved or promoted
   fact that is essential to the answer is still absent from attention.
 - Treat in-world peer-directed speech, a direct question from another animal, or an immediate peer
@@ -41,11 +45,15 @@ Speak is not currently streaming. Use a strict readiness gate before setting sho
 - If the speak memo already contains an utterance that addresses the current attended request, set
   should_speak=false unless a new attended request or peer situation needs another utterance.
 
-When should_speak=false because a missing fact is needed for speech, include evidence_gaps that
-name the source to consult, the concrete question to answer, and the exact fact that must become
-visible in attention before speaking. Use memory for stable self/body/peer/world facts, file for
-local design or world-rule documents, self-model for a current first-person model, and
-attention-promotion when a memo already contains the needed fact but attention does not.
+When a missing fact is needed for speech, call an evidence tool before waiting:
+- query_memory(question) for stable self/body/peer/world facts.
+- query_self_model(question) for current first-person model facts.
+- query_sensory_detail(question) for details from current sensory observations.
+If a tool result contains the needed fact but attention does not, return should_speak=false with an
+attention-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
+the source to consult, the concrete question to answer, and the exact fact that must become visible
+in attention before speaking. After publishing an evidence request, wait silently; speak-gate will
+reconsider when a later attention-stream update arrives.
 
 When should_speak=true, provide a concrete generation_hint naming the attended facts to use, the
 intended addressee/frame, and any constraints on style or scope. If you cannot write such a hint,
@@ -56,8 +64,8 @@ const INTERRUPTION_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Speak is currently streaming a user-visible utterance. Decide whether the current stream must be
 cancelled and replaced by publishing a new typed SpeakRequest. You may read the current cognitive
 attention-stream set, blackboard memos, memory metadata, scheduler-owned module status, and
-utterance progress. You must not write attention, publish query/self-model requests, emit
-utterances, or change allocation.
+utterance progress. You may call evidence tools during this decision turn. You must not write
+attention, emit utterances, or change allocation.
 
 Use an interruption gate:
 - Compare the new attention stream with the partial utterance and current generation hint.
@@ -107,8 +115,57 @@ enum EvidenceGapSource {
     Memory,
     File,
     SelfModel,
+    SensoryDetail,
     AttentionPromotion,
 }
+
+#[lutum::tool_input(name = "query_memory", output = QueryMemoryOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct QueryMemoryArgs {
+    question: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct QueryMemoryOutput {
+    latest_memo: Option<String>,
+    requested: bool,
+    duplicate: bool,
+}
+
+#[lutum::tool_input(name = "query_self_model", output = QuerySelfModelOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct QuerySelfModelArgs {
+    question: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct QuerySelfModelOutput {
+    latest_memo: Option<String>,
+    requested: bool,
+    duplicate: bool,
+}
+
+#[lutum::tool_input(name = "query_sensory_detail", output = QuerySensoryDetailOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct QuerySensoryDetailArgs {
+    question: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct QuerySensoryDetailOutput {
+    latest_memo: Option<String>,
+    requested: bool,
+    duplicate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+enum SpeakGateTools {
+    QueryMemory(QueryMemoryArgs),
+    QuerySelfModel(QuerySelfModelArgs),
+    QuerySensoryDetail(QuerySensoryDetailArgs),
+}
+
+const MAX_GATE_TOOL_ROUNDS: usize = 4;
 
 fn speak_owner() -> ModuleInstanceId {
     ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO)
@@ -149,6 +206,9 @@ pub struct SpeakGateModule {
     attention: AttentionReader,
     blackboard: BlackboardReader,
     module_status: ModuleStatusReader,
+    query: QueryMailbox,
+    self_model: SelfModelMailbox,
+    sensory_detail: SensoryDetailRequestMailbox,
     memo: Memo,
     speak: SpeakMailbox,
     llm: LlmAccess,
@@ -160,6 +220,9 @@ impl SpeakGateModule {
         attention: AttentionReader,
         blackboard: BlackboardReader,
         module_status: ModuleStatusReader,
+        query: QueryMailbox,
+        self_model: SelfModelMailbox,
+        sensory_detail: SensoryDetailRequestMailbox,
         memo: Memo,
         speak: SpeakMailbox,
         llm: LlmAccess,
@@ -169,6 +232,9 @@ impl SpeakGateModule {
             attention,
             blackboard,
             module_status,
+            query,
+            self_model,
+            sensory_detail,
             memo,
             speak,
             llm,
@@ -206,15 +272,7 @@ impl SpeakGateModule {
             .to_string(),
         );
 
-        let result = session
-            .structured_turn::<SpeakGateDecision>()
-            .collect()
-            .await
-            .context("speak-gate decision turn failed")?;
-
-        let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-            anyhow::bail!("speak-gate decision turn refused");
-        };
+        let decision = self.run_decision_turn(&mut session).await?;
 
         self.memo
             .write(serde_json::to_string(&decision).context("serialize speak-gate decision memo")?)
@@ -233,6 +291,152 @@ impl SpeakGateModule {
             }
         }
         Ok(())
+    }
+
+    async fn run_decision_turn(&self, session: &mut Session) -> Result<SpeakGateDecision> {
+        let mut memory_requests = HashSet::<String>::new();
+        let mut self_model_requests = HashSet::<String>::new();
+        let mut sensory_detail_requests = HashSet::<String>::new();
+
+        for _ in 0..MAX_GATE_TOOL_ROUNDS {
+            let outcome = session
+                .structured_turn::<SpeakGateDecision>()
+                .tools::<SpeakGateTools>()
+                .available_tools([
+                    SpeakGateToolsSelector::QueryMemory,
+                    SpeakGateToolsSelector::QuerySelfModel,
+                    SpeakGateToolsSelector::QuerySensoryDetail,
+                ])
+                .collect()
+                .await
+                .context("speak-gate decision turn failed")?;
+
+            match outcome {
+                StructuredStepOutcomeWithTools::Finished(result) => {
+                    let StructuredTurnOutcome::Structured(decision) = result.semantic else {
+                        anyhow::bail!("speak-gate decision turn refused");
+                    };
+                    return Ok(decision);
+                }
+                StructuredStepOutcomeWithTools::NeedsTools(round) => {
+                    let mut results: Vec<ToolResult> = Vec::new();
+                    for call in round.tool_calls.iter().cloned() {
+                        match call {
+                            SpeakGateToolsCall::QueryMemory(call) => {
+                                let output = self
+                                    .query_memory(call.input.clone(), &mut memory_requests)
+                                    .await
+                                    .context("run query_memory tool")?;
+                                results.push(
+                                    call.complete(output)
+                                        .context("complete query_memory tool call")?,
+                                );
+                            }
+                            SpeakGateToolsCall::QuerySelfModel(call) => {
+                                let output = self
+                                    .query_self_model(call.input.clone(), &mut self_model_requests)
+                                    .await
+                                    .context("run query_self_model tool")?;
+                                results.push(
+                                    call.complete(output)
+                                        .context("complete query_self_model tool call")?,
+                                );
+                            }
+                            SpeakGateToolsCall::QuerySensoryDetail(call) => {
+                                let output = self
+                                    .query_sensory_detail(
+                                        call.input.clone(),
+                                        &mut sensory_detail_requests,
+                                    )
+                                    .await
+                                    .context("run query_sensory_detail tool")?;
+                                results.push(
+                                    call.complete(output)
+                                        .context("complete query_sensory_detail tool call")?,
+                                );
+                            }
+                        }
+                    }
+                    round
+                        .commit(session, results)
+                        .context("commit speak-gate tool round")?;
+                }
+            }
+        }
+
+        anyhow::bail!("speak-gate decision did not finish before tool-round limit")
+    }
+
+    async fn query_memory(
+        &self,
+        args: QueryMemoryArgs,
+        requested_questions: &mut HashSet<String>,
+    ) -> Result<QueryMemoryOutput> {
+        let question = args.question.trim().to_owned();
+        let duplicate = !requested_questions.insert(question.clone());
+        let requested = if duplicate {
+            false
+        } else {
+            self.query
+                .publish(QueryRequest::new(question))
+                .await
+                .is_ok()
+        };
+        Ok(QueryMemoryOutput {
+            latest_memo: self.latest_module_memo(&builtin::query_vector()).await,
+            requested,
+            duplicate,
+        })
+    }
+
+    async fn query_self_model(
+        &self,
+        args: QuerySelfModelArgs,
+        requested_questions: &mut HashSet<String>,
+    ) -> Result<QuerySelfModelOutput> {
+        let question = args.question.trim().to_owned();
+        let duplicate = !requested_questions.insert(question.clone());
+        let before = self.latest_module_memo(&builtin::self_model()).await;
+        let requested = if duplicate {
+            false
+        } else {
+            self.self_model
+                .publish(SelfModelRequest::new(question))
+                .await
+                .is_ok()
+        };
+        Ok(QuerySelfModelOutput {
+            latest_memo: before,
+            requested,
+            duplicate,
+        })
+    }
+
+    async fn query_sensory_detail(
+        &self,
+        args: QuerySensoryDetailArgs,
+        requested_questions: &mut HashSet<String>,
+    ) -> Result<QuerySensoryDetailOutput> {
+        let question = args.question.trim().to_owned();
+        let duplicate = !requested_questions.insert(question.clone());
+        let before = self.latest_module_memo(&builtin::sensory()).await;
+        let requested = if duplicate {
+            false
+        } else {
+            self.sensory_detail
+                .publish(SensoryDetailRequest::new(question))
+                .await
+                .is_ok()
+        };
+        Ok(QuerySensoryDetailOutput {
+            latest_memo: before,
+            requested,
+            duplicate,
+        })
+    }
+
+    async fn latest_module_memo(&self, module: &ModuleId) -> Option<String> {
+        self.blackboard.latest_memo_for_module(module).await
     }
 }
 
@@ -422,11 +626,22 @@ impl SpeakModule {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     use lutum::{
-        AssistantInputItem, InputMessageRole, MessageContent, MockLlmAdapter, ModelInputItem,
-        Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
+        AssistantInputItem, InputMessageRole, Lutum, MessageContent, MockLlmAdapter,
+        ModelInputItem, Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
+    };
+    use nuillu_blackboard::{ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation};
+    use nuillu_module::ports::{
+        NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+        SystemClock,
+    };
+    use nuillu_module::{
+        CapabilityProviders, LutumTiers, ModuleRegistry, QueryInbox, SelfModelInbox,
+        SensoryDetailRequestInbox,
     };
 
     use super::*;
@@ -435,6 +650,141 @@ mod tests {
         let adapter = MockLlmAdapter::new();
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         Session::new(lutum::Lutum::new(Arc::new(adapter), budget))
+    }
+
+    fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
+        let adapter = Arc::new(MockLlmAdapter::new());
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        CapabilityProviders::new(
+            blackboard,
+            Arc::new(NoopAttentionRepository),
+            Arc::new(NoopMemoryStore),
+            Vec::new(),
+            Arc::new(NoopFileSearchProvider),
+            Arc::new(NoopUtteranceSink),
+            Arc::new(SystemClock),
+            LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        )
+    }
+
+    fn tool_test_allocation() -> ResourceAllocation {
+        let mut allocation = ResourceAllocation::default();
+        for module in [
+            builtin::speak_gate(),
+            builtin::query_vector(),
+            builtin::self_model(),
+            builtin::sensory(),
+            builtin::speak(),
+        ] {
+            allocation.set(
+                module,
+                ModuleConfig {
+                    activation_ratio: ActivationRatio::ONE,
+                    ..Default::default()
+                },
+            );
+        }
+        allocation
+    }
+
+    struct NoopModule;
+
+    #[async_trait(?Send)]
+    impl Module for NoopModule {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> Result<Self::Batch> {
+            std::future::pending().await
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct GateToolFixture {
+        gate: SpeakGateModule,
+        query_inbox: QueryInbox,
+        self_model_inbox: SelfModelInbox,
+        sensory_detail_inbox: SensoryDetailRequestInbox,
+        query_memo: Memo,
+        self_model_memo: Memo,
+        sensory_memo: Memo,
+    }
+
+    async fn gate_tool_fixture() -> GateToolFixture {
+        let blackboard = Blackboard::with_allocation(tool_test_allocation());
+        let caps = test_caps(blackboard);
+
+        let gate_cell = Rc::new(RefCell::new(None));
+        let query_inbox_cell = Rc::new(RefCell::new(None));
+        let self_model_inbox_cell = Rc::new(RefCell::new(None));
+        let sensory_detail_inbox_cell = Rc::new(RefCell::new(None));
+        let query_memo_cell = Rc::new(RefCell::new(None));
+        let self_model_memo_cell = Rc::new(RefCell::new(None));
+        let sensory_memo_cell = Rc::new(RefCell::new(None));
+
+        let gate_sink = Rc::clone(&gate_cell);
+        let query_inbox_sink = Rc::clone(&query_inbox_cell);
+        let query_memo_sink = Rc::clone(&query_memo_cell);
+        let self_model_inbox_sink = Rc::clone(&self_model_inbox_cell);
+        let self_model_memo_sink = Rc::clone(&self_model_memo_cell);
+        let sensory_detail_inbox_sink = Rc::clone(&sensory_detail_inbox_cell);
+        let sensory_memo_sink = Rc::clone(&sensory_memo_cell);
+
+        let _modules = ModuleRegistry::new()
+            .register(builtin::speak_gate(), 0..=1, move |caps| {
+                *gate_sink.borrow_mut() = Some(SpeakGateModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.attention_reader(),
+                    caps.blackboard_reader(),
+                    caps.module_status_reader(),
+                    caps.query_mailbox(),
+                    caps.self_model_mailbox(),
+                    caps.sensory_detail_mailbox(),
+                    caps.memo(),
+                    caps.speak_mailbox(),
+                    caps.llm_access(),
+                ));
+                NoopModule
+            })
+            .unwrap()
+            .register(builtin::query_vector(), 0..=1, move |caps| {
+                *query_inbox_sink.borrow_mut() = Some(caps.query_inbox());
+                *query_memo_sink.borrow_mut() = Some(caps.memo());
+                NoopModule
+            })
+            .unwrap()
+            .register(builtin::self_model(), 0..=1, move |caps| {
+                *self_model_inbox_sink.borrow_mut() = Some(caps.self_model_inbox());
+                *self_model_memo_sink.borrow_mut() = Some(caps.memo());
+                NoopModule
+            })
+            .unwrap()
+            .register(builtin::sensory(), 0..=1, move |caps| {
+                *sensory_detail_inbox_sink.borrow_mut() = Some(caps.sensory_detail_inbox());
+                *sensory_memo_sink.borrow_mut() = Some(caps.memo());
+                NoopModule
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        GateToolFixture {
+            gate: gate_cell.borrow_mut().take().unwrap(),
+            query_inbox: query_inbox_cell.borrow_mut().take().unwrap(),
+            self_model_inbox: self_model_inbox_cell.borrow_mut().take().unwrap(),
+            sensory_detail_inbox: sensory_detail_inbox_cell.borrow_mut().take().unwrap(),
+            query_memo: query_memo_cell.borrow_mut().take().unwrap(),
+            self_model_memo: self_model_memo_cell.borrow_mut().take().unwrap(),
+            sensory_memo: sensory_memo_cell.borrow_mut().take().unwrap(),
+        }
     }
 
     #[test]
@@ -587,6 +937,105 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn evidence_tools_publish_requests_without_polling_and_return_current_memos() {
+        let mut fixture = gate_tool_fixture().await;
+        fixture.query_memo.write("cached memory fact").await;
+        fixture
+            .self_model_memo
+            .write("cached self-model fact")
+            .await;
+        fixture.sensory_memo.write("cached sensory detail").await;
+
+        let mut memory_requests = HashSet::new();
+        let memory_output = fixture
+            .gate
+            .query_memory(
+                QueryMemoryArgs {
+                    question: "  body fact?  ".into(),
+                },
+                &mut memory_requests,
+            )
+            .await
+            .unwrap();
+        let memory_request = fixture.query_inbox.next_item().await.unwrap();
+        assert_eq!(
+            memory_output.latest_memo.as_deref(),
+            Some("cached memory fact")
+        );
+        assert!(memory_output.requested);
+        assert!(!memory_output.duplicate);
+        assert_eq!(memory_request.sender.module, builtin::speak_gate());
+        assert_eq!(memory_request.body.question, "body fact?");
+
+        let duplicate_memory_output = fixture
+            .gate
+            .query_memory(
+                QueryMemoryArgs {
+                    question: "body fact?".into(),
+                },
+                &mut memory_requests,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate_memory_output.latest_memo.as_deref(),
+            Some("cached memory fact")
+        );
+        assert!(!duplicate_memory_output.requested);
+        assert!(duplicate_memory_output.duplicate);
+        assert!(
+            fixture
+                .query_inbox
+                .take_ready_items()
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        let mut self_model_requests = HashSet::new();
+        let self_model_output = fixture
+            .gate
+            .query_self_model(
+                QuerySelfModelArgs {
+                    question: " current role? ".into(),
+                },
+                &mut self_model_requests,
+            )
+            .await
+            .unwrap();
+        let self_model_request = fixture.self_model_inbox.next_item().await.unwrap();
+        assert_eq!(
+            self_model_output.latest_memo.as_deref(),
+            Some("cached self-model fact")
+        );
+        assert!(self_model_output.requested);
+        assert!(!self_model_output.duplicate);
+        assert_eq!(self_model_request.sender.module, builtin::speak_gate());
+        assert_eq!(self_model_request.body.question, "current role?");
+
+        let mut sensory_detail_requests = HashSet::new();
+        let sensory_output = fixture
+            .gate
+            .query_sensory_detail(
+                QuerySensoryDetailArgs {
+                    question: " what was just heard? ".into(),
+                },
+                &mut sensory_detail_requests,
+            )
+            .await
+            .unwrap();
+        let sensory_request = fixture.sensory_detail_inbox.next_item().await.unwrap();
+        assert_eq!(
+            sensory_output.latest_memo.as_deref(),
+            Some("cached sensory detail")
+        );
+        assert!(sensory_output.requested);
+        assert!(!sensory_output.duplicate);
+        assert_eq!(sensory_request.sender.module, builtin::speak_gate());
+        assert_eq!(sensory_request.body.question, "what was just heard?");
     }
 }
 

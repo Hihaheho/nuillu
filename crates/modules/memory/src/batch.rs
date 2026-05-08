@@ -6,26 +6,26 @@ use crate::MemoryModule;
 #[derive(Debug, Default)]
 pub struct NextBatch {
     pub(crate) requests: Vec<MemoryRequest>,
-    pub(crate) guidance: bool,
+    pub(crate) attention_updated: bool,
 }
 
 impl NextBatch {
-    fn guidance() -> Self {
+    fn attention_update() -> Self {
         Self {
             requests: Vec::new(),
-            guidance: true,
+            attention_updated: true,
         }
     }
 
     fn request(request: MemoryRequest) -> Option<Self> {
         Some(Self {
             requests: vec![Self::accepted_request(request)?],
-            guidance: false,
+            attention_updated: false,
         })
     }
 
-    fn mark_guidance(&mut self) {
-        self.guidance = true;
+    fn mark_attention_updated(&mut self) {
+        self.attention_updated = true;
     }
 
     fn accepted_request(request: MemoryRequest) -> Option<MemoryRequest> {
@@ -53,9 +53,9 @@ impl MemoryModule {
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
         loop {
             let batch = tokio::select! {
-                update = self.allocation_updates.next_item() => {
+                update = self.attention_updates.next_item() => {
                     let _ = update?;
-                    NextBatch::guidance()
+                    NextBatch::attention_update()
                 }
                 request = self.requests.next_item() => {
                     let envelope = request?;
@@ -75,8 +75,8 @@ impl MemoryModule {
             batch.push_request(envelope.body);
         }
 
-        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_guidance();
+        if !self.attention_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_attention_updated();
         }
 
         Ok(())
@@ -85,7 +85,7 @@ impl MemoryModule {
 
 #[cfg(test)]
 mod tests {
-    use nuillu_module::MemoryImportance;
+    use nuillu_module::{MemoryImportance, MemoryRequest};
 
     use super::*;
 
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_memory_requests_are_not_actionable_without_guidance_work() {
+    fn empty_memory_requests_are_not_actionable_without_attention_work() {
         assert!(NextBatch::request(request("  ")).is_none());
     }
 
@@ -116,12 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn guidance_scan_survives_empty_request_filtering() {
-        let mut batch = NextBatch::guidance();
+    fn attention_update_flag_survives_empty_request_filtering() {
+        let mut batch = NextBatch::attention_update();
         batch.push_request(request(""));
-        batch.mark_guidance();
+        batch.mark_attention_updated();
 
-        assert!(batch.guidance);
+        assert!(batch.attention_updated);
         assert!(batch.requests.is_empty());
     }
 }

@@ -21,8 +21,9 @@ use crate::{
     LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor, MemoryContentReader,
     MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, ModuleBatch,
     ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox,
-    SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox,
-    SpeakMailbox, SpeakRequest, TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
+    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox, SensoryDetailRequestMailbox,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest,
+    TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -39,6 +40,7 @@ struct CapabilityProvidersInner {
     blackboard: Blackboard,
     query_topic: Topic<QueryRequest>,
     self_model_topic: Topic<SelfModelRequest>,
+    sensory_detail_topic: Topic<SensoryDetailRequest>,
     speak_topic: Topic<SpeakRequest>,
     memory_request_topic: Topic<MemoryRequest>,
     attention_updates: Topic<AttentionStreamUpdated>,
@@ -55,6 +57,7 @@ struct CapabilityProvidersInner {
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
+    runtime_policy: RuntimePolicy,
 }
 
 impl CapabilityProviders {
@@ -122,7 +125,7 @@ impl CapabilityProviders {
         policy: RuntimePolicy,
     ) -> Self {
         let runtime_events = RuntimeEventEmitter::new(runtime_event_sink);
-        let rate_limiter = RateLimiter::new(policy.rate_limits);
+        let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         Self {
             inner: Arc::new(CapabilityProvidersInner {
                 query_topic: Topic::new(
@@ -136,6 +139,13 @@ impl CapabilityProviders {
                     blackboard.clone(),
                     TopicPolicy::RoleLoadBalanced,
                     TopicKind::SelfModel,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                sensory_detail_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::SensoryDetailRequest,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -192,6 +202,7 @@ impl CapabilityProviders {
                 tiers,
                 runtime_events,
                 rate_limiter,
+                runtime_policy: policy,
             }),
         }
     }
@@ -207,6 +218,21 @@ impl CapabilityProviders {
         self.inner
             .blackboard
             .apply(BlackboardCommand::SetReplicaCaps { caps })
+            .await;
+    }
+
+    pub(crate) async fn apply_runtime_policy(&self) {
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetAllocationLimits(
+                self.inner.runtime_policy.allocation_limits,
+            ))
+            .await;
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetMemoRetentionPerOwner(
+                self.inner.runtime_policy.memo_retained_per_owner,
+            ))
             .await;
     }
 
@@ -375,6 +401,13 @@ impl InternalHarnessIo {
         TopicMailbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
     }
 
+    pub fn sensory_detail_mailbox(&self) -> SensoryDetailRequestMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.sensory_detail_topic.clone(),
+        )
+    }
+
     pub fn attention_stream_updated_mailbox(&self) -> AttentionStreamUpdatedMailbox {
         TopicMailbox::new(
             self.owner.clone(),
@@ -404,6 +437,20 @@ impl ModuleCapabilityFactory {
 
     pub fn self_model_inbox(&self) -> SelfModelInbox {
         TopicInbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
+    }
+
+    pub fn sensory_detail_mailbox(&self) -> SensoryDetailRequestMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.sensory_detail_topic.clone(),
+        )
+    }
+
+    pub fn sensory_detail_inbox(&self) -> SensoryDetailRequestInbox {
+        TopicInbox::new(
+            self.owner.clone(),
+            self.root.inner.sensory_detail_topic.clone(),
+        )
     }
 
     pub fn speak_mailbox(&self) -> SpeakMailbox {
@@ -465,6 +512,7 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
+            self.root.inner.clock.clone(),
             self.root.inner.runtime_events.clone(),
         )
     }
@@ -679,6 +727,7 @@ impl ModuleRegistry {
         &self,
         caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
+        caps.apply_runtime_policy().await;
         caps.set_replica_caps(
             self.registrations
                 .iter()

@@ -4,7 +4,6 @@ description = "Full-agent case for interpreting a peer animal's play signal inst
 limits {
   max-ticks = 300
   tick-ms = 500
-  max-llm-calls = 96
 }
 
 @ memories[] {

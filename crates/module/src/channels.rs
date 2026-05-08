@@ -264,6 +264,19 @@ impl SelfModelRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SensoryDetailRequest {
+    pub question: String,
+}
+
+impl SensoryDetailRequest {
+    pub fn new(question: impl Into<String>) -> Self {
+        Self {
+            question: question.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SpeakRequest {
     pub generation_hint: String,
     pub rationale: String,
@@ -304,12 +317,15 @@ pub struct AllocationUpdated;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoUpdated {
     pub owner: ModuleInstanceId,
+    pub index: u64,
 }
 
 pub type QueryMailbox = TopicMailbox<QueryRequest>;
 pub type QueryInbox = TopicInbox<QueryRequest>;
 pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
 pub type SelfModelInbox = TopicInbox<SelfModelRequest>;
+pub type SensoryDetailRequestMailbox = TopicMailbox<SensoryDetailRequest>;
+pub type SensoryDetailRequestInbox = TopicInbox<SensoryDetailRequest>;
 pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
 pub type SpeakInbox = TopicInbox<SpeakRequest>;
 pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
@@ -522,6 +538,7 @@ mod tests {
                     RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
                 )
                 .unwrap(),
+                ..RuntimePolicy::default()
             },
         );
         let publisher = scoped(&caps, publisher_id, 0).query_mailbox();

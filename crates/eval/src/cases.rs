@@ -49,6 +49,10 @@ fn default_max_ticks() -> u64 {
     40
 }
 
+fn default_max_llm_calls() -> Option<u64> {
+    Some(10)
+}
+
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct FullAgentCaseFile {
@@ -253,7 +257,7 @@ pub struct EvalLimits {
     pub tick_ms: u64,
     #[eure(default = "default_max_ticks")]
     pub max_ticks: u64,
-    #[eure(default)]
+    #[eure(default = "default_max_llm_calls")]
     pub max_llm_calls: Option<u64>,
 }
 
@@ -262,7 +266,7 @@ impl Default for EvalLimits {
         Self {
             tick_ms: default_tick_ms(),
             max_ticks: default_max_ticks(),
-            max_llm_calls: None,
+            max_llm_calls: default_max_llm_calls(),
         }
     }
 }

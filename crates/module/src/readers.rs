@@ -6,11 +6,14 @@
 //! cannot read the non-cognitive blackboard, regardless of what its
 //! `run` body tries.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use nuillu_blackboard::{
-    AttentionStream, Blackboard, BlackboardInner, ModuleRunStatus, ModuleRunStatusRecord,
-    ResourceAllocation,
+    AttentionStream, Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus,
+    ModuleRunStatusRecord, ResourceAllocation,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleId, ModuleInstanceId};
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
@@ -20,17 +23,58 @@ use nuillu_types::ModuleInstanceId;
 #[derive(Clone)]
 pub struct BlackboardReader {
     blackboard: Blackboard,
+    last_seen_memo_indices: Arc<Mutex<HashMap<ModuleInstanceId, u64>>>,
 }
 
 impl BlackboardReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
-        Self { blackboard }
+        Self {
+            blackboard,
+            last_seen_memo_indices: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Apply `f` to a borrowed snapshot. The read lock is held for the
     /// duration of `f`; do not await inside it.
     pub async fn read<R>(&self, f: impl FnOnce(&BlackboardInner) -> R) -> R {
         self.blackboard.read(f).await
+    }
+
+    pub async fn latest_memos(&self) -> serde_json::Value {
+        self.blackboard.read(|bb| bb.memos()).await
+    }
+
+    pub async fn recent_memo_logs(&self) -> Vec<MemoLogRecord> {
+        self.blackboard.read(|bb| bb.recent_memo_logs()).await
+    }
+
+    pub async fn unread_memo_logs(&self) -> Vec<MemoLogRecord> {
+        let last_seen = self
+            .last_seen_memo_indices
+            .lock()
+            .expect("memo reader cursor poisoned")
+            .clone();
+        let records = self
+            .blackboard
+            .read(|bb| bb.unread_memo_logs(&last_seen))
+            .await;
+        if !records.is_empty() {
+            let mut cursor = self
+                .last_seen_memo_indices
+                .lock()
+                .expect("memo reader cursor poisoned");
+            for record in &records {
+                cursor
+                    .entry(record.owner.clone())
+                    .and_modify(|index| *index = (*index).max(record.index))
+                    .or_insert(record.index);
+            }
+        }
+        records
+    }
+
+    pub async fn latest_memo_for_module(&self, module: &ModuleId) -> Option<String> {
+        self.blackboard.memo(module).await
     }
 }
 
@@ -176,6 +220,7 @@ impl ModuleStatusReader {
 mod tests {
     use super::*;
 
+    use chrono::{TimeZone, Utc};
     use nuillu_blackboard::BlackboardCommand;
     use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
 
@@ -268,6 +313,57 @@ mod tests {
                     "state": "activating"
                 }
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_memo_logs_advance_per_reader_handle() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let reader_a = BlackboardReader::new(blackboard.clone());
+        let reader_b = BlackboardReader::new(blackboard.clone());
+
+        blackboard
+            .update_memo(
+                owner.clone(),
+                "first".into(),
+                Utc.timestamp_opt(0, 0).unwrap(),
+            )
+            .await;
+
+        let a_first = reader_a.unread_memo_logs().await;
+        assert_eq!(
+            a_first
+                .iter()
+                .map(|record| (record.owner.clone(), record.index, record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(owner.clone(), 0, "first")]
+        );
+        assert!(reader_a.unread_memo_logs().await.is_empty());
+
+        let b_first = reader_b.unread_memo_logs().await;
+        assert_eq!(b_first.len(), 1);
+        assert_eq!(b_first[0].index, 0);
+
+        blackboard
+            .update_memo(owner, "second".into(), Utc.timestamp_opt(1, 0).unwrap())
+            .await;
+
+        let a_second = reader_a.unread_memo_logs().await;
+        assert_eq!(
+            a_second
+                .iter()
+                .map(|record| (record.index, record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "second")]
+        );
+        let b_second = reader_b.unread_memo_logs().await;
+        assert_eq!(
+            b_second
+                .iter()
+                .map(|record| (record.index, record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "second")]
         );
     }
 }

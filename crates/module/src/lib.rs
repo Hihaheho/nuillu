@@ -47,8 +47,9 @@ pub use channels::{
     AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope, MemoUpdated,
     MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox,
     MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox,
-    SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
-    SpeakInbox, SpeakMailbox, SpeakRequest, TopicInbox, TopicMailbox, TopicRecvError,
+    SelfModelMailbox, SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox,
+    SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox,
+    SpeakMailbox, SpeakRequest, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;

@@ -1,16 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use chrono::{DateTime, Utc};
 use nuillu_types::{
     MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
-    AgenticDeadlockMarker, AttentionStream, AttentionStreamRecord, AttentionStreamSet,
-    BlackboardCommand, MemoryMetadata, ResourceAllocation,
+    AgenticDeadlockMarker, AllocationLimits, AttentionStream, AttentionStreamRecord,
+    AttentionStreamSet, BlackboardCommand, MemoryMetadata, ResourceAllocation,
 };
+
+const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
 
 /// The non-cognitive blackboard plus the cognitive surface and its
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
@@ -24,9 +27,11 @@ pub struct Blackboard {
 /// Inner blackboard state. Public so read closures in other crates can
 /// inspect it, but its fields are private and mutations stay behind
 /// [`BlackboardCommand`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BlackboardInner {
-    memos: HashMap<ModuleInstanceId, String>,
+    memos: HashMap<ModuleInstanceId, VecDeque<MemoLogRecord>>,
+    memo_next_indices: HashMap<ModuleInstanceId, u64>,
+    memo_retained_per_owner: usize,
     module_statuses: HashMap<ModuleInstanceId, ModuleRunStatus>,
     utterance_progresses: HashMap<ModuleInstanceId, UtteranceProgress>,
     attention_streams: HashMap<ModuleInstanceId, AttentionStream>,
@@ -36,12 +41,21 @@ pub struct BlackboardInner {
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
     replica_caps: HashMap<ModuleId, ReplicaCapRange>,
+    allocation_limits: AllocationLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoRecord {
     pub owner: ModuleInstanceId,
     pub memo: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoLogRecord {
+    pub owner: ModuleInstanceId,
+    pub index: u64,
+    pub written_at: DateTime<Utc>,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -147,12 +161,13 @@ impl Blackboard {
     }
 
     pub fn with_allocation(allocation: ResourceAllocation) -> Self {
+        let mut inner = BlackboardInner {
+            base_allocation: allocation,
+            ..BlackboardInner::default()
+        };
+        inner.recompute_effective_allocation();
         Self {
-            inner: Arc::new(RwLock::new(BlackboardInner {
-                base_allocation: allocation.clone(),
-                allocation,
-                ..BlackboardInner::default()
-            })),
+            inner: Arc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -169,6 +184,16 @@ impl Blackboard {
         let mut guard = self.inner.write().await;
         guard.apply(cmd);
         self.notify_active_waiters(&guard.allocation);
+    }
+
+    pub async fn update_memo(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        written_at: DateTime<Utc>,
+    ) -> MemoLogRecord {
+        let mut guard = self.inner.write().await;
+        guard.append_memo(owner, memo, written_at)
     }
 
     pub async fn memo(&self, id: &ModuleId) -> Option<String> {
@@ -228,20 +253,41 @@ impl Default for Blackboard {
     }
 }
 
+impl Default for BlackboardInner {
+    fn default() -> Self {
+        Self {
+            memos: HashMap::new(),
+            memo_next_indices: HashMap::new(),
+            memo_retained_per_owner: DEFAULT_MEMO_RETAINED_PER_OWNER,
+            module_statuses: HashMap::new(),
+            utterance_progresses: HashMap::new(),
+            attention_streams: HashMap::new(),
+            agentic_deadlock_marker: None,
+            memory_metadata: HashMap::new(),
+            base_allocation: ResourceAllocation::default(),
+            allocation: ResourceAllocation::default(),
+            allocation_proposals: HashMap::new(),
+            replica_caps: HashMap::new(),
+            allocation_limits: AllocationLimits::default(),
+        }
+    }
+}
+
 impl BlackboardInner {
     pub fn memo(&self, id: &ModuleId) -> Option<&str> {
         if let Some((_, memo)) = self
             .memos
             .iter()
+            .filter_map(|(owner, records)| latest_memo_content(records).map(|memo| (owner, memo)))
             .find(|(owner, _)| &owner.module == id && owner.replica == ReplicaIndex::ZERO)
         {
-            return Some(memo.as_str());
+            return Some(memo);
         }
         let mut matching = self
             .memos
             .iter()
-            .filter(|(owner, _)| &owner.module == id)
-            .map(|(_, memo)| memo.as_str());
+            .filter(|(owner, records)| &owner.module == id && !records.is_empty())
+            .filter_map(|(_, records)| latest_memo_content(records));
         let first = matching.next()?;
         if matching.next().is_none() {
             Some(first)
@@ -251,16 +297,20 @@ impl BlackboardInner {
     }
 
     pub fn memo_for_instance(&self, id: &ModuleInstanceId) -> Option<&str> {
-        self.memos.get(id).map(String::as_str)
+        self.memos
+            .get(id)
+            .and_then(|records| latest_memo_content(records))
     }
 
     pub fn memo_records(&self) -> Vec<MemoRecord> {
         let mut records = self
             .memos
             .iter()
-            .map(|(owner, memo)| MemoRecord {
-                owner: owner.clone(),
-                memo: memo.clone(),
+            .filter_map(|(owner, logs)| {
+                latest_memo_content(logs).map(|memo| MemoRecord {
+                    owner: owner.clone(),
+                    memo: memo.to_owned(),
+                })
             })
             .collect::<Vec<_>>();
         records.sort_by(|a, b| {
@@ -270,6 +320,35 @@ impl BlackboardInner {
                 .cmp(b.owner.module.as_str())
                 .then_with(|| a.owner.replica.cmp(&b.owner.replica))
         });
+        records
+    }
+
+    pub fn recent_memo_logs(&self) -> Vec<MemoLogRecord> {
+        let mut records = self
+            .memos
+            .values()
+            .flat_map(|records| records.iter().cloned())
+            .collect::<Vec<_>>();
+        sort_memo_logs(&mut records);
+        records
+    }
+
+    pub fn unread_memo_logs(
+        &self,
+        last_seen_indices: &HashMap<ModuleInstanceId, u64>,
+    ) -> Vec<MemoLogRecord> {
+        let mut records = self
+            .memos
+            .iter()
+            .flat_map(|(owner, records)| {
+                let last_seen = last_seen_indices.get(owner).copied();
+                records.iter().filter(move |record| {
+                    last_seen.is_none_or(|last_seen| record.index > last_seen)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_memo_logs(&mut records);
         records
     }
 
@@ -340,11 +419,14 @@ impl BlackboardInner {
 
     pub fn memos(&self) -> serde_json::Value {
         let mut grouped = std::collections::BTreeMap::<String, Vec<(u8, String)>>::new();
-        for (owner, memo) in &self.memos {
+        for (owner, records) in &self.memos {
+            let Some(memo) = latest_memo_content(records) else {
+                continue;
+            };
             grouped
                 .entry(owner.module.as_str().to_owned())
                 .or_default()
-                .push((owner.replica.get(), memo.clone()));
+                .push((owner.replica.get(), memo.to_owned()));
         }
 
         let mut object = serde_json::Map::new();
@@ -370,6 +452,22 @@ impl BlackboardInner {
             }
         }
         serde_json::Value::Object(object)
+    }
+
+    pub fn memo_logs(&self) -> serde_json::Value {
+        let mut grouped = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for record in self.recent_memo_logs() {
+            grouped
+                .entry(record.owner.module.as_str().to_owned())
+                .or_default()
+                .push(serde_json::json!({
+                    "replica": record.owner.replica.get(),
+                    "index": record.index,
+                    "written_at": record.written_at,
+                    "content": record.content,
+                }));
+        }
+        serde_json::json!(grouped)
     }
 
     pub fn attention_stream(&self) -> AttentionStream {
@@ -429,6 +527,14 @@ impl BlackboardInner {
         &self.replica_caps
     }
 
+    pub fn allocation_limits(&self) -> AllocationLimits {
+        self.allocation_limits
+    }
+
+    pub fn memo_retained_per_owner(&self) -> usize {
+        self.memo_retained_per_owner
+    }
+
     fn is_instance_active(&self, owner: &ModuleInstanceId) -> bool {
         self.allocation.is_replica_active(owner)
     }
@@ -438,8 +544,12 @@ impl BlackboardInner {
     /// matches.
     fn apply(&mut self, cmd: BlackboardCommand) {
         match cmd {
-            BlackboardCommand::UpdateMemo { owner, memo } => {
-                self.memos.insert(owner, memo);
+            BlackboardCommand::UpdateMemo {
+                owner,
+                memo,
+                written_at,
+            } => {
+                self.append_memo(owner, memo, written_at);
             }
             BlackboardCommand::SetModuleRunStatus { owner, status } => {
                 self.module_statuses.insert(owner, status);
@@ -484,12 +594,53 @@ impl BlackboardInner {
                 }
                 self.recompute_effective_allocation();
             }
+            BlackboardCommand::SetAllocationLimits(limits) => {
+                self.allocation_limits = limits;
+                self.recompute_effective_allocation();
+            }
+            BlackboardCommand::SetMemoRetentionPerOwner(retained) => {
+                self.memo_retained_per_owner = retained.max(1);
+                self.truncate_memos_to_retention();
+            }
             BlackboardCommand::RecordAllocationProposal {
                 controller,
                 proposal,
             } => {
                 self.allocation_proposals.insert(controller, proposal);
                 self.recompute_effective_allocation();
+            }
+        }
+    }
+
+    fn append_memo(
+        &mut self,
+        owner: ModuleInstanceId,
+        content: String,
+        written_at: DateTime<Utc>,
+    ) -> MemoLogRecord {
+        let index = self.memo_next_indices.entry(owner.clone()).or_default();
+        let record = MemoLogRecord {
+            owner: owner.clone(),
+            index: *index,
+            written_at,
+            content,
+        };
+        *index = (*index).saturating_add(1);
+
+        let retained = self.memo_retained_per_owner.max(1);
+        let records = self.memos.entry(owner).or_default();
+        records.push_back(record.clone());
+        while records.len() > retained {
+            records.pop_front();
+        }
+        record
+    }
+
+    fn truncate_memos_to_retention(&mut self) {
+        let retained = self.memo_retained_per_owner.max(1);
+        for records in self.memos.values_mut() {
+            while records.len() > retained {
+                records.pop_front();
             }
         }
     }
@@ -510,7 +661,11 @@ impl BlackboardInner {
         active_proposals.sort_by_key(|(owner, _)| owner.replica);
 
         if active_proposals.is_empty() {
-            self.allocation = self.base_allocation.clone().clamped(&self.replica_caps);
+            self.allocation = self
+                .base_allocation
+                .clone()
+                .clamped(&self.replica_caps)
+                .limited(self.allocation_limits);
             return;
         }
 
@@ -559,8 +714,25 @@ impl BlackboardInner {
             effective.set(id, cfg);
         }
 
-        self.allocation = effective.clamped(&self.replica_caps);
+        self.allocation = effective
+            .clamped(&self.replica_caps)
+            .limited(self.allocation_limits);
     }
+}
+
+fn latest_memo_content(records: &VecDeque<MemoLogRecord>) -> Option<&str> {
+    records.back().map(|record| record.content.as_str())
+}
+
+fn sort_memo_logs(records: &mut [MemoLogRecord]) {
+    records.sort_by(|a, b| {
+        a.owner
+            .module
+            .as_str()
+            .cmp(b.owner.module.as_str())
+            .then_with(|| a.owner.replica.cmp(&b.owner.replica))
+            .then_with(|| a.index.cmp(&b.index))
+    });
 }
 
 fn rounded_div(sum: u32, count: u32) -> u32 {
@@ -606,7 +778,12 @@ fn ordinal_to_tier(ordinal: u32) -> ModelTier {
 mod tests {
     use super::*;
 
+    use chrono::TimeZone;
     use nuillu_types::{ModelTier, ModuleId, ReplicaIndex, builtin};
+
+    fn memo_time(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
 
     #[tokio::test]
     async fn memo_round_trip() {
@@ -615,9 +792,46 @@ mod tests {
         bb.apply(BlackboardCommand::UpdateMemo {
             owner: ModuleInstanceId::new(id.clone(), ReplicaIndex::ZERO),
             memo: "noted".into(),
+            written_at: memo_time(0),
         })
         .await;
         assert_eq!(bb.memo(&id).await.as_deref(), Some("noted"));
+    }
+
+    #[tokio::test]
+    async fn memo_queue_assigns_per_owner_indexes_and_retains_latest_items() {
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        bb.apply(BlackboardCommand::SetMemoRetentionPerOwner(2))
+            .await;
+
+        let first = bb
+            .update_memo(owner.clone(), "first".into(), memo_time(1))
+            .await;
+        let second = bb
+            .update_memo(owner.clone(), "second".into(), memo_time(2))
+            .await;
+        let third = bb
+            .update_memo(owner.clone(), "third".into(), memo_time(3))
+            .await;
+
+        assert_eq!(first.index, 0);
+        assert_eq!(second.index, 1);
+        assert_eq!(third.index, 2);
+
+        let logs = bb.read(|bb| bb.recent_memo_logs()).await;
+        let owner_logs = logs
+            .into_iter()
+            .filter(|record| record.owner == owner)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            owner_logs
+                .iter()
+                .map(|record| (record.index, record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "second"), (2, "third")]
+        );
+        assert_eq!(bb.memo(&builtin::sensory()).await.as_deref(), Some("third"));
     }
 
     #[tokio::test]

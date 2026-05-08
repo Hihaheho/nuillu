@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, AttentionReader, AttentionStreamUpdatedInbox,
-    BlackboardReader, LlmAccess, Memo, Module,
+    AllocationReader, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    Memo, Module,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,6 @@ pub struct PredictionEntry {
 
 pub struct PredictModule {
     updates: AttentionStreamUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     attention: AttentionReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -44,7 +43,6 @@ pub struct PredictModule {
 impl PredictModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         attention: AttentionReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -53,7 +51,6 @@ impl PredictModule {
     ) -> Self {
         Self {
             updates,
-            allocation_updates,
             attention,
             allocation,
             blackboard,

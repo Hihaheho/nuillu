@@ -4514,6 +4514,8 @@ dependencies = [
  "async-trait",
  "futures",
  "lutum",
+ "lutum-protocol",
+ "nuillu-blackboard",
  "nuillu-module",
  "nuillu-types",
  "schemars 1.2.1",

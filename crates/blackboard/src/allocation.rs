@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -94,6 +94,30 @@ pub struct ResourceAllocation {
     active_replicas: HashMap<ModuleId, u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationLimits {
+    pub max_total_active_replicas: Option<u8>,
+    pub max_premium_replicas: Option<u8>,
+}
+
+impl AllocationLimits {
+    pub const fn unlimited() -> Self {
+        Self {
+            max_total_active_replicas: None,
+            max_premium_replicas: None,
+        }
+    }
+}
+
+impl Default for AllocationLimits {
+    fn default() -> Self {
+        Self {
+            max_total_active_replicas: Some(10),
+            max_premium_replicas: Some(1),
+        }
+    }
+}
+
 impl ResourceAllocation {
     pub fn for_module(&self, id: &ModuleId) -> ModuleConfig {
         self.per_module.get(id).cloned().unwrap_or_default()
@@ -132,5 +156,159 @@ impl ResourceAllocation {
             self.per_module.insert(id.clone(), cfg);
         }
         self
+    }
+
+    pub fn limited(mut self, limits: AllocationLimits) -> Self {
+        if let Some(max_premium) = limits.max_premium_replicas {
+            self.enforce_premium_limit(max_premium);
+        }
+        if let Some(max_active) = limits.max_total_active_replicas {
+            self.enforce_total_active_limit(max_active);
+        }
+        self
+    }
+
+    fn enforce_premium_limit(&mut self, max_premium: u8) {
+        let mut active_premium = self
+            .allocation_module_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let active = self.active_replicas(&id);
+                let cfg = self.for_module(&id);
+                (active > 0 && cfg.tier == ModelTier::Premium).then_some((
+                    id,
+                    cfg.activation_ratio,
+                    active,
+                ))
+            })
+            .collect::<Vec<_>>();
+        active_premium.sort_by(|(left_id, left_ratio, _), (right_id, right_ratio, _)| {
+            right_ratio
+                .cmp(left_ratio)
+                .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+        });
+
+        let mut kept = 0_u8;
+        for (id, _ratio, active) in active_premium {
+            let Some(next_kept) = kept.checked_add(active) else {
+                if let Some(cfg) = self.per_module.get_mut(&id) {
+                    cfg.tier = ModelTier::Default;
+                }
+                continue;
+            };
+            if next_kept <= max_premium {
+                kept = next_kept;
+            } else if let Some(cfg) = self.per_module.get_mut(&id) {
+                cfg.tier = ModelTier::Default;
+            }
+        }
+    }
+
+    fn enforce_total_active_limit(&mut self, max_active: u8) {
+        let mut active_modules = self
+            .allocation_module_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let active = self.active_replicas(&id);
+                let cfg = self.for_module(&id);
+                (active > 0).then_some((id, cfg.activation_ratio, active))
+            })
+            .collect::<Vec<_>>();
+        active_modules.sort_by(|(left_id, left_ratio, _), (right_id, right_ratio, _)| {
+            right_ratio
+                .cmp(left_ratio)
+                .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+        });
+
+        let mut kept = 0_u8;
+        for (id, _ratio, active) in active_modules {
+            let Some(next_kept) = kept.checked_add(active) else {
+                self.active_replicas.insert(id, 0);
+                continue;
+            };
+            if next_kept <= max_active {
+                kept = next_kept;
+            } else {
+                self.active_replicas.insert(id, 0);
+            }
+        }
+    }
+
+    fn allocation_module_ids(&self) -> Vec<ModuleId> {
+        let mut ids = self
+            .per_module
+            .keys()
+            .cloned()
+            .chain(self.active_replicas.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(name: &str) -> ModuleId {
+        ModuleId::new(name).unwrap()
+    }
+
+    fn set(allocation: &mut ResourceAllocation, module: &str, ratio: f64, tier: ModelTier) {
+        allocation.set(
+            id(module),
+            ModuleConfig {
+                activation_ratio: ActivationRatio::from_f64(ratio),
+                guidance: String::new(),
+                tier,
+            },
+        );
+    }
+
+    #[test]
+    fn allocation_limits_downgrade_excess_premium_by_ratio_then_lexical_id() {
+        let mut allocation = ResourceAllocation::default();
+        set(&mut allocation, "beta", 1.0, ModelTier::Premium);
+        set(&mut allocation, "alpha", 1.0, ModelTier::Premium);
+        set(&mut allocation, "gamma", 0.8, ModelTier::Premium);
+
+        let limited = allocation.limited(AllocationLimits {
+            max_total_active_replicas: None,
+            max_premium_replicas: Some(1),
+        });
+
+        assert_eq!(limited.for_module(&id("alpha")).tier, ModelTier::Premium);
+        assert_eq!(limited.for_module(&id("beta")).tier, ModelTier::Default);
+        assert_eq!(limited.for_module(&id("gamma")).tier, ModelTier::Default);
+    }
+
+    #[test]
+    fn allocation_limits_deactivate_excess_active_by_ratio_then_lexical_id() {
+        let mut allocation = ResourceAllocation::default();
+        set(&mut allocation, "gamma", 0.7, ModelTier::Cheap);
+        set(&mut allocation, "alpha", 1.0, ModelTier::Cheap);
+        set(&mut allocation, "beta", 0.7, ModelTier::Cheap);
+
+        let limited = allocation.limited(AllocationLimits {
+            max_total_active_replicas: Some(2),
+            max_premium_replicas: None,
+        });
+
+        assert_eq!(limited.active_replicas(&id("alpha")), 1);
+        assert_eq!(limited.active_replicas(&id("beta")), 1);
+        assert_eq!(limited.active_replicas(&id("gamma")), 0);
+    }
+
+    #[test]
+    fn allocation_limits_default_to_ten_active_and_one_premium() {
+        assert_eq!(
+            AllocationLimits::default(),
+            AllocationLimits {
+                max_total_active_replicas: Some(10),
+                max_premium_replicas: Some(1),
+            }
+        );
     }
 }

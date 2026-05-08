@@ -16,8 +16,12 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 lutum = { workspace = true }
+lutum-protocol = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+nuillu-blackboard = { workspace = true }

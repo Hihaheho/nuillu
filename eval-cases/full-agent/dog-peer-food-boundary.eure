@@ -4,7 +4,6 @@ description = "Full-agent case for a dog-to-dog food-boundary interaction that r
 limits {
   max-ticks = 300
   tick-ms = 500
-  max-llm-calls = 96
 }
 
 @ memories[] {

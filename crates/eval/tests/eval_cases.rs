@@ -234,7 +234,7 @@ fn parses_full_agent_peer_boundary_case() {
     assert_eq!(case.inputs.len(), 2);
     assert!(matches!(case.inputs[0], FullAgentInput::Seen { .. }));
     assert!(matches!(case.inputs[1], FullAgentInput::Heard { .. }));
-    assert_eq!(case.limits.max_llm_calls, Some(96));
+    assert_eq!(case.limits.max_llm_calls, Some(10));
 }
 
 #[test]
@@ -257,6 +257,37 @@ fn parses_full_agent_memory_required_case() {
         MemoryRank::Permanent
     );
     assert!(!case.memories[0].content.content.trim().is_empty());
+}
+
+#[test]
+fn omitted_max_llm_calls_defaults_to_ten() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("default-budget.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "default-budget"
+prompt = "Find memory."
+"#,
+    )
+    .unwrap();
+
+    let case = parse_module_case_file(&path).unwrap();
+    assert_eq!(case.limits.max_llm_calls, Some(10));
+}
+
+#[test]
+fn explicit_max_llm_calls_override_wins() {
+    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
+    let case = parse_case_file(&path).unwrap();
+
+    let EvalCase::Module { case, .. } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(case.limits.max_llm_calls, Some(8));
 }
 
 #[test]

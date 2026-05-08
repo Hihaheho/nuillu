@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, MemoryRequest,
+    AllocationReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, MemoryRequest,
     MemoryRequestInbox, MemoryWriter, Module,
 };
 use nuillu_types::MemoryRank;
@@ -14,10 +14,10 @@ pub use batch::NextBatch as MemoryBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
 Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
-MemoryRequest messages are candidates from other modules, not write commands. Evaluate them before
-any allocation-guidance scan work. You may reject, normalize, or merge candidates, including deduplicating
-multiple requests in the same batch. Use insert_memory only for concrete information likely to
-matter later."#;
+Use current attention plus unread/recent module memo logs as candidate evidence. MemoryRequest
+messages are explicit preservation candidates from other modules, not write commands. You may
+reject, normalize, merge, and deduplicate observations and requests. Use insert_memory only for
+concrete information likely to matter later."#;
 
 const NORMAL_REQUEST_DECAY_SECS: i64 = 86_400;
 const HIGH_REQUEST_DECAY_SECS: i64 = 604_800;
@@ -41,7 +41,7 @@ pub enum MemoryTools {
 }
 
 pub struct MemoryModule {
-    allocation_updates: AllocationUpdatedInbox,
+    attention_updates: AttentionStreamUpdatedInbox,
     requests: MemoryRequestInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -51,7 +51,7 @@ pub struct MemoryModule {
 
 impl MemoryModule {
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        attention_updates: AttentionStreamUpdatedInbox,
         requests: MemoryRequestInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -59,7 +59,7 @@ impl MemoryModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            allocation_updates,
+            attention_updates,
             requests,
             allocation,
             blackboard,
@@ -69,15 +69,14 @@ impl MemoryModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self, requests: Vec<MemoryRequest>, guidance_scan: bool) -> Result<()> {
-        if requests.is_empty() && !guidance_scan {
-            return Ok(());
-        }
+    async fn activate(&self, requests: Vec<MemoryRequest>, attention_updated: bool) -> Result<()> {
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         let snapshot = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
+                    "latest_memos": bb.memos(),
+                    "recent_memo_logs": bb.recent_memo_logs(),
                     "attention_stream": bb.attention_stream().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
@@ -91,9 +90,10 @@ impl MemoryModule {
         session.push_user(
             serde_json::json!({
                 "blackboard": snapshot,
-                "allocation": allocation,
+                "unread_memo_logs": unread_memo_logs,
                 "memory_requests": requests,
-                "guidance_scan": guidance_scan,
+                "attention_updated": attention_updated,
+                "allocation": allocation,
                 "request_policy": {
                     "normal_request_default_decay_secs": NORMAL_REQUEST_DECAY_SECS,
                     "high_request_default_decay_secs": HIGH_REQUEST_DECAY_SECS,
@@ -158,7 +158,7 @@ impl Module for MemoryModule {
     }
 
     async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
-        MemoryModule::activate(self, batch.requests.clone(), batch.guidance).await
+        MemoryModule::activate(self, batch.requests.clone(), batch.attention_updated).await
     }
 }
 
@@ -178,8 +178,11 @@ mod tests {
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NoopAttentionRepository,
         NoopFileSearchProvider, NoopUtteranceSink, PortError, SystemClock,
     };
-    use nuillu_module::{CapabilityProviders, LutumTiers, MemoryImportance, ModuleRegistry};
-    use nuillu_types::{MemoryIndex, builtin};
+    use nuillu_module::{
+        AttentionStreamUpdated, CapabilityProviders, LutumTiers, MemoryImportance,
+        MemoryRequestMailbox, ModuleRegistry,
+    };
+    use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::sync::Mutex;
     use tokio::task::LocalSet;
 
@@ -307,14 +310,29 @@ mod tests {
         ])
     }
 
+    async fn build_memory(caps: &CapabilityProviders) -> nuillu_module::AllocatedModules {
+        let modules = ModuleRegistry::new()
+            .register(builtin::memory(), 0..=1, |caps| {
+                MemoryModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.memory_request_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_writer(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        modules
+    }
+
     async fn build_memory_with_publisher(
         caps: &CapabilityProviders,
-    ) -> (
-        nuillu_module::AllocatedModules,
-        nuillu_module::MemoryRequestMailbox,
-    ) {
-        let publisher_cell: Rc<RefCell<Option<nuillu_module::MemoryRequestMailbox>>> =
-            Rc::new(RefCell::new(None));
+    ) -> (nuillu_module::AllocatedModules, MemoryRequestMailbox) {
+        let publisher_cell: Rc<RefCell<Option<MemoryRequestMailbox>>> = Rc::new(RefCell::new(None));
         let publisher_clone = Rc::clone(&publisher_cell);
         let modules = ModuleRegistry::new()
             .register(builtin::surprise(), 0..=1, move |caps| {
@@ -324,7 +342,7 @@ mod tests {
             .unwrap()
             .register(builtin::memory(), 0..=1, |caps| {
                 MemoryModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.attention_stream_updated_inbox(),
                     caps.memory_request_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -360,21 +378,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_request_does_not_insert_without_llm_tool_decision() {
+    async fn attention_update_does_not_insert_without_llm_tool_decision() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let primary = RecordingMemoryStore::default();
                 let adapter = MockLlmAdapter::new().with_text_scenario(final_text_scenario("done"));
                 let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
-                let (modules, publisher) = build_memory_with_publisher(&caps).await;
+                let modules = build_memory(&caps).await;
+                let attention = caps
+                    .internal_harness_io()
+                    .attention_stream_updated_mailbox();
 
                 run_modules(modules, async {
-                    publisher
-                        .publish(MemoryRequest {
-                            content: "candidate memory".into(),
-                            importance: MemoryImportance::High,
-                            reason: "test request".into(),
+                    attention
+                        .publish(AttentionStreamUpdated::StreamAppended {
+                            stream: ModuleInstanceId::new(
+                                builtin::attention_gate(),
+                                ReplicaIndex::ZERO,
+                            ),
                         })
                         .await
                         .expect("memory module subscribed");
@@ -391,14 +413,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_request_batch_allows_llm_to_consolidate_to_one_insert() {
+    async fn attention_update_allows_llm_to_insert_memory() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let primary = RecordingMemoryStore::default();
                 let adapter = MockLlmAdapter::new()
                     .with_text_scenario(memory_insert_tool_scenario(
-                        "Ryo wants inbox batching implemented.",
+                        "Ryo wants attention-driven memory implemented.",
+                    ))
+                    .with_text_scenario(final_text_scenario("memory-complete"));
+                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
+                let modules = build_memory(&caps).await;
+                let attention = caps
+                    .internal_harness_io()
+                    .attention_stream_updated_mailbox();
+
+                run_modules(modules, async {
+                    attention
+                        .publish(AttentionStreamUpdated::StreamAppended {
+                            stream: ModuleInstanceId::new(
+                                builtin::attention_gate(),
+                                ReplicaIndex::ZERO,
+                            ),
+                        })
+                        .await
+                        .expect("memory module subscribed");
+
+                    for _ in 0..20 {
+                        if primary.inserted_indexes().await.len() == 1 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+
+                let indexes = primary.inserted_indexes().await;
+                assert_eq!(indexes.len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_request_allows_surprise_to_trigger_insert_decision() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let primary = RecordingMemoryStore::default();
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(memory_insert_tool_scenario(
+                        "Koro stiffened at the food bowl.",
                     ))
                     .with_text_scenario(final_text_scenario("memory-complete"));
                 let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
@@ -407,17 +472,9 @@ mod tests {
                 run_modules(modules, async {
                     publisher
                         .publish(MemoryRequest {
-                            content: "Ryo wants inbox batching implemented".into(),
-                            importance: MemoryImportance::Normal,
-                            reason: "first signal".into(),
-                        })
-                        .await
-                        .expect("memory module subscribed");
-                    publisher
-                        .publish(MemoryRequest {
-                            content: "Inbox batching implementation is important to Ryo".into(),
+                            content: "Koro stiffened at the food bowl.".into(),
                             importance: MemoryImportance::High,
-                            reason: "duplicate signal".into(),
+                            reason: "surprising peer food-guarding posture".into(),
                         })
                         .await
                         .expect("memory module subscribed");

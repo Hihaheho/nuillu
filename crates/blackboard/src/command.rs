@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange};
 
 use crate::{
-    AgenticDeadlockMarker, AttentionStreamEvent, MemoryMetaPatch, ModuleRunStatus,
-    ResourceAllocation, UtteranceProgress,
+    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, MemoryMetaPatch,
+    ModuleRunStatus, ResourceAllocation, UtteranceProgress,
 };
 
 /// Internal blackboard mutation. Constructed only by the agent's
@@ -20,6 +20,7 @@ pub enum BlackboardCommand {
     UpdateMemo {
         owner: ModuleInstanceId,
         memo: String,
+        written_at: DateTime<Utc>,
     },
     SetModuleRunStatus {
         owner: ModuleInstanceId,
@@ -48,6 +49,8 @@ pub enum BlackboardCommand {
     SetReplicaCaps {
         caps: Vec<(ModuleId, ReplicaCapRange)>,
     },
+    SetAllocationLimits(AllocationLimits),
+    SetMemoRetentionPerOwner(usize),
     RecordAllocationProposal {
         controller: ModuleInstanceId,
         proposal: ResourceAllocation,

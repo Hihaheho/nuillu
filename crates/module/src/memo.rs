@@ -1,6 +1,9 @@
-use nuillu_blackboard::{Blackboard, BlackboardCommand};
+use std::sync::Arc;
+
+use nuillu_blackboard::Blackboard;
 use nuillu_types::ModuleInstanceId;
 
+use crate::ports::Clock;
 use crate::runtime_events::RuntimeEventEmitter;
 use crate::{MemoUpdated, MemoUpdatedMailbox};
 
@@ -16,6 +19,7 @@ pub struct Memo {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
     updates: MemoUpdatedMailbox,
+    clock: Arc<dyn Clock>,
     events: RuntimeEventEmitter,
 }
 
@@ -24,25 +28,25 @@ impl Memo {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
+        clock: Arc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
             owner,
             blackboard,
             updates,
+            clock,
             events,
         }
     }
 
-    /// Replace the owner module's memo. Allocates the slot on first call.
+    /// Append a new owner memo item. Allocates the queue on first call.
     pub async fn write(&self, memo: impl Into<String>) {
         let memo = memo.into();
         let char_count = memo.chars().count();
-        self.blackboard
-            .apply(BlackboardCommand::UpdateMemo {
-                owner: self.owner.clone(),
-                memo,
-            })
+        let record = self
+            .blackboard
+            .update_memo(self.owner.clone(), memo, self.clock.now())
             .await;
         self.events
             .memo_updated(self.owner.clone(), char_count)
@@ -51,6 +55,7 @@ impl Memo {
             .updates
             .publish(MemoUpdated {
                 owner: self.owner.clone(),
+                index: record.index,
             })
             .await
             .is_err()

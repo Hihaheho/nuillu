@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nuillu_blackboard::AllocationLimits;
 use nuillu_types::{ModuleId, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +15,7 @@ pub enum TopicKind {
     SelfModel,
     Speak,
     SensoryInput,
+    SensoryDetailRequest,
     MemoryRequest,
     AttentionStreamUpdated,
     AllocationUpdated,
@@ -106,9 +108,21 @@ impl Default for RateLimitPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimePolicy {
     pub rate_limits: RateLimitPolicy,
+    pub allocation_limits: AllocationLimits,
+    pub memo_retained_per_owner: usize,
+}
+
+impl Default for RuntimePolicy {
+    fn default() -> Self {
+        Self {
+            rate_limits: RateLimitPolicy::default(),
+            allocation_limits: AllocationLimits::default(),
+            memo_retained_per_owner: 8,
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +403,7 @@ mod tests {
             .acquire(
                 &owner,
                 CapabilityKind::ChannelPublish {
-                    topic: TopicKind::MemoryRequest,
+                    topic: TopicKind::SensoryDetailRequest,
                 },
             )
             .await;

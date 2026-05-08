@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, AttentionWriter, BlackboardReader, LlmAccess, Module,
+    AllocationReader, AttentionWriter, BlackboardReader, LlmAccess, MemoUpdatedInbox, Module,
     TimeDivision,
 };
 use schemars::JsonSchema;
@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-gate module.
-Read the non-cognitive blackboard snapshot and allocation guidance, then decide whether anything
-should enter the cognitive attention stream. Append only concise, novel, currently relevant events.
+Read the indexed memo-log snapshot and allocation guidance, then decide whether anything should
+enter the cognitive attention stream. Append only concise, novel, currently relevant events.
+Treat unread_memo_logs as newly written module output. Treat recent_memo_logs as older context.
+Do not promote a fact solely because it appears in recent_memo_logs if it has already been promoted
+or is not directly relevant now.
 When promoting sensory memo content, convert detailed observation ages to one of the provided
 time-division tags before writing attention text.
 If allocation guidance asks for speech evidence promotion and a query, self-model, sensory, or
@@ -29,7 +32,7 @@ pub struct AttentionGateDecision {
 }
 
 pub struct AttentionGateModule {
-    updates: AllocationUpdatedInbox,
+    updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
     attention: AttentionWriter,
@@ -39,7 +42,7 @@ pub struct AttentionGateModule {
 
 impl AttentionGateModule {
     pub fn new(
-        updates: AllocationUpdatedInbox,
+        updates: MemoUpdatedInbox,
         blackboard: BlackboardReader,
         allocation: AllocationReader,
         attention: AttentionWriter,
@@ -58,11 +61,13 @@ impl AttentionGateModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&self) -> Result<()> {
-        let snapshot = self
+        let snapshot = self.blackboard.unread_memo_logs().await;
+        let context = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
+                    "latest_memos": bb.memos(),
+                    "recent_memo_logs": bb.recent_memo_logs(),
                     "attention_stream": bb.attention_stream().entries(),
                     "memory_metadata": bb.memory_metadata(),
                     "time_division": self.time_division.as_prompt_json(),
@@ -76,7 +81,8 @@ impl AttentionGateModule {
         session.push_system(SYSTEM_PROMPT);
         session.push_user(
             serde_json::json!({
-                "blackboard": snapshot,
+                "unread_memo_logs": snapshot,
+                "blackboard": context,
                 "allocation": allocation,
             })
             .to_string(),
