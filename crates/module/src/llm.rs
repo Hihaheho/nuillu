@@ -3,6 +3,7 @@ use nuillu_blackboard::Blackboard;
 use nuillu_types::ModuleInstanceId;
 
 use crate::LutumTiers;
+use crate::rate_limit::{CapabilityKind, RateLimiter};
 use crate::runtime_events::RuntimeEventEmitter;
 
 /// LLM-access capability.
@@ -23,6 +24,7 @@ pub struct LlmAccess {
     tiers: LutumTiers,
     blackboard: Blackboard,
     events: RuntimeEventEmitter,
+    rate_limiter: RateLimiter,
 }
 
 impl LlmAccess {
@@ -31,12 +33,14 @@ impl LlmAccess {
         tiers: LutumTiers,
         blackboard: Blackboard,
         events: RuntimeEventEmitter,
+        rate_limiter: RateLimiter,
     ) -> Self {
         Self {
             owner,
             tiers,
             blackboard,
             events,
+            rate_limiter,
         }
     }
 
@@ -45,6 +49,20 @@ impl LlmAccess {
     /// activations take effect on the next call without re-issuing the
     /// capability.
     pub async fn lutum(&self) -> Lutum {
+        let outcome = self
+            .rate_limiter
+            .acquire(&self.owner, CapabilityKind::LlmCall)
+            .await;
+        if outcome.was_delayed() {
+            self.events
+                .rate_limit_delayed(
+                    self.owner.clone(),
+                    CapabilityKind::LlmCall,
+                    outcome.delayed_for,
+                )
+                .await;
+        }
+
         let cfg = self
             .blackboard
             .read(|bb| bb.allocation().for_module(&self.owner.module))
@@ -57,6 +75,7 @@ impl LlmAccess {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
@@ -64,6 +83,7 @@ mod tests {
     use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
 
     use crate::ports::PortError;
+    use crate::rate_limit::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RateLimiter};
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
     use super::LlmAccess;
@@ -103,7 +123,13 @@ mod tests {
         };
         let sink = Arc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
-        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
+        let access = LlmAccess::new(
+            owner.clone(),
+            tiers,
+            blackboard,
+            events,
+            RateLimiter::disabled(),
+        );
 
         let _ = access.lutum().await;
         let _ = access.lutum().await;
@@ -126,5 +152,61 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn lutum_waits_for_rate_limit_before_access_event() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
+        let adapter = Arc::new(MockLlmAdapter::new());
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        let tiers = crate::LutumTiers {
+            cheap: lutum.clone(),
+            default: lutum.clone(),
+            premium: lutum,
+        };
+        let sink = Arc::new(RecordingSink::default());
+        let events = RuntimeEventEmitter::new(sink.clone());
+        let limiter = RateLimiter::new(
+            RateLimitPolicy::for_module(
+                owner.module.clone(),
+                CapabilityKind::LlmCall,
+                RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
+            )
+            .unwrap(),
+        );
+        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events, limiter);
+
+        let _ = access.lutum().await;
+        let _ = access.lutum().await;
+
+        let actual = sink.events.lock().expect("event lock poisoned").clone();
+        assert_eq!(actual.len(), 3);
+        assert!(matches!(
+            actual[0],
+            RuntimeEvent::LlmAccessed {
+                sequence: 0,
+                call: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &actual[1],
+            RuntimeEvent::RateLimitDelayed {
+                sequence: 1,
+                owner: delayed_owner,
+                capability: CapabilityKind::LlmCall,
+                delayed_for,
+            } if delayed_owner == &owner && *delayed_for > Duration::ZERO
+        ));
+        assert!(matches!(
+            actual[2],
+            RuntimeEvent::LlmAccessed {
+                sequence: 2,
+                call: 1,
+                ..
+            }
+        ));
     }
 }

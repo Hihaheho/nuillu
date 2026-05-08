@@ -2088,6 +2088,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 .max_llm_calls
                 .is_some_and(|max| call.saturating_add(1) >= max),
             RuntimeEvent::MemoUpdated { .. } => false,
+            RuntimeEvent::RateLimitDelayed { .. } => false,
         };
         let live_message = match &event {
             RuntimeEvent::LlmAccessed {
@@ -2101,6 +2102,18 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             } => format!(
                 "eval memo-updated case={} owner={} chars={}",
                 self.case_id, owner, char_count
+            ),
+            RuntimeEvent::RateLimitDelayed {
+                owner,
+                capability,
+                delayed_for,
+                ..
+            } => format!(
+                "eval rate-limit-delayed case={} owner={} capability={:?} delayed_ms={}",
+                self.case_id,
+                owner,
+                capability,
+                delayed_for.as_millis()
             ),
         };
         self.events

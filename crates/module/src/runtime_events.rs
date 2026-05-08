@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nuillu_types::{ModelTier, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 
 use crate::ports::PortError;
+use crate::rate_limit::CapabilityKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -20,6 +22,12 @@ pub enum RuntimeEvent {
         sequence: u64,
         owner: ModuleInstanceId,
         char_count: usize,
+    },
+    RateLimitDelayed {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        capability: CapabilityKind,
+        delayed_for: Duration,
     },
 }
 
@@ -79,6 +87,27 @@ impl RuntimeEventEmitter {
                 sequence,
                 owner,
                 char_count,
+            })
+            .await
+        {
+            tracing::warn!(?error, "runtime event sink failed");
+        }
+    }
+
+    pub(crate) async fn rate_limit_delayed(
+        &self,
+        owner: ModuleInstanceId,
+        capability: CapabilityKind,
+        delayed_for: Duration,
+    ) {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self
+            .sink
+            .on_event(RuntimeEvent::RateLimitDelayed {
+                sequence,
+                owner,
+                capability,
+                delayed_for,
             })
             .await
         {

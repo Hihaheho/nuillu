@@ -411,10 +411,16 @@ pub enum RuntimeEvent {
         owner: ModuleInstanceId,
         char_count: usize,
     },
+    RateLimitDelayed {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        capability: CapabilityKind,
+        delayed_for: Duration,
+    },
 }
 ```
 
-`sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after resolving the holder's current effective tier and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. Sinks must not deny acquisition or memo writes; limit policies such as eval `max-llm-calls` request shutdown after observing the event.
+`sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after any rate-limit delay, after resolving the holder's current effective tier, and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. `RateLimitDelayed` is emitted after a configured capability permit waits and before the delayed capability operation continues. Sinks must not deny acquisition, memo writes, or delayed capability operations; limit policies such as eval `max-llm-calls` request shutdown after observing `LlmAccessed`.
 
 ---
 
@@ -677,7 +683,7 @@ Common eval behavior:
 2. the eval runner uses libSQL as the primary memory store, local `PotionBase8MEmbedder` for embeddings, and `lutum-openai` in Chat Completions mode for Ollama,
 3. the eval binary installs a global tracing subscriber with `lutum_trace::layer()` before running cases, matching the Lutum trace setup contract; spawned module tasks inherit that global dispatcher,
 4. each case writes `artifact.json`, `report.json`, `events.json`, and `trace.json` under `.tmp/eval/<run-id>/<case-id>/`; failed, invalid, runtime-error, and panic cases also write `raw-trace.json` for provider/protocol-level debugging, and the suite writes both `suite-report.json` and append-only `events.jsonl`,
-5. live progress is always emitted to stderr for suite start/end, case start/end, full-agent allocation changes, completed utterances, `LlmAccessed` events, and stop requests,
+5. live progress is always emitted to stderr for suite start/end, case start/end, full-agent allocation changes, completed utterances, `LlmAccessed` events, `RateLimitDelayed` events, and stop requests,
 6. limits include max loop iterations, optional loop sleep, and `max-llm-calls`,
 7. `max-llm-calls` counts `LlmAccessed` runtime events and requests scheduler shutdown after the event that reaches the limit; the acquisition is observed, not denied.
 

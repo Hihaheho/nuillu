@@ -79,6 +79,7 @@ pub enum CapabilityKind {
 pub enum TopicKind {
     Query,
     SelfModel,
+    Speak,
     SensoryInput,
     MemoryRequest,
     AttentionStreamUpdated,
@@ -87,18 +88,15 @@ pub enum TopicKind {
 }
 
 pub struct RateLimitConfig {
-    pub window: Duration,
-    pub max_rate: f64, // events/sec; over the limit waits for the next permit
+    pub window: Duration, // burst span, not a hard sliding-window rule
+    pub max_rate: f64,    // steady-state events/sec
 }
 
 pub struct RateLimitPolicy {
     pub configs: HashMap<(ModuleId, CapabilityKind), RateLimitConfig>,
 }
 
-pub struct RateLimiter {
-    // Interior state stores recent event timestamps and the next eligible
-    // permit time for each configured key.
-}
+pub struct RateLimiter { /* token bucket state per configured key */ }
 
 impl RateLimiter {
     pub fn disabled() -> Self;
@@ -192,17 +190,34 @@ for the permit, then performs normal topic routing.
 
 ## 4. Rate Calculation
 
-For each configured `(ModuleId, CapabilityKind)` key, the limiter keeps a
-sliding window of granted events.
+For each configured `(ModuleId, CapabilityKind)` key, the limiter keeps a token
+bucket:
+
+```text
+capacity = max(1.0, max_rate * window.as_secs_f64())
+refill   = elapsed_secs * max_rate
+grant    = consume 1 token
+```
+
+`max_rate` defines the steady-state rate. `window` defines the allowed burst
+capacity at that rate. If no token is available, the limiter computes the
+earliest monotonic deadline at which one token will be refilled and awaits that
+deadline. A permit is not reserved while sleeping: under contention, another
+task may consume the token first, and the waiter will compute a later deadline on
+the next loop. This is acceptable for v1 because the limiter is a deterministic
+safety guardrail, not a fairness scheduler.
+
+The limiter may also keep recent granted event timestamps for snapshots and
+observability:
 
 ```text
 prune events older than now - window
 observed_rate = granted_count / window.as_secs_f64()
 ```
 
-If `observed_rate < max_rate`, the permit is immediate. If the next event would
-exceed `max_rate`, the limiter computes the earliest monotonic deadline at which
-the event can be admitted and awaits that deadline.
+Those timestamps do not decide admission. `snapshot()` may prune expired
+timestamps and refill the token bucket before returning a view; this mutates only
+limiter bookkeeping so the observation is current.
 
 The monotonic clock for this calculation is `tokio::time::Instant`, matching the
 scheduler's existing idle-deadline use. The injected `Clock` remains the source
@@ -301,9 +316,9 @@ by topic:
 - Wake-only topics (`AttentionStreamUpdated`, `MemoUpdated`,
   `AllocationUpdated`) may coalesce redundant queued wakes because durable state
   is the source of truth.
-- Work-carrying topics (`QueryRequest`, `SelfModelRequest`, `SensoryInput`,
-  `MemoryRequest`) must not silently drop by default because the payload is the
-  work.
+- Work-carrying topics (`QueryRequest`, `SelfModelRequest`, `SpeakRequest`,
+  `SensoryInput`, `MemoryRequest`) must not silently drop by default because the
+  payload is the work.
 - If a work-carrying topic is made lossy, that must be explicit per topic, traced
   as a runtime event, and justified by the caller's semantics.
 

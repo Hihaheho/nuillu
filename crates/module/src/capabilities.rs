@@ -10,6 +10,7 @@ use nuillu_types::{
 
 use crate::channels::{Topic, TopicPolicy};
 use crate::ports::{AttentionRepository, Clock, FileSearchProvider, MemoryStore, UtteranceSink};
+use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::r#trait::ErasedModule;
 use crate::utterance::UtteranceWriter;
@@ -53,6 +54,7 @@ struct CapabilityProvidersInner {
     time_division: TimeDivision,
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
+    rate_limiter: RateLimiter,
 }
 
 impl CapabilityProviders {
@@ -92,16 +94,93 @@ impl CapabilityProviders {
         tiers: LutumTiers,
         runtime_event_sink: Arc<dyn RuntimeEventSink>,
     ) -> Self {
+        Self::new_with_runtime_policy(
+            blackboard,
+            attention_port,
+            primary_memory_store,
+            memory_replicas,
+            file_search,
+            utterance_sink,
+            clock,
+            tiers,
+            runtime_event_sink,
+            RuntimePolicy::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime_policy(
+        blackboard: Blackboard,
+        attention_port: Arc<dyn AttentionRepository>,
+        primary_memory_store: Arc<dyn MemoryStore>,
+        memory_replicas: Vec<Arc<dyn MemoryStore>>,
+        file_search: Arc<dyn FileSearchProvider>,
+        utterance_sink: Arc<dyn UtteranceSink>,
+        clock: Arc<dyn Clock>,
+        tiers: LutumTiers,
+        runtime_event_sink: Arc<dyn RuntimeEventSink>,
+        policy: RuntimePolicy,
+    ) -> Self {
+        let runtime_events = RuntimeEventEmitter::new(runtime_event_sink);
+        let rate_limiter = RateLimiter::new(policy.rate_limits);
         Self {
             inner: Arc::new(CapabilityProvidersInner {
-                query_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
-                self_model_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
-                speak_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
-                memory_request_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
-                attention_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
-                allocation_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
-                memo_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
-                sensory_input_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
+                query_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::Query,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                self_model_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::SelfModel,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                speak_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::Speak,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                memory_request_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::MemoryRequest,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                attention_updates: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::AttentionStreamUpdated,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                allocation_updates: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::AllocationUpdated,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                memo_updates: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::MemoUpdated,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                sensory_input_topic: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::RoleLoadBalanced,
+                    TopicKind::SensoryInput,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
                 blackboard,
                 attention_port,
                 primary_memory_store,
@@ -111,7 +190,8 @@ impl CapabilityProviders {
                 clock,
                 time_division: TimeDivision::default(),
                 tiers,
-                runtime_events: RuntimeEventEmitter::new(runtime_event_sink),
+                runtime_events,
+                rate_limiter,
             }),
         }
     }
@@ -395,6 +475,7 @@ impl ModuleCapabilityFactory {
             self.root.inner.tiers.clone(),
             self.root.inner.blackboard.clone(),
             self.root.inner.runtime_events.clone(),
+            self.root.inner.rate_limiter.clone(),
         )
     }
 

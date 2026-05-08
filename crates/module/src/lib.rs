@@ -24,6 +24,7 @@ mod llm;
 mod memo;
 mod memory_caps;
 pub mod ports;
+mod rate_limit;
 mod readers;
 mod runtime_events;
 mod tiers;
@@ -55,6 +56,10 @@ pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
 pub use ports::Embedder;
+pub use rate_limit::{
+    ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
+    RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
+};
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleStatusReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
