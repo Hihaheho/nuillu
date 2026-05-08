@@ -392,13 +392,13 @@ mod tests {
         }
     }
 
-    struct SummarizeStub {
+    struct AttentionGateStub {
         writer: AttentionWriter,
         on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
-    impl Module for SummarizeStub {
+    impl Module for AttentionGateStub {
         type Batch = ();
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -569,7 +569,7 @@ mod tests {
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
-                    builtin::summarize(),
+                    builtin::attention_gate(),
                     ModuleConfig {
                         activation_ratio: nuillu_blackboard::ActivationRatio::ONE,
                         tier: ModelTier::Default,
@@ -582,9 +582,9 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(builtin::summarize(), 0..=1, {
+                    .register(builtin::attention_gate(), 0..=1, {
                         let done_tx = Rc::clone(&done_tx);
-                        move |caps| SummarizeStub {
+                        move |caps| AttentionGateStub {
                             writer: caps.attention_writer(),
                             on_done: done_tx.borrow_mut().take(),
                         }

@@ -58,7 +58,7 @@ mod tests {
     #[tokio::test]
     async fn attention_repo_filters_by_time() {
         let repo = InMemoryAttentionRepository::new();
-        let stream = ModuleInstanceId::new(builtin::summarize(), ReplicaIndex::ZERO);
+        let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
         let old = Utc::now();
         repo.append(
             stream.clone(),

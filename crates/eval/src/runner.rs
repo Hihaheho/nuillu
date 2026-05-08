@@ -33,7 +33,8 @@ use nuillu_module::ports::{
     NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
-    CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent, RuntimeEventSink, SensoryInput,
+    AttentionStreamUpdated, CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent,
+    RuntimeEventSink, SensoryInput,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
@@ -654,6 +655,18 @@ async fn execute_module_case(
                 }
                 ModuleEvalTarget::AttentionSchema => {
                     harness
+                        .attention_stream_updated_mailbox()
+                        .publish(AttentionStreamUpdated::StreamAppended {
+                            stream: ModuleInstanceId::new(
+                                builtin::attention_gate(),
+                                ReplicaIndex::ZERO,
+                            ),
+                        })
+                        .await
+                        .expect("module eval failed to publish AttentionStreamUpdated");
+                }
+                ModuleEvalTarget::SelfModel => {
+                    harness
                         .self_model_mailbox()
                         .publish(nuillu_module::SelfModelRequest::new(prompt))
                         .await
@@ -880,7 +893,7 @@ async fn seed_attention_stream(
     clock: &dyn Clock,
     seeds: &[crate::cases::AttentionSeed],
 ) {
-    let stream = ModuleInstanceId::new(builtin::summarize(), ReplicaIndex::ZERO);
+    let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
     let now = clock.now();
     for seed in seeds {
         blackboard
@@ -969,8 +982,8 @@ fn full_agent_registry() -> ModuleRegistry {
             )
         })
         .unwrap()
-        .register(builtin::summarize(), 0..=1, |caps| {
-            nuillu_summarize::SummarizeModule::new(
+        .register(builtin::attention_gate(), 0..=1, |caps| {
+            nuillu_attention_gate::AttentionGateModule::new(
                 caps.allocation_updated_inbox(),
                 caps.blackboard_reader(),
                 caps.allocation_reader(),
@@ -994,10 +1007,17 @@ fn full_agent_registry() -> ModuleRegistry {
         .unwrap()
         .register(builtin::attention_schema(), 0..=1, |caps| {
             nuillu_attention_schema::AttentionSchemaModule::new(
-                caps.self_model_inbox(),
-                caps.allocation_updated_inbox(),
+                caps.attention_stream_updated_inbox(),
                 caps.attention_reader(),
-                caps.allocation_reader(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::self_model(), 0..=1, |caps| {
+            nuillu_self_model::SelfModelModule::new(
+                caps.self_model_inbox(),
+                caps.blackboard_reader(),
                 caps.memo(),
                 caps.llm_access(),
             )
@@ -1117,10 +1137,18 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
         ModuleEvalTarget::AttentionSchema => ModuleRegistry::new()
             .register(builtin::attention_schema(), 0..=1, |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
-                    caps.self_model_inbox(),
-                    caps.allocation_updated_inbox(),
+                    caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
-                    caps.allocation_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap(),
+        ModuleEvalTarget::SelfModel => ModuleRegistry::new()
+            .register(builtin::self_model(), 0..=1, |caps| {
+                nuillu_self_model::SelfModelModule::new(
+                    caps.self_model_inbox(),
+                    caps.blackboard_reader(),
                     caps.memo(),
                     caps.llm_access(),
                 )
@@ -1141,7 +1169,7 @@ fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocati
     );
     set_allocation_module(
         &mut allocation,
-        builtin::summarize(),
+        builtin::attention_gate(),
         0.0,
         ModelTier::Cheap,
         "Wait for controller guidance before promoting memos into attention.",
@@ -1158,7 +1186,14 @@ fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocati
         builtin::attention_schema(),
         0.0,
         ModelTier::Default,
-        "Idle until self-model guidance or request requires work.",
+        "Idle until attention-stream updates require attention-state modeling.",
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::self_model(),
+        0.0,
+        ModelTier::Default,
+        "Idle until explicit self-model requests require work.",
     );
     set_allocation_module(
         &mut allocation,
@@ -1252,6 +1287,7 @@ fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
         ModuleEvalTarget::QueryVector => builtin::query_vector(),
         ModuleEvalTarget::QueryAgentic => builtin::query_agentic(),
         ModuleEvalTarget::AttentionSchema => builtin::attention_schema(),
+        ModuleEvalTarget::SelfModel => builtin::self_model(),
     }
 }
 
@@ -1260,6 +1296,7 @@ fn module_tier_for_target(target: ModuleEvalTarget) -> ModelTier {
         ModuleEvalTarget::QueryVector => ModelTier::Cheap,
         ModuleEvalTarget::QueryAgentic => ModelTier::Premium,
         ModuleEvalTarget::AttentionSchema => ModelTier::Default,
+        ModuleEvalTarget::SelfModel => ModelTier::Default,
     }
 }
 
@@ -2339,7 +2376,7 @@ limits {{
     }
 
     #[tokio::test]
-    async fn seed_attention_stream_stamps_summarize_replica_and_offsets_time() {
+    async fn seed_attention_stream_stamps_attention_gate_replica_and_offsets_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("attention-seed.eure");
         std::fs::write(
@@ -2369,7 +2406,7 @@ prompt = "What am I attending to?"
         let records = stream_set.streams();
         assert_eq!(records.len(), 1);
         let record = &records[0];
-        assert_eq!(record.stream.module, builtin::summarize());
+        assert_eq!(record.stream.module, builtin::attention_gate());
         assert_eq!(record.stream.replica, ReplicaIndex::ZERO);
         assert_eq!(record.entries.len(), 2);
         assert_eq!(record.entries[0].text, "Older attended topic");
@@ -2390,9 +2427,9 @@ prompt = "What am I attending to?"
         assert_eq!(sensory.activation_ratio, ActivationRatio::ONE);
         assert_eq!(sensory.tier, ModelTier::Cheap);
 
-        let summarize = allocation.for_module(&builtin::summarize());
-        assert_eq!(summarize.activation_ratio, ActivationRatio::ZERO);
-        assert_eq!(summarize.tier, ModelTier::Cheap);
+        let attention_gate = allocation.for_module(&builtin::attention_gate());
+        assert_eq!(attention_gate.activation_ratio, ActivationRatio::ZERO);
+        assert_eq!(attention_gate.tier, ModelTier::Cheap);
 
         let controller = allocation.for_module(&builtin::attention_controller());
         assert_eq!(controller.activation_ratio, ActivationRatio::ONE);
@@ -2404,6 +2441,7 @@ prompt = "What am I attending to?"
 
         for module in [
             builtin::attention_schema(),
+            builtin::self_model(),
             builtin::query_vector(),
             builtin::query_agentic(),
             builtin::memory(),

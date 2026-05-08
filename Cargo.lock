@@ -4285,6 +4285,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-attention-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-attention-schema"
 version = "0.1.0"
 dependencies = [
@@ -4332,6 +4347,7 @@ dependencies = [
  "lutum-trace",
  "nuillu-agent",
  "nuillu-attention-controller",
+ "nuillu-attention-gate",
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-memory",
@@ -4340,9 +4356,9 @@ dependencies = [
  "nuillu-predict",
  "nuillu-query-agentic",
  "nuillu-query-vector",
+ "nuillu-self-model",
  "nuillu-sensory",
  "nuillu-speak",
- "nuillu-summarize",
  "nuillu-surprise",
  "nuillu-types",
  "regex",
@@ -4460,6 +4476,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-self-model"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "nuillu-module",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-sensory"
 version = "0.1.0"
 dependencies = [
@@ -4490,21 +4520,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nuillu-summarize"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "nuillu-module",
- "nuillu-types",
- "schemars 1.2.1",
- "serde",
- "serde_json",
  "tracing",
 ]
 

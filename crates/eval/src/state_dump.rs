@@ -211,7 +211,7 @@ mod tests {
                 }],
                 attention_streams: vec![AttentionStreamDump {
                     stream: ModuleInstanceDump {
-                        module: "summarize".to_string(),
+                        module: "attention-gate".to_string(),
                         replica: 0,
                     },
                     entries: vec![AttentionEntryDump {

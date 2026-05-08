@@ -457,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn memo_round_trip() {
         let bb = Blackboard::new();
-        let id = builtin::summarize();
+        let id = builtin::attention_gate();
         bb.apply(BlackboardCommand::UpdateMemo {
             owner: ModuleInstanceId::new(id.clone(), ReplicaIndex::ZERO),
             memo: "noted".into(),

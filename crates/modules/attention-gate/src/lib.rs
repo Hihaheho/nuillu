@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 mod batch;
 
-const SYSTEM_PROMPT: &str = r#"You are the summarize module.
+const SYSTEM_PROMPT: &str = r#"You are the attention-gate module.
 Read the non-cognitive blackboard snapshot and allocation guidance, then decide whether anything
 should enter the cognitive attention stream. Append only concise, novel, currently relevant events.
 When promoting sensory memo content, convert detailed observation ages to one of the provided
@@ -18,12 +18,12 @@ time-division tags before writing attention text. Return only raw JSON for the s
 do not wrap it in Markdown or code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SummaryDecision {
+pub struct AttentionGateDecision {
     pub append_attention: bool,
     pub attention_text: Option<String>,
 }
 
-pub struct SummarizeModule {
+pub struct AttentionGateModule {
     updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
@@ -32,7 +32,7 @@ pub struct SummarizeModule {
     llm: LlmAccess,
 }
 
-impl SummarizeModule {
+impl AttentionGateModule {
     pub fn new(
         updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
@@ -78,13 +78,13 @@ impl SummarizeModule {
         );
 
         let result = session
-            .structured_turn::<SummaryDecision>()
+            .structured_turn::<AttentionGateDecision>()
             .collect()
             .await
-            .context("summarize structured turn failed")?;
+            .context("attention-gate structured turn failed")?;
 
         let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-            anyhow::bail!("summarize structured turn refused");
+            anyhow::bail!("attention-gate structured turn refused");
         };
 
         if decision.append_attention
@@ -98,14 +98,14 @@ impl SummarizeModule {
 }
 
 #[async_trait(?Send)]
-impl Module for SummarizeModule {
+impl Module for AttentionGateModule {
     type Batch = ();
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        SummarizeModule::next_batch(self).await
+        AttentionGateModule::next_batch(self).await
     }
 
     async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-        SummarizeModule::activate(self).await
+        AttentionGateModule::activate(self).await
     }
 }

@@ -34,8 +34,9 @@ nuillu-predict = { workspace = true }
 nuillu-query-agentic = { workspace = true }
 nuillu-query-vector = { workspace = true }
 nuillu-sensory = { workspace = true }
+nuillu-self-model = { workspace = true }
 nuillu-speak = { workspace = true }
-nuillu-summarize = { workspace = true }
+nuillu-attention-gate = { workspace = true }
 nuillu-surprise = { workspace = true }
 nuillu-types = { workspace = true }
 schemars = { workspace = true }

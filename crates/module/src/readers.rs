@@ -10,7 +10,7 @@ use nuillu_blackboard::{AttentionStream, Blackboard, BlackboardInner, ResourceAl
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
-/// Held by modules that legitimately need a wide view (summarize,
+/// Held by modules that legitimately need a wide view (attention-gate,
 /// query, memory, memory-compaction). Pointedly *not* held by the
 /// attention controller, which is restricted to the cognitive surface.
 #[derive(Clone)]

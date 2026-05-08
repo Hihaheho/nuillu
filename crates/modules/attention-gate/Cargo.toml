@@ -1,5 +1,5 @@
 [package]
-name = "nuillu-summarize"
+name = "nuillu-attention-gate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

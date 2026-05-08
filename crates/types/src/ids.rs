@@ -167,9 +167,10 @@ pub mod builtin {
 
     builtin!(
         sensory               => "sensory",
-        summarize             => "summarize",
+        attention_gate        => "attention-gate",
         attention_controller  => "attention-controller",
         attention_schema      => "attention-schema",
+        self_model            => "self-model",
         query_vector          => "query-vector",
         query_agentic         => "query-agentic",
         memory                => "memory",
@@ -229,9 +230,10 @@ mod tests {
 
     #[test]
     fn builtins_parse() {
-        let _ = builtin::summarize();
+        let _ = builtin::attention_gate();
         let _ = builtin::attention_controller();
         let _ = builtin::attention_schema();
+        let _ = builtin::self_model();
         let _ = builtin::query_vector();
         let _ = builtin::query_agentic();
     }

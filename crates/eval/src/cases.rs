@@ -121,6 +121,7 @@ pub enum ModuleEvalTarget {
     QueryVector,
     QueryAgentic,
     AttentionSchema,
+    SelfModel,
 }
 
 impl ModuleEvalTarget {
@@ -129,6 +130,7 @@ impl ModuleEvalTarget {
             Self::QueryVector => "query-vector",
             Self::QueryAgentic => "query-agentic",
             Self::AttentionSchema => "attention-schema",
+            Self::SelfModel => "self-model",
         }
     }
 
@@ -139,6 +141,7 @@ impl ModuleEvalTarget {
                 "query-vector" => Some(Self::QueryVector),
                 "query-agentic" => Some(Self::QueryAgentic),
                 "attention-schema" => Some(Self::AttentionSchema),
+                "self-model" => Some(Self::SelfModel),
                 _ => None,
             })
     }
@@ -458,9 +461,8 @@ pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
     }
     let target = ModuleEvalTarget::from_path(path).ok_or_else(|| CaseFileError::Validation {
         path: path.to_path_buf(),
-        message:
-            "module eval case path must include query-vector, query-agentic, or attention-schema"
-                .to_string(),
+        message: "module eval case path must include query-vector, query-agentic, attention-schema, or self-model"
+            .to_string(),
     })?;
     parse_module_case_file(path).map(|case| EvalCase::Module { target, case })
 }

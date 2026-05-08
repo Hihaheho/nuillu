@@ -85,14 +85,14 @@ mod tests {
     async fn lutum_emits_one_runtime_event_per_acquisition() {
         let mut allocation = ResourceAllocation::default();
         allocation.set(
-            builtin::summarize(),
+            builtin::attention_gate(),
             ModuleConfig {
                 tier: ModelTier::Premium,
                 ..Default::default()
             },
         );
         let blackboard = Blackboard::with_allocation(allocation);
-        let owner = ModuleInstanceId::new(builtin::summarize(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
         let adapter = Arc::new(MockLlmAdapter::new());
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);

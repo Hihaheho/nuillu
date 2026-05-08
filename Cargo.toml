@@ -70,9 +70,10 @@ lutum-lancedb-core = { path = "crates/adapters/lancedb-core" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 
-nuillu-summarize = { path = "crates/modules/summarize" }
+nuillu-attention-gate = { path = "crates/modules/attention-gate" }
 nuillu-attention-controller = { path = "crates/modules/attention-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
+nuillu-self-model = { path = "crates/modules/self-model" }
 nuillu-query-vector = { path = "crates/modules/query-vector" }
 nuillu-query-agentic = { path = "crates/modules/query-agentic" }
 nuillu-memory = { path = "crates/modules/memory" }

@@ -341,7 +341,7 @@ mod tests {
         let query_publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
         let self_publisher = scoped(&caps, echo_id(), 0).self_model_mailbox();
         let mut query_inbox = scoped(&caps, builtin::query_vector(), 0).query_inbox();
-        let mut self_inbox = scoped(&caps, builtin::attention_schema(), 0).self_model_inbox();
+        let mut self_inbox = scoped(&caps, builtin::self_model(), 0).self_model_inbox();
 
         query_publisher
             .publish(QueryRequest::new("memory only"))

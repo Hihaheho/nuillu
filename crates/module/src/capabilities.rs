@@ -282,6 +282,13 @@ impl InternalHarnessIo {
     pub fn self_model_mailbox(&self) -> SelfModelMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
     }
+
+    pub fn attention_stream_updated_mailbox(&self) -> AttentionStreamUpdatedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.attention_updates.clone(),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -637,26 +644,26 @@ mod tests {
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
-            .register(builtin::summarize(), 0..=1, noop_builder)
+            .register(builtin::attention_gate(), 0..=1, noop_builder)
             .unwrap();
 
         let err = registry
-            .register(builtin::summarize(), 0..=1, noop_builder)
+            .register(builtin::attention_gate(), 0..=1, noop_builder)
             .unwrap_err();
 
         assert!(matches!(
             err,
-            ModuleRegistryError::DuplicateModule { module } if module == builtin::summarize()
+            ModuleRegistryError::DuplicateModule { module } if module == builtin::attention_gate()
         ));
     }
 
     #[tokio::test]
     async fn capabilities_are_non_exclusive() {
         let caps = test_caps(Blackboard::default());
-        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let _w1 = summarize.attention_writer();
-        let _w2 = summarize.attention_writer();
+        let _w1 = attention_gate.attention_writer();
+        let _w2 = attention_gate.attention_writer();
         let _a1 = controller.allocation_writer();
         let _a2 = controller.allocation_writer();
     }
@@ -664,11 +671,11 @@ mod tests {
     #[tokio::test]
     async fn memo_updated_inbox_filters_self_writes() {
         let caps = test_caps(Blackboard::default());
-        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
         let sensory = scoped(&caps, builtin::sensory(), 0);
-        let mut inbox = summarize.memo_updated_inbox();
+        let mut inbox = attention_gate.memo_updated_inbox();
 
-        summarize.memo().write("own memo").await;
+        attention_gate.memo().write("own memo").await;
         sensory.memo().write("sensory memo").await;
 
         let event = inbox.next_item().await.unwrap();
@@ -687,22 +694,25 @@ mod tests {
                         builtin::attention_controller(),
                         ReplicaCapRange { min: 1, max: 1 },
                     ),
-                    (builtin::summarize(), ReplicaCapRange { min: 0, max: 1 }),
+                    (
+                        builtin::attention_gate(),
+                        ReplicaCapRange { min: 0, max: 1 },
+                    ),
                 ],
             })
             .await;
         let caps = test_caps(blackboard);
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
         let writer = controller.allocation_writer();
-        let mut inbox = summarize.allocation_updated_inbox();
+        let mut inbox = attention_gate.allocation_updated_inbox();
 
         let mut proposal = ResourceAllocation::default();
         proposal.set(
-            builtin::summarize(),
+            builtin::attention_gate(),
             ModuleConfig {
                 activation_ratio: ActivationRatio::ONE,
-                guidance: "summarize current sensory memo".into(),
+                guidance: "promote current sensory memo into attention".into(),
                 tier: ModelTier::Default,
             },
         );
@@ -720,10 +730,10 @@ mod tests {
     async fn attention_stream_updates_do_not_wake_controller_memo_inbox() {
         let caps = test_caps(Blackboard::default());
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
         let mut memo_updates = controller.memo_updated_inbox();
 
-        summarize
+        attention_gate
             .attention_writer()
             .append("user question needs a summary")
             .await;

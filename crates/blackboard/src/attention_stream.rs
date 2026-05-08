@@ -5,7 +5,7 @@ use std::time::Duration;
 
 /// A single (time, event) entry on the cognitive attention stream.
 ///
-/// Per the design, the summarize module is the *only* module that may
+/// Per the design, the attention-gate module is the *only* module that may
 /// produce these. Enforcement lives in the agent scheduler and a workspace
 /// test, not in this struct.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
