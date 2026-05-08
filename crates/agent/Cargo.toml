@@ -19,6 +19,7 @@ tokio = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 lutum = { workspace = true }

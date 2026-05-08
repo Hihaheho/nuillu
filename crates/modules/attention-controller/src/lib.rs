@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationWriter, AttentionReader, BlackboardReader,
-    LlmAccess, Memo, MemoUpdatedInbox, Module,
+    AllocationReader, AllocationWriter, AttentionReader, BlackboardReader, LlmAccess, Memo,
+    MemoUpdatedInbox, Module,
 };
 use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -62,7 +62,6 @@ pub struct AllocationEntry {
 
 pub struct AttentionControllerModule {
     updates: MemoUpdatedInbox,
-    gate: ActivationGate,
     blackboard: BlackboardReader,
     attention: AttentionReader,
     allocation_reader: AllocationReader,
@@ -74,7 +73,6 @@ pub struct AttentionControllerModule {
 impl AttentionControllerModule {
     pub fn new(
         updates: MemoUpdatedInbox,
-        gate: ActivationGate,
         blackboard: BlackboardReader,
         attention: AttentionReader,
         allocation_reader: AllocationReader,
@@ -84,7 +82,6 @@ impl AttentionControllerModule {
     ) -> Self {
         Self {
             updates,
-            gate,
             blackboard,
             attention,
             allocation_reader,
@@ -165,13 +162,6 @@ impl AttentionControllerModule {
         memo.write(next.memo.clone()).await;
         allocation_writer.set(next.allocation).await;
         Ok(())
-    }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
     }
 }
 
@@ -276,9 +266,13 @@ mod tests {
 
 #[async_trait(?Send)]
 impl Module for AttentionControllerModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("attention-controller module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        AttentionControllerModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        AttentionControllerModule::activate(self).await
     }
 }

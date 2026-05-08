@@ -1,25 +1,26 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
-use nuillu_blackboard::{Blackboard, BlackboardCommand};
+use nuillu_blackboard::{AgenticDeadlockMarker, Blackboard, BlackboardCommand};
 use nuillu_types::{
     ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
 };
 
-use crate::activation::ActivationGate;
 use crate::channels::{Topic, TopicPolicy};
 use crate::ports::{AttentionRepository, Clock, FileSearchProvider, MemoryStore, UtteranceSink};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
+use crate::r#trait::ErasedModule;
 use crate::utterance::UtteranceWriter;
 use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
     AllocationWriter, AttentionReader, AttentionStreamUpdated, AttentionStreamUpdatedInbox,
     AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader, FileSearcher, LlmAccess,
     LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor, MemoryContentReader,
-    MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, QueryInbox,
-    QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput,
-    SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox,
+    MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, ModuleBatch,
+    QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox, SelfModelRequest,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox,
     VectorMemorySearcher,
 };
 
@@ -127,6 +128,21 @@ impl CapabilityProviders {
             .await;
     }
 
+    pub(crate) fn runtime_control(&self) -> AgentRuntimeControl {
+        let owner = ModuleInstanceId::new(
+            ModuleId::new("agent-event-loop").expect("agent event loop id is valid"),
+            ReplicaIndex::ZERO,
+        );
+        AgentRuntimeControl {
+            blackboard: self.inner.blackboard.clone(),
+            attention_updates: AttentionStreamUpdatedMailbox::new(
+                owner,
+                self.inner.attention_updates.clone(),
+            ),
+            clock: self.inner.clock.clone(),
+        }
+    }
+
     pub fn blackboard_reader(&self) -> BlackboardReader {
         BlackboardReader::new(self.inner.blackboard.clone())
     }
@@ -203,6 +219,41 @@ impl CapabilityProviders {
 }
 
 #[derive(Clone)]
+pub struct AgentRuntimeControl {
+    blackboard: Blackboard,
+    attention_updates: AttentionStreamUpdatedMailbox,
+    clock: Arc<dyn Clock>,
+}
+
+impl AgentRuntimeControl {
+    pub async fn is_active(&self, owner: &ModuleInstanceId) -> bool {
+        self.blackboard
+            .read(|bb| bb.allocation().is_replica_active(owner))
+            .await
+    }
+
+    pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
+        self.blackboard
+            .apply(BlackboardCommand::RecordAgenticDeadlockMarker(
+                AgenticDeadlockMarker {
+                    at: self.clock.now(),
+                    idle_for,
+                },
+            ))
+            .await;
+
+        if self
+            .attention_updates
+            .publish(AttentionStreamUpdated::AgenticDeadlockMarker)
+            .await
+            .is_err()
+        {
+            tracing::trace!("agentic deadlock attention update had no active subscribers");
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct HostIo {
     owner: ModuleInstanceId,
     root: CapabilityProviders,
@@ -240,10 +291,6 @@ pub struct ModuleCapabilityFactory {
 }
 
 impl ModuleCapabilityFactory {
-    pub fn activation_gate(&self) -> ActivationGate {
-        ActivationGate::new(self.owner.clone(), self.root.inner.blackboard.clone())
-    }
-
     pub fn query_mailbox(&self) -> QueryMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
     }
@@ -397,13 +444,37 @@ impl ModuleCapabilityFactory {
     }
 }
 
+pub struct AllocatedModule {
+    owner: ModuleInstanceId,
+    module: Box<dyn ErasedModule>,
+}
+
+impl AllocatedModule {
+    fn new(owner: ModuleInstanceId, module: Box<dyn ErasedModule>) -> Self {
+        Self { owner, module }
+    }
+
+    pub fn owner(&self) -> &ModuleInstanceId {
+        &self.owner
+    }
+
+    pub async fn next_batch(&mut self) -> anyhow::Result<ModuleBatch> {
+        self.module.next_batch().await
+    }
+
+    pub async fn activate(&mut self, batch: &ModuleBatch) -> anyhow::Result<()> {
+        self.module.activate(batch).await
+    }
+}
+
 pub struct AllocatedModules {
-    modules: Vec<Box<dyn Module>>,
+    runtime: AgentRuntimeControl,
+    modules: Vec<AllocatedModule>,
 }
 
 impl AllocatedModules {
-    fn new(modules: Vec<Box<dyn Module>>) -> Self {
-        Self { modules }
+    fn new(runtime: AgentRuntimeControl, modules: Vec<AllocatedModule>) -> Self {
+        Self { runtime, modules }
     }
 
     pub fn len(&self) -> usize {
@@ -414,8 +485,8 @@ impl AllocatedModules {
         self.modules.is_empty()
     }
 
-    pub fn into_modules(self) -> impl Iterator<Item = Box<dyn Module>> {
-        self.modules.into_iter()
+    pub fn into_parts(self) -> (AgentRuntimeControl, Vec<AllocatedModule>) {
+        (self.runtime, self.modules)
     }
 }
 
@@ -434,7 +505,7 @@ impl fmt::Debug for ModuleRegistry {
 struct ModuleRegistration {
     module: ModuleId,
     cap_range: ReplicaCapRange,
-    builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn Module>>,
+    builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
 }
 
 impl fmt::Debug for ModuleRegistration {
@@ -449,7 +520,7 @@ impl fmt::Debug for ModuleRegistration {
 /// Builds one module replica from its replica-scoped capability factory.
 ///
 /// Closures that return a concrete `Module` implement this automatically, so
-/// registration call sites do not need to allocate `Box<dyn Module>`.
+/// registration call sites do not need to allocate erased module wrappers.
 pub trait ModuleRegisterer: Fn(ModuleCapabilityFactory) -> Self::Module {
     type Module: crate::Module + 'static;
 }
@@ -506,16 +577,15 @@ impl ModuleRegistry {
         let mut modules = Vec::new();
         for registration in &self.registrations {
             // Build every possible replica up to the registered max; allocation
-            // and `ActivationGate` decide which replicas are active at runtime.
+            // and the agent event loop decide which replicas are active.
             for replica in 0..registration.cap_range.max {
-                let scoped = caps.scoped(ModuleInstanceId::new(
-                    registration.module.clone(),
-                    ReplicaIndex::new(replica),
-                ));
-                modules.push((registration.builder)(scoped));
+                let owner =
+                    ModuleInstanceId::new(registration.module.clone(), ReplicaIndex::new(replica));
+                let scoped = caps.scoped(owner.clone());
+                modules.push(AllocatedModule::new(owner, (registration.builder)(scoped)));
             }
         }
-        Ok(AllocatedModules::new(modules))
+        Ok(AllocatedModules::new(caps.runtime_control(), modules))
     }
 }
 
@@ -549,7 +619,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Module for NoopModule {
-        async fn run(&mut self) {}
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(())
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     fn noop_builder(_: ModuleCapabilityFactory) -> NoopModule {

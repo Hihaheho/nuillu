@@ -23,7 +23,7 @@ use lutum_in_memory_adapter::InMemoryAttentionRepository;
 use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
-use nuillu_agent::run as run_agent;
+use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardInner, MemoryMetadata,
     ModuleConfig, ResourceAllocation,
@@ -52,6 +52,8 @@ use crate::{
     model_set::ReasoningEffort,
     trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
 };
+
+const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct LlmBackendConfig {
@@ -489,72 +491,88 @@ async fn execute_full_agent_case(
     let case_id_for_idle = case_id.to_string();
     let modules = full_agent_registry().build(&env.caps).await?;
 
-    run_agent(modules, async move {
-        let _ = allocation_reporter
-            .emit_if_changed(&allocation_blackboard)
-            .await;
-        let now = clock.now();
-        for input in inputs {
-            let body = match input {
-                FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
-                    direction,
-                    content: content.content,
-                    observed_at: now,
-                },
-                FullAgentInput::Seen {
-                    direction,
-                    appearance,
-                } => SensoryInput::Seen {
-                    direction,
-                    appearance: appearance.content,
-                    observed_at: now,
-                },
-            };
-            sensory
-                .publish(body)
-                .await
-                .expect("full-agent eval failed to publish SensoryInput");
-        }
-
-        let mut last_event_count = events.event_count();
-        let mut idle_ticks = 0_u64;
-        let idle_report_every_ticks = (5000 / limits.tick_ms.max(1)).max(1);
-        for tick in 0..limits.max_ticks {
-            if utterances.has_completed() || events.stop_requested() {
-                break;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+    run_agent(
+        modules,
+        AgentEventLoopConfig {
+            idle_threshold: Duration::from_secs(1),
+            activate_retries: 2,
+        },
+        async move {
             let _ = allocation_reporter
                 .emit_if_changed(&allocation_blackboard)
                 .await;
-            let event_count = events.event_count();
-            if event_count == last_event_count {
-                idle_ticks = idle_ticks.saturating_add(1);
-            } else {
-                last_event_count = event_count;
-                idle_ticks = 0;
+            let now = clock.now();
+            for input in inputs {
+                let body = match input {
+                    FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
+                        direction,
+                        content: content.content,
+                        observed_at: now,
+                    },
+                    FullAgentInput::Seen {
+                        direction,
+                        appearance,
+                    } => SensoryInput::Seen {
+                        direction,
+                        appearance: appearance.content,
+                        observed_at: now,
+                    },
+                };
+                sensory
+                    .publish(body)
+                    .await
+                    .expect("full-agent eval failed to publish SensoryInput");
             }
-            if idle_ticks > 0 && idle_ticks.is_multiple_of(idle_report_every_ticks) {
-                live_reporter
-                    .emit_port(
-                        Some(&case_id_for_idle),
-                        "idle",
-                        serde_json::json!({
-                            "tick": tick + 1,
-                            "events": event_count,
-                            "idle_ticks": idle_ticks,
-                            "tick_ms": limits.tick_ms,
-                        }),
-                        format!(
-                            "eval idle case={} ticks_without_runtime_events={} events={}",
-                            case_id_for_idle, idle_ticks, event_count
-                        ),
-                    )
-                    .expect("full-agent eval failed to write idle event");
+
+            let mut last_event_count = events.event_count();
+            let mut idle_ticks = 0_u64;
+            let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, limits.tick_ms);
+            for tick in 0..limits.max_ticks {
+                if utterances.has_completed() || events.stop_requested() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+                let _ = allocation_reporter
+                    .emit_if_changed(&allocation_blackboard)
+                    .await;
+                let event_count = events.event_count();
+                if event_count == last_event_count {
+                    idle_ticks = idle_ticks.saturating_add(1);
+                } else {
+                    last_event_count = event_count;
+                    idle_ticks = 0;
+                }
+                if idle_ticks > 0 && idle_ticks.is_multiple_of(idle_report_every_ticks) {
+                    let active_modules =
+                        allocation_blackboard.read(active_module_observations).await;
+                    let active_summary = active_modules_live_summary(&active_modules);
+                    live_reporter
+                        .emit_port(
+                            Some(&case_id_for_idle),
+                            "idle",
+                            serde_json::json!({
+                                "tick": tick + 1,
+                                "events": event_count,
+                                "idle_ticks": idle_ticks,
+                                "idle_for_ms": idle_ticks.saturating_mul(limits.tick_ms),
+                                "tick_ms": limits.tick_ms,
+                                "report_interval_ms": duration_millis_u64(IDLE_REPORT_INTERVAL),
+                                "active_modules": active_modules,
+                            }),
+                            format!(
+                                "eval idle case={} idle_for_ms={} events={} active=[{}]",
+                                case_id_for_idle,
+                                idle_ticks.saturating_mul(limits.tick_ms),
+                                event_count,
+                                active_summary
+                            ),
+                        )
+                        .expect("full-agent eval failed to write idle event");
+                }
             }
-        }
-    })
+        },
+    )
     .await?;
 
     let mut artifact = if let Some(utterance) = env.utterances.first_complete() {
@@ -600,32 +618,41 @@ async fn execute_module_case(
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
 
-    run_agent(modules, async move {
-        match target {
-            ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
-                harness
-                    .query_mailbox()
-                    .publish(nuillu_module::QueryRequest::new(prompt))
-                    .await
-                    .expect("module eval failed to publish QueryRequest");
+    run_agent(
+        modules,
+        AgentEventLoopConfig {
+            idle_threshold: Duration::from_secs(1),
+            activate_retries: 2,
+        },
+        async move {
+            match target {
+                ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
+                    harness
+                        .query_mailbox()
+                        .publish(nuillu_module::QueryRequest::new(prompt))
+                        .await
+                        .expect("module eval failed to publish QueryRequest");
+                }
+                ModuleEvalTarget::AttentionSchema => {
+                    harness
+                        .self_model_mailbox()
+                        .publish(nuillu_module::SelfModelRequest::new(prompt))
+                        .await
+                        .expect("module eval failed to publish SelfModelRequest");
+                }
             }
-            ModuleEvalTarget::AttentionSchema => {
-                harness
-                    .self_model_mailbox()
-                    .publish(nuillu_module::SelfModelRequest::new(prompt))
-                    .await
-                    .expect("module eval failed to publish SelfModelRequest");
-            }
-        }
 
-        for _ in 0..limits.max_ticks {
-            if events.stop_requested() || blackboard.memo(&shutdown_target_module).await.is_some() {
-                break;
+            for _ in 0..limits.max_ticks {
+                if events.stop_requested()
+                    || blackboard.memo(&shutdown_target_module).await.is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
             }
-            tokio::task::yield_now().await;
-            tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
-        }
-    })
+        },
+    )
     .await?;
 
     let output = env
@@ -802,7 +829,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::sensory(), 0..=1, |caps| {
             nuillu_sensory::SensoryModule::new(
                 caps.sensory_input_inbox(),
-                caps.activation_gate(),
                 caps.allocation_reader(),
                 caps.memo(),
                 caps.clock(),
@@ -813,7 +839,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::summarize(), 0..=1, |caps| {
             nuillu_summarize::SummarizeModule::new(
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.blackboard_reader(),
                 caps.allocation_reader(),
                 caps.attention_writer(),
@@ -825,7 +850,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::attention_controller(), 0..=1, |caps| {
             nuillu_attention_controller::AttentionControllerModule::new(
                 caps.memo_updated_inbox(),
-                caps.activation_gate(),
                 caps.blackboard_reader(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
@@ -839,7 +863,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_attention_schema::AttentionSchemaModule::new(
                 caps.self_model_inbox(),
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.memo(),
@@ -851,7 +874,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_query_vector::QueryVectorModule::new(
                 caps.query_inbox(),
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.vector_memory_searcher(),
@@ -864,7 +886,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_query_agentic::QueryAgenticModule::new(
                 caps.query_inbox(),
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.file_searcher(),
@@ -877,7 +898,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_memory::MemoryModule::new(
                 caps.allocation_updated_inbox(),
                 caps.memory_request_inbox(),
-                caps.activation_gate(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memory_writer(),
@@ -888,7 +908,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::memory_compaction(), 0..=1, |caps| {
             nuillu_memory_compaction::MemoryCompactionModule::new(
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
                 caps.memory_compactor(),
@@ -900,7 +919,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_predict::PredictModule::new(
                 caps.attention_stream_updated_inbox(),
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
@@ -912,7 +930,6 @@ fn full_agent_registry() -> ModuleRegistry {
         .register(builtin::surprise(), 0..=1, |caps| {
             nuillu_surprise::SurpriseModule::new(
                 caps.attention_stream_updated_inbox(),
-                caps.activation_gate(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.blackboard_reader(),
@@ -926,7 +943,6 @@ fn full_agent_registry() -> ModuleRegistry {
             nuillu_speak::SpeakModule::new(
                 caps.attention_stream_updated_inbox(),
                 caps.allocation_updated_inbox(),
-                caps.activation_gate(),
                 caps.attention_reader(),
                 caps.allocation_reader(),
                 caps.memo(),
@@ -944,7 +960,6 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
                     caps.allocation_updated_inbox(),
-                    caps.activation_gate(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.vector_memory_searcher(),
@@ -958,7 +973,6 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.query_inbox(),
                     caps.allocation_updated_inbox(),
-                    caps.activation_gate(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.file_searcher(),
@@ -972,7 +986,6 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.self_model_inbox(),
                     caps.allocation_updated_inbox(),
-                    caps.activation_gate(),
                     caps.attention_reader(),
                     caps.allocation_reader(),
                     caps.memo(),
@@ -1179,6 +1192,14 @@ struct ModuleInstanceObservation {
     replica: u8,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ActiveModuleObservation {
+    module: String,
+    active_replicas: u8,
+    activation_ratio: ActivationRatio,
+    tier: ModelTier,
+}
+
 fn memo_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<ReplicaMemoObservation>> {
     let mut memos = BTreeMap::<String, Vec<ReplicaMemoObservation>>::new();
     for record in bb.memo_records() {
@@ -1224,6 +1245,33 @@ fn replica_cap_observations(bb: &BlackboardInner) -> BTreeMap<String, ReplicaCap
     bb.replica_caps()
         .iter()
         .map(|(module, range)| (module.as_str().to_owned(), *range))
+        .collect()
+}
+
+fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservation> {
+    let mut modules = bb
+        .replica_caps()
+        .keys()
+        .cloned()
+        .chain(bb.allocation().iter().map(|(module, _)| module.clone()))
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    modules.dedup();
+    modules
+        .into_iter()
+        .filter_map(|module| {
+            let active_replicas = bb.allocation().active_replicas(&module);
+            if active_replicas == 0 {
+                return None;
+            }
+            let config = bb.allocation().for_module(&module);
+            Some(ActiveModuleObservation {
+                module: module.as_str().to_owned(),
+                active_replicas,
+                activation_ratio: config.activation_ratio,
+                tier: config.tier,
+            })
+        })
         .collect()
 }
 
@@ -1304,6 +1352,33 @@ fn allocation_live_summary(allocation: &BTreeMap<String, ModuleConfig>) -> Strin
         .filter(|config| config.activation_ratio == ActivationRatio::ZERO)
         .count();
     format!("active=[{}] inactive={inactive}", active.join(","))
+}
+
+fn active_modules_live_summary(active_modules: &[ActiveModuleObservation]) -> String {
+    if active_modules.is_empty() {
+        return "none".to_owned();
+    }
+    active_modules
+        .iter()
+        .map(|module| {
+            format!(
+                "{}:{}:{:.2}/{:?}",
+                module.module,
+                module.active_replicas,
+                module.activation_ratio.as_f64(),
+                module.tier
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn ticks_for_interval(interval: Duration, tick_ms: u64) -> u64 {
+    (duration_millis_u64(interval) / tick_ms.max(1)).max(1)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone)]

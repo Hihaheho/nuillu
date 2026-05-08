@@ -63,7 +63,7 @@ A module can be activated by any inbox capability it holds:
 - typed fanout topics, such as external `SensoryInputInbox` or internal `QueryInbox` / `SelfModelInbox`,
 - `MemoUpdatedInbox`, published by memo writes and filtered so a holder does not wake on its own writes,
 - `AllocationUpdatedInbox`, published when effective allocation or guidance changes,
-- `AttentionStreamUpdatedInbox`, published by attention-stream writes.
+- `AttentionStreamUpdatedInbox`, published by attention-stream writes and by the event loop when it records an agentic-deadlock marker.
 
 There is no periodic wake mechanism. Allocation guidance is the controller's durable control plane: modules read the current allocation snapshot and decide whether a wake should produce work, defer silently, or only update local state.
 

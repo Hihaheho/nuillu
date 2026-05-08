@@ -23,4 +23,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+nuillu-agent = { workspace = true }
 nuillu-blackboard = { workspace = true }

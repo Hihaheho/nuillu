@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionWriter, BlackboardReader,
-    LlmAccess, Module, TimeDivision,
+    AllocationReader, AllocationUpdatedInbox, AttentionWriter, BlackboardReader, LlmAccess, Module,
+    TimeDivision,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,6 @@ pub struct SummaryDecision {
 
 pub struct SummarizeModule {
     updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
     attention: AttentionWriter,
@@ -36,7 +35,6 @@ pub struct SummarizeModule {
 impl SummarizeModule {
     pub fn new(
         updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         blackboard: BlackboardReader,
         allocation: AllocationReader,
         attention: AttentionWriter,
@@ -45,7 +43,6 @@ impl SummarizeModule {
     ) -> Self {
         Self {
             updates,
-            gate,
             blackboard,
             allocation,
             attention,
@@ -98,20 +95,17 @@ impl SummarizeModule {
         }
         Ok(())
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for SummarizeModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("summarize module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SummarizeModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        SummarizeModule::activate(self).await
     }
 }

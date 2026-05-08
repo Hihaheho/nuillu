@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use lutum::{Session, StructuredTurnOutcome, TextTurnEvent};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader,
-    AttentionStreamUpdatedInbox, LlmAccess, Memo, Module, UtteranceWriter,
+    AllocationReader, AllocationUpdatedInbox, AttentionReader, AttentionStreamUpdatedInbox,
+    LlmAccess, Memo, Module, UtteranceWriter,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,6 @@ fn generation_input(
 pub struct SpeakModule {
     updates: AttentionStreamUpdatedInbox,
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     attention: AttentionReader,
     allocation: AllocationReader,
     memo: Memo,
@@ -93,7 +92,6 @@ impl SpeakModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         attention: AttentionReader,
         allocation: AllocationReader,
         memo: Memo,
@@ -103,7 +101,6 @@ impl SpeakModule {
         Self {
             updates,
             allocation_updates,
-            gate,
             attention,
             allocation,
             memo,
@@ -226,13 +223,6 @@ impl SpeakModule {
             }
         }
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -276,9 +266,13 @@ mod tests {
 
 #[async_trait(?Send)]
 impl Module for SpeakModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("speak module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SpeakModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        SpeakModule::activate(self).await
     }
 }

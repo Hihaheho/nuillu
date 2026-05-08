@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AllocationReader, LlmAccess, Memo, Module, SensoryInput, SensoryInputInbox,
-    ports::Clock,
+    AllocationReader, LlmAccess, Memo, Module, SensoryInput, SensoryInputInbox, ports::Clock,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,7 +58,6 @@ struct StimulusState {
 
 pub struct SensoryModule {
     inbox: SensoryInputInbox,
-    gate: ActivationGate,
     allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
@@ -71,7 +69,6 @@ pub struct SensoryModule {
 impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
-        gate: ActivationGate,
         allocation: AllocationReader,
         memo: Memo,
         clock: Arc<dyn Clock>,
@@ -79,7 +76,6 @@ impl SensoryModule {
     ) -> Self {
         Self {
             inbox,
-            gate,
             allocation,
             memo,
             clock,
@@ -248,25 +244,9 @@ impl SensoryModule {
             .join("\n")
     }
 
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            for input in self.next_batch().await? {
-                self.handle(input).await?;
-            }
-        }
-    }
-
     async fn next_batch(&mut self) -> Result<Vec<SensoryInput>> {
         let first = self.inbox.next_item().await?.body;
         let mut batch = vec![first];
-        batch.extend(
-            self.inbox
-                .take_ready_items()?
-                .items
-                .into_iter()
-                .map(|envelope| envelope.body),
-        );
-        self.gate.block().await;
         batch.extend(
             self.inbox
                 .take_ready_items()?
@@ -331,9 +311,16 @@ mod tests {
 
 #[async_trait(?Send)]
 impl Module for SensoryModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("sensory module failed: {error:#}");
+    type Batch = Vec<SensoryInput>;
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SensoryModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        for input in batch.iter().cloned() {
+            self.handle(input).await?;
         }
+        Ok(())
     }
 }

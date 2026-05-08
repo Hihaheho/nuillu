@@ -14,7 +14,6 @@
 //! - LLM tier is read from allocation per-call inside [`LlmAccess`];
 //!   modules don't pick tiers themselves.
 
-mod activation;
 mod allocation_writer;
 mod attention;
 mod capabilities;
@@ -33,12 +32,12 @@ mod utterance;
 #[cfg(test)]
 mod test_support;
 
-pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;
 pub use capabilities::{
-    AllocatedModules, CapabilityProviders, HostIo, InternalHarnessIo, ModuleCapabilityFactory,
-    ModuleRegisterer, ModuleRegistry, ModuleRegistryError,
+    AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviders, HostIo,
+    InternalHarnessIo, ModuleCapabilityFactory, ModuleRegisterer, ModuleRegistry,
+    ModuleRegistryError,
 };
 pub use channels::{
     AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AttentionStreamUpdated,
@@ -58,5 +57,5 @@ pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
-pub use r#trait::Module;
+pub use r#trait::{Module, ModuleBatch};
 pub use utterance::UtteranceWriter;

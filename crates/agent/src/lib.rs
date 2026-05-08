@@ -10,4 +10,4 @@ pub mod scheduler;
 #[cfg(test)]
 mod testing;
 
-pub use scheduler::{SchedulerError, run};
+pub use scheduler::{AgentEventLoopConfig, SchedulerError, run};

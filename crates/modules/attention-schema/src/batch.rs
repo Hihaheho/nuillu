@@ -4,7 +4,7 @@ use nuillu_module::SelfModelRequest;
 use crate::AttentionSchemaModule;
 
 #[derive(Debug, Default)]
-pub(crate) struct NextBatch {
+pub struct NextBatch {
     pub(crate) update_model: bool,
     pub(crate) requests: Vec<SelfModelRequest>,
 }
@@ -36,8 +36,6 @@ impl NextBatch {
 impl AttentionSchemaModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
         let mut batch = self.await_first_batch().await?;
-        self.collect_ready_events_into_batch(&mut batch)?;
-        self.gate.block().await;
         self.collect_ready_events_into_batch(&mut batch)?;
         Ok(batch)
     }

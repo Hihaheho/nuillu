@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess,
-    MemoryRequest, MemoryRequestInbox, MemoryWriter, Module,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, MemoryRequest,
+    MemoryRequestInbox, MemoryWriter, Module,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+pub use batch::NextBatch as MemoryBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
 Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
@@ -42,7 +43,6 @@ pub enum MemoryTools {
 pub struct MemoryModule {
     allocation_updates: AllocationUpdatedInbox,
     requests: MemoryRequestInbox,
-    gate: ActivationGate,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: MemoryWriter,
@@ -53,7 +53,6 @@ impl MemoryModule {
     pub fn new(
         allocation_updates: AllocationUpdatedInbox,
         requests: MemoryRequestInbox,
-        gate: ActivationGate,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: MemoryWriter,
@@ -62,7 +61,6 @@ impl MemoryModule {
         Self {
             allocation_updates,
             requests,
-            gate,
             allocation,
             blackboard,
             memory,
@@ -149,21 +147,18 @@ impl MemoryModule {
             index: index.to_string(),
         })
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            let batch = self.next_batch().await?;
-            self.activate(batch.requests, batch.guidance).await?;
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for MemoryModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("memory module failed: {error:#}");
-        }
+    type Batch = MemoryBatch;
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        MemoryModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        MemoryModule::activate(self, batch.requests.clone(), batch.guidance).await
     }
 }
 
@@ -265,7 +260,15 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Module for PublisherStub {
-        async fn run(&mut self) {}
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> Result<Self::Batch> {
+            std::future::pending().await
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn memory_insert_tool_scenario(content: &str) -> MockTextScenario {
@@ -306,7 +309,10 @@ mod tests {
 
     async fn build_memory_with_publisher(
         caps: &CapabilityProviders,
-    ) -> (Vec<Box<dyn Module>>, nuillu_module::MemoryRequestMailbox) {
+    ) -> (
+        nuillu_module::AllocatedModules,
+        nuillu_module::MemoryRequestMailbox,
+    ) {
         let publisher_cell: Rc<RefCell<Option<nuillu_module::MemoryRequestMailbox>>> =
             Rc::new(RefCell::new(None));
         let publisher_clone = Rc::clone(&publisher_cell);
@@ -320,7 +326,6 @@ mod tests {
                 MemoryModule::new(
                     caps.allocation_updated_inbox(),
                     caps.memory_request_inbox(),
-                    caps.activation_gate(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memory_writer(),
@@ -335,19 +340,23 @@ mod tests {
             .borrow_mut()
             .take()
             .expect("publisher captured");
-        (modules.into_modules().collect(), publisher)
+        (modules, publisher)
     }
 
     async fn run_modules<F: std::future::Future<Output = ()>>(
-        modules: Vec<Box<dyn Module>>,
+        modules: nuillu_module::AllocatedModules,
         body: F,
     ) {
-        for mut module in modules {
-            tokio::task::spawn_local(async move {
-                module.run().await;
-            });
-        }
-        body.await;
+        nuillu_agent::run(
+            modules,
+            nuillu_agent::AgentEventLoopConfig {
+                idle_threshold: std::time::Duration::from_millis(50),
+                activate_retries: 2,
+            },
+            body,
+        )
+        .await
+        .expect("memory test runtime should not fail");
     }
 
     #[tokio::test]
@@ -356,7 +365,8 @@ mod tests {
         local
             .run_until(async {
                 let primary = RecordingMemoryStore::default();
-                let caps = test_caps_with_adapter(Arc::new(primary.clone()), MockLlmAdapter::new());
+                let adapter = MockLlmAdapter::new().with_text_scenario(final_text_scenario("done"));
+                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
                 let (modules, publisher) = build_memory_with_publisher(&caps).await;
 
                 run_modules(modules, async {

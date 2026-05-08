@@ -8,8 +8,8 @@ use nuillu_types::{
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
-    AttentionStream, AttentionStreamRecord, AttentionStreamSet, BlackboardCommand, MemoryMetadata,
-    ResourceAllocation,
+    AgenticDeadlockMarker, AttentionStream, AttentionStreamRecord, AttentionStreamSet,
+    BlackboardCommand, MemoryMetadata, ResourceAllocation,
 };
 
 /// The non-cognitive blackboard plus the cognitive surface and its
@@ -28,6 +28,7 @@ pub struct Blackboard {
 pub struct BlackboardInner {
     memos: HashMap<ModuleInstanceId, String>,
     attention_streams: HashMap<ModuleInstanceId, AttentionStream>,
+    agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     base_allocation: ResourceAllocation,
     allocation: ResourceAllocation,
@@ -253,7 +254,11 @@ impl BlackboardInner {
                 .cmp(b.stream.module.as_str())
                 .then_with(|| a.stream.replica.cmp(&b.stream.replica))
         });
-        AttentionStreamSet::new(records)
+        AttentionStreamSet::new(records, self.agentic_deadlock_marker.clone())
+    }
+
+    pub fn agentic_deadlock_marker(&self) -> Option<&AgenticDeadlockMarker> {
+        self.agentic_deadlock_marker.as_ref()
     }
 
     pub fn memory_metadata(&self) -> &HashMap<MemoryIndex, MemoryMetadata> {
@@ -293,6 +298,9 @@ impl BlackboardInner {
                     .entry(stream)
                     .or_default()
                     .append(event);
+            }
+            BlackboardCommand::RecordAgenticDeadlockMarker(marker) => {
+                self.agentic_deadlock_marker = Some(marker);
             }
             BlackboardCommand::UpsertMemoryMetadata {
                 index,

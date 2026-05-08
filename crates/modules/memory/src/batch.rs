@@ -4,7 +4,7 @@ use nuillu_module::MemoryRequest;
 use crate::MemoryModule;
 
 #[derive(Debug, Default)]
-pub(crate) struct NextBatch {
+pub struct NextBatch {
     pub(crate) requests: Vec<MemoryRequest>,
     pub(crate) guidance: bool,
 }
@@ -46,8 +46,6 @@ impl NextBatch {
 impl MemoryModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
         let mut batch = self.await_first_batch().await?;
-        self.collect_ready_events_into_batch(&mut batch)?;
-        self.gate.block().await;
         self.collect_ready_events_into_batch(&mut batch)?;
         Ok(batch)
     }

@@ -4,7 +4,7 @@ use nuillu_module::QueryRequest;
 use crate::QueryVectorModule;
 
 #[derive(Debug, Default)]
-pub(crate) struct NextBatch {
+pub struct NextBatch {
     pub(crate) queries: Vec<QueryRequest>,
     pub(crate) guidance: bool,
 }
@@ -36,8 +36,6 @@ impl NextBatch {
 impl QueryVectorModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
         let mut batch = self.await_first_batch().await?;
-        self.collect_ready_events_into_batch(&mut batch)?;
-        self.gate.block().await;
         self.collect_ready_events_into_batch(&mut batch)?;
         Ok(batch)
     }

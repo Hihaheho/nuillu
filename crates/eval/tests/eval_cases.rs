@@ -89,18 +89,18 @@ fn parses_checked_in_model_set() {
     let cheap = model_set.cheap.unwrap();
     assert_eq!(cheap.endpoint(), Some("http://localhost:11434/v1"));
     assert_eq!(cheap.token.as_deref(), Some("local"));
-    assert_eq!(cheap.model.as_deref(), Some("gemma4:e2b"));
-    assert_eq!(cheap.reasoning_effort, None);
+    assert_eq!(cheap.model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(cheap.reasoning_effort, Some(ReasoningEffort::Low));
     let default = model_set.default.unwrap();
     assert_eq!(default.endpoint(), Some("http://localhost:11434/v1"));
     assert_eq!(default.token.as_deref(), Some("local"));
-    assert_eq!(default.model.as_deref(), Some("gemma4:e4b"));
-    assert_eq!(default.reasoning_effort, None);
+    assert_eq!(default.model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(default.reasoning_effort, Some(ReasoningEffort::Medium));
     let premium = model_set.premium.unwrap();
-    assert_eq!(premium.endpoint(), Some("https://openrouter.ai/api/v1"));
-    assert_eq!(premium.token_env.as_deref(), Some("OPENROUTER_API_KEY"));
-    assert_eq!(premium.model.as_deref(), Some("google/gemma-4-26b-a4b-it"));
-    assert_eq!(premium.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(premium.endpoint(), Some("http://localhost:11434/v1"));
+    assert_eq!(premium.token.as_deref(), Some("local"));
+    assert_eq!(premium.model.as_deref(), Some("gemma4:26b"));
+    assert_eq!(premium.reasoning_effort, Some(ReasoningEffort::High));
 }
 
 #[test]

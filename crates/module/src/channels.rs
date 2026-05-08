@@ -247,8 +247,10 @@ pub struct MemoryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AttentionStreamUpdated {
-    pub stream: ModuleInstanceId,
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum AttentionStreamUpdated {
+    StreamAppended { stream: ModuleInstanceId },
+    AgenticDeadlockMarker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

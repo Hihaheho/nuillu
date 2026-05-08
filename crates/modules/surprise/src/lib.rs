@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AttentionReader, AttentionStreamUpdatedInbox,
-    BlackboardReader, LlmAccess, Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox,
-    Module,
+    AllocationReader, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -47,7 +46,6 @@ pub struct SurpriseMemoryRequest {
 
 pub struct SurpriseModule {
     updates: AttentionStreamUpdatedInbox,
-    gate: ActivationGate,
     attention: AttentionReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -59,7 +57,6 @@ pub struct SurpriseModule {
 impl SurpriseModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
-        gate: ActivationGate,
         attention: AttentionReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -69,7 +66,6 @@ impl SurpriseModule {
     ) -> Self {
         Self {
             updates,
-            gate,
             attention,
             allocation,
             blackboard,
@@ -141,20 +137,17 @@ impl SurpriseModule {
         self.memo.write(serialized).await;
         Ok(())
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for SurpriseModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("surprise module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SurpriseModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        SurpriseModule::activate(self).await
     }
 }

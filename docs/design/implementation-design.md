@@ -9,7 +9,7 @@ This document is the implementation source of truth. It describes the desired ar
 
 ## 0. Decisions
 
-1. **Runtime shape** — Each module runs as a persistent task spawned via `tokio::task::spawn_local`. The scheduler waits for shutdown and does not interpret module state.
+1. **Runtime shape** — The scheduler/event loop starts `next_batch()` for active module replicas, runs `activate(&batch)` with configured retry, and waits for shutdown on a single-threaded `LocalSet`.
 2. **Single-thread / WASM-compatible futures** — Module futures use `#[async_trait(?Send)]`; the runtime is current-thread / `LocalSet` oriented.
 3. **Capability-based design** — A module's possible side effects are exactly the capability handles passed to its constructor. Without a capability, there is no API path to the operation.
 4. **Owner-stamped operations** — Identity-bearing capabilities bake a hidden `ModuleInstanceId = (ModuleId, replica)` in at construction. Module constructors receive only a replica-scoped capability factory, so modules cannot claim to send, memo-write, append, or request as another module instance.
@@ -23,7 +23,7 @@ This document is the implementation source of truth. It describes the desired ar
 12. **Streaming for user-visible output, collect for internal decisions** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules (structured decision turns and tool loops) use `.collect()` because their output is memo-authoritative and has no value until complete and validated. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
 13. **Attention/allocation interruption of speak streaming** — If `AttentionStreamUpdated` or `AllocationUpdated` arrives while speak is generating, the current text stream is cancelled and generation restarts with fresh attention and allocation snapshots. This ensures speak's utterances reflect both the latest attended state and the latest controller guidance.
 14. **Local deterministic inbox batching** — Modules may batch transient inbox activations immediately before LLM work. Batching is module-local, bounded by boot-time module registration, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership.
-15. **Replica-capped persistent loops** — Boot registers modules as `(module_id, cap_range, builder)`, creates persistent loops up to `cap_range.max`, and never kills those loops when allocation lowers replica count. Allocation only changes which replica inboxes are active.
+15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
 16. **Controller proposals with deterministic effective allocation** — Attention-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, then computes active replicas from each module's boot-time cap range.
 17. **Registry-derived controller schema** — The attention-controller structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
 
@@ -64,11 +64,14 @@ Modules each live in their own crate. Their constructor signatures are the role 
 ```rust
 #[async_trait(?Send)]
 pub trait Module {
-    async fn run(&mut self);
+    type Batch: 'static;
+
+    async fn next_batch(&mut self) -> anyhow::Result<Self::Batch>;
+    async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()>;
 }
 ```
 
-`run` is the module's main loop. Modules own their inbox capabilities and decide how to combine them, typically with `tokio::select!`.
+Modules own inbox capabilities and decide how to form a deterministic module-local batch. They do not own a persistent run loop; the agent event loop awaits `next_batch`, keeps the batch, and invokes `activate(&batch)`.
 
 ### Module identity and registration
 
@@ -88,7 +91,7 @@ pub struct ModuleInstanceId {
 }
 ```
 
-`ReplicaCapRange` is boot-time policy. It must satisfy `min <= max`, and v1 caps should stay within `0..=3` unless a later runtime design explicitly raises the global limit. The runtime creates `max` persistent loops for the registration. Allocation chooses the effective active replica count and is clamped to `min..=max`.
+`ReplicaCapRange` is boot-time policy. It must satisfy `min <= max`, and v1 caps should stay within `0..=3` unless a later runtime design explicitly raises the global limit. The runtime creates `max` module instances for the registration. Allocation chooses the effective active replica count and is clamped to `min..=max`.
 
 Application boot registers modules as `(module_id, cap_range, builder)`:
 
@@ -97,7 +100,6 @@ let registry = ModuleRegistry::new().register(builtin::query_vector(), 0..=3, |c
     QueryVectorModule::new(
         caps.query_inbox(),
         caps.allocation_updated_inbox(),
-        caps.activation_gate(),
         caps.allocation_reader(),
         caps.blackboard_reader(),
         caps.vector_memory_searcher(),
@@ -193,8 +195,9 @@ pub enum SensoryInput {
 pub type SensoryInputMailbox = TopicMailbox<SensoryInput>;
 pub type SensoryInputInbox = TopicInbox<SensoryInput>;
 
-pub struct AttentionStreamUpdated {
-    pub stream: ModuleInstanceId,
+pub enum AttentionStreamUpdated {
+    StreamAppended { stream: ModuleInstanceId },
+    AgenticDeadlockMarker,
 }
 pub type AttentionStreamUpdatedInbox = TopicInbox<AttentionStreamUpdated>;
 
@@ -224,7 +227,7 @@ Delivery policy is per topic:
 - `MemoUpdated` is fanout with self-filtering at the inbox handle: every active subscriber replica receives memo writes except its own writes.
 - `AllocationUpdated` is fanout: every active subscriber replica receives the wake signal when effective allocation or guidance changes.
 - `QueryRequest`, `SelfModelRequest`, `SensoryInput`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
-- Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there and are gated before semantic work.
+- Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
 `SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
 
@@ -276,37 +279,33 @@ pub struct UtteranceDelta {
 
 `AllocationUpdated` is not a request and does not carry work. It tells modules that controller guidance changed and that they should reread allocation as source of truth. Modules may use that wake to start guidance-driven work, update local state, or wait silently.
 
-### Replica activation gate
+### Replica activation
 
-Lowering `activation_ratio` never kills module loops and never closes inboxes. Each persistent loop has an owner-stamped `ActivationGate` capability. The gate exposes only `block().await`, which returns immediately when the holder instance is within the derived active replica count and waits when allocation currently excludes that replica. It does not expose the full allocation snapshot.
+Lowering `activation_ratio` never destroys module instances and never closes inboxes. The agent event loop owns activation gating: it starts `next_batch()` only for active replicas and calls `activate(&batch)` only while that replica is active. Disabled replicas keep their module state but do not receive newly started batch or activation work.
 
 The activation prelude is:
 
 ```rust
 let mut batch = self.await_first_batch().await?;
 self.collect_ready_events_into_batch(&mut batch)?;
-self.gate.block().await?;
-self.collect_ready_events_into_batch(&mut batch)?;
 Ok(batch)
 ```
 
-This order is required. A module first takes one real activation and drains already-ready work, then parks before semantic work if its replica is disabled. After the gate opens, it drains once more so work that arrived before routing noticed the allocation change can be coalesced into the same deterministic batch.
+The awaited receive and ready drain are module-local. Active-replica gating happens outside the module in the event loop before `next_batch` starts and before `activate(&batch)` runs.
 
-Wake-only activations such as `AttentionStreamUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as attention streams, memos, or allocation. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `MemoryRequest`, and `SensoryInput` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until their gate opens.
+Wake-only activations such as `AttentionStreamUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as attention streams, memos, or allocation. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `MemoryRequest`, and `SensoryInput` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until the event loop activates the replica.
 
-If a disabled replica is waiting on an empty inbox, it simply remains idle; re-enabling preserves the loop and any local/session state, but does not invent domain work. If a disabled replica is parked at `gate.block()` with a pending batch, re-enabling wakes it and it resumes from the same suspended future. Allocation changes do not preempt an already-running activation unless that module has its own interruption rule; speak's attention/allocation-update interruption is the v1 preemption behavior.
+If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation unless that module has its own interruption rule; speak's attention/allocation-update interruption is the v1 preemption behavior.
 
 Boot policy should register `attention-controller` with `cap_range.min >= 1`. If all controller replicas are disabled by host policy, only the host or explicit boot wiring can recover allocation.
 
 ### Inbox batching
 
-Inbox batching is a per-module activation prelude, not a scheduler feature. A module waits for exactly one activation event, collects already-ready events without awaiting, blocks on its activation gate, then deterministically converts those events into a module-local `NextBatch` before any LLM call or side effect:
+Inbox batching is a per-module activation prelude. A module waits for exactly one activation event, collects already-ready events without awaiting, then deterministically converts those events into a module-local `NextBatch` before any LLM call or side effect:
 
 ```rust
 async fn next_batch(&mut self) -> Result<NextBatch> {
     let mut batch = self.await_first_batch().await?;
-    self.collect_ready_events_into_batch(&mut batch)?;
-    self.gate.block().await?;
     self.collect_ready_events_into_batch(&mut batch)?;
     Ok(batch)
 }
@@ -315,7 +314,7 @@ async fn next_batch(&mut self) -> Result<NextBatch> {
 Rules:
 - The first event is the only awaited receive. The ready collection must use `take_ready_items()` and must not wait for more work.
 - `TopicInbox::next_item()` and `TopicInbox::take_ready_items()` hide transport details from modules. Closed inboxes are application-shutdown signals and propagate as `TopicRecvError::Closed`.
-- After the deterministic batch is collected, the module calls `ActivationGate::block()` before semantic processing. If disabled, the module performs no LLM call, memo write, or side effect while the pending batch remains in the suspended `next_batch` future. After the gate opens, the module collects ready events once more and returns the batch.
+- After the deterministic batch is collected, the event loop owns semantic processing. If the replica is inactive, the event loop performs no LLM call, memo write, or side effect and keeps the pending batch for later activation.
 - v1 does not impose a shared `max_ready_events` limit. If a future module needs burst limits, that policy should be added as module-local domain logic rather than as a scheduler allocation field.
 - There is no shared `ActivationBatch`, `Incoming`, or `NextBatch` type in `crates/module`. Each module defines the private event and batch shape that matches its capability set.
 - Cross-inbox event ordering has no runtime-wide meaning. Each module defines whether `calculate_next_batch` preserves order, groups by source, or reduces wake signals into booleans.
@@ -347,8 +346,8 @@ Attention:
 - `AttentionWriter` appends to the holder instance's attention stream.
 - `BlackboardInner` stores attention streams keyed by `ModuleInstanceId`.
 - `AttentionReader` exposes an attention-stream set, not one global stream.
-- Prompt/eval serialization keeps the old array shape for a single stream and uses stream records with `{ module, replica, entries }` when more than one stream exists.
-- `AttentionStreamUpdated` carries the updated stream owner, but consumers still reread the attention-stream set as source of truth.
+- Prompt/eval serialization keeps the old array shape for a single stream, uses stream records with `{ module, replica, entries }` when more than one stream exists, and includes `agentic_deadlock_marker` only when the event loop has recorded one.
+- `AttentionStreamUpdated` carries either the updated stream owner or an agentic-deadlock marker wake; consumers still reread the attention-stream set as source of truth.
 
 Memory metadata remains keyed by `MemoryIndex`. Storage-level memory replicas are external persistence mirrors and are unrelated to module replicas.
 
@@ -359,7 +358,6 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | Handle | Owner-stamped | Purpose |
 |---|---:|---|
 | `ModuleCapabilityFactory` | yes | replica-scoped issuer of owner-stamped handles |
-| `ActivationGate` | yes | owner-scoped block that returns only when the holder replica is active |
 | `SensoryInputMailbox` | yes | publish external observations into the agent boundary |
 | `SensoryInputInbox` | yes | subscribe to external observations |
 | `MemoUpdatedInbox` | yes | subscribe to memo-update wake signals, excluding the holder's own memo writes |
@@ -412,7 +410,7 @@ pub enum RuntimeEvent {
 
 ## 3. Scheduler And Event Loop
 
-Boot expands registered modules into persistent replica loops before the scheduler starts:
+Boot expands registered modules into persistent replica instances before the scheduler starts:
 
 ```rust
 let modules = ModuleRegistry::new()
@@ -420,7 +418,6 @@ let modules = ModuleRegistry::new()
         QueryVectorModule::new(
             caps.query_inbox(),
             caps.allocation_updated_inbox(),
-            caps.activation_gate(),
             caps.allocation_reader(),
             caps.blackboard_reader(),
             caps.vector_memory_searcher(),
@@ -432,25 +429,24 @@ let modules = ModuleRegistry::new()
     .await?;
 ```
 
-`ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityFactory` per replica index in `0..cap_range.max`, calls the builder once per scoped factory, and records cap metadata for routing, activation gates, and attention-controller schema generation.
+`ModuleRegistry::register` validates `cap_range.min <= cap_range.max` and the v1 global cap limit. `build` creates one `ModuleCapabilityFactory` per replica index in `0..cap_range.max`, calls the builder once per scoped factory, and records cap metadata for routing, event-loop activation, and attention-controller schema generation.
 
-The scheduler only spawns the built loops:
+The scheduler owns the loop over built modules:
 
 ```rust
 pub async fn run(
     modules: AllocatedModules,
+    config: AgentEventLoopConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
-    for mut module in modules.into_modules() {
-        spawn_local(async move { module.run().await });
-    }
-    // wait for shutdown or task completion policy
+    // start next_batch for active replicas, run activate(&batch) with retry,
+    // record agentic-deadlock markers, and wait for shutdown.
 }
 ```
 
-`AllocatedModules` is an opaque newtype returned by `ModuleRegistry::build`; public boot paths do not accept a raw `Vec<Box<dyn Module>>`. This keeps scheduler startup tied to the registry step that records replica caps for allocation, routing, activation gates, and attention-controller schema generation.
+`AllocatedModules` is an opaque newtype returned by `ModuleRegistry::build`; public boot paths do not accept raw module vectors. This keeps scheduler startup tied to the registry step that records replica caps for allocation, routing, event-loop activation, and attention-controller schema generation.
 
-There is no scheduler-owned event loop handle and no runtime tick API. The scheduler spawns module tasks and waits for shutdown. Time is still injectable for modules that need timestamps, but time does not create activations.
+There is no runtime tick API and no periodic activation. Time is still injectable for modules that need timestamps; the event loop also uses injected `Clock` to timestamp agentic-deadlock markers while using `tokio::time::Instant` for monotonic idle-threshold measurement.
 
 The boot layer injects time through `CapabilityProviders`:
 
@@ -476,7 +472,7 @@ let caps = CapabilityProviders::new(..., Arc::new(FixedClock::new(observed_now))
 
 ## 4. Module Responsibilities
 
-The role-specific capability lists below omit the ubiquitous `ActivationGate`. Every module that consumes activations receives its own owner-stamped gate and blocks on it after batching but before semantic work. The gate is not a side-effect capability and does not expose the full allocation snapshot.
+Activation gating is event-loop owned. The role-specific capability lists below include only handles held by module structs.
 
 ### Sensory
 
@@ -566,7 +562,7 @@ Emits user-visible text. The module is named `speak`, not `talk`, because it rep
 
 Speak reads only the attention-stream set and allocation guidance — it has no `BlackboardReader` and does not inspect other modules' memos. This keeps the utterance boundary narrow: speak distills what is attended and follows controller guidance, not the full blackboard state.
 
-Speak replicas are allocation-suppressed during evidence gathering. If a speak replica receives an attention/allocation update and then finds itself inactive at `gate.block()`, it preserves the pending wake without a decision turn, generation turn, memo write, delta, or complete utterance. When allocation later includes that replica, the pending wake runs once against fresh attention and allocation snapshots; it does not need another attention update just to start speaking.
+Speak replicas are allocation-suppressed during evidence gathering. If a speak replica has a pending attention/allocation batch while inactive, the event loop preserves that pending wake without a decision turn, generation turn, memo write, delta, or complete utterance. When allocation later includes that replica, the pending wake runs once against fresh attention and allocation snapshots; it does not need another attention update just to start speaking.
 
 Speak uses a two-stage LLM interaction:
 
@@ -714,8 +710,8 @@ This keeps realistic artifacts observable without adding request/response correl
 | Capabilities are non-exclusive | root providers and scoped factories issue handles without uniqueness checks; any capability may be granted to multiple module instances |
 | Module constructors cannot forge replica identity | constructors receive only `ModuleCapabilityFactory`; hidden `ModuleInstanceId` is captured inside owner-stamped handles |
 | Replica caps are boot policy | `ModuleRegistry::register` validates `cap_range`; effective allocation derives active replicas from `activation_ratio` and clamps to that range |
-| Lowering activation ratio never kills loops | boot spawns `cap_range.max` persistent loops and allocation only changes routing and `ActivationGate` state |
-| Disabled replicas perform no semantic work | routed topics target active replicas only, and already-received work blocks at `gate.block()` before LLM calls, memo writes, or side effects |
+| Lowering activation ratio never destroys module state | boot builds `cap_range.max` replicas and allocation only changes routing plus event-loop scheduling |
+| Disabled replicas perform no semantic work | routed topics target active replicas only, and the event loop does not start `next_batch` or `activate` for inactive replicas |
 | Controller schema matches registered caps | attention-controller schema is generated from the registry and parsed output is clamped after decoding |
 | Controller and schema are separate modules | separate crates and separate constructor capabilities |
 | Controller wakes only on memo updates | it receives `MemoUpdatedInbox`, not `AttentionStreamUpdatedInbox`, and the inbox filters self writes |
@@ -725,7 +721,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `AttentionWriter`, `AllocationWriter`, or memory capabilities |
 | Speak reads only attention and allocation | it receives `AttentionReader` and `AllocationReader`, not `BlackboardReader` |
-| Speak suppression is allocation-controlled | attention-controller proposals lower `speak.activation_ratio` or guidance; inactive speak replicas defer pending wakes through `ActivationGate` before decision/generation and emit only when active |
+| Speak suppression is allocation-controlled | attention-controller proposals lower `speak.activation_ratio` or guidance; inactive speak replicas are not activated by the event loop and emit only when active |
 | Speak still does not route query work | evidence gathering is driven by allocation, query memos, and attention updates; speak receives no `QueryMailbox` |
 | Speak interrupts streaming on attention/allocation updates | speak holds `AttentionStreamUpdatedInbox` and `AllocationUpdatedInbox`; generation restarts from step 1 with fresh attention and allocation snapshots |
 | Summarize replicas are the only path to attention stream append | boot-time wiring grants `AttentionWriter` only to summarize registrations; each replica writes its own stream |

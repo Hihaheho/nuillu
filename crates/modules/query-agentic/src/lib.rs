@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher,
-    LlmAccess, Memo, Module, QueryInbox, QueryRequest, ports::FileSearchQuery,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
+    Module, QueryInbox, QueryRequest, ports::FileSearchQuery,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+pub use batch::NextBatch as QueryAgenticBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-agentic module.
 Answer questions by searching read-only files. Use the search_files tool for file and text lookup.
@@ -74,7 +75,6 @@ pub enum QueryAgenticTools {
 pub struct QueryAgenticModule {
     query: QueryInbox,
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     files: FileSearcher,
@@ -86,7 +86,6 @@ impl QueryAgenticModule {
     pub fn new(
         query: QueryInbox,
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         files: FileSearcher,
@@ -96,7 +95,6 @@ impl QueryAgenticModule {
         Self {
             query,
             allocation_updates,
-            gate,
             allocation,
             blackboard,
             files,
@@ -229,18 +227,6 @@ impl QueryAgenticModule {
                 .collect(),
         })
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            let batch = self.next_batch().await?;
-            if !batch.queries.is_empty() {
-                self.handle_queries(batch.queries).await?;
-            }
-            if batch.guidance {
-                self.activate_guidance().await?;
-            }
-        }
-    }
 }
 
 fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
@@ -255,9 +241,19 @@ fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
 
 #[async_trait(?Send)]
 impl Module for QueryAgenticModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("query-agentic module failed: {error:#}");
+    type Batch = QueryAgenticBatch;
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        QueryAgenticModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        if !batch.queries.is_empty() {
+            self.handle_queries(batch.queries.clone()).await?;
         }
+        if batch.guidance {
+            self.activate_guidance().await?;
+        }
+        Ok(())
     }
 }

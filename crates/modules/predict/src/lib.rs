@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader,
-    AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
+    AllocationReader, AllocationUpdatedInbox, AttentionReader, AttentionStreamUpdatedInbox,
+    BlackboardReader, LlmAccess, Memo, Module,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,6 @@ pub struct PredictionEntry {
 pub struct PredictModule {
     updates: AttentionStreamUpdatedInbox,
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     attention: AttentionReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -46,7 +45,6 @@ impl PredictModule {
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         attention: AttentionReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -56,7 +54,6 @@ impl PredictModule {
         Self {
             updates,
             allocation_updates,
-            gate,
             attention,
             allocation,
             blackboard,
@@ -108,20 +105,17 @@ impl PredictModule {
         self.memo.write(serialized).await;
         Ok(())
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for PredictModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("predict module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        PredictModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        PredictModule::activate(self).await
     }
 }

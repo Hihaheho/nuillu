@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo,
-    Module, QueryInbox, QueryRequest, VectorMemorySearcher,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
+    QueryInbox, QueryRequest, VectorMemorySearcher,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+pub use batch::NextBatch as QueryVectorBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
 Answer vector-memory/RAG questions only. Use the search_vector_memory tool for factual memory lookup. Do not
@@ -70,7 +71,6 @@ pub enum QueryVectorTools {
 pub struct QueryVectorModule {
     query: QueryInbox,
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: VectorMemorySearcher,
@@ -82,7 +82,6 @@ impl QueryVectorModule {
     pub fn new(
         query: QueryInbox,
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: VectorMemorySearcher,
@@ -92,7 +91,6 @@ impl QueryVectorModule {
         Self {
             query,
             allocation_updates,
-            gate,
             allocation,
             blackboard,
             memory,
@@ -227,18 +225,6 @@ impl QueryVectorModule {
                 .collect(),
         })
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            let batch = self.next_batch().await?;
-            if !batch.queries.is_empty() {
-                self.handle_queries(batch.queries).await?;
-            }
-            if batch.guidance {
-                self.activate_guidance().await?;
-            }
-        }
-    }
 }
 
 fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
@@ -253,9 +239,19 @@ fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
 
 #[async_trait(?Send)]
 impl Module for QueryVectorModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("query-vector module failed: {error:#}");
+    type Batch = QueryVectorBatch;
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        QueryVectorModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        if !batch.queries.is_empty() {
+            self.handle_queries(batch.queries.clone()).await?;
         }
+        if batch.guidance {
+            self.activate_guidance().await?;
+        }
+        Ok(())
     }
 }

@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess,
-    MemoryCompactor, Module,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, MemoryCompactor, Module,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -56,7 +55,6 @@ pub enum CompactionTools {
 
 pub struct MemoryCompactionModule {
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
@@ -66,7 +64,6 @@ pub struct MemoryCompactionModule {
 impl MemoryCompactionModule {
     pub fn new(
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
@@ -74,7 +71,6 @@ impl MemoryCompactionModule {
     ) -> Self {
         Self {
             allocation_updates,
-            gate,
             allocation,
             blackboard,
             compactor,
@@ -201,20 +197,17 @@ impl MemoryCompactionModule {
             merged_sources: source_count,
         })
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            self.next_batch().await?;
-            self.activate().await?;
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for MemoryCompactionModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("memory-compaction module failed: {error:#}");
-        }
+    type Batch = ();
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        MemoryCompactionModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+        MemoryCompactionModule::activate(self).await
     }
 }

@@ -65,7 +65,7 @@ impl AttentionWriter {
 
         if self
             .updates
-            .publish(AttentionStreamUpdated {
+            .publish(AttentionStreamUpdated::StreamAppended {
                 stream: self.owner.clone(),
             })
             .await

@@ -15,9 +15,6 @@ impl SpeakModule {
 
         let _ = self.updates.take_ready_items()?;
         let _ = self.allocation_updates.take_ready_items()?;
-        self.gate.block().await;
-        let _ = self.updates.take_ready_items()?;
-        let _ = self.allocation_updates.take_ready_items()?;
         Ok(())
     }
 }

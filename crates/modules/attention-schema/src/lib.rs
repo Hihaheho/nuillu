@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AllocationReader, AllocationUpdatedInbox, AttentionReader, LlmAccess, Memo,
-    Module, SelfModelInbox, SelfModelRequest,
+    AllocationReader, AllocationUpdatedInbox, AttentionReader, LlmAccess, Memo, Module,
+    SelfModelInbox, SelfModelRequest,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+pub use batch::NextBatch as AttentionSchemaBatch;
 
 const MODEL_PROMPT: &str = r#"You are the attention-schema module.
 Maintain a compact first-person model of what the agent is currently attending to. The model is
@@ -44,7 +45,6 @@ pub struct SelfReportBatch {
 pub struct AttentionSchemaModule {
     self_model: SelfModelInbox,
     allocation_updates: AllocationUpdatedInbox,
-    gate: ActivationGate,
     attention: AttentionReader,
     allocation: AllocationReader,
     memo: Memo,
@@ -55,7 +55,6 @@ impl AttentionSchemaModule {
     pub fn new(
         self_model: SelfModelInbox,
         allocation_updates: AllocationUpdatedInbox,
-        gate: ActivationGate,
         attention: AttentionReader,
         allocation: AllocationReader,
         memo: Memo,
@@ -64,7 +63,6 @@ impl AttentionSchemaModule {
         Self {
             self_model,
             allocation_updates,
-            gate,
             attention,
             allocation,
             memo,
@@ -143,25 +141,23 @@ impl AttentionSchemaModule {
         self.memo.write(serialized).await;
         Ok(())
     }
-
-    async fn run_loop(&mut self) -> Result<()> {
-        loop {
-            let batch = self.next_batch().await?;
-            if batch.update_model {
-                self.update_model().await?;
-            }
-            if !batch.requests.is_empty() {
-                self.answer_batch(batch.requests).await?;
-            }
-        }
-    }
 }
 
 #[async_trait(?Send)]
 impl Module for AttentionSchemaModule {
-    async fn run(&mut self) {
-        if let Err(error) = self.run_loop().await {
-            panic!("attention-schema module failed: {error:#}");
+    type Batch = AttentionSchemaBatch;
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        AttentionSchemaModule::next_batch(self).await
+    }
+
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        if batch.update_model {
+            self.update_model().await?;
         }
+        if !batch.requests.is_empty() {
+            self.answer_batch(batch.requests.clone()).await?;
+        }
+        Ok(())
     }
 }
