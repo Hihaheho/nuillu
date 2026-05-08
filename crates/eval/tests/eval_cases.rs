@@ -36,28 +36,28 @@ impl RubricJudge for ScriptJudge {
         _trace: &TraceSnapshot,
         request: RubricJudgeRequest,
     ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert!(request.prompt.contains("Greet the user"));
-        assert!(request.rubric.contains("brief greeting"));
-        assert!(request.artifact.output.contains("nuillu"));
+        assert!(request.prompt.contains("Who are you?"));
+        assert!(request.rubric.contains("search_vector_memory"));
+        assert!(request.artifact.output.contains("blue frog"));
         self.called.set(true);
         Ok(RubricJudgeVerdict {
             passed: true,
             score: 0.92,
-            summary: "brief greeting with correct identity".to_string(),
+            summary: "targeted search query with retrieved content output".to_string(),
             criteria: vec![
                 RubricJudgeVerdictCriterion {
-                    name: "greeting".to_string(),
+                    name: "generated-query".to_string(),
                     passed: true,
                     score: 0.9,
-                    reason: "starts with a greeting".to_string(),
-                    evidence: Some("hello".to_string()),
+                    reason: "uses a query targeted at the prompt".to_string(),
+                    evidence: Some("search_vector_memory".to_string()),
                 },
                 RubricJudgeVerdictCriterion {
-                    name: "identity".to_string(),
+                    name: "content-only-output".to_string(),
                     passed: true,
                     score: 1.0,
-                    reason: "names nuillu".to_string(),
-                    evidence: Some("hello from nuillu".to_string()),
+                    reason: "outputs retrieved memory content only".to_string(),
+                    evidence: Some("I'm a Lutum, a blue frog.".to_string()),
                 },
             ],
         })
@@ -78,7 +78,7 @@ fn parses_checked_in_eval_cases() {
 
 #[test]
 fn parses_checked_in_model_set() {
-    let path = workspace_root().join("configs/modelsets/eval.eure");
+    let path = workspace_root().join("configs/modelsets/eval-ollama.eure");
     let model_set = parse_model_set_file(&path).unwrap();
 
     let judge = model_set.judge.unwrap();
@@ -164,7 +164,7 @@ fn parses_query_vector_module_case_with_memory_seed() {
 
 #[test]
 fn parses_query_agentic_module_case() {
-    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let path = eval_root().join("modules/query-agentic/file-lookup.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -172,7 +172,15 @@ fn parses_query_agentic_module_case() {
     };
 
     assert_eq!(target, ModuleEvalTarget::QueryAgentic);
-    assert!(case.prompt.content.contains("Greet the user"));
+    assert_eq!(case.prompt.content, "nuillu");
+    assert_eq!(case.files.len(), 1);
+    assert_eq!(case.files[0].path, "notes/identity.txt");
+    assert!(
+        case.files[0]
+            .content
+            .content
+            .contains("capability-based agent runtime")
+    );
     assert_eq!(case.limits.max_llm_calls, Some(8));
 }
 
@@ -219,9 +227,9 @@ id = "bad-full-agent-internal-message"
 
 #[tokio::test]
 async fn evaluates_module_case_with_rubric_judge() {
-    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let path = eval_root().join("modules/query-vector/memory-identity.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new("hello from nuillu");
+    let artifact = CaseArtifact::new("I'm a Lutum, a blue frog.");
     let judge = ScriptJudge {
         called: Cell::new(false),
     };
@@ -236,9 +244,9 @@ async fn evaluates_module_case_with_rubric_judge() {
 
 #[tokio::test]
 async fn rubric_case_requires_judge() {
-    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let path = eval_root().join("modules/query-vector/memory-identity.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new("hello from nuillu");
+    let artifact = CaseArtifact::new("I'm a Lutum, a blue frog.");
 
     let report = evaluate_case(&case, &empty_trace(), &artifact, None).await;
 

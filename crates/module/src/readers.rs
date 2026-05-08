@@ -89,10 +89,7 @@ impl AllocationReader {
         let mut caps = caps.into_iter().collect::<Vec<_>>();
         caps.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
-        let module_ids = caps
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .collect::<Vec<_>>();
+        let module_ids = caps.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
 
         let patch_items = if module_ids.is_empty() {
             serde_json::Value::Bool(false)

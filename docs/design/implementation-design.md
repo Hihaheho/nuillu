@@ -512,13 +512,13 @@ Maintains a simplified first-person self-model from the attention-stream set and
 
 Capabilities: `QueryInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `VectorMemorySearcher`, `Memo`, `LlmAccess`.
 
-Handles vector-memory/RAG queries only. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-vector replicas. Allocation updates may wake it to act on guidance with the current blackboard context. It does not handle self-referential or self-model questions. Output is this replica's memo.
+Handles vector-memory/RAG queries only. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-vector replicas. Allocation updates may wake it to act on guidance with the current blackboard context. It does not handle self-referential or self-model questions. Output is this replica's memo, and that memo contains only retrieved memory content copied from query results.
 
 ### Query Agentic
 
 Capabilities: `QueryInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `FileSearcher`, `Memo`, `LlmAccess`.
 
-Handles read-only file-search queries. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-agentic replicas. Allocation updates may wake it to act on guidance with the current blackboard context. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is this replica's memo.
+Handles read-only file-search queries. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-agentic replicas. Allocation updates may wake it to act on guidance with the current blackboard context. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is this replica's memo, and that memo contains only retrieved file content/snippets copied from query results.
 
 ### Memory
 
@@ -687,7 +687,7 @@ Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. The
 
 Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, and speak start with positive activation ratios; summarize starts low and is raised by controller guidance after sensory memo writes; lower-priority query, memory, prediction, surprise, and attention-schema modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to attention-schema through `CapabilityProviders::internal_harness_io()`, then score the target module memo as the artifact.
+Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to attention-schema through `CapabilityProviders::internal_harness_io()`, then score the target module memo as the artifact. Query evals statically check that retrieved content reached the artifact, while rubrics judge generated search/tool arguments from the trace.
 
 Common eval behavior:
 

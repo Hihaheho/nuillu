@@ -149,11 +149,11 @@ The self-model is a simplification. It may diverge from the controller's interna
 
 ### Query Vector
 
-Handles vector-memory/RAG queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Output is written to the query-vector module's memo.
+Handles vector-memory/RAG queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Its memo contains only retrieved memory content, copied from query results; it does not synthesize answers or describe itself.
 
 ### Query Agentic
 
-Handles read-only file-search queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Output is written to the query-agentic module's memo.
+Handles read-only file-search queries only. Explicit internal query requests arrive through `QueryInbox`; allocation updates can also wake it to act on controller guidance. Its memo contains only retrieved file content/snippets, copied from query results; it does not synthesize answers or describe itself.
 
 ### Memory
 

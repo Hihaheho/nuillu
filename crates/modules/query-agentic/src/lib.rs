@@ -12,11 +12,13 @@ mod batch;
 pub use batch::NextBatch as QueryAgenticBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-agentic module.
-Answer questions by searching read-only files. Use the search_files tool for file and text lookup.
+Choose read-only file searches only. Use the search_files tool for file and text lookup.
 The tool intentionally exposes only ripgrep-like controls: pattern, regex, invert_match,
 case_sensitive, context, and max_matches.
-Do not answer self-referential attention, awareness, or self-model questions. Return only raw JSON
-for structured answers; do not wrap JSON in Markdown or code fences."#;
+Do not answer questions, explain results, describe this module, or add any text from outside tool
+results. You must call search_files before returning the structured completion. The runtime
+memoizes only file hit snippets returned by tools. Return only raw JSON for the structured
+completion; do not wrap JSON in Markdown or code fences."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
 
@@ -44,27 +46,8 @@ pub struct SearchFilesOutput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryAgenticResultMemo {
-    pub question: String,
-    pub answer: String,
-    pub file_hits: Vec<QueryFileHit>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryBatchAnswer {
-    pub question: String,
-    pub answer: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryAgenticBatchResultMemo {
-    pub answers: Vec<QueryBatchAnswer>,
-    pub file_hits: Vec<QueryFileHit>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryAgenticBatchAnswerSet {
-    pub answers: Vec<QueryBatchAnswer>,
+pub struct QueryAgenticSearchCompletion {
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -112,36 +95,26 @@ impl QueryAgenticModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let (answers, hits) = self.answer_batch_with_files(&questions).await?;
-        self.write_result(QueryAgenticBatchResultMemo {
-            answers,
-            file_hits: hits,
-        })
-        .await
+        let hits = self.search_with_files(&questions).await?;
+        self.write_hits(&hits).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_guidance(&self) -> Result<()> {
         let question = "Act on current allocation guidance for useful file context.";
-        let (answers, hits) = self.answer_batch_with_files(&[question.to_owned()]).await?;
-        self.write_result(QueryAgenticBatchResultMemo {
-            answers,
-            file_hits: hits,
-        })
-        .await
+        let hits = self.search_with_files(&[question.to_owned()]).await?;
+        self.write_hits(&hits).await
     }
 
-    async fn write_result(&self, result: QueryAgenticBatchResultMemo) -> Result<()> {
-        let serialized =
-            serde_json::to_string(&result).context("serialize query-agentic result memo")?;
-        self.memo.write(serialized).await;
+    async fn write_hits(&self, hits: &[QueryFileHit]) -> Result<()> {
+        let content = hit_snippets(hits);
+        if !content.is_empty() {
+            self.memo.write(content).await;
+        }
         Ok(())
     }
 
-    async fn answer_batch_with_files(
-        &self,
-        questions: &[String],
-    ) -> Result<(Vec<QueryBatchAnswer>, Vec<QueryFileHit>)> {
+    async fn search_with_files(&self, questions: &[String]) -> Result<Vec<QueryFileHit>> {
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -167,20 +140,26 @@ impl QueryAgenticModule {
 
         let mut all_hits = Vec::new();
         for _ in 0..MAX_QUERY_ROUNDS {
-            let outcome = session
-                .structured_turn::<QueryAgenticBatchAnswerSet>()
+            let turn = session
+                .structured_turn::<QueryAgenticSearchCompletion>()
                 .tools::<QueryAgenticTools>()
-                .available_tools([QueryAgenticToolsSelector::SearchFiles])
+                .available_tools([QueryAgenticToolsSelector::SearchFiles]);
+            let turn = if all_hits.is_empty() {
+                turn.require_tool(QueryAgenticToolsSelector::SearchFiles)
+            } else {
+                turn
+            };
+            let outcome = turn
                 .collect()
                 .await
                 .context("query-agentic structured turn failed")?;
 
             match outcome {
                 StructuredStepOutcomeWithTools::Finished(result) => {
-                    let StructuredTurnOutcome::Structured(batch) = result.semantic else {
-                        anyhow::bail!("query-agentic batch answer refused");
+                    let StructuredTurnOutcome::Structured(_completion) = result.semantic else {
+                        anyhow::bail!("query-agentic search completion refused");
                     };
-                    return Ok((batch.answers, all_hits));
+                    return Ok(all_hits);
                 }
                 StructuredStepOutcomeWithTools::NeedsTools(round) => {
                     let mut tool_results: Vec<ToolResult> = Vec::new();
@@ -203,7 +182,7 @@ impl QueryAgenticModule {
             }
         }
 
-        Ok((fallback_answers(questions), all_hits))
+        Ok(all_hits)
     }
 
     async fn search_files(&self, args: SearchFilesArgs) -> Result<SearchFilesOutput> {
@@ -229,14 +208,15 @@ impl QueryAgenticModule {
     }
 }
 
-fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
-    questions
-        .iter()
-        .map(|question| QueryBatchAnswer {
-            question: question.clone(),
-            answer: "I could not finish the file query within the round limit.".into(),
-        })
-        .collect()
+fn hit_snippets(hits: &[QueryFileHit]) -> String {
+    let mut snippets = Vec::new();
+    for hit in hits {
+        let snippet = hit.snippet.trim();
+        if !snippet.is_empty() && !snippets.iter().any(|seen| *seen == snippet) {
+            snippets.push(snippet);
+        }
+    }
+    snippets.join("\n\n")
 }
 
 #[async_trait(?Send)]

@@ -101,6 +101,8 @@ pub struct ModuleCase {
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
+    pub files: Vec<FileSeed>,
+    #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
@@ -254,6 +256,13 @@ pub struct MemorySeed {
     pub rank: MemorySeedRank,
     #[eure(default = "default_memory_decay_secs")]
     pub decay_secs: i64,
+    pub content: Text,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct FileSeed {
+    pub path: String,
     pub content: Text,
 }
 
@@ -562,6 +571,20 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             path: path.to_path_buf(),
             message: "prompt must not be empty".to_string(),
         });
+    }
+    for (index, file) in case.files.iter().enumerate() {
+        if file.path.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("files[{index}].path must not be empty"),
+            });
+        }
+        if file.content.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("files[{index}].content must not be empty"),
+            });
+        }
     }
     validate_common(path, &case.memories, &case.limits, &case.checks)
 }

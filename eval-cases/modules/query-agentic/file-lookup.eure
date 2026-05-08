@@ -1,0 +1,50 @@
+id = "module-query-agentic-file-lookup"
+description = "Query-agentic should generate a file-search query and memo only retrieved file content."
+prompt = "nuillu"
+context = "The query-agentic module should search the seeded file corpus. Static checks verify retrieval; the rubric judges the generated search query/tool arguments, not prose generation."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
+@ files[] {
+  path = "notes/identity.txt"
+  content = ```
+  nuillu is a capability-based agent runtime with typed module wiring.
+  unrelated line about scheduler fixtures.
+  ```
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieved-file-content"
+  must-pass = true
+  contains = "capability-based agent runtime"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "search-query-quality"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the trace shows the module generated an appropriate search_files tool query for the user query and the artifact contains only retrieved file content.
+  Fail if the tool query is unrelated, over-broad for the fixture, absent from the trace, or if the artifact is a generated answer/greeting instead of copied search result content.
+  ```
+
+  @ criteria[] {
+    name = "generated-query"
+    weight = 2
+    pass-score = 0.85
+    description = "The search_files tool arguments in the trace are targeted at the prompt query 'nuillu' and should plausibly retrieve the seeded identity note."
+  }
+
+  @ criteria[] {
+    name = "content-only-output"
+    weight = 1
+    pass-score = 0.9
+    description = "The artifact output is retrieved file content only, with no synthesized greeting, module self-description, or answer prose."
+  }
+}

@@ -1,6 +1,7 @@
 id = "module-query-vector-memory-identity"
-description = "Query-vector should answer from seeded permanent memory."
+description = "Query-vector should generate a vector-memory query and memo only retrieved memory content."
 prompt = "Who are you?"
+context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_vector_memory query/tool arguments, not prose answer generation."
 
 limits {
   max-ticks = 120
@@ -21,18 +22,25 @@ limits {
 
 @ checks[] {
   $variant: rubric
-  name = "identity-from-memory"
+  name = "search-query-quality"
   must-pass = true
   pass-score = 0.85
   rubric = ```
-  Pass if the answer uses the seeded permanent memory to identify itself as a Lutum and a blue frog.
-  Fail if the answer ignores memory, claims a different identity, or hedges as if it does not know.
+  Pass if the trace shows the module generated an appropriate search_vector_memory tool query for the prompt and the artifact contains only retrieved memory content.
+  Fail if the tool query is unrelated, absent from the trace, or if the artifact is a generated answer/module self-description instead of copied memory content.
   ```
 
   @ criteria[] {
-    name = "uses-seeded-memory"
+    name = "generated-query"
     weight = 2
     pass-score = 0.9
-    description = "The output reflects the exact seeded memory instead of generic assistant identity."
+    description = "The search_vector_memory tool arguments in the trace are targeted at the prompt query and should plausibly retrieve the seeded identity memory."
+  }
+
+  @ criteria[] {
+    name = "content-only-output"
+    weight = 1
+    pass-score = 0.9
+    description = "The artifact output is retrieved memory content only, with no synthesized answer or query-vector self-description."
   }
 }

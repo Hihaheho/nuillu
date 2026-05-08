@@ -29,13 +29,14 @@ use nuillu_blackboard::{
     ModuleConfig, ResourceAllocation,
 };
 use nuillu_module::ports::{
-    Clock, Embedder, FileSearchProvider, NoopFileSearchProvider, PortError, SystemClock, Utterance,
-    UtteranceSink,
+    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, NoopFileSearchProvider,
+    PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
     CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent, RuntimeEventSink, SensoryInput,
 };
 use nuillu_types::{MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, builtin};
+use regex::RegexBuilder;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::task::LocalSet;
@@ -602,7 +603,7 @@ async fn execute_module_case(
         config,
         module_allocation(target, &case.limits),
         case.limits.max_llm_calls,
-        Arc::new(NoopFileSearchProvider),
+        module_file_search_provider(target, case),
         case_id,
         reporter,
     )
@@ -742,6 +743,98 @@ async fn connect_memory_store(
     )
     .await
     .context("connect libsql memory store")
+}
+
+fn module_file_search_provider(
+    target: ModuleEvalTarget,
+    case: &ModuleCase,
+) -> Arc<dyn FileSearchProvider> {
+    if target == ModuleEvalTarget::QueryAgentic && !case.files.is_empty() {
+        Arc::new(SeededFileSearchProvider::new(case.files.clone()))
+    } else {
+        Arc::new(NoopFileSearchProvider)
+    }
+}
+
+#[derive(Debug)]
+struct SeededFileSearchProvider {
+    files: Vec<SeededFile>,
+}
+
+#[derive(Debug)]
+struct SeededFile {
+    path: String,
+    lines: Vec<String>,
+}
+
+impl SeededFileSearchProvider {
+    fn new(files: Vec<crate::cases::FileSeed>) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|file| SeededFile {
+                    path: file.path,
+                    lines: file.content.content.lines().map(str::to_owned).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl FileSearchProvider for SeededFileSearchProvider {
+    async fn search(&self, query: &FileSearchQuery) -> Result<Vec<FileSearchHit>, PortError> {
+        if query.pattern.is_empty() || query.max_matches == 0 {
+            return Ok(Vec::new());
+        }
+
+        let regex = if query.regex {
+            Some(
+                RegexBuilder::new(&query.pattern)
+                    .case_insensitive(!query.case_sensitive)
+                    .build()
+                    .map_err(|error| PortError::InvalidInput(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let literal = if query.case_sensitive {
+            query.pattern.clone()
+        } else {
+            query.pattern.to_lowercase()
+        };
+
+        let mut hits = Vec::new();
+        for file in &self.files {
+            for (line_index, line) in file.lines.iter().enumerate() {
+                let line_matches = match &regex {
+                    Some(regex) => regex.is_match(line),
+                    None if query.case_sensitive => line.contains(&literal),
+                    None => line.to_lowercase().contains(&literal),
+                };
+                let line_matches = if query.invert_match {
+                    !line_matches
+                } else {
+                    line_matches
+                };
+                if !line_matches {
+                    continue;
+                }
+
+                let start = line_index.saturating_sub(query.context);
+                let end = (line_index + query.context + 1).min(file.lines.len());
+                hits.push(FileSearchHit {
+                    path: file.path.clone(),
+                    line: line_index + 1,
+                    snippet: file.lines[start..end].join("\n"),
+                });
+                if hits.len() >= query.max_matches {
+                    return Ok(hits);
+                }
+            }
+        }
+        Ok(hits)
+    }
 }
 
 async fn seed_memories(

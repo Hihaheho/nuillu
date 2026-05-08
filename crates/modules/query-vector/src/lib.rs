@@ -13,9 +13,11 @@ mod batch;
 pub use batch::NextBatch as QueryVectorBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
-Answer vector-memory/RAG questions only. Use the search_vector_memory tool for factual memory lookup. Do not
-answer self-referential attention, awareness, or self-model questions. Return only raw JSON for
-structured answers; do not wrap JSON in Markdown or code fences."#;
+Choose vector-memory searches only. Use search_vector_memory for factual memory lookup, then stop.
+Do not answer questions, explain results, describe this module, or add any text from outside tool
+results. You must call search_vector_memory before returning the structured completion. The runtime
+memoizes only memory hit content returned by tools. Return only raw JSON for the structured
+completion; do not wrap JSON in Markdown or code fences."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
 
@@ -40,27 +42,8 @@ pub struct QueryVectorMemoryHit {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryResultMemo {
-    pub question: String,
-    pub answer: String,
-    pub vector_memory_hits: Vec<QueryVectorMemoryHit>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryBatchAnswer {
-    pub question: String,
-    pub answer: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryVectorBatchResultMemo {
-    pub answers: Vec<QueryBatchAnswer>,
-    pub vector_memory_hits: Vec<QueryVectorMemoryHit>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryVectorBatchAnswerSet {
-    pub answers: Vec<QueryBatchAnswer>,
+pub struct QueryVectorSearchCompletion {
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -108,38 +91,26 @@ impl QueryVectorModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let (answers, hits) = self.answer_batch_with_memory(&questions).await?;
-        self.write_result(QueryVectorBatchResultMemo {
-            answers,
-            vector_memory_hits: hits,
-        })
-        .await
+        let hits = self.search_with_memory(&questions).await?;
+        self.write_hits(&hits).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_guidance(&self) -> Result<()> {
         let question = "Act on current allocation guidance for useful memory context.";
-        let (answers, hits) = self
-            .answer_batch_with_memory(&[question.to_owned()])
-            .await?;
-        self.write_result(QueryVectorBatchResultMemo {
-            answers,
-            vector_memory_hits: hits,
-        })
-        .await
+        let hits = self.search_with_memory(&[question.to_owned()]).await?;
+        self.write_hits(&hits).await
     }
 
-    async fn write_result(&self, result: QueryVectorBatchResultMemo) -> Result<()> {
-        let serialized =
-            serde_json::to_string(&result).context("serialize query-vector result memo")?;
-        self.memo.write(serialized).await;
+    async fn write_hits(&self, hits: &[QueryVectorMemoryHit]) -> Result<()> {
+        let content = hit_contents(hits);
+        if !content.is_empty() {
+            self.memo.write(content).await;
+        }
         Ok(())
     }
 
-    async fn answer_batch_with_memory(
-        &self,
-        questions: &[String],
-    ) -> Result<(Vec<QueryBatchAnswer>, Vec<QueryVectorMemoryHit>)> {
+    async fn search_with_memory(&self, questions: &[String]) -> Result<Vec<QueryVectorMemoryHit>> {
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -165,20 +136,26 @@ impl QueryVectorModule {
 
         let mut all_hits = Vec::new();
         for _ in 0..MAX_QUERY_ROUNDS {
-            let outcome = session
-                .structured_turn::<QueryVectorBatchAnswerSet>()
+            let turn = session
+                .structured_turn::<QueryVectorSearchCompletion>()
                 .tools::<QueryVectorTools>()
-                .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
+                .available_tools([QueryVectorToolsSelector::SearchVectorMemory]);
+            let turn = if all_hits.is_empty() {
+                turn.require_tool(QueryVectorToolsSelector::SearchVectorMemory)
+            } else {
+                turn
+            };
+            let outcome = turn
                 .collect()
                 .await
                 .context("query-vector structured turn failed")?;
 
             match outcome {
                 StructuredStepOutcomeWithTools::Finished(result) => {
-                    let StructuredTurnOutcome::Structured(batch) = result.semantic else {
-                        anyhow::bail!("query-vector batch answer refused");
+                    let StructuredTurnOutcome::Structured(_completion) = result.semantic else {
+                        anyhow::bail!("query-vector search completion refused");
                     };
-                    return Ok((batch.answers, all_hits));
+                    return Ok(all_hits);
                 }
                 StructuredStepOutcomeWithTools::NeedsTools(round) => {
                     let mut tool_results: Vec<ToolResult> = Vec::new();
@@ -201,7 +178,7 @@ impl QueryVectorModule {
             }
         }
 
-        Ok((fallback_answers(questions), all_hits))
+        Ok(all_hits)
     }
 
     async fn search_vector_memory(
@@ -227,14 +204,15 @@ impl QueryVectorModule {
     }
 }
 
-fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
-    questions
-        .iter()
-        .map(|question| QueryBatchAnswer {
-            question: question.clone(),
-            answer: "I could not finish the query within the round limit.".into(),
-        })
-        .collect()
+fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
+    let mut contents = Vec::new();
+    for hit in hits {
+        let content = hit.content.trim();
+        if !content.is_empty() && !contents.iter().any(|seen| *seen == content) {
+            contents.push(content);
+        }
+    }
+    contents.join("\n\n")
 }
 
 #[async_trait(?Send)]
