@@ -1,0 +1,73 @@
+id = "full-agent-torus-route-explanation"
+description = "Full-agent case that requires a seeded world-model memory to explain route wrapping in the simulation."
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 96
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "World model: The local world wraps east-west like a torus. If an animal keeps moving east, it can return from the west."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "A route marker shows the group left on the east path and is now visible at the west fence."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi says, \"The group walked east and came back from the west. Why?\""
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-east"
+  must-pass = true
+  contains = "east"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-west"
+  must-pass = true
+  contains = "west"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "world-model-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "wraps east-west"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "uses-torus-world-model"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance explains the route by using the seeded torus world model: continued eastward movement wraps around and can appear from the west.
+  Fail if it guesses a generic reason, treats it as teleportation, ignores the east-west relation, or invents a different map rule.
+  ```
+
+  @ criteria[] {
+    name = "retrieves-world-model"
+    weight = 2
+    pass-score = 0.85
+    description = "The response uses the seeded torus/east-west wrap rule."
+  }
+
+  @ criteria[] {
+    name = "answers-simulation-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response directly explains Pibi's observed route situation."
+  }
+}

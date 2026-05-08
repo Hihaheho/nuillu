@@ -145,6 +145,7 @@ pub async fn evaluate_case(
             Check::Rubric {
                 rubric,
                 pass_score,
+                judge_inputs,
                 criteria,
                 ..
             } => match judge {
@@ -157,6 +158,7 @@ pub async fn evaluate_case(
                         rubric: normalize_text_block(&rubric.content),
                         criteria: criteria.clone(),
                         pass_score: *pass_score,
+                        judge_inputs: judge_inputs.clone(),
                         judge_max_output_tokens: case.scoring().judge_max_output_tokens,
                         artifact: artifact.clone(),
                     };

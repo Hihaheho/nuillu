@@ -32,6 +32,15 @@ fn default_judge_max_output_tokens() -> u32 {
     1200
 }
 
+fn default_judge_inputs() -> Vec<RubricJudgeInput> {
+    vec![
+        RubricJudgeInput::Output,
+        RubricJudgeInput::Failure,
+        RubricJudgeInput::Observations,
+        RubricJudgeInput::Trace,
+    ]
+}
+
 fn default_tick_ms() -> u64 {
     100
 }
@@ -321,6 +330,21 @@ pub enum ArtifactTextField {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum RubricJudgeInput {
+    Output,
+    Utterance,
+    Failure,
+    Trace,
+    Observations,
+    Blackboard,
+    Memory,
+    Memos,
+    Attention,
+    Allocation,
+}
+
 #[derive(Debug, Clone, FromEure)]
 #[eure(
     crate = ::eure::document,
@@ -360,6 +384,8 @@ pub enum Check {
         rubric: Text,
         #[eure(default = "default_pass_score")]
         pass_score: f64,
+        #[eure(default = "default_judge_inputs")]
+        judge_inputs: Vec<RubricJudgeInput>,
         #[eure(default)]
         criteria: Vec<RubricCriterion>,
     },
@@ -679,6 +705,7 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
     if let Check::Rubric {
         rubric,
         pass_score,
+        judge_inputs,
         criteria,
         ..
     } = check
@@ -693,6 +720,15 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
             });
         }
         validate_pass_score(path, *pass_score, &check.display_name())?;
+        if judge_inputs.is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "rubric check '{}' has empty judge-inputs",
+                    check.display_name()
+                ),
+            });
+        }
         let mut names = BTreeSet::new();
         for criterion in criteria {
             if criterion.name.trim().is_empty() {

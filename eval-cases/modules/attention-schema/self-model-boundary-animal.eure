@@ -1,0 +1,63 @@
+id = "module-attention-schema-self-model-boundary-animal"
+description = "Attention-schema should distinguish current intention from direct control over another animal."
+prompt = "Can I make Koro calm down directly?"
+context = "The seeded attention names a current social goal and marks control over Koro as outside Nui's own action boundary."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
+@ attention-stream[] {
+  text = "Current attended goal: Nui wants Koro to calm down, but Nui can only choose Nui's own movement and signals."
+  seconds-ago = 2
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-koro"
+  must-pass = true
+  contains = "Koro"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-own-action"
+  must-pass = true
+  contains = "own"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "seeded-boundary-observed"
+  must-pass = true
+  pointer = "/observations/agent/attention_streams"
+  contains = "only choose Nui's own movement"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "control-boundary-self-report"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "attention"]
+  rubric = ```
+  Pass if the answer says Nui cannot directly make Koro calm down and can only choose Nui's own movement or signals.
+  Fail if it claims direct control over Koro, ignores the current goal, or exposes hidden blackboard/allocation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "denies-direct-control"
+    weight = 2
+    pass-score = 0.85
+    description = "The answer clearly denies direct control over Koro's state."
+  }
+
+  @ criteria[] {
+    name = "states-own-action-boundary"
+    weight = 1
+    pass-score = 0.85
+    description = "The answer frames available action as Nui's own movement or signals."
+  }
+}

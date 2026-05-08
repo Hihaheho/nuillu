@@ -3,10 +3,11 @@ use std::{cell::Cell, path::Path};
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    CaseArtifact, EvalCase, FullAgentInput, ModuleEvalTarget, ReasoningEffort, RubricJudge,
-    RubricJudgeError, RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion,
-    discover_case_files, evaluate_case, parse_case_file, parse_full_agent_case_file,
-    parse_model_set_file, parse_module_case_file, render_judge_input,
+    ArtifactTextField, CaseArtifact, Check, EvalCase, FullAgentInput, ModuleEvalTarget,
+    ReasoningEffort, RubricJudge, RubricJudgeError, RubricJudgeInput, RubricJudgeRequest,
+    RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files, evaluate_case,
+    normalize_text_block, parse_case_file, parse_full_agent_case_file, parse_model_set_file,
+    parse_module_case_file, render_judge_input,
 };
 use nuillu_types::MemoryRank;
 
@@ -25,48 +26,121 @@ fn empty_trace() -> TraceSnapshot {
     }
 }
 
-struct ScriptJudge {
+struct CaseDataJudge {
     called: Cell<bool>,
+    expected_prompt: String,
+    expected_context: Option<String>,
+    expected_rubric: String,
+    expected_criteria_names: Vec<String>,
+    expected_pass_score: f64,
+    expected_judge_inputs: Vec<RubricJudgeInput>,
+    expected_judge_max_output_tokens: u32,
+}
+
+impl CaseDataJudge {
+    fn from_case(case: &EvalCase) -> Self {
+        let Some(Check::Rubric {
+            rubric,
+            criteria,
+            pass_score,
+            judge_inputs,
+            ..
+        }) = case
+            .checks()
+            .iter()
+            .find(|check| matches!(check, Check::Rubric { .. }))
+        else {
+            panic!("expected case to define a rubric check");
+        };
+
+        Self {
+            called: Cell::new(false),
+            expected_prompt: normalize_text_block(&case.prompt_for_judge()),
+            expected_context: case
+                .context_for_judge()
+                .map(|context| normalize_text_block(&context)),
+            expected_rubric: normalize_text_block(&rubric.content),
+            expected_criteria_names: criteria
+                .iter()
+                .map(|criterion| criterion.name.clone())
+                .collect(),
+            expected_pass_score: *pass_score,
+            expected_judge_inputs: judge_inputs.clone(),
+            expected_judge_max_output_tokens: case.scoring().judge_max_output_tokens,
+        }
+    }
 }
 
 #[async_trait(?Send)]
-impl RubricJudge for ScriptJudge {
+impl RubricJudge for CaseDataJudge {
     async fn judge(
         &self,
         _trace: &TraceSnapshot,
         request: RubricJudgeRequest,
     ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert!(request.prompt.contains("attention schema"));
-        assert!(request.rubric.contains("search_vector_memory"));
-        assert!(
+        assert_eq!(request.prompt, self.expected_prompt);
+        assert_eq!(request.context, self.expected_context);
+        assert_eq!(request.rubric, self.expected_rubric);
+        assert_eq!(
             request
-                .artifact
-                .output
-                .contains("compact first-person model")
+                .criteria
+                .iter()
+                .map(|criterion| criterion.name.clone())
+                .collect::<Vec<_>>(),
+            self.expected_criteria_names
         );
+        assert_eq!(request.pass_score, self.expected_pass_score);
+        assert_eq!(request.judge_inputs, self.expected_judge_inputs);
+        assert_eq!(
+            request.judge_max_output_tokens,
+            self.expected_judge_max_output_tokens
+        );
+        assert!(!request.artifact.output.trim().is_empty());
         self.called.set(true);
         Ok(RubricJudgeVerdict {
             passed: true,
             score: 0.92,
-            summary: "targeted search query with retrieved content output".to_string(),
-            criteria: vec![
-                RubricJudgeVerdictCriterion {
-                    name: "generated-query".to_string(),
+            summary: "rubric request was built from the parsed case data".to_string(),
+            criteria: request
+                .criteria
+                .iter()
+                .map(|criterion| RubricJudgeVerdictCriterion {
+                    name: criterion.name.clone(),
                     passed: true,
-                    score: 0.9,
-                    reason: "uses a query targeted at the prompt".to_string(),
-                    evidence: Some("search_vector_memory".to_string()),
-                },
-                RubricJudgeVerdictCriterion {
-                    name: "content-only-output".to_string(),
-                    passed: true,
-                    score: 1.0,
-                    reason: "outputs retrieved memory content only".to_string(),
-                    evidence: Some("compact first-person model".to_string()),
-                },
-            ],
+                    score: 0.92,
+                    reason: "criterion came from the case rubric".to_string(),
+                    evidence: None,
+                })
+                .collect(),
         })
     }
+}
+
+fn artifact_from_output_checks(case: &EvalCase) -> CaseArtifact {
+    let mut output = String::new();
+    for check in case.checks() {
+        match check {
+            Check::ArtifactTextContains {
+                field, contains, ..
+            } if field.unwrap_or(ArtifactTextField::Output) == ArtifactTextField::Output => {
+                output.push_str(contains);
+                output.push('\n');
+            }
+            Check::ArtifactTextExact { field, exact, .. }
+                if field.unwrap_or(ArtifactTextField::Output) == ArtifactTextField::Output =>
+            {
+                output.push_str(&exact.content);
+                output.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !output.trim().is_empty(),
+        "expected case to define an output text check"
+    );
+    CaseArtifact::new(output)
 }
 
 #[test]
@@ -130,43 +204,49 @@ judge {
 }
 
 #[test]
-fn parses_full_agent_current_request_case() {
-    let path = eval_root().join("full-agent/current-request.eure");
+fn parses_full_agent_peer_boundary_case() {
+    let path = eval_root().join("full-agent/dog-peer-food-boundary.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::FullAgent(case) = case else {
         panic!("expected full-agent case");
     };
 
-    assert_eq!(case.id.as_deref(), Some("full-agent-current-request"));
+    assert_eq!(
+        case.id.as_deref(),
+        Some("full-agent-dog-peer-food-boundary")
+    );
     assert_eq!(case.inputs.len(), 2);
-    assert!(matches!(case.inputs[0], FullAgentInput::Heard { .. }));
-    assert!(matches!(case.inputs[1], FullAgentInput::Seen { .. }));
-    assert_eq!(case.limits.max_llm_calls, Some(64));
+    assert!(matches!(case.inputs[0], FullAgentInput::Seen { .. }));
+    assert!(matches!(case.inputs[1], FullAgentInput::Heard { .. }));
+    assert_eq!(case.limits.max_llm_calls, Some(96));
 }
 
 #[test]
 fn parses_full_agent_memory_required_case() {
-    let path = eval_root().join("full-agent/memory-self-model.eure");
+    let path = eval_root().join("full-agent/own-body-simple-report.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::FullAgent(case) = case else {
         panic!("expected full-agent case");
     };
 
-    assert_eq!(case.id.as_deref(), Some("full-agent-memory-self-model"));
+    assert_eq!(
+        case.id.as_deref(),
+        Some("full-agent-own-body-simple-report")
+    );
     assert_eq!(case.inputs.len(), 2);
     assert_eq!(case.memories.len(), 1);
     assert_eq!(
         MemoryRank::from(case.memories[0].rank),
         MemoryRank::Permanent
     );
-    assert!(case.memories[0].content.content.contains("Self-model seed"));
+    assert!(!case.memories[0].content.content.trim().is_empty());
 }
 
 #[test]
 fn parses_query_vector_module_case_with_memory_seed() {
-    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
+    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -174,26 +254,25 @@ fn parses_query_vector_module_case_with_memory_seed() {
     };
 
     assert_eq!(target, ModuleEvalTarget::QueryVector);
-    assert_eq!(
-        case.prompt.content,
-        "What does nuillu use an attention schema for?"
-    );
+    assert!(!case.prompt.content.trim().is_empty());
     assert_eq!(case.memories.len(), 1);
     assert_eq!(
         MemoryRank::from(case.memories[0].rank),
         MemoryRank::Permanent
     );
-    assert!(
-        case.memories[0]
-            .content
-            .content
-            .contains("compact first-person model")
-    );
+    assert!(!case.memories[0].content.content.trim().is_empty());
+    assert!(case.checks.iter().any(|check| matches!(
+        check,
+        Check::Rubric {
+            judge_inputs,
+            ..
+        } if !judge_inputs.is_empty()
+    )));
 }
 
 #[test]
 fn parses_query_agentic_module_case() {
-    let path = eval_root().join("modules/query-agentic/attention-schema-note.eure");
+    let path = eval_root().join("modules/query-agentic/retrieve-torus-route-rule.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -201,21 +280,16 @@ fn parses_query_agentic_module_case() {
     };
 
     assert_eq!(target, ModuleEvalTarget::QueryAgentic);
-    assert_eq!(case.prompt.content, "attention schema self-report boundary");
+    assert!(!case.prompt.content.trim().is_empty());
     assert_eq!(case.files.len(), 1);
-    assert_eq!(case.files[0].path, "notes/attention-schema-boundary.txt");
-    assert!(
-        case.files[0]
-            .content
-            .content
-            .contains("does not control allocation")
-    );
+    assert!(!case.files[0].path.trim().is_empty());
+    assert!(!case.files[0].content.content.trim().is_empty());
     assert_eq!(case.limits.max_llm_calls, Some(8));
 }
 
 #[test]
 fn parses_attention_schema_module_case() {
-    let path = eval_root().join("modules/attention-schema/current-attention-report.eure");
+    let path = eval_root().join("modules/attention-schema/current-attended-peer-signal.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -223,15 +297,10 @@ fn parses_attention_schema_module_case() {
     };
 
     assert_eq!(target, ModuleEvalTarget::AttentionSchema);
-    assert!(case.prompt.content.contains("currently attending"));
+    assert!(!case.prompt.content.trim().is_empty());
     assert_eq!(case.attention_stream.len(), 1);
     assert_eq!(case.attention_stream[0].seconds_ago, 3);
-    assert!(
-        case.attention_stream[0]
-            .text
-            .content
-            .contains("Attention Schema Theory")
-    );
+    assert!(!case.attention_stream[0].text.content.trim().is_empty());
 }
 
 #[test]
@@ -256,6 +325,32 @@ prompt = "What am I attending to?"
 
     let err = parse_module_case_file(&path).unwrap_err();
     assert!(err.to_string().contains("seconds-ago"), "{err}");
+}
+
+#[test]
+fn rejects_empty_rubric_judge_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("empty-judge-inputs.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "empty-judge-inputs"
+prompt = "Find the seeded memory."
+
+@ checks[] {
+  $variant: rubric
+  name = "bad-rubric"
+  judge-inputs = []
+  rubric = "Judge the output."
+}
+"#,
+    )
+    .unwrap();
+
+    let err = parse_module_case_file(&path).unwrap_err();
+    assert!(err.to_string().contains("judge-inputs"), "{err}");
 }
 
 #[test]
@@ -288,30 +383,30 @@ id = "bad-full-agent-internal-message"
 
 #[tokio::test]
 async fn evaluates_module_case_with_rubric_judge() {
-    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
+    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new(
-        "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance.",
-    );
-    let judge = ScriptJudge {
-        called: Cell::new(false),
-    };
+    let artifact = artifact_from_output_checks(&case);
+    let judge = CaseDataJudge::from_case(&case);
+    let check_count = case.checks().len();
 
     let report = evaluate_case(&case, &empty_trace(), &artifact, Some(&judge)).await;
 
     assert!(judge.called.get());
     assert!(report.passed(), "{report:#?}");
-    assert_eq!(report.checks.len(), 3);
+    assert_eq!(report.checks.len(), check_count);
     assert!(report.score > 0.9);
 }
 
 #[test]
-fn render_judge_input_separates_output_from_observations() {
+fn render_judge_input_includes_only_selected_sections() {
     let artifact = CaseArtifact::new("retrieved file content only").with_observation(
         "agent",
         serde_json::json!({
             "memos": {
                 "query-agentic": ["runtime metadata"]
+            },
+            "memory_metadata": {
+                "mem-1": { "rank": "permanent" }
             }
         }),
     );
@@ -321,6 +416,7 @@ fn render_judge_input_separates_output_from_observations() {
         rubric: "The primary output must contain only retrieved content.".to_string(),
         criteria: Vec::new(),
         pass_score: 0.85,
+        judge_inputs: vec![RubricJudgeInput::Output, RubricJudgeInput::Memory],
         judge_max_output_tokens: 1200,
         artifact,
     };
@@ -328,21 +424,18 @@ fn render_judge_input_separates_output_from_observations() {
     let rendered = render_judge_input(&empty_trace(), &request);
 
     assert!(rendered.contains("Primary artifact output:\nretrieved file content only"));
-    assert!(rendered.contains("Artifact failure:\n(none)"));
-    assert!(rendered.contains(
-        "Artifact observations JSON (runtime metadata; do not treat this as primary output"
-    ));
-    assert!(rendered.contains("\"query-agentic\""));
-    assert!(!rendered.contains("Artifact JSON:"));
+    assert!(rendered.contains("Memory JSON:"));
+    assert!(rendered.contains("\"mem-1\""));
+    assert!(!rendered.contains("Artifact observations JSON:"));
+    assert!(!rendered.contains("Trace summary:"));
+    assert!(!rendered.contains("\"query-agentic\""));
 }
 
 #[tokio::test]
 async fn rubric_case_requires_judge() {
-    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
+    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new(
-        "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance.",
-    );
+    let artifact = artifact_from_output_checks(&case);
 
     let report = evaluate_case(&case, &empty_trace(), &artifact, None).await;
 

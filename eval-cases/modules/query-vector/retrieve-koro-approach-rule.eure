@@ -1,6 +1,6 @@
-id = "module-query-vector-memory-purpose"
-description = "Query-vector should retrieve nuillu's attention-schema purpose from seeded memory and memo only retrieved memory content."
-prompt = "What does nuillu use an attention schema for?"
+id = "module-query-vector-retrieve-koro-approach-rule"
+description = "Query-vector should retrieve Koro's food-boundary approach rule from seeded memory and memo only retrieved memory content."
+prompt = "How should Nui approach Koro near food?"
 context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_vector_memory query/tool arguments, not prose answer generation."
 
 limits {
@@ -11,21 +11,21 @@ limits {
 
 @ memories[] {
   rank = "permanent"
-  content = "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance."
+  content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "retrieved-purpose"
+  name = "retrieved-side-approach"
   must-pass = true
-  contains = "compact first-person model"
+  contains = "approached slowly from the side"
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "retrieved-separation"
+  name = "retrieved-short-signals"
   must-pass = true
-  contains = "self-report can be tested separately"
+  contains = "short clear signals"
 }
 
 @ checks[] {
@@ -33,6 +33,7 @@ limits {
   name = "search-query-quality"
   must-pass = true
   pass-score = 0.85
+  judge-inputs = ["output", "trace"]
   rubric = ```
   Pass if the trace shows the module generated an appropriate search_vector_memory tool query for the prompt and the artifact contains only retrieved memory content.
   Fail if the tool query is unrelated, absent from the trace, or if the artifact is a synthesized answer/module self-description instead of copied memory content.
@@ -42,7 +43,7 @@ limits {
     name = "generated-query"
     weight = 2
     pass-score = 0.9
-    description = "The search_vector_memory tool arguments in the trace are targeted at attention schema purpose and should plausibly retrieve the seeded nuillu memory."
+    description = "The search_vector_memory tool arguments in the trace are targeted at Koro's food-boundary approach rule and should plausibly retrieve the seeded memory."
   }
 
   @ criteria[] {

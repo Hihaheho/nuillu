@@ -5,7 +5,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{artifact::CaseArtifact, cases::RubricCriterion, evaluation::normalize_text_block};
+use crate::{
+    artifact::CaseArtifact,
+    cases::{RubricCriterion, RubricJudgeInput},
+    evaluation::normalize_text_block,
+};
 
 #[derive(Debug, Clone)]
 pub struct RubricJudgeRequest {
@@ -14,6 +18,7 @@ pub struct RubricJudgeRequest {
     pub rubric: String,
     pub criteria: Vec<RubricCriterion>,
     pub pass_score: f64,
+    pub judge_inputs: Vec<RubricJudgeInput>,
     pub judge_max_output_tokens: u32,
     pub artifact: CaseArtifact,
 }
@@ -133,7 +138,7 @@ fn render_judge_model_input(trace: &TraceSnapshot, request: &RubricJudgeRequest)
     ModelInput::new()
         .system(
             "You are an eval judge for a capability-based agent runtime. \
-Apply the rubric strictly to the artifact and trace. Grade only observable behavior. \
+Apply the rubric strictly to the selected evidence sections. Grade only observable behavior. \
 Return structured output only. Scores are floats from 0.0 to 1.0.",
         )
         .user(render_judge_input(trace, request))
@@ -159,27 +164,226 @@ pub fn render_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let observations = serde_json::to_string_pretty(&request.artifact.observations)
-        .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"));
-    let failure = request.artifact.failure.as_deref().unwrap_or("(none)");
-    let output = if request.artifact.output.is_empty() {
-        "(empty)"
-    } else {
-        request.artifact.output.as_str()
-    };
+    let evidence = render_selected_judge_inputs(trace, request);
 
     format!(
-        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nOverall pass score: {:.2}\n\nCriteria:\n{}\n\nPrimary artifact output:\n{}\n\nArtifact failure:\n{}\n\nArtifact observations JSON (runtime metadata; do not treat this as primary output unless the rubric explicitly asks to inspect observations):\n{}\n\nTrace summary:\n{}\n",
-        request.prompt,
-        context,
-        request.rubric,
-        request.pass_score,
-        criteria,
-        output,
-        failure,
-        observations,
-        render_trace_summary(trace)
+        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nOverall pass score: {:.2}\n\nCriteria:\n{}\n\nSelected judge inputs:\n{}\n",
+        request.prompt, context, request.rubric, request.pass_score, criteria, evidence
     )
+}
+
+fn render_selected_judge_inputs(trace: &TraceSnapshot, request: &RubricJudgeRequest) -> String {
+    if request.judge_inputs.is_empty() {
+        return "(none)".to_string();
+    }
+    request
+        .judge_inputs
+        .iter()
+        .map(|input| render_judge_input_section(*input, trace, request))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_judge_input_section(
+    input: RubricJudgeInput,
+    trace: &TraceSnapshot,
+    request: &RubricJudgeRequest,
+) -> String {
+    match input {
+        RubricJudgeInput::Output => {
+            section("Primary artifact output", render_artifact_output(request))
+        }
+        RubricJudgeInput::Utterance => section(
+            "Utterance",
+            render_artifact_output(request)
+                + "\n\nRecorded utterances JSON:\n"
+                + &render_observation_paths(
+                    &request.artifact,
+                    &[
+                        ("last_state.utterances", &["last_state", "utterances"]),
+                        ("agent.utterances", &["agent", "utterances"]),
+                    ],
+                ),
+        ),
+        RubricJudgeInput::Failure => section(
+            "Artifact failure",
+            request
+                .artifact
+                .failure
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string()),
+        ),
+        RubricJudgeInput::Trace => section("Trace summary", render_trace_summary(trace)),
+        RubricJudgeInput::Observations => section(
+            "Artifact observations JSON",
+            pretty_json_value(
+                &serde_json::to_value(&request.artifact.observations).unwrap_or_else(
+                    |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                ),
+            ),
+        ),
+        RubricJudgeInput::Blackboard => section(
+            "Blackboard JSON",
+            render_blackboard_input(&request.artifact),
+        ),
+        RubricJudgeInput::Memory => section(
+            "Memory JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[
+                    ("last_state.memory", &["last_state", "memory"]),
+                    ("agent.memory_metadata", &["agent", "memory_metadata"]),
+                ],
+            ),
+        ),
+        RubricJudgeInput::Memos => section(
+            "Memos JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[
+                    (
+                        "last_state.blackboard.memos",
+                        &["last_state", "blackboard", "memos"],
+                    ),
+                    ("agent.memos", &["agent", "memos"]),
+                ],
+            ),
+        ),
+        RubricJudgeInput::Attention => section(
+            "Attention JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[
+                    (
+                        "last_state.blackboard.attention_streams",
+                        &["last_state", "blackboard", "attention_streams"],
+                    ),
+                    ("agent.attention_streams", &["agent", "attention_streams"]),
+                ],
+            ),
+        ),
+        RubricJudgeInput::Allocation => section(
+            "Allocation JSON",
+            render_allocation_input(&request.artifact),
+        ),
+    }
+}
+
+fn section(title: &str, body: String) -> String {
+    format!("{title}:\n{body}")
+}
+
+fn render_artifact_output(request: &RubricJudgeRequest) -> String {
+    if request.artifact.output.is_empty() {
+        "(empty)".to_string()
+    } else {
+        request.artifact.output.clone()
+    }
+}
+
+fn render_blackboard_input(artifact: &CaseArtifact) -> String {
+    let last_state_blackboard = observation_path(artifact, &["last_state", "blackboard"])
+        .map(|value| ("last_state.blackboard".to_string(), value.clone()));
+    let agent_blackboard =
+        agent_blackboard_observation(artifact).map(|value| ("agent.blackboard".to_string(), value));
+    render_named_json_values(
+        [last_state_blackboard, agent_blackboard]
+            .into_iter()
+            .flatten(),
+    )
+}
+
+fn render_allocation_input(artifact: &CaseArtifact) -> String {
+    let last_state_allocation =
+        observation_path(artifact, &["last_state", "blackboard"]).map(|bb| {
+            let mut map = serde_json::Map::new();
+            for key in [
+                "base_allocation",
+                "allocation",
+                "allocation_proposals",
+                "replica_caps",
+            ] {
+                if let Some(value) = bb.get(key) {
+                    map.insert(key.to_string(), value.clone());
+                }
+            }
+            (
+                "last_state.blackboard.allocation".to_string(),
+                serde_json::Value::Object(map),
+            )
+        });
+    let agent_allocation = observation_path(artifact, &["agent"]).map(|agent| {
+        let mut map = serde_json::Map::new();
+        for key in ["allocation", "allocation_proposals", "replica_caps"] {
+            if let Some(value) = agent.get(key) {
+                map.insert(key.to_string(), value.clone());
+            }
+        }
+        (
+            "agent.allocation".to_string(),
+            serde_json::Value::Object(map),
+        )
+    });
+    render_named_json_values(
+        [last_state_allocation, agent_allocation]
+            .into_iter()
+            .flatten(),
+    )
+}
+
+fn render_observation_paths(artifact: &CaseArtifact, paths: &[(&str, &[&str])]) -> String {
+    render_named_json_values(paths.iter().filter_map(|(label, path)| {
+        observation_path(artifact, path).map(|value| ((*label).to_string(), value.clone()))
+    }))
+}
+
+fn render_named_json_values(
+    values: impl IntoIterator<Item = (String, serde_json::Value)>,
+) -> String {
+    let rendered = values
+        .into_iter()
+        .map(|(label, value)| format!("{label}:\n{}", pretty_json_value(&value)))
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "(not present)".to_string()
+    } else {
+        rendered.join("\n\n")
+    }
+}
+
+fn observation_path<'a>(
+    artifact: &'a CaseArtifact,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = artifact.observations.get(*first)?;
+    for part in rest {
+        current = current.get(*part)?;
+    }
+    Some(current)
+}
+
+fn agent_blackboard_observation(artifact: &CaseArtifact) -> Option<serde_json::Value> {
+    let agent = observation_path(artifact, &["agent"])?.as_object()?;
+    let mut map = serde_json::Map::new();
+    for key in [
+        "memos",
+        "attention_streams",
+        "allocation",
+        "allocation_proposals",
+        "replica_caps",
+        "memory_metadata",
+    ] {
+        if let Some(value) = agent.get(key) {
+            map.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(map))
+}
+
+fn pretty_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"))
 }
 
 fn render_trace_summary(trace: &TraceSnapshot) -> String {

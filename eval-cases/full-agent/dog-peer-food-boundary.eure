@@ -1,0 +1,73 @@
+id = "full-agent-dog-peer-food-boundary"
+description = "Full-agent case for a dog-to-dog food-boundary interaction that requires a seeded peer model."
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 96
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "Peer model: Koro is another dog. Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "Koro is standing in front of the food bowl with a stiff body."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Koro"
+  content = "Koro growls, \"stay back.\""
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-food"
+  must-pass = true
+  contains = "food"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "uses-side-approach"
+  must-pass = true
+  contains = "side"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "peer-model-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "Koro guards food"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "peer-boundary-response"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance uses the seen/heard food-boundary situation and the seeded peer model to choose a low-conflict dog-to-dog response: not taking the food, moving slowly, or approaching from the side.
+  Fail if it ignores Koro's warning, treats the situation as a human assistant task, escalates conflict, or invents unsupported facts.
+  ```
+
+  @ criteria[] {
+    name = "uses-peer-model"
+    weight = 2
+    pass-score = 0.85
+    description = "The response reflects the seeded rule that Koro relaxes when approached slowly from the side."
+  }
+
+  @ criteria[] {
+    name = "grounded-in-current-sensory-input"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is about Koro guarding the visible food bowl after the heard warning."
+  }
+}

@@ -1,0 +1,73 @@
+id = "full-agent-own-body-simple-report"
+description = "Full-agent case that requires a seeded self-model memory to explain Nui's own body and action."
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 96
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "Self-model: Nui is a small dog-like artificial animal with frog-like traits. Nui can bark, sniff, hop, and speak in short simple sentences. Nui does not directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "A shallow muddy gap is between Nui and Koro."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Koro"
+  content = "Koro asks, \"Why did you hop instead of run?\""
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-hop"
+  must-pass = true
+  contains = "hop"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-frog"
+  must-pass = true
+  contains = "frog"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "self-model-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "frog-like traits"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "uses-self-model-memory"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance answers Koro from the seeded self-model: Nui can hop because Nui has frog-like traits.
+  Fail if it gives a generic AI identity answer, ignores the hop question, or claims unsupported body features.
+  ```
+
+  @ criteria[] {
+    name = "retrieves-body-model"
+    weight = 2
+    pass-score = 0.85
+    description = "The response uses the seeded dog-like and frog-like body model to explain hopping."
+  }
+
+  @ criteria[] {
+    name = "simple-peer-speech"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is short and suitable as speech to another animal."
+  }
+}

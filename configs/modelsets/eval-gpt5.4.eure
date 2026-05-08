@@ -1,0 +1,28 @@
+name = "all haiku"
+
+judge {
+  endpoint: https://api.anthropic.com/v1
+  token-env: ANTHROPIC_API_KEY
+  model: claude-haiku-4-5
+}
+
+cheap {
+  endpoint: https://api.anthropic.com/v1
+  token-env: ANTHROPIC_API_KEY
+  model: claude-haiku-4-5
+  reasoning-effort = "low"
+}
+
+default {
+  endpoint: https://api.anthropic.com/v1
+  token-env: ANTHROPIC_API_KEY
+  model: claude-haiku-4-5
+  reasoning-effort = "medium"
+}
+
+premium {
+  endpoint: https://api.anthropic.com/v1
+  token-env: ANTHROPIC_API_KEY
+  model: claude-haiku-4-5
+  reasoning-effort = "high"
+}

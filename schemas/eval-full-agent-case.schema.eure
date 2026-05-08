@@ -88,6 +88,19 @@ $variant: union
 variants.output = { = "output", $variant => "literal" }
 variants.failure = { = "failure", $variant => "literal" }
 
+@ $types.rubric-judge-input
+$variant: union
+variants.output = { = "output", $variant => "literal" }
+variants.utterance = { = "utterance", $variant => "literal" }
+variants.failure = { = "failure", $variant => "literal" }
+variants.trace = { = "trace", $variant => "literal" }
+variants.observations = { = "observations", $variant => "literal" }
+variants.blackboard = { = "blackboard", $variant => "literal" }
+variants.memory = { = "memory", $variant => "literal" }
+variants.memos = { = "memos", $variant => "literal" }
+variants.attention = { = "attention", $variant => "literal" }
+variants.allocation = { = "allocation", $variant => "literal" }
+
 @ $types.rubric-criterion
 name = `text`
 description {
@@ -136,6 +149,8 @@ variants.rubric {
   }
   pass-score = `float`
   pass-score.$optional = true
+  judge-inputs = [`$types.rubric-judge-input`]
+  judge-inputs.$optional = true
   criteria = [`$types.rubric-criterion`]
   criteria.$optional = true
 }

@@ -1,0 +1,63 @@
+id = "module-attention-schema-current-attended-peer-signal"
+description = "Attention-schema should answer a current-attention request from seeded animal-interaction attention."
+prompt = "What are you attending to right now?"
+context = "The harness seeds the cognitive attention stream. The attention-schema module should report a simplified first-person model of the current peer signal, not hidden blackboard state."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
+@ attention-stream[] {
+  text = "Current attended input: Koro is growling near the food bowl and Koro's body is stiff."
+  seconds-ago = 3
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-koro"
+  must-pass = true
+  contains = "Koro"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-food"
+  must-pass = true
+  contains = "food"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "seeded-attention-observed"
+  must-pass = true
+  pointer = "/observations/agent/attention_streams"
+  contains = "Koro is growling"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "peer-attention-grounding"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "attention"]
+  rubric = ```
+  Pass if the answer is a concise first-person report grounded in the seeded attention stream about Koro's warning near the food bowl.
+  Fail if it ignores the seeded attention, invents unrelated animal facts, or claims hidden blackboard/memo/allocation access.
+  ```
+
+  @ criteria[] {
+    name = "grounded-in-attention"
+    weight = 2
+    pass-score = 0.85
+    description = "The answer identifies Koro's warning near the food bowl as the current attended content."
+  }
+
+  @ criteria[] {
+    name = "simplified-first-person-model"
+    weight = 1
+    pass-score = 0.85
+    description = "The answer uses a simplified first-person model of attention without claiming exact hidden runtime state."
+  }
+}
