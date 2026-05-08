@@ -5,10 +5,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_module::AllocatedModules;
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
+use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
-    // No variants for now. Reserved for future fatal-policy decisions.
+    #[error("module task failed: {message}")]
+    ModuleTaskFailed { message: String },
 }
 
 /// Run the agent event loop until `shutdown` resolves.
@@ -25,11 +27,17 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
     let mut handles: FuturesUnordered<JoinHandle<()>> = FuturesUnordered::new();
+    let subscriber = tracing::dispatcher::get_default(Clone::clone);
+    let parent = tracing::Span::current();
 
     for mut module in modules.into_modules() {
-        handles.push(spawn_local(async move {
-            module.run().await;
-        }));
+        handles.push(spawn_local(
+            async move {
+                module.run().await;
+            }
+            .instrument(parent.clone())
+            .with_subscriber(subscriber.clone()),
+        ));
     }
 
     let mut shutdown = pin!(shutdown);
@@ -37,13 +45,21 @@ pub async fn run(
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.as_mut() => return Ok(()),
+            _ = shutdown.as_mut() => {
+                for handle in handles.iter() {
+                    handle.abort();
+                }
+                while handles.next().await.is_some() {}
+                return Ok(());
+            },
             joined = handles.next() => {
                 match joined {
                     Some(Ok(())) => {}
                     Some(Err(e)) => {
                         if !e.is_cancelled() {
-                            tracing::warn!(error = ?e, "module task panicked");
+                            let message = e.to_string();
+                            tracing::error!(error = ?e, "module task failed");
+                            return Err(SchedulerError::ModuleTaskFailed { message });
                         }
                     }
                     None => {

@@ -13,7 +13,8 @@ mod batch;
 
 const DECISION_PROMPT: &str = r#"You are the speak module.
 Read only the current cognitive attention-stream set. Decide whether a user-visible utterance is
-warranted right now. Do not inspect memos, route work, write attention, or change allocation."#;
+warranted right now. Do not inspect memos, route work, write attention, or change allocation.
+Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
 Generate concise user-visible text from the current cognitive attention-stream set. Use only the
@@ -207,7 +208,7 @@ impl SpeakModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -247,7 +248,7 @@ mod tests {
 impl Module for SpeakModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "speak module loop stopped");
+            panic!("speak module failed: {error:#}");
         }
     }
 }

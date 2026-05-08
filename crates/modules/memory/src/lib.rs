@@ -148,7 +148,7 @@ impl MemoryModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             let batch = self.next_batch().await?;
-            let _ = self.activate(batch.requests, batch.periodic).await;
+            self.activate(batch.requests, batch.periodic).await?;
         }
     }
 }
@@ -157,7 +157,7 @@ impl MemoryModule {
 impl Module for MemoryModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "memory module loop stopped");
+            panic!("memory module failed: {error:#}");
         }
     }
 }

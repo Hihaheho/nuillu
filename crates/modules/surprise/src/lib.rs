@@ -15,7 +15,8 @@ const SYSTEM_PROMPT: &str = r#"You are the surprise module.
 Detect unexpected attention events. If a predict memo is present, frame the assessment as
 divergence from pending predictions. If no predict memo is present, judge novelty against recent
 attention history. Do not generate forward predictions. Request memory only when the event is
-significant enough to preserve."#;
+significant enough to preserve. Return only raw JSON for the structured object; do not wrap it in
+Markdown or code fences."#;
 
 const RECENT_ATTENTION_LIMIT: usize = 12;
 
@@ -138,7 +139,7 @@ impl SurpriseModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -147,7 +148,7 @@ impl SurpriseModule {
 impl Module for SurpriseModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "surprise module loop stopped");
+            panic!("surprise module failed: {error:#}");
         }
     }
 }

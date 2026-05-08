@@ -12,11 +12,13 @@ mod batch;
 
 const MODEL_PROMPT: &str = r#"You are the attention-schema module.
 Maintain a compact first-person model of what the agent is currently attending to. The model is
-a simplified self-model, not a controller or ground truth allocator."#;
+a simplified self-model, not a controller or ground truth allocator. Return only raw JSON for the
+structured self-model; do not wrap it in Markdown or code fences."#;
 
 const ANSWER_PROMPT: &str = r#"Answer from the attention schema in the first person.
 Use only the current attention stream and self-model. Be concise and do not claim access to hidden
-non-cognitive state."#;
+non-cognitive state. Return only raw JSON for the structured answer; do not wrap it in Markdown or
+code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SelfModel {
@@ -134,10 +136,10 @@ impl AttentionSchemaModule {
         loop {
             let batch = self.next_batch().await?;
             if batch.update_model {
-                let _ = self.update_model().await;
+                self.update_model().await?;
             }
             if !batch.requests.is_empty() {
-                let _ = self.answer_batch(batch.requests).await;
+                self.answer_batch(batch.requests).await?;
             }
         }
     }
@@ -147,7 +149,7 @@ impl AttentionSchemaModule {
 impl Module for AttentionSchemaModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "attention-schema module loop stopped");
+            panic!("attention-schema module failed: {error:#}");
         }
     }
 }

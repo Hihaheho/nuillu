@@ -1,99 +1,311 @@
-use std::path::{Path, PathBuf};
+use std::{
+    any::Any,
+    collections::BTreeMap,
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::Utc;
+use futures::FutureExt as _;
+use lutum::{
+    Lutum, ModelName, RawTelemetryConfig, RequestExtensions, SharedPoolBudgetManager,
+    SharedPoolBudgetOptions,
+};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
+use lutum_in_memory_adapter::InMemoryAttentionRepository;
+use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
+use lutum_model2vec_adapter::PotionBase8MEmbedder;
+use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
+use nuillu_agent::{AgentEventLoop, run as run_agent};
+use nuillu_blackboard::{
+    AttentionStreamEvent, Blackboard, BlackboardInner, MemoryMetadata, ModuleConfig,
+    ResourceAllocation,
+};
+use nuillu_module::ports::{
+    Clock, Embedder, FileSearchProvider, NoopFileSearchProvider, PortError, SystemClock, Utterance,
+    UtteranceSink,
+};
+use nuillu_module::{
+    CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent, RuntimeEventSink, SensoryInput,
+};
+use nuillu_types::{MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, builtin};
+use serde::Serialize;
 use thiserror::Error;
-use tracing::instrument::WithSubscriber as _;
+use tokio::task::LocalSet;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::{
     artifact::CaseArtifact,
-    cases::{CaseFileError, EvalCase, discover_case_files, parse_case_file},
-    evaluation::{CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
-    judge::RubricJudge,
+    cases::{
+        CaseFileError, EvalCase, FullAgentCase, FullAgentInput, ModuleCase, ModuleEvalTarget,
+        discover_case_files, parse_case_file,
+    },
+    evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
+    judge::{LlmRubricJudge, RubricJudge},
+    model_set::ReasoningEffort,
+    trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
 };
 
-pub type DriverError = Box<dyn std::error::Error>;
-
-#[async_trait(?Send)]
-pub trait CaseDriver {
-    /// Execute one parsed case and return the normalized artifact to score.
-    ///
-    /// The runner wraps this future in `lutum_trace::capture_raw`. Drivers that
-    /// call Lutum should enable raw telemetry on their `Lutum` value when they
-    /// want provider request/stream details to appear in `CaseRunOutput::raw_trace`.
-    async fn run_case(&mut self, case: &EvalCase) -> Result<CaseArtifact, DriverError>;
+#[derive(Debug, Clone)]
+pub struct LlmBackendConfig {
+    pub endpoint: String,
+    pub token: String,
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone)]
-pub struct RunOptions {
+pub struct RunnerConfig {
+    pub cases_root: PathBuf,
+    pub output_root: PathBuf,
+    pub run_id: String,
+    pub judge_backend: LlmBackendConfig,
+    pub cheap_backend: LlmBackendConfig,
+    pub default_backend: LlmBackendConfig,
+    pub premium_backend: LlmBackendConfig,
+    pub model_dir: PathBuf,
     pub fail_fast: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct CaseRunOutput {
     pub case_path: PathBuf,
+    pub output_dir: PathBuf,
     pub summary: CaseSummary,
     pub artifact: CaseArtifact,
+    pub events: Vec<RuntimeEvent>,
     pub trace: TraceSnapshot,
     pub raw_trace: RawTraceSnapshot,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self { fail_fast: false }
-    }
 }
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error(transparent)]
     Case(#[from] CaseFileError),
-    #[error("case driver failed for {path}: {message}")]
-    Driver { path: PathBuf, message: String },
     #[error("failed to discover eval cases under {path}: {source}")]
     DiscoverCases {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    #[error("case runner failed for {path}: {message}")]
+    Driver { path: PathBuf, message: String },
+    #[error("failed to write eval output under {path}: {source}")]
+    WriteOutput {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to install lutum trace subscriber: {message}")]
+    TraceSubscriber { message: String },
 }
 
-pub async fn run_case(
-    case_path: &Path,
-    driver: &mut dyn CaseDriver,
-    judge: Option<&dyn RubricJudge>,
-) -> Result<CaseSummary, RunnerError> {
-    run_case_detailed(case_path, driver, judge)
-        .await
-        .map(|output| output.summary)
+struct CaseExecution {
+    artifact: CaseArtifact,
+    events: Vec<RuntimeEvent>,
+}
+
+struct CaseOutputContext<'a> {
+    case_path: &'a Path,
+    output_dir: &'a Path,
+    case: &'a EvalCase,
+    id: &'a str,
+    reporter: &'a LiveReporter,
+}
+
+pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError> {
+    install_lutum_trace_subscriber()?;
+    let case_paths =
+        discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
+            path: config.cases_root.clone(),
+            source,
+        })?;
+    let run_dir = config.output_root.join(&config.run_id);
+    std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
+        path: run_dir.clone(),
+        source,
+    })?;
+    let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
+    reporter.emit(
+        None,
+        "suite_started",
+        serde_json::json!({
+            "cases": case_paths.len(),
+            "output_dir": run_dir.display().to_string(),
+            "backends": {
+                "judge": backend_report(&config.judge_backend),
+                "cheap": backend_report(&config.cheap_backend),
+                "default": backend_report(&config.default_backend),
+                "premium": backend_report(&config.premium_backend),
+            },
+        }),
+        format!(
+            "eval suite start run={} cases={} output={}",
+            config.run_id,
+            case_paths.len(),
+            run_dir.display()
+        ),
+    )?;
+
+    let judge_llm = build_lutum(
+        &config.judge_backend.endpoint,
+        &config.judge_backend.token,
+        &config.judge_backend.model,
+        config.judge_backend.reasoning_effort,
+    )
+    .map_err(|error| RunnerError::Driver {
+        path: config.cases_root.clone(),
+        message: error.to_string(),
+    })?;
+    let judge = LlmRubricJudge::new(judge_llm);
+
+    let mut cases = Vec::new();
+    for path in case_paths {
+        let output =
+            run_case_detailed_with_reporter(&path, config, Some(&judge), &reporter).await?;
+        let failed = !output.summary.passed || output.summary.invalid;
+        cases.push(output.summary);
+        if failed && config.fail_fast {
+            break;
+        }
+    }
+
+    let report = aggregate_suite(cases);
+    let suite_path = run_dir.join("suite-report.json");
+    write_json_file(&suite_path, &report)?;
+    reporter.emit(
+        None,
+        "suite_finished",
+        serde_json::json!({
+            "case_count": report.case_count,
+            "passed_cases": report.passed_cases,
+            "failed_cases": report.failed_cases,
+            "invalid_cases": report.invalid_cases,
+            "mean_score": report.mean_score,
+        }),
+        format!(
+            "eval suite end run={} passed={} failed={} invalid={} mean_score={:.3}",
+            config.run_id,
+            report.passed_cases,
+            report.failed_cases,
+            report.invalid_cases,
+            report.mean_score
+        ),
+    )?;
+    Ok(report)
+}
+
+fn backend_report(backend: &LlmBackendConfig) -> serde_json::Value {
+    serde_json::json!({
+        "endpoint": backend.endpoint.as_str(),
+        "model": backend.model.as_str(),
+        "reasoning_effort": backend.reasoning_effort,
+    })
 }
 
 pub async fn run_case_detailed(
     case_path: &Path,
-    driver: &mut dyn CaseDriver,
+    config: &RunnerConfig,
     judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseRunOutput, RunnerError> {
+    install_lutum_trace_subscriber()?;
+    let run_dir = config.output_root.join(&config.run_id);
+    std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
+        path: run_dir.clone(),
+        source,
+    })?;
+    let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
+    run_case_detailed_with_reporter(case_path, config, judge, &reporter).await
+}
+
+async fn run_case_detailed_with_reporter(
+    case_path: &Path,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+    reporter: &LiveReporter,
+) -> Result<CaseRunOutput, RunnerError> {
     let case = parse_case_file(case_path)?;
-    let dispatch =
-        tracing::Dispatch::new(tracing_subscriber::registry().with(lutum_trace::layer()));
-    let collected = lutum_trace::capture_raw(driver.run_case(&case))
-        .with_subscriber(dispatch)
+    let id = case_id(case_path, &case);
+    let output_dir = config
+        .output_root
+        .join(&config.run_id)
+        .join(sanitize_id(&id));
+    std::fs::create_dir_all(&output_dir).map_err(|source| RunnerError::WriteOutput {
+        path: output_dir.clone(),
+        source,
+    })?;
+    reporter.emit(
+        Some(&id),
+        "case_started",
+        serde_json::json!({
+            "path": case_path.display().to_string(),
+            "output_dir": output_dir.display().to_string(),
+        }),
+        format!(
+            "eval case start id={} path={} output={}",
+            id,
+            case_path.display(),
+            output_dir.display()
+        ),
+    )?;
+
+    let local = LocalSet::new();
+    let collected = local
+        .run_until(lutum_trace::capture_raw(
+            AssertUnwindSafe(execute_case(&case, config, &output_dir, &id, reporter))
+                .catch_unwind(),
+        ))
         .await;
+
     let trace = collected.trace;
     let raw_trace = collected.raw;
-    let artifact = collected.output.map_err(|error| RunnerError::Driver {
-        path: case_path.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    let execution = match collected.output {
+        Ok(Ok(execution)) => execution,
+        Ok(Err(error)) => {
+            return write_runtime_failure_case_output(
+                CaseOutputContext {
+                    case_path,
+                    output_dir: &output_dir,
+                    case: &case,
+                    id: &id,
+                    reporter,
+                },
+                error.to_string(),
+                trace,
+                raw_trace,
+            );
+        }
+        Err(payload) => {
+            let message = format!("panic: {}", panic_payload_message(payload.as_ref()));
+            return write_runtime_failure_case_output(
+                CaseOutputContext {
+                    case_path,
+                    output_dir: &output_dir,
+                    case: &case,
+                    id: &id,
+                    reporter,
+                },
+                message,
+                trace,
+                raw_trace,
+            );
+        }
+    };
+    let artifact = execution.artifact;
+    let events = execution.events;
     let report = evaluate_case(&case, &trace, &artifact, judge).await;
-
     let summary = CaseSummary {
         path: case_path.display().to_string(),
-        id: case_id(case_path, &case),
+        id,
         description: case
-            .description
-            .as_ref()
+            .description()
             .map(|text| normalize_text_block(&text.content)),
         passed: report.passed(),
         invalid: report.invalid,
@@ -101,39 +313,1245 @@ pub async fn run_case_detailed(
         report,
     };
 
+    write_json_file(&output_dir.join("artifact.json"), &artifact)?;
+    write_json_file(&output_dir.join("report.json"), &summary)?;
+    write_json_file(&output_dir.join("events.json"), &events)?;
+    write_json_file(&output_dir.join("trace.json"), &trace_snapshot_json(&trace))?;
+    if !summary.passed
+        || summary.invalid
+        || artifact.failure.is_some()
+        || raw_trace_has_error(&raw_trace)
+    {
+        write_json_file(
+            &output_dir.join("raw-trace.json"),
+            &raw_trace_snapshot_json(&raw_trace),
+        )?;
+    }
+    emit_case_finished(reporter, &summary, events.len())?;
+
     Ok(CaseRunOutput {
         case_path: case_path.to_path_buf(),
+        output_dir,
         summary,
         artifact,
+        events,
         trace,
         raw_trace,
     })
 }
 
-pub async fn run_suite(
-    cases_root: &Path,
-    driver: &mut dyn CaseDriver,
-    judge: Option<&dyn RubricJudge>,
-    options: &RunOptions,
-) -> Result<SuiteReport, RunnerError> {
-    let case_paths =
-        discover_case_files(cases_root).map_err(|source| RunnerError::DiscoverCases {
-            path: cases_root.to_path_buf(),
-            source,
-        })?;
-    let mut cases = Vec::with_capacity(case_paths.len());
+fn write_runtime_failure_case_output(
+    ctx: CaseOutputContext<'_>,
+    message: String,
+    trace: TraceSnapshot,
+    raw_trace: RawTraceSnapshot,
+) -> Result<CaseRunOutput, RunnerError> {
+    let artifact = CaseArtifact::failed(message.clone());
+    let events = Vec::new();
+    let report = CaseReport {
+        runtime_failure: Some(message.clone()),
+        checks: Vec::new(),
+        invalid: true,
+        must_pass_ok: false,
+        weighted_points_earned: 0,
+        weighted_points_total: 0,
+        score: 0.0,
+    };
+    let summary = CaseSummary {
+        path: ctx.case_path.display().to_string(),
+        id: ctx.id.to_string(),
+        description: ctx
+            .case
+            .description()
+            .map(|text| normalize_text_block(&text.content)),
+        passed: false,
+        invalid: true,
+        score: 0.0,
+        report,
+    };
 
-    for path in case_paths {
-        let output = run_case_detailed(&path, driver, judge).await?;
-        let summary = output.summary;
-        let failed = !summary.passed || summary.invalid;
-        cases.push(summary);
-        if failed && options.fail_fast {
-            break;
+    write_json_file(&ctx.output_dir.join("artifact.json"), &artifact)?;
+    write_json_file(&ctx.output_dir.join("report.json"), &summary)?;
+    write_json_file(&ctx.output_dir.join("events.json"), &events)?;
+    write_json_file(
+        &ctx.output_dir.join("trace.json"),
+        &trace_snapshot_json(&trace),
+    )?;
+    write_json_file(
+        &ctx.output_dir.join("raw-trace.json"),
+        &raw_trace_snapshot_json(&raw_trace),
+    )?;
+    ctx.reporter.emit(
+        Some(&summary.id),
+        "case_error",
+        serde_json::json!({
+            "path": summary.path.as_str(),
+            "error": message,
+        }),
+        format!("eval case error id={} error={}", summary.id, message),
+    )?;
+    emit_case_finished(ctx.reporter, &summary, events.len())?;
+
+    Ok(CaseRunOutput {
+        case_path: ctx.case_path.to_path_buf(),
+        output_dir: ctx.output_dir.to_path_buf(),
+        summary,
+        artifact,
+        events,
+        trace,
+        raw_trace,
+    })
+}
+
+fn emit_case_finished(
+    reporter: &LiveReporter,
+    summary: &CaseSummary,
+    event_count: usize,
+) -> Result<(), RunnerError> {
+    let case_finished_message = if let Some(runtime_failure) = &summary.report.runtime_failure {
+        format!(
+            "eval case end id={} passed={} invalid={} score={:.3} events={} failure={}",
+            summary.id,
+            summary.passed,
+            summary.invalid,
+            summary.score,
+            event_count,
+            runtime_failure
+        )
+    } else {
+        format!(
+            "eval case end id={} passed={} invalid={} score={:.3} events={}",
+            summary.id, summary.passed, summary.invalid, summary.score, event_count
+        )
+    };
+    reporter.emit(
+        Some(&summary.id),
+        "case_finished",
+        serde_json::json!({
+            "path": summary.path.as_str(),
+            "passed": summary.passed,
+            "invalid": summary.invalid,
+            "score": summary.score,
+            "runtime_failure": summary.report.runtime_failure.as_deref(),
+            "events": event_count,
+        }),
+        case_finished_message,
+    )
+}
+
+async fn execute_case(
+    case: &EvalCase,
+    config: &RunnerConfig,
+    output_dir: &Path,
+    case_id: &str,
+    reporter: &LiveReporter,
+) -> Result<CaseExecution> {
+    match case {
+        EvalCase::FullAgent(case) => {
+            execute_full_agent_case(case, config, output_dir, case_id, reporter).await
+        }
+        EvalCase::Module { target, case } => {
+            execute_module_case(*target, case, config, output_dir, case_id, reporter).await
+        }
+    }
+}
+
+async fn execute_full_agent_case(
+    case: &FullAgentCase,
+    config: &RunnerConfig,
+    output_dir: &Path,
+    case_id: &str,
+    reporter: &LiveReporter,
+) -> Result<CaseExecution> {
+    let env = build_eval_environment(
+        output_dir,
+        config,
+        full_agent_allocation(&case.limits),
+        case.limits.max_llm_calls,
+        Arc::new(NoopFileSearchProvider),
+        case_id,
+        reporter,
+    )
+    .await?;
+    seed_memories(&env.caps, &case.memories).await?;
+
+    let mut event_loop = AgentEventLoop::new(env.caps.periodic_activation());
+    let host = env.caps.host_io();
+    let sensory = host.sensory_input_mailbox();
+    let inputs = case.inputs.clone();
+    let limits = case.limits.clone();
+    let utterances = env.utterances.clone();
+    let events = env.events.clone();
+    let clock = env.clock.clone();
+    let allocation_blackboard = env.blackboard.clone();
+    let mut allocation_reporter =
+        AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
+    let live_reporter = reporter.clone();
+    let case_id_for_idle = case_id.to_string();
+    let modules = full_agent_registry().build(&env.caps).await?;
+
+    run_agent(modules, async move {
+        let _ = allocation_reporter
+            .emit_if_changed(&allocation_blackboard)
+            .await;
+        let now = clock.now();
+        for input in inputs {
+            let body = match input {
+                FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
+                    direction,
+                    content: content.content,
+                    observed_at: now,
+                },
+                FullAgentInput::Seen {
+                    direction,
+                    appearance,
+                } => SensoryInput::Seen {
+                    direction,
+                    appearance: appearance.content,
+                    observed_at: now,
+                },
+            };
+            sensory
+                .publish(body)
+                .await
+                .expect("full-agent eval failed to publish SensoryInput");
+        }
+
+        let mut last_event_count = events.event_count();
+        let mut idle_ticks = 0_u64;
+        let idle_report_every_ticks = (5000 / limits.tick_ms.max(1)).max(1);
+        for tick in 0..limits.max_ticks {
+            if utterances.has_completed() || events.stop_requested() {
+                break;
+            }
+            event_loop.tick(Duration::from_millis(limits.tick_ms)).await;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+            let _ = allocation_reporter
+                .emit_if_changed(&allocation_blackboard)
+                .await;
+            let event_count = events.event_count();
+            if event_count == last_event_count {
+                idle_ticks = idle_ticks.saturating_add(1);
+            } else {
+                last_event_count = event_count;
+                idle_ticks = 0;
+            }
+            if idle_ticks > 0 && idle_ticks.is_multiple_of(idle_report_every_ticks) {
+                live_reporter
+                    .emit_port(
+                        Some(&case_id_for_idle),
+                        "idle",
+                        serde_json::json!({
+                            "tick": tick + 1,
+                            "events": event_count,
+                            "idle_ticks": idle_ticks,
+                            "tick_ms": limits.tick_ms,
+                        }),
+                        format!(
+                            "eval idle case={} ticks_without_runtime_events={} events={}",
+                            case_id_for_idle, idle_ticks, event_count
+                        ),
+                    )
+                    .expect("full-agent eval failed to write idle event");
+            }
+        }
+    })
+    .await?;
+
+    let mut artifact = if let Some(utterance) = env.utterances.first_complete() {
+        CaseArtifact::new(utterance.text)
+    } else if env.events.stop_requested() {
+        CaseArtifact::failed("stopped after max-llm-calls")
+    } else {
+        CaseArtifact::failed("no utterance before max-ticks")
+    };
+    add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    Ok(CaseExecution {
+        artifact,
+        events: env.events.snapshot(),
+    })
+}
+
+async fn execute_module_case(
+    target: ModuleEvalTarget,
+    case: &ModuleCase,
+    config: &RunnerConfig,
+    output_dir: &Path,
+    case_id: &str,
+    reporter: &LiveReporter,
+) -> Result<CaseExecution> {
+    let env = build_eval_environment(
+        output_dir,
+        config,
+        module_allocation(target, &case.limits),
+        case.limits.max_llm_calls,
+        Arc::new(NoopFileSearchProvider),
+        case_id,
+        reporter,
+    )
+    .await?;
+    seed_memories(&env.caps, &case.memories).await?;
+
+    let target_module = module_id_for_target(target);
+    let shutdown_target_module = target_module.clone();
+    let modules = module_registry(target).build(&env.caps).await?;
+    let harness = env.caps.internal_harness_io();
+    let limits = case.limits.clone();
+    let prompt = case.prompt.content.clone();
+    let events = env.events.clone();
+    let blackboard = env.blackboard.clone();
+    let mut event_loop = AgentEventLoop::new(env.caps.periodic_activation());
+
+    run_agent(modules, async move {
+        match target {
+            ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
+                harness
+                    .query_mailbox()
+                    .publish(nuillu_module::QueryRequest::new(prompt))
+                    .await
+                    .expect("module eval failed to publish QueryRequest");
+            }
+            ModuleEvalTarget::AttentionSchema => {
+                harness
+                    .self_model_mailbox()
+                    .publish(nuillu_module::SelfModelRequest::new(prompt))
+                    .await
+                    .expect("module eval failed to publish SelfModelRequest");
+            }
+        }
+
+        for _ in 0..limits.max_ticks {
+            if events.stop_requested() || blackboard.memo(&shutdown_target_module).await.is_some() {
+                break;
+            }
+            event_loop.tick(Duration::from_millis(limits.tick_ms)).await;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+        }
+    })
+    .await?;
+
+    let output = env
+        .blackboard
+        .memo(&target_module)
+        .await
+        .unwrap_or_default();
+    let mut artifact = if output.is_empty() {
+        if env.events.stop_requested() {
+            CaseArtifact::failed("stopped after max-llm-calls before target module wrote a memo")
+        } else {
+            CaseArtifact::failed("target module did not write a memo before max-ticks")
+        }
+    } else {
+        CaseArtifact::new(output)
+    };
+    add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    Ok(CaseExecution {
+        artifact,
+        events: env.events.snapshot(),
+    })
+}
+
+struct EvalEnvironment {
+    blackboard: Blackboard,
+    caps: CapabilityProviders,
+    utterances: Arc<RecordingUtteranceSink>,
+    events: Arc<RecordingRuntimeEventSink>,
+    clock: Arc<dyn Clock>,
+}
+
+async fn build_eval_environment(
+    output_dir: &Path,
+    config: &RunnerConfig,
+    allocation: ResourceAllocation,
+    max_llm_calls: Option<u64>,
+    file_search: Arc<dyn FileSearchProvider>,
+    case_id: &str,
+    reporter: &LiveReporter,
+) -> Result<EvalEnvironment> {
+    let blackboard = Blackboard::with_allocation(allocation);
+    let events = Arc::new(RecordingRuntimeEventSink::new(
+        case_id.to_string(),
+        max_llm_calls,
+        reporter.clone(),
+    ));
+    let utterances = Arc::new(RecordingUtteranceSink::new(
+        case_id.to_string(),
+        reporter.clone(),
+    ));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let memory = Arc::new(connect_memory_store(output_dir, config).await?);
+    let tiers = build_tiers(config)?;
+    let caps = CapabilityProviders::new_with_runtime_events(
+        blackboard.clone(),
+        Arc::new(InMemoryAttentionRepository::new()),
+        memory,
+        Vec::new(),
+        file_search,
+        utterances.clone(),
+        clock.clone(),
+        tiers,
+        events.clone(),
+    );
+
+    Ok(EvalEnvironment {
+        blackboard,
+        caps,
+        utterances,
+        events,
+        clock,
+    })
+}
+
+async fn connect_memory_store(
+    output_dir: &Path,
+    config: &RunnerConfig,
+) -> Result<LibsqlMemoryStore> {
+    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
+        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
+    let dimensions = embedder.dimensions();
+    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let db_path = output_dir.join("memory.db");
+    LibsqlMemoryStore::connect(
+        LibsqlMemoryStoreConfig::local(db_path, dimensions).with_active_profile(profile),
+        Box::new(embedder),
+    )
+    .await
+    .context("connect libsql memory store")
+}
+
+async fn seed_memories(
+    caps: &CapabilityProviders,
+    memories: &[crate::cases::MemorySeed],
+) -> Result<()> {
+    let writer = caps.memory_writer();
+    for memory in memories {
+        writer
+            .insert(
+                memory.content.content.clone(),
+                MemoryRank::from(memory.rank),
+                memory.decay_secs,
+            )
+            .await
+            .context("seed eval memory")?;
+    }
+    Ok(())
+}
+
+fn build_tiers(config: &RunnerConfig) -> Result<LutumTiers> {
+    let cheap = build_lutum(
+        &config.cheap_backend.endpoint,
+        &config.cheap_backend.token,
+        &config.cheap_backend.model,
+        config.cheap_backend.reasoning_effort,
+    )?;
+    let default = build_lutum(
+        &config.default_backend.endpoint,
+        &config.default_backend.token,
+        &config.default_backend.model,
+        config.default_backend.reasoning_effort,
+    )?;
+    let premium = build_lutum(
+        &config.premium_backend.endpoint,
+        &config.premium_backend.token,
+        &config.premium_backend.model,
+        config.premium_backend.reasoning_effort,
+    )?;
+    Ok(LutumTiers {
+        cheap,
+        default,
+        premium,
+    })
+}
+
+fn build_lutum(
+    endpoint: &str,
+    token: &str,
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<Lutum> {
+    let adapter = OpenAiAdapter::new(token.to_owned())
+        .with_base_url(endpoint.to_owned())
+        .with_default_model(ModelName::new(model)?)
+        .with_resolve_reasoning_effort(ConfiguredReasoningEffort)
+        .with_chat_completions();
+    let lutum = Lutum::new(
+        Arc::new(adapter),
+        SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
+    )
+    .with_extension(RawTelemetryConfig::all());
+    Ok(match reasoning_effort {
+        Some(reasoning_effort) => {
+            lutum.with_extension(ReasoningEffortConfig(reasoning_effort.into()))
+        }
+        None => lutum,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ReasoningEffortConfig(OpenAiReasoningEffort);
+
+#[lutum::impl_hook(lutum_openai::ResolveReasoningEffort)]
+async fn configured_reasoning_effort(
+    extensions: &RequestExtensions,
+) -> Option<OpenAiReasoningEffort> {
+    extensions
+        .get::<ReasoningEffortConfig>()
+        .map(|value| value.0)
+}
+
+fn full_agent_registry() -> ModuleRegistry {
+    ModuleRegistry::new()
+        .register(builtin::sensory(), 0..=1, |caps| {
+            nuillu_sensory::SensoryModule::new(
+                caps.sensory_input_inbox(),
+                caps.activation_gate(),
+                caps.memo(),
+                caps.clock(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::summarize(), 0..=1, |caps| {
+            nuillu_summarize::SummarizeModule::new(
+                caps.memo_updated_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.attention_writer(),
+                caps.memo(),
+                caps.time_division(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::attention_controller(), 0..=1, |caps| {
+            nuillu_attention_controller::AttentionControllerModule::new(
+                caps.attention_stream_updated_inbox(),
+                Some(caps.periodic_inbox()),
+                caps.activation_gate(),
+                caps.attention_reader(),
+                caps.allocation_reader(),
+                caps.allocation_writer(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::attention_schema(), 0..=1, |caps| {
+            nuillu_attention_schema::AttentionSchemaModule::new(
+                caps.self_model_inbox(),
+                caps.periodic_inbox(),
+                caps.activation_gate(),
+                caps.attention_reader(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::query_vector(), 0..=1, |caps| {
+            nuillu_query_vector::QueryVectorModule::new(
+                caps.query_inbox(),
+                caps.periodic_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.vector_memory_searcher(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::query_agentic(), 0..=1, |caps| {
+            nuillu_query_agentic::QueryAgenticModule::new(
+                caps.query_inbox(),
+                caps.periodic_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.file_searcher(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::memory(), 0..=1, |caps| {
+            nuillu_memory::MemoryModule::new(
+                caps.periodic_inbox(),
+                caps.memory_request_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.memory_writer(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::memory_compaction(), 0..=1, |caps| {
+            nuillu_memory_compaction::MemoryCompactionModule::new(
+                caps.periodic_inbox(),
+                caps.activation_gate(),
+                caps.blackboard_reader(),
+                caps.memory_compactor(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::predict(), 0..=1, |caps| {
+            nuillu_predict::PredictModule::new(
+                caps.attention_stream_updated_inbox(),
+                caps.periodic_inbox(),
+                caps.activation_gate(),
+                caps.attention_reader(),
+                caps.blackboard_reader(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::surprise(), 0..=1, |caps| {
+            nuillu_surprise::SurpriseModule::new(
+                caps.attention_stream_updated_inbox(),
+                caps.activation_gate(),
+                caps.attention_reader(),
+                caps.blackboard_reader(),
+                caps.memory_request_mailbox(),
+                caps.memo(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+        .register(builtin::speak(), 0..=1, |caps| {
+            nuillu_speak::SpeakModule::new(
+                caps.attention_stream_updated_inbox(),
+                None,
+                caps.activation_gate(),
+                caps.attention_reader(),
+                caps.memo(),
+                caps.utterance_writer(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
+}
+
+fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
+    match target {
+        ModuleEvalTarget::QueryVector => ModuleRegistry::new()
+            .register(builtin::query_vector(), 0..=1, |caps| {
+                nuillu_query_vector::QueryVectorModule::new(
+                    caps.query_inbox(),
+                    caps.periodic_inbox(),
+                    caps.activation_gate(),
+                    caps.blackboard_reader(),
+                    caps.vector_memory_searcher(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap(),
+        ModuleEvalTarget::QueryAgentic => ModuleRegistry::new()
+            .register(builtin::query_agentic(), 0..=1, |caps| {
+                nuillu_query_agentic::QueryAgenticModule::new(
+                    caps.query_inbox(),
+                    caps.periodic_inbox(),
+                    caps.activation_gate(),
+                    caps.blackboard_reader(),
+                    caps.file_searcher(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap(),
+        ModuleEvalTarget::AttentionSchema => ModuleRegistry::new()
+            .register(builtin::attention_schema(), 0..=1, |caps| {
+                nuillu_attention_schema::AttentionSchemaModule::new(
+                    caps.self_model_inbox(),
+                    caps.periodic_inbox(),
+                    caps.activation_gate(),
+                    caps.attention_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .unwrap(),
+    }
+}
+
+fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocation {
+    let mut allocation = ResourceAllocation::default();
+
+    set_allocation_module(
+        &mut allocation,
+        builtin::sensory(),
+        1,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::summarize(),
+        1,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::attention_controller(),
+        1,
+        ModelTier::Premium,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::attention_schema(),
+        0,
+        ModelTier::Default,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::query_vector(),
+        0,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::query_agentic(),
+        0,
+        ModelTier::Premium,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::memory(),
+        0,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::memory_compaction(),
+        0,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::predict(),
+        0,
+        ModelTier::Cheap,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::surprise(),
+        0,
+        ModelTier::Default,
+        None,
+    );
+    set_allocation_module(
+        &mut allocation,
+        builtin::speak(),
+        1,
+        ModelTier::Premium,
+        None,
+    );
+    allocation
+}
+
+fn module_allocation(
+    target: ModuleEvalTarget,
+    _limits: &crate::cases::EvalLimits,
+) -> ResourceAllocation {
+    let mut allocation = ResourceAllocation::default();
+    allocation.set(
+        module_id_for_target(target),
+        ModuleConfig {
+            replicas: 1,
+            tier: module_tier_for_target(target),
+            period: None,
+            ..Default::default()
+        },
+    );
+    allocation
+}
+
+fn set_allocation_module(
+    allocation: &mut ResourceAllocation,
+    id: ModuleId,
+    replicas: u8,
+    tier: ModelTier,
+    period: Option<Duration>,
+) {
+    allocation.set(
+        id,
+        ModuleConfig {
+            replicas,
+            tier,
+            period,
+            ..Default::default()
+        },
+    );
+}
+
+fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
+    match target {
+        ModuleEvalTarget::QueryVector => builtin::query_vector(),
+        ModuleEvalTarget::QueryAgentic => builtin::query_agentic(),
+        ModuleEvalTarget::AttentionSchema => builtin::attention_schema(),
+    }
+}
+
+fn module_tier_for_target(target: ModuleEvalTarget) -> ModelTier {
+    match target {
+        ModuleEvalTarget::QueryVector => ModelTier::Cheap,
+        ModuleEvalTarget::QueryAgentic => ModelTier::Premium,
+        ModuleEvalTarget::AttentionSchema => ModelTier::Default,
+    }
+}
+
+async fn add_observations(
+    artifact: &mut CaseArtifact,
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+) {
+    let observations = blackboard
+        .read(|bb| AgentObservation::from_blackboard(bb, utterances.snapshot()))
+        .await;
+    let observations = match serde_json::to_value(observations) {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "serialization_error": error.to_string(),
+        }),
+    };
+    artifact
+        .observations
+        .insert("agent".to_string(), observations);
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentObservation {
+    memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
+    attention_streams: Vec<AttentionStreamObservation>,
+    allocation: BTreeMap<String, ModuleConfig>,
+    allocation_proposals: BTreeMap<String, BTreeMap<String, ModuleConfig>>,
+    replica_caps: BTreeMap<String, ReplicaCapRange>,
+    memory_metadata: BTreeMap<String, MemoryMetadata>,
+    utterances: Vec<RecordedUtterance>,
+}
+
+impl AgentObservation {
+    fn from_blackboard(bb: &BlackboardInner, utterances: Vec<RecordedUtterance>) -> Self {
+        Self {
+            memos: memo_observations(bb),
+            attention_streams: attention_stream_observations(bb),
+            allocation: allocation_observation(bb.allocation()),
+            allocation_proposals: allocation_proposal_observations(bb),
+            replica_caps: replica_cap_observations(bb),
+            memory_metadata: memory_metadata_observations(bb),
+            utterances,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReplicaMemoObservation {
+    replica: u8,
+    memo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AttentionStreamObservation {
+    stream: ModuleInstanceObservation,
+    entries: Vec<AttentionStreamEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModuleInstanceObservation {
+    module: String,
+    replica: u8,
+}
+
+fn memo_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<ReplicaMemoObservation>> {
+    let mut memos = BTreeMap::<String, Vec<ReplicaMemoObservation>>::new();
+    for record in bb.memo_records() {
+        memos
+            .entry(record.owner.module.as_str().to_owned())
+            .or_default()
+            .push(ReplicaMemoObservation {
+                replica: record.owner.replica.get(),
+                memo: record.memo,
+            });
+    }
+    memos
+}
+
+fn attention_stream_observations(bb: &BlackboardInner) -> Vec<AttentionStreamObservation> {
+    bb.attention_stream_set()
+        .streams()
+        .iter()
+        .map(|record| AttentionStreamObservation {
+            stream: module_instance_observation(&record.stream),
+            entries: record.entries.clone(),
+        })
+        .collect()
+}
+
+fn allocation_observation(allocation: &ResourceAllocation) -> BTreeMap<String, ModuleConfig> {
+    allocation
+        .iter()
+        .map(|(module, config)| (module.as_str().to_owned(), config.clone()))
+        .collect()
+}
+
+fn allocation_proposal_observations(
+    bb: &BlackboardInner,
+) -> BTreeMap<String, BTreeMap<String, ModuleConfig>> {
+    bb.allocation_proposals()
+        .iter()
+        .map(|(owner, allocation)| (owner.to_string(), allocation_observation(allocation)))
+        .collect()
+}
+
+fn replica_cap_observations(bb: &BlackboardInner) -> BTreeMap<String, ReplicaCapRange> {
+    bb.replica_caps()
+        .iter()
+        .map(|(module, range)| (module.as_str().to_owned(), *range))
+        .collect()
+}
+
+fn memory_metadata_observations(bb: &BlackboardInner) -> BTreeMap<String, MemoryMetadata> {
+    bb.memory_metadata()
+        .iter()
+        .map(|(index, metadata)| (index.as_str().to_owned(), metadata.clone()))
+        .collect()
+}
+
+fn module_instance_observation(owner: &ModuleInstanceId) -> ModuleInstanceObservation {
+    ModuleInstanceObservation {
+        module: owner.module.as_str().to_owned(),
+        replica: owner.replica.get(),
+    }
+}
+
+struct AllocationChangeReporter {
+    case_id: String,
+    reporter: LiveReporter,
+    last: Option<String>,
+}
+
+impl AllocationChangeReporter {
+    fn new(case_id: String, reporter: LiveReporter) -> Self {
+        Self {
+            case_id,
+            reporter,
+            last: None,
         }
     }
 
-    Ok(aggregate_suite(cases))
+    async fn emit_if_changed(&mut self, blackboard: &Blackboard) -> Result<(), RunnerError> {
+        let allocation = blackboard
+            .read(|bb| allocation_observation(bb.allocation()))
+            .await;
+        let value = serde_json::to_value(&allocation).map_err(|error| RunnerError::Driver {
+            path: PathBuf::from(&self.case_id),
+            message: error.to_string(),
+        })?;
+        let signature = serde_json::to_string(&value).map_err(|error| RunnerError::Driver {
+            path: PathBuf::from(&self.case_id),
+            message: error.to_string(),
+        })?;
+        if self.last.as_deref() == Some(signature.as_str()) {
+            return Ok(());
+        }
+        self.last = Some(signature);
+        let live = format!(
+            "eval allocation case={} {}",
+            self.case_id,
+            allocation_live_summary(&allocation)
+        );
+        self.reporter.emit(
+            Some(&self.case_id),
+            "allocation_changed",
+            serde_json::json!({ "allocation": value }),
+            live,
+        )
+    }
+}
+
+fn allocation_live_summary(allocation: &BTreeMap<String, ModuleConfig>) -> String {
+    let active = allocation
+        .iter()
+        .filter(|(_, config)| config.replicas > 0)
+        .map(|(module, config)| {
+            let period = config
+                .period
+                .map(|period| format!("{}ms", period.as_millis()))
+                .unwrap_or_else(|| "msg".to_string());
+            format!(
+                "{}:{}x/{:?}/{}",
+                module, config.replicas, config.tier, period
+            )
+        })
+        .collect::<Vec<_>>();
+    let inactive = allocation
+        .values()
+        .filter(|config| config.replicas == 0)
+        .count();
+    format!("active=[{}] inactive={inactive}", active.join(","))
+}
+
+#[derive(Clone)]
+struct LiveReporter {
+    run_id: String,
+    path: PathBuf,
+    file: Arc<Mutex<File>>,
+}
+
+impl std::fmt::Debug for LiveReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveReporter")
+            .field("run_id", &self.run_id)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LiveReporter {
+    fn new(run_id: &str, run_dir: &Path) -> Result<Self, RunnerError> {
+        let path = run_dir.join("events.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| RunnerError::WriteOutput { path, source })?;
+        Ok(Self {
+            run_id: run_id.to_string(),
+            path: run_dir.join("events.jsonl"),
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn emit(
+        &self,
+        case_id: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+        live_message: String,
+    ) -> Result<(), RunnerError> {
+        self.emit_jsonl(case_id, kind, data, live_message)
+            .map_err(|source| RunnerError::WriteOutput {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    fn emit_port(
+        &self,
+        case_id: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+        live_message: String,
+    ) -> Result<(), PortError> {
+        self.emit_jsonl(case_id, kind, data, live_message)
+            .map_err(|error| PortError::Backend(format!("write live eval event: {error}")))
+    }
+
+    fn emit_jsonl(
+        &self,
+        case_id: Option<&str>,
+        kind: &str,
+        data: serde_json::Value,
+        live_message: String,
+    ) -> io::Result<()> {
+        eprintln!("{live_message}");
+        let record = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "run_id": self.run_id,
+            "case_id": case_id,
+            "kind": kind,
+            "data": data,
+        });
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("events.jsonl lock poisoned"))?;
+        serde_json::to_writer(&mut *file, &record).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecordedUtterance {
+    sender: String,
+    text: String,
+    emitted_at: String,
+}
+
+#[derive(Clone)]
+struct RecordingUtteranceSink {
+    case_id: String,
+    reporter: LiveReporter,
+    complete: Arc<Mutex<Vec<RecordedUtterance>>>,
+}
+
+impl std::fmt::Debug for RecordingUtteranceSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingUtteranceSink")
+            .field("case_id", &self.case_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecordingUtteranceSink {
+    fn new(case_id: String, reporter: LiveReporter) -> Self {
+        Self {
+            case_id,
+            reporter,
+            complete: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn has_completed(&self) -> bool {
+        !self
+            .complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .is_empty()
+    }
+
+    fn first_complete(&self) -> Option<RecordedUtterance> {
+        self.complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .first()
+            .cloned()
+    }
+
+    fn snapshot(&self) -> Vec<RecordedUtterance> {
+        self.complete
+            .lock()
+            .expect("utterance lock poisoned")
+            .clone()
+    }
+}
+
+#[async_trait(?Send)]
+impl UtteranceSink for RecordingUtteranceSink {
+    async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
+        let recorded = RecordedUtterance {
+            sender: utterance.sender.to_string(),
+            text: utterance.text,
+            emitted_at: utterance.emitted_at.to_rfc3339(),
+        };
+        self.complete
+            .lock()
+            .map_err(|_| PortError::Backend("utterance lock poisoned".into()))?
+            .push(recorded.clone());
+        self.reporter.emit_port(
+            Some(&self.case_id),
+            "utterance_completed",
+            serde_json::json!({
+                "sender": recorded.sender.clone(),
+                "text": recorded.text.clone(),
+                "emitted_at": recorded.emitted_at.clone(),
+            }),
+            format!(
+                "eval utterance case={} sender={} chars={}",
+                self.case_id,
+                recorded.sender,
+                recorded.text.chars().count()
+            ),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RecordingRuntimeEventSink {
+    events: Mutex<Vec<RuntimeEvent>>,
+    stop: AtomicBool,
+    case_id: String,
+    max_llm_calls: Option<u64>,
+    reporter: LiveReporter,
+}
+
+impl RecordingRuntimeEventSink {
+    fn new(case_id: String, max_llm_calls: Option<u64>, reporter: LiveReporter) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            case_id,
+            max_llm_calls,
+            reporter,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<RuntimeEvent> {
+        self.events
+            .lock()
+            .expect("runtime event lock poisoned")
+            .clone()
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn event_count(&self) -> usize {
+        self.events
+            .lock()
+            .expect("runtime event lock poisoned")
+            .len()
+    }
+}
+
+#[async_trait(?Send)]
+impl RuntimeEventSink for RecordingRuntimeEventSink {
+    async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+        let should_stop = match &event {
+            RuntimeEvent::LlmAccessed { call, .. } => self
+                .max_llm_calls
+                .is_some_and(|max| call.saturating_add(1) >= max),
+            RuntimeEvent::MemoUpdated { .. } => false,
+        };
+        let live_message = match &event {
+            RuntimeEvent::LlmAccessed {
+                call, owner, tier, ..
+            } => format!(
+                "eval llm-accessed case={} call={} owner={} tier={:?}",
+                self.case_id, call, owner, tier
+            ),
+            RuntimeEvent::MemoUpdated {
+                owner, char_count, ..
+            } => format!(
+                "eval memo-updated case={} owner={} chars={}",
+                self.case_id, owner, char_count
+            ),
+        };
+        self.events
+            .lock()
+            .map_err(|_| PortError::Backend("runtime event lock poisoned".into()))?
+            .push(event.clone());
+        self.reporter.emit_port(
+            Some(&self.case_id),
+            "runtime_event",
+            serde_json::json!({ "event": event }),
+            live_message,
+        )?;
+        if should_stop && !self.stop.swap(true, Ordering::Relaxed) {
+            self.reporter.emit_port(
+                Some(&self.case_id),
+                "stop_requested",
+                serde_json::json!({ "reason": "max-llm-calls" }),
+                format!(
+                    "eval stop requested case={} reason=max-llm-calls",
+                    self.case_id
+                ),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn aggregate_suite(cases: Vec<CaseSummary>) -> SuiteReport {
@@ -158,10 +1576,353 @@ fn aggregate_suite(cases: Vec<CaseSummary>) -> SuiteReport {
 }
 
 fn case_id(path: &Path, case: &EvalCase) -> String {
-    case.id.clone().unwrap_or_else(|| {
+    case.id().map(String::from).unwrap_or_else(|| {
         path.with_extension("")
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "case".to_string())
     })
+}
+
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), RunnerError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| RunnerError::Driver {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    std::fs::write(path, bytes).map_err(|source| RunnerError::WriteOutput {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub fn install_lutum_trace_subscriber() -> Result<(), RunnerError> {
+    static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = INSTALL_RESULT.get_or_init(|| {
+        let subscriber = tracing_subscriber::registry().with(lutum_trace::layer());
+        tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|message| RunnerError::TraceSubscriber {
+            message: message.clone(),
+        })
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+pub fn default_run_id() -> String {
+    Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+    use nuillu_blackboard::{AttentionStreamEvent, BlackboardCommand, MemoryMetaPatch};
+    use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
+
+    use super::*;
+
+    fn test_backend_config() -> LlmBackendConfig {
+        LlmBackendConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            token: "local".to_string(),
+            model: "gpt-oss:20b".to_string(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn max_llm_calls_requests_stop_after_limit_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter);
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 0,
+            call: 0,
+            owner: owner.clone(),
+            tier: ModelTier::Default,
+        })
+        .await
+        .unwrap();
+        assert!(!sink.stop_requested());
+
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 1,
+            call: 1,
+            owner: owner.clone(),
+            tier: ModelTier::Default,
+        })
+        .await
+        .unwrap();
+        assert!(!sink.stop_requested());
+
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 2,
+            call: 2,
+            owner: owner.clone(),
+            tier: ModelTier::Default,
+        })
+        .await
+        .unwrap();
+
+        assert!(sink.stop_requested());
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 3,
+            call: 3,
+            owner,
+            tier: ModelTier::Default,
+        })
+        .await
+        .unwrap();
+        assert_eq!(sink.snapshot().len(), 4);
+        let jsonl = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+        assert!(jsonl.contains("\"kind\":\"runtime_event\""));
+        assert!(jsonl.contains("\"kind\":\"stop_requested\""));
+        assert_eq!(jsonl.matches("\"kind\":\"stop_requested\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_suite_records_case_runtime_failures_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        for id in ["runtime-failure-one", "runtime-failure-two"] {
+            std::fs::write(
+                case_dir.join(format!("{id}.eure")),
+                format!(
+                    r#"
+id = "{id}"
+prompt = "Who are you?"
+
+limits {{
+  max-ticks = 1
+  tick-ms = 1
+  max-llm-calls = 1
+}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let output_root = dir.path().join("out");
+        let config = RunnerConfig {
+            cases_root: dir.path().join("eval-cases"),
+            output_root: output_root.clone(),
+            run_id: "runtime-failures".to_string(),
+            judge_backend: test_backend_config(),
+            cheap_backend: test_backend_config(),
+            default_backend: test_backend_config(),
+            premium_backend: test_backend_config(),
+            model_dir: dir.path().join("missing-model"),
+            fail_fast: false,
+        };
+
+        let report = run_suite(&config).await.unwrap();
+
+        assert_eq!(report.case_count, 2);
+        assert_eq!(report.passed_cases, 0);
+        assert_eq!(report.invalid_cases, 2);
+        assert!(report.cases.iter().all(|case| {
+            !case.passed
+                && case.invalid
+                && case.score == 0.0
+                && case.report.runtime_failure.is_some()
+                && case.report.checks.is_empty()
+        }));
+
+        let run_dir = output_root.join("runtime-failures");
+        assert!(run_dir.join("suite-report.json").exists());
+        for summary in &report.cases {
+            let output_dir = run_dir.join(sanitize_id(&summary.id));
+            assert!(output_dir.join("report.json").exists());
+            assert!(output_dir.join("artifact.json").exists());
+            assert!(output_dir.join("raw-trace.json").exists());
+            let events: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output_dir.join("events.json")).unwrap())
+                    .unwrap();
+            assert_eq!(events, serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_observation_serializes_string_keyed_blackboard_maps() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(
+            builtin::query_vector(),
+            ModuleConfig {
+                replicas: 1,
+                tier: ModelTier::Default,
+                period: None,
+                context_budget: nuillu_types::TokenBudget::new(8192),
+            },
+        );
+        let blackboard = Blackboard::with_allocation(allocation.clone());
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+
+        blackboard
+            .apply(BlackboardCommand::UpdateMemo {
+                owner: owner.clone(),
+                memo: "memo".to_string(),
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream: owner,
+                event: AttentionStreamEvent {
+                    at: now,
+                    text: "attention".to_string(),
+                },
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::SetReplicaCaps {
+                caps: vec![(builtin::query_vector(), ReplicaCapRange::new(0, 1).unwrap())],
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::RecordAllocationProposal {
+                controller: ModuleInstanceId::new(
+                    builtin::attention_controller(),
+                    ReplicaIndex::ZERO,
+                ),
+                proposal: allocation,
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::UpsertMemoryMetadata {
+                index: MemoryIndex::new("mem-1"),
+                rank_if_new: MemoryRank::Permanent,
+                decay_if_new_secs: 0,
+                now,
+                patch: MemoryMetaPatch::default(),
+            })
+            .await;
+
+        let observation = blackboard
+            .read(|bb| AgentObservation::from_blackboard(bb, Vec::new()))
+            .await;
+        let actual = serde_json::to_value(observation).unwrap();
+        let expected = serde_json::json!({
+            "memos": {
+                "query-vector": [{
+                    "replica": 0,
+                    "memo": "memo",
+                }],
+            },
+            "attention_streams": [{
+                "stream": {
+                    "module": "query-vector",
+                    "replica": 0,
+                },
+                "entries": [{
+                    "at": "2026-05-07T00:00:00Z",
+                    "text": "attention",
+                }],
+            }],
+            "allocation": {
+                "query-vector": {
+                    "replicas": 1,
+                    "tier": "Default",
+                    "period": null,
+                    "context_budget": 8192,
+                },
+            },
+            "allocation_proposals": {
+                "attention-controller": {
+                    "query-vector": {
+                        "replicas": 1,
+                        "tier": "Default",
+                        "period": null,
+                        "context_budget": 8192,
+                    },
+                },
+            },
+            "replica_caps": {
+                "query-vector": {
+                    "min": 0,
+                    "max": 1,
+                },
+            },
+            "memory_metadata": {
+                "mem-1": {
+                    "index": "mem-1",
+                    "rank": "Permanent",
+                    "decay_remaining_secs": 0,
+                    "remember_tokens": 0,
+                    "last_accessed": "2026-05-07T00:00:00Z",
+                    "access_count": 0,
+                    "query_history": [],
+                },
+            },
+            "utterances": [],
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn full_agent_allocation_bootstraps_controller_instead_of_every_module() {
+        let allocation = full_agent_allocation(&crate::cases::EvalLimits {
+            tick_ms: 500,
+            max_ticks: 1,
+            max_llm_calls: None,
+        });
+
+        let sensory = allocation.for_module(&builtin::sensory());
+        assert_eq!(sensory.replicas, 1);
+        assert_eq!(sensory.tier, ModelTier::Cheap);
+        assert_eq!(sensory.period, None);
+
+        let summarize = allocation.for_module(&builtin::summarize());
+        assert_eq!(summarize.replicas, 1);
+        assert_eq!(summarize.tier, ModelTier::Cheap);
+        assert_eq!(summarize.period, None);
+
+        let controller = allocation.for_module(&builtin::attention_controller());
+        assert_eq!(controller.replicas, 1);
+        assert_eq!(controller.tier, ModelTier::Premium);
+        assert_eq!(controller.period, None);
+
+        let speak = allocation.for_module(&builtin::speak());
+        assert_eq!(speak.replicas, 1);
+        assert_eq!(speak.tier, ModelTier::Premium);
+        assert_eq!(speak.period, None);
+
+        for module in [
+            builtin::attention_schema(),
+            builtin::query_vector(),
+            builtin::query_agentic(),
+            builtin::memory(),
+            builtin::memory_compaction(),
+            builtin::predict(),
+            builtin::surprise(),
+        ] {
+            assert_eq!(allocation.for_module(&module).replicas, 0);
+            assert_eq!(allocation.for_module(&module).period, None);
+        }
+    }
 }

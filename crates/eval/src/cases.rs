@@ -12,12 +12,12 @@ fn default_weight() -> i64 {
     1
 }
 
-fn default_query_target() -> CaseTarget {
-    CaseTarget::Query
-}
-
 fn default_memory_rank() -> MemorySeedRank {
     MemorySeedRank::ShortTerm
+}
+
+fn default_memory_decay_secs() -> i64 {
+    86_400
 }
 
 fn default_pass_score() -> f64 {
@@ -28,73 +28,232 @@ fn default_judge_max_output_tokens() -> u32 {
     1200
 }
 
-#[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct EvalCaseFile {
-    #[eure(flatten)]
-    pub case: EvalCase,
+fn default_tick_ms() -> u64 {
+    100
+}
+
+fn default_max_ticks() -> u64 {
+    40
 }
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct EvalCase {
+pub struct FullAgentCaseFile {
+    #[eure(flatten)]
+    pub case: FullAgentCase,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct FullAgentCase {
     #[eure(default)]
     pub id: Option<String>,
     #[eure(default)]
     pub description: Option<Text>,
-    #[eure(default = "default_query_target")]
-    pub target: CaseTarget,
-    pub prompt: Text,
     #[eure(default)]
-    pub context: Option<Text>,
+    pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
+    #[eure(default)]
+    pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
     #[eure(default)]
     pub scoring: CaseScoring,
 }
 
-impl Default for EvalCase {
-    fn default() -> Self {
-        Self {
-            id: None,
-            description: None,
-            target: default_query_target(),
-            prompt: Text::plaintext(String::new()),
-            context: None,
-            memories: Vec::new(),
-            checks: Vec::new(),
-            scoring: CaseScoring::default(),
-        }
-    }
+#[derive(Debug, Clone, FromEure)]
+#[eure(
+    crate = ::eure::document,
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case"
+)]
+pub enum FullAgentInput {
+    Heard {
+        #[eure(default)]
+        direction: Option<String>,
+        content: Text,
+    },
+    Seen {
+        #[eure(default)]
+        direction: Option<String>,
+        appearance: Text,
+    },
 }
 
-impl Default for EvalCaseFile {
-    fn default() -> Self {
-        Self {
-            case: EvalCase::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
+#[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub enum CaseTarget {
-    Query,
-    SelfModel,
-    Conversation,
-    Periodic,
-    Custom,
+pub struct ModuleCaseFile {
+    #[eure(flatten)]
+    pub case: ModuleCase,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ModuleCase {
+    #[eure(default)]
+    pub id: Option<String>,
+    #[eure(default)]
+    pub description: Option<Text>,
+    pub prompt: Text,
+    #[eure(default)]
+    pub context: Option<Text>,
+    #[eure(default)]
+    pub memories: Vec<MemorySeed>,
+    #[eure(default)]
+    pub limits: EvalLimits,
+    #[eure(default)]
+    pub checks: Vec<Check>,
+    #[eure(default)]
+    pub scoring: CaseScoring,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleEvalTarget {
+    QueryVector,
+    QueryAgentic,
+    AttentionSchema,
+}
+
+impl ModuleEvalTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueryVector => "query-vector",
+            Self::QueryAgentic => "query-agentic",
+            Self::AttentionSchema => "attention-schema",
+        }
+    }
+
+    fn from_path(path: &Path) -> Option<Self> {
+        path.components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .find_map(|part| match part {
+                "query-vector" => Some(Self::QueryVector),
+                "query-agentic" => Some(Self::QueryAgentic),
+                "attention-schema" => Some(Self::AttentionSchema),
+                _ => None,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum EvalCase {
+    FullAgent(FullAgentCase),
+    Module {
+        target: ModuleEvalTarget,
+        case: ModuleCase,
+    },
+}
+
+impl EvalCase {
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::FullAgent(case) => case.id.as_deref(),
+            Self::Module { case, .. } => case.id.as_deref(),
+        }
+    }
+
+    pub fn description(&self) -> Option<&Text> {
+        match self {
+            Self::FullAgent(case) => case.description.as_ref(),
+            Self::Module { case, .. } => case.description.as_ref(),
+        }
+    }
+
+    pub fn memories(&self) -> &[MemorySeed] {
+        match self {
+            Self::FullAgent(case) => &case.memories,
+            Self::Module { case, .. } => &case.memories,
+        }
+    }
+
+    pub fn limits(&self) -> &EvalLimits {
+        match self {
+            Self::FullAgent(case) => &case.limits,
+            Self::Module { case, .. } => &case.limits,
+        }
+    }
+
+    pub fn checks(&self) -> &[Check] {
+        match self {
+            Self::FullAgent(case) => &case.checks,
+            Self::Module { case, .. } => &case.checks,
+        }
+    }
+
+    pub fn scoring(&self) -> &CaseScoring {
+        match self {
+            Self::FullAgent(case) => &case.scoring,
+            Self::Module { case, .. } => &case.scoring,
+        }
+    }
+
+    pub fn prompt_for_judge(&self) -> String {
+        match self {
+            Self::FullAgent(case) => case
+                .inputs
+                .iter()
+                .map(FullAgentInput::as_prompt_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Module { case, .. } => case.prompt.content.clone(),
+        }
+    }
+
+    pub fn context_for_judge(&self) -> Option<String> {
+        match self {
+            Self::FullAgent(_) => None,
+            Self::Module { case, .. } => case.context.as_ref().map(|text| text.content.clone()),
+        }
+    }
+}
+
+impl FullAgentInput {
+    pub fn as_prompt_line(&self) -> String {
+        match self {
+            Self::Heard { direction, content } => {
+                let direction = direction.as_deref().unwrap_or("unknown");
+                format!("heard[{direction}]: {}", content.content)
+            }
+            Self::Seen {
+                direction,
+                appearance,
+            } => {
+                let direction = direction.as_deref().unwrap_or("unknown");
+                format!("seen[{direction}]: {}", appearance.content)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct EvalLimits {
+    #[eure(default = "default_tick_ms")]
+    pub tick_ms: u64,
+    #[eure(default = "default_max_ticks")]
+    pub max_ticks: u64,
+    #[eure(default)]
+    pub max_llm_calls: Option<u64>,
+}
+
+impl Default for EvalLimits {
+    fn default() -> Self {
+        Self {
+            tick_ms: default_tick_ms(),
+            max_ticks: default_max_ticks(),
+            max_llm_calls: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemorySeed {
-    #[eure(default)]
-    pub key: Option<String>,
     #[eure(default = "default_memory_rank")]
     pub rank: MemorySeedRank,
+    #[eure(default = "default_memory_decay_secs")]
+    pub decay_secs: i64,
     pub content: Text,
 }
 
@@ -271,19 +430,49 @@ pub enum CaseFileError {
 }
 
 pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
-    let content = fs::read_to_string(path).map_err(|source| CaseFileError::Read {
+    if is_full_agent_case_path(path) {
+        return parse_full_agent_case_file(path).map(EvalCase::FullAgent);
+    }
+    let target = ModuleEvalTarget::from_path(path).ok_or_else(|| CaseFileError::Validation {
         path: path.to_path_buf(),
-        source,
+        message:
+            "module eval case path must include query-vector, query-agentic, or attention-schema"
+                .to_string(),
     })?;
-    let file: EvalCaseFile =
+    parse_module_case_file(path).map(|case| EvalCase::Module { target, case })
+}
+
+pub fn parse_full_agent_case_file(path: &Path) -> Result<FullAgentCase, CaseFileError> {
+    let content = read_case(path)?;
+    let file: FullAgentCaseFile =
         eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
             CaseFileError::Parse {
                 path: path.to_path_buf(),
                 message,
             }
         })?;
-    validate_case(path, &file.case)?;
+    validate_full_agent_case(path, &file.case)?;
     Ok(file.case)
+}
+
+pub fn parse_module_case_file(path: &Path) -> Result<ModuleCase, CaseFileError> {
+    let content = read_case(path)?;
+    let file: ModuleCaseFile =
+        eure::parse_content(&content, path.to_path_buf()).map_err(|message| {
+            CaseFileError::Parse {
+                path: path.to_path_buf(),
+                message,
+            }
+        })?;
+    validate_module_case(path, &file.case)?;
+    Ok(file.case)
+}
+
+fn read_case(path: &Path) -> Result<String, CaseFileError> {
+    fs::read_to_string(path).map_err(|source| CaseFileError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 pub fn discover_case_files(root: &Path) -> Result<Vec<PathBuf>, io::Error> {
@@ -334,30 +523,90 @@ fn is_persisted_eval_output_file_name(name: &str) -> bool {
     matches!(name, "result.eure" | "report.eure" | "artifact.eure")
 }
 
-fn validate_case(path: &Path, case: &EvalCase) -> Result<(), CaseFileError> {
+fn is_full_agent_case_path(path: &Path) -> bool {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|part| part == "full-agent")
+}
+
+fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
+    if case.inputs.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "full-agent case must have at least one input".to_string(),
+        });
+    }
+    for (index, input) in case.inputs.iter().enumerate() {
+        match input {
+            FullAgentInput::Heard { content, .. } if content.content.trim().is_empty() => {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("inputs[{index}].content must not be empty"),
+                });
+            }
+            FullAgentInput::Seen { appearance, .. } if appearance.content.trim().is_empty() => {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("inputs[{index}].appearance must not be empty"),
+                });
+            }
+            _ => {}
+        }
+    }
+    validate_common(path, &case.memories, &case.limits, &case.checks)
+}
+
+fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileError> {
     if case.prompt.content.trim().is_empty() {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "prompt must not be empty".to_string(),
         });
     }
+    validate_common(path, &case.memories, &case.limits, &case.checks)
+}
 
-    for (index, memory) in case.memories.iter().enumerate() {
-        if memory.key.as_deref().is_some_and(str::is_empty) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("memories[{index}].key must not be empty when present"),
-            });
-        }
+fn validate_common(
+    path: &Path,
+    memories: &[MemorySeed],
+    limits: &EvalLimits,
+    checks: &[Check],
+) -> Result<(), CaseFileError> {
+    if limits.tick_ms == 0 {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "limits.tick-ms must be greater than zero".to_string(),
+        });
+    }
+    if limits.max_ticks == 0 {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "limits.max-ticks must be greater than zero".to_string(),
+        });
+    }
+    if matches!(limits.max_llm_calls, Some(0)) {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "limits.max-llm-calls must be greater than zero when present".to_string(),
+        });
+    }
+
+    for (index, memory) in memories.iter().enumerate() {
         if memory.content.content.trim().is_empty() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("memories[{index}].content must not be empty"),
             });
         }
+        if memory.decay_secs < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memories[{index}].decay-secs must not be negative"),
+            });
+        }
     }
 
-    for check in &case.checks {
+    for check in checks {
         validate_check(path, check)?;
     }
 

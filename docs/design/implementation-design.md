@@ -18,7 +18,7 @@ This document is the implementation source of truth. It describes the desired ar
 7. **Kebab-case module ids** — `ModuleId(String)` accepts only `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`. Builtins live in `nuillu_types::builtin::*`.
 8. **Non-exclusive capabilities** — Root providers and replica-scoped capability factories issue handles without uniqueness checks; any capability may be granted to multiple module instances. Single-writer roles are upheld by boot-time wiring and replica-owned state, not by issuer enforcement.
 9. **Elapsed-tick periodic activation** — The app advances elapsed time explicitly. Periodic activation is allocation-aware, replica-aware, accumulator-based, and available only to instances whose registration builder requests `PeriodicInbox`.
-10. **Sensory/action boundaries** — Full-agent runs receive external observations through a `sensory` module and emit user-visible text through a `speak` module. Module-level eval targets may still drive `query-*` or `attention-schema` directly.
+10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. `QueryRequest` and `SelfModelRequest` are internal module messages; eval may publish them only from module-level harnesses.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
 12. **Streaming for user-visible output, collect for internal decisions** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules (structured decision turns and tool loops) use `.collect()` because their output is memo-authoritative and has no value until complete and validated. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
 13. **Attention-stream interruption of speak streaming** — If `AttentionStreamUpdated` arrives while speak is generating, the current text stream is cancelled and generation restarts with a fresh attention snapshot. The in-progress delta sequence is abandoned; the sink detects abandonment via a `generation_id` change on `UtteranceDelta`. This ensures speak's utterances always reflect the latest attended state rather than a stale snapshot taken at stream start.
@@ -199,7 +199,7 @@ Delivery policy is per topic:
 - `QueryRequest`, `SelfModelRequest`, `SensoryInput`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there and are gated before semantic work.
 
-`SensoryInput` is an external stimulus, not a durable answer. The initial built-in variants are:
+`SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
 
 - `Heard { direction, content, observed_at }` for linguistic/auditory input,
 - `Seen { direction, appearance, observed_at }` for visual input.
@@ -215,7 +215,7 @@ Delivery policy is per topic:
 
 Examples: `Ryo said "..." 42 seconds ago`, `Ryo said "..." 1 minute 20 seconds ago`, `screen showed "..." 3 hours 40 minutes ago`, `Ryo said "..." 2 days 5 hours ago`. Future timestamps caused by host clock skew should be clamped to `0 seconds ago`.
 
-The sensory module does not publish derived typed work requests. Direct app use of `QueryMailbox` and `SelfModelMailbox` remains useful for module-level tests, and a separate routing/planning module may own those mailboxes in a later design. Full-agent artifact runs should enter through `SensoryInputMailbox`.
+The sensory module does not publish derived typed work requests. `QueryMailbox` and `SelfModelMailbox` are internal messaging surfaces; module-level eval harnesses may hold them to isolate query modules or attention-schema, but app-facing/full-agent eval cases must not use them as external inputs. A separate routing/planning module may own those mailboxes in a later design.
 
 Speech actions are app-facing port writes rather than channel messages:
 
@@ -313,7 +313,8 @@ Rules:
 - When explicit requests and periodic ticks are ready together, explicit requests are handled first. `attention-schema` is the exception: if a self-model request and tick are batched together, it refreshes the self-model before answering.
 
 Module conventions:
-- Tick-only modules, such as summarize and memory-compaction, collapse multiple ready ticks into one periodic activation.
+- Tick-only modules, such as memory-compaction, collapse multiple ready ticks into one periodic activation.
+- Memo-update modules, such as summarize, collapse multiple ready memo updates into one wake activation and reread the blackboard as source-of-truth. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
 - Attention-update modules, such as attention-controller and predict, collapse multiple ready attention updates into one wake activation and reread the attention stream as source-of-truth.
 - Query and self-model modules collect ready explicit requests into a module-local batch and answer the batch in one LLM turn. The module decides answer granularity and memo write policy; channel responses and request/response correlation remain out of scope.
 - Memory collects ready `MemoryRequest` values into a deterministic batch of memory candidates, passes them with the blackboard snapshot to its LLM deliberation, and writes only through `insert_memory` tool calls. A request is not a durable write command; the memory module may deduplicate, merge, normalize, or reject candidates.
@@ -370,6 +371,30 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `UtteranceWriter` | yes | emit app-facing speech actions for one speak replica + persist/notify through an adapter |
 | `Clock` | no | injected current time for timestamping and relative-time normalization |
 | `TimeDivision` | no | load attention-boundary age buckets from `configs/time-division.eure` |
+
+### Runtime event observation
+
+Capability providers may be constructed with a `RuntimeEventSink`. The default sink is a no-op, but eval and observability boot can inject a sink that receives owner-stamped runtime events without giving modules any new side-effect power.
+
+The initial event set is:
+
+```rust
+pub enum RuntimeEvent {
+    LlmAccessed {
+        sequence: u64,
+        call: u64,
+        owner: ModuleInstanceId,
+        tier: ModelTier,
+    },
+    MemoUpdated {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        char_count: usize,
+    },
+}
+```
+
+`sequence` is global to the runtime event emitter and preserves event ordering across event kinds. `LlmAccess::lutum().await` emits exactly one `LlmAccessed` event after resolving the holder's current effective tier and before returning the `lutum::Lutum` handle. Its `call` field is the LLM acquisition sequence only; it observes acquisition count, not provider request count. `Memo::write(...).await` emits `MemoUpdated` after the blackboard memo write completes; `char_count` is the memo's character count at write time. Sinks must not deny acquisition or memo writes; limit policies such as eval `max-llm-calls` request shutdown after observing the event.
 
 ---
 
@@ -651,21 +676,25 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 ## 7. Eval Integration
 
-`crates/eval` keeps supporting module-level targets:
+`crates/eval` has two schema families because they exercise different boundaries.
 
-- `query` publishes `QueryRequest` and scores grouped query-module memos/artifacts,
-- `self-model` publishes `SelfModelRequest` and scores grouped attention-schema memos,
-- `periodic` and `custom` remain low-level driver hooks.
+Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()` before ticking, advances `AgentEventLoop::tick(elapsed)` until the first completed utterance, max ticks, or runtime-event shutdown, and returns the first complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent artifact evaluation should add a conversation-style target that:
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and summarize start on cheap tier, attention-controller and speak start on premium tier, and lower-priority query, memory, prediction, surprise, and attention-schema modules start at zero replicas until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-1. boots the selected app wiring with `sensory`, `summarize`, query modules, `attention-schema`, `attention-controller`, memory modules, and `speak`,
-2. publishes the case prompt as `SensoryInput::Heard { direction: Some("Ryo".into()), content, observed_at }`,
-3. advances `AgentEventLoop::tick(elapsed)` until an utterance is emitted, the driver reaches a max tick budget, or shutdown is requested,
-4. returns a `CaseArtifact` whose `output` is the collected user-visible utterance text (eval harnesses consume only the `on_complete` surface of `UtteranceSink`; streaming deltas are not collected and do not affect artifact output),
-5. records observations such as sensory filtering decisions, grouped memos, attention stream sets, effective allocation snapshots, controller proposals, registry cap ranges, and the utterance log under `CaseArtifact::observations`.
+Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to attention-schema through `CapabilityProviders::internal_harness_io()`, then score the target module memo as the artifact.
 
-This keeps realistic artifacts observable without adding request/response correlation to module channels. The artifact is collected at the host boundary from `UtteranceSink`; intermediate reasoning remains memo/attention authoritative.
+Common eval behavior:
+
+1. memory seeds are inserted through `MemoryWriter` using `{ content, rank, decay-secs }` so libSQL content and blackboard memory metadata stay aligned,
+2. the eval runner uses libSQL as the primary memory store, local `PotionBase8MEmbedder` for embeddings, and `lutum-openai` in Chat Completions mode for Ollama,
+3. the eval binary installs a global tracing subscriber with `lutum_trace::layer()` before running cases, matching the Lutum trace setup contract; spawned module tasks inherit that global dispatcher,
+4. each case writes `artifact.json`, `report.json`, `events.json`, and `trace.json` under `.tmp/eval/<run-id>/<case-id>/`; failed, invalid, runtime-error, and panic cases also write `raw-trace.json` for provider/protocol-level debugging, and the suite writes both `suite-report.json` and append-only `events.jsonl`,
+5. live progress is always emitted to stderr for suite start/end, case start/end, full-agent allocation changes, completed utterances, `LlmAccessed` events, and stop requests,
+6. limits include `max-ticks`, `tick-ms`, and `max-llm-calls`,
+7. `max-llm-calls` counts `LlmAccessed` runtime events and requests scheduler shutdown after the event that reaches the limit; the acquisition is observed, not denied.
+
+This keeps realistic artifacts observable without adding request/response correlation to module channels. Full-agent artifacts are collected at the host boundary from `UtteranceSink`; module artifacts remain memo-authoritative.
 
 ---
 
@@ -682,6 +711,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Controller and schema are separate modules | separate crates and separate constructor capabilities |
 | Controller cannot read non-cognitive blackboard | it receives no `BlackboardReader` |
 | Sensory is the full-agent observation boundary | full-agent boot wiring grants `SensoryInputInbox` only to sensory |
+| Full-agent external input is sensory-only | app/full-agent eval uses `HostIo` with only `SensoryInputMailbox`; `QueryRequest` and `SelfModelRequest` are internal messages |
 | Sensory cannot answer, route work, or alter cognition directly | it receives no `QueryMailbox`, `SelfModelMailbox`, `UtteranceWriter`, `AttentionWriter`, `AllocationWriter`, memory capabilities, or readers |
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `AttentionWriter`, `AllocationWriter`, or memory capabilities |
@@ -706,5 +736,6 @@ This keeps realistic artifacts observable without adding request/response correl
 | Surprise is the only module that sends `MemoryRequest` | boot-time wiring convention; capability issuers do not enforce uniqueness |
 | Predict and surprise ablations are wiring-only | boot wiring may include predict, surprise, both, or neither |
 | Conversation artifacts are boundary observations | eval collects utterances from `UtteranceSink`, not channel responses |
+| LLM call limits observe acquisitions | `LlmAccess::lutum()` emits `LlmAccessed`; eval requests shutdown after the limit event rather than denying the handle |
 
 Mailbox backpressure policy remains a separate runtime policy decision. Current typed topics use unbounded per-subscriber queues; if bounded queues are introduced, overflow policy must be explicit per topic. The source-of-truth state is not carried in channel payloads.

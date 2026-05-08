@@ -2,9 +2,31 @@
 
 $schema = "https://eure.dev/v0.1.7/schemas/eure-config.schema.eure"
 
-@ targets.eval-cases
-globs = ["eval-cases/**/*.eure"]
-schema = "schemas/eval-case.schema.eure"
+@ targets.eval-full-agent-cases
+globs = ["eval-cases/full-agent/**/*.eure"]
+schema = "schemas/eval-full-agent-case.schema.eure"
+
+@ targets.eval-query-vector-cases
+globs = ["eval-cases/modules/query-vector/**/*.eure"]
+schema = "schemas/eval-query-vector-case.schema.eure"
+
+@ targets.eval-query-agentic-cases
+globs = ["eval-cases/modules/query-agentic/**/*.eure"]
+schema = "schemas/eval-query-agentic-case.schema.eure"
+
+@ targets.eval-attention-schema-cases
+globs = ["eval-cases/modules/attention-schema/**/*.eure"]
+schema = "schemas/eval-attention-schema-case.schema.eure"
+
+@ targets.eval-modelsets
+globs = ["configs/modelsets/**/*.eure"]
+schema = "schemas/eval-model-set.schema.eure"
 
 @ cli
-default-targets = ["eval-cases"]
+default-targets = [
+  "eval-full-agent-cases",
+  "eval-query-vector-cases",
+  "eval-query-agentic-cases",
+  "eval-attention-schema-cases",
+  "eval-modelsets",
+]

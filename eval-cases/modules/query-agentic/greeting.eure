@@ -1,18 +1,17 @@
-id = "smoke-greeting"
-description = "A minimal rubric-first eval case shape for nuillu drivers."
-target = "query"
+id = "module-query-agentic-greeting"
+description = "Query-agentic smoke case driven by the internal module eval harness."
 prompt = "Greet the user briefly and identify yourself as nuillu."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
 
 @ checks[] {
   $variant: artifact-text-contains
   must-pass = true
   contains = "nuillu"
-}
-
-@ checks[] {
-  $variant: trace-span
-  must-pass = true
-  span-name = "echo-driver"
 }
 
 @ checks[] {

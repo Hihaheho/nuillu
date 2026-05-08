@@ -16,7 +16,25 @@ clap = { workspace = true }
 eure = { workspace = true }
 lutum = { workspace = true }
 lutum-eval = { workspace = true }
+lutum-in-memory-adapter = { workspace = true }
+lutum-libsql-adapter = { workspace = true }
+lutum-model2vec-adapter = { workspace = true }
+lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
+nuillu-agent = { workspace = true }
+nuillu-attention-controller = { workspace = true }
+nuillu-attention-schema = { workspace = true }
+nuillu-blackboard = { workspace = true }
+nuillu-memory = { workspace = true }
+nuillu-memory-compaction = { workspace = true }
+nuillu-module = { workspace = true }
+nuillu-predict = { workspace = true }
+nuillu-query-agentic = { workspace = true }
+nuillu-query-vector = { workspace = true }
+nuillu-sensory = { workspace = true }
+nuillu-speak = { workspace = true }
+nuillu-summarize = { workspace = true }
+nuillu-surprise = { workspace = true }
 nuillu-types = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
@@ -25,6 +43,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

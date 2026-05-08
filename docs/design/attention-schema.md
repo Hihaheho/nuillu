@@ -32,8 +32,10 @@ Module results that should be durable live in memos or other blackboard state. C
 
 External input and output sit at the boundary of cognition:
 
-- **sensory input** enters through a typed `SensoryInput` channel and is normalized by the sensory module into its memo,
+- **sensory input** is the only external/app-facing input; it enters through a typed `SensoryInput` channel and is normalized by the sensory module into its memo,
 - **speech output** leaves through a speak/action capability and is mirrored into the speak module's memo.
+
+`QueryRequest` and `SelfModelRequest` are internal typed messages. Module-level eval harnesses may publish them to isolate query modules or attention-schema, but full-agent/app-facing cases must enter through `SensoryInput`.
 
 Sensory input is multimodal. Initial built-in observations are `Heard { direction, content, observed_at }` for linguistic/auditory input and `Seen { direction, appearance, observed_at }` for visual input. The variant names are past-tense observations rather than actions: `Listen` would describe what the agent does, while `Heard` describes what arrived at the sensory boundary; `Visible` would describe a property, while `Seen` describes an observed event.
 
@@ -58,7 +60,7 @@ Rank can rise through access or remember-token accumulation and fall when decay 
 
 A module can be activated by any inbox capability it holds:
 
-- typed fanout topics, such as `SensoryInputInbox`, `QueryInbox`, or `SelfModelInbox`,
+- typed fanout topics, such as external `SensoryInputInbox` or internal `QueryInbox` / `SelfModelInbox`,
 - `PeriodicInbox`, driven by elapsed application ticks and current allocation,
 - `AttentionStreamUpdatedInbox`, published by attention-stream writes.
 
@@ -78,7 +80,7 @@ Periodic activation is opt-in. A module becomes periodic only when boot wiring g
 | memory-compaction | ✓ | — | optional | ✓ | — | ✓ | `MemoryCompactor` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | — | — | ✓ | `AttentionStreamUpdatedInbox`, `MemoryRequestMailbox` |
-| speak | ✓ | ✓ | ✓ | optional | ✓ | ✓ | `AttentionStreamUpdatedInbox`, `Speak` |
+| speak | — | ✓ | ✓ | optional | ✓ | ✓ | `AttentionStreamUpdatedInbox`, `UtteranceWriter` |
 
 Notable absences:
 
@@ -97,7 +99,7 @@ Notable absences:
 
 ### Sensory
 
-Receives external observations through `SensoryInputInbox`, normalizes them, and writes selected observations to the sensory memo. It is the observation boundary for realistic eval runs and application integrations.
+Receives external observations through `SensoryInputInbox`, normalizes them, and writes selected observations to the sensory memo. It is the only observation boundary for realistic eval runs and application integrations.
 
 Sensory is a pre-attentive filter. Its role is to decide which stimuli should be made available to the rest of the system through its memo, not to decide which cognitive module should work next.
 
@@ -134,11 +136,11 @@ The self-model is a simplification. It may diverge from the controller's interna
 
 ### Query Vector
 
-Handles vector-memory/RAG queries only. Explicit query requests arrive through `QueryInbox`; periodic activation can refresh memory-oriented context. Output is written to the query-vector module's memo.
+Handles vector-memory/RAG queries only. Explicit internal query requests arrive through `QueryInbox`; periodic activation can refresh memory-oriented context. Output is written to the query-vector module's memo.
 
 ### Query Agentic
 
-Handles read-only file-search queries only. Explicit query requests arrive through `QueryInbox`; periodic activation can refresh file-oriented context. Output is written to the query-agentic module's memo.
+Handles read-only file-search queries only. Explicit internal query requests arrive through `QueryInbox`; periodic activation can refresh file-oriented context. Output is written to the query-agentic module's memo.
 
 ### Memory
 
@@ -169,7 +171,7 @@ Surprise does not generate predictions. When the predict memo is absent, surpris
 
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
-Speak reads the attention stream and blackboard memo state, decides whether a user-facing response is warranted, writes the chosen utterance to its memo, and emits it through the `Speak` capability that the application or eval harness can collect as an artifact.
+Speak reads the attention stream, decides whether a user-facing response is warranted, writes the chosen utterance to its memo, and emits it through `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact.
 
 Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. If required information is not yet available in attended state or memos, it should remain silent or emit a bounded clarification/failure utterance according to application policy.
 
@@ -180,6 +182,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - The attention controller and attention schema module are separate modules.
 - The attention controller cannot directly read the non-cognitive blackboard.
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
+- Query and self-model messages are internal; they are only driven directly by module-level eval harnesses or internal modules that hold those mailbox capabilities.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
 - The summarize module is the only path from the non-cognitive blackboard to the attention stream.
 - Query modules and self-model questions are separated by typed channels.

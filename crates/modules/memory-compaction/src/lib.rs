@@ -194,7 +194,7 @@ impl MemoryCompactionModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -203,7 +203,7 @@ impl MemoryCompactionModule {
 impl Module for MemoryCompactionModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "memory-compaction module loop stopped");
+            panic!("memory-compaction module failed: {error:#}");
         }
     }
 }

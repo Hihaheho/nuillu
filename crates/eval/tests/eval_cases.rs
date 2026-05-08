@@ -1,34 +1,27 @@
-use std::{cell::Cell, error::Error, path::Path};
+use std::{cell::Cell, path::Path};
 
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    CaseArtifact, CaseDriver, EvalCase, RubricJudge, RubricJudgeError, RubricJudgeRequest,
-    RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files, parse_case_file,
-    run_case,
+    CaseArtifact, EvalCase, FullAgentInput, ModuleEvalTarget, ReasoningEffort, RubricJudge,
+    RubricJudgeError, RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion,
+    discover_case_files, evaluate_case, parse_case_file, parse_full_agent_case_file,
+    parse_model_set_file,
 };
 use nuillu_types::MemoryRank;
 
-struct EchoDriver;
+fn eval_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases")
+}
 
-#[async_trait(?Send)]
-impl CaseDriver for EchoDriver {
-    async fn run_case(&mut self, case: &EvalCase) -> Result<CaseArtifact, Box<dyn Error>> {
-        let _span = tracing::info_span!("echo-driver", "lutum.capture" = true).entered();
-        let seeded_memories = case
-            .memories
-            .iter()
-            .map(|memory| memory.content.content.clone())
-            .collect::<Vec<_>>();
-        let output = if seeded_memories.is_empty() {
-            format!("hello from nuillu: {}", case.prompt.content)
-        } else {
-            format!("Based on memory: {}", seeded_memories.join(" "))
-        };
+fn workspace_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
 
-        Ok(CaseArtifact::new(output)
-            .with_observation("seeded_memories", serde_json::json!(seeded_memories))
-            .with_observation("memos", serde_json::json!({"query-agentic": "answered"})))
+fn empty_trace() -> TraceSnapshot {
+    TraceSnapshot {
+        roots: Vec::new(),
+        root_events: Vec::new(),
     }
 }
 
@@ -71,36 +64,9 @@ impl RubricJudge for ScriptJudge {
     }
 }
 
-struct MemoryJudge;
-
-#[async_trait(?Send)]
-impl RubricJudge for MemoryJudge {
-    async fn judge(
-        &self,
-        _trace: &TraceSnapshot,
-        request: RubricJudgeRequest,
-    ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert!(request.prompt.contains("Who are you?"));
-        assert!(request.artifact.output.contains("blue frog"));
-        Ok(RubricJudgeVerdict {
-            passed: true,
-            score: 0.95,
-            summary: "answer uses the seeded permanent memory".to_string(),
-            criteria: vec![RubricJudgeVerdictCriterion {
-                name: "uses-seeded-memory".to_string(),
-                passed: true,
-                score: 0.95,
-                reason: "the output includes Lutum and blue frog identity".to_string(),
-                evidence: Some("I'm a Lutum, a blue frog.".to_string()),
-            }],
-        })
-    }
-}
-
 #[test]
 fn parses_checked_in_eval_cases() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases");
-    let files = discover_case_files(&root).unwrap();
+    let files = discover_case_files(&eval_root()).unwrap();
 
     assert!(!files.is_empty(), "expected checked-in eval cases");
     for path in files {
@@ -111,14 +77,81 @@ fn parses_checked_in_eval_cases() {
 }
 
 #[test]
-fn parses_memory_seed_setup() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases/smoke/memory-identity.eure");
+fn parses_checked_in_model_set() {
+    let path = workspace_root().join("configs/modelsets/eval.eure");
+    let model_set = parse_model_set_file(&path).unwrap();
 
+    let judge = model_set.judge.unwrap();
+    assert_eq!(judge.endpoint(), Some("http://localhost:11434/v1"));
+    assert_eq!(judge.token.as_deref(), Some("local"));
+    assert_eq!(judge.model.as_deref(), Some("gpt-oss:20b"));
+    assert_eq!(judge.reasoning_effort, None);
+    let cheap = model_set.cheap.unwrap();
+    assert_eq!(cheap.endpoint(), Some("http://localhost:11434/v1"));
+    assert_eq!(cheap.token.as_deref(), Some("local"));
+    assert_eq!(cheap.model.as_deref(), Some("gemma4:e2b"));
+    assert_eq!(cheap.reasoning_effort, None);
+    let default = model_set.default.unwrap();
+    assert_eq!(default.endpoint(), Some("http://localhost:11434/v1"));
+    assert_eq!(default.token.as_deref(), Some("local"));
+    assert_eq!(default.model.as_deref(), Some("gemma4:e4b"));
+    assert_eq!(default.reasoning_effort, None);
+    let premium = model_set.premium.unwrap();
+    assert_eq!(premium.endpoint(), Some("https://openrouter.ai/api/v1"));
+    assert_eq!(premium.token_env.as_deref(), Some("OPENROUTER_API_KEY"));
+    assert_eq!(premium.model.as_deref(), Some("google/gemma-4-26b-a4b-it"));
+    assert_eq!(premium.reasoning_effort, Some(ReasoningEffort::Medium));
+}
+
+#[test]
+fn rejects_global_model_set_backend_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("global-backend.eure");
+    std::fs::write(
+        &path,
+        r#"
+name = "bad-global"
+endpoint = "http://localhost:11434/v1"
+
+judge {
+  model = "judge"
+}
+"#,
+    )
+    .unwrap();
+
+    let err = parse_model_set_file(&path).unwrap_err();
+    assert!(err.to_string().contains("endpoint"), "{err}");
+}
+
+#[test]
+fn parses_full_agent_multimodal_case() {
+    let path = eval_root().join("full-agent/multimodal-greeting.eure");
     let case = parse_case_file(&path).unwrap();
 
+    let EvalCase::FullAgent(case) = case else {
+        panic!("expected full-agent case");
+    };
+
+    assert_eq!(case.id.as_deref(), Some("full-agent-multimodal-greeting"));
+    assert_eq!(case.inputs.len(), 2);
+    assert!(matches!(case.inputs[0], FullAgentInput::Heard { .. }));
+    assert!(matches!(case.inputs[1], FullAgentInput::Seen { .. }));
+    assert_eq!(case.limits.max_llm_calls, Some(64));
+}
+
+#[test]
+fn parses_query_vector_module_case_with_memory_seed() {
+    let path = eval_root().join("modules/query-vector/memory-identity.eure");
+    let case = parse_case_file(&path).unwrap();
+
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(target, ModuleEvalTarget::QueryVector);
+    assert_eq!(case.prompt.content, "Who are you?");
     assert_eq!(case.memories.len(), 1);
-    assert_eq!(case.memories[0].key.as_deref(), Some("identity"));
     assert_eq!(
         MemoryRank::from(case.memories[0].rank),
         MemoryRank::Permanent
@@ -129,51 +162,92 @@ fn parses_memory_seed_setup() {
     );
 }
 
+#[test]
+fn parses_query_agentic_module_case() {
+    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let case = parse_case_file(&path).unwrap();
+
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(target, ModuleEvalTarget::QueryAgentic);
+    assert!(case.prompt.content.contains("Greet the user"));
+    assert_eq!(case.limits.max_llm_calls, Some(8));
+}
+
+#[test]
+fn parses_attention_schema_module_case() {
+    let path = eval_root().join("modules/attention-schema/self-report.eure");
+    let case = parse_case_file(&path).unwrap();
+
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(target, ModuleEvalTarget::AttentionSchema);
+    assert!(case.prompt.content.contains("aware"));
+}
+
+#[test]
+fn rejects_internal_message_variants_in_full_agent_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_agent_dir = dir.path().join("full-agent");
+    std::fs::create_dir_all(&full_agent_dir).unwrap();
+
+    for variant in ["query-request", "self-model-request"] {
+        let path = full_agent_dir.join(format!("{variant}.eure"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+id = "bad-full-agent-internal-message"
+
+@ inputs[] {{
+  $variant: {variant}
+  question = "Who are you?"
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = parse_full_agent_case_file(&path).unwrap_err();
+        assert!(err.to_string().contains("parse"), "{err}");
+    }
+}
+
 #[tokio::test]
-async fn runs_case_with_driver_and_rubric_judge() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases/smoke/greeting.eure");
-    let mut driver = EchoDriver;
+async fn evaluates_module_case_with_rubric_judge() {
+    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let case = parse_case_file(&path).unwrap();
+    let artifact = CaseArtifact::new("hello from nuillu");
     let judge = ScriptJudge {
         called: Cell::new(false),
     };
 
-    let summary = run_case(&path, &mut driver, Some(&judge)).await.unwrap();
+    let report = evaluate_case(&case, &empty_trace(), &artifact, Some(&judge)).await;
 
     assert!(judge.called.get());
-    assert!(summary.passed, "{:#?}", summary.report);
-    assert_eq!(summary.id, "smoke-greeting");
-    assert_eq!(summary.report.checks.len(), 3);
-    assert!(summary.score > 0.9);
+    assert!(report.passed(), "{report:#?}");
+    assert_eq!(report.checks.len(), 2);
+    assert!(report.score > 0.9);
 }
 
 #[tokio::test]
 async fn rubric_case_requires_judge() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases/smoke/greeting.eure");
-    let mut driver = EchoDriver;
+    let path = eval_root().join("modules/query-agentic/greeting.eure");
+    let case = parse_case_file(&path).unwrap();
+    let artifact = CaseArtifact::new("hello from nuillu");
 
-    let summary = run_case(&path, &mut driver, None).await.unwrap();
+    let report = evaluate_case(&case, &empty_trace(), &artifact, None).await;
 
-    assert!(!summary.passed);
-    assert!(summary.invalid);
+    assert!(!report.passed());
+    assert!(report.invalid);
     assert!(
-        summary
-            .report
+        report
             .checks
             .iter()
             .any(|check| check.kind == "rubric" && check.errored)
     );
-}
-
-#[tokio::test]
-async fn seeded_memory_is_available_to_driver() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases/smoke/memory-identity.eure");
-    let mut driver = EchoDriver;
-
-    let summary = run_case(&path, &mut driver, Some(&MemoryJudge))
-        .await
-        .unwrap();
-
-    assert!(summary.passed, "{:#?}", summary.report);
-    assert_eq!(summary.id, "smoke-memory-identity");
 }

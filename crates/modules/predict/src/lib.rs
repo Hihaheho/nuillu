@@ -14,7 +14,8 @@ const SYSTEM_PROMPT: &str = r#"You are the predict module.
 Maintain forward predictions about the current attention targets.
 Generate predictions only; do not assess whether earlier predictions were correct and do not
 request memory writes. Keep predictions concise, grounded in the current attention stream and
-blackboard context."#;
+blackboard context. Return only raw JSON for the structured object; do not wrap it in Markdown or
+code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PredictionMemo {
@@ -106,7 +107,7 @@ impl PredictModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -115,7 +116,7 @@ impl PredictModule {
 impl Module for PredictModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "predict module loop stopped");
+            panic!("predict module failed: {error:#}");
         }
     }
 }

@@ -36,6 +36,12 @@ pub struct BlackboardInner {
     replica_caps: HashMap<ModuleId, ReplicaCapRange>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoRecord {
+    pub owner: ModuleInstanceId,
+    pub memo: String,
+}
+
 struct ActivationWaiter {
     owner: ModuleInstanceId,
     sender: oneshot::Sender<()>,
@@ -163,6 +169,25 @@ impl BlackboardInner {
 
     pub fn memo_for_instance(&self, id: &ModuleInstanceId) -> Option<&str> {
         self.memos.get(id).map(String::as_str)
+    }
+
+    pub fn memo_records(&self) -> Vec<MemoRecord> {
+        let mut records = self
+            .memos
+            .iter()
+            .map(|(owner, memo)| MemoRecord {
+                owner: owner.clone(),
+                memo: memo.clone(),
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            a.owner
+                .module
+                .as_str()
+                .cmp(b.owner.module.as_str())
+                .then_with(|| a.owner.replica.cmp(&b.owner.replica))
+        });
+        records
     }
 
     pub fn memos(&self) -> serde_json::Value {

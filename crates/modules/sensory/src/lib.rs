@@ -13,11 +13,15 @@ use serde::{Deserialize, Serialize};
 
 const SYSTEM_PROMPT: &str = r#"You are the sensory module.
 You receive raw observations from the environment and decide whether each is notable
-enough to record. If notable, produce a concise normalized description in plain text. Use the
-deterministic salience features as guidance; repeated low-change stimuli should usually be
-ignored or folded into summary.
-Do not write to the attention stream, memory, or emit utterances — your only output
-is the normalized observation text written into your memo."#;
+enough to record.
+Return a structured SensoryDecision object:
+- notable: whether the observation should be recorded.
+- normalized: the concise plain-text observation to write into your memo when notable is true.
+Use the deterministic salience features as guidance; repeated low-change stimuli should usually
+be ignored or folded into summary.
+Do not write to the attention stream, memory, or emit utterances. Do not return a bare string;
+the only textual observation belongs in the normalized field. Return only raw JSON for the
+structured object; do not wrap it in Markdown or code fences."#;
 
 const MAX_OBSERVATIONS: usize = 20;
 const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
@@ -241,7 +245,7 @@ impl SensoryModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             for input in self.next_batch().await? {
-                let _ = self.handle(input).await;
+                self.handle(input).await?;
             }
         }
     }
@@ -323,7 +327,7 @@ mod tests {
 impl Module for SensoryModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "sensory module loop stopped");
+            panic!("sensory module failed: {error:#}");
         }
     }
 }

@@ -73,12 +73,14 @@ impl CaseReport {
 }
 
 pub struct CaseEval {
-    case: EvalCase,
+    checks: Vec<Check>,
 }
 
 impl CaseEval {
-    pub fn new(case: EvalCase) -> Self {
-        Self { case }
+    pub fn new(case: &EvalCase) -> Self {
+        Self {
+            checks: case.checks().to_vec(),
+        }
     }
 }
 
@@ -92,8 +94,8 @@ impl PureEval for CaseEval {
         trace: &TraceSnapshot,
         artifact: &Self::Artifact,
     ) -> Result<Self::Report, Self::Error> {
-        let mut checks = Vec::with_capacity(self.case.checks.len());
-        for check in &self.case.checks {
+        let mut checks = Vec::with_capacity(self.checks.len());
+        for check in &self.checks {
             if matches!(check, Check::Rubric { .. }) {
                 continue;
             }
@@ -130,11 +132,11 @@ pub async fn evaluate_case(
     artifact: &CaseArtifact,
     judge: Option<&dyn RubricJudge>,
 ) -> CaseReport {
-    let mut report = CaseEval::new(case.clone())
+    let mut report = CaseEval::new(case)
         .evaluate(trace, artifact)
         .unwrap_or_else(|never| match never {});
 
-    for (index, check) in case.checks.iter().enumerate() {
+    for (index, check) in case.checks().iter().enumerate() {
         if !matches!(check, Check::Rubric { .. }) {
             continue;
         }
@@ -148,15 +150,14 @@ pub async fn evaluate_case(
             } => match judge {
                 Some(judge) => {
                     let request = RubricJudgeRequest {
-                        prompt: normalize_text_block(&case.prompt.content),
+                        prompt: normalize_text_block(&case.prompt_for_judge()),
                         context: case
-                            .context
-                            .as_ref()
-                            .map(|text| normalize_text_block(&text.content)),
+                            .context_for_judge()
+                            .map(|text| normalize_text_block(&text)),
                         rubric: normalize_text_block(&rubric.content),
                         criteria: criteria.clone(),
                         pass_score: *pass_score,
-                        judge_max_output_tokens: case.scoring.judge_max_output_tokens,
+                        judge_max_output_tokens: case.scoring().judge_max_output_tokens,
                         artifact: artifact.clone(),
                     };
                     match judge.judge(trace, request).await {

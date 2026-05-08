@@ -1,0 +1,41 @@
+/// Schema for configs/modelsets/**/*.eure files.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+name = `text`
+name.$optional = true
+
+judge = `$types.model-role`
+judge.$optional = true
+
+cheap = `$types.model-role`
+cheap.$optional = true
+
+default = `$types.model-role`
+default.$optional = true
+
+premium = `$types.model-role`
+premium.$optional = true
+
+@ $types.reasoning-effort
+$variant: union
+variants.none = { = "none", $variant => "literal" }
+variants.minimal = { = "minimal", $variant => "literal" }
+variants.low = { = "low", $variant => "literal" }
+variants.medium = { = "medium", $variant => "literal" }
+variants.high = { = "high", $variant => "literal" }
+variants.xhigh = { = "xhigh", $variant => "literal" }
+
+@ $types.model-role
+endpoint = `text`
+endpoint.$optional = true
+base-url = `text`
+base-url.$optional = true
+token = `text`
+token.$optional = true
+token-env = `text`
+token-env.$optional = true
+model = `text`
+model.$optional = true
+reasoning-effort = `$types.reasoning-effort`
+reasoning-effort.$optional = true

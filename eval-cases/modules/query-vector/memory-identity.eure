@@ -1,10 +1,14 @@
-id = "smoke-memory-identity"
-description = "The driver should seed permanent memory before asking the query."
-target = "query"
+id = "module-query-vector-memory-identity"
+description = "Query-vector should answer from seeded permanent memory."
 prompt = "Who are you?"
 
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
 @ memories[] {
-  key = "identity"
   rank = "permanent"
   content = "I'm a Lutum, a blue frog."
 }

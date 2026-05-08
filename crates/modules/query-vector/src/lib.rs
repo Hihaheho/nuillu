@@ -13,7 +13,8 @@ mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
 Answer vector-memory/RAG questions only. Use the search_vector_memory tool for factual memory lookup. Do not
-answer self-referential attention, awareness, or self-model questions."#;
+answer self-referential attention, awareness, or self-model questions. Return only raw JSON for
+structured answers; do not wrap JSON in Markdown or code fences."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
 
@@ -226,10 +227,10 @@ impl QueryVectorModule {
         loop {
             let batch = self.next_batch().await?;
             if !batch.queries.is_empty() {
-                let _ = self.handle_queries(batch.queries).await;
+                self.handle_queries(batch.queries).await?;
             }
             if batch.periodic {
-                let _ = self.activate_periodic().await;
+                self.activate_periodic().await?;
             }
         }
     }
@@ -249,7 +250,7 @@ fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
 impl Module for QueryVectorModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "query-vector module loop stopped");
+            panic!("query-vector module failed: {error:#}");
         }
     }
 }

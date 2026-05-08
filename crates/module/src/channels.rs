@@ -156,29 +156,54 @@ impl<T: Clone> TopicMailbox<T> {
 
 /// Subscribe capability for one typed topic.
 pub struct TopicInbox<T: Clone> {
+    owner: ModuleInstanceId,
     receiver: mpsc::UnboundedReceiver<Envelope<T>>,
+    exclude_self: bool,
 }
 
 impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
         Self {
+            owner: owner.clone(),
             receiver: topic.subscribe(owner.clone()),
+            exclude_self: false,
+        }
+    }
+
+    pub(crate) fn new_excluding_self(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
+        Self {
+            owner: owner.clone(),
+            receiver: topic.subscribe(owner),
+            exclude_self: true,
         }
     }
 
     pub async fn next_item(&mut self) -> Result<Envelope<T>, TopicRecvError> {
-        self.receiver.next().await.ok_or(TopicRecvError::Closed)
+        while let Some(envelope) = self.receiver.next().await {
+            if self.accepts(&envelope) {
+                return Ok(envelope);
+            }
+        }
+        Err(TopicRecvError::Closed)
     }
 
     pub fn take_ready_items(&mut self) -> Result<ReadyItems<T>, TopicRecvError> {
         let mut items = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(envelope) => items.push(envelope),
+                Ok(envelope) => {
+                    if self.accepts(&envelope) {
+                        items.push(envelope);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => return Ok(ReadyItems { items }),
                 Err(mpsc::TryRecvError::Closed) => return Err(TopicRecvError::Closed),
             }
         }
+    }
+
+    fn accepts(&self, envelope: &Envelope<T>) -> bool {
+        !self.exclude_self || envelope.sender != self.owner
     }
 }
 
@@ -226,6 +251,11 @@ pub struct AttentionStreamUpdated {
     pub stream: ModuleInstanceId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoUpdated {
+    pub owner: ModuleInstanceId,
+}
+
 pub type QueryMailbox = TopicMailbox<QueryRequest>;
 pub type QueryInbox = TopicInbox<QueryRequest>;
 pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
@@ -234,6 +264,8 @@ pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
 pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
 pub type AttentionStreamUpdatedMailbox = TopicMailbox<AttentionStreamUpdated>;
 pub type AttentionStreamUpdatedInbox = TopicInbox<AttentionStreamUpdated>;
+pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;
+pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum SensoryInput {

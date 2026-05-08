@@ -14,7 +14,8 @@ const SYSTEM_PROMPT: &str = r#"You are the query-agentic module.
 Answer questions by searching read-only files. Use the search_files tool for file and text lookup.
 The tool intentionally exposes only ripgrep-like controls: pattern, regex, invert_match,
 case_sensitive, context, and max_matches.
-Do not answer self-referential attention, awareness, or self-model questions."#;
+Do not answer self-referential attention, awareness, or self-model questions. Return only raw JSON
+for structured answers; do not wrap JSON in Markdown or code fences."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
 
@@ -228,10 +229,10 @@ impl QueryAgenticModule {
         loop {
             let batch = self.next_batch().await?;
             if !batch.queries.is_empty() {
-                let _ = self.handle_queries(batch.queries).await;
+                self.handle_queries(batch.queries).await?;
             }
             if batch.periodic {
-                let _ = self.activate_periodic().await;
+                self.activate_periodic().await?;
             }
         }
     }
@@ -251,7 +252,7 @@ fn fallback_answers(questions: &[String]) -> Vec<QueryBatchAnswer> {
 impl Module for QueryAgenticModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "query-agentic module loop stopped");
+            panic!("query-agentic module failed: {error:#}");
         }
     }
 }

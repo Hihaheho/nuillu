@@ -27,4 +27,4 @@ pub use attention_stream::{
 };
 pub use command::BlackboardCommand;
 pub use memory::{MemoryMetaPatch, MemoryMetadata};
-pub use state::{Blackboard, BlackboardInner};
+pub use state::{Blackboard, BlackboardInner, MemoRecord};

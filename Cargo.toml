@@ -9,7 +9,6 @@ members = [
     "crates/adapters/lancedb",
     "crates/adapters/lancedb-core",
     "crates/adapters/libsql",
-    "crates/adapters/local-memory",
     "crates/adapters/model2vec",
     "crates/modules/*",
     "crates/eval",
@@ -33,6 +32,7 @@ dbg_macro = "warn"
 lutum = { git = "https://github.com/Hihaheho/lutum" }
 lutum-protocol = { git = "https://github.com/Hihaheho/lutum" }
 lutum-eval = { git = "https://github.com/Hihaheho/lutum" }
+lutum-openai = { git = "https://github.com/Hihaheho/lutum" }
 lutum-trace = { git = "https://github.com/Hihaheho/lutum" }
 
 async-trait = "0.1"
@@ -55,7 +55,7 @@ tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 eure = "0.1.6"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # workspace-internal crates
 nuillu-types = { path = "crates/types" }
@@ -66,7 +66,6 @@ lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-lancedb-adapter = { path = "crates/adapters/lancedb" }
 lutum-lancedb-core = { path = "crates/adapters/lancedb-core" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
-lutum-local-memory-adapter = { path = "crates/adapters/local-memory" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 
 nuillu-summarize = { path = "crates/modules/summarize" }

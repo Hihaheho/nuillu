@@ -25,6 +25,7 @@ mod memory_caps;
 mod periodic;
 pub mod ports;
 mod readers;
+mod runtime_events;
 mod tiers;
 mod time_division;
 mod r#trait;
@@ -37,14 +38,15 @@ pub use activation::ActivationGate;
 pub use allocation_writer::AllocationWriter;
 pub use attention::AttentionWriter;
 pub use capabilities::{
-    AllocatedModules, CapabilityProviders, ModuleCapabilityFactory, ModuleRegisterer,
-    ModuleRegistry, ModuleRegistryError,
+    AllocatedModules, CapabilityProviders, HostIo, InternalHarnessIo, ModuleCapabilityFactory,
+    ModuleRegisterer, ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{
     AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope,
-    MemoryImportance, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, QueryInbox,
-    QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox, SelfModelMailbox, SelfModelRequest,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
+    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest,
+    MemoryRequestInbox, MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems,
+    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;
@@ -54,6 +56,7 @@ pub use memory_caps::{
 pub use periodic::{PeriodicActivation, PeriodicInbox, PeriodicRecvError, PeriodicTick};
 pub use ports::Embedder;
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
+pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::Module;

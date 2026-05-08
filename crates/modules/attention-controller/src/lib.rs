@@ -19,7 +19,8 @@ mod batch;
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
 You may only use the attention stream and current allocation. Return conservative patches for
 module replica count, cadence, tier, and context budget. Do not invent module ids.
-Every patch field must be present; use null for optional fields you are not changing."#;
+Every patch field must be present; use null for optional fields you are not changing.
+Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 tokio::task_local! {
     static CONTROLLER_DECISION_SCHEMA: Schema;
@@ -160,7 +161,7 @@ impl AttentionControllerModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -282,7 +283,7 @@ mod tests {
 impl Module for AttentionControllerModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "attention-controller module loop stopped");
+            panic!("attention-controller module failed: {error:#}");
         }
     }
 }

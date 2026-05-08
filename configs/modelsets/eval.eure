@@ -1,0 +1,29 @@
+name = "mixed-eval"
+
+judge {
+  endpoint = "http://localhost:11434/v1"
+  token = "local"
+  model = "gpt-oss:20b"
+}
+
+cheap {
+  endpoint = "http://localhost:11434/v1"
+  token = "local"
+  model = "gemma4:26b"
+  reasoning-effort = "low"
+}
+
+default {
+  endpoint = "http://localhost:11434/v1"
+  token = "local"
+  model = "gemma4:26b"
+  reasoning-effort = "medium"
+}
+
+premium {
+  endpoint = "http://localhost:11434/v1"
+  // token-env = "OPENROUTER_API_KEY"
+  token = "local"
+  model = "gemma4:26b"
+  reasoning-effort = "high"
+}

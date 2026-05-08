@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    ActivationGate, AttentionWriter, BlackboardReader, LlmAccess, Memo, Module, PeriodicInbox,
+    ActivationGate, AttentionWriter, BlackboardReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
     TimeDivision,
 };
 use schemars::JsonSchema;
@@ -14,7 +14,8 @@ const SYSTEM_PROMPT: &str = r#"You are the summarize module.
 Read the non-cognitive blackboard snapshot and decide whether anything should enter the
 cognitive attention stream. Append only concise, novel, currently relevant events.
 When promoting sensory memo content, convert detailed observation ages to one of the provided
-time-division tags before writing attention text."#;
+time-division tags before writing attention text. Return only raw JSON for the structured object;
+do not wrap it in Markdown or code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SummaryDecision {
@@ -24,7 +25,7 @@ pub struct SummaryDecision {
 }
 
 pub struct SummarizeModule {
-    periodic: PeriodicInbox,
+    updates: MemoUpdatedInbox,
     gate: ActivationGate,
     blackboard: BlackboardReader,
     attention: AttentionWriter,
@@ -35,7 +36,7 @@ pub struct SummarizeModule {
 
 impl SummarizeModule {
     pub fn new(
-        periodic: PeriodicInbox,
+        updates: MemoUpdatedInbox,
         gate: ActivationGate,
         blackboard: BlackboardReader,
         attention: AttentionWriter,
@@ -44,7 +45,7 @@ impl SummarizeModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            periodic,
+            updates,
             gate,
             blackboard,
             attention,
@@ -96,7 +97,7 @@ impl SummarizeModule {
     async fn run_loop(&mut self) -> Result<()> {
         loop {
             self.next_batch().await?;
-            let _ = self.activate().await;
+            self.activate().await?;
         }
     }
 }
@@ -105,7 +106,7 @@ impl SummarizeModule {
 impl Module for SummarizeModule {
     async fn run(&mut self) {
         if let Err(error) = self.run_loop().await {
-            tracing::debug!(?error, "summarize module loop stopped");
+            panic!("summarize module failed: {error:#}");
         }
     }
 }

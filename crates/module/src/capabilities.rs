@@ -11,15 +11,16 @@ use crate::activation::ActivationGate;
 use crate::channels::{Topic, TopicPolicy};
 use crate::periodic::PeriodicRegistry;
 use crate::ports::{AttentionRepository, Clock, FileSearchProvider, MemoryStore, UtteranceSink};
+use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::utterance::UtteranceWriter;
 use crate::{
     AllocationReader, AllocationWriter, AttentionReader, AttentionStreamUpdated,
     AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader,
-    FileSearcher, LlmAccess, LutumTiers, Memo, MemoryCompactor, MemoryContentReader, MemoryRequest,
-    MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, PeriodicActivation,
-    PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox,
-    SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision,
-    TopicInbox, TopicMailbox, VectorMemorySearcher,
+    FileSearcher, LlmAccess, LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor,
+    MemoryContentReader, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter,
+    Module, PeriodicActivation, PeriodicInbox, QueryInbox, QueryMailbox, QueryRequest,
+    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -39,6 +40,7 @@ struct CapabilityProvidersInner {
     self_model_topic: Topic<SelfModelRequest>,
     memory_request_topic: Topic<MemoryRequest>,
     attention_updates: Topic<AttentionStreamUpdated>,
+    memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
     attention_port: Arc<dyn AttentionRepository>,
     primary_memory_store: Arc<dyn MemoryStore>,
@@ -48,6 +50,7 @@ struct CapabilityProvidersInner {
     clock: Arc<dyn Clock>,
     time_division: TimeDivision,
     tiers: LutumTiers,
+    runtime_events: RuntimeEventEmitter,
 }
 
 impl CapabilityProviders {
@@ -62,6 +65,31 @@ impl CapabilityProviders {
         clock: Arc<dyn Clock>,
         tiers: LutumTiers,
     ) -> Self {
+        Self::new_with_runtime_events(
+            blackboard,
+            attention_port,
+            primary_memory_store,
+            memory_replicas,
+            file_search,
+            utterance_sink,
+            clock,
+            tiers,
+            Arc::new(NoopRuntimeEventSink),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime_events(
+        blackboard: Blackboard,
+        attention_port: Arc<dyn AttentionRepository>,
+        primary_memory_store: Arc<dyn MemoryStore>,
+        memory_replicas: Vec<Arc<dyn MemoryStore>>,
+        file_search: Arc<dyn FileSearchProvider>,
+        utterance_sink: Arc<dyn UtteranceSink>,
+        clock: Arc<dyn Clock>,
+        tiers: LutumTiers,
+        runtime_event_sink: Arc<dyn RuntimeEventSink>,
+    ) -> Self {
         Self {
             inner: Arc::new(CapabilityProvidersInner {
                 periodic_registry: Arc::new(PeriodicRegistry::new()),
@@ -69,6 +97,7 @@ impl CapabilityProviders {
                 self_model_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 memory_request_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 attention_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
+                memo_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
                 sensory_input_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 blackboard,
                 attention_port,
@@ -79,6 +108,7 @@ impl CapabilityProviders {
                 clock,
                 time_division: TimeDivision::default(),
                 tiers,
+                runtime_events: RuntimeEventEmitter::new(runtime_event_sink),
             }),
         }
     }
@@ -157,6 +187,57 @@ impl CapabilityProviders {
     pub fn time_division(&self) -> TimeDivision {
         self.inner.time_division.clone()
     }
+
+    pub fn host_io(&self) -> HostIo {
+        HostIo {
+            owner: ModuleInstanceId::new(
+                ModuleId::new("host").expect("host module id is valid"),
+                ReplicaIndex::ZERO,
+            ),
+            root: self.clone(),
+        }
+    }
+
+    pub fn internal_harness_io(&self) -> InternalHarnessIo {
+        InternalHarnessIo {
+            owner: ModuleInstanceId::new(
+                ModuleId::new("eval-harness").expect("eval-harness module id is valid"),
+                ReplicaIndex::ZERO,
+            ),
+            root: self.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HostIo {
+    owner: ModuleInstanceId,
+    root: CapabilityProviders,
+}
+
+impl HostIo {
+    pub fn sensory_input_mailbox(&self) -> SensoryInputMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.sensory_input_topic.clone(),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct InternalHarnessIo {
+    owner: ModuleInstanceId,
+    root: CapabilityProviders,
+}
+
+impl InternalHarnessIo {
+    pub fn query_mailbox(&self) -> QueryMailbox {
+        TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
+    }
+
+    pub fn self_model_mailbox(&self) -> SelfModelMailbox {
+        TopicMailbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +295,10 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
+        TopicInbox::new_excluding_self(self.owner.clone(), self.root.inner.memo_updates.clone())
+    }
+
     pub fn sensory_input_mailbox(&self) -> SensoryInputMailbox {
         TopicMailbox::new(
             self.owner.clone(),
@@ -229,7 +314,12 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn memo(&self) -> Memo {
-        Memo::new(self.owner.clone(), self.root.inner.blackboard.clone())
+        Memo::new(
+            self.owner.clone(),
+            self.root.inner.blackboard.clone(),
+            TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
+            self.root.inner.runtime_events.clone(),
+        )
     }
 
     pub fn llm_access(&self) -> LlmAccess {
@@ -237,6 +327,7 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.tiers.clone(),
             self.root.inner.blackboard.clone(),
+            self.root.inner.runtime_events.clone(),
         )
     }
 
@@ -488,5 +579,21 @@ mod tests {
         let _w2 = summarize.attention_writer();
         let _a1 = controller.allocation_writer();
         let _a2 = controller.allocation_writer();
+    }
+
+    #[tokio::test]
+    async fn memo_updated_inbox_filters_self_writes() {
+        let caps = test_caps(Blackboard::default());
+        let summarize = scoped(&caps, builtin::summarize(), 0);
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let mut inbox = summarize.memo_updated_inbox();
+
+        summarize.memo().write("own memo").await;
+        sensory.memo().write("sensory memo").await;
+
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::sensory());
+        assert_eq!(event.body.owner.module, builtin::sensory());
+        assert!(inbox.take_ready_items().unwrap().items.is_empty());
     }
 }

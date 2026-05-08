@@ -1,0 +1,156 @@
+/// Schema for eval-cases/full-agent/**/*.eure files.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+id {
+  $variant: text
+  min-length = 1
+}
+id.$optional = true
+
+description = `text`
+description.$optional = true
+
+inputs = [`$types.full-agent-input`]
+
+memories = [`$types.memory-seed`]
+memories.$optional = true
+
+limits = `$types.eval-limits`
+limits.$optional = true
+
+checks = [`$types.check`]
+checks.$optional = true
+
+scoring = `$types.case-scoring`
+scoring.$optional = true
+
+@ $types.full-agent-input
+$variant: union
+
+variants.heard {
+  direction = `text`
+  direction.$optional = true
+  content {
+    $variant: text
+    min-length = 1
+  }
+}
+
+variants.seen {
+  direction = `text`
+  direction.$optional = true
+  appearance {
+    $variant: text
+    min-length = 1
+  }
+}
+
+@ $types.memory-rank
+$variant: union
+variants.short-term = { = "short-term", $variant => "literal" }
+variants.mid-term = { = "mid-term", $variant => "literal" }
+variants.long-term = { = "long-term", $variant => "literal" }
+variants.permanent = { = "permanent", $variant => "literal" }
+
+@ $types.memory-seed
+rank = `$types.memory-rank`
+rank.$optional = true
+decay-secs = `integer`
+decay-secs.$optional = true
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.eval-limits
+tick-ms = `integer`
+tick-ms.$optional = true
+max-ticks = `integer`
+max-ticks.$optional = true
+max-llm-calls = `integer`
+max-llm-calls.$optional = true
+
+@ $types.case-scoring
+judge-max-output-tokens = `integer`
+judge-max-output-tokens.$optional = true
+
+@ $types.check-common
+name = `text`
+name.$optional = true
+must-pass = `boolean`
+must-pass.$optional = true
+weight = `integer`
+weight.$optional = true
+
+@ $types.artifact-text-field
+$variant: union
+variants.output = { = "output", $variant => "literal" }
+variants.failure = { = "failure", $variant => "literal" }
+
+@ $types.rubric-criterion
+name = `text`
+description {
+  $variant: text
+  min-length = 1
+}
+weight = `integer`
+weight.$optional = true
+pass-score = `float`
+pass-score.$optional = true
+
+@ $types.check
+$variant: union
+
+variants.artifact-text-contains {
+  $flatten = [`$types.check-common`]
+  field = `$types.artifact-text-field`
+  field.$optional = true
+  contains = `text`
+}
+
+variants.artifact-text-exact {
+  $flatten = [`$types.check-common`]
+  field = `$types.artifact-text-field`
+  field.$optional = true
+  exact = `text`
+}
+
+variants.json-pointer-equals {
+  $flatten = [`$types.check-common`]
+  pointer = `text`
+  expected = `text`
+}
+
+variants.json-pointer-contains {
+  $flatten = [`$types.check-common`]
+  pointer = `text`
+  contains = `text`
+}
+
+variants.rubric {
+  $flatten = [`$types.check-common`]
+  rubric {
+    $variant: text
+    min-length = 1
+  }
+  pass-score = `float`
+  pass-score.$optional = true
+  criteria = [`$types.rubric-criterion`]
+  criteria.$optional = true
+}
+
+variants.trace-span {
+  $flatten = [`$types.check-common`]
+  span-name = `text`
+}
+
+variants.trace-event {
+  $flatten = [`$types.check-common`]
+  message-contains = `text`
+}
+
+variants.trace-spans-ordered {
+  $flatten = [`$types.check-common`]
+  names = [`text`]
+}
