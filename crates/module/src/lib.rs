@@ -14,6 +14,8 @@
 //! - LLM tier is read from allocation per-call inside [`LlmAccess`];
 //!   modules don't pick tiers themselves.
 
+pub use nuillu_blackboard::{ModuleRunStatus, UtteranceProgress, UtteranceProgressState};
+
 mod allocation_writer;
 mod attention;
 mod capabilities;
@@ -45,7 +47,7 @@ pub use channels::{
     MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox,
     MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox,
     SelfModelMailbox, SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
-    TopicInbox, TopicMailbox, TopicRecvError,
+    SpeakInbox, SpeakMailbox, SpeakRequest, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use llm::LlmAccess;
 pub use memo::Memo;
@@ -53,7 +55,7 @@ pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
 pub use ports::Embedder;
-pub use readers::{AllocationReader, AttentionReader, BlackboardReader};
+pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleStatusReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};

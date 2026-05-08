@@ -3,7 +3,9 @@ use std::pin::pin;
 use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_module::{AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch};
+use nuillu_module::{
+    AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch, ModuleRunStatus,
+};
 use nuillu_types::ModuleInstanceId;
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
@@ -99,14 +101,14 @@ pub async fn run(
                     Some(Ok(message)) => {
                         handle_task_message(
                             message,
+                            &runtime,
                             &owners,
-                            &active,
                             &mut states,
                             &mut tasks,
                             config,
                             &parent,
                             &subscriber,
-                        )?;
+                        ).await?;
                         refresh_active_and_schedule(
                             &runtime,
                             &owners,
@@ -184,6 +186,9 @@ async fn refresh_active_and_schedule(
     for index in 0..states.len() {
         match &states[index] {
             ModuleState::Stored(_) if active[index] => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
+                    .await;
                 let ModuleState::Stored(module) =
                     std::mem::replace(&mut states[index], ModuleState::Awaiting)
                 else {
@@ -191,7 +196,25 @@ async fn refresh_active_and_schedule(
                 };
                 spawn_next_batch(tasks, index, module, parent, subscriber);
             }
+            ModuleState::Stored(_) => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
+                    .await;
+            }
+            ModuleState::Awaiting if active[index] => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
+                    .await;
+            }
+            ModuleState::Awaiting => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
+                    .await;
+            }
             ModuleState::PendingBatch { .. } if active[index] => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
+                    .await;
                 let ModuleState::PendingBatch { module, batch } =
                     std::mem::replace(&mut states[index], ModuleState::Activating)
                 else {
@@ -199,15 +222,24 @@ async fn refresh_active_and_schedule(
                 };
                 spawn_activate(tasks, index, module, batch, config, parent, subscriber);
             }
-            _ => {}
+            ModuleState::PendingBatch { .. } => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
+                    .await;
+            }
+            ModuleState::Activating => {
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
+                    .await;
+            }
         }
     }
 }
 
-fn handle_task_message(
+async fn handle_task_message(
     message: TaskMessage,
+    runtime: &AgentRuntimeControl,
     owners: &[ModuleInstanceId],
-    active: &[bool],
     states: &mut [ModuleState],
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     config: AgentEventLoopConfig,
@@ -221,19 +253,36 @@ fn handle_task_message(
             result,
         } => match result {
             Ok(batch) => {
-                if active[index] {
+                if runtime.is_active(&owners[index]).await {
+                    runtime
+                        .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
+                        .await;
                     states[index] = ModuleState::Activating;
                     spawn_activate(tasks, index, module, batch, config, parent, subscriber);
                 } else {
+                    runtime
+                        .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
+                        .await;
                     states[index] = ModuleState::PendingBatch { module, batch };
                 }
                 Ok(())
             }
-            Err(message) => Err(SchedulerError::ModuleTaskFailed {
-                owner: owners[index].clone(),
-                phase: "next_batch",
-                message,
-            }),
+            Err(message) => {
+                runtime
+                    .record_module_status(
+                        owners[index].clone(),
+                        ModuleRunStatus::Failed {
+                            phase: "next_batch".to_string(),
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                Err(SchedulerError::ModuleTaskFailed {
+                    owner: owners[index].clone(),
+                    phase: "next_batch",
+                    message,
+                })
+            }
         },
         TaskMessage::Activate {
             index,
@@ -244,11 +293,22 @@ fn handle_task_message(
                 states[index] = ModuleState::Stored(module);
                 Ok(())
             }
-            Err(message) => Err(SchedulerError::ModuleTaskFailed {
-                owner: owners[index].clone(),
-                phase: "activate",
-                message,
-            }),
+            Err(message) => {
+                runtime
+                    .record_module_status(
+                        owners[index].clone(),
+                        ModuleRunStatus::Failed {
+                            phase: "activate".to_string(),
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                Err(SchedulerError::ModuleTaskFailed {
+                    owner: owners[index].clone(),
+                    phase: "activate",
+                    message,
+                })
+            }
         },
     }
 }
@@ -347,7 +407,10 @@ mod tests {
     use std::rc::Rc;
 
     use async_trait::async_trait;
-    use nuillu_blackboard::{ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{
+        ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ModuleRunStatus,
+        ResourceAllocation,
+    };
     use nuillu_module::{
         AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
         ModuleRegistry, QueryInbox, QueryRequest,
@@ -500,6 +563,96 @@ mod tests {
         }
     }
 
+    struct HangingBatchStub;
+
+    #[async_trait(?Send)]
+    impl Module for HangingBatchStub {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            std::future::pending().await
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+            unreachable!("hanging batch stub never produces a batch")
+        }
+    }
+
+    struct DelayedBatchStub {
+        release: Option<oneshot::Receiver<()>>,
+        activated: Rc<Cell<bool>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for DelayedBatchStub {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+            self.activated.set(true);
+            Ok(())
+        }
+    }
+
+    struct BlockingActivateStub {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingActivateStub {
+        type Batch = ();
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            Ok(())
+        }
+    }
+
+    async fn wait_for_status(
+        blackboard: &Blackboard,
+        owner: &nuillu_types::ModuleInstanceId,
+        expected: ModuleRunStatus,
+    ) {
+        for _ in 0..50 {
+            let status = blackboard
+                .read(|bb| bb.module_status_for_instance(owner).cloned())
+                .await;
+            if status.as_ref() == Some(&expected) {
+                return;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let status = blackboard
+            .read(|bb| bb.module_status_for_instance(owner).cloned())
+            .await;
+        panic!("expected status {expected:?}, got {status:?}");
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn typed_query_fanout_reaches_active_module() {
         let local = LocalSet::new();
@@ -558,6 +711,179 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn scheduler_records_awaiting_batch_status() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new("status-awaiting").unwrap();
+                let owner = nuillu_types::ModuleInstanceId::new(
+                    module_id.clone(),
+                    nuillu_types::ReplicaIndex::ZERO,
+                );
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        activation_ratio: ActivationRatio::ONE,
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let modules = ModuleRegistry::new()
+                    .register(module_id, 0..=1, |_| HangingBatchStub)
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async {
+                    wait_for_status(&blackboard, &owner, ModuleRunStatus::AwaitingBatch).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::AwaitingBatch)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn scheduler_records_pending_batch_when_ready_replica_is_now_inactive() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new("status-pending").unwrap();
+                let owner = nuillu_types::ModuleInstanceId::new(
+                    module_id.clone(),
+                    nuillu_types::ReplicaIndex::ZERO,
+                );
+                let mut active_alloc = ResourceAllocation::default();
+                active_alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        activation_ratio: ActivationRatio::ONE,
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+                let mut inactive_alloc = ResourceAllocation::default();
+                inactive_alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        activation_ratio: ActivationRatio::ZERO,
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+
+                let blackboard = Blackboard::with_allocation(active_alloc);
+                let caps = test_caps(blackboard.clone());
+                let (release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let activated = Rc::new(Cell::new(false));
+                let modules = ModuleRegistry::new()
+                    .register(module_id, 0..=1, {
+                        let release_rx = Rc::clone(&release_rx);
+                        let activated = Rc::clone(&activated);
+                        move |_| DelayedBatchStub {
+                            release: release_rx.borrow_mut().take(),
+                            activated: Rc::clone(&activated),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async {
+                    wait_for_status(&blackboard, &owner, ModuleRunStatus::AwaitingBatch).await;
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(inactive_alloc))
+                        .await;
+                    let _ = release_tx.send(());
+                    wait_for_status(&blackboard, &owner, ModuleRunStatus::PendingBatch).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert!(!activated.get());
+                assert_eq!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::PendingBatch)
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn scheduler_records_activating_status() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new("status-activating").unwrap();
+                let owner = nuillu_types::ModuleInstanceId::new(
+                    module_id.clone(),
+                    nuillu_types::ReplicaIndex::ZERO,
+                );
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        activation_ratio: ActivationRatio::ONE,
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let entered_tx = Rc::new(RefCell::new(Some(entered_tx)));
+                let (_release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let modules = ModuleRegistry::new()
+                    .register(module_id, 0..=1, {
+                        let entered_tx = Rc::clone(&entered_tx);
+                        let release_rx = Rc::clone(&release_rx);
+                        move |_| BlockingActivateStub {
+                            entered: entered_tx.borrow_mut().take(),
+                            release: release_rx.borrow_mut().take(),
+                            batch_sent: false,
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async {
+                    let _ = entered_rx.await;
+                    wait_for_status(&blackboard, &owner, ModuleRunStatus::Activating).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::Activating)
+                );
             })
             .await;
     }
@@ -685,7 +1011,8 @@ mod tests {
                     },
                 );
 
-                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
                     .register(fail_id.clone(), 0..=1, |_| AlwaysFailStub {
                         batch_sent: false,
@@ -711,6 +1038,15 @@ mod tests {
                     SchedulerError::ModuleTaskFailed { owner, phase: "activate", message }
                         if owner.module == fail_id
                             && message.contains("permanent activation failure")
+                ));
+                let owner =
+                    nuillu_types::ModuleInstanceId::new(fail_id, nuillu_types::ReplicaIndex::ZERO);
+                assert!(matches!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::Failed { phase, message })
+                        if phase == "activate" && message.contains("permanent activation failure")
                 ));
             })
             .await;
@@ -761,6 +1097,16 @@ mod tests {
 
                 assert!(done_rx.try_recv().is_err());
                 assert!(blackboard.memo(&inactive_id).await.is_none());
+                let owner = nuillu_types::ModuleInstanceId::new(
+                    inactive_id,
+                    nuillu_types::ReplicaIndex::ZERO,
+                );
+                assert_eq!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::Inactive)
+                );
             })
             .await;
     }

@@ -177,6 +177,7 @@ pub mod builtin {
         memory_compaction     => "memory-compaction",
         predict               => "predict",
         surprise              => "surprise",
+        speak_gate            => "speak-gate",
         speak                 => "speak",
     );
 }

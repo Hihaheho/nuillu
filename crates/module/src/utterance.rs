@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use nuillu_blackboard::{Blackboard, BlackboardCommand, UtteranceProgress};
 use nuillu_types::ModuleInstanceId;
 
 use crate::ports::{Clock, Utterance, UtteranceDelta, UtteranceSink};
@@ -13,6 +14,7 @@ use crate::ports::{Clock, Utterance, UtteranceDelta, UtteranceSink};
 /// and dropped so a slow sink does not stall the speak module.
 pub struct UtteranceWriter {
     owner: ModuleInstanceId,
+    blackboard: Blackboard,
     sink: Arc<dyn UtteranceSink>,
     clock: Arc<dyn Clock>,
     next_generation: Rc<Cell<u64>>,
@@ -21,11 +23,13 @@ pub struct UtteranceWriter {
 impl UtteranceWriter {
     pub(crate) fn new(
         owner: ModuleInstanceId,
+        blackboard: Blackboard,
         sink: Arc<dyn UtteranceSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             owner,
+            blackboard,
             sink,
             clock,
             next_generation: Rc::new(Cell::new(0)),
@@ -59,5 +63,14 @@ impl UtteranceWriter {
         if let Err(e) = self.sink.on_delta(delta).await {
             tracing::warn!(error = ?e, "utterance sink delta failed");
         }
+    }
+
+    pub async fn record_progress(&self, progress: UtteranceProgress) {
+        self.blackboard
+            .apply(BlackboardCommand::SetUtteranceProgress {
+                owner: self.owner.clone(),
+                progress,
+            })
+            .await;
     }
 }

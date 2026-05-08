@@ -27,6 +27,8 @@ pub struct Blackboard {
 #[derive(Debug, Default)]
 pub struct BlackboardInner {
     memos: HashMap<ModuleInstanceId, String>,
+    module_statuses: HashMap<ModuleInstanceId, ModuleRunStatus>,
+    utterance_progresses: HashMap<ModuleInstanceId, UtteranceProgress>,
     attention_streams: HashMap<ModuleInstanceId, AttentionStream>,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
@@ -40,6 +42,87 @@ pub struct BlackboardInner {
 pub struct MemoRecord {
     pub owner: ModuleInstanceId,
     pub memo: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModuleRunStatus {
+    Inactive,
+    AwaitingBatch,
+    PendingBatch,
+    Activating,
+    Failed { phase: String, message: String },
+}
+
+impl Default for ModuleRunStatus {
+    fn default() -> Self {
+        Self::Inactive
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRunStatusRecord {
+    pub owner: ModuleInstanceId,
+    pub status: ModuleRunStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UtteranceProgressState {
+    Streaming,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UtteranceProgress {
+    pub state: UtteranceProgressState,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub partial_utterance: String,
+    pub generation_hint: String,
+    pub rationale: String,
+}
+
+impl UtteranceProgress {
+    pub fn streaming(
+        generation_id: u64,
+        sequence: u32,
+        partial_utterance: impl Into<String>,
+        generation_hint: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: UtteranceProgressState::Streaming,
+            generation_id,
+            sequence,
+            partial_utterance: partial_utterance.into(),
+            generation_hint: generation_hint.into(),
+            rationale: rationale.into(),
+        }
+    }
+
+    pub fn completed(
+        generation_id: u64,
+        sequence: u32,
+        utterance: impl Into<String>,
+        generation_hint: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: UtteranceProgressState::Completed,
+            generation_id,
+            sequence,
+            partial_utterance: utterance.into(),
+            generation_hint: generation_hint.into(),
+            rationale: rationale.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UtteranceProgressRecord {
+    pub owner: ModuleInstanceId,
+    pub progress: UtteranceProgress,
 }
 
 struct ActivationWaiter {
@@ -190,6 +273,71 @@ impl BlackboardInner {
         records
     }
 
+    pub fn module_status_for_instance(&self, id: &ModuleInstanceId) -> Option<&ModuleRunStatus> {
+        self.module_statuses.get(id)
+    }
+
+    pub fn module_status_records(&self) -> Vec<ModuleRunStatusRecord> {
+        let mut records = self
+            .module_statuses
+            .iter()
+            .map(|(owner, status)| ModuleRunStatusRecord {
+                owner: owner.clone(),
+                status: status.clone(),
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            a.owner
+                .module
+                .as_str()
+                .cmp(b.owner.module.as_str())
+                .then_with(|| a.owner.replica.cmp(&b.owner.replica))
+        });
+        records
+    }
+
+    pub fn module_statuses(&self) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for record in self.module_status_records() {
+            object.insert(record.owner.to_string(), serde_json::json!(record.status));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    pub fn utterance_progress_for_instance(
+        &self,
+        id: &ModuleInstanceId,
+    ) -> Option<&UtteranceProgress> {
+        self.utterance_progresses.get(id)
+    }
+
+    pub fn utterance_progress_records(&self) -> Vec<UtteranceProgressRecord> {
+        let mut records = self
+            .utterance_progresses
+            .iter()
+            .map(|(owner, progress)| UtteranceProgressRecord {
+                owner: owner.clone(),
+                progress: progress.clone(),
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            a.owner
+                .module
+                .as_str()
+                .cmp(b.owner.module.as_str())
+                .then_with(|| a.owner.replica.cmp(&b.owner.replica))
+        });
+        records
+    }
+
+    pub fn utterance_progresses(&self) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for record in self.utterance_progress_records() {
+            object.insert(record.owner.to_string(), serde_json::json!(record.progress));
+        }
+        serde_json::Value::Object(object)
+    }
+
     pub fn memos(&self) -> serde_json::Value {
         let mut grouped = std::collections::BTreeMap::<String, Vec<(u8, String)>>::new();
         for (owner, memo) in &self.memos {
@@ -292,6 +440,12 @@ impl BlackboardInner {
         match cmd {
             BlackboardCommand::UpdateMemo { owner, memo } => {
                 self.memos.insert(owner, memo);
+            }
+            BlackboardCommand::SetModuleRunStatus { owner, status } => {
+                self.module_statuses.insert(owner, status);
+            }
+            BlackboardCommand::SetUtteranceProgress { owner, progress } => {
+                self.utterance_progresses.insert(owner, progress);
             }
             BlackboardCommand::AppendAttentionStream { stream, event } => {
                 self.attention_streams

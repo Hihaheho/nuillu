@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nuillu_blackboard::{AgenticDeadlockMarker, Blackboard, BlackboardCommand};
+use nuillu_blackboard::{AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModuleRunStatus};
 use nuillu_types::{
     ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
 };
@@ -19,9 +19,9 @@ use crate::{
     AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader, FileSearcher, LlmAccess,
     LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor, MemoryContentReader,
     MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, ModuleBatch,
-    QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox, SelfModelRequest,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox,
-    VectorMemorySearcher,
+    ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox,
+    SelfModelRequest, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox,
+    SpeakMailbox, SpeakRequest, TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -38,6 +38,7 @@ struct CapabilityProvidersInner {
     blackboard: Blackboard,
     query_topic: Topic<QueryRequest>,
     self_model_topic: Topic<SelfModelRequest>,
+    speak_topic: Topic<SpeakRequest>,
     memory_request_topic: Topic<MemoryRequest>,
     attention_updates: Topic<AttentionStreamUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
@@ -95,6 +96,7 @@ impl CapabilityProviders {
             inner: Arc::new(CapabilityProvidersInner {
                 query_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 self_model_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
+                speak_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 memory_request_topic: Topic::new(blackboard.clone(), TopicPolicy::RoleLoadBalanced),
                 attention_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
                 allocation_updates: Topic::new(blackboard.clone(), TopicPolicy::Fanout),
@@ -153,6 +155,10 @@ impl CapabilityProviders {
 
     pub fn allocation_reader(&self) -> AllocationReader {
         AllocationReader::new(self.inner.blackboard.clone())
+    }
+
+    pub fn module_status_reader(&self) -> ModuleStatusReader {
+        ModuleStatusReader::new(self.inner.blackboard.clone())
     }
 
     pub fn vector_memory_searcher(&self) -> VectorMemorySearcher {
@@ -230,6 +236,12 @@ impl AgentRuntimeControl {
         self.blackboard
             .read(|bb| bb.allocation().is_replica_active(owner))
             .await
+    }
+
+    pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
+        self.blackboard
+            .apply(BlackboardCommand::SetModuleRunStatus { owner, status })
+            .await;
     }
 
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
@@ -314,6 +326,14 @@ impl ModuleCapabilityFactory {
         TopicInbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
     }
 
+    pub fn speak_mailbox(&self) -> SpeakMailbox {
+        TopicMailbox::new(self.owner.clone(), self.root.inner.speak_topic.clone())
+    }
+
+    pub fn speak_inbox(&self) -> SpeakInbox {
+        TopicInbox::new(self.owner.clone(), self.root.inner.speak_topic.clone())
+    }
+
     pub fn memory_request_mailbox(&self) -> MemoryRequestMailbox {
         TopicMailbox::new(
             self.owner.clone(),
@@ -390,6 +410,10 @@ impl ModuleCapabilityFactory {
         self.root.allocation_reader()
     }
 
+    pub fn module_status_reader(&self) -> ModuleStatusReader {
+        self.root.module_status_reader()
+    }
+
     pub fn vector_memory_searcher(&self) -> VectorMemorySearcher {
         self.root.vector_memory_searcher()
     }
@@ -437,6 +461,7 @@ impl ModuleCapabilityFactory {
     pub fn utterance_writer(&self) -> UtteranceWriter {
         UtteranceWriter::new(
             self.owner.clone(),
+            self.root.inner.blackboard.clone(),
             self.root.inner.utterance_sink.clone(),
             self.root.inner.clock.clone(),
         )
@@ -617,6 +642,7 @@ mod tests {
     use async_trait::async_trait;
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation,
+        UtteranceProgress,
     };
     use nuillu_types::{ModelTier, ReplicaCapRange, builtin};
 
@@ -753,5 +779,31 @@ mod tests {
         let event = memo_updates.next_item().await.unwrap();
         assert_eq!(event.sender.module, builtin::speak());
         assert_eq!(event.body.owner.module, builtin::speak());
+    }
+
+    #[tokio::test]
+    async fn utterance_writer_owner_stamps_stream_progress() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let speak = scoped(&caps, builtin::speak(), 0);
+
+        speak
+            .utterance_writer()
+            .record_progress(UtteranceProgress::streaming(
+                7,
+                2,
+                "Koro, wait",
+                "answer Koro",
+                "peer needs response",
+            ))
+            .await;
+
+        let records = blackboard.read(|bb| bb.utterance_progress_records()).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner.module, builtin::speak());
+        assert_eq!(
+            records[0].progress,
+            UtteranceProgress::streaming(7, 2, "Koro, wait", "answer Koro", "peer needs response",)
+        );
     }
 }

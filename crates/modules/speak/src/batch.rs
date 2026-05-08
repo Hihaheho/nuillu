@@ -1,20 +1,45 @@
 use anyhow::Result;
+use nuillu_module::SpeakRequest;
 
-use crate::SpeakModule;
+use crate::{SpeakGateModule, SpeakModule};
+
+#[derive(Debug)]
+pub struct NextBatch {
+    pub(crate) request: SpeakRequest,
+}
+
+impl SpeakGateModule {
+    pub(crate) async fn next_batch(&mut self) -> Result<()> {
+        let _ = self.attention_updates.next_item().await?;
+        let _ = self.attention_updates.take_ready_items()?;
+        Ok(())
+    }
+}
 
 impl SpeakModule {
-    pub(crate) async fn next_batch(&mut self) -> Result<()> {
-        tokio::select! {
-            update = self.updates.next_item() => {
-                let _ = update?;
-            }
-            update = self.allocation_updates.next_item() => {
-                let _ = update?;
-            }
+    pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
+        let first = self.requests.next_item().await?;
+        let mut request = first.body;
+        for ready in self.requests.take_ready_items()?.items {
+            request = ready.body;
         }
 
-        let _ = self.updates.take_ready_items()?;
-        let _ = self.allocation_updates.take_ready_items()?;
-        Ok(())
+        Ok(NextBatch { request })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_ready_request_wins() {
+        let mut batch = NextBatch {
+            request: SpeakRequest::new("first", "old"),
+        };
+        batch.request = SpeakRequest::new("second", "new");
+
+        assert_eq!(batch.request.generation_hint, "second");
+        assert_eq!(batch.request.rationale, "new");
     }
 }

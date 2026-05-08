@@ -6,7 +6,11 @@
 //! cannot read the non-cognitive blackboard, regardless of what its
 //! `run` body tries.
 
-use nuillu_blackboard::{AttentionStream, Blackboard, BlackboardInner, ResourceAllocation};
+use nuillu_blackboard::{
+    AttentionStream, Blackboard, BlackboardInner, ModuleRunStatus, ModuleRunStatusRecord,
+    ResourceAllocation,
+};
+use nuillu_types::ModuleInstanceId;
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
@@ -138,12 +142,42 @@ impl AllocationReader {
     }
 }
 
+/// Read-only access to scheduler-owned module lifecycle status.
+#[derive(Clone)]
+pub struct ModuleStatusReader {
+    blackboard: Blackboard,
+}
+
+impl ModuleStatusReader {
+    pub(crate) fn new(blackboard: Blackboard) -> Self {
+        Self { blackboard }
+    }
+
+    pub async fn status_for_instance(&self, owner: &ModuleInstanceId) -> ModuleRunStatus {
+        self.blackboard
+            .read(|bb| {
+                bb.module_status_for_instance(owner)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .await
+    }
+
+    pub async fn records(&self) -> Vec<ModuleRunStatusRecord> {
+        self.blackboard.read(|bb| bb.module_status_records()).await
+    }
+
+    pub async fn snapshot_json(&self) -> serde_json::Value {
+        self.blackboard.read(|bb| bb.module_statuses()).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use nuillu_blackboard::BlackboardCommand;
-    use nuillu_types::{ReplicaCapRange, builtin};
+    use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
 
     #[tokio::test]
     async fn controller_schema_enumerates_registered_modules_with_cap_ranges() {
@@ -198,6 +232,41 @@ mod tests {
                     },
                 },
                 "required": ["memo", "allocations"],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn module_status_reader_exposes_scheduler_owned_status() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        blackboard
+            .apply(BlackboardCommand::SetModuleRunStatus {
+                owner: owner.clone(),
+                status: ModuleRunStatus::Activating,
+            })
+            .await;
+        let reader = ModuleStatusReader::new(blackboard);
+
+        assert_eq!(
+            reader.status_for_instance(&owner).await,
+            ModuleRunStatus::Activating
+        );
+        assert_eq!(
+            reader
+                .status_for_instance(&ModuleInstanceId::new(
+                    builtin::query_vector(),
+                    ReplicaIndex::ZERO,
+                ))
+                .await,
+            ModuleRunStatus::Inactive
+        );
+        assert_eq!(
+            reader.snapshot_json().await,
+            serde_json::json!({
+                "speak": {
+                    "state": "activating"
+                }
             })
         );
     }

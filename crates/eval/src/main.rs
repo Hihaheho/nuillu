@@ -72,6 +72,10 @@ struct Args {
     /// Stop the suite after the first failed or invalid case.
     #[arg(long)]
     fail_fast: bool,
+
+    /// Optional case id/path substring patterns. When present, only matching cases run.
+    #[arg(value_name = "PATTERN")]
+    patterns: Vec<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         premium_backend,
         model_dir: args.model_dir,
         fail_fast: args.fail_fast,
+        case_patterns: args.patterns,
     };
 
     let report = run_suite(&config).await?;

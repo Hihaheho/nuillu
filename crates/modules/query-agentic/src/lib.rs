@@ -13,6 +13,9 @@ pub use batch::NextBatch as QueryAgenticBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-agentic module.
 Choose read-only file searches only. Use the search_files tool for file and text lookup.
+If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
+requested facts, proper nouns, route/world terms, filenames hinted by the guidance, and the
+needed_fact phrases.
 The tool intentionally exposes only ripgrep-like controls: pattern, regex, invert_match,
 case_sensitive, context, and max_matches.
 The backend is lexical line search like ripgrep, not semantic search. Exact words and short
@@ -106,8 +109,14 @@ impl QueryAgenticModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_guidance(&self) -> Result<()> {
-        let question = "Act on current allocation guidance for useful file context.";
-        let hits = self.search_with_files(&[question.to_owned()]).await?;
+        let allocation = self.allocation.snapshot().await;
+        let guidance = allocation
+            .iter()
+            .find(|(id, _config)| id.as_str() == "query-agentic")
+            .map(|(_id, config)| config.guidance.as_str())
+            .unwrap_or_default();
+        let question = guidance_question(guidance, "file");
+        let hits = self.search_with_files(&[question]).await?;
         self.write_hits(&hits).await
     }
 
@@ -222,6 +231,32 @@ fn hit_snippets(hits: &[QueryFileHit]) -> String {
         }
     }
     snippets.join("\n\n")
+}
+
+fn guidance_question(guidance: &str, context_kind: &str) -> String {
+    let trimmed = guidance.trim();
+    if trimmed.is_empty() {
+        return format!("Act on current allocation guidance for useful {context_kind} context.");
+    }
+    format!("Act on this allocation guidance for {context_kind} lookup: {trimmed}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_question_carries_concrete_guidance() {
+        let question = guidance_question(
+            "speech-evidence request: question=torus route; needed_fact=eastbound appears west",
+            "file",
+        );
+
+        assert_eq!(
+            question,
+            "Act on this allocation guidance for file lookup: speech-evidence request: question=torus route; needed_fact=eastbound appears west"
+        );
+    }
 }
 
 #[async_trait(?Send)]

@@ -5,7 +5,7 @@ use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
     QueryInbox, QueryRequest, VectorMemorySearcher,
 };
-use nuillu_types::{MemoryIndex, MemoryRank};
+use nuillu_types::{MemoryIndex, MemoryRank, builtin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,10 @@ pub use batch::NextBatch as QueryVectorBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
 Choose vector-memory searches only. Use search_vector_memory for factual memory lookup, then stop.
+If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
+requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
+phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
+question is available.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
 results. You must call search_vector_memory before returning the structured completion. The runtime
 memoizes only memory hit content returned by tools. Return only raw JSON for the structured
@@ -97,8 +101,10 @@ impl QueryVectorModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_guidance(&self) -> Result<()> {
-        let question = "Act on current allocation guidance for useful memory context.";
-        let hits = self.search_with_memory(&[question.to_owned()]).await?;
+        let allocation = self.allocation.snapshot().await;
+        let guidance = allocation.for_module(&builtin::query_vector()).guidance;
+        let question = guidance_question(&guidance, "memory");
+        let hits = self.search_with_memory(&[question]).await?;
         self.write_hits(&hits).await
     }
 
@@ -213,6 +219,32 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
         }
     }
     contents.join("\n\n")
+}
+
+fn guidance_question(guidance: &str, context_kind: &str) -> String {
+    let trimmed = guidance.trim();
+    if trimmed.is_empty() {
+        return format!("Act on current allocation guidance for useful {context_kind} context.");
+    }
+    format!("Act on this allocation guidance for {context_kind} lookup: {trimmed}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_question_carries_concrete_guidance() {
+        let question = guidance_question(
+            "speech-evidence request: question=what body do I have; needed_fact=frog body",
+            "memory",
+        );
+
+        assert_eq!(
+            question,
+            "Act on this allocation guidance for memory lookup: speech-evidence request: question=what body do I have; needed_fact=frog body"
+        );
+    }
 }
 
 #[async_trait(?Send)]

@@ -14,7 +14,12 @@ const SYSTEM_PROMPT: &str = r#"You are the attention-gate module.
 Read the non-cognitive blackboard snapshot and allocation guidance, then decide whether anything
 should enter the cognitive attention stream. Append only concise, novel, currently relevant events.
 When promoting sensory memo content, convert detailed observation ages to one of the provided
-time-division tags before writing attention text. Return only raw JSON for the structured object;
+time-division tags before writing attention text.
+If allocation guidance asks for speech evidence promotion and a query, self-model, sensory, or
+other memo contains the requested fact, promote that fact into attention in plain speech-ready form.
+Include the retrieved fact and the immediate attended question or peer situation. Do not promote
+generic advice, speculation, hidden module mechanics, or facts not present in memos.
+Return only raw JSON for the structured object;
 do not wrap it in Markdown or code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

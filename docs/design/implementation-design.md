@@ -21,7 +21,7 @@ This document is the implementation source of truth. It describes the desired ar
 10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. `QueryRequest` and `SelfModelRequest` are internal module messages; eval may publish them only from module-level harnesses.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
 12. **Streaming for user-visible output, collect for internal decisions** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules (structured decision turns and tool loops) use `.collect()` because their output is memo-authoritative and has no value until complete and validated. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
-13. **Attention/allocation interruption of speak streaming** — If `AttentionStreamUpdated` or `AllocationUpdated` arrives while speak is generating, the current text stream is cancelled and generation restarts with fresh attention and allocation snapshots. This ensures speak's utterances reflect both the latest attended state and the latest controller guidance.
+13. **SpeakRequest-only interruption of speak streaming** — Speak streaming is cancelled only by a new typed `SpeakRequest`. Attention updates wake SpeakGate, which reads scheduler-owned module status plus utterance progress and decides whether the new attention stream warrants sending a replacement request.
 14. **Local deterministic inbox batching** — Modules may batch transient inbox activations immediately before LLM work. Batching is module-local, bounded by boot-time module registration, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership.
 15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
 16. **Controller proposals with deterministic effective allocation** — Attention-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, then computes active replicas from each module's boot-time cap range.
@@ -210,6 +210,13 @@ pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 pub struct AllocationUpdated;
 pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 
+pub struct SpeakRequest {
+    pub generation_hint: String,
+    pub rationale: String,
+}
+pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
+pub type SpeakInbox   = TopicInbox<SpeakRequest>;
+
 pub struct MemoryRequest {
     pub content: String,
     pub importance: MemoryImportance,
@@ -227,7 +234,7 @@ Delivery policy is per topic:
 - `AttentionStreamUpdated` is fanout: every active subscriber replica receives the wake signal.
 - `MemoUpdated` is fanout with self-filtering at the inbox handle: every active subscriber replica receives memo writes except its own writes.
 - `AllocationUpdated` is fanout: every active subscriber replica receives the wake signal when effective allocation or guidance changes.
-- `QueryRequest`, `SelfModelRequest`, `SensoryInput`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
+- `QueryRequest`, `SelfModelRequest`, `SpeakRequest`, `SensoryInput`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
 `SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
@@ -267,12 +274,13 @@ pub struct UtteranceDelta {
 
 `UtteranceWriter` owner-stamps the emitting module instance, stamps `emitted_at` from `Clock`, and sends utterances to an `UtteranceSink`. The writer is a side-effect capability like `AttentionWriter`; it is not a request/response path.
 
-`UtteranceWriter` exposes two methods:
+`UtteranceWriter` exposes three methods:
 
 - `emit(text)` — stamps `emitted_at`, owner, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
 - `emit_delta(generation_id, sequence, delta)` — sends a `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
+- `record_progress(progress)` — owner-stamps the latest utterance progress on the blackboard so SpeakGate can inspect partial speech while deciding whether a replacement `SpeakRequest` is needed.
 
-`UtteranceDelta` carries no durability semantics. When generation is interrupted (attention-stream update or LLM retry), speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Sinks append resumed chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
+`UtteranceDelta` carries no durability semantics. When generation is interrupted by an LLM retry, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Speak cancels a current stream only when it receives a newer typed `SpeakRequest`; attention updates wake SpeakGate, which may send that replacement request after inspecting module status and utterance progress. Sinks append resumed retry chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
 
 ### Allocation updates
 
@@ -296,7 +304,7 @@ The awaited receive and ready drain are module-local. Active-replica gating happ
 
 Wake-only activations such as `AttentionStreamUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as attention streams, memos, or allocation. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `MemoryRequest`, and `SensoryInput` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until the event loop activates the replica.
 
-If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation unless that module has its own interruption rule; speak's attention/allocation-update interruption is the v1 preemption behavior.
+If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation. Speak's v1 preemption rule is narrower: only a newer typed `SpeakRequest` cancels the active stream.
 
 Boot policy should register `attention-controller` with `cap_range.min >= 1`. If all controller replicas are disabled by host policy, only the host or explicit boot wiring can recover allocation.
 
@@ -329,7 +337,7 @@ Module conventions:
 - Attention-update modules, such as attention-schema, predict, and surprise, collapse multiple ready attention updates into one wake activation and reread the attention stream as source of truth.
 - Query and self-model modules collect ready explicit requests into a module-local batch and answer the batch in one LLM turn. The module decides answer granularity and memo write policy; channel responses and request/response correlation remain out of scope.
 - Memory collects ready `MemoryRequest` values into a deterministic batch of memory candidates, passes them with the blackboard snapshot to its LLM deliberation, and writes only through `insert_memory` tool calls. A request is not a durable write command; the memory module may deduplicate, merge, normalize, or reject candidates.
-- Speak may batch while waiting to start work, but attention and allocation updates received during a generation stream remain immediate interruption signals and are not delayed behind start-time batching.
+- Speak may batch queued `SpeakRequest` values while waiting to start work. During a generation stream, only a newer `SpeakRequest` is an immediate interruption signal; attention updates wake SpeakGate rather than Speak.
 - Sensory batching is deferred in v1 because its batching policy is tied to salience, habituation, and stimulus decay rather than generic activation collapse.
 
 ### Replica-owned blackboard views
@@ -370,6 +378,7 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `BlackboardReader` | no | read whole blackboard through compact grouped views |
 | `AttentionReader` | no | read the attention-stream set only |
 | `AllocationReader` | no | read effective allocation snapshot and, for controller prompts, registry cap metadata |
+| `ModuleStatusReader` | no | read scheduler-owned module run status |
 | `VectorMemorySearcher` | no | primary-store memory search + access metadata patch |
 | `MemoryContentReader` | no | primary-store content lookup by memory index |
 | `MemoryWriter` | no | primary-assigned insert + storage-replica fan-out + single metadata mirror |
@@ -501,9 +510,9 @@ Wakes only on memo updates, excluding its own memo writes. It reads the blackboa
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
 
-When current memos and attention suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it lowers `speak.activation_ratio` when the speak registration permits `min = 0`, keeps or raises query and attention-gate activation ratios/tier, and writes explicit guidance telling Speak to wait silently. Query modules continue to write memo-authoritative results; attention-gate may later promote useful query memo content into attention streams. Once attended state and memos indicate that enough evidence is available for a user-visible answer, the controller raises Speak and updates its guidance.
+When current memos and attention suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps `speak` and `speak-gate` active, keeps or raises query and attention-gate activation ratios/tier, and writes guidance for the modules that can gather or promote the missing evidence. Query modules continue to write memo-authoritative results; attention-gate may later promote useful query memo content into attention streams. Once attended state and memos indicate that enough evidence is available for a user-visible answer, SpeakGate can send Speak a typed `SpeakRequest`.
 
-This is not a request/response wait and not a query-completion correlation protocol. The controller judges readiness from memos, attention, and allocation guidance, while query results remain durable only through query-module memos.
+This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memos, attention, and allocation state, while query results remain durable only through query-module memos.
 
 ### Attention Schema
 
@@ -565,63 +574,23 @@ Surprise does not generate forward predictions; its activation is attention-driv
 
 The v1 surprise threshold is represented by the structured LLM field `significant`; there is no numeric global threshold yet.
 
+### SpeakGate
+
+Capabilities: `AttentionStreamUpdatedInbox`, `AttentionReader`, `BlackboardReader`, `ModuleStatusReader`, `Memo`, `SpeakMailbox`, `LlmAccess`.
+
+Activates only on attention updates. Reads the attention-stream set, blackboard memos, scheduler-owned module status, and utterance progress to decide whether the current cognitive surface is speech-ready. If speak is not currently streaming, it uses the normal readiness prompt. If speak is currently activating and utterance progress is streaming, it uses an interruption prompt that compares the new attention stream with the partial utterance and current generation hint. If speech is ready or the current stream should be replaced, it publishes a typed `SpeakRequest`; otherwise it writes the wait decision and any missing-evidence notes to its memo. SpeakGate does not emit utterances, write attention, write allocation, or publish query/self-model requests.
+
 ### Speak
 
-Capabilities: `AttentionStreamUpdatedInbox`, `AllocationUpdatedInbox`, `AttentionReader`, `AllocationReader`, `UtteranceWriter`, `Memo`, `Clock`, `LlmAccess`.
+Capabilities: `SpeakInbox`, `AttentionReader`, `UtteranceWriter`, `Memo`, `Clock`, `LlmAccess`.
 
 Emits user-visible text. The module is named `speak`, not `talk`, because it represents the concrete speech action capability rather than the whole conversational process.
 
-Speak reads only the attention-stream set and allocation guidance — it has no `BlackboardReader` and does not inspect other modules' memos. This keeps the utterance boundary narrow: speak distills what is attended and follows controller guidance, not the full blackboard state.
+Speak reads only the attention-stream set and a typed `SpeakRequest` — it has no `BlackboardReader`, no `AllocationReader`, and does not inspect other modules' memos or allocation guidance. This keeps the utterance boundary narrow: speak distills what is attended according to the generation hint selected by SpeakGate.
 
-Speak replicas are allocation-suppressed during evidence gathering. If a speak replica has a pending attention/allocation batch while inactive, the event loop preserves that pending wake without a decision turn, generation turn, memo write, delta, or complete utterance. When allocation later includes that replica, the pending wake runs once against fresh attention and allocation snapshots; it does not need another attention update just to start speaking.
+Speak has no decision turn. It waits on `SpeakInbox`; receiving a `SpeakRequest` starts a generation turn. If multiple requests are queued, the latest request wins. During `text_turn().stream()`, each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()` and mirrored into utterance progress as the current partial utterance. The only stream-cancel path is receiving another `SpeakRequest`; attention updates cannot cancel speak directly.
 
-Speak uses a two-stage LLM interaction:
-
-1. **Decision turn** — `structured_turn::<SpeakDecision>().collect()`. Reads the current attention-stream set and allocation snapshots and determines whether a response is warranted (`should_respond`, `rationale`, optional generation hint). If `should_respond` is false, speak writes the decision to its memo and emits nothing.
-2. **Generation turn** — `text_turn().stream()`. Each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()`. Speak simultaneously listens on `AttentionStreamUpdatedInbox` and `AllocationUpdatedInbox` via `tokio::select!`. If either update arrives before the stream completes, the stream is cancelled and speak restarts from step 1 with fresh snapshots:
-
-```rust
-loop {
-    let attention = attention_reader.snapshot().await;
-    let allocation = allocation_reader.snapshot().await;
-    // Stage 1: decide
-    let decision = session.structured_turn::<SpeakDecision>()
-        .collect().await?;
-    if !decision.should_respond { break; }
-    // Stage 2: stream generation
-    let mut stream = session.text_turn().stream().await?;
-    let mut accumulated = String::new();
-    let mut gen_id = utterance_writer.next_generation_id();
-    let mut seq = 0u32;
-    let interrupted = loop {
-        tokio::select! {
-            event = stream.next() => match event {
-                Some(Ok(TextTurnEvent::TextDelta { delta })) => {
-                    accumulated.push_str(&delta);
-                    utterance_writer.emit_delta(gen_id, seq, &delta).await;
-                    seq += 1;
-                }
-                Some(Ok(TextTurnEvent::WillRetry { .. })) => {
-                    accumulated.clear();
-                    gen_id = utterance_writer.next_generation_id();
-                    seq = 0;
-                }
-                Some(Ok(TextTurnEvent::Completed { .. })) | None => break false,
-                _ => {}
-            },
-            _ = attention_inbox.recv() => break true,
-            _ = allocation_inbox.recv() => break true,
-        }
-    };
-    if interrupted { continue; } // restart with new context
-    // Stage 3: commit
-    memo.write(SpeakMemo { utterance: accumulated.clone(), rationale: decision.rationale }).await;
-    utterance_writer.emit(accumulated).await;
-    break;
-}
-```
-
-Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, the preferred control path is for attention-controller proposals to lower `speak.activation_ratio` and/or give Speak guidance to wait silently while query and attention-gate work progresses. A completed utterance memo wakes the controller so it can reclaim Speak resources afterward.
+Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, SpeakGate records its wait decision in memo and the attention controller routes any useful query or attention-promotion work through ordinary allocation guidance. A completed utterance memo wakes the controller as ordinary output context, but speech start itself is not controlled through memo JSON or allocation guidance.
 
 ---
 
@@ -684,7 +653,7 @@ Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` in
 `UtteranceSink` is not a query response channel. It is an observable action log for host applications and eval harnesses. It exposes two notification surfaces:
 
 - `on_complete(utterance: Utterance)` — a complete, timestamped utterance. Every compliant sink must implement this.
-- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. If generation is interrupted by an attention-stream update or LLM retry, speak resumes the same utterance with the same `generation_id` and the next `sequence`; sinks append those resumed chunks to the partial text they already accepted.
+- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. If generation retries, speak resumes the same utterance with the same `generation_id` and the next `sequence`; if a newer `SpeakRequest` replaces the stream, speak starts a new generation. Sinks append resumed retry chunks to the partial text they already accepted.
 
 Implementations may persist utterances, stream deltas to UI, or both. The `on_complete` call always follows the full `on_delta` sequence for the same `generation_id`, so a UI adapter that consumed deltas can use `on_complete` as a framing signal rather than re-rendering the text.
 
@@ -727,16 +696,16 @@ This keeps realistic artifacts observable without adding request/response correl
 | Disabled replicas perform no semantic work | routed topics target active replicas only, and the event loop does not start `next_batch` or `activate` for inactive replicas |
 | Controller schema matches registered caps | attention-controller schema is generated from the registry and parsed output is clamped after decoding |
 | Controller, attention schema, and self-model are separate modules | separate crates and separate constructor capabilities |
-| Controller wakes only on memo updates | it receives `MemoUpdatedInbox`, not `AttentionStreamUpdatedInbox`, and the inbox filters self writes |
+| Controller wakes only on memo updates | it receives `MemoUpdatedInbox`, not `AttentionStreamUpdatedInbox`; memo inbox filters self writes |
 | Sensory is the full-agent observation boundary | full-agent boot wiring grants `SensoryInputInbox` only to sensory |
 | Full-agent external input is sensory-only | app/full-agent eval uses `HostIo` with only `SensoryInputMailbox`; `QueryRequest` and `SelfModelRequest` are internal messages |
 | Sensory cannot answer, route work, or alter cognition directly | it receives no `QueryMailbox`, `SelfModelMailbox`, `UtteranceWriter`, `AttentionWriter`, `AllocationWriter`, memory capabilities, or readers |
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `AttentionWriter`, `AllocationWriter`, or memory capabilities |
-| Speak reads only attention and allocation | it receives `AttentionReader` and `AllocationReader`, not `BlackboardReader` |
-| Speak suppression is allocation-controlled | attention-controller proposals lower `speak.activation_ratio` or guidance; inactive speak replicas are not activated by the event loop and emit only when active |
+| Speak reads only attention and typed speech requests | it receives `AttentionReader` and `SpeakInbox`, not `BlackboardReader` or `AllocationReader` |
+| Speak start is channel-controlled | `SpeakRequest` from SpeakGate is the only speech-start protocol; allocation guidance is not parsed by speak |
 | Speak still does not route query work | evidence gathering is driven by allocation, query memos, and attention updates; speak receives no `QueryMailbox` |
-| Speak interrupts streaming on attention/allocation updates | speak holds `AttentionStreamUpdatedInbox` and `AllocationUpdatedInbox`; generation restarts from step 1 with fresh attention and allocation snapshots |
+| Speak interrupts streaming only on `SpeakRequest` | attention updates wake SpeakGate, which may send a replacement `SpeakRequest`; speak does not subscribe to `AttentionStreamUpdatedInbox` |
 | Attention-gate replicas are the only path to attention stream append | boot-time wiring grants `AttentionWriter` only to attention-gate registrations; each replica writes its own stream |
 | Attention-gate cannot wake controller directly | attention-gate has no `Memo`; attention appends publish `AttentionStreamUpdated`, which the controller does not receive |
 | Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to attention-controller registrations; runtime computes effective allocation |

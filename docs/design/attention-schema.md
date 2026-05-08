@@ -72,11 +72,13 @@ There is no periodic wake mechanism. Allocation guidance is the controller's dur
 Guidance-based allocation flow:
 
 ```text
-Sensory memo -> AttentionController -> AllocationUpdated -> AttentionGate -> AttentionStreamUpdated -> Speak
+Sensory memo -> AttentionController -> AllocationUpdated -> AttentionGate -> AttentionStreamUpdated -> SpeakGate
+SpeakGate -> SpeakRequest -> Speak
+SpeakGate memo -> AttentionController -> AllocationUpdated -> Query/AttentionGate
 Query/Speak/etc memo -> AttentionController -> AllocationUpdated -> modules
 ```
 
-Attention-gate does not write a memo. Attention appended by attention-gate wakes attention consumers such as attention-schema, Speak, Predict, and Surprise, but does not directly wake the controller. Speak writes a completion memo after a finished utterance; that memo wakes the controller so it can reduce `speak.activation_ratio` and reallocate resources.
+Attention-gate does not write a memo. Attention appended by attention-gate wakes attention consumers such as attention-schema, SpeakGate, Predict, and Surprise, but does not directly wake the controller or Speak. SpeakGate sends a typed one-shot `SpeakRequest` to Speak when the attention stream is speech-ready or when a current stream should be replaced. When SpeakGate waits, its decision and missing-evidence notes are durable only in its memo; the memo update wakes the controller through the ordinary memo path. Speak writes a completion memo after a finished utterance.
 
 ## Capabilities
 
@@ -93,7 +95,8 @@ Attention-gate does not write a memo. Attention appended by attention-gate wakes
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox`, `AllocationUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AttentionStreamUpdatedInbox`, `MemoryRequestMailbox` |
-| speak | — | ✓ | ✓ | ✓ | ✓ | ✓ | `AttentionStreamUpdatedInbox`, `AllocationUpdatedInbox`, `UtteranceWriter` |
+| speak-gate | ✓ | ✓ | — | ✓ | — | ✓ | `AttentionStreamUpdatedInbox`, `ModuleStatusReader`, `SpeakMailbox` |
+| speak | — | ✓ | — | ✓ | ✓ | ✓ | `SpeakInbox`, `UtteranceWriter` |
 
 Notable absences:
 
@@ -101,10 +104,11 @@ Notable absences:
 - The self-model module handles explicit self-model questions, but has no attention-write, allocation-write, or memory-write path.
 - Query modules do not receive self-model requests and do not answer self-referential questions.
 - The sensory module is the app-facing observation boundary; it cannot write attention, publish work requests, or emit utterances.
-- The speak module is the app-facing output boundary; it cannot write attention, allocation, memory, or query/self-model requests.
+- The speak-gate module can inspect memos to decide speech readiness, but cannot emit utterances, write attention, change allocation, memory, or publish query/self-model requests.
+- The speak module is the app-facing output boundary; it cannot read blackboard memos or allocation guidance, and cannot write attention, allocation, memory, or query/self-model requests.
 - Only attention-gate can write the attention stream.
 - Attention-gate cannot write memo, so attention appends cannot wake the controller directly.
-- The attention controller wakes only on memo updates, excluding its own memo writes; it reads the attention stream but is not woken by `AttentionStreamUpdated`.
+- The attention controller wakes on memo updates; it reads the attention stream but is not woken by `AttentionStreamUpdated`.
 - Only the attention controller can write resource allocation.
 - The memory module cannot increment remember tokens; that belongs to memory compaction.
 - Predict does not send memory requests; that belongs to surprise.
@@ -143,7 +147,7 @@ When sensory memo content is promoted, attention-gate rounds the detailed memo a
 
 Wakes only on memo updates from other modules. It reads the blackboard memo set, memory metadata, attention stream, and current allocation, then writes the next resource allocation for every registered module: `activation_ratio`, natural-language `guidance`, and `tier`.
 
-The controller uses guidance rather than request/response correlation. For example, if Speak should wait for query or attention-gate work, the controller raises the relevant modules and gives Speak guidance to wait silently until attended evidence is sufficient.
+The controller uses guidance rather than request/response correlation. For example, if speech should wait for query or attention-gate work, the controller raises the relevant modules and lets SpeakGate keep speech silent until attended evidence is sufficient. Speak itself does not parse allocation guidance.
 
 ### Attention Schema
 
@@ -187,13 +191,27 @@ Surprise-triggered requests carry `Normal` / `High` importance as memory-module 
 
 Surprise does not generate predictions. When the predict memo is absent, surprise acts as a novelty detector over the attention stream — it judges unexpectedness from recent history rather than from explicit predictions.
 
+### SpeakGate
+
+Decides whether attention is ready for speech. SpeakGate is triggered only by attention-stream
+updates. When it wakes, it can read blackboard memos, the attention stream, scheduler-owned module
+status, and utterance progress, so it can distinguish memo-only facts from attended facts and decide
+whether a new attention stream should interrupt an in-progress utterance. If speech is ready or an
+in-progress stream should be replaced, it sends a typed `SpeakRequest` to Speak. If speech should
+wait, it writes the wait decision and any missing-evidence notes to its memo. It does not emit
+utterances, write attention, publish query/self-model requests, or change allocation.
+
 ### Speak
 
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
-Speak reads the attention stream and allocation guidance, decides whether a user-facing response is warranted, writes the chosen utterance to its memo, and emits it through `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact.
+Speak reads the attention stream and typed `SpeakRequest`, records utterance progress while
+streaming, writes the completed utterance to its memo, and emits through `UtteranceWriter` so the
+application or eval harness can collect the utterance as an artifact. It does not read blackboard
+memos, allocation guidance, or module status; readiness and interruption decisions are delegated to
+SpeakGate.
 
-Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. If allocation guidance indicates query or attention-gate work is still in progress, Speak may wait silently. Completed utterance memos wake the controller so resources can be reclaimed.
+Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. It starts and interrupts streams only when SpeakGate sends a typed `SpeakRequest`. Completed utterance memos wake the controller.
 
 ## Invariants
 
@@ -202,6 +220,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - The attention controller, attention schema, and self-model modules are separate modules.
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
 - Query and self-model messages are internal; they are only driven directly by module-level eval harnesses or internal modules that hold those mailbox capabilities.
+- The speak-gate module may inspect memos to judge readiness, but speech generation itself receives only attention plus a typed `SpeakRequest`.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
 - The attention-gate module is the only path from the non-cognitive blackboard to the attention stream.
 - Query modules and self-model questions are separated by typed channels.

@@ -16,10 +16,14 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
-You wake only on memo updates. Use blackboard memos, the attention stream, current allocation,
-and registry schema to write guidance-based allocation for registered modules.
+You wake on memo updates. Use blackboard memos, the attention stream, current allocation, and
+registry schema to write guidance-based allocation for registered modules.
 Return one allocation entry for every registered module. Use guidance to tell modules what work
 should be done now and what other module work should be considered. Do not invent module ids.
+
+Speech output is driven by a typed SpeakRequest from speak-gate to speak, not by allocation
+guidance. Do not use speak guidance as a speech protocol. Keep speak and speak-gate active because
+idle speak only waits on its inbox and does not call the LLM.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 tokio::task_local! {
@@ -134,12 +138,12 @@ impl AttentionControllerModule {
         let mut session = Session::new(lutum);
         session.push_system(SYSTEM_PROMPT);
         session.push_user(
-            serde_json::json!({
-                "attention_stream": attention,
-                "blackboard": blackboard,
-                "allocation": current,
-                "controller_schema": controller_schema,
-            })
+            controller_input(
+                serde_json::to_value(&attention).context("serialize attention stream")?,
+                blackboard,
+                serde_json::to_value(&current).context("serialize current allocation")?,
+                controller_schema,
+            )
             .to_string(),
         );
 
@@ -216,6 +220,20 @@ fn fallback_allocation_decision_schema() -> Schema {
     .expect("fallback allocation decision schema must be a JSON object")
 }
 
+fn controller_input(
+    attention: serde_json::Value,
+    blackboard: serde_json::Value,
+    allocation: serde_json::Value,
+    controller_schema: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "attention_stream": attention,
+        "blackboard": blackboard,
+        "allocation": allocation,
+        "controller_schema": controller_schema,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +280,34 @@ mod tests {
         assert_eq!(speak.guidance, "respond from attention when ready");
         assert_eq!(speak.tier, ModelTier::Premium);
     }
+
+    #[test]
+    fn controller_input_includes_blackboard_memos_without_special_protocol() {
+        let input = controller_input(
+            serde_json::json!([]),
+            serde_json::json!({
+                "memos": {
+                    "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
+                }
+            }),
+            serde_json::json!({}),
+            serde_json::json!({"schema": true}),
+        );
+
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "attention_stream": [],
+                "blackboard": {
+                    "memos": {
+                        "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
+                    }
+                },
+                "allocation": {},
+                "controller_schema": {"schema": true},
+            })
+        );
+    }
 }
 
 #[async_trait(?Send)]
@@ -272,7 +318,8 @@ impl Module for AttentionControllerModule {
         AttentionControllerModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+        let _ = batch;
         AttentionControllerModule::activate(self).await
     }
 }

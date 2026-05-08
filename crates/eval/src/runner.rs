@@ -84,6 +84,7 @@ pub struct RunnerConfig {
     pub premium_backend: LlmBackendConfig,
     pub model_dir: PathBuf,
     pub fail_fast: bool,
+    pub case_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,8 @@ pub enum RunnerError {
     },
     #[error("failed to install lutum trace subscriber: {message}")]
     TraceSubscriber { message: String },
+    #[error("case patterns matched no eval cases: {patterns}")]
+    NoCasesMatched { patterns: String },
 }
 
 struct CaseExecution {
@@ -134,11 +137,12 @@ struct CaseOutputContext<'a> {
 
 pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError> {
     install_lutum_trace_subscriber()?;
-    let case_paths =
+    let mut case_paths =
         discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
             path: config.cases_root.clone(),
             source,
         })?;
+    case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
     let run_dir = config.output_root.join(&config.run_id);
     std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
         path: run_dir.clone(),
@@ -235,6 +239,62 @@ pub async fn run_case_detailed(
     })?;
     let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
     run_case_detailed_with_reporter(case_path, config, judge, &reporter).await
+}
+
+fn filter_case_paths(
+    case_paths: Vec<PathBuf>,
+    patterns: &[String],
+) -> Result<Vec<PathBuf>, RunnerError> {
+    let normalized_patterns = patterns
+        .iter()
+        .map(|pattern| normalize_case_pattern(pattern))
+        .filter(|pattern| !pattern.is_empty())
+        .collect::<Vec<_>>();
+    if normalized_patterns.is_empty() {
+        return Ok(case_paths);
+    }
+
+    let mut matched = Vec::new();
+    for path in case_paths {
+        let mut haystacks = vec![
+            normalize_case_pattern(&path.display().to_string()),
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(normalize_case_pattern)
+                .unwrap_or_default(),
+        ];
+        if let Ok(case) = parse_case_file(&path)
+            && let Some(id) = case.id()
+        {
+            haystacks.push(normalize_case_pattern(id));
+        }
+
+        if normalized_patterns.iter().any(|pattern| {
+            haystacks
+                .iter()
+                .any(|haystack| haystack.contains(pattern.as_str()))
+        }) {
+            matched.push(path);
+        }
+    }
+
+    if matched.is_empty() {
+        return Err(RunnerError::NoCasesMatched {
+            patterns: patterns.join(", "),
+        });
+    }
+    Ok(matched)
+}
+
+fn normalize_case_pattern(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|ch| match ch {
+            '/' | '\\' | '_' => '-',
+            other => other,
+        })
+        .collect::<String>()
 }
 
 async fn run_case_detailed_with_reporter(
@@ -1092,12 +1152,22 @@ fn full_agent_registry() -> ModuleRegistry {
             )
         })
         .unwrap()
+        .register(builtin::speak_gate(), 0..=1, |caps| {
+            nuillu_speak::SpeakGateModule::new(
+                caps.attention_stream_updated_inbox(),
+                caps.attention_reader(),
+                caps.blackboard_reader(),
+                caps.module_status_reader(),
+                caps.memo(),
+                caps.speak_mailbox(),
+                caps.llm_access(),
+            )
+        })
+        .unwrap()
         .register(builtin::speak(), 0..=1, |caps| {
             nuillu_speak::SpeakModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.allocation_updated_inbox(),
+                caps.speak_inbox(),
                 caps.attention_reader(),
-                caps.allocation_reader(),
                 caps.memo(),
                 caps.utterance_writer(),
                 caps.llm_access(),
@@ -1239,10 +1309,17 @@ fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocati
     );
     set_allocation_module(
         &mut allocation,
+        builtin::speak_gate(),
+        1.0,
+        ModelTier::Premium,
+        "Decide whether attention is ready for speech or which evidence is missing.",
+    );
+    set_allocation_module(
+        &mut allocation,
         builtin::speak(),
         1.0,
         ModelTier::Premium,
-        "Wait until the attention stream contains answer-ready content, then respond.",
+        "Wait for typed SpeakRequest.",
     );
     allocation
 }
@@ -2146,6 +2223,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn case_patterns_match_case_id_or_path_substrings() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let first = case_dir.join("first-route.eure");
+        let second = case_dir.join("second-memory.eure");
+        std::fs::write(
+            &first,
+            r#"
+id = "module-query-vector-first-route"
+prompt = "First?"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            r#"
+id = "module-query-vector-special-memory"
+prompt = "Second?"
+"#,
+        )
+        .unwrap();
+
+        let by_path = filter_case_paths(
+            vec![first.clone(), second.clone()],
+            &["first-route".to_string()],
+        )
+        .unwrap();
+        assert_eq!(by_path, vec![first.clone()]);
+
+        let by_id = filter_case_paths(vec![first, second.clone()], &["special-memory".to_string()])
+            .unwrap();
+        assert_eq!(by_id, vec![second]);
+    }
+
     #[tokio::test]
     async fn max_llm_calls_requests_stop_after_limit_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -2233,6 +2346,7 @@ limits {{
             premium_backend: test_backend_config(),
             model_dir: dir.path().join("missing-model"),
             fail_fast: false,
+            case_patterns: Vec::new(),
         };
 
         let report = run_suite(&config).await.unwrap();
@@ -2434,6 +2548,10 @@ prompt = "What am I attending to?"
         let controller = allocation.for_module(&builtin::attention_controller());
         assert_eq!(controller.activation_ratio, ActivationRatio::ONE);
         assert_eq!(controller.tier, ModelTier::Premium);
+
+        let speak_gate = allocation.for_module(&builtin::speak_gate());
+        assert_eq!(speak_gate.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(speak_gate.tier, ModelTier::Premium);
 
         let speak = allocation.for_module(&builtin::speak());
         assert_eq!(speak.activation_ratio, ActivationRatio::ONE);

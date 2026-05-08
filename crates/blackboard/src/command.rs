@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange};
 
-use crate::{AgenticDeadlockMarker, AttentionStreamEvent, MemoryMetaPatch, ResourceAllocation};
+use crate::{
+    AgenticDeadlockMarker, AttentionStreamEvent, MemoryMetaPatch, ModuleRunStatus,
+    ResourceAllocation, UtteranceProgress,
+};
 
 /// Internal blackboard mutation. Constructed only by the agent's
 /// capability layer (each capability is responsible for one variant) and
@@ -17,6 +20,14 @@ pub enum BlackboardCommand {
     UpdateMemo {
         owner: ModuleInstanceId,
         memo: String,
+    },
+    SetModuleRunStatus {
+        owner: ModuleInstanceId,
+        status: ModuleRunStatus,
+    },
+    SetUtteranceProgress {
+        owner: ModuleInstanceId,
+        progress: UtteranceProgress,
     },
     AppendAttentionStream {
         stream: ModuleInstanceId,

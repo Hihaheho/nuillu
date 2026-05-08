@@ -233,6 +233,21 @@ impl SelfModelRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SpeakRequest {
+    pub generation_hint: String,
+    pub rationale: String,
+}
+
+impl SpeakRequest {
+    pub fn new(generation_hint: impl Into<String>, rationale: impl Into<String>) -> Self {
+        Self {
+            generation_hint: generation_hint.into(),
+            rationale: rationale.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum MemoryImportance {
     Normal,
@@ -265,6 +280,8 @@ pub type QueryMailbox = TopicMailbox<QueryRequest>;
 pub type QueryInbox = TopicInbox<QueryRequest>;
 pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
 pub type SelfModelInbox = TopicInbox<SelfModelRequest>;
+pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
+pub type SpeakInbox = TopicInbox<SpeakRequest>;
 pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
 pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
 pub type AttentionStreamUpdatedMailbox = TopicMailbox<AttentionStreamUpdated>;
@@ -362,6 +379,23 @@ mod tests {
         );
         assert!(query_inbox.take_ready_items().unwrap().items.is_empty());
         assert!(self_inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn speak_mailbox_delivers_typed_request_to_active_speak() {
+        let caps = test_caps(Blackboard::default());
+        let publisher = scoped(&caps, builtin::speak_gate(), 0).speak_mailbox();
+        let mut speak = scoped(&caps, builtin::speak(), 0).speak_inbox();
+
+        publisher
+            .publish(SpeakRequest::new("answer the attended peer", "ready"))
+            .await
+            .expect("speak subscriber exists");
+
+        let envelope = speak.next_item().await.expect("speak receives request");
+        assert_eq!(envelope.sender.module, builtin::speak_gate());
+        assert_eq!(envelope.body.generation_hint, "answer the attended peer");
+        assert_eq!(envelope.body.rationale, "ready");
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@
 //!
 //! - per-module memos
 //! - cognitive attention stream
+//! - scheduler-owned module run status
+//! - current utterance stream progress
 //! - memory metadata mirror (content lives in the external `MemoryStore`)
 //! - the attention controller's `ResourceAllocation` snapshot
 //!
@@ -28,4 +30,7 @@ pub use attention_stream::{
 };
 pub use command::BlackboardCommand;
 pub use memory::{MemoryMetaPatch, MemoryMetadata};
-pub use state::{Blackboard, BlackboardInner, MemoRecord};
+pub use state::{
+    Blackboard, BlackboardInner, MemoRecord, ModuleRunStatus, ModuleRunStatusRecord,
+    UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
+};
