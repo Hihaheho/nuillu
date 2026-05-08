@@ -45,6 +45,8 @@ pub struct ModelSetRole {
     pub model: Option<String>,
     #[eure(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[eure(default)]
+    pub use_responses_api: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum, FromEure)]

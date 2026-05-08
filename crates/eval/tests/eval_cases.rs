@@ -165,21 +165,36 @@ fn parses_checked_in_model_set() {
     assert_eq!(judge.token.as_deref(), Some("local"));
     assert_eq!(judge.model.as_deref(), Some("gpt-oss:20b"));
     assert_eq!(judge.reasoning_effort, None);
+    assert_eq!(judge.use_responses_api, None);
     let cheap = model_set.cheap.unwrap();
     assert_eq!(cheap.endpoint(), Some("http://localhost:11434/v1"));
     assert_eq!(cheap.token.as_deref(), Some("local"));
     assert_eq!(cheap.model.as_deref(), Some("gemma4:26b"));
     assert_eq!(cheap.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(cheap.use_responses_api, None);
     let default = model_set.default.unwrap();
     assert_eq!(default.endpoint(), Some("http://localhost:11434/v1"));
     assert_eq!(default.token.as_deref(), Some("local"));
     assert_eq!(default.model.as_deref(), Some("gemma4:26b"));
     assert_eq!(default.reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(default.use_responses_api, None);
     let premium = model_set.premium.unwrap();
     assert_eq!(premium.endpoint(), Some("http://localhost:11434/v1"));
     assert_eq!(premium.token.as_deref(), Some("local"));
     assert_eq!(premium.model.as_deref(), Some("gemma4:26b"));
     assert_eq!(premium.reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(premium.use_responses_api, None);
+}
+
+#[test]
+fn parses_responses_api_model_set_option() {
+    let path = workspace_root().join("configs/modelsets/eval-gpt5.4.eure");
+    let model_set = parse_model_set_file(&path).unwrap();
+
+    assert_eq!(model_set.judge.unwrap().use_responses_api, Some(true));
+    assert_eq!(model_set.cheap.unwrap().use_responses_api, Some(true));
+    assert_eq!(model_set.default.unwrap().use_responses_api, Some(true));
+    assert_eq!(model_set.premium.unwrap().use_responses_api, Some(true));
 }
 
 #[test]

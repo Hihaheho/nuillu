@@ -71,6 +71,7 @@ pub struct LlmBackendConfig {
     pub token: String,
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub use_responses_api: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +176,7 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
         &config.judge_backend.token,
         &config.judge_backend.model,
         config.judge_backend.reasoning_effort,
+        config.judge_backend.use_responses_api,
     )
     .map_err(|error| RunnerError::Driver {
         path: config.cases_root.clone(),
@@ -223,6 +225,7 @@ fn backend_report(backend: &LlmBackendConfig) -> serde_json::Value {
         "endpoint": backend.endpoint.as_str(),
         "model": backend.model.as_str(),
         "reasoning_effort": backend.reasoning_effort,
+        "use_responses_api": backend.use_responses_api,
     })
 }
 
@@ -974,18 +977,21 @@ fn build_tiers(config: &RunnerConfig) -> Result<LutumTiers> {
         &config.cheap_backend.token,
         &config.cheap_backend.model,
         config.cheap_backend.reasoning_effort,
+        config.cheap_backend.use_responses_api,
     )?;
     let default = build_lutum(
         &config.default_backend.endpoint,
         &config.default_backend.token,
         &config.default_backend.model,
         config.default_backend.reasoning_effort,
+        config.default_backend.use_responses_api,
     )?;
     let premium = build_lutum(
         &config.premium_backend.endpoint,
         &config.premium_backend.token,
         &config.premium_backend.model,
         config.premium_backend.reasoning_effort,
+        config.premium_backend.use_responses_api,
     )?;
     Ok(LutumTiers {
         cheap,
@@ -999,12 +1005,17 @@ fn build_lutum(
     token: &str,
     model: &str,
     reasoning_effort: Option<ReasoningEffort>,
+    use_responses_api: bool,
 ) -> Result<Lutum> {
     let adapter = OpenAiAdapter::new(token.to_owned())
         .with_base_url(endpoint.to_owned())
         .with_default_model(ModelName::new(model)?)
-        .with_resolve_reasoning_effort(ConfiguredReasoningEffort)
-        .with_chat_completions();
+        .with_resolve_reasoning_effort(ConfiguredReasoningEffort);
+    let adapter = if use_responses_api {
+        adapter
+    } else {
+        adapter.with_chat_completions()
+    };
     let lutum = Lutum::new(
         Arc::new(adapter),
         SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
@@ -2220,6 +2231,7 @@ mod tests {
             token: "local".to_string(),
             model: "gpt-oss:20b".to_string(),
             reasoning_effort: None,
+            use_responses_api: false,
         }
     }
 

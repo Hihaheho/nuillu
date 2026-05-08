@@ -39,3 +39,5 @@ model = `text`
 model.$optional = true
 reasoning-effort = `$types.reasoning-effort`
 reasoning-effort.$optional = true
+use-responses-api = `boolean`
+use-responses-api.$optional = true

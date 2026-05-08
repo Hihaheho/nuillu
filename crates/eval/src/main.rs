@@ -166,12 +166,16 @@ fn resolve_backend(
         .to_string();
     let reasoning_effort =
         explicit_reasoning_effort.or_else(|| role.and_then(|role| role.reasoning_effort));
+    let use_responses_api = role
+        .and_then(|role| role.use_responses_api)
+        .unwrap_or(false);
 
     Ok(LlmBackendConfig {
         endpoint,
         token,
         model,
         reasoning_effort,
+        use_responses_api,
     })
 }
 

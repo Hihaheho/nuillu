@@ -3,7 +3,9 @@ name = "all haiku"
 judge {
   endpoint: https://api.openai.com/v1
   token-env: OPENAI_API_KEY
-  model: gpt-5.4-nano-2026-03-17
+  model: gpt-5.4-mini-2026-03-17
+  reasoning-effort = "medium"
+  use-responses-api = true
 }
 
 cheap {
@@ -11,6 +13,7 @@ cheap {
   token-env: OPENAI_API_KEY
   model: gpt-5.4-nano-2026-03-17
   reasoning-effort = "low"
+  use-responses-api = true
 }
 
 default {
@@ -18,11 +21,13 @@ default {
   token-env: OPENAI_API_KEY
   model: gpt-5.4-nano-2026-03-17
   reasoning-effort = "medium"
+  use-responses-api = true
 }
 
 premium {
   endpoint: https://api.openai.com/v1
   token-env: OPENAI_API_KEY
   model: gpt-5.4-mini-2026-03-17
-  reasoning-effort = "high"
+  reasoning-effort = "medium"
+  use-responses-api = true
 }
