@@ -1,5 +1,6 @@
 id = "module-attention-schema-current-attended-peer-signal"
 description = "Attention-schema should answer a current-attention request from seeded animal-interaction attention."
+modules = ["attention-schema"]
 prompt = "What are you attending to right now?"
 context = "The harness seeds the cognitive attention stream. The attention-schema module should report a simplified first-person model of the current peer signal, not hidden blackboard state."
 

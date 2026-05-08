@@ -1,5 +1,6 @@
 id = "module-query-vector-retrieve-koro-approach-rule"
 description = "Query-vector should retrieve Koro's food-boundary approach rule from seeded memory and memo only retrieved memory content."
+modules = ["query-vector"]
 prompt = "How should Nui approach Koro near food?"
 context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_vector_memory query/tool arguments, not prose answer generation."
 

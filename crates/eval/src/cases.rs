@@ -5,7 +5,7 @@ use std::{
 };
 
 use eure::{FromEure, value::Text};
-use nuillu_types::MemoryRank;
+use nuillu_types::{MemoryRank, ModuleId, builtin};
 use thiserror::Error;
 
 fn default_weight() -> i64 {
@@ -68,6 +68,8 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub description: Option<Text>,
     #[eure(default)]
+    pub modules: Option<Vec<EvalModule>>,
+    #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
@@ -112,6 +114,8 @@ pub struct ModuleCase {
     pub id: Option<String>,
     #[eure(default)]
     pub description: Option<Text>,
+    #[eure(default)]
+    pub modules: Option<Vec<EvalModule>>,
     pub prompt: Text,
     #[eure(default)]
     pub context: Option<Text>,
@@ -129,6 +133,62 @@ pub struct ModuleCase {
     pub scoring: CaseScoring,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum EvalModule {
+    Sensory,
+    AttentionGate,
+    AttentionController,
+    AttentionSchema,
+    SelfModel,
+    QueryVector,
+    QueryAgentic,
+    Memory,
+    MemoryCompaction,
+    Predict,
+    Surprise,
+    SpeakGate,
+    Speak,
+}
+
+impl EvalModule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sensory => "sensory",
+            Self::AttentionGate => "attention-gate",
+            Self::AttentionController => "attention-controller",
+            Self::AttentionSchema => "attention-schema",
+            Self::SelfModel => "self-model",
+            Self::QueryVector => "query-vector",
+            Self::QueryAgentic => "query-agentic",
+            Self::Memory => "memory",
+            Self::MemoryCompaction => "memory-compaction",
+            Self::Predict => "predict",
+            Self::Surprise => "surprise",
+            Self::SpeakGate => "speak-gate",
+            Self::Speak => "speak",
+        }
+    }
+
+    pub fn module_id(self) -> ModuleId {
+        match self {
+            Self::Sensory => builtin::sensory(),
+            Self::AttentionGate => builtin::attention_gate(),
+            Self::AttentionController => builtin::attention_controller(),
+            Self::AttentionSchema => builtin::attention_schema(),
+            Self::SelfModel => builtin::self_model(),
+            Self::QueryVector => builtin::query_vector(),
+            Self::QueryAgentic => builtin::query_agentic(),
+            Self::Memory => builtin::memory(),
+            Self::MemoryCompaction => builtin::memory_compaction(),
+            Self::Predict => builtin::predict(),
+            Self::Surprise => builtin::surprise(),
+            Self::SpeakGate => builtin::speak_gate(),
+            Self::Speak => builtin::speak(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleEvalTarget {
     QueryVector,
@@ -144,6 +204,15 @@ impl ModuleEvalTarget {
             Self::QueryAgentic => "query-agentic",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
+        }
+    }
+
+    pub fn module(self) -> EvalModule {
+        match self {
+            Self::QueryVector => EvalModule::QueryVector,
+            Self::QueryAgentic => EvalModule::QueryAgentic,
+            Self::AttentionSchema => EvalModule::AttentionSchema,
+            Self::SelfModel => EvalModule::SelfModel,
         }
     }
 
@@ -494,7 +563,9 @@ pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
         message: "module eval case path must include query-vector, query-agentic, attention-schema, or self-model"
             .to_string(),
     })?;
-    parse_module_case_file(path).map(|case| EvalCase::Module { target, case })
+    let case = parse_module_case_file(path)?;
+    validate_module_case_target(path, target, &case)?;
+    Ok(EvalCase::Module { target, case })
 }
 
 pub fn parse_full_agent_case_file(path: &Path) -> Result<FullAgentCase, CaseFileError> {
@@ -611,6 +682,7 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
             _ => {}
         }
     }
+    validate_modules(path, case.modules.as_deref())?;
     validate_common(path, &case.memories, &case.limits, &case.checks)
 }
 
@@ -649,7 +721,53 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             });
         }
     }
+    validate_modules(path, case.modules.as_deref())?;
     validate_common(path, &case.memories, &case.limits, &case.checks)
+}
+
+fn validate_module_case_target(
+    path: &Path,
+    target: ModuleEvalTarget,
+    case: &ModuleCase,
+) -> Result<(), CaseFileError> {
+    let Some(modules) = case.modules.as_deref() else {
+        return Ok(());
+    };
+    let target_module = target.module();
+    if modules.contains(&target_module) {
+        return Ok(());
+    }
+    Err(CaseFileError::Validation {
+        path: path.to_path_buf(),
+        message: format!(
+            "modules must include target module '{}' for {} eval cases",
+            target_module.as_str(),
+            target.as_str(),
+        ),
+    })
+}
+
+fn validate_modules(path: &Path, modules: Option<&[EvalModule]>) -> Result<(), CaseFileError> {
+    let Some(modules) = modules else {
+        return Ok(());
+    };
+    if modules.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "modules must not be empty when present".to_string(),
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    for module in modules {
+        if !seen.insert(*module) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("modules contains duplicate module '{}'", module.as_str()),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_common(

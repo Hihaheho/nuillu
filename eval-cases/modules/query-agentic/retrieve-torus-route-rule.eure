@@ -1,5 +1,6 @@
 id = "module-query-agentic-retrieve-torus-route-rule"
 description = "Query-agentic should retrieve a torus route rule from seeded files and memo only retrieved file content."
+modules = ["query-agentic"]
 prompt = "Why can an eastbound animal appear from the west?"
 context = "The query-agentic module should search the seeded file corpus. Static checks verify retrieval; the rubric judges generated search_files arguments and primary artifact.output only."
 

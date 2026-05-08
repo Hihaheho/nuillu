@@ -16,7 +16,7 @@ pub mod trace_json;
 pub use artifact::CaseArtifact;
 pub use cases::{
     ArtifactTextField, AttentionSeed, CaseFileError, CaseScoring, Check, CheckCommon, EvalCase,
-    EvalLimits, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed,
+    EvalLimits, EvalModule, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed,
     MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleEvalTarget, RubricCriterion,
     RubricJudgeInput, discover_case_files, parse_case_file, parse_full_agent_case_file,
     parse_module_case_file,

@@ -48,8 +48,8 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use crate::{
     artifact::CaseArtifact,
     cases::{
-        CaseFileError, EvalCase, FullAgentCase, FullAgentInput, ModuleCase, ModuleEvalTarget,
-        discover_case_files, parse_case_file,
+        CaseFileError, EvalCase, EvalModule, FullAgentCase, FullAgentInput, ModuleCase,
+        ModuleEvalTarget, discover_case_files, parse_case_file,
     },
     evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
     judge::{LlmRubricJudge, RubricJudge},
@@ -538,10 +538,11 @@ async fn execute_full_agent_case(
     case_id: &str,
     reporter: &LiveReporter,
 ) -> Result<CaseExecution> {
+    let case_modules = full_agent_case_modules(case);
     let env = build_eval_environment(
         output_dir,
         config,
-        full_agent_allocation(&case.limits),
+        full_agent_allocation(&case.limits, &case_modules),
         case.limits.max_llm_calls,
         Arc::new(NoopFileSearchProvider),
         case_id,
@@ -562,7 +563,7 @@ async fn execute_full_agent_case(
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
     let live_reporter = reporter.clone();
     let case_id_for_idle = case_id.to_string();
-    let modules = full_agent_registry().build(&env.caps).await?;
+    let modules = eval_registry(&case_modules).build(&env.caps).await?;
 
     run_agent(
         modules,
@@ -679,10 +680,11 @@ async fn execute_module_case(
     case_id: &str,
     reporter: &LiveReporter,
 ) -> Result<CaseExecution> {
+    let case_modules = module_case_modules(target, case);
     let env = build_eval_environment(
         output_dir,
         config,
-        module_allocation(target, &case.limits),
+        module_allocation(target, &case.limits, &case_modules),
         case.limits.max_llm_calls,
         module_file_search_provider(target, case),
         case_id,
@@ -694,7 +696,7 @@ async fn execute_module_case(
 
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
-    let modules = module_registry(target).build(&env.caps).await?;
+    let modules = eval_registry(&case_modules).build(&env.caps).await?;
     let harness = env.caps.internal_harness_io();
     let limits = case.limits.clone();
     let prompt = case.prompt.content.clone();
@@ -1041,146 +1043,101 @@ async fn configured_reasoning_effort(
         .map(|value| value.0)
 }
 
-fn full_agent_registry() -> ModuleRegistry {
-    ModuleRegistry::new()
-        .register(builtin::sensory(), 0..=1, |caps| {
-            nuillu_sensory::SensoryModule::new(
-                caps.sensory_input_inbox(),
-                caps.sensory_detail_inbox(),
-                caps.allocation_reader(),
-                caps.memo(),
-                caps.clock(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::attention_gate(), 0..=1, |caps| {
-            nuillu_attention_gate::AttentionGateModule::new(
-                caps.memo_updated_inbox(),
-                caps.blackboard_reader(),
-                caps.allocation_reader(),
-                caps.attention_writer(),
-                caps.time_division(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::attention_controller(), 0..=1, |caps| {
-            nuillu_attention_controller::AttentionControllerModule::new(
-                caps.memo_updated_inbox(),
-                caps.blackboard_reader(),
-                caps.attention_reader(),
-                caps.allocation_reader(),
-                caps.allocation_writer(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::attention_schema(), 0..=1, |caps| {
-            nuillu_attention_schema::AttentionSchemaModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.attention_reader(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::self_model(), 0..=1, |caps| {
-            nuillu_self_model::SelfModelModule::new(
-                caps.self_model_inbox(),
-                caps.blackboard_reader(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::query_vector(), 0..=1, |caps| {
-            nuillu_query_vector::QueryVectorModule::new(
-                caps.query_inbox(),
-                caps.attention_stream_updated_inbox(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.vector_memory_searcher(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::memory(), 0..=1, |caps| {
-            nuillu_memory::MemoryModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.memory_request_inbox(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.memory_writer(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::memory_compaction(), 0..=1, |caps| {
-            nuillu_memory_compaction::MemoryCompactionModule::new(
-                caps.allocation_updated_inbox(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.memory_compactor(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::predict(), 0..=1, |caps| {
-            nuillu_predict::PredictModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.attention_reader(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::surprise(), 0..=1, |caps| {
-            nuillu_surprise::SurpriseModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.attention_reader(),
-                caps.allocation_reader(),
-                caps.blackboard_reader(),
-                caps.memory_request_mailbox(),
-                caps.memo(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::speak_gate(), 0..=1, |caps| {
-            nuillu_speak::SpeakGateModule::new(
-                caps.attention_stream_updated_inbox(),
-                caps.attention_reader(),
-                caps.blackboard_reader(),
-                caps.module_status_reader(),
-                caps.query_mailbox(),
-                caps.self_model_mailbox(),
-                caps.sensory_detail_mailbox(),
-                caps.memo(),
-                caps.speak_mailbox(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
-        .register(builtin::speak(), 0..=1, |caps| {
-            nuillu_speak::SpeakModule::new(
-                caps.speak_inbox(),
-                caps.attention_reader(),
-                caps.memo(),
-                caps.utterance_writer(),
-                caps.llm_access(),
-            )
-        })
-        .unwrap()
+const LEGACY_FULL_AGENT_MODULES: &[EvalModule] = &[
+    EvalModule::Sensory,
+    EvalModule::AttentionGate,
+    EvalModule::AttentionController,
+    EvalModule::AttentionSchema,
+    EvalModule::SelfModel,
+    EvalModule::QueryVector,
+    EvalModule::Memory,
+    EvalModule::MemoryCompaction,
+    EvalModule::Predict,
+    EvalModule::Surprise,
+    EvalModule::SpeakGate,
+    EvalModule::Speak,
+];
+
+fn full_agent_case_modules(case: &FullAgentCase) -> Vec<EvalModule> {
+    case.modules
+        .clone()
+        .unwrap_or_else(|| LEGACY_FULL_AGENT_MODULES.to_vec())
 }
 
-fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
-    match target {
-        ModuleEvalTarget::QueryVector => ModuleRegistry::new()
+fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
+    case.modules
+        .clone()
+        .unwrap_or_else(|| vec![target.module()])
+}
+
+fn eval_registry(modules: &[EvalModule]) -> ModuleRegistry {
+    let mut registry = ModuleRegistry::new();
+    for module in modules {
+        registry = register_eval_module(registry, *module);
+    }
+    registry
+}
+
+fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
+    match module {
+        EvalModule::Sensory => registry
+            .register(builtin::sensory(), 0..=1, |caps| {
+                nuillu_sensory::SensoryModule::new(
+                    caps.sensory_input_inbox(),
+                    caps.sensory_detail_inbox(),
+                    caps.allocation_reader(),
+                    caps.memo(),
+                    caps.clock(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::AttentionGate => registry
+            .register(builtin::attention_gate(), 0..=1, |caps| {
+                nuillu_attention_gate::AttentionGateModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.allocation_reader(),
+                    caps.attention_writer(),
+                    caps.time_division(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::AttentionController => registry
+            .register(builtin::attention_controller(), 0..=1, |caps| {
+                nuillu_attention_controller::AttentionControllerModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.attention_reader(),
+                    caps.allocation_reader(),
+                    caps.allocation_writer(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::AttentionSchema => registry
+            .register(builtin::attention_schema(), 0..=1, |caps| {
+                nuillu_attention_schema::AttentionSchemaModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.attention_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::SelfModel => registry
+            .register(builtin::self_model(), 0..=1, |caps| {
+                nuillu_self_model::SelfModelModule::new(
+                    caps.self_model_inbox(),
+                    caps.blackboard_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::QueryVector => registry
             .register(builtin::query_vector(), 0..=1, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
@@ -1192,8 +1149,8 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
                     caps.llm_access(),
                 )
             })
-            .unwrap(),
-        ModuleEvalTarget::QueryAgentic => ModuleRegistry::new()
+            .expect("eval module registration should be unique"),
+        EvalModule::QueryAgentic => registry
             .register(builtin::query_agentic(), 0..=1, |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.query_inbox(),
@@ -1205,134 +1162,217 @@ fn module_registry(target: ModuleEvalTarget) -> ModuleRegistry {
                     caps.llm_access(),
                 )
             })
-            .unwrap(),
-        ModuleEvalTarget::AttentionSchema => ModuleRegistry::new()
-            .register(builtin::attention_schema(), 0..=1, |caps| {
-                nuillu_attention_schema::AttentionSchemaModule::new(
+            .expect("eval module registration should be unique"),
+        EvalModule::Memory => registry
+            .register(builtin::memory(), 0..=1, |caps| {
+                nuillu_memory::MemoryModule::new(
                     caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
-                    caps.memo(),
+                    caps.memory_request_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_writer(),
                     caps.llm_access(),
                 )
             })
-            .unwrap(),
-        ModuleEvalTarget::SelfModel => ModuleRegistry::new()
-            .register(builtin::self_model(), 0..=1, |caps| {
-                nuillu_self_model::SelfModelModule::new(
-                    caps.self_model_inbox(),
+            .expect("eval module registration should be unique"),
+        EvalModule::MemoryCompaction => registry
+            .register(builtin::memory_compaction(), 0..=1, |caps| {
+                nuillu_memory_compaction::MemoryCompactionModule::new(
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_compactor(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::Predict => registry
+            .register(builtin::predict(), 0..=1, |caps| {
+                nuillu_predict::PredictModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.attention_reader(),
+                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memo(),
                     caps.llm_access(),
                 )
             })
-            .unwrap(),
+            .expect("eval module registration should be unique"),
+        EvalModule::Surprise => registry
+            .register(builtin::surprise(), 0..=1, |caps| {
+                nuillu_surprise::SurpriseModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.attention_reader(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_request_mailbox(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::SpeakGate => registry
+            .register(builtin::speak_gate(), 0..=1, |caps| {
+                nuillu_speak::SpeakGateModule::new(
+                    caps.attention_stream_updated_inbox(),
+                    caps.attention_reader(),
+                    caps.blackboard_reader(),
+                    caps.module_status_reader(),
+                    caps.query_mailbox(),
+                    caps.self_model_mailbox(),
+                    caps.sensory_detail_mailbox(),
+                    caps.memo(),
+                    caps.speak_mailbox(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::Speak => registry
+            .register(builtin::speak(), 0..=1, |caps| {
+                nuillu_speak::SpeakModule::new(
+                    caps.speak_inbox(),
+                    caps.attention_reader(),
+                    caps.memo(),
+                    caps.utterance_writer(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
     }
 }
 
-fn full_agent_allocation(_limits: &crate::cases::EvalLimits) -> ResourceAllocation {
+fn full_agent_allocation(
+    _limits: &crate::cases::EvalLimits,
+    modules: &[EvalModule],
+) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
 
-    set_allocation_module(
-        &mut allocation,
-        builtin::sensory(),
-        1.0,
-        ModelTier::Cheap,
-        "Filter incoming observations into sensory memo.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::attention_gate(),
-        0.0,
-        ModelTier::Cheap,
-        "Wait for controller guidance before promoting memos into attention.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::attention_controller(),
-        1.0,
-        ModelTier::Premium,
-        "Allocate modules from memo updates and write natural-language guidance.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::attention_schema(),
-        0.0,
-        ModelTier::Default,
-        "Idle until attention-stream updates require attention-state modeling.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::self_model(),
-        0.0,
-        ModelTier::Default,
-        "Idle until explicit self-model requests require work.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::query_vector(),
-        0.0,
-        ModelTier::Cheap,
-        "Idle until memory retrieval is needed.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::memory(),
-        0.0,
-        ModelTier::Cheap,
-        "Idle until preservation guidance or memory requests arrive.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::memory_compaction(),
-        0.0,
-        ModelTier::Cheap,
-        "Idle until compaction guidance arrives.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::predict(),
-        0.0,
-        ModelTier::Cheap,
-        "Idle until prediction guidance arrives.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::surprise(),
-        0.0,
-        ModelTier::Default,
-        "Idle until surprise detection is useful.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::speak_gate(),
-        1.0,
-        ModelTier::Premium,
-        "Decide whether attention is ready for speech or which evidence is missing.",
-    );
-    set_allocation_module(
-        &mut allocation,
-        builtin::speak(),
-        1.0,
-        ModelTier::Premium,
-        "Wait for typed SpeakRequest.",
-    );
+    for module in modules {
+        match module {
+            EvalModule::Sensory => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Cheap,
+                "Filter incoming observations into sensory memo.",
+            ),
+            EvalModule::AttentionGate => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Wait for controller guidance before promoting memos into attention.",
+            ),
+            EvalModule::AttentionController => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Premium,
+                "Allocate modules from memo updates and write natural-language guidance.",
+            ),
+            EvalModule::AttentionSchema => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Default,
+                "Idle until attention-stream updates require attention-state modeling.",
+            ),
+            EvalModule::SelfModel => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Default,
+                "Idle until explicit self-model requests require work.",
+            ),
+            EvalModule::QueryVector => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until memory retrieval is needed.",
+            ),
+            EvalModule::QueryAgentic => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Premium,
+                "Idle until file lookup is needed.",
+            ),
+            EvalModule::Memory => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until preservation guidance or memory requests arrive.",
+            ),
+            EvalModule::MemoryCompaction => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until compaction guidance arrives.",
+            ),
+            EvalModule::Predict => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until prediction guidance arrives.",
+            ),
+            EvalModule::Surprise => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Default,
+                "Idle until surprise detection is useful.",
+            ),
+            EvalModule::SpeakGate => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Premium,
+                "Decide whether attention is ready for speech or which evidence is missing.",
+            ),
+            EvalModule::Speak => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Premium,
+                "Wait for typed SpeakRequest.",
+            ),
+        }
+    }
     allocation
 }
 
 fn module_allocation(
     target: ModuleEvalTarget,
     _limits: &crate::cases::EvalLimits,
+    modules: &[EvalModule],
 ) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
-    allocation.set(
-        module_id_for_target(target),
-        ModuleConfig {
-            activation_ratio: ActivationRatio::ONE,
-            guidance: "Handle the module eval request.".into(),
-            tier: module_tier_for_target(target),
-            ..Default::default()
-        },
-    );
+    let target_module = target.module();
+    for module in modules {
+        let is_target = *module == target_module;
+        allocation.set(
+            module.module_id(),
+            ModuleConfig {
+                activation_ratio: if is_target {
+                    ActivationRatio::ONE
+                } else {
+                    ActivationRatio::ZERO
+                },
+                guidance: if is_target {
+                    "Handle the module eval request.".into()
+                } else {
+                    "Registered for this module eval; idle unless activated by a typed signal."
+                        .into()
+                },
+                tier: eval_module_tier(*module),
+                ..Default::default()
+            },
+        );
+    }
     allocation
 }
 
@@ -1355,20 +1395,24 @@ fn set_allocation_module(
 }
 
 fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
-    match target {
-        ModuleEvalTarget::QueryVector => builtin::query_vector(),
-        ModuleEvalTarget::QueryAgentic => builtin::query_agentic(),
-        ModuleEvalTarget::AttentionSchema => builtin::attention_schema(),
-        ModuleEvalTarget::SelfModel => builtin::self_model(),
-    }
+    target.module().module_id()
 }
 
-fn module_tier_for_target(target: ModuleEvalTarget) -> ModelTier {
-    match target {
-        ModuleEvalTarget::QueryVector => ModelTier::Cheap,
-        ModuleEvalTarget::QueryAgentic => ModelTier::Premium,
-        ModuleEvalTarget::AttentionSchema => ModelTier::Default,
-        ModuleEvalTarget::SelfModel => ModelTier::Default,
+fn eval_module_tier(module: EvalModule) -> ModelTier {
+    match module {
+        EvalModule::Sensory
+        | EvalModule::AttentionGate
+        | EvalModule::QueryVector
+        | EvalModule::Memory
+        | EvalModule::MemoryCompaction
+        | EvalModule::Predict => ModelTier::Cheap,
+        EvalModule::AttentionController
+        | EvalModule::QueryAgentic
+        | EvalModule::SpeakGate
+        | EvalModule::Speak => ModelTier::Premium,
+        EvalModule::AttentionSchema | EvalModule::SelfModel | EvalModule::Surprise => {
+            ModelTier::Default
+        }
     }
 }
 
@@ -2208,8 +2252,15 @@ pub fn default_run_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::TimeZone as _;
+    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
     use nuillu_blackboard::{AttentionStreamEvent, BlackboardCommand, MemoryMetaPatch};
+    use nuillu_module::ports::{
+        NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+        SystemClock,
+    };
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
@@ -2230,6 +2281,26 @@ mod tests {
             reasoning_effort: None,
             use_responses_api: false,
         }
+    }
+
+    fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
+        let adapter = Arc::new(MockLlmAdapter::new());
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        CapabilityProviders::new(
+            blackboard,
+            Arc::new(NoopAttentionRepository),
+            Arc::new(NoopMemoryStore),
+            Vec::new(),
+            Arc::new(NoopFileSearchProvider),
+            Arc::new(NoopUtteranceSink),
+            Arc::new(SystemClock),
+            LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        )
     }
 
     #[test]
@@ -2539,13 +2610,68 @@ prompt = "What am I attending to?"
         assert_eq!(record.entries[1].at, now);
     }
 
+    #[tokio::test]
+    async fn eval_registry_and_allocation_include_only_selected_modules() {
+        let selected = [
+            EvalModule::Sensory,
+            EvalModule::AttentionController,
+            EvalModule::Speak,
+        ];
+        let allocation = full_agent_allocation(
+            &crate::cases::EvalLimits {
+                tick_ms: 500,
+                max_ticks: 1,
+                max_llm_calls: None,
+            },
+            &selected,
+        );
+        assert!(allocation.get(&builtin::query_vector()).is_none());
+        assert!(allocation.get(&builtin::speak_gate()).is_none());
+
+        let blackboard = Blackboard::with_allocation(allocation);
+        let caps = test_caps(blackboard.clone());
+        let allocated = eval_registry(&selected).build(&caps).await.unwrap();
+        assert_eq!(allocated.len(), selected.len());
+
+        let (replica_caps, allocation_modules) = blackboard
+            .read(|bb| {
+                let mut replica_caps = bb
+                    .replica_caps()
+                    .keys()
+                    .map(|module| module.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                replica_caps.sort();
+                let mut allocation_modules = bb
+                    .allocation()
+                    .iter()
+                    .map(|(module, _)| module.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                allocation_modules.sort();
+                (replica_caps, allocation_modules)
+            })
+            .await;
+
+        assert_eq!(
+            replica_caps,
+            vec!["attention-controller", "sensory", "speak"]
+        );
+        assert_eq!(
+            allocation_modules,
+            vec!["attention-controller", "sensory", "speak"]
+        );
+    }
+
     #[test]
     fn full_agent_allocation_bootstraps_controller_instead_of_every_module() {
-        let allocation = full_agent_allocation(&crate::cases::EvalLimits {
-            tick_ms: 500,
-            max_ticks: 1,
-            max_llm_calls: None,
-        });
+        let selected = LEGACY_FULL_AGENT_MODULES.to_vec();
+        let allocation = full_agent_allocation(
+            &crate::cases::EvalLimits {
+                tick_ms: 500,
+                max_ticks: 1,
+                max_llm_calls: None,
+            },
+            &selected,
+        );
 
         let sensory = allocation.for_module(&builtin::sensory());
         assert_eq!(sensory.activation_ratio, ActivationRatio::ONE);

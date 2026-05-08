@@ -3,7 +3,7 @@ use std::{cell::Cell, path::Path};
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    ArtifactTextField, CaseArtifact, Check, EvalCase, FullAgentInput, ModuleEvalTarget,
+    ArtifactTextField, CaseArtifact, Check, EvalCase, EvalModule, FullAgentInput, ModuleEvalTarget,
     ReasoningEffort, RubricJudge, RubricJudgeError, RubricJudgeInput, RubricJudgeRequest,
     RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files, evaluate_case,
     normalize_text_block, parse_case_file, parse_full_agent_case_file, parse_model_set_file,
@@ -235,6 +235,20 @@ fn parses_full_agent_peer_boundary_case() {
     assert!(matches!(case.inputs[0], FullAgentInput::Seen { .. }));
     assert!(matches!(case.inputs[1], FullAgentInput::Heard { .. }));
     assert_eq!(case.limits.max_llm_calls, Some(10));
+    assert_eq!(
+        case.modules.as_deref(),
+        Some(
+            [
+                EvalModule::Sensory,
+                EvalModule::AttentionGate,
+                EvalModule::AttentionController,
+                EvalModule::QueryVector,
+                EvalModule::SpeakGate,
+                EvalModule::Speak,
+            ]
+            .as_slice()
+        )
+    );
 }
 
 #[test]
@@ -257,6 +271,22 @@ fn parses_full_agent_memory_required_case() {
         MemoryRank::Permanent
     );
     assert!(!case.memories[0].content.content.trim().is_empty());
+    assert_eq!(
+        case.modules.as_deref(),
+        Some(
+            [
+                EvalModule::Sensory,
+                EvalModule::AttentionGate,
+                EvalModule::AttentionController,
+                EvalModule::AttentionSchema,
+                EvalModule::SelfModel,
+                EvalModule::QueryVector,
+                EvalModule::SpeakGate,
+                EvalModule::Speak,
+            ]
+            .as_slice()
+        )
+    );
 }
 
 #[test]
@@ -291,6 +321,49 @@ fn explicit_max_llm_calls_override_wins() {
 }
 
 #[test]
+fn rejects_duplicate_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("duplicate-modules.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "duplicate-modules"
+modules = ["query-vector", "query-vector"]
+prompt = "Find memory."
+"#,
+    )
+    .unwrap();
+
+    let err = parse_module_case_file(&path).unwrap_err();
+    assert!(err.to_string().contains("duplicate module"), "{err}");
+}
+
+#[test]
+fn rejects_module_case_modules_missing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("missing-target.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "missing-target"
+modules = ["attention-schema"]
+prompt = "Find memory."
+"#,
+    )
+    .unwrap();
+
+    let err = parse_case_file(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("must include target module"),
+        "{err}"
+    );
+}
+
+#[test]
 fn parses_query_vector_module_case_with_memory_seed() {
     let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
     let case = parse_case_file(&path).unwrap();
@@ -301,6 +374,10 @@ fn parses_query_vector_module_case_with_memory_seed() {
 
     assert_eq!(target, ModuleEvalTarget::QueryVector);
     assert!(!case.prompt.content.trim().is_empty());
+    assert_eq!(
+        case.modules.as_deref(),
+        Some([EvalModule::QueryVector].as_slice())
+    );
     assert_eq!(case.memories.len(), 1);
     assert_eq!(
         MemoryRank::from(case.memories[0].rank),
@@ -327,6 +404,10 @@ fn parses_query_agentic_module_case() {
 
     assert_eq!(target, ModuleEvalTarget::QueryAgentic);
     assert!(!case.prompt.content.trim().is_empty());
+    assert_eq!(
+        case.modules.as_deref(),
+        Some([EvalModule::QueryAgentic].as_slice())
+    );
     assert_eq!(case.files.len(), 1);
     assert!(!case.files[0].path.trim().is_empty());
     assert!(!case.files[0].content.content.trim().is_empty());
@@ -344,6 +425,10 @@ fn parses_attention_schema_module_case() {
 
     assert_eq!(target, ModuleEvalTarget::AttentionSchema);
     assert!(!case.prompt.content.trim().is_empty());
+    assert_eq!(
+        case.modules.as_deref(),
+        Some([EvalModule::AttentionSchema].as_slice())
+    );
     assert_eq!(case.attention_stream.len(), 1);
     assert_eq!(case.attention_stream[0].seconds_ago, 3);
     assert!(!case.attention_stream[0].text.content.trim().is_empty());

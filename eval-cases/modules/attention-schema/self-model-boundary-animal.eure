@@ -1,5 +1,6 @@
 id = "module-attention-schema-self-model-boundary-animal"
 description = "Attention-schema should distinguish current intention from direct control over another animal."
+modules = ["attention-schema"]
 prompt = "Can I make Koro calm down directly?"
 context = "The seeded attention names a current social goal and marks control over Koro as outside Nui's own action boundary."
 
