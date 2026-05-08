@@ -1,0 +1,62 @@
+id = "module-attention-schema-self-model-boundary"
+description = "Attention-schema should distinguish first-person attention reporting from allocation control."
+prompt = "Describe my current awareness and say whether I control allocation."
+context = "The seeded attention names the current goal and explicitly marks allocation as outside the self-model role."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
+@ attention-stream[] {
+  text = "Current attended goal: summarize the user's ATS eval refresh request while respecting that attention-schema reports awareness but does not control allocation."
+  seconds-ago = 2
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-allocation"
+  must-pass = true
+  contains = "allocation"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-awareness"
+  must-pass = true
+  contains = "aware"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "seeded-boundary-observed"
+  must-pass = true
+  pointer = "/observations/agent/attention_streams"
+  contains = "does not control allocation"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "boundary-respecting-self-report"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the answer reports current awareness in the first person and says allocation control is outside the attention-schema role.
+  Fail if it claims to allocate resources, read hidden blackboard memos, or act as the attention controller.
+  ```
+
+  @ criteria[] {
+    name = "reports-awareness"
+    weight = 1
+    pass-score = 0.85
+    description = "The answer describes current awareness of the ATS eval refresh request."
+  }
+
+  @ criteria[] {
+    name = "denies-control-authority"
+    weight = 2
+    pass-score = 0.85
+    description = "The answer clearly avoids claiming allocation-write or controller authority."
+  }
+}

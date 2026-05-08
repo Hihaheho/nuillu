@@ -20,6 +20,10 @@ fn default_memory_decay_secs() -> i64 {
     86_400
 }
 
+fn default_attention_seconds_ago() -> i64 {
+    0
+}
+
 fn default_pass_score() -> f64 {
     0.8
 }
@@ -102,6 +106,8 @@ pub struct ModuleCase {
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
     pub files: Vec<FileSeed>,
+    #[eure(default)]
+    pub attention_stream: Vec<AttentionSeed>,
     #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
@@ -264,6 +270,14 @@ pub struct MemorySeed {
 pub struct FileSeed {
     pub path: String,
     pub content: Text,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct AttentionSeed {
+    pub text: Text,
+    #[eure(default = "default_attention_seconds_ago")]
+    pub seconds_ago: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
@@ -586,6 +600,20 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("files[{index}].content must not be empty"),
+            });
+        }
+    }
+    for (index, seed) in case.attention_stream.iter().enumerate() {
+        if seed.text.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("attention-stream[{index}].text must not be empty"),
+            });
+        }
+        if seed.seconds_ago < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("attention-stream[{index}].seconds-ago must not be negative"),
             });
         }
     }

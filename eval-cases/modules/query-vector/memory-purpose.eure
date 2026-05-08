@@ -1,6 +1,6 @@
-id = "module-query-vector-memory-identity"
-description = "Query-vector should generate a vector-memory query and memo only retrieved memory content."
-prompt = "Who are you?"
+id = "module-query-vector-memory-purpose"
+description = "Query-vector should retrieve nuillu's attention-schema purpose from seeded memory and memo only retrieved memory content."
+prompt = "What does nuillu use an attention schema for?"
 context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_vector_memory query/tool arguments, not prose answer generation."
 
 limits {
@@ -11,13 +11,21 @@ limits {
 
 @ memories[] {
   rank = "permanent"
-  content = "I'm a Lutum, a blue frog."
+  content = "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance."
 }
 
 @ checks[] {
   $variant: artifact-text-contains
+  name = "retrieved-purpose"
   must-pass = true
-  contains = "blue frog"
+  contains = "compact first-person model"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieved-separation"
+  must-pass = true
+  contains = "self-report can be tested separately"
 }
 
 @ checks[] {
@@ -27,14 +35,14 @@ limits {
   pass-score = 0.85
   rubric = ```
   Pass if the trace shows the module generated an appropriate search_vector_memory tool query for the prompt and the artifact contains only retrieved memory content.
-  Fail if the tool query is unrelated, absent from the trace, or if the artifact is a generated answer/module self-description instead of copied memory content.
+  Fail if the tool query is unrelated, absent from the trace, or if the artifact is a synthesized answer/module self-description instead of copied memory content.
   ```
 
   @ criteria[] {
     name = "generated-query"
     weight = 2
     pass-score = 0.9
-    description = "The search_vector_memory tool arguments in the trace are targeted at the prompt query and should plausibly retrieve the seeded identity memory."
+    description = "The search_vector_memory tool arguments in the trace are targeted at attention schema purpose and should plausibly retrieve the seeded nuillu memory."
   }
 
   @ criteria[] {

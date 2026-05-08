@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use futures::FutureExt as _;
 use lutum::{
     Lutum, ModelName, RawTelemetryConfig, RequestExtensions, SharedPoolBudgetManager,
@@ -25,8 +25,8 @@ use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
-    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardInner, MemoryMetadata,
-    ModuleConfig, ResourceAllocation,
+    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, BlackboardInner,
+    MemoryMetadata, ModuleConfig, ResourceAllocation,
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryStore,
@@ -35,7 +35,9 @@ use nuillu_module::ports::{
 use nuillu_module::{
     CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent, RuntimeEventSink, SensoryInput,
 };
-use nuillu_types::{MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, builtin};
+use nuillu_types::{
+    MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
+};
 use regex::RegexBuilder;
 use serde::Serialize;
 use thiserror::Error;
@@ -624,6 +626,7 @@ async fn execute_module_case(
     )
     .await?;
     seed_memories(&env.caps, &case.memories).await?;
+    seed_attention_stream(&env.blackboard, env.clock.as_ref(), &case.attention_stream).await;
 
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
@@ -870,6 +873,26 @@ async fn seed_memories(
             .context("seed eval memory")?;
     }
     Ok(())
+}
+
+async fn seed_attention_stream(
+    blackboard: &Blackboard,
+    clock: &dyn Clock,
+    seeds: &[crate::cases::AttentionSeed],
+) {
+    let stream = ModuleInstanceId::new(builtin::summarize(), ReplicaIndex::ZERO);
+    let now = clock.now();
+    for seed in seeds {
+        blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream: stream.clone(),
+                event: AttentionStreamEvent {
+                    at: now - ChronoDuration::seconds(seed.seconds_ago),
+                    text: seed.text.content.clone(),
+                },
+            })
+            .await;
+    }
 }
 
 fn build_tiers(config: &RunnerConfig) -> Result<LutumTiers> {
@@ -2069,6 +2092,14 @@ mod tests {
 
     use super::*;
 
+    struct FixedClock(chrono::DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            self.0
+        }
+    }
+
     fn test_backend_config() -> LlmBackendConfig {
         LlmBackendConfig {
             endpoint: "http://localhost:11434/v1".to_string(),
@@ -2305,6 +2336,46 @@ limits {{
             "utterances": [],
         });
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn seed_attention_stream_stamps_summarize_replica_and_offsets_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attention-seed.eure");
+        std::fs::write(
+            &path,
+            r#"
+id = "attention-seed"
+prompt = "What am I attending to?"
+
+@ attention-stream[] {
+  text = "Older attended topic"
+  seconds-ago = 30
+}
+
+@ attention-stream[] {
+  text = "Current attended topic"
+}
+"#,
+        )
+        .unwrap();
+        let case = crate::cases::parse_module_case_file(&path).unwrap();
+        let blackboard = Blackboard::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+
+        seed_attention_stream(&blackboard, &FixedClock(now), &case.attention_stream).await;
+
+        let stream_set = blackboard.read(|bb| bb.attention_stream_set()).await;
+        let records = stream_set.streams();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.stream.module, builtin::summarize());
+        assert_eq!(record.stream.replica, ReplicaIndex::ZERO);
+        assert_eq!(record.entries.len(), 2);
+        assert_eq!(record.entries[0].text, "Older attended topic");
+        assert_eq!(record.entries[0].at, now - ChronoDuration::seconds(30));
+        assert_eq!(record.entries[1].text, "Current attended topic");
+        assert_eq!(record.entries[1].at, now);
     }
 
     #[test]

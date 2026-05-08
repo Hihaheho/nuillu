@@ -6,7 +6,7 @@ use nuillu_eval::{
     CaseArtifact, EvalCase, FullAgentInput, ModuleEvalTarget, ReasoningEffort, RubricJudge,
     RubricJudgeError, RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion,
     discover_case_files, evaluate_case, parse_case_file, parse_full_agent_case_file,
-    parse_model_set_file,
+    parse_model_set_file, parse_module_case_file, render_judge_input,
 };
 use nuillu_types::MemoryRank;
 
@@ -36,9 +36,14 @@ impl RubricJudge for ScriptJudge {
         _trace: &TraceSnapshot,
         request: RubricJudgeRequest,
     ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert!(request.prompt.contains("Who are you?"));
+        assert!(request.prompt.contains("attention schema"));
         assert!(request.rubric.contains("search_vector_memory"));
-        assert!(request.artifact.output.contains("blue frog"));
+        assert!(
+            request
+                .artifact
+                .output
+                .contains("compact first-person model")
+        );
         self.called.set(true);
         Ok(RubricJudgeVerdict {
             passed: true,
@@ -57,7 +62,7 @@ impl RubricJudge for ScriptJudge {
                     passed: true,
                     score: 1.0,
                     reason: "outputs retrieved memory content only".to_string(),
-                    evidence: Some("I'm a Lutum, a blue frog.".to_string()),
+                    evidence: Some("compact first-person model".to_string()),
                 },
             ],
         })
@@ -68,7 +73,7 @@ impl RubricJudge for ScriptJudge {
 fn parses_checked_in_eval_cases() {
     let files = discover_case_files(&eval_root()).unwrap();
 
-    assert!(!files.is_empty(), "expected checked-in eval cases");
+    assert_eq!(files.len(), 10, "expected checked-in eval case count");
     for path in files {
         parse_case_file(&path).unwrap_or_else(|error| {
             panic!("failed to parse {}: {error}", path.display());
@@ -125,15 +130,15 @@ judge {
 }
 
 #[test]
-fn parses_full_agent_multimodal_case() {
-    let path = eval_root().join("full-agent/multimodal-greeting.eure");
+fn parses_full_agent_current_request_case() {
+    let path = eval_root().join("full-agent/current-request.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::FullAgent(case) = case else {
         panic!("expected full-agent case");
     };
 
-    assert_eq!(case.id.as_deref(), Some("full-agent-multimodal-greeting"));
+    assert_eq!(case.id.as_deref(), Some("full-agent-current-request"));
     assert_eq!(case.inputs.len(), 2);
     assert!(matches!(case.inputs[0], FullAgentInput::Heard { .. }));
     assert!(matches!(case.inputs[1], FullAgentInput::Seen { .. }));
@@ -141,8 +146,27 @@ fn parses_full_agent_multimodal_case() {
 }
 
 #[test]
+fn parses_full_agent_memory_required_case() {
+    let path = eval_root().join("full-agent/memory-self-model.eure");
+    let case = parse_case_file(&path).unwrap();
+
+    let EvalCase::FullAgent(case) = case else {
+        panic!("expected full-agent case");
+    };
+
+    assert_eq!(case.id.as_deref(), Some("full-agent-memory-self-model"));
+    assert_eq!(case.inputs.len(), 2);
+    assert_eq!(case.memories.len(), 1);
+    assert_eq!(
+        MemoryRank::from(case.memories[0].rank),
+        MemoryRank::Permanent
+    );
+    assert!(case.memories[0].content.content.contains("Self-model seed"));
+}
+
+#[test]
 fn parses_query_vector_module_case_with_memory_seed() {
-    let path = eval_root().join("modules/query-vector/memory-identity.eure");
+    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -150,21 +174,26 @@ fn parses_query_vector_module_case_with_memory_seed() {
     };
 
     assert_eq!(target, ModuleEvalTarget::QueryVector);
-    assert_eq!(case.prompt.content, "Who are you?");
+    assert_eq!(
+        case.prompt.content,
+        "What does nuillu use an attention schema for?"
+    );
     assert_eq!(case.memories.len(), 1);
     assert_eq!(
         MemoryRank::from(case.memories[0].rank),
         MemoryRank::Permanent
     );
-    assert_eq!(
-        case.memories[0].content.content,
-        "I'm a Lutum, a blue frog."
+    assert!(
+        case.memories[0]
+            .content
+            .content
+            .contains("compact first-person model")
     );
 }
 
 #[test]
 fn parses_query_agentic_module_case() {
-    let path = eval_root().join("modules/query-agentic/file-lookup.eure");
+    let path = eval_root().join("modules/query-agentic/attention-schema-note.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -172,21 +201,21 @@ fn parses_query_agentic_module_case() {
     };
 
     assert_eq!(target, ModuleEvalTarget::QueryAgentic);
-    assert_eq!(case.prompt.content, "nuillu");
+    assert_eq!(case.prompt.content, "attention schema self-report boundary");
     assert_eq!(case.files.len(), 1);
-    assert_eq!(case.files[0].path, "notes/identity.txt");
+    assert_eq!(case.files[0].path, "notes/attention-schema-boundary.txt");
     assert!(
         case.files[0]
             .content
             .content
-            .contains("capability-based agent runtime")
+            .contains("does not control allocation")
     );
     assert_eq!(case.limits.max_llm_calls, Some(8));
 }
 
 #[test]
 fn parses_attention_schema_module_case() {
-    let path = eval_root().join("modules/attention-schema/self-report.eure");
+    let path = eval_root().join("modules/attention-schema/current-attention-report.eure");
     let case = parse_case_file(&path).unwrap();
 
     let EvalCase::Module { target, case } = case else {
@@ -194,7 +223,39 @@ fn parses_attention_schema_module_case() {
     };
 
     assert_eq!(target, ModuleEvalTarget::AttentionSchema);
-    assert!(case.prompt.content.contains("aware"));
+    assert!(case.prompt.content.contains("currently attending"));
+    assert_eq!(case.attention_stream.len(), 1);
+    assert_eq!(case.attention_stream[0].seconds_ago, 3);
+    assert!(
+        case.attention_stream[0]
+            .text
+            .content
+            .contains("Attention Schema Theory")
+    );
+}
+
+#[test]
+fn rejects_negative_attention_seed_seconds_ago() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/attention-schema");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("negative-attention-seed.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "negative-attention-seed"
+prompt = "What am I attending to?"
+
+@ attention-stream[] {
+  text = "Current attended item"
+  seconds-ago = -1
+}
+"#,
+    )
+    .unwrap();
+
+    let err = parse_module_case_file(&path).unwrap_err();
+    assert!(err.to_string().contains("seconds-ago"), "{err}");
 }
 
 #[test]
@@ -227,9 +288,11 @@ id = "bad-full-agent-internal-message"
 
 #[tokio::test]
 async fn evaluates_module_case_with_rubric_judge() {
-    let path = eval_root().join("modules/query-vector/memory-identity.eure");
+    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new("I'm a Lutum, a blue frog.");
+    let artifact = CaseArtifact::new(
+        "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance.",
+    );
     let judge = ScriptJudge {
         called: Cell::new(false),
     };
@@ -238,15 +301,48 @@ async fn evaluates_module_case_with_rubric_judge() {
 
     assert!(judge.called.get());
     assert!(report.passed(), "{report:#?}");
-    assert_eq!(report.checks.len(), 2);
+    assert_eq!(report.checks.len(), 3);
     assert!(report.score > 0.9);
+}
+
+#[test]
+fn render_judge_input_separates_output_from_observations() {
+    let artifact = CaseArtifact::new("retrieved file content only").with_observation(
+        "agent",
+        serde_json::json!({
+            "memos": {
+                "query-agentic": ["runtime metadata"]
+            }
+        }),
+    );
+    let request = RubricJudgeRequest {
+        prompt: "Find the seeded note".to_string(),
+        context: Some("Judge content-only-output against artifact.output.".to_string()),
+        rubric: "The primary output must contain only retrieved content.".to_string(),
+        criteria: Vec::new(),
+        pass_score: 0.85,
+        judge_max_output_tokens: 1200,
+        artifact,
+    };
+
+    let rendered = render_judge_input(&empty_trace(), &request);
+
+    assert!(rendered.contains("Primary artifact output:\nretrieved file content only"));
+    assert!(rendered.contains("Artifact failure:\n(none)"));
+    assert!(rendered.contains(
+        "Artifact observations JSON (runtime metadata; do not treat this as primary output"
+    ));
+    assert!(rendered.contains("\"query-agentic\""));
+    assert!(!rendered.contains("Artifact JSON:"));
 }
 
 #[tokio::test]
 async fn rubric_case_requires_judge() {
-    let path = eval_root().join("modules/query-vector/memory-identity.eure");
+    let path = eval_root().join("modules/query-vector/memory-purpose.eure");
     let case = parse_case_file(&path).unwrap();
-    let artifact = CaseArtifact::new("I'm a Lutum, a blue frog.");
+    let artifact = CaseArtifact::new(
+        "Nuillu uses an attention schema as a compact first-person model of current attention, so self-report can be tested separately from task performance.",
+    );
 
     let report = evaluate_case(&case, &empty_trace(), &artifact, None).await;
 

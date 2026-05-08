@@ -15,10 +15,10 @@ pub mod trace_json;
 
 pub use artifact::CaseArtifact;
 pub use cases::{
-    ArtifactTextField, CaseFileError, CaseScoring, Check, CheckCommon, EvalCase, EvalLimits,
-    FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed, MemorySeedRank,
-    ModuleCase, ModuleCaseFile, ModuleEvalTarget, RubricCriterion, discover_case_files,
-    parse_case_file, parse_full_agent_case_file, parse_module_case_file,
+    ArtifactTextField, AttentionSeed, CaseFileError, CaseScoring, Check, CheckCommon, EvalCase,
+    EvalLimits, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed,
+    MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleEvalTarget, RubricCriterion,
+    discover_case_files, parse_case_file, parse_full_agent_case_file, parse_module_case_file,
 };
 pub use evaluation::{
     CaseEval, CaseObjective, CaseReport, CaseSummary, CheckOutcome, SuiteReport, evaluate_case,

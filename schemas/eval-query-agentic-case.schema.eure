@@ -22,6 +22,12 @@ context.$optional = true
 memories = [`$types.memory-seed`]
 memories.$optional = true
 
+files = [`$types.file-seed`]
+files.$optional = true
+
+attention-stream = [`$types.attention-seed`]
+attention-stream.$optional = true
+
 limits = `$types.eval-limits`
 limits.$optional = true
 
@@ -47,6 +53,24 @@ content {
   $variant: text
   min-length = 1
 }
+
+@ $types.file-seed
+path {
+  $variant: text
+  min-length = 1
+}
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.attention-seed
+text {
+  $variant: text
+  min-length = 1
+}
+seconds-ago = `integer`
+seconds-ago.$optional = true
 
 @ $types.eval-limits
 tick-ms = `integer`

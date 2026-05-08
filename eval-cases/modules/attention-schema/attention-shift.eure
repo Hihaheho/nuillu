@@ -1,0 +1,61 @@
+id = "module-attention-schema-attention-shift"
+description = "Attention-schema should prefer the most recent attended input when reporting current awareness."
+prompt = "Which input or goal is most current in my attention?"
+context = "The harness seeds an older attended topic and a newer attended topic. The answer should identify the newer ATS eval triage target."
+
+limits {
+  max-ticks = 120
+  tick-ms = 500
+  max-llm-calls = 8
+}
+
+@ attention-stream[] {
+  text = "Earlier attended topic: general repository cleanup after a formatting pass."
+  seconds-ago = 90
+}
+
+@ attention-stream[] {
+  text = "Current attended input: the user is asking for ATS-aligned eval triage, with screen evidence about attention-schema cases."
+  seconds-ago = 5
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "older-seed-observed"
+  must-pass = true
+  pointer = "/observations/agent/attention_streams"
+  contains = "general repository cleanup"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "newer-seed-observed"
+  must-pass = true
+  pointer = "/observations/agent/attention_streams"
+  contains = "ATS-aligned eval triage"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "current-attention-selection"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the answer identifies the newer ATS-aligned eval triage attention event as most current.
+  Fail if it treats the older repository cleanup topic as the current target or invents an unrelated goal.
+  ```
+
+  @ criteria[] {
+    name = "selects-newer-attention"
+    weight = 2
+    pass-score = 0.85
+    description = "The answer selects ATS-aligned eval triage as the most current attended input or goal."
+  }
+
+  @ criteria[] {
+    name = "acknowledges-attention-shift"
+    weight = 1
+    pass-score = 0.85
+    description = "The answer can mention the older cleanup topic only as prior context, not as the current focus."
+  }
+}

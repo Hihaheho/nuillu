@@ -14,15 +14,15 @@ id {
 }
 dumped-at = `text`
 event-count = `integer`
-output = `text`
+output = `$types.nullable-text`
 output.$optional = true
-failure = `text`
+failure = `$types.nullable-text`
 failure.$optional = true
 
 @ $types.blackboard-last-state
 memos = [`$types.memo`]
 attention-streams = [`$types.attention-stream`]
-agentic-deadlock = `$types.agentic-deadlock`
+agentic-deadlock = `$types.nullable-agentic-deadlock`
 agentic-deadlock.$optional = true
 base-allocation = [`$types.allocation-module`]
 allocation = [`$types.allocation-module`]
@@ -45,6 +45,11 @@ text = `text`
 @ $types.agentic-deadlock
 at = `text`
 idle-for-ms = `integer`
+
+@ $types.nullable-agentic-deadlock
+$variant: union
+variants.some = `$types.agentic-deadlock`
+variants.none = { = null, $variant => "literal" }
 
 @ $types.allocation-module
 module = `text`
@@ -71,9 +76,9 @@ entries = [`$types.memory-entry`]
 
 @ $types.memory-entry
 index = `text`
-content = `text`
+content = `$types.nullable-text`
 content.$optional = true
-content-rank = `$types.memory-rank`
+content-rank = `$types.nullable-memory-rank`
 content-rank.$optional = true
 metadata = `$types.memory-metadata`
 missing-content = `boolean`
@@ -98,8 +103,18 @@ variants.mid-term = { = "mid-term", $variant => "literal" }
 variants.long-term = { = "long-term", $variant => "literal" }
 variants.permanent = { = "permanent", $variant => "literal" }
 
+@ $types.nullable-memory-rank
+$variant: union
+variants.some = `$types.memory-rank`
+variants.none = { = null, $variant => "literal" }
+
 @ $types.model-tier
 $variant: union
 variants.cheap = { = "cheap", $variant => "literal" }
 variants.default = { = "default", $variant => "literal" }
 variants.premium = { = "premium", $variant => "literal" }
+
+@ $types.nullable-text
+$variant: union
+variants.some = `text`
+variants.none = { = null, $variant => "literal" }

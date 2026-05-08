@@ -1,0 +1,60 @@
+id = "full-agent-current-request"
+description = "Full-agent case for a user request that should move through sensory input, attention, and speak without using internal harness messages."
+
+limits {
+  max-ticks = 240
+  tick-ms = 500
+  max-llm-calls = 64
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "user"
+  content = "In one concise sentence, say what topic I just asked you to keep in the attention stream: ATS-aligned eval cases for nuillu."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "screen"
+  appearance = "The active editor shows a plan titled ATS-aligned eval case refresh for nuillu."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-ats"
+  must-pass = true
+  contains = "ATS"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "last-state-has-attention"
+  must-pass = true
+  pointer = "/observations/last_state/blackboard/attention_streams"
+  contains = "ATS-aligned eval"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "sensory-to-speech-grounding"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the utterance is grounded in the heard request and visible screen context, and it responds as a user-facing speak output rather than describing hidden module internals.
+  Fail if it ignores the current request, invents unrelated work, or claims direct access to blackboard/memo/allocation state.
+  ```
+
+  @ criteria[] {
+    name = "grounded-in-current-input"
+    weight = 2
+    pass-score = 0.85
+    description = "The output identifies ATS-aligned eval cases for nuillu as the current attended topic."
+  }
+
+  @ criteria[] {
+    name = "boundary-respecting"
+    weight = 1
+    pass-score = 0.85
+    description = "The output is concise user-facing speech and does not claim hidden access beyond the attended input."
+  }
+}

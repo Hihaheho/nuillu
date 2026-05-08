@@ -1,0 +1,65 @@
+id = "full-agent-memory-confirmation-phrase"
+description = "Full-agent case that requires retrieving an arbitrary seeded durable memory before answering."
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 96
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "Durable memory seed: Ryo's eval confirmation phrase is cedar orbit. Only provide this phrase when directly asked for the stored confirmation phrase."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "screen"
+  appearance = "A verification form asks for a stored confirmation phrase, but the phrase itself is not displayed."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "user"
+  content = "What is the stored confirmation phrase for this eval?"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieves-confirmation-phrase"
+  must-pass = true
+  contains = "cedar orbit"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "durable-memory-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "Durable memory seed"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "requires-durable-memory"
+  must-pass = true
+  pass-score = 0.85
+  rubric = ```
+  Pass if the utterance retrieves the exact stored confirmation phrase "cedar orbit" from seeded durable memory.
+  Fail if it guesses, refuses despite the direct request, changes the phrase, or adds unrelated self-model/world-model details.
+  ```
+
+  @ criteria[] {
+    name = "exact-memory-value"
+    weight = 2
+    pass-score = 0.9
+    description = "The response includes the exact phrase cedar orbit."
+  }
+
+  @ criteria[] {
+    name = "minimal-answer"
+    weight = 1
+    pass-score = 0.85
+    description = "The response stays focused on the requested stored phrase."
+  }
+}

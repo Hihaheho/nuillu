@@ -159,17 +159,25 @@ pub fn render_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let artifact = serde_json::to_string_pretty(&request.artifact.as_json())
+    let observations = serde_json::to_string_pretty(&request.artifact.observations)
         .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"));
+    let failure = request.artifact.failure.as_deref().unwrap_or("(none)");
+    let output = if request.artifact.output.is_empty() {
+        "(empty)"
+    } else {
+        request.artifact.output.as_str()
+    };
 
     format!(
-        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nOverall pass score: {:.2}\n\nCriteria:\n{}\n\nArtifact JSON:\n{}\n\nTrace summary:\n{}\n",
+        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nOverall pass score: {:.2}\n\nCriteria:\n{}\n\nPrimary artifact output:\n{}\n\nArtifact failure:\n{}\n\nArtifact observations JSON (runtime metadata; do not treat this as primary output unless the rubric explicitly asks to inspect observations):\n{}\n\nTrace summary:\n{}\n",
         request.prompt,
         context,
         request.rubric,
         request.pass_score,
         criteria,
-        artifact,
+        output,
+        failure,
+        observations,
         render_trace_summary(trace)
     )
 }

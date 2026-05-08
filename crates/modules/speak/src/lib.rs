@@ -67,15 +67,24 @@ fn generation_input(
     allocation_json: serde_json::Value,
     draft: &GenerationDraft,
 ) -> serde_json::Value {
-    let mut input = serde_json::json!({
+    serde_json::json!({
         "attention_streams": attention_json,
         "allocation": allocation_json,
         "generation_hint": draft.generation_hint.as_deref(),
-    });
+    })
+}
+
+fn push_generation_context(
+    session: &mut Session,
+    attention_json: serde_json::Value,
+    allocation_json: serde_json::Value,
+    draft: &GenerationDraft,
+) {
+    session.push_system(GENERATION_PROMPT);
+    session.push_user(generation_input(attention_json, allocation_json, draft).to_string());
     if !draft.accumulated.is_empty() {
-        input["partial_utterance"] = serde_json::Value::String(draft.accumulated.clone());
+        session.push_assistant_text(draft.accumulated.clone());
     }
-    input
 }
 
 pub struct SpeakModule {
@@ -169,8 +178,7 @@ impl SpeakModule {
     ) -> Result<bool> {
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(GENERATION_PROMPT);
-        session.push_user(generation_input(attention_json, allocation_json, draft).to_string());
+        push_generation_context(&mut session, attention_json, allocation_json, draft);
 
         let mut stream = session
             .text_turn()
@@ -227,40 +235,96 @@ impl SpeakModule {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use lutum::{
+        AssistantInputItem, InputMessageRole, MessageContent, MockLlmAdapter, ModelInputItem,
+        Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
+    };
+
     use super::*;
 
-    #[test]
-    fn fresh_generation_omits_partial_utterance() {
-        let draft = GenerationDraft::new(7, Some("be concise".into()), "respond".into());
-
-        let input = generation_input(
-            serde_json::json!({"streams": []}),
-            serde_json::json!({"speak": {"guidance": "respond"}}),
-            &draft,
-        );
-
-        assert_eq!(draft.generation_id, 7);
-        assert_eq!(draft.sequence, 0);
-        assert_eq!(input["generation_hint"], "be concise");
-        assert!(input.get("partial_utterance").is_none());
+    fn test_session() -> Session {
+        let adapter = MockLlmAdapter::new();
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        Session::new(lutum::Lutum::new(Arc::new(adapter), budget))
     }
 
     #[test]
-    fn resumed_generation_keeps_id_sequence_and_partial_utterance() {
-        let mut draft = GenerationDraft::new(11, None, "respond".into());
+    fn fresh_generation_omits_assistant_prefill() {
+        let draft = GenerationDraft::new(7, Some("be concise".into()), "respond".into());
+        let mut session = test_session();
 
-        assert_eq!(draft.push_delta("hello "), 0);
-        assert_eq!(draft.push_delta("world"), 1);
-        let input = generation_input(
+        push_generation_context(
+            &mut session,
             serde_json::json!({"streams": []}),
             serde_json::json!({"speak": {"guidance": "respond"}}),
             &draft,
         );
+        let items = session.input().items();
+
+        assert_eq!(draft.generation_id, 7);
+        assert_eq!(draft.sequence, 0);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0],
+            ModelInputItem::Message {
+                role: InputMessageRole::System,
+                ..
+            }
+        ));
+        let ModelInputItem::Message {
+            role: InputMessageRole::User,
+            content,
+        } = &items[1]
+        else {
+            panic!("expected user generation context");
+        };
+        let [MessageContent::Text(text)] = content.as_slice() else {
+            panic!("expected one text content item");
+        };
+        let json: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(json["generation_hint"], "be concise");
+        assert!(json.get("partial_utterance").is_none());
+    }
+
+    #[test]
+    fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
+        let mut draft = GenerationDraft::new(11, None, "respond".into());
+        let mut session = test_session();
+
+        assert_eq!(draft.push_delta("hello "), 0);
+        assert_eq!(draft.push_delta("world"), 1);
+        push_generation_context(
+            &mut session,
+            serde_json::json!({"streams": []}),
+            serde_json::json!({"speak": {"guidance": "respond"}}),
+            &draft,
+        );
+        let items = session.input().items();
 
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
-        assert_eq!(input["partial_utterance"], "hello world");
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            ModelInputItem::Message {
+                role: InputMessageRole::System,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &items[1],
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                ..
+            }
+        ));
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
+            panic!("expected assistant prefill");
+        };
+        assert_eq!(text, "hello world");
     }
 }
 
