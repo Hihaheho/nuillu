@@ -139,7 +139,7 @@ The sensory memo is the only output. It should contain the filtered, normalized 
 
 ### Attention Gate
 
-Reads the non-cognitive blackboard snapshot and current allocation guidance, then appends to the attention stream when something is novel, unresolved, strongly changed, or requested by controller guidance. It is the only bridge from the non-cognitive blackboard to the cognitive surface, and it has no memo capability. This role is the successor to the older `summarize` design name: selection and promotion to attention are the essence of the module, not generic summarization.
+Reads the non-cognitive blackboard snapshot and current allocation guidance, then appends to the attention stream when something is novel, unresolved, strongly changed, or requested by controller guidance. It is the only bridge from the non-cognitive blackboard to the cognitive surface, and it has no memo capability.
 
 When sensory memo content is promoted, attention-gate rounds the detailed memo age through `configs/time-division.eure` before appending the attention event. Detailed timing stays in the sensory memo; rounded timing belongs to the attention stream.
 
