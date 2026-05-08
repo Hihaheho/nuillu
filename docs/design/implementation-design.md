@@ -38,9 +38,10 @@ crates/
   module/                     # Module trait, port traits, capability handles, typed channels, capability issuers
   modules/
     sensory/                  # observations -> deterministic salience + LLM-filtered memo
-    summarize/                # non-cognitive snapshot -> attention stream
+    attention-gate/           # non-cognitive snapshot -> attention stream
     attention-controller/     # attention stream -> resource allocation
-    attention-schema/         # attention stream -> self-model memo
+    attention-schema/         # attention stream -> attention-state memo
+    self-model/               # attention schema + memos -> self-model memo
     query-vector/             # blackboard/vector memory RAG -> query-vector memo
     query-agentic/            # blackboard/file search -> query-agentic memo
     memory/                   # blackboard snapshot -> memory inserts
@@ -245,7 +246,7 @@ Delivery policy is per topic:
 
 Examples: `Ryo said "..." 42 seconds ago`, `Ryo said "..." 1 minute 20 seconds ago`, `screen showed "..." 3 hours 40 minutes ago`, `Ryo said "..." 2 days 5 hours ago`. Future timestamps caused by host clock skew should be clamped to `0 seconds ago`.
 
-The sensory module does not publish derived typed work requests. `QueryMailbox` and `SelfModelMailbox` are internal messaging surfaces; module-level eval harnesses may hold them to isolate query modules or attention-schema, but app-facing/full-agent eval cases must not use them as external inputs. A separate routing/planning module may own those mailboxes in a later design.
+The sensory module does not publish derived typed work requests. `QueryMailbox` and `SelfModelMailbox` are internal messaging surfaces; module-level eval harnesses may hold them to isolate query modules or self-model, but app-facing/full-agent eval cases must not use them as external inputs. A separate routing/planning module may own those mailboxes in a later design.
 
 Speech actions are app-facing port writes rather than channel messages:
 
@@ -320,12 +321,12 @@ Rules:
 - Cross-inbox event ordering has no runtime-wide meaning. Each module defines whether `calculate_next_batch` preserves order, groups by source, or reduces wake signals into booleans.
 - Batching is deterministic computation over already-received transient events. It must not call an LLM to decide batch membership. Module-local LLM work may still decide semantic output over the deterministic batch, such as memory candidate deduplication.
 - Closed inboxes terminate the module loop by propagating a typed receive error to the module's `run_loop`.
-- When explicit requests and allocation updates are ready together, explicit requests are handled first. `attention-schema` refreshes the self-model before answering if a self-model request and allocation wake are batched together.
+- When explicit requests and wake signals are ready together, explicit requests are handled first. `self-model` refreshes the current self-description before answering if a self-model request and relevant memo/context wake are batched together.
 
 Module conventions:
-- Allocation-update modules, such as summarize and memory-compaction, collapse multiple ready allocation updates into one guidance activation and reread allocation as source of truth.
+- Allocation-update modules, such as attention-gate and memory-compaction, collapse multiple ready allocation updates into one guidance activation and reread allocation as source of truth.
 - Memo-update modules, such as attention-controller, collapse multiple ready memo updates into one wake activation and reread the blackboard as source of truth. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
-- Attention-update modules, such as predict and surprise, collapse multiple ready attention updates into one wake activation and reread the attention stream as source of truth.
+- Attention-update modules, such as attention-schema, predict, and surprise, collapse multiple ready attention updates into one wake activation and reread the attention stream as source of truth.
 - Query and self-model modules collect ready explicit requests into a module-local batch and answer the batch in one LLM turn. The module decides answer granularity and memo write policy; channel responses and request/response correlation remain out of scope.
 - Memory collects ready `MemoryRequest` values into a deterministic batch of memory candidates, passes them with the blackboard snapshot to its LLM deliberation, and writes only through `insert_memory` tool calls. A request is not a durable write command; the memory module may deduplicate, merge, normalize, or reject candidates.
 - Speak may batch while waiting to start work, but attention and allocation updates received during a generation stream remain immediate interruption signals and are not delayed behind start-time batching.
@@ -484,11 +485,13 @@ The sensory module is deliberately a pre-attentive filter, not the conversation 
 
 The LLM stage receives the raw observation, detailed relative age, normalized signature, repetition/change metrics, decay-adjusted salience, current allocation guidance, and any configured thresholds. Its output is constrained to one of: ignore, update background summary, or write/update memo observation. The memo is the contract with the rest of the system. It should contain filtered observations and enough inspection detail to explain the computed salience and the LLM decision. Raw sensory events are transient and should not be mirrored wholesale into durable state.
 
-### Summarize
+### Attention Gate
 
 Capabilities: `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `AttentionWriter`, `TimeDivision`, `LlmAccess`.
 
-Reads the non-cognitive blackboard snapshot and current allocation guidance, then appends concise, novel, currently relevant events to this replica's attention stream. It has no `Memo` capability; its only durable output is the attention stream. When promoting sensory memo content, summarize is the only place that applies time-division rounding: it converts the detailed memo age into the bucket/tag from `configs/time-division.eure` before writing the attention stream event.
+Reads the non-cognitive blackboard snapshot and current allocation guidance, then appends concise, novel, currently relevant events to this replica's attention stream. It has no `Memo` capability; its only durable output is the attention stream. When promoting sensory memo content, attention-gate is the only place that applies time-division rounding: it converts the detailed memo age into the bucket/tag from `configs/time-division.eure` before writing the attention stream event.
+
+This role is the successor to the older `summarize` design name. The module may summarize content as part of its decision, but its architectural job is gating: selecting which non-cognitive memo/blackboard state becomes cognitive attention.
 
 ### Attention Controller
 
@@ -498,15 +501,23 @@ Wakes only on memo updates, excluding its own memo writes. It reads the blackboa
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
 
-When current memos and attention suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it lowers `speak.activation_ratio` when the speak registration permits `min = 0`, keeps or raises query and summarize activation ratios/tier, and writes explicit guidance telling Speak to wait silently. Query modules continue to write memo-authoritative results; summarize may later promote useful query memo content into attention streams. Once attended state and memos indicate that enough evidence is available for a user-visible answer, the controller raises Speak and updates its guidance.
+When current memos and attention suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it lowers `speak.activation_ratio` when the speak registration permits `min = 0`, keeps or raises query and attention-gate activation ratios/tier, and writes explicit guidance telling Speak to wait silently. Query modules continue to write memo-authoritative results; attention-gate may later promote useful query memo content into attention streams. Once attended state and memos indicate that enough evidence is available for a user-visible answer, the controller raises Speak and updates its guidance.
 
 This is not a request/response wait and not a query-completion correlation protocol. The controller judges readiness from memos, attention, and allocation guidance, while query results remain durable only through query-module memos.
 
 ### Attention Schema
 
-Capabilities: `SelfModelInbox`, `AllocationUpdatedInbox`, `AttentionReader`, `AllocationReader`, `Memo`, `LlmAccess`.
+Capabilities: `AttentionStreamUpdatedInbox`, `AttentionReader`, `Memo`, `LlmAccess`.
 
-Maintains a simplified first-person self-model from the attention-stream set and allocation guidance. Explicit self-model questions arrive on `SelfModelInbox`; allocation updates can refresh the model. Output is this replica's memo.
+Maintains a simplified model of the current attentional relation and process from the attention-stream set. It tracks attended targets, attentional stability, competing targets, and what the current attention makes claimable as awareness. It does not receive `SelfModelInbox`, answer self-model questions, write attention, write allocation, or write memory. Output is this replica's attention-schema memo.
+
+### Self Model
+
+Capabilities: `SelfModelInbox`, `BlackboardReader` for memo/context reads, `Memo`, `LlmAccess`.
+
+Maintains a current self-description by integrating the attention-schema memo, relevant module memos, and self-related knowledge that query modules surface from memory. Explicit self-model questions arrive on `SelfModelInbox`; topic routing load-balances requests across active self-model replicas. Output is this replica's memo, which is memo-authoritative for self-model answers.
+
+Stable self-knowledge belongs in memory and is surfaced through query-module memos; the self-model module is the dynamic integration layer over that knowledge, current attention, active task context, uncertainty, and recent module outputs. v1 should avoid granting broad direct memory search to self-model unless a later narrow self-knowledge capability is introduced; if `BlackboardReader` proves too wide for this role, introduce a narrower memo/context reader before implementation. Object/world models remain distributed through sensory, query, predict, and surprise memos in v1; add a dedicated `world-model` only if those fragments need one owner.
 
 ### Query Vector
 
@@ -610,7 +621,7 @@ loop {
 }
 ```
 
-Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, the preferred control path is for attention-controller proposals to lower `speak.activation_ratio` and/or give Speak guidance to wait silently while query and summarization work progresses. A completed utterance memo wakes the controller so it can reclaim Speak resources afterward.
+Speak does not publish query or self-model requests. If an external observation has been attended but supporting work has not completed, the preferred control path is for attention-controller proposals to lower `speak.activation_ratio` and/or give Speak guidance to wait silently while query and attention-gate work progresses. A completed utterance memo wakes the controller so it can reclaim Speak resources afterward.
 
 ---
 
@@ -628,7 +639,7 @@ Tool loops are written directly by each module so tool availability, round limit
 - the turn is part of a tool loop (`text_turn().tools::<T>().collect()`) — each round must complete before tool results can be committed,
 - the result is written directly to a `Memo` slot — there is no consumer of partial output.
 
-summarize, attention-controller, attention-schema, query-vector, query-agentic, memory, and memory-compaction use `.collect()` exclusively.
+attention-gate, attention-controller, attention-schema, self-model, query-vector, query-agentic, memory, and memory-compaction use `.collect()` exclusively.
 
 `.stream()` is appropriate only for the `speak` module's text generation step, where the response is user-facing and `UtteranceSink` can act on each chunk as it arrives. See Section 4 (Speak) for the full streaming + interruption pattern.
 
@@ -645,7 +656,7 @@ summarize, attention-controller, attention-schema, query-vector, query-agentic, 
 - `AttentionRepository`: append-only attention stream persistence with the emitting `ModuleInstanceId` / stream owner.
 - `UtteranceSink`: append-only app-facing output persistence/notification for user-visible speech actions with the emitting `ModuleInstanceId`.
 - `Clock`: injectable time source.
-- Time-division config: `configs/time-division.eure`, an ordered set of duration buckets used only when summarize promotes sensory memo content into attention stream events. It converts observation age into tags such as `now`, `last_30sec`, `last_2min`, and `before_24hour`.
+- Time-division config: `configs/time-division.eure`, an ordered set of duration buckets used only when attention-gate promotes sensory memo content into attention stream events. It converts observation age into tags such as `now`, `last_30sec`, `last_2min`, and `before_24hour`.
 
 Desired Eure shape:
 
@@ -683,11 +694,11 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 `crates/eval` has two schema families because they exercise different boundaries.
 
-Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the first completed utterance, max loop iterations, or runtime-event shutdown, and returns the first complete `Utterance` as `CaseArtifact::output`.
+Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/attention-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the first completed utterance, max loop iterations, or runtime-event shutdown, and returns the first complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, and speak start with positive activation ratios; summarize starts low and is raised by controller guidance after sensory memo writes; lower-priority query, memory, prediction, surprise, and attention-schema modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, and speak start with positive activation ratios; attention-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query, memory, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to attention-schema through `CapabilityProviders::internal_harness_io()`, then score the target module memo as the artifact. Query evals statically check that retrieved content reached the artifact, while rubrics judge generated search/tool arguments from the trace.
+Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to self-model through `CapabilityProviders::internal_harness_io()`, then score the target module memo as the artifact. Module cases may also seed `attention-stream[]` entries; those entries are written only by the eval harness, stamped as `attention-gate/0`, and exist to isolate attention-consuming modules such as attention-schema and self-model. Query evals statically check that retrieved content reached the artifact, while rubrics judge generated search/tool arguments from the trace.
 
 Common eval behavior:
 
@@ -713,7 +724,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Lowering activation ratio never destroys module state | boot builds `cap_range.max` replicas and allocation only changes routing plus event-loop scheduling |
 | Disabled replicas perform no semantic work | routed topics target active replicas only, and the event loop does not start `next_batch` or `activate` for inactive replicas |
 | Controller schema matches registered caps | attention-controller schema is generated from the registry and parsed output is clamped after decoding |
-| Controller and schema are separate modules | separate crates and separate constructor capabilities |
+| Controller, attention schema, and self-model are separate modules | separate crates and separate constructor capabilities |
 | Controller wakes only on memo updates | it receives `MemoUpdatedInbox`, not `AttentionStreamUpdatedInbox`, and the inbox filters self writes |
 | Sensory is the full-agent observation boundary | full-agent boot wiring grants `SensoryInputInbox` only to sensory |
 | Full-agent external input is sensory-only | app/full-agent eval uses `HostIo` with only `SensoryInputMailbox`; `QueryRequest` and `SelfModelRequest` are internal messages |
@@ -724,12 +735,14 @@ This keeps realistic artifacts observable without adding request/response correl
 | Speak suppression is allocation-controlled | attention-controller proposals lower `speak.activation_ratio` or guidance; inactive speak replicas are not activated by the event loop and emit only when active |
 | Speak still does not route query work | evidence gathering is driven by allocation, query memos, and attention updates; speak receives no `QueryMailbox` |
 | Speak interrupts streaming on attention/allocation updates | speak holds `AttentionStreamUpdatedInbox` and `AllocationUpdatedInbox`; generation restarts from step 1 with fresh attention and allocation snapshots |
-| Summarize replicas are the only path to attention stream append | boot-time wiring grants `AttentionWriter` only to summarize registrations; each replica writes its own stream |
-| Summary cannot wake controller directly | summarize has no `Memo`; attention appends publish `AttentionStreamUpdated`, which the controller does not receive |
+| Attention-gate replicas are the only path to attention stream append | boot-time wiring grants `AttentionWriter` only to attention-gate registrations; each replica writes its own stream |
+| Attention-gate cannot wake controller directly | attention-gate has no `Memo`; attention appends publish `AttentionStreamUpdated`, which the controller does not receive |
 | Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to attention-controller registrations; runtime computes effective allocation |
+| Attention schema models attention only | it receives `AttentionStreamUpdatedInbox`, `AttentionReader`, `Memo`, and `LlmAccess`, not `SelfModelInbox`, `AttentionWriter`, `AllocationWriter`, or memory capabilities |
+| Self-model handles self-report | callers need `SelfModelMailbox`; self-model receives `SelfModelInbox` and writes self-model answers to its own memo |
+| Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memos; self-model integrates that knowledge with attention-schema and current memo context |
 | Query vector is memory/RAG only | it receives `VectorMemorySearcher`, not file or self-model capabilities |
 | Query agentic is file-search only | it receives `FileSearcher`, not memory or self-model capabilities |
-| Self-model queries go to attention-schema | callers need `SelfModelMailbox`; schema receives `SelfModelInbox` |
 | Results are durable via memo, not responses | module instances write their own `Memo`; channels are transient |
 | Modules cannot impersonate each other | owner-stamped capabilities construct envelope senders, memo owners, attention stream owners, and utterance owners |
 | No periodic activation | there is no `PeriodicInbox`, `PeriodicActivation`, `period`, `period_ms`, or scheduler tick path |
