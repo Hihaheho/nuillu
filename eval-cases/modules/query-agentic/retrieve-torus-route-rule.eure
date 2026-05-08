@@ -12,7 +12,8 @@ limits {
 @ files[] {
   path = "world/torus-route-rule.txt"
   content = ```
-  Torus route rule: the local world wraps east-west.
+  Torus route rule: an eastbound animal can appear from the west.
+  The local world wraps east-west.
   An animal that keeps moving east can return from the west.
   This is route geometry, not teleportation.
   ```
