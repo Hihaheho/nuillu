@@ -89,43 +89,39 @@ impl AllocationReader {
         let mut caps = caps.into_iter().collect::<Vec<_>>();
         caps.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
 
-        let patch_branches = caps
-            .into_iter()
-            .map(|(id, range)| {
-                serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "module_id": {
-                            "enum": [id.as_str()],
-                        },
-                        "activation_ratio": {
-                            "type": "number",
-                            "minimum": 0.0,
-                            "maximum": 1.0,
-                            "description": format!("Runtime derives active replicas by ceil(ratio * {}) clamped to {}..={}.", range.max, range.min, range.max),
-                        },
-                        "guidance": {
-                            "type": "string",
-                        },
-                        "tier": {
-                            "enum": ["Cheap", "Default", "Premium"],
-                        },
-                    },
-                    "required": [
-                        "module_id",
-                        "activation_ratio",
-                        "guidance",
-                        "tier",
-                    ],
-                })
-            })
+        let module_ids = caps
+            .iter()
+            .map(|(id, _)| id.as_str())
             .collect::<Vec<_>>();
 
-        let patch_items = if patch_branches.is_empty() {
+        let patch_items = if module_ids.is_empty() {
             serde_json::Value::Bool(false)
         } else {
-            serde_json::json!({ "anyOf": patch_branches })
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "module_id": {
+                        "enum": module_ids,
+                    },
+                    "activation_ratio": {
+                        "type": "number",
+                        "description": "Runtime clamps activation_ratio to 0.0..=1.0 before deriving active replicas.",
+                    },
+                    "guidance": {
+                        "type": "string",
+                    },
+                    "tier": {
+                        "enum": ["Cheap", "Default", "Premium"],
+                    },
+                },
+                "required": [
+                    "module_id",
+                    "activation_ratio",
+                    "guidance",
+                    "tier",
+                ],
+            })
         };
 
         serde_json::json!({
@@ -178,61 +174,28 @@ mod tests {
                     "allocations": {
                         "type": "array",
                         "items": {
-                            "anyOf": [
-                                {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "properties": {
-                                        "module_id": {
-                                            "enum": ["query-vector"],
-                                        },
-                                        "activation_ratio": {
-                                            "type": "number",
-                                            "minimum": 0.0,
-                                            "maximum": 1.0,
-                                            "description": "Runtime derives active replicas by ceil(ratio * 3) clamped to 0..=3.",
-                                        },
-                                        "guidance": {
-                                            "type": "string",
-                                        },
-                                        "tier": {
-                                            "enum": ["Cheap", "Default", "Premium"],
-                                        },
-                                    },
-                                    "required": [
-                                        "module_id",
-                                        "activation_ratio",
-                                        "guidance",
-                                        "tier",
-                                    ],
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "module_id": {
+                                    "enum": ["query-vector", "speak"],
                                 },
-                                {
-                                    "type": "object",
-                                    "additionalProperties": false,
-                                    "properties": {
-                                        "module_id": {
-                                            "enum": ["speak"],
-                                        },
-                                        "activation_ratio": {
-                                            "type": "number",
-                                            "minimum": 0.0,
-                                            "maximum": 1.0,
-                                            "description": "Runtime derives active replicas by ceil(ratio * 1) clamped to 0..=1.",
-                                        },
-                                        "guidance": {
-                                            "type": "string",
-                                        },
-                                        "tier": {
-                                            "enum": ["Cheap", "Default", "Premium"],
-                                        },
-                                    },
-                                    "required": [
-                                        "module_id",
-                                        "activation_ratio",
-                                        "guidance",
-                                        "tier",
-                                    ],
+                                "activation_ratio": {
+                                    "type": "number",
+                                    "description": "Runtime clamps activation_ratio to 0.0..=1.0 before deriving active replicas.",
                                 },
+                                "guidance": {
+                                    "type": "string",
+                                },
+                                "tier": {
+                                    "enum": ["Cheap", "Default", "Premium"],
+                                },
+                            },
+                            "required": [
+                                "module_id",
+                                "activation_ratio",
+                                "guidance",
+                                "tier",
                             ],
                         },
                     },
