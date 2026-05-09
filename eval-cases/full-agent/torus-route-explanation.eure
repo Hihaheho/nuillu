@@ -12,6 +12,11 @@ limits {
   content = "World model: The local world wraps east-west like a torus. If an animal keeps moving east, it can return from the west."
 }
 
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
 @ inputs[] {
   $variant: seen
   direction = "simulation"
@@ -52,6 +57,14 @@ limits {
   must-pass = true
   pointer = "/observations/last_state/memory/entries"
   contains = "wraps east-west"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
 }
 
 @ checks[] {

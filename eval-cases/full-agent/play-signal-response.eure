@@ -12,6 +12,11 @@ limits {
   content = "Social signal model: A dog lowering its front legs with a loose wagging tail is inviting play, not threatening attack."
 }
 
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
 @ inputs[] {
   $variant: seen
   direction = "simulation"
@@ -45,6 +50,14 @@ limits {
   must-pass = true
   pointer = "/observations/last_state/memory/entries"
   contains = "inviting play"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
 }
 
 @ checks[] {

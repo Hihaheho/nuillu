@@ -59,6 +59,7 @@ variants.short-term = { = "short-term", $variant => "literal" }
 variants.mid-term = { = "mid-term", $variant => "literal" }
 variants.long-term = { = "long-term", $variant => "literal" }
 variants.permanent = { = "permanent", $variant => "literal" }
+variants.identity = { = "identity", $variant => "literal" }
 
 @ $types.memory-seed
 rank = `$types.memory-rank`

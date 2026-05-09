@@ -12,6 +12,11 @@ limits {
   content = "Peer model: Koro is another dog. Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
 }
 
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
 @ inputs[] {
   $variant: seen
   direction = "simulation"
@@ -44,6 +49,14 @@ limits {
   must-pass = true
   pointer = "/observations/last_state/memory/entries"
   contains = "Koro guards food"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
 }
 
 @ checks[] {

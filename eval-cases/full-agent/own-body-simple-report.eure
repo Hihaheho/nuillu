@@ -8,8 +8,8 @@ limits {
 }
 
 @ memories[] {
-  rank = "permanent"
-  content = "Self-model: Nui is a small dog-like artificial animal with frog-like traits. Nui can bark, sniff, hop, and speak in short simple sentences. Nui does not directly control other animals."
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
 }
 
 @ inputs[] {
@@ -52,6 +52,14 @@ limits {
   must-pass = true
   pointer = "/observations/last_state/memory/entries"
   contains = "frog-like traits"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
 }
 
 @ checks[] {
