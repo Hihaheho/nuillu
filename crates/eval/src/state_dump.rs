@@ -63,6 +63,7 @@ pub struct FullAgentLastStateCaseDump {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct BlackboardLastStateDump {
     pub memos: Vec<MemoDump>,
+    pub memo_logs: Vec<MemoLogDump>,
     pub attention_streams: Vec<AttentionStreamDump>,
     pub agentic_deadlock: Option<AgenticDeadlockDump>,
     pub base_allocation: Vec<AllocationModuleDump>,
@@ -77,6 +78,16 @@ pub struct MemoDump {
     pub module: String,
     pub replica: u8,
     pub memo: DumpText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct MemoLogDump {
+    pub module: String,
+    pub replica: u8,
+    pub index: u64,
+    pub written_at: String,
+    pub content: DumpText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
@@ -208,6 +219,13 @@ mod tests {
                     module: "sensory".to_string(),
                     replica: 0,
                     memo: DumpText::new("memo\nwith newline"),
+                }],
+                memo_logs: vec![MemoLogDump {
+                    module: "sensory".to_string(),
+                    replica: 0,
+                    index: 0,
+                    written_at: "2026-05-08T00:00:00Z".to_string(),
+                    content: DumpText::new("memo\nwith newline"),
                 }],
                 attention_streams: vec![AttentionStreamDump {
                     stream: ModuleInstanceDump {

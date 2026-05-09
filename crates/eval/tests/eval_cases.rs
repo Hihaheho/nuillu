@@ -1,4 +1,7 @@
-use std::{cell::Cell, path::Path};
+use std::{
+    cell::{Cell, RefCell},
+    path::Path,
+};
 
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
@@ -112,6 +115,56 @@ impl RubricJudge for CaseDataJudge {
                     evidence: None,
                 })
                 .collect(),
+        })
+    }
+}
+
+struct ModuleScopedJudge {
+    called: Cell<bool>,
+    rendered_inputs: RefCell<Vec<String>>,
+}
+
+impl ModuleScopedJudge {
+    fn new() -> Self {
+        Self {
+            called: Cell::new(false),
+            rendered_inputs: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl RubricJudge for ModuleScopedJudge {
+    async fn judge(
+        &self,
+        trace: &TraceSnapshot,
+        request: RubricJudgeRequest,
+    ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
+        assert_eq!(
+            request.context.as_deref(),
+            Some(
+                "Module-scoped full-agent check for 'query-vector'. Judge only the selected evidence for this module."
+            )
+        );
+        assert_eq!(
+            request.judge_inputs,
+            vec![RubricJudgeInput::Output, RubricJudgeInput::Memos]
+        );
+        assert!(request.artifact.output.contains("first query memo"));
+        assert!(request.artifact.output.contains("second query memo"));
+        assert!(!request.artifact.output.contains("sensory memo"));
+        let rendered = render_judge_input(trace, &request);
+        assert!(rendered.contains("agent.memo_logs"));
+        assert!(rendered.contains("first query memo"));
+        assert!(rendered.contains("second query memo"));
+        assert!(!rendered.contains("sensory memo"));
+        self.rendered_inputs.borrow_mut().push(rendered);
+        self.called.set(true);
+        Ok(RubricJudgeVerdict {
+            passed: false,
+            score: 0.2,
+            summary: "module diagnostic failed without failing the case".to_string(),
+            criteria: Vec::new(),
         })
     }
 }
@@ -286,6 +339,52 @@ fn parses_full_agent_memory_required_case() {
             ]
             .as_slice()
         )
+    );
+}
+
+#[test]
+fn parses_full_agent_modules_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_agent_dir = dir.path().join("eval-cases/full-agent");
+    std::fs::create_dir_all(&full_agent_dir).unwrap();
+    let path = full_agent_dir.join("modules-checks.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "modules-checks"
+modules = ["sensory", "query-vector"]
+
+@ inputs[] {
+  $variant: heard
+  content = "Find the memory."
+}
+
+@ modules-checks[] {
+  module = "query-vector"
+
+  @ rubrics[] {
+    name = "query-history"
+    pass-score = 0.85
+    judge-inputs = ["output", "memos"]
+    rubric = "Judge the query-vector memo history."
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let case = parse_full_agent_case_file(&path).unwrap();
+
+    assert_eq!(case.modules_checks.len(), 1);
+    assert_eq!(case.modules_checks[0].module, EvalModule::QueryVector);
+    assert_eq!(case.modules_checks[0].rubrics.len(), 1);
+    assert_eq!(
+        case.modules_checks[0].rubrics[0].name.as_deref(),
+        Some("query-history")
+    );
+    assert_eq!(
+        case.modules_checks[0].rubrics[0].judge_inputs,
+        vec![RubricJudgeInput::Output, RubricJudgeInput::Memos]
     );
 }
 
@@ -512,6 +611,42 @@ id = "bad-full-agent-internal-message"
     }
 }
 
+#[test]
+fn rejects_full_agent_modules_checks_for_unregistered_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_agent_dir = dir.path().join("full-agent");
+    std::fs::create_dir_all(&full_agent_dir).unwrap();
+    let path = full_agent_dir.join("bad-module-check.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "bad-module-check"
+modules = ["sensory"]
+
+@ inputs[] {
+  $variant: heard
+  content = "Find the memory."
+}
+
+@ modules-checks[] {
+  module = "query-vector"
+
+  @ rubrics[] {
+    rubric = "Judge query-vector output."
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = parse_full_agent_case_file(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("must be included in full-agent modules"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn evaluates_module_case_with_rubric_judge() {
     let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
@@ -526,6 +661,88 @@ async fn evaluates_module_case_with_rubric_judge() {
     assert!(report.passed(), "{report:#?}");
     assert_eq!(report.checks.len(), check_count);
     assert!(report.score > 0.9);
+}
+
+#[tokio::test]
+async fn evaluates_full_agent_modules_checks_from_scoped_memo_logs_without_affecting_score() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_agent_dir = dir.path().join("eval-cases/full-agent");
+    std::fs::create_dir_all(&full_agent_dir).unwrap();
+    let path = full_agent_dir.join("module-checks-eval.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "module-checks-eval"
+modules = ["sensory", "query-vector"]
+
+@ inputs[] {
+  $variant: heard
+  content = "Find the memory."
+}
+
+@ modules-checks[] {
+  module = "query-vector"
+
+  @ rubrics[] {
+    name = "query-history"
+    pass-score = 0.85
+    judge-inputs = ["output", "memos"]
+    rubric = "Judge the query-vector memo history."
+  }
+}
+"#,
+    )
+    .unwrap();
+    let case = EvalCase::FullAgent(parse_full_agent_case_file(&path).unwrap());
+    let artifact = CaseArtifact::new("final utterance").with_observation(
+        "agent",
+        serde_json::json!({
+            "memos": {
+                "query-vector": [
+                    { "replica": 0, "memo": "second query memo" }
+                ],
+                "sensory": [
+                    { "replica": 0, "memo": "sensory memo" }
+                ]
+            },
+            "memo_logs": {
+                "query-vector": [
+                    {
+                        "replica": 0,
+                        "index": 0,
+                        "written_at": "2026-05-08T00:00:00Z",
+                        "content": "first query memo"
+                    },
+                    {
+                        "replica": 0,
+                        "index": 1,
+                        "written_at": "2026-05-08T00:00:01Z",
+                        "content": "second query memo"
+                    }
+                ],
+                "sensory": [
+                    {
+                        "replica": 0,
+                        "index": 0,
+                        "written_at": "2026-05-08T00:00:00Z",
+                        "content": "sensory memo"
+                    }
+                ]
+            }
+        }),
+    );
+    let judge = ModuleScopedJudge::new();
+
+    let report = evaluate_case(&case, &empty_trace(), &artifact, Some(&judge)).await;
+
+    assert!(judge.called.get());
+    assert!(report.passed(), "{report:#?}");
+    assert_eq!(report.score, 1.0);
+    assert_eq!(report.modules_checks.len(), 1);
+    assert_eq!(report.modules_checks[0].module, "query-vector");
+    assert_eq!(report.modules_checks[0].rubrics.len(), 1);
+    assert!(!report.modules_checks[0].rubrics[0].passed);
+    assert!(!report.invalid);
 }
 
 #[test]

@@ -34,7 +34,7 @@ use nuillu_module::ports::{
 };
 use nuillu_module::{
     AttentionStreamUpdated, CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent,
-    RuntimeEventSink, SensoryInput,
+    RuntimeEventSink, RuntimePolicy, SensoryInput,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
@@ -48,8 +48,8 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use crate::{
     artifact::CaseArtifact,
     cases::{
-        CaseFileError, EvalCase, EvalModule, FullAgentCase, FullAgentInput, ModuleCase,
-        ModuleEvalTarget, discover_case_files, parse_case_file,
+        CaseFileError, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule, FullAgentCase,
+        FullAgentInput, ModuleCase, ModuleEvalTarget, discover_case_files, parse_case_file,
     },
     evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
     judge::{LlmRubricJudge, RubricJudge},
@@ -57,13 +57,15 @@ use crate::{
     state_dump::{
         AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
         AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
-        FullAgentLastStateDump, MemoDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
-        ModuleInstanceDump, ReplicaCapDump, UtteranceDump, render_full_agent_last_state_eure,
+        FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
+        MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
+        render_full_agent_last_state_eure,
     },
     trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
 };
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+const EVAL_MEMO_RETAINED_PER_OWNER: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct LlmBackendConfig {
@@ -426,6 +428,7 @@ fn write_runtime_failure_case_output(
     let report = CaseReport {
         runtime_failure: Some(message.clone()),
         checks: Vec::new(),
+        modules_checks: Vec::new(),
         invalid: true,
         must_pass_ok: false,
         weighted_points_earned: 0,
@@ -804,7 +807,11 @@ async fn build_eval_environment(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
     let tiers = build_tiers(config)?;
-    let caps = CapabilityProviders::new_with_runtime_events(
+    let runtime_policy = RuntimePolicy {
+        memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
+        ..RuntimePolicy::default()
+    };
+    let caps = CapabilityProviders::new_with_runtime_policy(
         blackboard.clone(),
         Arc::new(InMemoryAttentionRepository::new()),
         memory.clone(),
@@ -814,6 +821,7 @@ async fn build_eval_environment(
         clock.clone(),
         tiers,
         events.clone(),
+        runtime_policy,
     );
 
     Ok(EvalEnvironment {
@@ -1043,25 +1051,10 @@ async fn configured_reasoning_effort(
         .map(|value| value.0)
 }
 
-const LEGACY_FULL_AGENT_MODULES: &[EvalModule] = &[
-    EvalModule::Sensory,
-    EvalModule::AttentionGate,
-    EvalModule::AttentionController,
-    EvalModule::AttentionSchema,
-    EvalModule::SelfModel,
-    EvalModule::QueryVector,
-    EvalModule::Memory,
-    EvalModule::MemoryCompaction,
-    EvalModule::Predict,
-    EvalModule::Surprise,
-    EvalModule::SpeakGate,
-    EvalModule::Speak,
-];
-
 fn full_agent_case_modules(case: &FullAgentCase) -> Vec<EvalModule> {
     case.modules
         .clone()
-        .unwrap_or_else(|| LEGACY_FULL_AGENT_MODULES.to_vec())
+        .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec())
 }
 
 fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
@@ -1138,7 +1131,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::QueryVector => registry
-            .register(builtin::query_vector(), 0..=1, |caps| {
+            .register(builtin::query_vector(), 1..=1, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
                     caps.attention_stream_updated_inbox(),
@@ -1492,6 +1485,7 @@ fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
     let attention_stream_set = bb.attention_stream_set();
     BlackboardLastStateDump {
         memos: memo_dumps(bb),
+        memo_logs: memo_log_dumps(bb),
         attention_streams: attention_stream_set
             .streams()
             .iter()
@@ -1527,6 +1521,19 @@ fn memo_dumps(bb: &BlackboardInner) -> Vec<MemoDump> {
             module: record.owner.module.as_str().to_owned(),
             replica: record.owner.replica.get(),
             memo: DumpText::new(record.memo),
+        })
+        .collect()
+}
+
+fn memo_log_dumps(bb: &BlackboardInner) -> Vec<MemoLogDump> {
+    bb.recent_memo_logs()
+        .into_iter()
+        .map(|record| MemoLogDump {
+            module: record.owner.module.as_str().to_owned(),
+            replica: record.owner.replica.get(),
+            index: record.index,
+            written_at: record.written_at.to_rfc3339(),
+            content: DumpText::new(record.content),
         })
         .collect()
 }
@@ -1649,6 +1656,7 @@ fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
 #[derive(Debug, Clone, Serialize)]
 struct AgentObservation {
     memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
+    memo_logs: BTreeMap<String, Vec<MemoLogObservation>>,
     attention_streams: Vec<AttentionStreamObservation>,
     allocation: BTreeMap<String, ModuleConfig>,
     allocation_proposals: BTreeMap<String, BTreeMap<String, ModuleConfig>>,
@@ -1661,6 +1669,7 @@ impl AgentObservation {
     fn from_blackboard(bb: &BlackboardInner, utterances: Vec<RecordedUtterance>) -> Self {
         Self {
             memos: memo_observations(bb),
+            memo_logs: memo_log_observations(bb),
             attention_streams: attention_stream_observations(bb),
             allocation: allocation_observation(bb.allocation()),
             allocation_proposals: allocation_proposal_observations(bb),
@@ -1675,6 +1684,14 @@ impl AgentObservation {
 struct ReplicaMemoObservation {
     replica: u8,
     memo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoLogObservation {
+    replica: u8,
+    index: u64,
+    written_at: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1709,6 +1726,21 @@ fn memo_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<ReplicaMemoOb
             });
     }
     memos
+}
+
+fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogObservation>> {
+    let mut logs = BTreeMap::<String, Vec<MemoLogObservation>>::new();
+    for record in bb.recent_memo_logs() {
+        logs.entry(record.owner.module.as_str().to_owned())
+            .or_default()
+            .push(MemoLogObservation {
+                replica: record.owner.replica.get(),
+                index: record.index,
+                written_at: record.written_at.to_rfc3339(),
+                content: record.content,
+            });
+    }
+    logs
 }
 
 fn attention_stream_observations(bb: &BlackboardInner) -> Vec<AttentionStreamObservation> {
@@ -2531,6 +2563,14 @@ limits {{
                     "memo": "memo",
                 }],
             },
+            "memo_logs": {
+                "query-vector": [{
+                    "replica": 0,
+                    "index": 0,
+                    "written_at": "2026-05-07T00:00:00+00:00",
+                    "content": "memo",
+                }],
+            },
             "attention_streams": [{
                 "stream": {
                     "module": "query-vector",
@@ -2672,7 +2712,7 @@ prompt = "What am I attending to?"
 
     #[test]
     fn full_agent_allocation_bootstraps_controller_instead_of_every_module() {
-        let selected = LEGACY_FULL_AGENT_MODULES.to_vec();
+        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
                 tick_ms: 500,

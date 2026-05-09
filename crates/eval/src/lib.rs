@@ -17,13 +17,13 @@ pub use artifact::CaseArtifact;
 pub use cases::{
     ArtifactTextField, AttentionSeed, CaseFileError, CaseScoring, Check, CheckCommon, EvalCase,
     EvalLimits, EvalModule, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed,
-    MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleEvalTarget, RubricCriterion,
-    RubricJudgeInput, discover_case_files, parse_case_file, parse_full_agent_case_file,
-    parse_module_case_file,
+    MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks, ModuleEvalTarget, ModuleRubric,
+    RubricCriterion, RubricJudgeInput, discover_case_files, parse_case_file,
+    parse_full_agent_case_file, parse_module_case_file,
 };
 pub use evaluation::{
-    CaseEval, CaseObjective, CaseReport, CaseSummary, CheckOutcome, SuiteReport, evaluate_case,
-    normalize_text_block,
+    CaseEval, CaseObjective, CaseReport, CaseSummary, CheckOutcome, ModuleChecksReport,
+    ModuleRubricOutcome, SuiteReport, evaluate_case, normalize_text_block,
 };
 pub use judge::{
     JudgeOptions, LlmRubricJudge, RubricJudge, RubricJudgeError, RubricJudgeRequest,
@@ -39,8 +39,8 @@ pub use runner::{
 pub use state_dump::{
     AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
     AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
-    FullAgentLastStateDump, MemoDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
-    ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
+    FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
+    MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
     render_full_agent_last_state_eure,
 };
 pub use trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json};

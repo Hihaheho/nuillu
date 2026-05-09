@@ -245,7 +245,12 @@ fn render_judge_input_section(
                         "last_state.blackboard.memos",
                         &["last_state", "blackboard", "memos"],
                     ),
+                    (
+                        "last_state.blackboard.memo_logs",
+                        &["last_state", "blackboard", "memo_logs"],
+                    ),
                     ("agent.memos", &["agent", "memos"]),
+                    ("agent.memo_logs", &["agent", "memo_logs"]),
                 ],
             ),
         ),
@@ -368,6 +373,7 @@ fn agent_blackboard_observation(artifact: &CaseArtifact) -> Option<serde_json::V
     let mut map = serde_json::Map::new();
     for key in [
         "memos",
+        "memo_logs",
         "attention_streams",
         "allocation",
         "allocation_proposals",

@@ -21,6 +21,8 @@ failure.$optional = true
 
 @ $types.blackboard-last-state
 memos = [`$types.memo`]
+memo-logs = [`$types.memo-log`]
+memo-logs.$optional = true
 attention-streams = [`$types.attention-stream`]
 agentic-deadlock = `$types.nullable-agentic-deadlock`
 agentic-deadlock.$optional = true
@@ -33,6 +35,13 @@ replica-caps = [`$types.replica-cap`]
 module = `text`
 replica = `integer`
 memo = `text`
+
+@ $types.memo-log
+module = `text`
+replica = `integer`
+index = `integer`
+written-at = `text`
+content = `text`
 
 @ $types.attention-stream
 stream = `$types.module-instance`

@@ -25,6 +25,9 @@ limits.$optional = true
 checks = [`$types.check`]
 checks.$optional = true
 
+modules-checks = [`$types.module-checks`]
+modules-checks.$optional = true
+
 scoring = `$types.case-scoring`
 scoring.$optional = true
 
@@ -130,6 +133,24 @@ weight = `integer`
 weight.$optional = true
 pass-score = `float`
 pass-score.$optional = true
+
+@ $types.module-checks
+module = `$types.eval-module`
+rubrics = [`$types.module-rubric`]
+
+@ $types.module-rubric
+name = `text`
+name.$optional = true
+rubric {
+  $variant: text
+  min-length = 1
+}
+pass-score = `float`
+pass-score.$optional = true
+judge-inputs = [`$types.rubric-judge-input`]
+judge-inputs.$optional = true
+criteria = [`$types.rubric-criterion`]
+criteria.$optional = true
 
 @ $types.check
 $variant: union

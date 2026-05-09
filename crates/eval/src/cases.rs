@@ -41,6 +41,10 @@ fn default_judge_inputs() -> Vec<RubricJudgeInput> {
     ]
 }
 
+fn default_module_rubric_judge_inputs() -> Vec<RubricJudgeInput> {
+    vec![RubricJudgeInput::Output, RubricJudgeInput::Observations]
+}
+
 fn default_tick_ms() -> u64 {
     100
 }
@@ -77,6 +81,8 @@ pub struct FullAgentCase {
     pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
+    #[eure(default)]
+    pub modules_checks: Vec<ModuleChecks>,
     #[eure(default)]
     pub scoring: CaseScoring,
 }
@@ -151,6 +157,21 @@ pub enum EvalModule {
     Speak,
 }
 
+pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
+    EvalModule::Sensory,
+    EvalModule::AttentionGate,
+    EvalModule::AttentionController,
+    EvalModule::AttentionSchema,
+    EvalModule::SelfModel,
+    EvalModule::QueryVector,
+    EvalModule::Memory,
+    EvalModule::MemoryCompaction,
+    EvalModule::Predict,
+    EvalModule::Surprise,
+    EvalModule::SpeakGate,
+    EvalModule::Speak,
+];
+
 impl EvalModule {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -186,6 +207,14 @@ impl EvalModule {
             Self::SpeakGate => builtin::speak_gate(),
             Self::Speak => builtin::speak(),
         }
+    }
+}
+
+impl FullAgentCase {
+    pub fn effective_modules(&self) -> Vec<EvalModule> {
+        self.modules
+            .clone()
+            .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec())
     }
 }
 
@@ -271,6 +300,13 @@ impl EvalCase {
         match self {
             Self::FullAgent(case) => &case.checks,
             Self::Module { case, .. } => &case.checks,
+        }
+    }
+
+    pub fn modules_checks(&self) -> &[ModuleChecks] {
+        match self {
+            Self::FullAgent(case) => &case.modules_checks,
+            Self::Module { .. } => &[],
         }
     }
 
@@ -394,6 +430,36 @@ pub struct CheckCommon {
     pub must_pass: bool,
     #[eure(default = "default_weight")]
     pub weight: i64,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ModuleChecks {
+    pub module: EvalModule,
+    #[eure(default)]
+    pub rubrics: Vec<ModuleRubric>,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ModuleRubric {
+    #[eure(default)]
+    pub name: Option<String>,
+    pub rubric: Text,
+    #[eure(default = "default_pass_score")]
+    pub pass_score: f64,
+    #[eure(default = "default_module_rubric_judge_inputs")]
+    pub judge_inputs: Vec<RubricJudgeInput>,
+    #[eure(default)]
+    pub criteria: Vec<RubricCriterion>,
+}
+
+impl ModuleRubric {
+    pub fn display_name(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| "module-rubric".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
@@ -683,6 +749,7 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
         }
     }
     validate_modules(path, case.modules.as_deref())?;
+    validate_module_checks(path, case)?;
     validate_common(path, &case.memories, &case.limits, &case.checks)
 }
 
@@ -770,6 +837,65 @@ fn validate_modules(path: &Path, modules: Option<&[EvalModule]>) -> Result<(), C
     Ok(())
 }
 
+fn validate_module_checks(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
+    let modules = case.effective_modules();
+    let mut seen = BTreeSet::new();
+    for (index, checks) in case.modules_checks.iter().enumerate() {
+        if !modules.contains(&checks.module) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "modules-checks[{index}].module '{}' must be included in full-agent modules",
+                    checks.module.as_str()
+                ),
+            });
+        }
+        if !seen.insert(checks.module) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "modules-checks contains duplicate module '{}'",
+                    checks.module.as_str()
+                ),
+            });
+        }
+        if checks.rubrics.is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "modules-checks[{index}] for '{}' must contain at least one rubric",
+                    checks.module.as_str()
+                ),
+            });
+        }
+        for rubric in &checks.rubrics {
+            let name = rubric.display_name();
+            if rubric
+                .name
+                .as_deref()
+                .is_some_and(|name| name.trim().is_empty())
+            {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module rubric for '{}' has an empty name",
+                        checks.module.as_str()
+                    ),
+                });
+            }
+            validate_rubric_fields(
+                path,
+                &format!("module {} rubric '{}'", checks.module.as_str(), name),
+                &rubric.rubric,
+                rubric.pass_score,
+                &rubric.judge_inputs,
+                &rubric.criteria,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_common(
     path: &Path,
     memories: &[MemorySeed],
@@ -832,48 +958,14 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
         ..
     } = check
     {
-        if rubric.content.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "rubric check '{}' has an empty rubric",
-                    check.display_name()
-                ),
-            });
-        }
-        validate_pass_score(path, *pass_score, &check.display_name())?;
-        if judge_inputs.is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!(
-                    "rubric check '{}' has empty judge-inputs",
-                    check.display_name()
-                ),
-            });
-        }
-        let mut names = BTreeSet::new();
-        for criterion in criteria {
-            if criterion.name.trim().is_empty() {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "rubric check '{}' has an empty criterion name",
-                        check.display_name()
-                    ),
-                });
-            }
-            if !names.insert(criterion.name.clone()) {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "rubric check '{}' has duplicate criterion '{}'",
-                        check.display_name(),
-                        criterion.name
-                    ),
-                });
-            }
-            validate_pass_score(path, criterion.pass_score, &criterion.name)?;
-        }
+        validate_rubric_fields(
+            path,
+            &format!("rubric check '{}'", check.display_name()),
+            rubric,
+            *pass_score,
+            judge_inputs,
+            criteria,
+        )?;
     }
 
     match check {
@@ -909,6 +1001,46 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
         _ => {}
     }
 
+    Ok(())
+}
+
+fn validate_rubric_fields(
+    path: &Path,
+    label: &str,
+    rubric: &Text,
+    pass_score: f64,
+    judge_inputs: &[RubricJudgeInput],
+    criteria: &[RubricCriterion],
+) -> Result<(), CaseFileError> {
+    if rubric.content.trim().is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{label} has an empty rubric"),
+        });
+    }
+    validate_pass_score(path, pass_score, label)?;
+    if judge_inputs.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{label} has empty judge-inputs"),
+        });
+    }
+    let mut names = BTreeSet::new();
+    for criterion in criteria {
+        if criterion.name.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label} has an empty criterion name"),
+            });
+        }
+        if !names.insert(criterion.name.clone()) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label} has duplicate criterion '{}'", criterion.name),
+            });
+        }
+        validate_pass_score(path, criterion.pass_score, &criterion.name)?;
+    }
     Ok(())
 }
 
