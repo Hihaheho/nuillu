@@ -2117,6 +2117,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 .is_some_and(|max| call.saturating_add(1) >= max),
             RuntimeEvent::MemoUpdated { .. } => false,
             RuntimeEvent::RateLimitDelayed { .. } => false,
+            RuntimeEvent::ModuleBatchThrottled { .. } => false,
         };
         let live_message = match &event {
             RuntimeEvent::LlmAccessed {
@@ -2141,6 +2142,14 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.case_id,
                 owner,
                 capability,
+                delayed_for.as_millis()
+            ),
+            RuntimeEvent::ModuleBatchThrottled {
+                owner, delayed_for, ..
+            } => format!(
+                "eval module-batch-throttled case={} owner={} delayed_ms={}",
+                self.case_id,
+                owner,
                 delayed_for.as_millis()
             ),
         };

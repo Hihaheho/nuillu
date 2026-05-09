@@ -8,13 +8,20 @@ use nuillu_module::ports::{
     NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
     SystemClock,
 };
-use nuillu_module::{CapabilityProviders, LutumTiers};
+use nuillu_module::{CapabilityProviders, LutumTiers, RuntimePolicy};
 
 pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
+    test_caps_with_policy(blackboard, RuntimePolicy::default())
+}
+
+pub(crate) fn test_caps_with_policy(
+    blackboard: Blackboard,
+    policy: RuntimePolicy,
+) -> CapabilityProviders {
     let adapter = Arc::new(MockLlmAdapter::new());
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
     let lutum = Lutum::new(adapter, budget);
-    CapabilityProviders::new(
+    CapabilityProviders::new_with_runtime_policy(
         blackboard,
         Arc::new(NoopAttentionRepository),
         Arc::new(NoopMemoryStore),
@@ -27,5 +34,7 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
             default: lutum.clone(),
             premium: lutum,
         },
+        Arc::new(nuillu_module::NoopRuntimeEventSink),
+        policy,
     )
 }

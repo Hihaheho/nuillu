@@ -248,6 +248,8 @@ impl CapabilityProviders {
                 self.inner.attention_updates.clone(),
             ),
             clock: self.inner.clock.clone(),
+            runtime_events: self.inner.runtime_events.clone(),
+            runtime_policy: self.inner.runtime_policy.clone(),
         }
     }
 
@@ -335,6 +337,8 @@ pub struct AgentRuntimeControl {
     blackboard: Blackboard,
     attention_updates: AttentionStreamUpdatedMailbox,
     clock: Arc<dyn Clock>,
+    runtime_events: RuntimeEventEmitter,
+    runtime_policy: RuntimePolicy,
 }
 
 impl AgentRuntimeControl {
@@ -347,6 +351,22 @@ impl AgentRuntimeControl {
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
         self.blackboard
             .apply(BlackboardCommand::SetModuleRunStatus { owner, status })
+            .await;
+    }
+
+    pub fn module_batch_min_interval(&self, owner: &ModuleInstanceId) -> Option<Duration> {
+        self.runtime_policy
+            .module_batch_throttles
+            .min_interval_for(&owner.module)
+    }
+
+    pub async fn record_module_batch_throttled(
+        &self,
+        owner: ModuleInstanceId,
+        delayed_for: Duration,
+    ) {
+        self.runtime_events
+            .module_batch_throttled(owner, delayed_for)
             .await;
     }
 

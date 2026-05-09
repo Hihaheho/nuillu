@@ -29,6 +29,11 @@ pub enum RuntimeEvent {
         capability: CapabilityKind,
         delayed_for: Duration,
     },
+    ModuleBatchThrottled {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        delayed_for: Duration,
+    },
 }
 
 #[async_trait(?Send)]
@@ -63,35 +68,23 @@ impl RuntimeEventEmitter {
     }
 
     pub(crate) async fn llm_accessed(&self, owner: ModuleInstanceId, tier: ModelTier) {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let call = self.next_llm_call.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self
-            .sink
-            .on_event(RuntimeEvent::LlmAccessed {
-                sequence,
-                call,
-                owner,
-                tier,
-            })
-            .await
-        {
-            tracing::warn!(?error, "runtime event sink failed");
-        }
+        self.emit(|sequence| RuntimeEvent::LlmAccessed {
+            sequence,
+            call,
+            owner,
+            tier,
+        })
+        .await;
     }
 
     pub(crate) async fn memo_updated(&self, owner: ModuleInstanceId, char_count: usize) {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self
-            .sink
-            .on_event(RuntimeEvent::MemoUpdated {
-                sequence,
-                owner,
-                char_count,
-            })
-            .await
-        {
-            tracing::warn!(?error, "runtime event sink failed");
-        }
+        self.emit(|sequence| RuntimeEvent::MemoUpdated {
+            sequence,
+            owner,
+            char_count,
+        })
+        .await;
     }
 
     pub(crate) async fn rate_limit_delayed(
@@ -100,17 +93,31 @@ impl RuntimeEventEmitter {
         capability: CapabilityKind,
         delayed_for: Duration,
     ) {
+        self.emit(|sequence| RuntimeEvent::RateLimitDelayed {
+            sequence,
+            owner,
+            capability,
+            delayed_for,
+        })
+        .await;
+    }
+
+    pub(crate) async fn module_batch_throttled(
+        &self,
+        owner: ModuleInstanceId,
+        delayed_for: Duration,
+    ) {
+        self.emit(|sequence| RuntimeEvent::ModuleBatchThrottled {
+            sequence,
+            owner,
+            delayed_for,
+        })
+        .await;
+    }
+
+    async fn emit(&self, build: impl FnOnce(u64) -> RuntimeEvent) {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self
-            .sink
-            .on_event(RuntimeEvent::RateLimitDelayed {
-                sequence,
-                owner,
-                capability,
-                delayed_for,
-            })
-            .await
-        {
+        if let Err(error) = self.sink.on_event(build(sequence)).await {
             tracing::warn!(?error, "runtime event sink failed");
         }
     }

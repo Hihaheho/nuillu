@@ -1,8 +1,8 @@
-# Capability Rate Limiting
+# Capability And Runtime Rate Limiting
 
 Date: 2026-05-08
-Scope: Deterministic runtime guardrails for capability use in the current
-`CapabilityProviders` / replica runtime.
+Scope: Deterministic runtime guardrails for capability use and module batch
+scheduling in the current `CapabilityProviders` / replica runtime.
 
 This document describes desired architecture, not implementation progress.
 
@@ -18,12 +18,14 @@ This document describes desired architecture, not implementation progress.
    `tier`. Rate limiting does not write allocation proposals and does not change
    `ResourceAllocation`.
 3. **Deterministic intervention** — Rate limiting only delays capability
-   acquisition or publish operations in v1. It does not ask an LLM for policy,
-   does not deny LLM handles, and does not add module-local throttling logic.
-4. **Capability-boundary only** — Intervention points are
-   `LlmAccess::lutum().await` and `TopicMailbox::publish(...).await`.
+   acquisition, publish operations, or runtime-owned next-batch scheduling. It
+   does not ask an LLM for policy, does not deny LLM handles, and does not add
+   module-local throttling logic.
+4. **Capability/runtime boundary only** — Intervention points are
+   `LlmAccess::lutum().await`, `TopicMailbox::publish(...).await`, and the agent
+   scheduler's decision to start a module's next `next_batch()` future.
    `next_batch()` / `activate()` signatures and module constructors do not
-   receive rate-limit state.
+   receive rate-limit or throttle state.
 5. **No periodic or boost semantics** — The current runtime has no
    `PeriodicActivation`, period, or scheduler tick API. Low-activity recovery is
    handled by attention-controller allocation guidance, not by a rate-limit
@@ -52,6 +54,7 @@ Primary risks addressed:
 
 - runaway LLM acquisition by an over-active module role,
 - publish storms that repeatedly wake downstream modules,
+- memo-reactive modules forming too many activation batches from bursts,
 - controller lag during bursts, where delaying a capability use gives allocation
   changes time to catch up,
 - eval and production observability gaps around throttling behavior.
@@ -95,6 +98,10 @@ pub struct RateLimitConfig {
 
 pub struct RateLimitPolicy {
     pub configs: HashMap<(ModuleId, CapabilityKind), RateLimitConfig>,
+}
+
+pub struct ModuleBatchThrottlePolicy {
+    pub min_intervals: HashMap<ModuleId, Duration>,
 }
 
 pub struct RateLimiter { /* token bucket state per configured key */ }
@@ -187,6 +194,20 @@ catch up before more work is routed.
 No background send queue is introduced in v1. The publishing task itself waits
 for the permit, then performs normal topic routing.
 
+### Module batch scheduling
+
+The agent scheduler owns `next_batch()` and `activate(&batch)` execution. A
+module batch throttle therefore belongs in the scheduler, not in
+`TopicInbox::next_item()`. After a module activation completes, the scheduler
+records the earliest time that module may start its next `next_batch()` future.
+Until that deadline, no inbox is polled for that module, so wake messages remain
+queued. When the cooldown expires, the module's ordinary `next_batch()` code can
+receive the first queued wake and use its existing `take_ready_items()` drain to
+fold additional ready messages into the same activation.
+
+This keeps throttling at batch granularity: it does not delay memo writers, does
+not charge each received envelope, and does not change typed topic semantics.
+
 ---
 
 ## 4. Rate Calculation
@@ -245,6 +266,7 @@ An additional constructor or policy builder should accept rate-limit policy:
 ```rust
 pub struct RuntimePolicy {
     pub rate_limits: RateLimitPolicy,
+    pub module_batch_throttles: ModuleBatchThrottlePolicy,
 }
 
 impl CapabilityProviders {
@@ -259,9 +281,12 @@ impl CapabilityProviders {
 `ModuleCapabilityFactory` then passes the shared limiter into owner-stamped
 capabilities when issuing `LlmAccess` and `TopicMailbox`.
 
-The rate limiter is a runtime policy knob, not a capability granted to modules.
-Modules cannot inspect it, change it, or bypass it except by not holding the
-capability in question.
+The scheduler reads `module_batch_throttles` through `AgentRuntimeControl` before
+starting the next `next_batch()` future for a module.
+
+The rate limiter and batch throttle are runtime policy knobs, not capabilities
+granted to modules. Modules cannot inspect them, change them, or bypass them
+except by not holding the capability in question or not being scheduled.
 
 ---
 
@@ -278,11 +303,18 @@ pub enum RuntimeEvent {
         capability: CapabilityKind,
         delayed_for: Duration,
     },
+    ModuleBatchThrottled {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        delayed_for: Duration,
+    },
 }
 ```
 
-The event is emitted after a delayed permit is granted. Immediate permits do not
-need events in v1; snapshots and aggregate metrics can report normal activity.
+`RateLimitDelayed` is emitted after a delayed permit is granted.
+`ModuleBatchThrottled` is emitted after a scheduler cooldown expires. Immediate
+permits and unthrottled batches do not need events in v1; snapshots and
+aggregate metrics can report normal activity.
 
 Ablation studies should vary only injected runtime policy while keeping module
 registration, allocation controller, prompts, and eval cases constant:
@@ -290,7 +322,9 @@ registration, allocation controller, prompts, and eval cases constant:
 - no limiter,
 - LLM acquisition only,
 - channel publish only,
+- module batch throttle only,
 - LLM plus channel publish,
+- LLM plus module batch throttle,
 - topic-specific channel policy,
 - loose versus strict windows and rates.
 
@@ -347,6 +381,7 @@ Capability integration tests:
 - `llm_access_uses_tier_at_grant_time`,
 - `publish_waits_before_allocation_read`,
 - `publish_routes_to_active_replicas_after_delay`,
+- `runtime_batch_throttle_delays_next_batch_start_and_coalesces_ready_work`,
 - `no_op_policy_preserves_existing_publish_behavior`.
 
 Regression tests that must continue passing:

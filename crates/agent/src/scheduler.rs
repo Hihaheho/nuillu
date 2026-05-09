@@ -50,7 +50,10 @@ pub async fn run(
         .collect::<Vec<_>>();
     let mut states = modules
         .into_iter()
-        .map(ModuleState::Stored)
+        .map(|module| ModuleState::Stored {
+            module,
+            next_batch_not_before: None,
+        })
         .collect::<Vec<_>>();
     let mut active = vec![false; states.len()];
     let mut tasks: FuturesUnordered<JoinHandle<TaskMessage>> = FuturesUnordered::new();
@@ -147,7 +150,11 @@ pub async fn run(
 }
 
 enum ModuleState {
-    Stored(AllocatedModule),
+    Stored {
+        module: AllocatedModule,
+        next_batch_not_before: Option<Instant>,
+    },
+    CoolingDown,
     Awaiting,
     PendingBatch {
         module: AllocatedModule,
@@ -157,6 +164,11 @@ enum ModuleState {
 }
 
 enum TaskMessage {
+    BatchCooldownExpired {
+        index: usize,
+        module: AllocatedModule,
+        delayed_for: Duration,
+    },
     NextBatch {
         index: usize,
         module: AllocatedModule,
@@ -185,30 +197,39 @@ async fn refresh_active_and_schedule(
 
     for index in 0..states.len() {
         match &states[index] {
-            ModuleState::Stored(_) if active[index] => {
+            ModuleState::Stored { .. } if active[index] => {
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
                     .await;
-                let ModuleState::Stored(module) =
-                    std::mem::replace(&mut states[index], ModuleState::Awaiting)
+                let ModuleState::Stored {
+                    module,
+                    next_batch_not_before,
+                } = std::mem::replace(&mut states[index], ModuleState::Awaiting)
                 else {
                     unreachable!("module state changed while scheduling next batch");
                 };
-                spawn_next_batch(tasks, index, module, parent, subscriber);
+                if let Some(deadline) = next_batch_not_before.filter(|deadline| {
+                    deadline.saturating_duration_since(Instant::now()) > Duration::ZERO
+                }) {
+                    states[index] = ModuleState::CoolingDown;
+                    spawn_batch_cooldown(tasks, index, module, deadline, parent, subscriber);
+                } else {
+                    spawn_next_batch(tasks, index, module, parent, subscriber);
+                }
             }
-            ModuleState::Stored(_) => {
+            ModuleState::Stored { .. } => {
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
                     .await;
             }
-            ModuleState::Awaiting if active[index] => {
+            ModuleState::CoolingDown | ModuleState::Awaiting => {
+                let status = if active[index] {
+                    ModuleRunStatus::AwaitingBatch
+                } else {
+                    ModuleRunStatus::Inactive
+                };
                 runtime
-                    .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
-                    .await;
-            }
-            ModuleState::Awaiting => {
-                runtime
-                    .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
+                    .record_module_status(owners[index].clone(), status)
                     .await;
             }
             ModuleState::PendingBatch { .. } if active[index] => {
@@ -247,6 +268,20 @@ async fn handle_task_message(
     subscriber: &tracing::Dispatch,
 ) -> Result<(), SchedulerError> {
     match message {
+        TaskMessage::BatchCooldownExpired {
+            index,
+            module,
+            delayed_for,
+        } => {
+            runtime
+                .record_module_batch_throttled(owners[index].clone(), delayed_for)
+                .await;
+            states[index] = ModuleState::Stored {
+                module,
+                next_batch_not_before: None,
+            };
+            Ok(())
+        }
         TaskMessage::NextBatch {
             index,
             module,
@@ -290,7 +325,13 @@ async fn handle_task_message(
             result,
         } => match result {
             Ok(()) => {
-                states[index] = ModuleState::Stored(module);
+                let next_batch_not_before = runtime
+                    .module_batch_min_interval(&owners[index])
+                    .map(|interval| Instant::now() + interval);
+                states[index] = ModuleState::Stored {
+                    module,
+                    next_batch_not_before,
+                };
                 Ok(())
             }
             Err(message) => {
@@ -330,6 +371,30 @@ fn spawn_next_batch(
                 index,
                 module,
                 result,
+            }
+        }
+        .instrument(parent.clone())
+        .with_subscriber(subscriber.clone()),
+    ));
+}
+
+fn spawn_batch_cooldown(
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    module: AllocatedModule,
+    deadline: Instant,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) {
+    tasks.push(spawn_local(
+        async move {
+            let started = Instant::now();
+            sleep_until(deadline).await;
+            let delayed_for = Instant::now().saturating_duration_since(started);
+            TaskMessage::BatchCooldownExpired {
+                index,
+                module,
+                delayed_for,
             }
         }
         .instrument(parent.clone())
@@ -413,13 +478,13 @@ mod tests {
     };
     use nuillu_module::{
         AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
-        ModuleRegistry, QueryInbox, QueryRequest,
+        ModuleBatchThrottlePolicy, ModuleRegistry, QueryInbox, QueryRequest, RuntimePolicy,
     };
     use nuillu_types::{ModelTier, ModuleId, builtin};
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    use crate::testing::test_caps;
+    use crate::testing::{test_caps, test_caps_with_policy};
 
     fn test_config() -> AgentEventLoopConfig {
         AgentEventLoopConfig {
@@ -450,6 +515,49 @@ mod tests {
             self.memo.write(format!("echoed {}", batch.question)).await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct QueryBatchRecorder {
+        query_inbox: QueryInbox,
+        batches: Rc<RefCell<Vec<Vec<String>>>>,
+        first_done: Option<oneshot::Sender<()>>,
+        second_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for QueryBatchRecorder {
+        type Batch = Vec<String>;
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            let first = self.query_inbox.next_item().await?.body.question;
+            let mut batch = vec![first];
+            batch.extend(
+                self.query_inbox
+                    .take_ready_items()?
+                    .items
+                    .into_iter()
+                    .map(|envelope| envelope.body.question),
+            );
+            Ok(batch)
+        }
+
+        async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()> {
+            self.batches.borrow_mut().push(batch.clone());
+            match self.batches.borrow().len() {
+                1 => {
+                    if let Some(done) = self.first_done.take() {
+                        let _ = done.send(());
+                    }
+                }
+                2 => {
+                    if let Some(done) = self.second_done.take() {
+                        let _ = done.send(());
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -711,6 +819,90 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_delays_next_batch_start_and_coalesces_ready_work() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new("batch-recorder").unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        activation_ratio: ActivationRatio::ONE,
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_policy(
+                    blackboard,
+                    RuntimePolicy {
+                        module_batch_throttles: ModuleBatchThrottlePolicy::for_module(
+                            module_id.clone(),
+                            std::time::Duration::from_millis(30),
+                        )
+                        .unwrap(),
+                        ..RuntimePolicy::default()
+                    },
+                );
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(module_id.clone(), 0..=1, {
+                        let batches = Rc::clone(&batches);
+                        let first_tx = Rc::clone(&first_tx);
+                        let second_tx = Rc::clone(&second_tx);
+                        move |caps| QueryBatchRecorder {
+                            query_inbox: caps.query_inbox(),
+                            batches: Rc::clone(&batches),
+                            first_done: first_tx.borrow_mut().take(),
+                            second_done: second_tx.borrow_mut().take(),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().query_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(QueryRequest::new("first"))
+                        .await
+                        .expect("first query should route");
+                    let _ = first_rx.await;
+
+                    let started = tokio::time::Instant::now();
+                    mailbox
+                        .publish(QueryRequest::new("second"))
+                        .await
+                        .expect("second query should route");
+                    mailbox
+                        .publish(QueryRequest::new("third"))
+                        .await
+                        .expect("third query should route");
+                    let _ = second_rx.await;
+                    assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[
+                        vec!["first".to_string()],
+                        vec!["second".to_string(), "third".to_string()]
+                    ]
+                );
             })
             .await;
     }
