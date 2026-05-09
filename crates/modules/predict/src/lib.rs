@@ -108,6 +108,14 @@ impl PredictModule {
 impl Module for PredictModule {
     type Batch = ();
 
+    fn id() -> &'static str {
+        "predict"
+    }
+
+    fn role_description() -> &'static str {
+        "Generates forward predictions about currently attended subjects on each attention update and writes them to its memo."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         PredictModule::next_batch(self).await
     }

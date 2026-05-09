@@ -143,6 +143,14 @@ impl SurpriseModule {
 impl Module for SurpriseModule {
     type Batch = ();
 
+    fn id() -> &'static str {
+        "surprise"
+    }
+
+    fn role_description() -> &'static str {
+        "Detects unexpected attention events by comparing new entries against predict's memo or recent attention; can request memory preservation."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SurpriseModule::next_batch(self).await
     }

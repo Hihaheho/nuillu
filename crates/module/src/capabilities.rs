@@ -3,7 +3,10 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nuillu_blackboard::{AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModuleRunStatus};
+use nuillu_blackboard::{
+    ActivationRatioFn, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
+    ModuleRunStatus,
+};
 use nuillu_types::{
     ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
 };
@@ -214,10 +217,10 @@ impl CapabilityProviders {
         }
     }
 
-    pub(crate) async fn set_replica_caps(&self, caps: Vec<(ModuleId, ReplicaCapRange)>) {
+    pub(crate) async fn set_module_policies(&self, policies: Vec<(ModuleId, ModulePolicy)>) {
         self.inner
             .blackboard
-            .apply(BlackboardCommand::SetReplicaCaps { caps })
+            .apply(BlackboardCommand::SetModulePolicies { policies })
             .await;
     }
 
@@ -249,7 +252,6 @@ impl CapabilityProviders {
             ),
             clock: self.inner.clock.clone(),
             runtime_events: self.inner.runtime_events.clone(),
-            runtime_policy: self.inner.runtime_policy.clone(),
         }
     }
 
@@ -338,7 +340,6 @@ pub struct AgentRuntimeControl {
     attention_updates: AttentionStreamUpdatedMailbox,
     clock: Arc<dyn Clock>,
     runtime_events: RuntimeEventEmitter,
-    runtime_policy: RuntimePolicy,
 }
 
 impl AgentRuntimeControl {
@@ -348,16 +349,20 @@ impl AgentRuntimeControl {
             .await
     }
 
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
         self.blackboard
             .apply(BlackboardCommand::SetModuleRunStatus { owner, status })
             .await;
     }
 
-    pub fn module_batch_min_interval(&self, owner: &ModuleInstanceId) -> Option<Duration> {
-        self.runtime_policy
-            .module_batch_throttles
-            .min_interval_for(&owner.module)
+    pub async fn module_batch_min_interval(&self, owner: &ModuleInstanceId) -> Option<Duration> {
+        self.blackboard
+            .read(|bb| bb.allocation().cooldown_for(&owner.module))
+            .await
     }
 
     pub async fn record_module_batch_throttled(
@@ -685,7 +690,7 @@ impl fmt::Debug for ModuleRegistry {
 
 struct ModuleRegistration {
     module: ModuleId,
-    cap_range: ReplicaCapRange,
+    policy: ModulePolicy,
     builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
 }
 
@@ -693,7 +698,7 @@ impl fmt::Debug for ModuleRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleRegistration")
             .field("module", &self.module)
-            .field("cap_range", &self.cap_range)
+            .field("policy", &self.policy)
             .finish_non_exhaustive()
     }
 }
@@ -721,12 +726,20 @@ impl ModuleRegistry {
         }
     }
 
-    pub fn register(
+    /// Register a module type with its base-active replica range, BPM tempo
+    /// range, and per-module activation-ratio mapping. The module's identity
+    /// comes from [`Module::id`] / [`Module::role_description`].
+    pub fn register<B>(
         mut self,
-        module: ModuleId,
-        cap_range: RangeInclusive<u8>,
-        builder: impl ModuleRegisterer + 'static,
-    ) -> Result<Self, ModuleRegistryError> {
+        replicas_range: RangeInclusive<u8>,
+        rate_limit_range: RangeInclusive<Bpm>,
+        activation_ratio_fn: ActivationRatioFn,
+        builder: B,
+    ) -> Result<Self, ModuleRegistryError>
+    where
+        B: ModuleRegisterer + 'static,
+    {
+        let module = ModuleId::new(<B::Module as Module>::id())?;
         if self
             .registrations
             .iter()
@@ -734,10 +747,13 @@ impl ModuleRegistry {
         {
             return Err(ModuleRegistryError::DuplicateModule { module });
         }
-        let range = ReplicaCapRange::new(*cap_range.start(), *cap_range.end())?;
+        // The supplied range counts *additional* replicas above the always-on
+        // base of 1; total active replicas = additional + 1.
+        let range = ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end())?;
+        let policy = ModulePolicy::new(range, rate_limit_range, activation_ratio_fn);
         self.registrations.push(ModuleRegistration {
             module,
-            cap_range: range,
+            policy,
             builder: Box::new(move |caps| Box::new(builder(caps))),
         });
         Ok(self)
@@ -748,19 +764,20 @@ impl ModuleRegistry {
         caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
         caps.apply_runtime_policy().await;
-        caps.set_replica_caps(
+        caps.set_module_policies(
             self.registrations
                 .iter()
-                .map(|registration| (registration.module.clone(), registration.cap_range))
+                .map(|registration| (registration.module.clone(), registration.policy.clone()))
                 .collect(),
         )
         .await;
 
         let mut modules = Vec::new();
         for registration in &self.registrations {
-            // Build every possible replica up to the registered max; allocation
-            // and the agent event loop decide which replicas are active.
-            for replica in 0..registration.cap_range.max {
+            // Build every possible replica up to (additional max + base 1);
+            // allocation and the agent event loop decide which are active.
+            let total_replicas = registration.policy.max_active_replicas();
+            for replica in 0..total_replicas {
                 let owner =
                     ModuleInstanceId::new(registration.module.clone(), ReplicaIndex::new(replica));
                 let scoped = caps.scoped(owner.clone());
@@ -781,6 +798,8 @@ impl Default for ModuleRegistry {
 pub enum ModuleRegistryError {
     #[error(transparent)]
     ReplicaCapRange(#[from] ReplicaCapRangeError),
+    #[error(transparent)]
+    ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
 }
@@ -804,6 +823,14 @@ mod tests {
     impl Module for NoopModule {
         type Batch = ();
 
+        fn id() -> &'static str {
+            "noop"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(())
         }
@@ -820,16 +847,27 @@ mod tests {
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
-            .register(builtin::attention_gate(), 0..=1, noop_builder)
+            .register(
+                0..=0,
+                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
+                nuillu_blackboard::linear_ratio_fn,
+                noop_builder,
+            )
             .unwrap();
 
         let err = registry
-            .register(builtin::attention_gate(), 0..=1, noop_builder)
+            .register(
+                0..=0,
+                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
+                nuillu_blackboard::linear_ratio_fn,
+                noop_builder,
+            )
             .unwrap_err();
 
+        let expected = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
         assert!(matches!(
             err,
-            ModuleRegistryError::DuplicateModule { module } if module == builtin::attention_gate()
+            ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
     }
 
@@ -864,15 +902,25 @@ mod tests {
     async fn allocation_writer_publishes_guidance_changes_once() {
         let blackboard = Blackboard::default();
         blackboard
-            .apply(BlackboardCommand::SetReplicaCaps {
-                caps: vec![
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![
                     (
                         builtin::attention_controller(),
-                        ReplicaCapRange { min: 1, max: 1 },
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 0).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
                     ),
                     (
                         builtin::attention_gate(),
-                        ReplicaCapRange { min: 0, max: 1 },
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 0).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
                     ),
                 ],
             })
@@ -887,11 +935,11 @@ mod tests {
         proposal.set(
             builtin::attention_gate(),
             ModuleConfig {
-                activation_ratio: ActivationRatio::ONE,
                 guidance: "promote current sensory memo into attention".into(),
                 tier: ModelTier::Default,
             },
         );
+        proposal.set_activation(builtin::attention_gate(), ActivationRatio::ONE);
 
         writer.set(proposal.clone()).await;
         let event = inbox.next_item().await.unwrap();

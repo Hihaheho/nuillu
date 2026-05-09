@@ -126,18 +126,19 @@ impl AllocationReader {
         self.blackboard.read(|bb| bb.allocation().clone()).await
     }
 
-    pub async fn replica_caps(
-        &self,
-    ) -> std::collections::HashMap<nuillu_types::ModuleId, nuillu_types::ReplicaCapRange> {
-        self.blackboard.read(|bb| bb.replica_caps().clone()).await
+    pub async fn registered_module_ids(&self) -> Vec<nuillu_types::ModuleId> {
+        self.blackboard
+            .read(|bb| {
+                let mut ids = bb.module_policies().keys().cloned().collect::<Vec<_>>();
+                ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                ids
+            })
+            .await
     }
 
     pub async fn controller_schema_json(&self) -> serde_json::Value {
-        let caps = self.replica_caps().await;
-        let mut caps = caps.into_iter().collect::<Vec<_>>();
-        caps.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
-
-        let module_ids = caps.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+        let ids = self.registered_module_ids().await;
+        let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
 
         let patch_items = if module_ids.is_empty() {
             serde_json::Value::Bool(false)
@@ -221,17 +222,31 @@ mod tests {
     use super::*;
 
     use chrono::{TimeZone, Utc};
-    use nuillu_blackboard::BlackboardCommand;
+    use nuillu_blackboard::{BlackboardCommand, Bpm, ModulePolicy, linear_ratio_fn};
     use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
+
+    fn test_policy(range: ReplicaCapRange) -> ModulePolicy {
+        ModulePolicy::new(
+            range,
+            Bpm::from_f64(1.0)..=Bpm::from_f64(60.0),
+            linear_ratio_fn,
+        )
+    }
 
     #[tokio::test]
     async fn controller_schema_enumerates_registered_modules_with_cap_ranges() {
         let blackboard = Blackboard::default();
         blackboard
-            .apply(BlackboardCommand::SetReplicaCaps {
-                caps: vec![
-                    (builtin::query_vector(), ReplicaCapRange { min: 0, max: 3 }),
-                    (builtin::speak(), ReplicaCapRange { min: 0, max: 1 }),
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![
+                    (
+                        builtin::query_vector(),
+                        test_policy(ReplicaCapRange::new(0, 2).unwrap()),
+                    ),
+                    (
+                        builtin::speak(),
+                        test_policy(ReplicaCapRange::new(0, 0).unwrap()),
+                    ),
                 ],
             })
             .await;

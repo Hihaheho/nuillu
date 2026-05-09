@@ -404,6 +404,14 @@ mod tests {
 impl Module for SensoryModule {
     type Batch = SensoryBatch;
 
+    fn id() -> &'static str {
+        "sensory"
+    }
+
+    fn role_description() -> &'static str {
+        "Pre-attentive filter: receives external observations, scores their salience, and writes selected normalized observations to its memo."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SensoryModule::next_batch(self).await
     }

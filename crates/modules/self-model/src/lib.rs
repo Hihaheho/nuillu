@@ -98,6 +98,14 @@ impl SelfModelModule {
 impl Module for SelfModelModule {
     type Batch = SelfModelBatch;
 
+    fn id() -> &'static str {
+        "self-model"
+    }
+
+    fn role_description() -> &'static str {
+        "Integrates attention-schema, peer module memos, and retrieved self-knowledge into a current first-person self-description; answers self-model requests."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SelfModelModule::next_batch(self).await
     }

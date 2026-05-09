@@ -25,8 +25,8 @@ use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
-    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, BlackboardInner,
-    MemoryMetadata, ModuleConfig, ResourceAllocation,
+    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, BlackboardInner, Bpm,
+    MemoryMetadata, ModuleConfig, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryStore,
@@ -1071,10 +1071,23 @@ fn eval_registry(modules: &[EvalModule]) -> ModuleRegistry {
     registry
 }
 
+/// Default per-module additional-replica range. `0..=0` means "always exactly
+/// 1 active replica" (the always-on base).
+fn eval_replicas(max_extra: u8) -> std::ops::RangeInclusive<u8> {
+    0..=max_extra
+}
+
+fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
+    // Idle pace 1 BPM (60s between batches) up to fully-active 5 BPM (12s).
+    // Time is injected via the Clock trait, so tests with a mock Clock can
+    // skip cooldowns entirely.
+    Bpm::from_f64(1.0)..=Bpm::from_f64(5.0)
+}
+
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
     match module {
         EvalModule::Sensory => registry
-            .register(builtin::sensory(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.sensory_detail_inbox(),
@@ -1086,7 +1099,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::AttentionGate => registry
-            .register(builtin::attention_gate(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_attention_gate::AttentionGateModule::new(
                     caps.memo_updated_inbox(),
                     caps.blackboard_reader(),
@@ -1098,7 +1111,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::AttentionController => registry
-            .register(builtin::attention_controller(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_attention_controller::AttentionControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.blackboard_reader(),
@@ -1111,7 +1124,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::AttentionSchema => registry
-            .register(builtin::attention_schema(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
@@ -1121,7 +1134,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::SelfModel => registry
-            .register(builtin::self_model(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_self_model::SelfModelModule::new(
                     caps.self_model_inbox(),
                     caps.blackboard_reader(),
@@ -1131,7 +1144,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::QueryVector => registry
-            .register(builtin::query_vector(), 1..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.query_inbox(),
                     caps.attention_stream_updated_inbox(),
@@ -1144,7 +1157,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::QueryAgentic => registry
-            .register(builtin::query_agentic(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.query_inbox(),
                     caps.allocation_updated_inbox(),
@@ -1157,7 +1170,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::Memory => registry
-            .register(builtin::memory(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_memory::MemoryModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.memory_request_inbox(),
@@ -1169,7 +1182,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::MemoryCompaction => registry
-            .register(builtin::memory_compaction(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_memory_compaction::MemoryCompactionModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -1180,7 +1193,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::Predict => registry
-            .register(builtin::predict(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_predict::PredictModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
@@ -1192,7 +1205,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::Surprise => registry
-            .register(builtin::surprise(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_surprise::SurpriseModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
@@ -1205,7 +1218,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::SpeakGate => registry
-            .register(builtin::speak_gate(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_speak::SpeakGateModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
@@ -1221,7 +1234,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             })
             .expect("eval module registration should be unique"),
         EvalModule::Speak => registry
-            .register(builtin::speak(), 0..=1, |caps| {
+            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
                 nuillu_speak::SpeakModule::new(
                     caps.speak_inbox(),
                     caps.attention_reader(),
@@ -1347,14 +1360,10 @@ fn module_allocation(
     let target_module = target.module();
     for module in modules {
         let is_target = *module == target_module;
+        let id = module.module_id();
         allocation.set(
-            module.module_id(),
+            id.clone(),
             ModuleConfig {
-                activation_ratio: if is_target {
-                    ActivationRatio::ONE
-                } else {
-                    ActivationRatio::ZERO
-                },
                 guidance: if is_target {
                     "Handle the module eval request.".into()
                 } else {
@@ -1362,7 +1371,14 @@ fn module_allocation(
                         .into()
                 },
                 tier: eval_module_tier(*module),
-                ..Default::default()
+            },
+        );
+        allocation.set_activation(
+            id,
+            if is_target {
+                ActivationRatio::ONE
+            } else {
+                ActivationRatio::ZERO
             },
         );
     }
@@ -1377,14 +1393,13 @@ fn set_allocation_module(
     guidance: impl Into<String>,
 ) {
     allocation.set(
-        id,
+        id.clone(),
         ModuleConfig {
-            activation_ratio: ActivationRatio::from_f64(activation_ratio),
             guidance: guidance.into(),
             tier,
-            ..Default::default()
         },
     );
+    allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 
 fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
@@ -1543,7 +1558,7 @@ fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationMod
         .iter()
         .map(|(module, config)| AllocationModuleDump {
             module: module.as_str().to_owned(),
-            activation_ratio: config.activation_ratio.as_f64(),
+            activation_ratio: allocation.activation_for(module).as_f64(),
             active_replicas: allocation.active_replicas(module),
             tier: model_tier_name(config.tier).to_owned(),
             guidance: DumpText::new(config.guidance.clone()),
@@ -1573,12 +1588,12 @@ fn allocation_proposal_dumps(bb: &BlackboardInner) -> Vec<AllocationProposalDump
 
 fn replica_cap_dumps(bb: &BlackboardInner) -> Vec<ReplicaCapDump> {
     let mut caps = bb
-        .replica_caps()
+        .module_policies()
         .iter()
-        .map(|(module, range)| ReplicaCapDump {
+        .map(|(module, policy)| ReplicaCapDump {
             module: module.as_str().to_owned(),
-            min: range.min,
-            max: range.max,
+            min: policy.replicas_range.min,
+            max: policy.replicas_range.max,
         })
         .collect::<Vec<_>>();
     caps.sort_by(|left, right| left.module.cmp(&right.module));
@@ -1658,8 +1673,8 @@ struct AgentObservation {
     memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
     memo_logs: BTreeMap<String, Vec<MemoLogObservation>>,
     attention_streams: Vec<AttentionStreamObservation>,
-    allocation: BTreeMap<String, ModuleConfig>,
-    allocation_proposals: BTreeMap<String, BTreeMap<String, ModuleConfig>>,
+    allocation: BTreeMap<String, AllocationModuleObservation>,
+    allocation_proposals: BTreeMap<String, BTreeMap<String, AllocationModuleObservation>>,
     replica_caps: BTreeMap<String, ReplicaCapRange>,
     memory_metadata: BTreeMap<String, MemoryMetadata>,
     utterances: Vec<RecordedUtterance>,
@@ -1678,6 +1693,13 @@ impl AgentObservation {
             utterances,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AllocationModuleObservation {
+    activation_ratio: ActivationRatio,
+    guidance: String,
+    tier: ModelTier,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1754,16 +1776,27 @@ fn attention_stream_observations(bb: &BlackboardInner) -> Vec<AttentionStreamObs
         .collect()
 }
 
-fn allocation_observation(allocation: &ResourceAllocation) -> BTreeMap<String, ModuleConfig> {
+fn allocation_observation(
+    allocation: &ResourceAllocation,
+) -> BTreeMap<String, AllocationModuleObservation> {
     allocation
         .iter()
-        .map(|(module, config)| (module.as_str().to_owned(), config.clone()))
+        .map(|(module, config)| {
+            (
+                module.as_str().to_owned(),
+                AllocationModuleObservation {
+                    activation_ratio: allocation.activation_for(module),
+                    guidance: config.guidance.clone(),
+                    tier: config.tier,
+                },
+            )
+        })
         .collect()
 }
 
 fn allocation_proposal_observations(
     bb: &BlackboardInner,
-) -> BTreeMap<String, BTreeMap<String, ModuleConfig>> {
+) -> BTreeMap<String, BTreeMap<String, AllocationModuleObservation>> {
     bb.allocation_proposals()
         .iter()
         .map(|(owner, allocation)| (owner.to_string(), allocation_observation(allocation)))
@@ -1771,15 +1804,15 @@ fn allocation_proposal_observations(
 }
 
 fn replica_cap_observations(bb: &BlackboardInner) -> BTreeMap<String, ReplicaCapRange> {
-    bb.replica_caps()
+    bb.module_policies()
         .iter()
-        .map(|(module, range)| (module.as_str().to_owned(), *range))
+        .map(|(module, policy)| (module.as_str().to_owned(), policy.replicas_range))
         .collect()
 }
 
 fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservation> {
     let mut modules = bb
-        .replica_caps()
+        .module_policies()
         .keys()
         .cloned()
         .chain(bb.allocation().iter().map(|(module, _)| module.clone()))
@@ -1797,7 +1830,7 @@ fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservati
             Some(ActiveModuleObservation {
                 module: module.as_str().to_owned(),
                 active_replicas,
-                activation_ratio: config.activation_ratio,
+                activation_ratio: bb.allocation().activation_for(&module),
                 tier: config.tier,
             })
         })
@@ -1887,22 +1920,22 @@ impl AllocationChangeReporter {
     }
 }
 
-fn allocation_live_summary(allocation: &BTreeMap<String, ModuleConfig>) -> String {
+fn allocation_live_summary(allocation: &BTreeMap<String, AllocationModuleObservation>) -> String {
     let active = allocation
         .iter()
-        .filter(|(_, config)| config.activation_ratio > ActivationRatio::ZERO)
-        .map(|(module, config)| {
+        .filter(|(_, obs)| obs.activation_ratio > ActivationRatio::ZERO)
+        .map(|(module, obs)| {
             format!(
                 "{}:{:.2}/{:?}",
                 module,
-                config.activation_ratio.as_f64(),
-                config.tier
+                obs.activation_ratio.as_f64(),
+                obs.tier
             )
         })
         .collect::<Vec<_>>();
     let inactive = allocation
         .values()
-        .filter(|config| config.activation_ratio == ActivationRatio::ZERO)
+        .filter(|obs| obs.activation_ratio == ActivationRatio::ZERO)
         .count();
     format!("active=[{}] inactive={inactive}", active.join(","))
 }
@@ -2308,9 +2341,15 @@ mod tests {
 
     struct FixedClock(chrono::DateTime<Utc>);
 
+    #[async_trait::async_trait(?Send)]
     impl Clock for FixedClock {
         fn now(&self) -> chrono::DateTime<Utc> {
             self.0
+        }
+
+        async fn sleep_until(&self, _deadline: chrono::DateTime<Utc>) {
+            // Test clock: sleeps complete immediately so test wall-clock stays
+            // independent of the registered BPM cooldown ranges.
         }
     }
 
@@ -2504,11 +2543,11 @@ limits {{
         allocation.set(
             builtin::query_vector(),
             ModuleConfig {
-                activation_ratio: ActivationRatio::ONE,
                 guidance: "test guidance".into(),
                 tier: ModelTier::Default,
             },
         );
+        allocation.set_activation(builtin::query_vector(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation.clone());
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
 
@@ -2529,8 +2568,15 @@ limits {{
             })
             .await;
         blackboard
-            .apply(BlackboardCommand::SetReplicaCaps {
-                caps: vec![(builtin::query_vector(), ReplicaCapRange::new(0, 1).unwrap())],
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(
+                    builtin::query_vector(),
+                    nuillu_blackboard::ModulePolicy::new(
+                        ReplicaCapRange::new(0, 0).unwrap(),
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                    ),
+                )],
             })
             .await;
         blackboard
@@ -2600,7 +2646,7 @@ limits {{
             "replica_caps": {
                 "query-vector": {
                     "min": 0,
-                    "max": 1,
+                    "max": 0,
                 },
             },
             "memory_metadata": {
@@ -2685,7 +2731,7 @@ prompt = "What am I attending to?"
         let (replica_caps, allocation_modules) = blackboard
             .read(|bb| {
                 let mut replica_caps = bb
-                    .replica_caps()
+                    .module_policies()
                     .keys()
                     .map(|module| module.as_str().to_owned())
                     .collect::<Vec<_>>();
@@ -2723,23 +2769,38 @@ prompt = "What am I attending to?"
         );
 
         let sensory = allocation.for_module(&builtin::sensory());
-        assert_eq!(sensory.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(
+            allocation.activation_for(&builtin::sensory()),
+            ActivationRatio::ONE
+        );
         assert_eq!(sensory.tier, ModelTier::Cheap);
 
         let attention_gate = allocation.for_module(&builtin::attention_gate());
-        assert_eq!(attention_gate.activation_ratio, ActivationRatio::ZERO);
+        assert_eq!(
+            allocation.activation_for(&builtin::attention_gate()),
+            ActivationRatio::ZERO
+        );
         assert_eq!(attention_gate.tier, ModelTier::Cheap);
 
         let controller = allocation.for_module(&builtin::attention_controller());
-        assert_eq!(controller.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(
+            allocation.activation_for(&builtin::attention_controller()),
+            ActivationRatio::ONE
+        );
         assert_eq!(controller.tier, ModelTier::Premium);
 
         let speak_gate = allocation.for_module(&builtin::speak_gate());
-        assert_eq!(speak_gate.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(
+            allocation.activation_for(&builtin::speak_gate()),
+            ActivationRatio::ONE
+        );
         assert_eq!(speak_gate.tier, ModelTier::Premium);
 
         let speak = allocation.for_module(&builtin::speak());
-        assert_eq!(speak.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(
+            allocation.activation_for(&builtin::speak()),
+            ActivationRatio::ONE
+        );
         assert_eq!(speak.tier, ModelTier::Premium);
 
         for module in [
@@ -2751,10 +2812,7 @@ prompt = "What am I attending to?"
             builtin::predict(),
             builtin::surprise(),
         ] {
-            assert_eq!(
-                allocation.for_module(&module).activation_ratio,
-                ActivationRatio::ZERO
-            );
+            assert_eq!(allocation.activation_for(&module), ActivationRatio::ZERO);
         }
         assert!(allocation.get(&builtin::query_agentic()).is_none());
     }

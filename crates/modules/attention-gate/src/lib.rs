@@ -112,6 +112,14 @@ impl AttentionGateModule {
 impl Module for AttentionGateModule {
     type Batch = ();
 
+    fn id() -> &'static str {
+        "attention-gate"
+    }
+
+    fn role_description() -> &'static str {
+        "Bridge from blackboard memos to the cognitive attention stream: appends novel, changed, or controller-requested events when promotion is warranted."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AttentionGateModule::next_batch(self).await
     }

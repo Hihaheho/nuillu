@@ -3,14 +3,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{
-    MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
-};
+use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
     AgenticDeadlockMarker, AllocationLimits, AttentionStream, AttentionStreamRecord,
-    AttentionStreamSet, BlackboardCommand, MemoryMetadata, ResourceAllocation,
+    AttentionStreamSet, BlackboardCommand, MemoryMetadata, ModulePolicy, ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -40,7 +38,7 @@ pub struct BlackboardInner {
     base_allocation: ResourceAllocation,
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
-    replica_caps: HashMap<ModuleId, ReplicaCapRange>,
+    module_policies: HashMap<ModuleId, ModulePolicy>,
     allocation_limits: AllocationLimits,
 }
 
@@ -267,7 +265,7 @@ impl Default for BlackboardInner {
             base_allocation: ResourceAllocation::default(),
             allocation: ResourceAllocation::default(),
             allocation_proposals: HashMap::new(),
-            replica_caps: HashMap::new(),
+            module_policies: HashMap::new(),
             allocation_limits: AllocationLimits::default(),
         }
     }
@@ -523,8 +521,8 @@ impl BlackboardInner {
         &self.allocation_proposals
     }
 
-    pub fn replica_caps(&self) -> &HashMap<ModuleId, ReplicaCapRange> {
-        &self.replica_caps
+    pub fn module_policies(&self) -> &HashMap<ModuleId, ModulePolicy> {
+        &self.module_policies
     }
 
     pub fn allocation_limits(&self) -> AllocationLimits {
@@ -588,9 +586,9 @@ impl BlackboardInner {
                 self.base_allocation = alloc;
                 self.recompute_effective_allocation();
             }
-            BlackboardCommand::SetReplicaCaps { caps } => {
-                for (module, range) in caps {
-                    self.replica_caps.insert(module, range);
+            BlackboardCommand::SetModulePolicies { policies } => {
+                for (module, policy) in policies {
+                    self.module_policies.insert(module, policy);
                 }
                 self.recompute_effective_allocation();
             }
@@ -664,16 +662,17 @@ impl BlackboardInner {
             self.allocation = self
                 .base_allocation
                 .clone()
-                .clamped(&self.replica_caps)
+                .derived(&self.module_policies)
                 .limited(self.allocation_limits);
             return;
         }
 
         let module_ids: HashSet<ModuleId> = self
-            .replica_caps
+            .module_policies
             .keys()
             .cloned()
             .chain(self.base_allocation.iter().map(|(id, _)| id.clone()))
+            .chain(self.base_allocation.iter_activation().map(|(id, _)| id.clone()))
             .collect();
 
         let mut effective = ResourceAllocation::default();
@@ -688,9 +687,16 @@ impl BlackboardInner {
                 })
                 .collect::<Vec<_>>();
             let count = configs.len() as u32;
-            let activation_sum = configs
+            let activation_sum = active_proposals
                 .iter()
-                .map(|cfg| u32::from(cfg.activation_ratio.raw()))
+                .map(|(_, proposal)| {
+                    let ratio = if proposal.get(&id).is_some() {
+                        proposal.activation_for(&id)
+                    } else {
+                        self.base_allocation.activation_for(&id)
+                    };
+                    u32::from(ratio.raw())
+                })
                 .sum::<u32>();
             let tier_sum = configs
                 .iter()
@@ -703,19 +709,21 @@ impl BlackboardInner {
                         .map(|cfg| (owner.to_string(), cfg.guidance.trim().to_owned()))
                 }));
 
-            let cfg = crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::from_raw(rounded_div(
-                    activation_sum,
-                    count,
-                ) as u16),
-                tier: ordinal_to_tier(rounded_div(tier_sum, count)),
-                guidance,
-            };
-            effective.set(id, cfg);
+            effective.set(
+                id.clone(),
+                crate::ModuleConfig {
+                    tier: ordinal_to_tier(rounded_div(tier_sum, count)),
+                    guidance,
+                },
+            );
+            effective.set_activation(
+                id,
+                crate::ActivationRatio::from_raw(rounded_div(activation_sum, count) as u16),
+            );
         }
 
         self.allocation = effective
-            .clamped(&self.replica_caps)
+            .derived(&self.module_policies)
             .limited(self.allocation_limits);
     }
 }
@@ -779,7 +787,7 @@ mod tests {
     use super::*;
 
     use chrono::TimeZone;
-    use nuillu_types::{ModelTier, ModuleId, ReplicaIndex, builtin};
+    use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin};
 
     fn memo_time(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).unwrap()
@@ -837,22 +845,22 @@ mod tests {
     #[tokio::test]
     async fn allocation_proposals_average_ratio_before_active_replica_derivation() {
         let mut base = ResourceAllocation::default();
-        base.set(
-            builtin::attention_controller(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
-                ..Default::default()
-            },
-        );
+        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
         let bb = Blackboard::with_allocation(base);
-        bb.apply(BlackboardCommand::SetReplicaCaps {
-            caps: vec![
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![
                 (
                     builtin::attention_controller(),
-                    ReplicaCapRange { min: 1, max: 2 },
+                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
                 ),
-                (builtin::query_vector(), ReplicaCapRange { min: 0, max: 3 }),
-                (builtin::speak(), ReplicaCapRange { min: 0, max: 1 }),
+                (
+                    builtin::query_vector(),
+                    test_policy(ReplicaCapRange::new(0, 2).unwrap()),
+                ),
+                (
+                    builtin::speak(),
+                    test_policy(ReplicaCapRange::new(0, 0).unwrap()),
+                ),
             ],
         })
         .await;
@@ -861,37 +869,40 @@ mod tests {
         proposal_a.set(
             builtin::query_vector(),
             crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::from_f64(1.0 / 3.0),
                 guidance: "query cheaply".into(),
                 tier: ModelTier::Cheap,
             },
         );
+        proposal_a.set_activation(
+            builtin::query_vector(),
+            crate::ActivationRatio::from_f64(1.0 / 3.0),
+        );
         proposal_a.set(
             builtin::speak(),
             crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ZERO,
                 guidance: "wait".into(),
                 ..Default::default()
             },
         );
+        proposal_a.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
 
         let mut proposal_b = ResourceAllocation::default();
         proposal_b.set(
             builtin::query_vector(),
             crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
                 guidance: "query deeply".into(),
                 tier: ModelTier::Premium,
             },
         );
+        proposal_b.set_activation(builtin::query_vector(), crate::ActivationRatio::ONE);
         proposal_b.set(
             builtin::speak(),
             crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
                 guidance: "respond if attention is ready".into(),
                 ..Default::default()
             },
         );
+        proposal_b.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
@@ -912,8 +923,9 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         let query = effective.for_module(&builtin::query_vector());
+        let query_activation = effective.activation_for(&builtin::query_vector());
         assert_eq!(effective.active_replicas(&builtin::query_vector()), 3);
-        assert!((query.activation_ratio.as_f64() - 0.6667).abs() < 0.001);
+        assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
         assert_eq!(query.tier, ModelTier::Default);
         assert_eq!(
             query.guidance,
@@ -925,50 +937,32 @@ mod tests {
     #[tokio::test]
     async fn allocation_ignores_proposals_from_inactive_controller_replicas() {
         let mut base = ResourceAllocation::default();
-        base.set(
+        base.set_activation(
             builtin::attention_controller(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::from_f64(0.5),
-                ..Default::default()
-            },
+            crate::ActivationRatio::from_f64(0.5),
         );
-        base.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ZERO,
-                ..Default::default()
-            },
-        );
+        base.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
 
         let bb = Blackboard::with_allocation(base);
-        bb.apply(BlackboardCommand::SetReplicaCaps {
-            caps: vec![
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![
                 (
                     builtin::attention_controller(),
-                    ReplicaCapRange { min: 1, max: 2 },
+                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
                 ),
-                (builtin::speak(), ReplicaCapRange { min: 0, max: 1 }),
+                (
+                    builtin::speak(),
+                    test_policy(ReplicaCapRange::new(0, 0).unwrap()),
+                ),
             ],
         })
         .await;
 
         let mut active = ResourceAllocation::default();
-        active.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ZERO,
-                ..Default::default()
-            },
-        );
+        active.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
 
         let mut inactive = ResourceAllocation::default();
-        inactive.set(
-            builtin::speak(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
-                ..Default::default()
-            },
-        );
+        inactive.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
@@ -988,24 +982,25 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        assert_eq!(effective.active_replicas(&builtin::speak()), 0);
+        // speak has min=1 base-active-1 policy; inactive controller's "ONE"
+        // activation is filtered out, only the active controller's ZERO is
+        // applied — but base-active-1 still keeps it at 1 active replica.
+        assert_eq!(effective.active_replicas(&builtin::speak()), 1);
+        assert_eq!(
+            effective.activation_for(&builtin::speak()),
+            crate::ActivationRatio::ZERO
+        );
     }
 
     #[tokio::test]
     async fn allocation_proposals_do_not_add_unregistered_modules() {
         let mut base = ResourceAllocation::default();
-        base.set(
-            builtin::attention_controller(),
-            crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
-                ..Default::default()
-            },
-        );
+        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
         let bb = Blackboard::with_allocation(base);
-        bb.apply(BlackboardCommand::SetReplicaCaps {
-            caps: vec![(
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![(
                 builtin::attention_controller(),
-                ReplicaCapRange { min: 1, max: 1 },
+                test_policy(ReplicaCapRange::new(0, 0).unwrap()),
             )],
         })
         .await;
@@ -1015,11 +1010,11 @@ mod tests {
         proposal.set(
             unknown.clone(),
             crate::ModuleConfig {
-                activation_ratio: crate::ActivationRatio::ONE,
                 guidance: "ignore me".into(),
                 tier: ModelTier::Premium,
             },
         );
+        proposal.set_activation(unknown.clone(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(builtin::attention_controller(), ReplicaIndex::ZERO),
@@ -1031,23 +1026,11 @@ mod tests {
         assert!(effective.get(&unknown).is_none());
     }
 
-    #[test]
-    fn activation_ratio_respects_cap_range_min_and_max() {
-        let range = ReplicaCapRange { min: 1, max: 3 };
-
-        assert_eq!(crate::ActivationRatio::ZERO.active_replicas(range), 1);
-        assert_eq!(
-            crate::ActivationRatio::from_f64(0.01).active_replicas(range),
-            1
-        );
-        assert_eq!(
-            crate::ActivationRatio::from_f64(0.5).active_replicas(range),
-            2
-        );
-        assert_eq!(crate::ActivationRatio::ONE.active_replicas(range), 3);
-        assert_eq!(
-            crate::ActivationRatio::ONE.active_replicas(ReplicaCapRange { min: 0, max: 0 }),
-            0
-        );
+    fn test_policy(range: ReplicaCapRange) -> crate::ModulePolicy {
+        crate::ModulePolicy::new(
+            range,
+            crate::Bpm::from_f64(1.0)..=crate::Bpm::from_f64(60.0),
+            crate::linear_ratio_fn,
+        )
     }
 }

@@ -1,10 +1,13 @@
 use std::future::Future;
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_module::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch, ModuleRunStatus,
+    ports::Clock,
 };
 use nuillu_types::ModuleInstanceId;
 use thiserror::Error;
@@ -152,7 +155,7 @@ pub async fn run(
 enum ModuleState {
     Stored {
         module: AllocatedModule,
-        next_batch_not_before: Option<Instant>,
+        next_batch_not_before: Option<DateTime<Utc>>,
     },
     CoolingDown,
     Awaiting,
@@ -208,11 +211,18 @@ async fn refresh_active_and_schedule(
                 else {
                     unreachable!("module state changed while scheduling next batch");
                 };
-                if let Some(deadline) = next_batch_not_before.filter(|deadline| {
-                    deadline.saturating_duration_since(Instant::now()) > Duration::ZERO
-                }) {
+                let now = runtime.clock().now();
+                if let Some(deadline) = next_batch_not_before.filter(|deadline| *deadline > now) {
                     states[index] = ModuleState::CoolingDown;
-                    spawn_batch_cooldown(tasks, index, module, deadline, parent, subscriber);
+                    spawn_batch_cooldown(
+                        tasks,
+                        index,
+                        module,
+                        deadline,
+                        runtime.clock(),
+                        parent,
+                        subscriber,
+                    );
                 } else {
                     spawn_next_batch(tasks, index, module, parent, subscriber);
                 }
@@ -325,9 +335,13 @@ async fn handle_task_message(
             result,
         } => match result {
             Ok(()) => {
+                let now = runtime.clock().now();
                 let next_batch_not_before = runtime
                     .module_batch_min_interval(&owners[index])
-                    .map(|interval| Instant::now() + interval);
+                    .await
+                    .and_then(|interval| {
+                        chrono::Duration::from_std(interval).ok().map(|d| now + d)
+                    });
                 states[index] = ModuleState::Stored {
                     module,
                     next_batch_not_before,
@@ -382,15 +396,18 @@ fn spawn_batch_cooldown(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     module: AllocatedModule,
-    deadline: Instant,
+    deadline: DateTime<Utc>,
+    clock: Arc<dyn Clock>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let started = Instant::now();
-            sleep_until(deadline).await;
-            let delayed_for = Instant::now().saturating_duration_since(started);
+            let started = clock.now();
+            clock.sleep_until(deadline).await;
+            let delayed_for = (clock.now() - started)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
             TaskMessage::BatchCooldownExpired {
                 index,
                 module,
@@ -473,18 +490,18 @@ mod tests {
 
     use async_trait::async_trait;
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ModuleRunStatus,
-        ResourceAllocation,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModulePolicy,
+        ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::{
         AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
-        ModuleBatchThrottlePolicy, ModuleRegistry, QueryInbox, QueryRequest, RuntimePolicy,
+        ModuleRegistry, QueryInbox, QueryRequest, RuntimePolicy,
     };
     use nuillu_types::{ModelTier, ModuleId, builtin};
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    use crate::testing::{test_caps, test_caps_with_policy};
+    use crate::testing::{test_caps, test_caps_with_real_clock};
 
     fn test_config() -> AgentEventLoopConfig {
         AgentEventLoopConfig {
@@ -506,6 +523,14 @@ mod tests {
     #[async_trait(?Send)]
     impl Module for EchoModule {
         type Batch = QueryRequest;
+
+        fn id() -> &'static str {
+            "echo"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.query_inbox.next_item().await?.body)
@@ -530,6 +555,14 @@ mod tests {
     #[async_trait(?Send)]
     impl Module for QueryBatchRecorder {
         type Batch = Vec<String>;
+
+        fn id() -> &'static str {
+            "batch-recorder"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             let first = self.query_inbox.next_item().await?.body.question;
@@ -572,6 +605,14 @@ mod tests {
     impl Module for AttentionGateStub {
         type Batch = ();
 
+        fn id() -> &'static str {
+            "attention-gate"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.on_done.is_some() {
                 Ok(())
@@ -599,6 +640,14 @@ mod tests {
     #[async_trait(?Send)]
     impl Module for RetryStub {
         type Batch = String;
+
+        fn id() -> &'static str {
+            "retry"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -633,6 +682,14 @@ mod tests {
     impl Module for AlwaysFailStub {
         type Batch = ();
 
+        fn id() -> &'static str {
+            "always-fail"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
                 std::future::pending().await
@@ -657,6 +714,14 @@ mod tests {
     impl Module for DeadlockObserver {
         type Batch = AttentionStreamUpdated;
 
+        fn id() -> &'static str {
+            "deadlock-observer"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             Ok(self.updates.next_item().await?.body)
         }
@@ -677,6 +742,14 @@ mod tests {
     impl Module for HangingBatchStub {
         type Batch = ();
 
+        fn id() -> &'static str {
+            "status-awaiting"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             std::future::pending().await
         }
@@ -694,6 +767,14 @@ mod tests {
     #[async_trait(?Send)]
     impl Module for DelayedBatchStub {
         type Batch = ();
+
+        fn id() -> &'static str {
+            "status-pending"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if let Some(release) = self.release.take() {
@@ -719,6 +800,14 @@ mod tests {
     #[async_trait(?Send)]
     impl Module for BlockingActivateStub {
         type Batch = ();
+
+        fn id() -> &'static str {
+            "status-activating"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
             if self.batch_sent {
@@ -770,25 +859,30 @@ mod tests {
                 alloc.set(
                     echo_id(),
                     ModuleConfig {
-                        activation_ratio: nuillu_blackboard::ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(echo_id(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(echo_id(), 0..=1, {
-                        let done_tx = Rc::clone(&done_tx);
-                        move |caps| EchoModule {
-                            query_inbox: caps.query_inbox(),
-                            memo: caps.memo(),
-                            on_done: done_tx.borrow_mut().take(),
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| EchoModule {
+                                query_inbox: caps.query_inbox(),
+                                memo: caps.memo(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -828,46 +922,45 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let module_id = ModuleId::new("batch-recorder").unwrap();
+                let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
                     module_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
-                let caps = test_caps_with_policy(
-                    blackboard,
-                    RuntimePolicy {
-                        module_batch_throttles: ModuleBatchThrottlePolicy::for_module(
-                            module_id.clone(),
-                            std::time::Duration::from_millis(30),
-                        )
-                        .unwrap(),
-                        ..RuntimePolicy::default()
-                    },
-                );
+                // Use real wall-clock so the test can observe the 30ms cooldown
+                // actually delaying the second batch.
+                let caps = test_caps_with_real_clock(blackboard);
                 let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
                 let (first_tx, first_rx) = oneshot::channel();
                 let (second_tx, second_rx) = oneshot::channel();
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                // 2000 BPM = 30ms cooldown per batch under linear_ratio_fn at
+                // activation_ratio=1.0.
                 let modules = ModuleRegistry::new()
-                    .register(module_id.clone(), 0..=1, {
-                        let batches = Rc::clone(&batches);
-                        let first_tx = Rc::clone(&first_tx);
-                        let second_tx = Rc::clone(&second_tx);
-                        move |caps| QueryBatchRecorder {
-                            query_inbox: caps.query_inbox(),
-                            batches: Rc::clone(&batches),
-                            first_done: first_tx.borrow_mut().take(),
-                            second_done: second_tx.borrow_mut().take(),
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(2000.0)..=Bpm::from_f64(2000.0),
+                        linear_ratio_fn,
+                        {
+                            let batches = Rc::clone(&batches);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            move |caps| QueryBatchRecorder {
+                                query_inbox: caps.query_inbox(),
+                                batches: Rc::clone(&batches),
+                                first_done: first_tx.borrow_mut().take(),
+                                second_done: second_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -912,7 +1005,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let module_id = ModuleId::new("status-awaiting").unwrap();
+                let module_id = ModuleId::new(HangingBatchStub::id()).unwrap();
                 let owner = nuillu_types::ModuleInstanceId::new(
                     module_id.clone(),
                     nuillu_types::ReplicaIndex::ZERO,
@@ -921,16 +1014,21 @@ mod tests {
                 alloc.set(
                     module_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
-                    .register(module_id, 0..=1, |_| HangingBatchStub)
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        |_| HangingBatchStub,
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -952,82 +1050,17 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn scheduler_records_pending_batch_when_ready_replica_is_now_inactive() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let module_id = ModuleId::new("status-pending").unwrap();
-                let owner = nuillu_types::ModuleInstanceId::new(
-                    module_id.clone(),
-                    nuillu_types::ReplicaIndex::ZERO,
-                );
-                let mut active_alloc = ResourceAllocation::default();
-                active_alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
-                let mut inactive_alloc = ResourceAllocation::default();
-                inactive_alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        activation_ratio: ActivationRatio::ZERO,
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
-
-                let blackboard = Blackboard::with_allocation(active_alloc);
-                let caps = test_caps(blackboard.clone());
-                let (release_tx, release_rx) = oneshot::channel();
-                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
-                let activated = Rc::new(Cell::new(false));
-                let modules = ModuleRegistry::new()
-                    .register(module_id, 0..=1, {
-                        let release_rx = Rc::clone(&release_rx);
-                        let activated = Rc::clone(&activated);
-                        move |_| DelayedBatchStub {
-                            release: release_rx.borrow_mut().take(),
-                            activated: Rc::clone(&activated),
-                        }
-                    })
-                    .unwrap()
-                    .build(&caps)
-                    .await
-                    .unwrap();
-
-                super::run(modules, test_config(), async {
-                    wait_for_status(&blackboard, &owner, ModuleRunStatus::AwaitingBatch).await;
-                    blackboard
-                        .apply(BlackboardCommand::SetAllocation(inactive_alloc))
-                        .await;
-                    let _ = release_tx.send(());
-                    wait_for_status(&blackboard, &owner, ModuleRunStatus::PendingBatch).await;
-                })
-                .await
-                .expect("scheduler returned err");
-
-                assert!(!activated.get());
-                assert_eq!(
-                    blackboard
-                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
-                        .await,
-                    Some(ModuleRunStatus::PendingBatch)
-                );
-            })
-            .await;
-    }
+    // The "PendingBatch when replica deactivates mid-flight" scenario is no
+    // longer reachable: registered modules always have replicas_range.min >= 1
+    // active replicas, so a controller cannot deactivate them via the
+    // allocation alone. The DelayedBatchStub itself is retained for future use.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn scheduler_records_activating_status() {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let module_id = ModuleId::new("status-activating").unwrap();
+                let module_id = ModuleId::new(BlockingActivateStub::id()).unwrap();
                 let owner = nuillu_types::ModuleInstanceId::new(
                     module_id.clone(),
                     nuillu_types::ReplicaIndex::ZERO,
@@ -1036,11 +1069,11 @@ mod tests {
                 alloc.set(
                     module_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
@@ -1049,15 +1082,20 @@ mod tests {
                 let (_release_tx, release_rx) = oneshot::channel();
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
-                    .register(module_id, 0..=1, {
-                        let entered_tx = Rc::clone(&entered_tx);
-                        let release_rx = Rc::clone(&release_rx);
-                        move |_| BlockingActivateStub {
-                            entered: entered_tx.borrow_mut().take(),
-                            release: release_rx.borrow_mut().take(),
-                            batch_sent: false,
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let entered_tx = Rc::clone(&entered_tx);
+                            let release_rx = Rc::clone(&release_rx);
+                            move |_| BlockingActivateStub {
+                                entered: entered_tx.borrow_mut().take(),
+                                release: release_rx.borrow_mut().take(),
+                                batch_sent: false,
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -1089,24 +1127,29 @@ mod tests {
                 alloc.set(
                     builtin::attention_gate(),
                     ModuleConfig {
-                        activation_ratio: nuillu_blackboard::ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(builtin::attention_gate(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(builtin::attention_gate(), 0..=1, {
-                        let done_tx = Rc::clone(&done_tx);
-                        move |caps| AttentionGateStub {
-                            writer: caps.attention_writer(),
-                            on_done: done_tx.borrow_mut().take(),
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| AttentionGateStub {
+                                writer: caps.attention_writer(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -1133,16 +1176,16 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let retry_id = ModuleId::new("retry").unwrap();
+                let retry_id = ModuleId::new(RetryStub::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
                     retry_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(retry_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
@@ -1150,16 +1193,21 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(retry_id.clone(), 0..=1, {
-                        let attempts = Rc::clone(&attempts);
-                        let done_tx = Rc::clone(&done_tx);
-                        move |caps| RetryStub {
-                            memo: caps.memo(),
-                            attempts: Rc::clone(&attempts),
-                            on_done: done_tx.borrow_mut().take(),
-                            batch_sent: false,
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let attempts = Rc::clone(&attempts);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| RetryStub {
+                                memo: caps.memo(),
+                                attempts: Rc::clone(&attempts),
+                                on_done: done_tx.borrow_mut().take(),
+                                batch_sent: false,
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -1192,23 +1240,26 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let fail_id = ModuleId::new("always-fail").unwrap();
+                let fail_id = ModuleId::new(AlwaysFailStub::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
                     fail_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(fail_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
-                    .register(fail_id.clone(), 0..=1, |_| AlwaysFailStub {
-                        batch_sent: false,
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        |_| AlwaysFailStub { batch_sent: false },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await
@@ -1244,94 +1295,44 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn inactive_replica_is_not_started() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let inactive_id = ModuleId::new("inactive").unwrap();
-                let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    inactive_id.clone(),
-                    ModuleConfig {
-                        activation_ratio: ActivationRatio::ZERO,
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
-
-                let blackboard = Blackboard::with_allocation(alloc);
-                let caps = test_caps(blackboard.clone());
-                let (done_tx, mut done_rx) = oneshot::channel::<()>();
-                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
-                let modules = ModuleRegistry::new()
-                    .register(inactive_id.clone(), 0..=1, {
-                        let done_tx = Rc::clone(&done_tx);
-                        move |caps| RetryStub {
-                            memo: caps.memo(),
-                            attempts: Rc::new(Cell::new(0)),
-                            on_done: done_tx.borrow_mut().take(),
-                            batch_sent: false,
-                        }
-                    })
-                    .unwrap()
-                    .build(&caps)
-                    .await
-                    .unwrap();
-
-                super::run(modules, test_config(), async {
-                    for _ in 0..4 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("scheduler returned err");
-
-                assert!(done_rx.try_recv().is_err());
-                assert!(blackboard.memo(&inactive_id).await.is_none());
-                let owner = nuillu_types::ModuleInstanceId::new(
-                    inactive_id,
-                    nuillu_types::ReplicaIndex::ZERO,
-                );
-                assert_eq!(
-                    blackboard
-                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
-                        .await,
-                    Some(ModuleRunStatus::Inactive)
-                );
-            })
-            .await;
-    }
+    // The "inactive replica is not started" scenario is no longer reachable:
+    // registered modules always have replicas_range.min >= 1 active replicas
+    // by construction.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn idle_deadlock_records_marker_and_publishes_attention_update() {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let observer_id = ModuleId::new("deadlock-observer").unwrap();
+                let observer_id = ModuleId::new(DeadlockObserver::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
                     observer_id.clone(),
                     ModuleConfig {
-                        activation_ratio: ActivationRatio::ONE,
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
+                alloc.set_activation(observer_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(observer_id.clone(), 0..=1, {
-                        let done_tx = Rc::clone(&done_tx);
-                        move |caps| DeadlockObserver {
-                            updates: caps.attention_stream_updated_inbox(),
-                            memo: caps.memo(),
-                            on_done: done_tx.borrow_mut().take(),
-                        }
-                    })
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| DeadlockObserver {
+                                updates: caps.attention_stream_updated_inbox(),
+                                memo: caps.memo(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
                     .unwrap()
                     .build(&caps)
                     .await

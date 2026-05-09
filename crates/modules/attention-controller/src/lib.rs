@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,7 +8,7 @@ use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionReader, BlackboardReader, LlmAccess, Memo,
     MemoUpdatedInbox, Module,
 };
-use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange};
+use nuillu_types::{ModelTier, ModuleId};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -132,7 +131,11 @@ impl AttentionControllerModule {
         let controller_schema = allocation_reader.controller_schema_json().await;
         let output_schema =
             Schema::try_from(controller_schema.clone()).context("controller schema is invalid")?;
-        let replica_caps = allocation_reader.replica_caps().await;
+        let registered = allocation_reader
+            .registered_module_ids()
+            .await
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
 
         let lutum = llm.lutum().await;
         let mut session = Session::new(lutum);
@@ -161,7 +164,7 @@ impl AttentionControllerModule {
             anyhow::bail!("attention-controller structured turn refused");
         };
 
-        let next = apply_decision(current, &replica_caps, decision);
+        let next = apply_decision(current, &registered, decision);
 
         memo.write(next.memo.clone()).await;
         allocation_writer.set(next.allocation).await;
@@ -176,7 +179,7 @@ struct AppliedDecision {
 
 fn apply_decision(
     current: nuillu_blackboard::ResourceAllocation,
-    caps: &HashMap<ModuleId, ReplicaCapRange>,
+    registered: &std::collections::HashSet<ModuleId>,
     decision: AllocationDecision,
 ) -> AppliedDecision {
     let mut next = current;
@@ -185,15 +188,15 @@ fn apply_decision(
             tracing::warn!("attention-controller ignored invalid module id");
             continue;
         };
-        let Some(_range) = caps.get(&id) else {
+        if !registered.contains(&id) {
             tracing::warn!(module = %id, "attention-controller ignored unregistered module id");
             continue;
-        };
+        }
         let mut config: ModuleConfig = next.for_module(&id);
-        config.activation_ratio = ActivationRatio::from_f64(entry.activation_ratio);
         config.guidance = entry.guidance;
         config.tier = entry.tier;
-        next.set(id, config);
+        next.set(id.clone(), config);
+        next.set_activation(id, ActivationRatio::from_f64(entry.activation_ratio));
     }
 
     AppliedDecision {
@@ -243,12 +246,12 @@ mod tests {
 
     #[test]
     fn apply_decision_ignores_unregistered_modules_and_clamps_activation_ratio() {
-        let mut caps = HashMap::new();
-        caps.insert(builtin::speak(), ReplicaCapRange { min: 0, max: 1 });
+        let mut registered = std::collections::HashSet::new();
+        registered.insert(builtin::speak());
 
         let applied = apply_decision(
             ResourceAllocation::default(),
-            &caps,
+            &registered,
             AllocationDecision {
                 memo: "checked".into(),
                 allocations: vec![
@@ -276,7 +279,10 @@ mod tests {
                 .is_none()
         );
         let speak = applied.allocation.for_module(&builtin::speak());
-        assert_eq!(speak.activation_ratio, ActivationRatio::ONE);
+        assert_eq!(
+            applied.allocation.activation_for(&builtin::speak()),
+            ActivationRatio::ONE
+        );
         assert_eq!(speak.guidance, "respond from attention when ready");
         assert_eq!(speak.tier, ModelTier::Premium);
     }
@@ -313,6 +319,14 @@ mod tests {
 #[async_trait(?Send)]
 impl Module for AttentionControllerModule {
     type Batch = ();
+
+    fn id() -> &'static str {
+        "attention-controller"
+    }
+
+    fn role_description() -> &'static str {
+        "Allocates resources across modules — writes activation, guidance, and tier per registered module on memo updates."
+    }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AttentionControllerModule::next_batch(self).await

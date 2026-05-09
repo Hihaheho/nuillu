@@ -111,7 +111,6 @@ impl Default for RateLimitPolicy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimePolicy {
     pub rate_limits: RateLimitPolicy,
-    pub module_batch_throttles: ModuleBatchThrottlePolicy,
     pub allocation_limits: AllocationLimits,
     pub memo_retained_per_owner: usize,
 }
@@ -120,60 +119,10 @@ impl Default for RuntimePolicy {
     fn default() -> Self {
         Self {
             rate_limits: RateLimitPolicy::default(),
-            module_batch_throttles: ModuleBatchThrottlePolicy::default(),
             allocation_limits: AllocationLimits::default(),
             memo_retained_per_owner: 8,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModuleBatchThrottlePolicy {
-    min_intervals: HashMap<ModuleId, Duration>,
-}
-
-impl ModuleBatchThrottlePolicy {
-    pub fn disabled() -> Self {
-        Self {
-            min_intervals: HashMap::new(),
-        }
-    }
-
-    pub fn new(
-        min_intervals: HashMap<ModuleId, Duration>,
-    ) -> Result<Self, ModuleBatchThrottlePolicyError> {
-        for interval in min_intervals.values() {
-            if *interval == Duration::ZERO {
-                return Err(ModuleBatchThrottlePolicyError::ZeroInterval);
-            }
-        }
-        Ok(Self { min_intervals })
-    }
-
-    pub fn for_module(
-        module: ModuleId,
-        min_interval: Duration,
-    ) -> Result<Self, ModuleBatchThrottlePolicyError> {
-        let mut min_intervals = HashMap::new();
-        min_intervals.insert(module, min_interval);
-        Self::new(min_intervals)
-    }
-
-    pub(crate) fn min_interval_for(&self, module: &ModuleId) -> Option<Duration> {
-        self.min_intervals.get(module).copied()
-    }
-}
-
-impl Default for ModuleBatchThrottlePolicy {
-    fn default() -> Self {
-        Self::disabled()
-    }
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleBatchThrottlePolicyError {
-    #[error("module batch throttle interval must be positive")]
-    ZeroInterval,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -355,20 +304,13 @@ mod tests {
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::time::Instant;
 
-    use super::{
-        CapabilityKind, ModuleBatchThrottlePolicy, RateLimitConfig, RateLimitPolicy, RateLimiter,
-        TopicKind,
-    };
+    use super::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RateLimiter, TopicKind};
 
     #[test]
     fn rejects_invalid_configs() {
         assert!(RateLimitConfig::new(Duration::ZERO, 1.0).is_err());
         assert!(RateLimitConfig::new(Duration::from_secs(1), 0.0).is_err());
         assert!(RateLimitConfig::new(Duration::from_secs(1), f64::NAN).is_err());
-        assert!(
-            ModuleBatchThrottlePolicy::for_module(builtin::attention_gate(), Duration::ZERO)
-                .is_err()
-        );
     }
 
     #[tokio::test]

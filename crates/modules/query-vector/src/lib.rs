@@ -233,6 +233,14 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
 impl Module for QueryVectorModule {
     type Batch = QueryVectorBatch;
 
+    fn id() -> &'static str {
+        "query-vector"
+    }
+
+    fn role_description() -> &'static str {
+        "Vector-memory/RAG retrieval: surfaces stored memory content into its memo on QueryRequest or attention updates; never synthesizes answers."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         QueryVectorModule::next_batch(self).await
     }

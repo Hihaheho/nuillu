@@ -128,18 +128,44 @@ pub trait AttentionRepository {
     ) -> Result<Vec<AttentionStreamEvent>, PortError>;
 }
 
-/// Time source. Indirected so tests can use a mock clock.
+/// Time source plus sleep. Indirected so tests can fully inject time —
+/// `sleep_until` lets the scheduler wait for a virtual deadline without
+/// blocking real time in tests.
+#[async_trait(?Send)]
 pub trait Clock {
     fn now(&self) -> DateTime<Utc>;
+
+    /// Sleep until the given absolute deadline. Implementations should return
+    /// immediately if the deadline is already in the past.
+    async fn sleep_until(&self, deadline: DateTime<Utc>);
+
+    /// Sleep for the given duration. Default impl computes the deadline via
+    /// `now()` and delegates to `sleep_until`.
+    async fn sleep_for(&self, duration: std::time::Duration) {
+        let deadline = self.now() + chrono::Duration::from_std(duration).unwrap_or_default();
+        self.sleep_until(deadline).await;
+    }
 }
 
 /// System clock: adequate default for non-test use.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
+#[async_trait(?Send)]
 impl Clock for SystemClock {
     fn now(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    async fn sleep_until(&self, deadline: DateTime<Utc>) {
+        let remaining = deadline - Utc::now();
+        let Ok(duration) = remaining.to_std() else {
+            return; // deadline already past or non-positive
+        };
+        if duration.is_zero() {
+            return;
+        }
+        tokio::time::sleep(duration).await;
     }
 }
 

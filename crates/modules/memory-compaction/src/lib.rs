@@ -203,6 +203,14 @@ impl MemoryCompactionModule {
 impl Module for MemoryCompactionModule {
     type Batch = ();
 
+    fn id() -> &'static str {
+        "memory-compaction"
+    }
+
+    fn role_description() -> &'static str {
+        "Merges redundant memory entries and accumulates remember tokens; wakes on allocation guidance, never on raw memos."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryCompactionModule::next_batch(self).await
     }

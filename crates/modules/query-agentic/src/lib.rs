@@ -263,6 +263,14 @@ mod tests {
 impl Module for QueryAgenticModule {
     type Batch = QueryAgenticBatch;
 
+    fn id() -> &'static str {
+        "query-agentic"
+    }
+
+    fn role_description() -> &'static str {
+        "Read-only file-search retrieval: surfaces snippets from project files into its memo on QueryRequest or allocation cues; never synthesizes answers."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         QueryAgenticModule::next_batch(self).await
     }

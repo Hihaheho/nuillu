@@ -634,7 +634,9 @@ mod tests {
         AssistantInputItem, InputMessageRole, Lutum, MessageContent, MockLlmAdapter,
         ModelInputItem, Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
     };
-    use nuillu_blackboard::{ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{
+        ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+    };
     use nuillu_module::ports::{
         NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
         SystemClock,
@@ -681,31 +683,47 @@ mod tests {
             builtin::sensory(),
             builtin::speak(),
         ] {
-            allocation.set(
-                module,
-                ModuleConfig {
-                    activation_ratio: ActivationRatio::ONE,
-                    ..Default::default()
-                },
-            );
+            allocation.set(module.clone(), ModuleConfig::default());
+            allocation.set_activation(module, ActivationRatio::ONE);
         }
         allocation
     }
 
-    struct NoopModule;
-
-    #[async_trait(?Send)]
-    impl Module for NoopModule {
-        type Batch = ();
-
-        async fn next_batch(&mut self) -> Result<Self::Batch> {
-            std::future::pending().await
-        }
-
-        async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-            Ok(())
-        }
+    fn test_bpm() -> std::ops::RangeInclusive<nuillu_blackboard::Bpm> {
+        nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0)
     }
+
+    macro_rules! noop_stub {
+        ($name:ident, $id:literal) => {
+            struct $name;
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
+
+                fn id() -> &'static str {
+                    $id
+                }
+
+                fn role_description() -> &'static str {
+                    "test stub"
+                }
+
+                async fn next_batch(&mut self) -> Result<Self::Batch> {
+                    std::future::pending().await
+                }
+
+                async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    noop_stub!(SpeakGateStub, "speak-gate");
+    noop_stub!(QueryVectorStub, "query-vector");
+    noop_stub!(SelfModelStub, "self-model");
+    noop_stub!(SensoryStub, "sensory");
 
     struct GateToolFixture {
         gate: SpeakGateModule,
@@ -738,7 +756,7 @@ mod tests {
         let sensory_memo_sink = Rc::clone(&sensory_memo_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(builtin::speak_gate(), 0..=1, move |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *gate_sink.borrow_mut() = Some(SpeakGateModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.attention_reader(),
@@ -751,25 +769,25 @@ mod tests {
                     caps.speak_mailbox(),
                     caps.llm_access(),
                 ));
-                NoopModule
+                SpeakGateStub
             })
             .unwrap()
-            .register(builtin::query_vector(), 0..=1, move |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *query_inbox_sink.borrow_mut() = Some(caps.query_inbox());
                 *query_memo_sink.borrow_mut() = Some(caps.memo());
-                NoopModule
+                QueryVectorStub
             })
             .unwrap()
-            .register(builtin::self_model(), 0..=1, move |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *self_model_inbox_sink.borrow_mut() = Some(caps.self_model_inbox());
                 *self_model_memo_sink.borrow_mut() = Some(caps.memo());
-                NoopModule
+                SelfModelStub
             })
             .unwrap()
-            .register(builtin::sensory(), 0..=1, move |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *sensory_detail_inbox_sink.borrow_mut() = Some(caps.sensory_detail_inbox());
                 *sensory_memo_sink.borrow_mut() = Some(caps.memo());
-                NoopModule
+                SensoryStub
             })
             .unwrap()
             .build(&caps)
@@ -1043,6 +1061,14 @@ mod tests {
 impl Module for SpeakGateModule {
     type Batch = ();
 
+    fn id() -> &'static str {
+        "speak-gate"
+    }
+
+    fn role_description() -> &'static str {
+        "Decides whether attention is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SpeakGateModule::next_batch(self).await
     }
@@ -1055,6 +1081,14 @@ impl Module for SpeakGateModule {
 #[async_trait(?Send)]
 impl Module for SpeakModule {
     type Batch = batch::NextBatch;
+
+    fn id() -> &'static str {
+        "speak"
+    }
+
+    fn role_description() -> &'static str {
+        "Emits user-visible utterances on SpeakRequest; streams output and records the completed utterance to its memo."
+    }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         SpeakModule::next_batch(self).await

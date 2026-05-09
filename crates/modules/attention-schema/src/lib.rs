@@ -84,6 +84,14 @@ impl AttentionSchemaModule {
 impl Module for AttentionSchemaModule {
     type Batch = AttentionSchemaBatch;
 
+    fn id() -> &'static str {
+        "attention-schema"
+    }
+
+    fn role_description() -> &'static str {
+        "Models the current attentional relation: what is attended, stability, competing targets, and what is claimable as awareness."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         AttentionSchemaModule::next_batch(self).await
     }

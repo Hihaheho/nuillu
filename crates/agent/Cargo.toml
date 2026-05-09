@@ -13,6 +13,7 @@ nuillu-types = { workspace = true }
 nuillu-blackboard = { workspace = true }
 nuillu-module = { workspace = true }
 
+chrono = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -21,7 +22,6 @@ tracing = "0.1"
 [dev-dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 lutum = { workspace = true }
 nuillu-memory = { workspace = true }
 nuillu-predict = { workspace = true }

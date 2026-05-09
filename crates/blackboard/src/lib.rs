@@ -23,7 +23,11 @@ mod command;
 mod memory;
 mod state;
 
-pub use allocation::{ActivationRatio, AllocationLimits, ModuleConfig, ResourceAllocation};
+pub use allocation::{
+    ActivationRatio, ActivationRatioFn, AllocationLimits, Bpm, ModuleConfig, ModulePolicy,
+    RateLimitRatio, ReplicasRatio, ResourceAllocation, linear_ratio_fn, rate_only_ratio_fn,
+    replicas_only_ratio_fn,
+};
 pub use attention_stream::{
     AgenticDeadlockMarker, AttentionStream, AttentionStreamEvent, AttentionStreamRecord,
     AttentionStreamSet,

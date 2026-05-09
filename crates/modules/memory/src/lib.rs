@@ -153,6 +153,14 @@ impl MemoryModule {
 impl Module for MemoryModule {
     type Batch = MemoryBatch;
 
+    fn id() -> &'static str {
+        "memory"
+    }
+
+    fn role_description() -> &'static str {
+        "Preserves useful information by inserting normalized, deduplicated memory entries from attended evidence and surprise-driven preservation requests."
+    }
+
     async fn next_batch(&mut self) -> Result<Self::Batch> {
         MemoryModule::next_batch(self).await
     }
@@ -178,6 +186,7 @@ mod tests {
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NoopAttentionRepository,
         NoopFileSearchProvider, NoopUtteranceSink, PortError, SystemClock,
     };
+    use nuillu_blackboard::{Bpm, linear_ratio_fn};
     use nuillu_module::{
         AttentionStreamUpdated, CapabilityProviders, LutumTiers, MemoryImportance,
         MemoryRequestMailbox, ModuleRegistry,
@@ -265,6 +274,14 @@ mod tests {
     impl Module for PublisherStub {
         type Batch = ();
 
+        fn id() -> &'static str {
+            "surprise"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
         async fn next_batch(&mut self) -> Result<Self::Batch> {
             std::future::pending().await
         }
@@ -310,9 +327,13 @@ mod tests {
         ])
     }
 
+    fn test_bpm() -> std::ops::RangeInclusive<Bpm> {
+        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)
+    }
+
     async fn build_memory(caps: &CapabilityProviders) -> nuillu_module::AllocatedModules {
         let modules = ModuleRegistry::new()
-            .register(builtin::memory(), 0..=1, |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.memory_request_inbox(),
@@ -335,12 +356,12 @@ mod tests {
         let publisher_cell: Rc<RefCell<Option<MemoryRequestMailbox>>> = Rc::new(RefCell::new(None));
         let publisher_clone = Rc::clone(&publisher_cell);
         let modules = ModuleRegistry::new()
-            .register(builtin::surprise(), 0..=1, move |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *publisher_clone.borrow_mut() = Some(caps.memory_request_mailbox());
                 PublisherStub
             })
             .unwrap()
-            .register(builtin::memory(), 0..=1, |caps| {
+            .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.attention_stream_updated_inbox(),
                     caps.memory_request_inbox(),

@@ -115,8 +115,11 @@ pub struct ReplicaCapRange {
 }
 
 impl ReplicaCapRange {
-    pub const V1_MAX: u8 = 3;
+    pub const V1_MAX: u8 = 2;
 
+    /// Construct a range of *additional* replicas above the always-on base of
+    /// 1. So `new(0, 0)` means "always exactly 1 active replica" and
+    /// `new(0, 2)` means "1 base + 0..=2 extras, i.e. 1..=3 total active".
     pub fn new(min: u8, max: u8) -> Result<Self, ReplicaCapRangeError> {
         if min > max {
             return Err(ReplicaCapRangeError::MinGreaterThanMax);
@@ -246,12 +249,17 @@ mod tests {
             Err(ReplicaCapRangeError::MinGreaterThanMax)
         );
         assert_eq!(
-            ReplicaCapRange::new(0, 4),
-            Err(ReplicaCapRangeError::AboveV1Max { max: 4 })
+            ReplicaCapRange::new(0, 3),
+            Err(ReplicaCapRangeError::AboveV1Max { max: 3 })
         );
         assert_eq!(
-            ReplicaCapRange::new(0, 3).unwrap(),
-            ReplicaCapRange { min: 0, max: 3 }
+            ReplicaCapRange::new(0, 2).unwrap(),
+            ReplicaCapRange { min: 0, max: 2 }
+        );
+        // Always-1-active is the typical default.
+        assert_eq!(
+            ReplicaCapRange::new(0, 0).unwrap(),
+            ReplicaCapRange { min: 0, max: 0 }
         );
     }
 }

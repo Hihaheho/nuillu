@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
+use std::time::Duration;
 
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -32,20 +34,6 @@ impl ActivationRatio {
     pub(crate) fn from_raw(raw: u16) -> Self {
         Self(raw.min(ACTIVATION_RATIO_SCALE))
     }
-
-    pub fn active_replicas(self, range: ReplicaCapRange) -> u8 {
-        if range.max == 0 {
-            return 0;
-        }
-        let requested =
-            ((u32::from(self.0) * u32::from(range.max)) + u32::from(ACTIVATION_RATIO_SCALE) - 1)
-                / u32::from(ACTIVATION_RATIO_SCALE);
-        (requested as u8).clamp(range.min, range.max)
-    }
-
-    fn active_without_caps(self) -> u8 {
-        u8::from(self.0 > 0)
-    }
 }
 
 impl Default for ActivationRatio {
@@ -66,32 +54,186 @@ impl<'de> Deserialize<'de> for ActivationRatio {
     }
 }
 
-/// Per-module knobs the attention controller writes to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModuleConfig {
-    #[serde(default)]
-    pub activation_ratio: ActivationRatio,
-    #[serde(default)]
-    pub guidance: String,
-    pub tier: ModelTier,
-}
+/// `0.0..=1.0` ratio of how many replicas to run, derived per-module from
+/// [`ActivationRatio`] via the registered [`ActivationRatioFn`].
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReplicasRatio(f64);
 
-impl Default for ModuleConfig {
-    fn default() -> Self {
-        Self {
-            activation_ratio: ActivationRatio::ONE,
-            guidance: String::new(),
-            tier: ModelTier::default(),
+impl ReplicasRatio {
+    pub const ZERO: Self = Self(0.0);
+    pub const ONE: Self = Self(1.0);
+
+    pub fn from_f64(value: f64) -> Self {
+        if !value.is_finite() {
+            return Self::ZERO;
         }
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
     }
 }
 
+/// `0.0..=1.0` ratio mapping into a per-module BPM range. Higher means more
+/// frequent `next_batch` invocations (shorter cooldown between batches).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct RateLimitRatio(f64);
+
+impl RateLimitRatio {
+    pub const ZERO: Self = Self(0.0);
+    pub const ONE: Self = Self(1.0);
+
+    pub fn from_f64(value: f64) -> Self {
+        if !value.is_finite() {
+            return Self::ZERO;
+        }
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
+
+/// Beats per minute — module-loop tempo for `next_batch` invocations.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct Bpm(f64);
+
+impl Bpm {
+    /// Floor for the BPM value. Anything `<=` this floor (including `0.0` and
+    /// non-finite inputs) is treated as the floor so that `cooldown()` never
+    /// produces a non-finite or out-of-range `Duration` and never panics.
+    /// 0.001 BPM corresponds to one beat per 1000 minutes (~16.7h), which is
+    /// effectively "never" but still a valid, finite cooldown.
+    pub const MIN: Self = Self(0.001);
+
+    pub fn from_f64(value: f64) -> Self {
+        if !value.is_finite() || value <= Self::MIN.0 {
+            return Self::MIN;
+        }
+        Self(value)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    pub fn cooldown(self) -> Duration {
+        // `Duration::from_secs_f64` panics on non-finite or out-of-range
+        // inputs; saturate just in case `self.0` is somehow below `MIN`.
+        let secs = 60.0 / self.0.max(Self::MIN.0);
+        if !secs.is_finite() {
+            return Duration::MAX;
+        }
+        Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
+    }
+}
+
+/// Pure mapping each module declares at registration: how a single
+/// controller-emitted activation knob splits into the replicas and rate-limit
+/// dimensions. Pure `fn` (not closure) keeps the registry copyable and
+/// stateless.
+pub type ActivationRatioFn = fn(ActivationRatio) -> (ReplicasRatio, RateLimitRatio);
+
+/// Both axes track the controller's activation linearly.
+pub fn linear_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRatio) {
+    let v = r.as_f64();
+    (ReplicasRatio::from_f64(v), RateLimitRatio::from_f64(v))
+}
+
+/// Activation scales replicas; rate limit is pinned at the maximum BPM.
+pub fn replicas_only_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRatio) {
+    (ReplicasRatio::from_f64(r.as_f64()), RateLimitRatio::ONE)
+}
+
+/// Activation scales rate limit; replicas pinned at the minimum (which is the
+/// always-on base under the new model).
+pub fn rate_only_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRatio) {
+    (ReplicasRatio::ZERO, RateLimitRatio::from_f64(r.as_f64()))
+}
+
+/// Boot-time per-module policy: the registry stores one of these per
+/// registered module and the blackboard reads them when deriving effective
+/// allocation state.
+#[derive(Debug, Clone)]
+pub struct ModulePolicy {
+    pub replicas_range: ReplicaCapRange,
+    pub rate_limit_range: RangeInclusive<Bpm>,
+    pub activation_ratio_fn: ActivationRatioFn,
+}
+
+impl ModulePolicy {
+    pub fn new(
+        replicas_range: ReplicaCapRange,
+        rate_limit_range: RangeInclusive<Bpm>,
+        activation_ratio_fn: ActivationRatioFn,
+    ) -> Self {
+        Self {
+            replicas_range,
+            rate_limit_range,
+            activation_ratio_fn,
+        }
+    }
+
+    pub fn cooldown_for(&self, ratio: RateLimitRatio) -> Duration {
+        let start = self.rate_limit_range.start().as_f64();
+        let end = self.rate_limit_range.end().as_f64();
+        // ratio = 1.0 picks the high end (max BPM, shortest cooldown);
+        // ratio = 0.0 picks the low end (min BPM, longest cooldown).
+        let bpm = start + (end - start) * ratio.as_f64();
+        Bpm::from_f64(bpm).cooldown()
+    }
+
+    /// Total active replica count for a given `replicas_ratio`. The stored
+    /// `replicas_range` represents *additional* replicas above the always-on
+    /// base of 1, so the total is always at least 1 — `register(0..=0)`
+    /// produces exactly 1 active replica.
+    pub fn active_replicas_for(&self, ratio: ReplicasRatio) -> u8 {
+        let max_extra = self.replicas_range.max;
+        let extra = if max_extra == 0 {
+            0
+        } else {
+            let requested = (ratio.as_f64() * f64::from(max_extra)).ceil() as i64;
+            requested.clamp(i64::from(self.replicas_range.min), i64::from(max_extra)) as u8
+        };
+        extra.saturating_add(1)
+    }
+
+    /// Total maximum active replica count this module can ever have under the
+    /// registered policy: the additional max plus the always-on base of 1.
+    pub fn max_active_replicas(&self) -> u8 {
+        self.replicas_range.max.saturating_add(1)
+    }
+}
+
+/// Per-module knobs the attention controller writes to. The activation knob is
+/// stored separately on [`ResourceAllocation`] (see `set_activation`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModuleConfig {
+    #[serde(default)]
+    pub guidance: String,
+    #[serde(default)]
+    pub tier: ModelTier,
+}
+
 /// Snapshot of the resource allocation across all modules.
+///
+/// Stores three layers:
+/// - `per_module`: controller-written guidance/tier per module.
+/// - `activation`: controller-written `ActivationRatio` per module (the single
+///   knob the controller emits per module).
+/// - `active_replicas` / `cooldown`: derived state populated by `derived()`
+///   when the blackboard knows the registered [`ModulePolicy`] per module.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceAllocation {
     per_module: HashMap<ModuleId, ModuleConfig>,
+    #[serde(default)]
+    activation: HashMap<ModuleId, ActivationRatio>,
     #[serde(skip)]
     active_replicas: HashMap<ModuleId, u8>,
+    #[serde(skip)]
+    cooldown: HashMap<ModuleId, Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,33 +269,63 @@ impl ResourceAllocation {
         self.per_module.get(id)
     }
 
+    pub fn activation_for(&self, id: &ModuleId) -> ActivationRatio {
+        self.activation.get(id).copied().unwrap_or_default()
+    }
+
+    pub fn cooldown_for(&self, id: &ModuleId) -> Option<Duration> {
+        self.cooldown.get(id).copied()
+    }
+
     pub fn active_replicas(&self, id: &ModuleId) -> u8 {
         self.active_replicas
             .get(id)
             .copied()
-            .unwrap_or_else(|| self.for_module(id).activation_ratio.active_without_caps())
+            // Modules without a registered policy fall back to the implicit
+            // always-on base of 1. This matches the new model's "every module
+            // always has at least 1 active replica" floor and keeps tests that
+            // construct ad-hoc allocations without registering policies
+            // working without each test having to install a policy table.
+            .unwrap_or(1)
     }
 
     pub fn is_replica_active(&self, owner: &ModuleInstanceId) -> bool {
         owner.replica.get() < self.active_replicas(&owner.module)
     }
 
+    /// Write guidance/tier for a module. Activation is set separately via
+    /// [`set_activation`].
     pub fn set(&mut self, id: ModuleId, config: ModuleConfig) {
-        self.active_replicas
-            .insert(id.clone(), config.activation_ratio.active_without_caps());
         self.per_module.insert(id, config);
+    }
+
+    /// Write the controller's activation knob for a module.
+    pub fn set_activation(&mut self, id: ModuleId, ratio: ActivationRatio) {
+        self.activation.insert(id, ratio);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ModuleId, &ModuleConfig)> {
         self.per_module.iter()
     }
 
-    pub fn clamped(mut self, caps: &HashMap<ModuleId, ReplicaCapRange>) -> Self {
-        for (id, range) in caps {
-            let cfg = self.for_module(id);
+    pub fn iter_activation(&self) -> impl Iterator<Item = (&ModuleId, ActivationRatio)> {
+        self.activation.iter().map(|(id, r)| (id, *r))
+    }
+
+    /// Derive `active_replicas` and `cooldown` from the controller's activation
+    /// knob and each registered module's [`ModulePolicy`]. Modules without a
+    /// registered policy are left at zero active replicas (the unregistered
+    /// fallback).
+    pub fn derived(mut self, policies: &HashMap<ModuleId, ModulePolicy>) -> Self {
+        self.active_replicas.clear();
+        self.cooldown.clear();
+        for (id, policy) in policies {
+            let ratio = self.activation_for(id);
+            let (replicas_ratio, rate_ratio) = (policy.activation_ratio_fn)(ratio);
             self.active_replicas
-                .insert(id.clone(), cfg.activation_ratio.active_replicas(*range));
-            self.per_module.insert(id.clone(), cfg);
+                .insert(id.clone(), policy.active_replicas_for(replicas_ratio));
+            self.cooldown
+                .insert(id.clone(), policy.cooldown_for(rate_ratio));
         }
         self
     }
@@ -175,11 +347,8 @@ impl ResourceAllocation {
             .filter_map(|id| {
                 let active = self.active_replicas(&id);
                 let cfg = self.for_module(&id);
-                (active > 0 && cfg.tier == ModelTier::Premium).then_some((
-                    id,
-                    cfg.activation_ratio,
-                    active,
-                ))
+                let ratio = self.activation_for(&id);
+                (active > 0 && cfg.tier == ModelTier::Premium).then_some((id, ratio, active))
             })
             .collect::<Vec<_>>();
         active_premium.sort_by(|(left_id, left_ratio, _), (right_id, right_ratio, _)| {
@@ -210,8 +379,8 @@ impl ResourceAllocation {
             .into_iter()
             .filter_map(|id| {
                 let active = self.active_replicas(&id);
-                let cfg = self.for_module(&id);
-                (active > 0).then_some((id, cfg.activation_ratio, active))
+                let ratio = self.activation_for(&id);
+                (active > 0).then_some((id, ratio, active))
             })
             .collect::<Vec<_>>();
         active_modules.sort_by(|(left_id, left_ratio, _), (right_id, right_ratio, _)| {
@@ -239,6 +408,7 @@ impl ResourceAllocation {
             .per_module
             .keys()
             .cloned()
+            .chain(self.activation.keys().cloned())
             .chain(self.active_replicas.keys().cloned())
             .collect::<HashSet<_>>()
             .into_iter()
@@ -256,15 +426,24 @@ mod tests {
         ModuleId::new(name).unwrap()
     }
 
+    fn linear_policy(min_extra: u8, max_extra: u8) -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(min_extra, max_extra).unwrap(),
+            Bpm::from_f64(1.0)..=Bpm::from_f64(60.0),
+            linear_ratio_fn,
+        )
+    }
+
     fn set(allocation: &mut ResourceAllocation, module: &str, ratio: f64, tier: ModelTier) {
+        let module = id(module);
         allocation.set(
-            id(module),
+            module.clone(),
             ModuleConfig {
-                activation_ratio: ActivationRatio::from_f64(ratio),
                 guidance: String::new(),
                 tier,
             },
         );
+        allocation.set_activation(module, ActivationRatio::from_f64(ratio));
     }
 
     #[test]
@@ -274,7 +453,12 @@ mod tests {
         set(&mut allocation, "alpha", 1.0, ModelTier::Premium);
         set(&mut allocation, "gamma", 0.8, ModelTier::Premium);
 
-        let limited = allocation.limited(AllocationLimits {
+        let mut policies = HashMap::new();
+        policies.insert(id("alpha"), linear_policy(0, 0));
+        policies.insert(id("beta"), linear_policy(0, 0));
+        policies.insert(id("gamma"), linear_policy(0, 0));
+
+        let limited = allocation.derived(&policies).limited(AllocationLimits {
             max_total_active_replicas: None,
             max_premium_replicas: Some(1),
         });
@@ -291,7 +475,12 @@ mod tests {
         set(&mut allocation, "alpha", 1.0, ModelTier::Cheap);
         set(&mut allocation, "beta", 0.7, ModelTier::Cheap);
 
-        let limited = allocation.limited(AllocationLimits {
+        let mut policies = HashMap::new();
+        policies.insert(id("alpha"), linear_policy(0, 0));
+        policies.insert(id("beta"), linear_policy(0, 0));
+        policies.insert(id("gamma"), linear_policy(0, 0));
+
+        let limited = allocation.derived(&policies).limited(AllocationLimits {
             max_total_active_replicas: Some(2),
             max_premium_replicas: None,
         });
@@ -310,5 +499,43 @@ mod tests {
                 max_premium_replicas: Some(1),
             }
         );
+    }
+
+    #[test]
+    fn module_policy_active_replicas_adds_implicit_base_replica() {
+        // additional 0..=0 — always exactly 1 total active.
+        let none_extra = linear_policy(0, 0);
+        assert_eq!(none_extra.active_replicas_for(ReplicasRatio::ZERO), 1);
+        assert_eq!(none_extra.active_replicas_for(ReplicasRatio::ONE), 1);
+
+        // additional 0..=1 — base 1 plus 0..=1 extras = 1 to 2 total active.
+        let one_extra = linear_policy(0, 1);
+        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ZERO), 1);
+        // Half of 1 rounds up to 1 extra → 2 total.
+        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::from_f64(0.5)), 2);
+        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ONE), 2);
+    }
+
+    #[test]
+    fn bpm_cooldown_is_inverse_of_rate() {
+        // 60 BPM = 1 second per beat.
+        assert_eq!(Bpm::from_f64(60.0).cooldown(), Duration::from_secs(1));
+        // 120 BPM = 0.5 seconds per beat.
+        assert_eq!(Bpm::from_f64(120.0).cooldown(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn bpm_handles_zero_negative_and_nan_without_panicking() {
+        let from_zero = Bpm::from_f64(0.0);
+        let from_negative = Bpm::from_f64(-1.0);
+        let from_nan = Bpm::from_f64(f64::NAN);
+        let from_inf = Bpm::from_f64(f64::INFINITY);
+        assert_eq!(from_zero, Bpm::MIN);
+        assert_eq!(from_negative, Bpm::MIN);
+        assert_eq!(from_nan, Bpm::MIN);
+        assert!(from_inf.as_f64().is_finite());
+        // Should be a finite, non-zero Duration without panicking.
+        assert!(from_zero.cooldown() > Duration::ZERO);
+        assert!(from_zero.cooldown() < Duration::MAX);
     }
 }

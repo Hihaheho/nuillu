@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange};
+use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, MemoryMetaPatch,
+    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, MemoryMetaPatch, ModulePolicy,
     ModuleRunStatus, ResourceAllocation, UtteranceProgress,
 };
 
@@ -46,8 +46,8 @@ pub enum BlackboardCommand {
         index: MemoryIndex,
     },
     SetAllocation(ResourceAllocation),
-    SetReplicaCaps {
-        caps: Vec<(ModuleId, ReplicaCapRange)>,
+    SetModulePolicies {
+        policies: Vec<(ModuleId, ModulePolicy)>,
     },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),

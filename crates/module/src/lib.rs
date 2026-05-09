@@ -58,9 +58,8 @@ pub use memory_caps::{
 };
 pub use ports::Embedder;
 pub use rate_limit::{
-    ActivitySnapshot, CapabilityKind, ModuleBatchThrottlePolicy, ModuleBatchThrottlePolicyError,
-    RateLimitConfig, RateLimitOutcome, RateLimitPolicy, RateLimitPolicyError, RateLimiter,
-    RuntimePolicy, TopicKind,
+    ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
+    RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
 pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleStatusReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};

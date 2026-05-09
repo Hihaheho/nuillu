@@ -360,7 +360,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use nuillu_blackboard::{ActivationRatio, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{ActivationRatio, BlackboardCommand, ModuleConfig, ResourceAllocation};
     use nuillu_types::{ReplicaCapRange, builtin};
     use tokio::time::Instant;
 
@@ -451,25 +451,36 @@ mod tests {
     #[tokio::test]
     async fn role_topics_load_balance_across_active_replicas() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(
-            builtin::query_vector(),
-            ModuleConfig {
-                activation_ratio: ActivationRatio::ONE,
-                ..Default::default()
-            },
-        );
-        alloc.set(
-            builtin::query_agentic(),
-            ModuleConfig {
-                activation_ratio: ActivationRatio::ONE,
-                ..Default::default()
-            },
-        );
-        let alloc = alloc.clamped(&std::collections::HashMap::from([
-            (builtin::query_vector(), ReplicaCapRange { min: 0, max: 2 }),
-            (builtin::query_agentic(), ReplicaCapRange { min: 0, max: 1 }),
-        ]));
-        let caps = test_caps(Blackboard::with_allocation(alloc));
+        alloc.set(builtin::query_vector(), ModuleConfig::default());
+        alloc.set_activation(builtin::query_vector(), ActivationRatio::ONE);
+        alloc.set(builtin::query_agentic(), ModuleConfig::default());
+        alloc.set_activation(builtin::query_agentic(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(alloc);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![
+                    (
+                        builtin::query_vector(),
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 1).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
+                    ),
+                    (
+                        builtin::query_agentic(),
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 0).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
+                    ),
+                ],
+            })
+            .await;
+        let caps = test_caps(blackboard);
         let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
         let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
         let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();
@@ -496,18 +507,25 @@ mod tests {
     #[tokio::test]
     async fn role_topics_do_not_route_to_disabled_replicas() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(
-            builtin::query_vector(),
-            ModuleConfig {
-                activation_ratio: ActivationRatio::from_f64(0.5),
-                ..Default::default()
-            },
-        );
-        let alloc = alloc.clamped(&std::collections::HashMap::from([(
-            builtin::query_vector(),
-            ReplicaCapRange { min: 0, max: 2 },
-        )]));
-        let caps = test_caps(Blackboard::with_allocation(alloc));
+        alloc.set(builtin::query_vector(), ModuleConfig::default());
+        // additional capacity 1, but no activation → only the base replica is
+        // active, so replica 1 stays out of routing.
+        alloc.set_activation(builtin::query_vector(), ActivationRatio::ZERO);
+        let blackboard = Blackboard::with_allocation(alloc);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(
+                    builtin::query_vector(),
+                    nuillu_blackboard::ModulePolicy::new(
+                        ReplicaCapRange::new(0, 1).unwrap(),
+                        nuillu_blackboard::Bpm::from_f64(60.0)
+                            ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                        nuillu_blackboard::linear_ratio_fn,
+                    ),
+                )],
+            })
+            .await;
+        let caps = test_caps(blackboard);
         let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
         let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
         let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();

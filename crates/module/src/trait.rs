@@ -17,6 +17,17 @@ use async_trait::async_trait;
 pub trait Module {
     type Batch: 'static;
 
+    /// Stable kebab-case identifier for this module type.
+    fn id() -> &'static str
+    where
+        Self: Sized;
+
+    /// One-sentence description of this module's role, used in system prompts
+    /// of peer modules so each module knows what its siblings do.
+    fn role_description() -> &'static str
+    where
+        Self: Sized;
+
     async fn next_batch(&mut self) -> Result<Self::Batch>;
     async fn activate(&mut self, batch: &Self::Batch) -> Result<()>;
 }
