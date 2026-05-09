@@ -2062,6 +2062,17 @@ struct RecordingUtteranceSink {
     complete: Arc<Mutex<Vec<RecordedUtterance>>>,
 }
 
+fn normalize_eval_utterance_text(text: String) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('"')
+        && trimmed.ends_with('"')
+        && let Ok(unquoted) = serde_json::from_str::<String>(trimmed)
+    {
+        return unquoted;
+    }
+    text
+}
+
 impl std::fmt::Debug for RecordingUtteranceSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingUtteranceSink")
@@ -2108,7 +2119,7 @@ impl UtteranceSink for RecordingUtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
         let recorded = RecordedUtterance {
             sender: utterance.sender.to_string(),
-            text: utterance.text,
+            text: normalize_eval_utterance_text(utterance.text),
             emitted_at: utterance.emitted_at.to_rfc3339(),
         };
         self.complete
@@ -2417,6 +2428,30 @@ prompt = "Second?"
         let by_id = filter_case_paths(vec![first, second.clone()], &["special-memory".to_string()])
             .unwrap();
         assert_eq!(by_id, vec![second]);
+    }
+
+    #[test]
+    fn eval_utterance_output_strips_balanced_outer_quotes() {
+        assert_eq!(
+            normalize_eval_utterance_text("\"short signal\"".to_string()),
+            "short signal"
+        );
+        assert_eq!(
+            normalize_eval_utterance_text("  \"short signal\"  ".to_string()),
+            "short signal"
+        );
+        assert_eq!(
+            normalize_eval_utterance_text("short signal".to_string()),
+            "short signal"
+        );
+        assert_eq!(
+            normalize_eval_utterance_text("\"an apple\" is \"red\"".to_string()),
+            "\"an apple\" is \"red\""
+        );
+        assert_eq!(
+            normalize_eval_utterance_text("\"an \\\"apple\\\"\"".to_string()),
+            "an \"apple\""
+        );
     }
 
     #[tokio::test]

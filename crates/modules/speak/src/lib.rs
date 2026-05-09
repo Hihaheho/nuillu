@@ -51,7 +51,6 @@ Speak is not currently streaming. Use a strict readiness gate before setting sho
 
 When a missing fact is needed for speech, call an evidence tool before waiting:
 - query_memory(question) for stable self/body/peer/world facts.
-- query_self_model(question) for current first-person model facts.
 - query_sensory_detail(question) for details from current sensory observations.
 If a tool result contains the needed fact but attention does not, return should_speak=false with an
 attention-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
@@ -63,6 +62,9 @@ When should_speak=true, provide a concrete generation_hint naming the attended f
 intended addressee/frame, and any constraints on style or scope. If you cannot write such a hint,
 should_speak must be false. Return only raw JSON for the structured decision; do not wrap it in
 Markdown or code fences."#;
+
+const READINESS_GATE_SELF_MODEL_TOOL_PROMPT: &str =
+    "- query_self_model(question) for current first-person model facts.\n";
 
 const INTERRUPTION_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Speak is currently streaming a user-visible utterance. Decide whether the current stream must be
@@ -198,6 +200,34 @@ fn gate_prompt_for<'a>(
     }
 }
 
+fn has_registered_module(modules: &[(ModuleId, &'static str)], module: &ModuleId) -> bool {
+    modules.iter().any(|(id, _)| id == module)
+}
+
+fn readiness_gate_prompt(self_model_available: bool) -> String {
+    if self_model_available {
+        READINESS_GATE_PROMPT.replace(
+            "- query_sensory_detail(question) for details from current sensory observations.",
+            &format!(
+                "{READINESS_GATE_SELF_MODEL_TOOL_PROMPT}- query_sensory_detail(question) for details from current sensory observations."
+            ),
+        )
+    } else {
+        READINESS_GATE_PROMPT.to_owned()
+    }
+}
+
+fn speak_gate_tool_selectors(self_model_available: bool) -> Vec<SpeakGateToolsSelector> {
+    let mut tools = vec![
+        SpeakGateToolsSelector::QueryMemory,
+        SpeakGateToolsSelector::QuerySensoryDetail,
+    ];
+    if self_model_available {
+        tools.push(SpeakGateToolsSelector::QuerySelfModel);
+    }
+    tools
+}
+
 fn attention_history_input(record: &AttentionLogRecord) -> serde_json::Value {
     serde_json::json!({
         "new_attention_stream_item": record,
@@ -276,7 +306,9 @@ impl SpeakGateModule {
 
     fn readiness_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.readiness_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(READINESS_GATE_PROMPT, cx.modules(), &self.owner)
+            let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
+            let base = readiness_gate_prompt(self_model_available);
+            nuillu_module::format_system_prompt(&base, cx.modules(), &self.owner)
         })
     }
 
@@ -288,6 +320,7 @@ impl SpeakGateModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+        let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_attention = self.attention.unread_events().await;
         push_attention_history(&mut self.session, &unread_attention);
         let attention_snapshot = self.attention.snapshot().await;
@@ -328,7 +361,7 @@ impl SpeakGateModule {
         );
 
         let lutum = self.llm.lutum().await;
-        let decision = self.run_decision_turn(&lutum).await?;
+        let decision = self.run_decision_turn(&lutum, self_model_available).await?;
 
         self.memo
             .write(serde_json::to_string(&decision).context("serialize speak-gate decision memo")?)
@@ -349,21 +382,22 @@ impl SpeakGateModule {
         Ok(())
     }
 
-    async fn run_decision_turn(&mut self, lutum: &Lutum) -> Result<SpeakGateDecision> {
+    async fn run_decision_turn(
+        &mut self,
+        lutum: &Lutum,
+        self_model_available: bool,
+    ) -> Result<SpeakGateDecision> {
         let mut memory_requests = HashSet::<String>::new();
         let mut self_model_requests = HashSet::<String>::new();
         let mut sensory_detail_requests = HashSet::<String>::new();
+        let available_tools = speak_gate_tool_selectors(self_model_available);
 
         for _ in 0..MAX_GATE_TOOL_ROUNDS {
             let outcome = self
                 .session
                 .structured_turn::<SpeakGateDecision>(lutum)
                 .tools::<SpeakGateTools>()
-                .available_tools([
-                    SpeakGateToolsSelector::QueryMemory,
-                    SpeakGateToolsSelector::QuerySelfModel,
-                    SpeakGateToolsSelector::QuerySensoryDetail,
-                ])
+                .available_tools(available_tools.clone())
                 .collect()
                 .await
                 .context("speak-gate decision turn failed")?;
@@ -964,6 +998,25 @@ mod tests {
                 None,
             )
             .contains("not currently streaming")
+        );
+    }
+
+    #[test]
+    fn self_model_tool_is_prompted_and_available_only_when_registered() {
+        let without_self_model = readiness_gate_prompt(false);
+        assert!(!without_self_model.contains("query_self_model"));
+        assert!(
+            !speak_gate_tool_selectors(false)
+                .iter()
+                .any(|tool| matches!(tool, &SpeakGateToolsSelector::QuerySelfModel))
+        );
+
+        let with_self_model = readiness_gate_prompt(true);
+        assert!(with_self_model.contains("query_self_model"));
+        assert!(
+            speak_gate_tool_selectors(true)
+                .iter()
+                .any(|tool| matches!(tool, &SpeakGateToolsSelector::QuerySelfModel))
         );
     }
 
