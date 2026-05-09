@@ -415,7 +415,7 @@ impl Module for SensoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Pre-attentive filter: receives external observations, scores their salience, and writes selected normalized observations to its memo."
+        "Pre-attentive filter for the agent's senses: receives sights, sounds, and other external observations from the world, scores their salience, and writes selected normalized observations to its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

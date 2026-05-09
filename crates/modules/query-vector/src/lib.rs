@@ -241,7 +241,7 @@ impl Module for QueryVectorModule {
     }
 
     fn role_description() -> &'static str {
-        "Vector-memory/RAG retrieval: surfaces stored memory content into its memo on QueryRequest or cognition-log updates; never synthesizes answers."
+        "Recalls stored memories by semantic similarity: surfaces relevant past memory content into its memo on QueryRequest or cognition-log updates; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

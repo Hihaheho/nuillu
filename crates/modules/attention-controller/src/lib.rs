@@ -24,8 +24,10 @@ needed by other modules, but do not encode that memo text as JSON, YAML, a code 
 schema.
 
 Speech output is driven by a typed SpeakRequest from speak-gate to speak, not by allocation
-guidance. Do not use speak guidance as a speech protocol. Keep speak and speak-gate active because
-idle speak only waits on its inbox and does not call the LLM.
+guidance. Do not use speak guidance as a speech protocol. Speech is the agent's primary outward
+action in its world, not a chat-style response gated on a user request — keep speak and speak-gate
+fully active so the agent can address peers, answer questions directed at it, and express
+in-world intent. Suppressing speak/speak-gate is suppressing the agent's voice.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 tokio::task_local! {

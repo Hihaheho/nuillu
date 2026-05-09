@@ -1083,7 +1083,7 @@ impl Module for SpeakGateModule {
     }
 
     fn role_description() -> &'static str {
-        "Decides whether the cognition log is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
+        "Decides when the agent should speak based on the cognition log. Speech is warranted when a peer addresses the agent, when the agent has formed an intent worth expressing, or when the situation calls for an in-world utterance — speech is not gated on a user request. Sends SpeakRequest to speak when ready; otherwise records waiting/evidence-gap notes in its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1108,7 +1108,7 @@ impl Module for SpeakModule {
     }
 
     fn role_description() -> &'static str {
-        "Emits user-visible utterances on SpeakRequest; streams output and records the completed utterance to its memo."
+        "Emits the agent's spoken utterances into its world — speech is the agent's primary outward action, addressed to peers, animals, or people present in the scene, not to a user or operator. Driven by typed SpeakRequest from speak-gate; streams output and records the completed utterance to its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

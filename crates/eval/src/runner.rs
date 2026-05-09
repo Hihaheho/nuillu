@@ -1163,7 +1163,7 @@ fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
     // cooldown, so this range expresses target batch-start tempo.
     // Time is injected via the Clock trait, so tests with a mock Clock can
     // skip cooldowns entirely.
-    Bpm::range(3.0, 18.0)
+    Bpm::range(3.0, 9.0)
 }
 
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {

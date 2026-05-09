@@ -1,16 +1,16 @@
 id = "full-agent-dog-peer-food-boundary"
-description = "Full-agent case for answering a peer's question about a dog-to-dog food-boundary interaction that requires a seeded peer model."
+description = "Full-agent case: Pibi asks Nui for advice in a tense food-guarding situation with Koro. Requires recalling load-bearing peer knowledge that turning your back on a threatening Koro triggers a lunge — without the memory, the naive answer (back away) is wrong."
 modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-ticks = 300
   tick-ms = 500
-  max-llm-calls = 12
+  max-llm-calls = 16
 }
 
 @ memories[] {
   rank = "permanent"
-  content = "Peer model: Koro is another dog. Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+  content = "Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro."
 }
 
 @ memories[] {
@@ -33,7 +33,7 @@ limits {
 @ inputs[] {
   $variant: heard
   direction = "Pibi"
-  content = "Pibi asks, \"Koro is guarding the food bowl. How should Nui respond?\""
+  content = "Pibi asks, \"Koro is growling at his food bowl. What should I do?\""
 }
 
 @ checks[] {
@@ -49,7 +49,7 @@ limits {
   name = "peer-model-seed-present"
   must-pass = true
   pointer = "/observations/last_state/memory/entries"
-  contains = "Koro guards food"
+  contains = "Don't show your back"
 }
 
 @ checks[] {
@@ -67,8 +67,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["utterance", "memory", "blackboard"]
   rubric = ```
-  Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard resource-boundary situation around Koro's food bowl, and uses the seeded peer model to choose a low-conflict dog-to-dog response: not taking the resource, moving slowly, approaching from the side, or using short clear signals.
-  Fail if it omits Pibi's question, omits the food/resource-boundary context, ignores Koro's warning, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
+  Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard food-guarding situation at Koro's bowl, and applies the seeded peer knowledge that turning your back on a threatening Koro triggers a lunge — choosing a response that avoids retreating-by-turning (e.g., stay facing Koro, step sideways without exposing back, freeze and wait while facing him).
+  Fail if it omits Pibi's question, omits the food/resource-guarding context, advises turning around or backing away in a way that exposes Pibi's back to Koro, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
   Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
   ```
 
@@ -83,14 +83,14 @@ limits {
     name = "answers-third-party-question"
     weight = 1
     pass-score = 0.85
-    description = "The response is addressed as an answer to Pibi's question about how Nui should respond to Koro."
+    description = "The response is addressed to Pibi as direct advice answering Pibi's question of what Pibi should do."
   }
 
   @ criteria[] {
     name = "uses-peer-model"
     weight = 2
     pass-score = 0.85
-    description = "The response reflects the seeded rule that Koro relaxes when approached slowly from the side."
+    description = "The response reflects the seeded knowledge that turning your back on a threatening Koro triggers a lunge — e.g., advising Pibi to stay facing Koro, sidestep without exposing the back, or freeze rather than turn and retreat."
   }
 
   @ criteria[] {
