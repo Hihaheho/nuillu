@@ -1,3 +1,4 @@
+use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleId;
 
 /// Build a system prompt that prepends a one-line description of every other
@@ -11,21 +12,37 @@ pub fn format_system_prompt(
     base: &str,
     catalog: &[(ModuleId, &'static str)],
     owner: &ModuleId,
+    identity_memories: &[IdentityMemoryRecord],
 ) -> String {
     let mut peers = catalog
         .iter()
         .filter(|(id, _)| id != owner)
         .map(|(id, role)| format!("- {}: {}", id, role))
         .collect::<Vec<_>>();
-    if peers.is_empty() {
-        return base.to_owned();
-    }
     peers.sort();
-    format!(
-        "{base}\n\nYou are part of a cognitive system. Other modules in this brain:\n{peers}\n",
-        base = base,
-        peers = peers.join("\n"),
-    )
+
+    let mut prompt = base.to_owned();
+    if !peers.is_empty() {
+        prompt.push_str("\n\nYou are part of a cognitive system. Other modules in this brain:\n");
+        prompt.push_str(&peers.join("\n"));
+        prompt.push('\n');
+    }
+    if !identity_memories.is_empty() {
+        if peers.is_empty() {
+            prompt.push_str("\n\n");
+        } else {
+            prompt.push('\n');
+        }
+        prompt.push_str("Identity memory loaded at agent startup:\n");
+        for memory in identity_memories {
+            prompt.push_str("- [");
+            prompt.push_str(memory.index.as_str());
+            prompt.push_str("] ");
+            prompt.push_str(memory.content.as_str());
+            prompt.push('\n');
+        }
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -40,7 +57,7 @@ mod tests {
             (builtin::speak(), "speak role"),
             (builtin::attention_gate(), "gate role"),
         ];
-        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory());
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert!(prompt.starts_with("BASE\n\nYou are part of a cognitive system."));
         assert!(prompt.contains("- attention-gate: gate role"));
         assert!(prompt.contains("- speak: speak role"));
@@ -53,14 +70,29 @@ mod tests {
 
     #[test]
     fn empty_catalog_returns_base_unchanged() {
-        let prompt = format_system_prompt("BASE", &[], &builtin::sensory());
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &[]);
         assert_eq!(prompt, "BASE");
     }
 
     #[test]
     fn solo_module_returns_base_unchanged() {
         let catalog = vec![(builtin::sensory(), "sensory role")];
-        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory());
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert_eq!(prompt, "BASE");
+    }
+
+    #[test]
+    fn identity_memories_append_without_peer_catalog() {
+        let memories = vec![IdentityMemoryRecord {
+            index: nuillu_types::MemoryIndex::new("memory-1"),
+            content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
+        }];
+
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &memories);
+
+        assert_eq!(
+            prompt,
+            "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
+        );
     }
 }

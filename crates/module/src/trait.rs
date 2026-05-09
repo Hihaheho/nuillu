@@ -2,6 +2,7 @@ use std::any::Any;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleId;
 
 /// Read-only context passed to `Module::activate` carrying agent-wide
@@ -11,16 +12,29 @@ use nuillu_types::ModuleId;
 /// module catalog used to build peer-aware system prompts.
 pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
+    identity_memories: &'a [IdentityMemoryRecord],
 }
 
 impl<'a> ActivateCx<'a> {
-    pub fn new(modules: &'a [(ModuleId, &'static str)]) -> Self {
-        Self { modules }
+    pub fn new(
+        modules: &'a [(ModuleId, &'static str)],
+        identity_memories: &'a [IdentityMemoryRecord],
+    ) -> Self {
+        Self {
+            modules,
+            identity_memories,
+        }
     }
 
     /// All modules registered in the agent: `(id, role_description)`.
     pub fn modules(&self) -> &[(ModuleId, &'static str)] {
         self.modules
+    }
+
+    /// Boot-time identity memory snapshot loaded from the primary memory
+    /// store before modules are activated.
+    pub fn identity_memories(&self) -> &[IdentityMemoryRecord] {
+        self.identity_memories
     }
 }
 

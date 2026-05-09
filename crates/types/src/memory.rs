@@ -7,6 +7,7 @@ pub enum MemoryRank {
     MidTerm,
     LongTerm,
     Permanent,
+    Identity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

@@ -1,8 +1,17 @@
 use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, MemoryRank};
+use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 use serde::{Deserialize, Serialize};
+
+/// Startup-loaded identity memory content. This is a boot snapshot of
+/// durable identity-ranked memory records, separate from the live metadata
+/// mirror used for ordinary memory search/access bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityMemoryRecord {
+    pub index: MemoryIndex,
+    pub content: MemoryContent,
+}
 
 /// Mutable metadata about a memory entry. Durable content and adapter-local
 /// search state live in the external `MemoryStore`, not here.

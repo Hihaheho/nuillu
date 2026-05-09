@@ -391,6 +391,15 @@ mod tests {
                 .cloned())
         }
 
+        async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(self
+                .search_hits
+                .iter()
+                .filter(|record| record.rank == rank)
+                .cloned()
+                .collect())
+        }
+
         async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
             Ok(self.search_hits.clone())
         }

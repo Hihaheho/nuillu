@@ -308,13 +308,23 @@ impl SpeakGateModule {
         self.readiness_prompt.get_or_init(|| {
             let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
             let base = readiness_gate_prompt(self_model_available);
-            nuillu_module::format_system_prompt(&base, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                &base,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 
     fn interruption_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.interruption_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(INTERRUPTION_GATE_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                INTERRUPTION_GATE_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 
@@ -620,7 +630,12 @@ impl SpeakModule {
 
     fn generation_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.generation_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(GENERATION_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                GENERATION_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 

@@ -74,7 +74,12 @@ impl MemoryModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                SYSTEM_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 
@@ -209,7 +214,7 @@ mod tests {
         AttentionStreamUpdated, CapabilityProviders, LutumTiers, MemoryImportance,
         MemoryRequestMailbox, ModuleRegistry,
     };
-    use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::{MemoryIndex, MemoryRank, ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::sync::Mutex;
     use tokio::task::LocalSet;
 
@@ -277,6 +282,9 @@ mod tests {
         }
         async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
             Ok(None)
+        }
+        async fn list_by_rank(&self, _rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
         }
         async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
             Ok(Vec::new())

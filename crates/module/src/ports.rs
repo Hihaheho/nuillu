@@ -59,6 +59,7 @@ pub trait MemoryStore {
         sources: &[MemoryIndex],
     ) -> Result<(), PortError>;
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError>;
+    async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError>;
     async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError>;
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
 }
@@ -203,6 +204,10 @@ impl MemoryStore for NoopMemoryStore {
 
     async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
         Ok(None)
+    }
+
+    async fn list_by_rank(&self, _rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+        Ok(Vec::new())
     }
 
     async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {

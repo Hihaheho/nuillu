@@ -665,6 +665,29 @@ impl MemoryStore for LibsqlMemoryStore {
         }
     }
 
+    async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT memory_index, content, rank
+            FROM {memories}
+            WHERE rank = ?1
+              AND deleted_at_ms IS NULL
+            ORDER BY memory_index ASC
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [rank_to_i64(rank)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            out.push(Self::row_to_record(&row)?);
+        }
+        Ok(out)
+    }
+
     async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
         if q.limit == 0 {
             return Ok(Vec::new());
@@ -773,6 +796,7 @@ fn rank_to_i64(rank: MemoryRank) -> i64 {
         MemoryRank::MidTerm => 1,
         MemoryRank::LongTerm => 2,
         MemoryRank::Permanent => 3,
+        MemoryRank::Identity => 4,
     }
 }
 
@@ -782,6 +806,7 @@ fn rank_from_i64(value: i64) -> Result<MemoryRank, PortError> {
         1 => Ok(MemoryRank::MidTerm),
         2 => Ok(MemoryRank::LongTerm),
         3 => Ok(MemoryRank::Permanent),
+        4 => Ok(MemoryRank::Identity),
         _ => Err(PortError::InvalidData(format!(
             "invalid memory rank: {value}"
         ))),
@@ -912,6 +937,52 @@ mod tests {
         assert_eq!(got.index, id);
         assert_eq!(got.content.as_str(), "alpha beta");
         assert_eq!(got.rank, MemoryRank::LongTerm);
+    }
+
+    #[tokio::test]
+    async fn identity_rank_mapping_uses_next_stable_value() {
+        assert_eq!(rank_to_i64(MemoryRank::Identity), 4);
+        assert_eq!(rank_from_i64(4).unwrap(), MemoryRank::Identity);
+    }
+
+    #[tokio::test]
+    async fn list_by_rank_returns_live_identity_records_in_index_order() {
+        let store = store().await;
+        store
+            .put(IndexedMemory {
+                index: MemoryIndex::new("identity-b"),
+                content: MemoryContent::new("second"),
+                rank: MemoryRank::Identity,
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                index: MemoryIndex::new("identity-a"),
+                content: MemoryContent::new("first"),
+                rank: MemoryRank::Identity,
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                index: MemoryIndex::new("ordinary"),
+                content: MemoryContent::new("ordinary"),
+                rank: MemoryRank::Permanent,
+            })
+            .await
+            .unwrap();
+        store.delete(&MemoryIndex::new("identity-b")).await.unwrap();
+
+        let records = store.list_by_rank(MemoryRank::Identity).await.unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.index.as_str(), record.content.as_str(), record.rank))
+                .collect::<Vec<_>>(),
+            vec![("identity-a", "first", MemoryRank::Identity)]
+        );
     }
 
     #[tokio::test]

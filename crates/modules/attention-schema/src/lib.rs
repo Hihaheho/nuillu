@@ -54,7 +54,12 @@ impl AttentionSchemaModule {
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.model_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(MODEL_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                MODEL_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 

@@ -693,7 +693,7 @@ Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum
 
 Common eval behavior:
 
-1. memory seeds are inserted through `MemoryWriter` using `{ content, rank, decay-secs }` so libSQL content and blackboard memory metadata stay aligned,
+1. memory seeds are inserted through `MemoryWriter` using `{ content, rank, decay-secs }` so libSQL content and blackboard memory metadata stay aligned; `identity` rank seeds are loaded into the boot identity-memory snapshot when the registry builds modules,
 2. the eval runner uses libSQL as the primary memory store, local `PotionBase8MEmbedder` for embeddings, and `lutum-openai` in Chat Completions mode for Ollama,
 3. the eval binary installs a global tracing subscriber with `lutum_trace::layer()` before running cases, matching the Lutum trace setup contract; spawned module tasks inherit that global dispatcher,
 4. each case writes `artifact.json`, `report.json`, `events.json`, and `trace.json` under `.tmp/eval/<run-id>/<case-id>/`; failed, invalid, runtime-error, and panic cases also write `raw-trace.json` for provider/protocol-level debugging, and the suite writes both `suite-report.json` and append-only `events.jsonl`,

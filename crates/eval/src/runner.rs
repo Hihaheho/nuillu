@@ -1929,6 +1929,7 @@ fn memory_rank_name(rank: MemoryRank) -> &'static str {
         MemoryRank::MidTerm => "mid-term",
         MemoryRank::LongTerm => "long-term",
         MemoryRank::Permanent => "permanent",
+        MemoryRank::Identity => "identity",
     }
 }
 

@@ -6,8 +6,6 @@ members = [
     "crates/module",
     "crates/agent",
     "crates/adapters/in-memory",
-    "crates/adapters/lancedb",
-    "crates/adapters/lancedb-core",
     "crates/adapters/libsql",
     "crates/adapters/model2vec",
     "crates/modules/*",
@@ -36,11 +34,8 @@ lutum-openai = { git = "https://github.com/Hihaheho/lutum" }
 lutum-trace = { git = "https://github.com/Hihaheho/lutum" }
 
 async-trait = "0.1"
-arrow-array = "=57.2.0"
-arrow-schema = "=57.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
-lancedb = "0.27.2"
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 model2vec-rs = { version = "0.1.4", default-features = false, features = ["onig"] }
 schemars = { version = "1", features = ["chrono04"] }

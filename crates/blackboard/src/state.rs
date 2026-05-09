@@ -7,8 +7,8 @@ use tokio::sync::{RwLock, oneshot};
 
 use crate::{
     AgenticDeadlockMarker, AllocationLimits, AttentionLogRecord, AttentionStream,
-    AttentionStreamRecord, AttentionStreamSet, BlackboardCommand, MemoryMetadata, ModulePolicy,
-    ResourceAllocation,
+    AttentionStreamRecord, AttentionStreamSet, BlackboardCommand, IdentityMemoryRecord,
+    MemoryMetadata, ModulePolicy, ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -44,6 +44,7 @@ pub struct BlackboardInner {
     attention_next_index: u64,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
+    identity_memories: Vec<IdentityMemoryRecord>,
     base_allocation: ResourceAllocation,
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
@@ -291,6 +292,7 @@ impl Default for BlackboardInner {
             attention_next_index: 0,
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
+            identity_memories: Vec::new(),
             base_allocation: ResourceAllocation::default(),
             allocation: ResourceAllocation::default(),
             allocation_proposals: HashMap::new(),
@@ -546,6 +548,10 @@ impl BlackboardInner {
         &self.memory_metadata
     }
 
+    pub fn identity_memories(&self) -> &[IdentityMemoryRecord] {
+        &self.identity_memories
+    }
+
     pub fn allocation(&self) -> &ResourceAllocation {
         &self.allocation
     }
@@ -624,6 +630,9 @@ impl BlackboardInner {
             }
             BlackboardCommand::RemoveMemoryMetadata { index } => {
                 self.memory_metadata.remove(&index);
+            }
+            BlackboardCommand::SetIdentityMemories(records) => {
+                self.identity_memories = records;
             }
             BlackboardCommand::SetAllocation(alloc) => {
                 self.base_allocation = alloc;
@@ -833,7 +842,9 @@ mod tests {
     use super::*;
 
     use chrono::TimeZone;
-    use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin};
+    use nuillu_types::{
+        MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
+    };
 
     fn memo_time(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).unwrap()
@@ -850,6 +861,27 @@ mod tests {
         })
         .await;
         assert_eq!(bb.memo(&id).await.as_deref(), Some("noted"));
+    }
+
+    #[tokio::test]
+    async fn identity_memories_replace_boot_snapshot() {
+        let bb = Blackboard::new();
+        let first = IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-1"),
+            content: MemoryContent::new("first identity"),
+        };
+        let second = IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-2"),
+            content: MemoryContent::new("second identity"),
+        };
+
+        bb.apply(BlackboardCommand::SetIdentityMemories(vec![first.clone()]))
+            .await;
+        bb.apply(BlackboardCommand::SetIdentityMemories(vec![second.clone()]))
+            .await;
+
+        let records = bb.read(|bb| bb.identity_memories().to_vec()).await;
+        assert_eq!(records, vec![second]);
     }
 
     #[tokio::test]

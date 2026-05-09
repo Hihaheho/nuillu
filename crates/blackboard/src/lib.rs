@@ -5,6 +5,7 @@
 //! - scheduler-owned module run status
 //! - current utterance stream progress
 //! - memory metadata mirror (content lives in the external `MemoryStore`)
+//! - boot-time identity memory snapshot
 //! - the attention controller's `ResourceAllocation` snapshot
 //!
 //! The blackboard mutates only through `apply(BlackboardCommand)`. Modules
@@ -33,7 +34,7 @@ pub use attention_stream::{
     AttentionStreamRecord, AttentionStreamSet,
 };
 pub use command::BlackboardCommand;
-pub use memory::{MemoryMetaPatch, MemoryMetadata};
+pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
 pub use state::{
     Blackboard, BlackboardInner, MemoLogRecord, MemoRecord, ModuleRunStatus, ModuleRunStatusRecord,
     UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,

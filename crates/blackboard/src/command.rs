@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, MemoryMetaPatch, ModulePolicy,
-    ModuleRunStatus, ResourceAllocation, UtteranceProgress,
+    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, IdentityMemoryRecord,
+    MemoryMetaPatch, ModulePolicy, ModuleRunStatus, ResourceAllocation, UtteranceProgress,
 };
 
 /// Internal blackboard mutation. Constructed only by the agent's
@@ -45,6 +45,7 @@ pub enum BlackboardCommand {
     RemoveMemoryMetadata {
         index: MemoryIndex,
     },
+    SetIdentityMemories(Vec<IdentityMemoryRecord>),
     SetAllocation(ResourceAllocation),
     SetModulePolicies {
         policies: Vec<(ModuleId, ModulePolicy)>,

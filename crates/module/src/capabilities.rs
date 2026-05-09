@@ -8,11 +8,13 @@ use nuillu_blackboard::{
     ModuleRunStatus,
 };
 use nuillu_types::{
-    ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
+    MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
 };
 
 use crate::channels::{Topic, TopicPolicy};
-use crate::ports::{AttentionRepository, Clock, FileSearchProvider, MemoryStore, UtteranceSink};
+use crate::ports::{
+    AttentionRepository, Clock, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
+};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::r#trait::ErasedModule;
@@ -224,17 +226,28 @@ impl CapabilityProviders {
             .await;
     }
 
-    pub(crate) fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
-        self.inner.blackboard.set_module_catalog(catalog);
+    pub(crate) async fn load_identity_memories(&self) -> Result<(), PortError> {
+        let mut records = self
+            .inner
+            .primary_memory_store
+            .list_by_rank(MemoryRank::Identity)
+            .await?
+            .into_iter()
+            .map(|record| nuillu_blackboard::IdentityMemoryRecord {
+                index: record.index,
+                content: record.content,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| a.index.as_str().cmp(b.index.as_str()));
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetIdentityMemories(records))
+            .await;
+        Ok(())
     }
 
-    /// Boot-time access to the post-boot module catalog (lives outside the
-    /// async lock so it can be read synchronously). The scheduler uses this
-    /// to construct the per-activate `ActivateCx`. Modules should not read
-    /// this directly: agent-global state is delivered to modules through the
-    /// [`ActivateCx`] passed to `activate`, not through capability handles.
-    pub(crate) fn module_catalog(&self) -> &[(ModuleId, &'static str)] {
-        self.inner.blackboard.module_catalog()
+    pub(crate) fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
+        self.inner.blackboard.set_module_catalog(catalog);
     }
 
     pub(crate) async fn apply_runtime_policy(&self) {
@@ -370,6 +383,12 @@ impl AgentRuntimeControl {
     /// scheduler turns this into an [`ActivateCx`] for each `activate` call.
     pub fn module_catalog(&self) -> Vec<(ModuleId, &'static str)> {
         self.blackboard.module_catalog().to_vec()
+    }
+
+    pub async fn identity_memories(&self) -> Vec<nuillu_blackboard::IdentityMemoryRecord> {
+        self.blackboard
+            .read(|bb| bb.identity_memories().to_vec())
+            .await
     }
 
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
@@ -804,6 +823,9 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
+        caps.load_identity_memories()
+            .await
+            .map_err(ModuleRegistryError::IdentityMemoryLoad)?;
         // Install the post-boot module catalog before any module is constructed
         // so module constructors can read peers from `caps.module_catalog()`
         // synchronously when they assemble their system prompts.
@@ -844,6 +866,8 @@ pub enum ModuleRegistryError {
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
+    #[error("failed to load identity memories: {0}")]
+    IdentityMemoryLoad(PortError),
 }
 
 #[cfg(test)]
@@ -855,9 +879,10 @@ mod tests {
         ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation,
         UtteranceProgress,
     };
-    use nuillu_types::{ModelTier, ReplicaCapRange, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ReplicaCapRange, builtin};
 
-    use crate::test_support::{scoped, test_caps};
+    use crate::ports::{IndexedMemory, MemoryQuery, MemoryRecord, NewMemory};
+    use crate::test_support::{scoped, test_caps, test_caps_with_stores};
 
     struct NoopModule;
 
@@ -890,6 +915,59 @@ mod tests {
         NoopModule
     }
 
+    #[derive(Clone)]
+    struct StaticMemoryStore {
+        records: Vec<MemoryRecord>,
+    }
+
+    #[async_trait(?Send)]
+    impl MemoryStore for StaticMemoryStore {
+        async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
+            Ok(MemoryIndex::new("unused"))
+        }
+
+        async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn compact(
+            &self,
+            _mem: NewMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<MemoryIndex, PortError> {
+            Ok(MemoryIndex::new("unused"))
+        }
+
+        async fn put_compacted(
+            &self,
+            _mem: IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+            Ok(None)
+        }
+
+        async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|record| record.rank == rank)
+                .cloned()
+                .collect())
+        }
+
+        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
@@ -915,6 +993,58 @@ mod tests {
             err,
             ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_build_loads_sorted_identity_memory_snapshot() {
+        let blackboard = Blackboard::default();
+        let store = StaticMemoryStore {
+            records: vec![
+                MemoryRecord {
+                    index: MemoryIndex::new("identity-b"),
+                    content: MemoryContent::new("second"),
+                    rank: MemoryRank::Identity,
+                },
+                MemoryRecord {
+                    index: MemoryIndex::new("other"),
+                    content: MemoryContent::new("ordinary"),
+                    rank: MemoryRank::Permanent,
+                },
+                MemoryRecord {
+                    index: MemoryIndex::new("identity-a"),
+                    content: MemoryContent::new("first"),
+                    rank: MemoryRank::Identity,
+                },
+            ],
+        };
+        let caps = test_caps_with_stores(
+            blackboard.clone(),
+            Arc::new(store),
+            Vec::new(),
+            Arc::new(crate::ports::NoopFileSearchProvider),
+        );
+
+        let modules = ModuleRegistry::new()
+            .register(
+                0..=0,
+                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
+                nuillu_blackboard::linear_ratio_fn,
+                noop_builder,
+            )
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        assert_eq!(modules.len(), 1);
+        let snapshot = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|record| (record.index.as_str(), record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("identity-a", "first"), ("identity-b", "second")]
+        );
     }
 
     #[tokio::test]

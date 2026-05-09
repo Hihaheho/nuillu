@@ -408,6 +408,7 @@ pub enum MemorySeedRank {
     MidTerm,
     LongTerm,
     Permanent,
+    Identity,
 }
 
 impl From<MemorySeedRank> for MemoryRank {
@@ -417,6 +418,7 @@ impl From<MemorySeedRank> for MemoryRank {
             MemorySeedRank::MidTerm => Self::MidTerm,
             MemorySeedRank::LongTerm => Self::LongTerm,
             MemorySeedRank::Permanent => Self::Permanent,
+            MemorySeedRank::Identity => Self::Identity,
         }
     }
 }

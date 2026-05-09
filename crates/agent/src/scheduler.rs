@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
+use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_module::{
     ActivateCx, AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch,
     ModuleRunStatus, ports::Clock,
@@ -251,13 +252,16 @@ async fn refresh_active_and_schedule(
                 else {
                     unreachable!("module state changed while scheduling activation");
                 };
+                let catalog = runtime.module_catalog();
+                let identity_memories = runtime.identity_memories().await;
                 spawn_activate(
                     tasks,
                     index,
                     module,
                     batch,
                     config,
-                    runtime.module_catalog(),
+                    catalog,
+                    identity_memories,
                     parent,
                     subscriber,
                 );
@@ -312,13 +316,16 @@ async fn handle_task_message(
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
                     states[index] = ModuleState::Activating;
+                    let catalog = runtime.module_catalog();
+                    let identity_memories = runtime.identity_memories().await;
                     spawn_activate(
                         tasks,
                         index,
                         module,
                         batch,
                         config,
-                        runtime.module_catalog(),
+                        catalog,
+                        identity_memories,
                         parent,
                         subscriber,
                     );
@@ -442,13 +449,20 @@ fn spawn_activate(
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
     catalog: Vec<(ModuleId, &'static str)>,
+    identity_memories: Vec<IdentityMemoryRecord>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let (module, result) =
-                activate_with_retries(module, &catalog, &batch, config.activate_retries).await;
+            let (module, result) = activate_with_retries(
+                module,
+                &catalog,
+                &identity_memories,
+                &batch,
+                config.activate_retries,
+            )
+            .await;
             TaskMessage::Activate {
                 index,
                 module,
@@ -463,10 +477,11 @@ fn spawn_activate(
 async fn activate_with_retries(
     mut module: AllocatedModule,
     catalog: &[(ModuleId, &'static str)],
+    identity_memories: &[IdentityMemoryRecord],
     batch: &ModuleBatch,
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
-    let cx = ActivateCx::new(catalog);
+    let cx = ActivateCx::new(catalog, identity_memories);
     let mut retries = 0_u8;
     loop {
         match module.activate(&cx, batch).await {
@@ -509,14 +524,14 @@ mod tests {
 
     use async_trait::async_trait;
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, Bpm, ModuleConfig, ModuleRunStatus, ResourceAllocation,
-        linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, IdentityMemoryRecord, ModuleConfig,
+        ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::{
         AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
         ModuleRegistry, QueryInbox, QueryRequest,
     };
-    use nuillu_types::{ModelTier, ModuleId, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ModuleId, builtin};
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
@@ -740,6 +755,55 @@ mod tests {
             _batch: &Self::Batch,
         ) -> anyhow::Result<()> {
             anyhow::bail!("permanent activation failure")
+        }
+    }
+
+    struct IdentityCxObserver {
+        seen: Rc<RefCell<Vec<(String, String)>>>,
+        on_done: Option<oneshot::Sender<()>>,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for IdentityCxObserver {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "identity-cx-observer"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            *self.seen.borrow_mut() = cx
+                .identity_memories()
+                .iter()
+                .map(|record| {
+                    (
+                        record.index.as_str().to_owned(),
+                        record.content.as_str().to_owned(),
+                    )
+                })
+                .collect();
+            if let Some(tx) = self.on_done.take() {
+                let _ = tx.send(());
+            }
+            Ok(())
         }
     }
 
@@ -968,6 +1032,68 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn scheduler_passes_identity_memories_into_activate_context() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(IdentityCxObserver::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let seen = Rc::new(RefCell::new(Vec::new()));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let seen = Rc::clone(&seen);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |_caps| IdentityCxObserver {
+                                seen: Rc::clone(&seen),
+                                on_done: done_tx.borrow_mut().take(),
+                                batch_sent: false,
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                blackboard
+                    .apply(BlackboardCommand::SetIdentityMemories(vec![
+                        IdentityMemoryRecord {
+                            index: MemoryIndex::new("identity-1"),
+                            content: MemoryContent::new("The agent is named Nuillu."),
+                        },
+                    ]))
+                    .await;
+
+                super::run(modules, test_config(), async move {
+                    let _ = done_rx.await;
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    seen.borrow().as_slice(),
+                    &[(
+                        "identity-1".to_string(),
+                        "The agent is named Nuillu.".to_string()
+                    )]
+                );
             })
             .await;
     }

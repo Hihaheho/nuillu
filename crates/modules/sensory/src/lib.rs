@@ -115,13 +115,23 @@ impl SensoryModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                SYSTEM_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 
     fn detail_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.detail_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(DETAIL_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_system_prompt(
+                DETAIL_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+            )
         })
     }
 

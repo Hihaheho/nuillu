@@ -26,6 +26,7 @@ The non-cognitive blackboard holds:
 
 - **per-module memo queues** — each module owner writes only its own bounded indexed log,
 - **memory metadata** — rank, decay, access counts, and remember tokens,
+- **identity memory snapshot** — identity-ranked memories loaded once at agent startup,
 - **resource allocation** — activation ratio, controller guidance, and model tier per module.
 
 Module results that should be durable live in memo logs or other blackboard state. Each memo item has a per-owner monotonic index; reader handles track their own last-seen index so modules can distinguish unread output from recent context. Channel messages are transient activation signals and are not persisted.
@@ -51,12 +52,14 @@ The design uses [Graziano's attention-schema framing](https://www.frontiersin.or
 
 A memory is `(rank, content, decay, query_history, remember_tokens)`.
 
-- **rank**: short-term, mid-term, long-term, permanent
+- **rank**: short-term, mid-term, long-term, permanent, identity
 - **query history**: recent access log
 - **remember tokens**: accumulated by memory compaction when repeated memories merge
 - **decay**: remaining time to stay in the current rank
 
 Rank can rise through access or remember-token accumulation and fall when decay expires.
+Identity-ranked memories are startup identity facts: the agent loads all of them from the primary
+memory store before module activation and injects that stable snapshot into LLM system prompts.
 
 ## Activations
 
