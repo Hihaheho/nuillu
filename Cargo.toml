@@ -60,8 +60,6 @@ nuillu-blackboard = { path = "crates/blackboard" }
 nuillu-module = { path = "crates/module" }
 nuillu-agent = { path = "crates/agent" }
 lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
-lutum-lancedb-adapter = { path = "crates/adapters/lancedb" }
-lutum-lancedb-core = { path = "crates/adapters/lancedb-core" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 
