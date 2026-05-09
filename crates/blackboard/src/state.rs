@@ -6,7 +6,7 @@ use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIn
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
+    ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
     CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, IdentityMemoryRecord,
     MemoryMetadata, ModulePolicy, ResourceAllocation,
 };
@@ -26,6 +26,7 @@ const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
 pub struct Blackboard {
     inner: Arc<RwLock<BlackboardInner>>,
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
+    activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     module_catalog: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
 }
 
@@ -155,10 +156,25 @@ struct ActivationWaiter {
     sender: oneshot::Sender<()>,
 }
 
+struct ActivationIncreaseWaiter {
+    module: ModuleId,
+    threshold: ActivationRatio,
+    sender: oneshot::Sender<()>,
+}
+
 impl std::fmt::Debug for ActivationWaiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivationWaiter")
             .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ActivationIncreaseWaiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationIncreaseWaiter")
+            .field("module", &self.module)
+            .field("threshold", &self.threshold)
             .finish_non_exhaustive()
     }
 }
@@ -168,6 +184,7 @@ impl Blackboard {
         Self {
             inner: Arc::new(RwLock::new(BlackboardInner::default())),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
+            activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             module_catalog: Arc::new(OnceLock::new()),
         }
     }
@@ -181,6 +198,7 @@ impl Blackboard {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
+            activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             module_catalog: Arc::new(OnceLock::new()),
         }
     }
@@ -215,6 +233,7 @@ impl Blackboard {
         let mut guard = self.inner.write().await;
         guard.apply(cmd);
         self.notify_active_waiters(&guard.allocation);
+        self.notify_activation_increase_waiters(&guard.allocation);
     }
 
     pub async fn update_memo(
@@ -261,6 +280,32 @@ impl Blackboard {
         Some(receiver)
     }
 
+    /// Register a one-shot notification for the next time `module`'s effective
+    /// activation ratio strictly exceeds `threshold`.
+    pub async fn activation_increase_waiter(
+        &self,
+        module: ModuleId,
+        threshold: ActivationRatio,
+    ) -> Option<oneshot::Receiver<()>> {
+        let guard = self.inner.read().await;
+        if guard.allocation.activation_for(&module) > threshold {
+            return None;
+        }
+
+        let mut waiters = self
+            .activation_increase_waiters
+            .lock()
+            .expect("activation increase waiters poisoned");
+        waiters.retain(|waiter| !waiter.sender.is_closed());
+        let (sender, receiver) = oneshot::channel();
+        waiters.push(ActivationIncreaseWaiter {
+            module,
+            threshold,
+            sender,
+        });
+        Some(receiver)
+    }
+
     fn notify_active_waiters(&self, allocation: &ResourceAllocation) {
         let mut waiters = self
             .activation_waiters
@@ -269,6 +314,22 @@ impl Blackboard {
         let mut pending = Vec::with_capacity(waiters.len());
         for waiter in waiters.drain(..) {
             if allocation.is_replica_active(&waiter.owner) {
+                let _ = waiter.sender.send(());
+            } else if !waiter.sender.is_closed() {
+                pending.push(waiter);
+            }
+        }
+        *waiters = pending;
+    }
+
+    fn notify_activation_increase_waiters(&self, allocation: &ResourceAllocation) {
+        let mut waiters = self
+            .activation_increase_waiters
+            .lock()
+            .expect("activation increase waiters poisoned");
+        let mut pending = Vec::with_capacity(waiters.len());
+        for waiter in waiters.drain(..) {
+            if allocation.activation_for(&waiter.module) > waiter.threshold {
                 let _ = waiter.sender.send(());
             } else if !waiter.sender.is_closed() {
                 pending.push(waiter);
@@ -1107,6 +1168,53 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         assert!(effective.get(&unknown).is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_increase_waiter_fires_only_on_strict_effective_increase() {
+        let module = builtin::query_vector();
+        let threshold = crate::ActivationRatio::from_f64(0.5);
+        let mut base = ResourceAllocation::default();
+        base.set_activation(module.clone(), crate::ActivationRatio::from_f64(0.25));
+        let bb = Blackboard::with_allocation(base);
+
+        let mut waiter = bb
+            .activation_increase_waiter(module.clone(), threshold)
+            .await
+            .expect("activation has not increased past threshold yet");
+
+        let mut same_threshold = ResourceAllocation::default();
+        same_threshold.set_activation(module.clone(), threshold);
+        bb.apply(BlackboardCommand::SetAllocation(same_threshold))
+            .await;
+        assert!(
+            waiter.try_recv().is_err(),
+            "equal threshold should not fire"
+        );
+
+        let mut lower = ResourceAllocation::default();
+        lower.set_activation(module.clone(), crate::ActivationRatio::from_f64(0.4));
+        bb.apply(BlackboardCommand::SetAllocation(lower)).await;
+        assert!(waiter.try_recv().is_err(), "lower value should not fire");
+
+        let mut higher = ResourceAllocation::default();
+        higher.set_activation(module, crate::ActivationRatio::from_f64(0.6));
+        bb.apply(BlackboardCommand::SetAllocation(higher)).await;
+        assert_eq!(waiter.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn activation_increase_waiter_returns_none_when_already_above_threshold() {
+        let module = builtin::query_vector();
+        let mut base = ResourceAllocation::default();
+        base.set_activation(module.clone(), crate::ActivationRatio::from_f64(0.75));
+        let bb = Blackboard::with_allocation(base);
+
+        let waiter = bb
+            .activation_increase_waiter(module, crate::ActivationRatio::from_f64(0.5))
+            .await;
+
+        assert!(waiter.is_none());
     }
 
     fn test_policy(range: ReplicaCapRange) -> crate::ModulePolicy {

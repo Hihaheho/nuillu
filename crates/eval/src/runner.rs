@@ -1158,10 +1158,12 @@ fn eval_replicas(max_extra: u8) -> std::ops::RangeInclusive<u8> {
 }
 
 fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
-    // Idle pace 1 BPM (60s between batches) up to fully-active 5 BPM (12s).
+    // Idle pace 3 BPM (20s between batch starts) up to fully-active 18 BPM
+    // (~3.3s). The scheduler subtracts activation elapsed time from the
+    // cooldown, so this range expresses target batch-start tempo.
     // Time is injected via the Clock trait, so tests with a mock Clock can
     // skip cooldowns entirely.
-    Bpm::range(1.0, 5.0)
+    Bpm::range(3.0, 18.0)
 }
 
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
@@ -1186,7 +1188,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         EvalModule::CognitionGate => registry
             .register(
                 eval_replicas(0),
-                Bpm::range(6.0, 12.0),
+                Bpm::range(6.0, 36.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_cognition_gate::CognitionGateModule::new(

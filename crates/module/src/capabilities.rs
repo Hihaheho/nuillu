@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use lutum::Lutum;
 use nuillu_blackboard::{
-    ActivationRatioFn, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
-    ModuleRunStatus,
+    ActivationRatio, ActivationRatioFn, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm,
+    ModulePolicy, ModuleRunStatus,
 };
 use nuillu_types::{
     MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
@@ -408,6 +408,30 @@ impl AgentRuntimeControl {
     pub async fn module_batch_min_interval(&self, owner: &ModuleInstanceId) -> Option<Duration> {
         self.blackboard
             .read(|bb| bb.allocation().cooldown_for(&owner.module))
+            .await
+    }
+
+    pub async fn module_batch_throttle_baseline(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Option<(Duration, ActivationRatio)> {
+        self.blackboard
+            .read(|bb| {
+                let allocation = bb.allocation();
+                allocation
+                    .cooldown_for(&owner.module)
+                    .map(|interval| (interval, allocation.activation_for(&owner.module)))
+            })
+            .await
+    }
+
+    pub async fn activation_increase_waiter(
+        &self,
+        owner: &ModuleInstanceId,
+        threshold: ActivationRatio,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.blackboard
+            .activation_increase_waiter(owner.module.clone(), threshold)
             .await
     }
 

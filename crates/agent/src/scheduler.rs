@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_blackboard::IdentityMemoryRecord;
+use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord};
 use nuillu_module::{
     ActivateCx, AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch,
     ModuleRunStatus, ports::Clock,
@@ -56,7 +56,7 @@ pub async fn run(
         .into_iter()
         .map(|module| ModuleState::Stored {
             module,
-            next_batch_not_before: None,
+            next_batch_throttle: None,
         })
         .collect::<Vec<_>>();
     let mut active = vec![false; states.len()];
@@ -156,7 +156,7 @@ pub async fn run(
 enum ModuleState {
     Stored {
         module: AllocatedModule,
-        next_batch_not_before: Option<DateTime<Utc>>,
+        next_batch_throttle: Option<NextBatchThrottle>,
     },
     CoolingDown,
     Awaiting,
@@ -181,8 +181,14 @@ enum TaskMessage {
     Activate {
         index: usize,
         module: AllocatedModule,
+        activation_elapsed: Duration,
         result: Result<(), String>,
     },
+}
+
+struct NextBatchThrottle {
+    not_before: DateTime<Utc>,
+    activation_threshold: ActivationRatio,
 }
 
 async fn refresh_active_and_schedule(
@@ -207,23 +213,33 @@ async fn refresh_active_and_schedule(
                     .await;
                 let ModuleState::Stored {
                     module,
-                    next_batch_not_before,
+                    next_batch_throttle,
                 } = std::mem::replace(&mut states[index], ModuleState::Awaiting)
                 else {
                     unreachable!("module state changed while scheduling next batch");
                 };
                 let now = runtime.clock().now();
-                if let Some(deadline) = next_batch_not_before.filter(|deadline| *deadline > now) {
-                    states[index] = ModuleState::CoolingDown;
-                    spawn_batch_cooldown(
-                        tasks,
-                        index,
-                        module,
-                        deadline,
-                        runtime.clock(),
-                        parent,
-                        subscriber,
-                    );
+                if let Some(throttle) =
+                    next_batch_throttle.filter(|throttle| throttle.not_before > now)
+                {
+                    if let Some(activation_increase) = runtime
+                        .activation_increase_waiter(&owners[index], throttle.activation_threshold)
+                        .await
+                    {
+                        states[index] = ModuleState::CoolingDown;
+                        spawn_batch_cooldown(
+                            tasks,
+                            index,
+                            module,
+                            throttle.not_before,
+                            runtime.clock(),
+                            activation_increase,
+                            parent,
+                            subscriber,
+                        );
+                    } else {
+                        spawn_next_batch(tasks, index, module, parent, subscriber);
+                    }
                 } else {
                     spawn_next_batch(tasks, index, module, parent, subscriber);
                 }
@@ -302,7 +318,7 @@ async fn handle_task_message(
                 .await;
             states[index] = ModuleState::Stored {
                 module,
-                next_batch_not_before: None,
+                next_batch_throttle: None,
             };
             Ok(())
         }
@@ -359,19 +375,30 @@ async fn handle_task_message(
         TaskMessage::Activate {
             index,
             module,
+            activation_elapsed,
             result,
         } => match result {
             Ok(()) => {
                 let now = runtime.clock().now();
-                let next_batch_not_before = runtime
-                    .module_batch_min_interval(&owners[index])
+                let next_batch_throttle = runtime
+                    .module_batch_throttle_baseline(&owners[index])
                     .await
-                    .and_then(|interval| {
-                        chrono::Duration::from_std(interval).ok().map(|d| now + d)
+                    .and_then(|(interval, activation_threshold)| {
+                        let remaining = interval.saturating_sub(activation_elapsed);
+                        if remaining.is_zero() {
+                            None
+                        } else {
+                            chrono::Duration::from_std(remaining)
+                                .ok()
+                                .map(|d| NextBatchThrottle {
+                                    not_before: now + d,
+                                    activation_threshold,
+                                })
+                        }
                     });
                 states[index] = ModuleState::Stored {
                     module,
-                    next_batch_not_before,
+                    next_batch_throttle,
                 };
                 Ok(())
             }
@@ -425,13 +452,17 @@ fn spawn_batch_cooldown(
     module: AllocatedModule,
     deadline: DateTime<Utc>,
     clock: Arc<dyn Clock>,
+    activation_increase: tokio::sync::oneshot::Receiver<()>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
             let started = clock.now();
-            clock.sleep_until(deadline).await;
+            tokio::select! {
+                _ = clock.sleep_until(deadline) => {}
+                _ = activation_increase => {}
+            }
             let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
             TaskMessage::BatchCooldownExpired {
                 index,
@@ -458,6 +489,7 @@ fn spawn_activate(
 ) {
     tasks.push(spawn_local(
         async move {
+            let activation_started = Instant::now();
             let (module, result) = activate_with_retries(
                 module,
                 &runtime,
@@ -467,9 +499,11 @@ fn spawn_activate(
                 config.activate_retries,
             )
             .await;
+            let activation_elapsed = activation_started.elapsed();
             TaskMessage::Activate {
                 index,
                 module,
+                activation_elapsed,
                 result,
             }
         }
@@ -529,7 +563,9 @@ mod tests {
     use super::{AgentEventLoopConfig, SchedulerError};
 
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use nuillu_blackboard::{
@@ -629,6 +665,70 @@ mod tests {
             _cx: &nuillu_module::ActivateCx<'_>,
             batch: &Self::Batch,
         ) -> anyhow::Result<()> {
+            self.batches.borrow_mut().push(batch.clone());
+            match self.batches.borrow().len() {
+                1 => {
+                    if let Some(done) = self.first_done.take() {
+                        let _ = done.send(());
+                    }
+                }
+                2 => {
+                    if let Some(done) = self.second_done.take() {
+                        let _ = done.send(());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    struct TimedQueryBatchRecorder {
+        query_inbox: QueryInbox,
+        batches: Rc<RefCell<Vec<Vec<String>>>>,
+        activation_delays: Rc<RefCell<VecDeque<Duration>>>,
+        first_done: Option<oneshot::Sender<()>>,
+        second_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for TimedQueryBatchRecorder {
+        type Batch = Vec<String>;
+
+        fn id() -> &'static str {
+            "timed-batch-recorder"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            let first = self.query_inbox.next_item().await?.body.question;
+            let mut batch = vec![first];
+            batch.extend(
+                self.query_inbox
+                    .take_ready_items()?
+                    .items
+                    .into_iter()
+                    .map(|envelope| envelope.body.question),
+            );
+            Ok(batch)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            let activation_delay = self
+                .activation_delays
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default();
+            if !activation_delay.is_zero() {
+                tokio::time::sleep(activation_delay).await;
+            }
             self.batches.borrow_mut().push(batch.clone());
             match self.batches.borrow().len() {
                 1 => {
@@ -879,6 +979,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct DelayedBatchStub {
         release: Option<oneshot::Receiver<()>>,
         activated: Rc<Cell<bool>>,
@@ -1185,6 +1286,258 @@ mod tests {
                         vec!["first".to_string()],
                         vec!["second".to_string(), "third".to_string()]
                     ]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_subtracts_activation_elapsed_from_sleep() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(TimedQueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard);
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let activation_delays = Rc::new(RefCell::new(VecDeque::from([
+                    Duration::from_millis(80),
+                    Duration::ZERO,
+                ])));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                // 300 BPM = 200ms target period between activation starts.
+                // The first activation takes ~80ms, so remaining cooldown
+                // should be ~120ms rather than a full 200ms.
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(300.0)..=Bpm::from_f64(300.0),
+                        linear_ratio_fn,
+                        {
+                            let batches = Rc::clone(&batches);
+                            let activation_delays = Rc::clone(&activation_delays);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            move |caps| TimedQueryBatchRecorder {
+                                query_inbox: caps.query_inbox(),
+                                batches: Rc::clone(&batches),
+                                activation_delays: Rc::clone(&activation_delays),
+                                first_done: first_tx.borrow_mut().take(),
+                                second_done: second_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().query_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(QueryRequest::new("first"))
+                        .await
+                        .expect("first query should route");
+                    let _ = first_rx.await;
+
+                    let started = tokio::time::Instant::now();
+                    mailbox
+                        .publish(QueryRequest::new("second"))
+                        .await
+                        .expect("second query should route");
+                    let _ = second_rx.await;
+                    let elapsed = started.elapsed();
+                    assert!(elapsed >= Duration::from_millis(90), "{elapsed:?}");
+                    assert!(elapsed < Duration::from_millis(190), "{elapsed:?}");
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[vec!["first".to_string()], vec!["second".to_string()]]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_skips_sleep_when_activation_exceeds_period() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(TimedQueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard);
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let activation_delays = Rc::new(RefCell::new(VecDeque::from([
+                    Duration::from_millis(160),
+                    Duration::ZERO,
+                ])));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                // 500 BPM = 120ms target period. Since the first activation
+                // takes longer than that, no extra cooldown should be added.
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(500.0)..=Bpm::from_f64(500.0),
+                        linear_ratio_fn,
+                        {
+                            let batches = Rc::clone(&batches);
+                            let activation_delays = Rc::clone(&activation_delays);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            move |caps| TimedQueryBatchRecorder {
+                                query_inbox: caps.query_inbox(),
+                                batches: Rc::clone(&batches),
+                                activation_delays: Rc::clone(&activation_delays),
+                                first_done: first_tx.borrow_mut().take(),
+                                second_done: second_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().query_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(QueryRequest::new("first"))
+                        .await
+                        .expect("first query should route");
+                    let _ = first_rx.await;
+
+                    let started = tokio::time::Instant::now();
+                    mailbox
+                        .publish(QueryRequest::new("second"))
+                        .await
+                        .expect("second query should route");
+                    let _ = second_rx.await;
+                    assert!(started.elapsed() < Duration::from_millis(80));
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[vec!["first".to_string()], vec!["second".to_string()]]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn runtime_batch_throttle_wakes_when_activation_increases() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(
+                    module_id.clone(),
+                    ModuleConfig {
+                        tier: ModelTier::Default,
+                        ..Default::default()
+                    },
+                );
+                alloc.set_activation(module_id.clone(), ActivationRatio::from_f64(0.5));
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard.clone());
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                // Fixed 120 BPM = 500ms period. The test bumps activation
+                // during cooldown and expects the second batch before deadline.
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(120.0)..=Bpm::from_f64(120.0),
+                        linear_ratio_fn,
+                        {
+                            let batches = Rc::clone(&batches);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            move |caps| QueryBatchRecorder {
+                                query_inbox: caps.query_inbox(),
+                                batches: Rc::clone(&batches),
+                                first_done: first_tx.borrow_mut().take(),
+                                second_done: second_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().query_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(QueryRequest::new("first"))
+                        .await
+                        .expect("first query should route");
+                    let _ = first_rx.await;
+
+                    mailbox
+                        .publish(QueryRequest::new("second"))
+                        .await
+                        .expect("second query should route");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+
+                    let mut raised = ResourceAllocation::default();
+                    raised.set(
+                        module_id.clone(),
+                        ModuleConfig {
+                            tier: ModelTier::Default,
+                            ..Default::default()
+                        },
+                    );
+                    raised.set_activation(module_id, ActivationRatio::ONE);
+                    let started = tokio::time::Instant::now();
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(raised))
+                        .await;
+
+                    let _ = second_rx.await;
+                    assert!(started.elapsed() < Duration::from_millis(120));
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[vec!["first".to_string()], vec!["second".to_string()]]
                 );
             })
             .await;
