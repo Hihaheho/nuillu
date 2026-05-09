@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
     Module, QueryInbox, QueryRequest, ports::FileSearchQuery,
@@ -24,9 +24,8 @@ over paraphrases. If a search returns no hits, retry with shorter terms taken fr
 proper nouns, domain nouns, direction words, filenames hinted by the question, and key verbs.
 Do not drift into general associations that are not words from the question or current context.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
-results. You must call search_files before returning the structured completion. The runtime
-memoizes only file hit snippets returned by tools. Return only raw JSON for the structured
-completion; do not wrap JSON in Markdown or code fences."#;
+results. You must call search_files before finishing. The runtime memoizes only file hit snippets
+returned by tools. Any final text is ignored; do not use a final answer as a data channel."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
 
@@ -51,11 +50,6 @@ pub struct QueryFileHit {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchFilesOutput {
     pub hits: Vec<QueryFileHit>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryAgenticSearchCompletion {
-    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -179,7 +173,7 @@ impl QueryAgenticModule {
         for _ in 0..MAX_QUERY_ROUNDS {
             let lutum = self.llm.lutum().await;
             let turn = session
-                .structured_turn::<QueryAgenticSearchCompletion>(&lutum)
+                .text_turn(&lutum)
                 .tools::<QueryAgenticTools>()
                 .available_tools([QueryAgenticToolsSelector::SearchFiles]);
             let turn = if all_hits.is_empty() {
@@ -190,16 +184,11 @@ impl QueryAgenticModule {
             let outcome = turn
                 .collect()
                 .await
-                .context("query-agentic structured turn failed")?;
+                .context("query-agentic text turn failed")?;
 
             match outcome {
-                StructuredStepOutcomeWithTools::Finished(result) => {
-                    let StructuredTurnOutcome::Structured(_completion) = result.semantic else {
-                        anyhow::bail!("query-agentic search completion refused");
-                    };
-                    return Ok(all_hits);
-                }
-                StructuredStepOutcomeWithTools::NeedsTools(round) => {
+                TextStepOutcomeWithTools::Finished(_) => return Ok(all_hits),
+                TextStepOutcomeWithTools::NeedsTools(round) => {
                     let mut tool_results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
                         let QueryAgenticToolsCall::SearchFiles(call) = call;

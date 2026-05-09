@@ -149,10 +149,31 @@ impl SurpriseModule {
                 .await;
         }
 
-        let serialized = serde_json::to_string(&assessment).context("serialize surprise memo")?;
-        self.memo.write(serialized).await;
+        self.memo.write(render_surprise_memo(&assessment)).await;
         Ok(())
     }
+}
+
+fn render_surprise_memo(assessment: &SurpriseAssessment) -> String {
+    let mut memo = format!(
+        "Surprise assessment: {}\nSurprise level: {:?}\nSignificant enough to preserve: {}\nRationale: {}",
+        assessment.assessment.trim(),
+        assessment.surprise_level,
+        if assessment.significant { "yes" } else { "no" },
+        assessment.rationale.trim(),
+    );
+    if let Some(request) = &assessment.memory_request {
+        memo.push_str("\nMemory preservation request:");
+        memo.push_str("\nContent: ");
+        memo.push_str(request.content.trim());
+        memo.push_str("\nImportance: ");
+        memo.push_str(&format!("{:?}", request.importance));
+        memo.push_str("\nReason: ");
+        memo.push_str(request.reason.trim());
+    } else {
+        memo.push_str("\nMemory preservation request: none");
+    }
+    memo
 }
 
 #[async_trait(?Send)]

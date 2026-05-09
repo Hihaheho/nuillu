@@ -29,7 +29,7 @@ The non-cognitive blackboard holds:
 - **identity memory snapshot** — identity-ranked memories loaded once at agent startup,
 - **resource allocation** — activation ratio, controller guidance, and model tier per module.
 
-Module results that should be durable live in memo logs or other blackboard state. Each memo item has a per-owner monotonic index; reader handles track their own last-seen index so modules can distinguish unread output from recent context. Channel messages are transient activation signals and are not persisted.
+Module results that should be durable live in memo logs or other blackboard state. Each memo item has a per-owner monotonic index; reader handles track their own last-seen index so modules can distinguish unread output from recent context. Memo content is free-form prose on the shared workspace surface, not JSON, schema-shaped data, or a structured data exchange channel. Channel messages are transient activation signals and are not persisted.
 
 External input and output sit at the boundary of cognition:
 

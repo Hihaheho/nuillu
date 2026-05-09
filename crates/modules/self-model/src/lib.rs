@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::Session;
 use nuillu_module::{
     BlackboardReader, CognitionLogReader, LlmAccess, Memo, Module, SelfModelInbox, SelfModelRequest,
 };
 use nuillu_types::builtin;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 mod batch;
 pub use batch::NextBatch as SelfModelBatch;
@@ -17,19 +15,8 @@ experiences written by attention-schema to the cognition log, and self-related f
 memory modules have surfaced in their memos.
 Stable self-knowledge may be present in retrieved memory memos, but do not claim direct access to
 raw hidden memories. Answer explicit self-model questions from this current self model.
-Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SelfModelAnswer {
-    pub question: String,
-    pub answer: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SelfModelReport {
-    pub memo: String,
-    pub answers: Vec<SelfModelAnswer>,
-}
+Write the memo as free-form prose. Preserve the current self-description and every explicit
+question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
 pub struct SelfModelModule {
     owner: nuillu_module::ModuleId,
@@ -114,17 +101,14 @@ impl SelfModelModule {
         );
 
         let result = session
-            .structured_turn::<SelfModelReport>(&self.llm.lutum().await)
+            .text_turn(&self.llm.lutum().await)
             .collect()
             .await
-            .context("self-model structured turn failed")?;
-
-        let StructuredTurnOutcome::Structured(report) = result.semantic else {
-            anyhow::bail!("self-model structured turn refused");
-        };
-
-        let serialized = serde_json::to_string(&report).context("serialize self-model report")?;
-        self.memo.write(serialized).await;
+            .context("self-model text turn failed")?;
+        let memo = result.assistant_text();
+        if !memo.trim().is_empty() {
+            self.memo.write(memo).await;
+        }
         Ok(())
     }
 }

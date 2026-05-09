@@ -385,14 +385,12 @@ impl SpeakGateModule {
         let lutum = self.llm.lutum().await;
         let decision = self.run_decision_turn(&lutum, self_model_available).await?;
 
-        self.memo
-            .write(serde_json::to_string(&decision).context("serialize speak-gate decision memo")?)
-            .await;
+        self.memo.write(render_speak_gate_memo(&decision)).await;
 
-        if let Some(request) = speak_request_from_decision(&decision) {
-            if self.speak.publish(request).await.is_err() {
-                tracing::trace!("speak request had no active subscribers");
-            }
+        if let Some(request) = speak_request_from_decision(&decision)
+            && self.speak.publish(request).await.is_err()
+        {
+            tracing::trace!("speak request had no active subscribers");
         }
         Ok(())
     }
@@ -561,6 +559,52 @@ fn speak_request_from_decision(decision: &SpeakGateDecision) -> Option<SpeakRequ
     )
 }
 
+fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
+    let mut memo = format!(
+        "Speak decision: {}\nRationale: {}",
+        if decision.should_speak {
+            "speak"
+        } else {
+            "wait silently"
+        },
+        decision.rationale.trim(),
+    );
+    if let Some(plan) = &decision.speech_plan {
+        memo.push_str("\nSpeech target: ");
+        memo.push_str(plan.target.trim());
+        memo.push_str("\nGeneration hint: ");
+        memo.push_str(plan.generation_hint.trim());
+    } else {
+        memo.push_str("\nSpeech plan: none");
+    }
+    if decision.evidence_gaps.is_empty() {
+        memo.push_str("\nEvidence gaps: none");
+    } else {
+        memo.push_str("\nEvidence gaps:");
+        for gap in &decision.evidence_gaps {
+            memo.push_str("\n- Source: ");
+            memo.push_str(gap.source.as_memo_text());
+            memo.push_str("; question: ");
+            memo.push_str(gap.question.trim());
+            memo.push_str("; needed fact: ");
+            memo.push_str(gap.needed_fact.trim());
+        }
+    }
+    memo
+}
+
+impl EvidenceGapSource {
+    fn as_memo_text(self) -> &'static str {
+        match self {
+            EvidenceGapSource::Memory => "memory",
+            EvidenceGapSource::File => "file",
+            EvidenceGapSource::SelfModel => "self-model",
+            EvidenceGapSource::SensoryDetail => "sensory detail",
+            EvidenceGapSource::CognitionPromotion => "cognition promotion",
+        }
+    }
+}
+
 struct GenerationDraft {
     generation_id: u64,
     sequence: u32,
@@ -588,6 +632,15 @@ impl GenerationDraft {
         self.sequence = self.sequence.wrapping_add(1);
         sequence
     }
+}
+
+fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> String {
+    format!(
+        "Completed utterance to {}:\n{}\nRationale: {}",
+        draft.target.trim(),
+        text.trim(),
+        draft.rationale.trim(),
+    )
 }
 
 fn generation_input(
@@ -733,13 +786,7 @@ impl SpeakModule {
                         }
                         Some(Ok(TextTurnEvent::Completed { .. })) | None => {
                             let text = draft.accumulated.trim().to_owned();
-                            self.memo
-                                .write(serde_json::json!({
-                                    "target": draft.target.as_str(),
-                                    "utterance": text,
-                                    "rationale": draft.rationale.as_str(),
-                                }).to_string())
-                                .await;
+                            self.memo.write(render_completed_utterance_memo(draft, &text)).await;
                             self.utterance
                                 .record_progress(UtteranceProgress::completed(
                                     draft.generation_id,
@@ -1283,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_decision_serializes_evidence_gaps_for_memo() {
+    fn wait_decision_renders_evidence_gaps_in_free_form_memo() {
         let decision = SpeakGateDecision {
             should_speak: false,
             rationale: "missing body fact".into(),
@@ -1295,23 +1342,15 @@ mod tests {
             }],
         };
 
-        let value = serde_json::to_value(decision).unwrap();
+        let memo = render_speak_gate_memo(&decision);
 
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "should_speak": false,
-                "rationale": "missing body fact",
-                "speech_plan": null,
-                "evidence_gaps": [
-                    {
-                        "source": "memory",
-                        "question": "What body should I report?",
-                        "needed_fact": "frog body"
-                    }
-                ]
-            })
-        );
+        assert!(memo.contains("Speak decision: wait silently"));
+        assert!(memo.contains("Rationale: missing body fact"));
+        assert!(memo.contains("Speech plan: none"));
+        assert!(memo.contains(
+            "Source: memory; question: What body should I report?; needed fact: frog body"
+        ));
+        assert!(serde_json::from_str::<serde_json::Value>(&memo).is_err());
     }
 
     #[test]

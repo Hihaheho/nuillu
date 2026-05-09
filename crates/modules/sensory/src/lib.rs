@@ -271,13 +271,7 @@ impl SensoryModule {
         };
 
         self.memo
-            .write(
-                serde_json::json!({
-                    "kind": "sensory_detail_response",
-                    "answer": answer,
-                })
-                .to_string(),
-            )
+            .write(render_detail_memo(&request.question, &answer))
             .await;
         Ok(())
     }
@@ -386,6 +380,25 @@ pub struct SensoryBatch {
 
 fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+fn render_detail_memo(question: &str, answer: &SensoryDetailAnswer) -> String {
+    let mut memo = format!(
+        "Sensory detail request: {}\nAnswer: {}\nEnough retained detail: {}",
+        question.trim(),
+        answer.answer.trim(),
+        if answer.enough_detail { "yes" } else { "no" },
+    );
+    if answer.evidence.is_empty() {
+        memo.push_str("\nEvidence: none");
+    } else {
+        memo.push_str("\nEvidence:");
+        for evidence in &answer.evidence {
+            memo.push_str("\n- ");
+            memo.push_str(evidence.trim());
+        }
+    }
+    memo
 }
 
 fn is_user_directed_direction(direction: &str) -> bool {

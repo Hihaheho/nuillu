@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredStepOutcomeWithTools};
+use lutum::{Session, TextStepOutcomeWithTools};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
     QueryInbox, QueryRequest, VectorMemorySearcher,
@@ -23,8 +23,7 @@ distinct questions or evidence requests. Prefer multiple targeted searches in on
 generic searches or later follow-up turns.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
 results. You must call search_vector_memory. The runtime memoizes only memory hit content returned
-by tools; no final structured completion is needed after tool calls. Do not wrap output in Markdown
-or code fences."#;
+by tools. Any final text is ignored; do not use a final answer as a data channel."#;
 
 #[lutum::tool_input(name = "search_vector_memory", output = SearchVectorMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -43,11 +42,6 @@ pub struct QueryVectorMemoryHit {
     pub index: MemoryIndex,
     pub content: String,
     pub rank: MemoryRank,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct QueryVectorSearchCompletion {
-    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -174,19 +168,19 @@ impl QueryVectorModule {
 
         let lutum = self.llm.lutum().await;
         let outcome = session
-            .structured_turn::<QueryVectorSearchCompletion>(&lutum)
+            .text_turn(&lutum)
             .tools::<QueryVectorTools>()
             .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
             .require_tool(QueryVectorToolsSelector::SearchVectorMemory)
             .collect()
             .await
-            .context("query-vector structured turn failed")?;
+            .context("query-vector text turn failed")?;
 
         match outcome {
-            StructuredStepOutcomeWithTools::Finished(_) => {
+            TextStepOutcomeWithTools::Finished(_) => {
                 anyhow::bail!("query-vector completed without calling search_vector_memory");
             }
-            StructuredStepOutcomeWithTools::NeedsTools(round) => {
+            TextStepOutcomeWithTools::NeedsTools(round) => {
                 if round.tool_calls.is_empty() {
                     anyhow::bail!("query-vector produced no valid search_vector_memory tool calls");
                 }

@@ -19,6 +19,9 @@ You wake on memo updates. Use blackboard memos, the cognition log, current alloc
 registry schema to write guidance-based allocation for registered modules.
 Return one allocation entry for every registered module. Use guidance to tell modules what work
 should be done now and what other module work should be considered. Do not invent module ids.
+The memo field is a free-form controller note for the shared memo surface; preserve the reasoning
+needed by other modules, but do not encode that memo text as JSON, YAML, a code block, or any fixed
+schema.
 
 Speech output is driven by a typed SpeakRequest from speak-gate to speak, not by allocation
 guidance. Do not use speak guidance as a speech protocol. Keep speak and speak-gate active because

@@ -20,12 +20,13 @@ This document is the implementation source of truth. It describes the desired ar
 9. **No periodic activation** — Modules wake from typed channels only. Controller guidance in `ResourceAllocation` replaces period/cadence fields; modules decide from allocation guidance whether an allocation wake should produce work or remain silent.
 10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. `QueryRequest` and `SelfModelRequest` are internal module messages; eval may publish them only from module-level harnesses.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
-12. **Streaming for user-visible output, collect for internal decisions** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules (structured decision turns and tool loops) use `.collect()` because their output is memo-authoritative and has no value until complete and validated. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
+12. **Streaming for user-visible output, collect for internal work** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules use `.collect()` for control decisions, tool loops, and complete free-form notes written through `Memo`. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
 13. **SpeakRequest-only interruption of speak streaming** — Speak streaming is cancelled only by a new typed `SpeakRequest`. Cognition-log updates wake SpeakGate, which reads scheduler-owned module status plus utterance progress and decides whether the new cognition log warrants sending a replacement request.
 14. **Local deterministic inbox batching** — Modules may batch transient inbox activations immediately before LLM work. Batching is module-local, bounded by boot-time module registration, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership.
 15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
 16. **Controller proposals with deterministic effective allocation** — Attention-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, computes active replicas from each module's boot-time cap range, then applies `RuntimePolicy` hard limits such as max total active replicas and max Premium replicas.
 17. **Registry-derived controller schema** — The attention-controller structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
+18. **Free-form memos** — `Memo` content is a global-workspace surface for durable module notes. It is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Structured output is reserved for runtime control decisions whose fields are read by code.
 
 ---
 
@@ -580,17 +581,15 @@ Fetches related memory contents and merges redundant entries while accumulating 
 
 Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `LlmAccess`.
 
-Activates on cognition-log updates. Uses an LLM to generate predictions about the likely near-future states of current cognition-log targets, with allocation guidance in context. Subjects are inferred from all active cognition log entries and may include external entities, conversational trajectory, or the agent's own mental state when attention-schema cognition-log entries report self-directed attention. Each prediction entry includes the target subject, predicted state, and an estimated validity horizon. Writes all predictions to this replica's memo.
+Activates on cognition-log updates. Uses an LLM to generate free-form predictions about the likely near-future states of current cognition-log targets, with allocation guidance in context. Subjects are inferred from all active cognition log entries and may include external entities, conversational trajectory, or the agent's own mental state when attention-schema cognition-log entries report self-directed attention. The memo should preserve the target subject, predicted state, estimated validity horizon, and rationale for each useful prediction without imposing a schema.
 
 Predict does not detect divergence and does not write memory.
-
-The v1 prediction memo schema is local to the predict module: a rationale plus entries containing subject, predicted state, validity horizon, and rationale.
 
 ### Surprise
 
 Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `MemoryRequestMailbox`, `LlmAccess`.
 
-Activates on each cognition-log update. Uses an LLM to assess whether the updated cognition log is expected or surprising, with allocation guidance in context. When predict memos are available in the blackboard, the assessment is framed as divergence from pending predictions. When predict is absent, the assessment is framed as novelty from recent cognition-log history alone. It writes the assessment to this replica's memo.
+Activates on each cognition-log update. Uses an LLM to assess whether the updated cognition log is expected or surprising, with allocation guidance in context. When predict memos are available in the blackboard, the assessment is framed as divergence from pending predictions. When predict is absent, the assessment is framed as novelty from recent cognition-log history alone. Runtime reads the `significant` and `memory_request` decision fields for preservation side effects, then writes the same assessment information to this replica's free-form memo.
 
 Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes a `MemoryRequest` as a candidate for the memory module rather than writing memory directly.
 
@@ -612,7 +611,7 @@ Speak reads only the cognition-log set and a typed `SpeakRequest` — it has no 
 
 Speak has no decision turn. It waits on `SpeakInbox`; receiving a `SpeakRequest` starts a generation turn. If multiple requests are queued, the latest request wins. During `text_turn().stream()`, each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()` and mirrored into utterance progress as the current partial utterance. The only stream-cancel path is receiving another `SpeakRequest`; cognition-log updates cannot cancel speak directly.
 
-Speak does not publish query or self-model requests. If an external observation has entered the cognition log but supporting work has not completed, SpeakGate may publish explicit evidence requests during its decision turn, records its wait decision in memo, and then waits for a later cognition-log update rather than polling for completion. A completed utterance memo wakes the controller as ordinary output context, but speech start itself is not controlled through memo JSON or allocation guidance.
+Speak does not publish query or self-model requests. If an external observation has entered the cognition log but supporting work has not completed, SpeakGate may publish explicit evidence requests during its decision turn, records its wait decision in memo, and then waits for a later cognition-log update rather than polling for completion. A completed utterance memo wakes the controller as ordinary output context, but speech start itself is not controlled through memo structure, memo JSON, or allocation guidance.
 
 ---
 
@@ -628,7 +627,7 @@ Tool loops are written directly by each module so tool availability, round limit
 
 - the turn produces a structured decision (`structured_turn::<T>().collect()`) — output is only useful once complete and schema-validated,
 - the turn is part of a tool loop (`text_turn().tools::<T>().collect()`) — each round must complete before tool results can be committed,
-- the result is written directly to durable internal state such as a `Memo` slot or cognition-log entry — there is no consumer of partial output.
+- the result is written directly to durable internal state such as free-form `Memo` text or a cognition-log entry — there is no consumer of partial output.
 
 cognition-gate, attention-controller, attention-schema, self-model, query-vector, query-agentic, memory, and memory-compaction use `.collect()` exclusively.
 

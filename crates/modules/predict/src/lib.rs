@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::Session;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
     Memo, Module,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 mod batch;
 
@@ -14,22 +12,10 @@ const SYSTEM_PROMPT: &str = r#"You are the predict module.
 Maintain forward predictions about the current cognition-log targets.
 Generate predictions only; do not assess whether earlier predictions were correct and do not
 request memory writes. Keep predictions concise, grounded in the current cognition log and
-blackboard context. Return only raw JSON for the structured object; do not wrap it in Markdown or
-code fences."#;
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PredictionMemo {
-    pub predictions: Vec<PredictionEntry>,
-    pub rationale: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PredictionEntry {
-    pub subject: String,
-    pub predicted_state: String,
-    pub validity_horizon: String,
-    pub rationale: String,
-}
+blackboard context.
+Write the memo as free-form prose. For each useful prediction, preserve the subject, predicted
+state, validity horizon, and rationale, but do not encode the memo as JSON, YAML, a code block, or
+any fixed schema."#;
 
 pub struct PredictModule {
     owner: nuillu_module::ModuleId,
@@ -101,17 +87,14 @@ impl PredictModule {
         );
 
         let result = session
-            .structured_turn::<PredictionMemo>(&self.llm.lutum().await)
+            .text_turn(&self.llm.lutum().await)
             .collect()
             .await
-            .context("predict structured turn failed")?;
-
-        let StructuredTurnOutcome::Structured(prediction) = result.semantic else {
-            anyhow::bail!("predict structured turn refused");
-        };
-
-        let serialized = serde_json::to_string(&prediction).context("serialize predict memo")?;
-        self.memo.write(serialized).await;
+            .context("predict text turn failed")?;
+        let memo = result.assistant_text();
+        if !memo.trim().is_empty() {
+            self.memo.write(memo).await;
+        }
         Ok(())
     }
 }
