@@ -278,16 +278,35 @@ impl SensoryDetailRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SpeakRequest {
+    pub target: String,
     pub generation_hint: String,
     pub rationale: String,
 }
 
 impl SpeakRequest {
-    pub fn new(generation_hint: impl Into<String>, rationale: impl Into<String>) -> Self {
-        Self {
+    pub fn new(
+        target: impl Into<String>,
+        generation_hint: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Self {
+        Self::try_new(target, generation_hint, rationale)
+            .expect("speak request target must be non-empty")
+    }
+
+    pub fn try_new(
+        target: impl Into<String>,
+        generation_hint: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Option<Self> {
+        let target = target.into().trim().to_owned();
+        if target.is_empty() {
+            return None;
+        }
+        Some(Self {
+            target,
             generation_hint: generation_hint.into(),
             rationale: rationale.into(),
-        }
+        })
     }
 }
 
@@ -438,12 +457,17 @@ mod tests {
         let mut speak = scoped(&caps, builtin::speak(), 0).speak_inbox();
 
         publisher
-            .publish(SpeakRequest::new("answer the attended peer", "ready"))
+            .publish(SpeakRequest::new(
+                "Koro",
+                "answer the attended peer",
+                "ready",
+            ))
             .await
             .expect("speak subscriber exists");
 
         let envelope = speak.next_item().await.expect("speak receives request");
         assert_eq!(envelope.sender.module, builtin::speak_gate());
+        assert_eq!(envelope.body.target, "Koro");
         assert_eq!(envelope.body.generation_hint, "answer the attended peer");
         assert_eq!(envelope.body.rationale, "ready");
     }

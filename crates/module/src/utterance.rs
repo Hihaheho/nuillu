@@ -7,6 +7,11 @@ use nuillu_types::ModuleInstanceId;
 
 use crate::ports::{Clock, Utterance, UtteranceDelta, UtteranceSink};
 
+fn normalized_target(target: impl Into<String>) -> Option<String> {
+    let target = target.into().trim().to_owned();
+    (!target.is_empty()).then_some(target)
+}
+
 /// Write capability for emitting user-visible utterances.
 ///
 /// Stamps `emitted_at` from the injected [`Clock`] so the timestamp is
@@ -42,9 +47,14 @@ impl UtteranceWriter {
         id
     }
 
-    pub async fn emit(&self, text: impl Into<String>) {
+    pub async fn emit(&self, target: impl Into<String>, text: impl Into<String>) {
+        let Some(target) = normalized_target(target) else {
+            tracing::warn!("utterance sink complete skipped empty target");
+            return;
+        };
         let utterance = Utterance {
             sender: self.owner.clone(),
+            target,
             text: text.into(),
             emitted_at: self.clock.now(),
         };
@@ -53,9 +63,20 @@ impl UtteranceWriter {
         }
     }
 
-    pub async fn emit_delta(&self, generation_id: u64, sequence: u32, delta: impl Into<String>) {
+    pub async fn emit_delta(
+        &self,
+        target: impl Into<String>,
+        generation_id: u64,
+        sequence: u32,
+        delta: impl Into<String>,
+    ) {
+        let Some(target) = normalized_target(target) else {
+            tracing::warn!("utterance sink delta skipped empty target");
+            return;
+        };
         let delta = UtteranceDelta {
             sender: self.owner.clone(),
+            target,
             generation_id,
             sequence,
             delta: delta.into(),

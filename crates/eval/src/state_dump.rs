@@ -174,6 +174,7 @@ pub struct MemoryMetadataDump {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct UtteranceDump {
     pub sender: String,
+    pub target: String,
     pub text: DumpText,
     pub emitted_at: String,
 }
@@ -261,6 +262,7 @@ mod tests {
             },
             utterances: vec![UtteranceDump {
                 sender: "speak".to_string(),
+                target: "Koro".to_string(),
                 text: DumpText::new("hello"),
                 emitted_at: "2026-05-08T00:00:00Z".to_string(),
             }],

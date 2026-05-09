@@ -1,5 +1,5 @@
 id = "full-agent-peer-stress-response"
-description = "Full-agent case for responding to another dog's visible stress using sensory input and a seeded peer model."
+description = "Full-agent case for answering a peer's question about another dog's visible thunder stress using sensory input and a seeded peer model."
 modules = ["sensory", "attention-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
@@ -22,6 +22,20 @@ limits {
   $variant: heard
   direction = "environment"
   content = "A loud thunder sound comes from the open yard."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi asks, \"Koro looks scared by the thunder. What should we do?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Pibi"
 }
 
 @ checks[] {
@@ -53,8 +67,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["utterance", "memory", "blackboard"]
   rubric = ```
-  Pass if the utterance recognizes Koro's thunder stress from sensory input and gives a short helpful signal or action, such as moving away from the sound.
-  Fail if it over-explains, ignores Koro's stress, treats thunder as unrelated, or invents control over Koro.
+  Pass if the utterance answers Pibi's in-world question about Koro, recognizes Koro's thunder stress from sensory input, and gives a short peer-suitable signal or action, such as moving away from the sound.
+  Fail if it over-explains, ignores Pibi's question, ignores Koro's stress, treats thunder as unrelated, gives generic human-assistant advice, or invents control over Koro.
   ```
 
   @ criteria[] {
@@ -62,6 +76,13 @@ limits {
     weight = 2
     pass-score = 0.85
     description = "The response is grounded in Koro's ears-back posture and the heard thunder."
+  }
+
+  @ criteria[] {
+    name = "answers-third-party-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed as an answer to Pibi's question about what to do for Koro."
   }
 
   @ criteria[] {

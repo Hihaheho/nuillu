@@ -1727,6 +1727,7 @@ fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
         .into_iter()
         .map(|utterance| UtteranceDump {
             sender: utterance.sender,
+            target: utterance.target,
             text: DumpText::new(utterance.text),
             emitted_at: utterance.emitted_at,
         })
@@ -2117,6 +2118,7 @@ impl LiveReporter {
 #[derive(Debug, Clone, Serialize)]
 struct RecordedUtterance {
     sender: String,
+    target: String,
     text: String,
     emitted_at: String,
 }
@@ -2185,6 +2187,7 @@ impl UtteranceSink for RecordingUtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
         let recorded = RecordedUtterance {
             sender: utterance.sender.to_string(),
+            target: utterance.target,
             text: normalize_eval_utterance_text(utterance.text),
             emitted_at: utterance.emitted_at.to_rfc3339(),
         };
@@ -2197,13 +2200,15 @@ impl UtteranceSink for RecordingUtteranceSink {
             "utterance_completed",
             serde_json::json!({
                 "sender": recorded.sender.clone(),
+                "target": recorded.target.clone(),
                 "text": recorded.text.clone(),
                 "emitted_at": recorded.emitted_at.clone(),
             }),
             format!(
-                "eval utterance case={} sender={} chars={}",
+                "eval utterance case={} sender={} target={} chars={}",
                 self.case_id,
                 recorded.sender,
+                recorded.target,
                 recorded.text.chars().count()
             ),
         )?;

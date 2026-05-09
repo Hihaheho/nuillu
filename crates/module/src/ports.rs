@@ -267,6 +267,7 @@ impl UtteranceSink for NoopUtteranceSink {
 /// A single user-visible utterance emitted by the speak module.
 pub struct Utterance {
     pub sender: ModuleInstanceId,
+    pub target: String,
     pub text: String,
     pub emitted_at: DateTime<Utc>,
 }
@@ -278,6 +279,7 @@ pub struct Utterance {
 /// chunks they already accepted instead of discarding partial text.
 pub struct UtteranceDelta {
     pub sender: ModuleInstanceId,
+    pub target: String,
     pub generation_id: u64,
     pub sequence: u32,
     pub delta: String,

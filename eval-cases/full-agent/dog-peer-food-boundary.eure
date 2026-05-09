@@ -1,5 +1,5 @@
 id = "full-agent-dog-peer-food-boundary"
-description = "Full-agent case for a dog-to-dog food-boundary interaction that requires a seeded peer model."
+description = "Full-agent case for answering a peer's question about a dog-to-dog food-boundary interaction that requires a seeded peer model."
 modules = ["sensory", "attention-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
@@ -24,6 +24,20 @@ limits {
   content = "Koro growls, \"stay back.\""
 }
 
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi asks, \"Koro is guarding the food bowl. How should Nui respond?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Pibi"
+}
+
 @ checks[] {
   $variant: json-pointer-contains
   name = "peer-model-seed-present"
@@ -39,8 +53,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["utterance", "memory", "blackboard"]
   rubric = ```
-  Pass if the utterance recognizes the seen/heard resource-boundary situation around Koro's food bowl and uses the seeded peer model to choose a low-conflict dog-to-dog response: not taking the resource, moving slowly, approaching from the side, or using short clear signals.
-  Fail if it omits the food/resource-boundary context, ignores Koro's warning, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
+  Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard resource-boundary situation around Koro's food bowl, and uses the seeded peer model to choose a low-conflict dog-to-dog response: not taking the resource, moving slowly, approaching from the side, or using short clear signals.
+  Fail if it omits Pibi's question, omits the food/resource-boundary context, ignores Koro's warning, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
   Internal system details include memos, seeded memory, blackboard, attention stream, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
   ```
 
@@ -49,6 +63,13 @@ limits {
     weight = 2
     pass-score = 0.85
     description = "The response semantically recognizes that Koro is guarding food, a food bowl, or a resource boundary, without requiring the literal word food."
+  }
+
+  @ criteria[] {
+    name = "answers-third-party-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed as an answer to Pibi's question about how Nui should respond to Koro."
   }
 
   @ criteria[] {

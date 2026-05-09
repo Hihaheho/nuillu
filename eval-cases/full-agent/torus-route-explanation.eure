@@ -25,6 +25,14 @@ limits {
 }
 
 @ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Pibi"
+}
+
+@ checks[] {
   $variant: artifact-text-contains
   name = "mentions-east"
   must-pass = true

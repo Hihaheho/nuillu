@@ -269,12 +269,14 @@ Speech actions are app-facing port writes rather than channel messages:
 ```rust
 pub struct Utterance {
     pub sender: ModuleInstanceId,
+    pub target: String,
     pub text: String,
     pub emitted_at: DateTime<Utc>,
 }
 
 pub struct UtteranceDelta {
     pub sender: ModuleInstanceId,
+    pub target: String,
     pub generation_id: u64, // increments on each new generation attempt (interruption or retry)
     pub sequence: u32,      // monotone within a generation
     pub delta: String,
@@ -285,8 +287,8 @@ pub struct UtteranceDelta {
 
 `UtteranceWriter` exposes three methods:
 
-- `emit(text)` — stamps `emitted_at`, owner, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
-- `emit_delta(generation_id, sequence, delta)` — sends a `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
+- `emit(target, text)` — stamps `emitted_at`, owner, target, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
+- `emit_delta(target, generation_id, sequence, delta)` — sends a targeted `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
 - `record_progress(progress)` — owner-stamps the latest utterance progress on the blackboard so SpeakGate can inspect partial speech while deciding whether a replacement `SpeakRequest` is needed.
 
 `UtteranceDelta` carries no durability semantics. When generation is interrupted by an LLM retry, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Speak cancels a current stream only when it receives a newer typed `SpeakRequest`; attention updates wake SpeakGate, which may send that replacement request after inspecting module status and utterance progress. Sinks append resumed retry chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.

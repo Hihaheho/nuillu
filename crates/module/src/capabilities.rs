@@ -1166,6 +1166,7 @@ mod tests {
             .record_progress(UtteranceProgress::streaming(
                 7,
                 2,
+                "Koro",
                 "Koro, wait",
                 "answer Koro",
                 "peer needs response",
@@ -1177,7 +1178,14 @@ mod tests {
         assert_eq!(records[0].owner.module, builtin::speak());
         assert_eq!(
             records[0].progress,
-            UtteranceProgress::streaming(7, 2, "Koro, wait", "answer Koro", "peer needs response",)
+            UtteranceProgress::streaming(
+                7,
+                2,
+                "Koro",
+                "Koro, wait",
+                "answer Koro",
+                "peer needs response",
+            )
         );
     }
 }

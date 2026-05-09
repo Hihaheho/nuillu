@@ -201,7 +201,8 @@ Decides whether attention is ready for speech. SpeakGate is triggered only by at
 updates. When it wakes, it can read blackboard memos, the attention stream, scheduler-owned module
 status, and utterance progress, so it can distinguish memo-only facts from attended facts and decide
 whether a new attention stream should interrupt an in-progress utterance. If speech is ready or an
-in-progress stream should be replaced, it sends a typed `SpeakRequest` to Speak. If speech should
+in-progress stream should be replaced, it sends a typed `SpeakRequest` with a mandatory target to
+Speak. The target is the addressee for the utterance; self-directed speech uses `self`. If speech should
 wait, it writes the wait decision and any missing-evidence notes to its memo. It does not emit
 utterances, write attention, change allocation, or write memory. It may call evidence tools for
 memory, self-model, and sensory-detail lookup during its decision turn.
@@ -210,8 +211,8 @@ memory, self-model, and sensory-detail lookup during its decision turn.
 
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
-Speak reads the attention stream and typed `SpeakRequest`, records utterance progress while
-streaming, writes the completed utterance to its memo, and emits through `UtteranceWriter` so the
+Speak reads the attention stream and typed `SpeakRequest`, records targeted utterance progress while
+streaming, writes the completed targeted utterance to its memo, and emits through `UtteranceWriter` so the
 application or eval harness can collect the utterance as an artifact. It does not read blackboard
 memos, allocation guidance, or module status; readiness and interruption decisions are delegated to
 SpeakGate.

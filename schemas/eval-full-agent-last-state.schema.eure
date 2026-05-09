@@ -102,6 +102,7 @@ query-history = [`text`]
 
 @ $types.utterance
 sender = `text`
+target = `text`
 text = `text`
 emitted-at = `text`
 

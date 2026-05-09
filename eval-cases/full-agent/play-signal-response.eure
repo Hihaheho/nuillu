@@ -25,6 +25,14 @@ limits {
 }
 
 @ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-koro"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Koro"
+}
+
+@ checks[] {
   $variant: artifact-text-contains
   name = "identifies-play"
   must-pass = true
