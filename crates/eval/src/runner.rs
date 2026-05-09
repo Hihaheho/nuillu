@@ -33,8 +33,8 @@ use nuillu_module::ports::{
     NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
-    CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, RuntimeEvent,
-    RuntimeEventSink, RuntimePolicy, SensoryInput,
+    CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
+    RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
@@ -554,6 +554,9 @@ async fn execute_full_agent_case(
         reporter,
     )
     .await?;
+    env.caps
+        .scene()
+        .set(case.participants.iter().map(Participant::new));
     seed_memories(&env.caps, &case.memories).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
 
@@ -1377,6 +1380,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                         caps.memo(),
                         caps.speak_mailbox(),
                         caps.llm_access(),
+                        caps.scene_reader(),
                     )
                 },
             )

@@ -80,6 +80,8 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
+    pub participants: Vec<String>,
+    #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
     pub memos: Vec<MemoSeed>,

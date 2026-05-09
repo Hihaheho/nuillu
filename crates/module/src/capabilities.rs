@@ -18,6 +18,7 @@ use crate::ports::{
 };
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
+use crate::scene::{SceneReader, SceneRegistry};
 use crate::r#trait::ErasedModule;
 use crate::utterance::UtteranceWriter;
 use crate::{
@@ -65,6 +66,7 @@ struct CapabilityProvidersInner {
     runtime_events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
     runtime_policy: RuntimePolicy,
+    scene: SceneRegistry,
 }
 
 impl CapabilityProviders {
@@ -210,8 +212,18 @@ impl CapabilityProviders {
                 runtime_events,
                 rate_limiter,
                 runtime_policy: policy,
+                scene: SceneRegistry::empty(),
             }),
         }
+    }
+
+    /// Access the scene registry for host-driven participant updates.
+    ///
+    /// The host (eval harness, game runtime) calls `scene().set(...)` to
+    /// declare which participants are currently in earshot. The agent only
+    /// reads the registry, never mutates it.
+    pub fn scene(&self) -> &SceneRegistry {
+        &self.inner.scene
     }
 
     pub(crate) fn scoped(&self, owner: ModuleInstanceId) -> ModuleCapabilityFactory {
@@ -699,6 +711,10 @@ impl ModuleCapabilityFactory {
             self.root.inner.utterance_sink.clone(),
             self.root.inner.clock.clone(),
         )
+    }
+
+    pub fn scene_reader(&self) -> SceneReader {
+        SceneReader::new(self.root.inner.scene.clone())
     }
 
     pub fn clock(&self) -> Arc<dyn Clock> {

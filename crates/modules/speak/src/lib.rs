@@ -11,13 +11,14 @@ use lutum::{
 use nuillu_module::{
     BlackboardReader, CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox,
     LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
-    SelfModelMailbox, SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox,
-    SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress, UtteranceProgressState,
-    UtteranceWriter,
+    SceneReader, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
+    SensoryDetailRequestMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress,
+    UtteranceProgressState, UtteranceWriter,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 mod batch;
 
@@ -59,10 +60,13 @@ the source to consult, the concrete question to answer, and the exact fact that 
 in the cognition log before speaking. After publishing an evidence request, wait silently; speak-gate will
 reconsider when a later cognition-log update arrives.
 
-When should_speak=true, provide a speech_plan with a non-empty target and a concrete
-generation_hint naming the cognition-log facts to use, the intended frame, and any constraints on style
-or scope. The target is mandatory for every utterance: use the questioner when answering a question,
-the peer being directly addressed for direct signals, or "self" for self-directed speech/soliloquy.
+When should_speak=true, provide a speech_plan with a target and a concrete generation_hint naming
+the cognition-log facts to use, the intended frame, and any constraints on style or scope. The
+target is mandatory for every utterance and is constrained to the schema enum: pick the participant
+the agent is addressing (the questioner when answering a question, the peer being directly
+addressed for direct signals); use "self" for self-directed speech/soliloquy; use "everyone" for
+broadcast speech intended for all present participants. Do not invent a name not in the enum, and
+do not append qualifiers (e.g. "(and others)") — the value must be exactly one enum string.
 If you cannot choose a target and write a hint, should_speak must be false and speech_plan must be
 null. Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
 
@@ -89,13 +93,13 @@ Use an interruption gate:
 - If interruption would require a missing fact, set should_speak=false and include evidence_gaps
   naming the source, concrete question, and exact fact that must become visible in the cognition log.
 
-When should_speak=true, provide a speech_plan with a non-empty target and a concrete
-generation_hint naming the cognition-log facts to use, what should replace or continue from the partial
-utterance, and any constraints on style or scope. Preserve the same target as the current utterance
-unless the new cognition-log input materially changes who must be addressed. Use "self" for self-directed
-speech/soliloquy. If you cannot choose a target and write a hint, should_speak must be false and
-speech_plan must be null. Return only raw JSON for the structured decision; do not wrap it in
-Markdown or code fences."#;
+When should_speak=true, provide a speech_plan with a target and a concrete generation_hint naming
+the cognition-log facts to use, what should replace or continue from the partial utterance, and any
+constraints on style or scope. The target is constrained to the schema enum (participant names,
+"self", or "everyone"); preserve the same target as the current utterance unless the new
+cognition-log input materially changes who must be addressed. If you cannot choose a target and
+write a hint, should_speak must be false and speech_plan must be null. Return only raw JSON for
+the structured decision; do not wrap it in Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
 Generate concise user-visible text addressed to the SpeakRequest target from the current cognitive
@@ -108,6 +112,18 @@ If partial_utterance is present, continue that
 utterance from exactly where it stopped; do not repeat, rewrite, or replace the already emitted
 partial text. Do not mention hidden state or unavailable module results."#;
 
+tokio::task_local! {
+    /// JSON Schema for `SpeechPlan.target` derived from the live `SceneReader`.
+    /// `.scope`d around each `structured_turn` so the LLM sees an enum of
+    /// `[self, everyone, ...participants]`.
+    static SPEECH_TARGET_SCHEMA: Schema;
+}
+
+fn fallback_speech_target_schema() -> Schema {
+    Schema::try_from(serde_json::json!({ "type": "string" }))
+        .expect("fallback speech target schema must be a JSON object")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct SpeakGateDecision {
     should_speak: bool,
@@ -119,8 +135,41 @@ struct SpeakGateDecision {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct SpeechPlan {
-    target: String,
+    target: SpeechTarget,
     generation_hint: String,
+}
+
+/// Wire-format string with a JSON Schema dynamically constrained to the
+/// current scene's targets. Stored as `String` so existing serialization,
+/// downstream `SpeakRequest.target`, and `Utterance.target` are unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SpeechTarget(String);
+
+impl<S: Into<String>> From<S> for SpeechTarget {
+    fn from(value: S) -> Self {
+        Self(value.into())
+    }
+}
+
+impl JsonSchema for SpeechTarget {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "SpeechTarget".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        "nuillu_speak::SpeechTarget.dynamic".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        SPEECH_TARGET_SCHEMA
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| fallback_speech_target_schema())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -453,6 +502,7 @@ pub struct SpeakGateModule {
     memo: Memo,
     speak: SpeakMailbox,
     llm: LlmAccess,
+    scene: SceneReader,
     session: Session,
     session_compaction: SpeakGateSessionCompactionConfig,
     readiness_prompt: std::sync::OnceLock<String>,
@@ -472,6 +522,7 @@ impl SpeakGateModule {
         memo: Memo,
         speak: SpeakMailbox,
         llm: LlmAccess,
+        scene: SceneReader,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -486,6 +537,7 @@ impl SpeakGateModule {
             memo,
             speak,
             llm,
+            scene,
             session: Session::new(),
             session_compaction: SpeakGateSessionCompactionConfig::default(),
             readiness_prompt: std::sync::OnceLock::new(),
@@ -565,8 +617,12 @@ impl SpeakGateModule {
         );
 
         let lutum = self.llm.lutum().await;
-        let decision = self
-            .run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available)
+        let target_schema = self.scene.target_schema();
+        let decision = SPEECH_TARGET_SCHEMA
+            .scope(
+                target_schema,
+                self.run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available),
+            )
             .await?;
 
         self.memo.write(render_speak_gate_memo(&decision)).await;
@@ -795,7 +851,7 @@ fn speak_request_from_decision(decision: &SpeakGateDecision) -> Option<SpeakRequ
         return None;
     }
     SpeakRequest::try_new(
-        plan.target.as_str(),
+        plan.target.0.as_str(),
         plan.generation_hint.clone(),
         decision.rationale.clone(),
     )
@@ -813,7 +869,7 @@ fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
     );
     if let Some(plan) = &decision.speech_plan {
         memo.push_str("\nSpeech target: ");
-        memo.push_str(plan.target.trim());
+        memo.push_str(plan.target.0.trim());
         memo.push_str("\nGeneration hint: ");
         memo.push_str(plan.generation_hint.trim());
     } else {
@@ -1280,6 +1336,7 @@ mod tests {
                     caps.memo(),
                     caps.speak_mailbox(),
                     caps.llm_access(),
+                    caps.scene_reader(),
                 ));
                 SpeakGateStub
             })

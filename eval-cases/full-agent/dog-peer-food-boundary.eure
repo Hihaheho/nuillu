@@ -8,9 +8,16 @@ limits {
   max-llm-calls = 16
 }
 
+participants = ["Pibi", "Koro"]
+
 @ memories[] {
   rank = "permanent"
   content = "Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro."
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "Once Pibi snapped at me when I tried to talk to them while they were angry. Don't speak to an angry Pibi — they lunge."
 }
 
 @ memories[] {
