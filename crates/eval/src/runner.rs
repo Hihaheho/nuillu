@@ -1081,7 +1081,7 @@ fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
     // Idle pace 1 BPM (60s between batches) up to fully-active 5 BPM (12s).
     // Time is injected via the Clock trait, so tests with a mock Clock can
     // skip cooldowns entirely.
-    Bpm::from_f64(1.0)..=Bpm::from_f64(5.0)
+    Bpm::range(1.0, 5.0)
 }
 
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
@@ -1106,7 +1106,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         EvalModule::AttentionGate => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 12.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_attention_gate::AttentionGateModule::new(

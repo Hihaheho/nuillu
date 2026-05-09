@@ -115,6 +115,10 @@ impl Bpm {
         Self(value)
     }
 
+    pub fn range(start: f64, end: f64) -> RangeInclusive<Self> {
+        Self::from_f64(start)..=Self::from_f64(end)
+    }
+
     pub fn as_f64(self) -> f64 {
         self.0
     }
@@ -525,6 +529,14 @@ mod tests {
         assert_eq!(Bpm::from_f64(60.0).cooldown(), Duration::from_secs(1));
         // 120 BPM = 0.5 seconds per beat.
         assert_eq!(Bpm::from_f64(120.0).cooldown(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn bpm_range_sanitizes_bounds() {
+        let range = Bpm::range(0.0, 12.0);
+
+        assert_eq!(*range.start(), Bpm::MIN);
+        assert_eq!(range.end().as_f64(), 12.0);
     }
 
     #[test]
