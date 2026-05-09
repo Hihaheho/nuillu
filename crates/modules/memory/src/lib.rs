@@ -61,8 +61,7 @@ impl MemoryModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("memory id is valid"),
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
             attention_updates,
             requests,
             allocation,
@@ -201,11 +200,11 @@ mod tests {
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
+    use nuillu_blackboard::{Bpm, linear_ratio_fn};
     use nuillu_module::ports::{
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NoopAttentionRepository,
         NoopFileSearchProvider, NoopUtteranceSink, PortError, SystemClock,
     };
-    use nuillu_blackboard::{Bpm, linear_ratio_fn};
     use nuillu_module::{
         AttentionStreamUpdated, CapabilityProviders, LutumTiers, MemoryImportance,
         MemoryRequestMailbox, ModuleRegistry,

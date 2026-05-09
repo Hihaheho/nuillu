@@ -1087,162 +1087,227 @@ fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
     match module {
         EvalModule::Sensory => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_sensory::SensoryModule::new(
-                    caps.sensory_input_inbox(),
-                    caps.sensory_detail_inbox(),
-                    caps.allocation_reader(),
-                    caps.memo(),
-                    caps.clock(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_sensory::SensoryModule::new(
+                        caps.sensory_input_inbox(),
+                        caps.sensory_detail_inbox(),
+                        caps.allocation_reader(),
+                        caps.memo(),
+                        caps.clock(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::AttentionGate => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_attention_gate::AttentionGateModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.attention_writer(),
-                    caps.time_division(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_attention_gate::AttentionGateModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        caps.attention_writer(),
+                        caps.time_division(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::AttentionController => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_attention_controller::AttentionControllerModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.attention_reader(),
-                    caps.allocation_reader(),
-                    caps.allocation_writer(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_attention_controller::AttentionControllerModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.attention_reader(),
+                        caps.allocation_reader(),
+                        caps.allocation_writer(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::AttentionSchema => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_attention_schema::AttentionSchemaModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_attention_schema::AttentionSchemaModule::new(
+                        caps.attention_stream_updated_inbox(),
+                        caps.attention_reader(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::SelfModel => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_self_model::SelfModelModule::new(
-                    caps.self_model_inbox(),
-                    caps.blackboard_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_self_model::SelfModelModule::new(
+                        caps.self_model_inbox(),
+                        caps.blackboard_reader(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::QueryVector => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_query_vector::QueryVectorModule::new(
-                    caps.query_inbox(),
-                    caps.attention_stream_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.vector_memory_searcher(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_query_vector::QueryVectorModule::new(
+                        caps.query_inbox(),
+                        caps.attention_stream_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.vector_memory_searcher(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::QueryAgentic => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_query_agentic::QueryAgenticModule::new(
-                    caps.query_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.file_searcher(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_query_agentic::QueryAgenticModule::new(
+                        caps.query_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.file_searcher(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Memory => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_memory::MemoryModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.memory_request_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_writer(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_memory::MemoryModule::new(
+                        caps.attention_stream_updated_inbox(),
+                        caps.memory_request_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.memory_writer(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::MemoryCompaction => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_memory_compaction::MemoryCompactionModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_compactor(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_memory_compaction::MemoryCompactionModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.memory_compactor(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Predict => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_predict::PredictModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_predict::PredictModule::new(
+                        caps.attention_stream_updated_inbox(),
+                        caps.attention_reader(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Surprise => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_surprise::SurpriseModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_request_mailbox(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_surprise::SurpriseModule::new(
+                        caps.attention_stream_updated_inbox(),
+                        caps.attention_reader(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.memory_request_mailbox(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::SpeakGate => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_speak::SpeakGateModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
-                    caps.blackboard_reader(),
-                    caps.module_status_reader(),
-                    caps.query_mailbox(),
-                    caps.self_model_mailbox(),
-                    caps.sensory_detail_mailbox(),
-                    caps.memo(),
-                    caps.speak_mailbox(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_speak::SpeakGateModule::new(
+                        caps.attention_stream_updated_inbox(),
+                        caps.attention_reader(),
+                        caps.blackboard_reader(),
+                        caps.module_status_reader(),
+                        caps.query_mailbox(),
+                        caps.self_model_mailbox(),
+                        caps.sensory_detail_mailbox(),
+                        caps.memo(),
+                        caps.speak_mailbox(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Speak => registry
-            .register(eval_replicas(0), eval_bpm_range(), linear_ratio_fn, |caps| {
-                nuillu_speak::SpeakModule::new(
-                    caps.speak_inbox(),
-                    caps.attention_reader(),
-                    caps.memo(),
-                    caps.utterance_writer(),
-                    caps.llm_access(),
-                )
-            })
+            .register(
+                eval_replicas(0),
+                eval_bpm_range(),
+                linear_ratio_fn,
+                |caps| {
+                    nuillu_speak::SpeakModule::new(
+                        caps.speak_inbox(),
+                        caps.attention_reader(),
+                        caps.memo(),
+                        caps.utterance_writer(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
     }
 }

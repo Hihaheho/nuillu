@@ -27,7 +27,11 @@ impl Clock for InstantSleepClock {
 }
 
 pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
-    test_caps_inner(blackboard, RuntimePolicy::default(), Arc::new(InstantSleepClock))
+    test_caps_inner(
+        blackboard,
+        RuntimePolicy::default(),
+        Arc::new(InstantSleepClock),
+    )
 }
 
 pub(crate) fn test_caps_with_policy(

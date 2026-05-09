@@ -423,9 +423,7 @@ fn spawn_batch_cooldown(
         async move {
             let started = clock.now();
             clock.sleep_until(deadline).await;
-            let delayed_for = (clock.now() - started)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
             TaskMessage::BatchCooldownExpired {
                 index,
                 module,

@@ -86,8 +86,7 @@ impl AttentionControllerModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id())
-                .expect("attention-controller id is valid"),
+            owner: ModuleId::new(<Self as Module>::id()).expect("attention-controller id is valid"),
             updates,
             blackboard,
             attention,

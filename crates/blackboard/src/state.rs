@@ -717,7 +717,11 @@ impl BlackboardInner {
             .keys()
             .cloned()
             .chain(self.base_allocation.iter().map(|(id, _)| id.clone()))
-            .chain(self.base_allocation.iter_activation().map(|(id, _)| id.clone()))
+            .chain(
+                self.base_allocation
+                    .iter_activation()
+                    .map(|(id, _)| id.clone()),
+            )
             .collect();
 
         let mut effective = ResourceAllocation::default();

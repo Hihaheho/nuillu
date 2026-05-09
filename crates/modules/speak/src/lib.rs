@@ -609,8 +609,7 @@ impl SpeakModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("speak id is valid"),
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("speak id is valid"),
             requests,
             attention,
             memo,
@@ -638,7 +637,10 @@ impl SpeakModule {
 
         loop {
             self.record_streaming_progress(&draft).await;
-            match self.stream_generation(cx, attention_json, &mut draft).await? {
+            match self
+                .stream_generation(cx, attention_json, &mut draft)
+                .await?
+            {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
                     attention_json = self.attention.snapshot().await.compact_json();
@@ -658,7 +660,12 @@ impl SpeakModule {
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         let mut session = Session::new();
-        push_generation_context(&mut session, attention_json, draft, self.generation_prompt(cx));
+        push_generation_context(
+            &mut session,
+            attention_json,
+            draft,
+            self.generation_prompt(cx),
+        );
 
         let lutum = self.llm.lutum().await;
         let mut stream = session

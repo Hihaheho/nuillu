@@ -512,7 +512,10 @@ mod tests {
         let one_extra = linear_policy(0, 1);
         assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ZERO), 1);
         // Half of 1 rounds up to 1 extra → 2 total.
-        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::from_f64(0.5)), 2);
+        assert_eq!(
+            one_extra.active_replicas_for(ReplicasRatio::from_f64(0.5)),
+            2
+        );
         assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ONE), 2);
     }
 
