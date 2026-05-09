@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, ToolResult};
+use lutum::{Session, StructuredStepOutcomeWithTools};
 use nuillu_module::{
     AllocationReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
     QueryInbox, QueryRequest, VectorMemorySearcher,
@@ -18,12 +18,13 @@ If the question contains allocation guidance or a speak-gate evidence request, s
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
 phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
 question is available.
+You may call search_vector_memory multiple times in the same turn when the input contains multiple
+distinct questions or evidence requests. Prefer multiple targeted searches in one turn over broad
+generic searches or later follow-up turns.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
-results. You must call search_vector_memory before returning the structured completion. The runtime
-memoizes only memory hit content returned by tools. Return only raw JSON for the structured
-completion; do not wrap JSON in Markdown or code fences."#;
-
-const MAX_QUERY_ROUNDS: usize = 4;
+results. You must call search_vector_memory. The runtime memoizes only memory hit content returned
+by tools; no final structured completion is needed after tool calls. Do not wrap output in Markdown
+or code fences."#;
 
 #[lutum::tool_input(name = "search_vector_memory", output = SearchVectorMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -167,52 +168,36 @@ impl QueryVectorModule {
             .to_string(),
         );
 
-        let mut all_hits = Vec::new();
-        for _ in 0..MAX_QUERY_ROUNDS {
-            let lutum = self.llm.lutum().await;
-            let turn = session
-                .structured_turn::<QueryVectorSearchCompletion>(&lutum)
-                .tools::<QueryVectorTools>()
-                .available_tools([QueryVectorToolsSelector::SearchVectorMemory]);
-            let turn = if all_hits.is_empty() {
-                turn.require_tool(QueryVectorToolsSelector::SearchVectorMemory)
-            } else {
-                turn
-            };
-            let outcome = turn
-                .collect()
-                .await
-                .context("query-vector structured turn failed")?;
+        let lutum = self.llm.lutum().await;
+        let outcome = session
+            .structured_turn::<QueryVectorSearchCompletion>(&lutum)
+            .tools::<QueryVectorTools>()
+            .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
+            .require_tool(QueryVectorToolsSelector::SearchVectorMemory)
+            .collect()
+            .await
+            .context("query-vector structured turn failed")?;
 
-            match outcome {
-                StructuredStepOutcomeWithTools::Finished(result) => {
-                    let StructuredTurnOutcome::Structured(_completion) = result.semantic else {
-                        anyhow::bail!("query-vector search completion refused");
-                    };
-                    return Ok(all_hits);
+        match outcome {
+            StructuredStepOutcomeWithTools::Finished(_) => {
+                anyhow::bail!("query-vector completed without calling search_vector_memory");
+            }
+            StructuredStepOutcomeWithTools::NeedsTools(round) => {
+                if round.tool_calls.is_empty() {
+                    anyhow::bail!("query-vector produced no valid search_vector_memory tool calls");
                 }
-                StructuredStepOutcomeWithTools::NeedsTools(round) => {
-                    let mut tool_results: Vec<ToolResult> = Vec::new();
-                    for call in round.tool_calls.iter().cloned() {
-                        let QueryVectorToolsCall::SearchVectorMemory(call) = call;
-                        let output = self
-                            .search_vector_memory(call.input.clone())
-                            .await
-                            .context("run search_vector_memory tool")?;
-                        all_hits.extend(output.hits.clone());
-                        let result = call
-                            .complete(output)
-                            .context("complete search_vector_memory tool call")?;
-                        tool_results.push(result);
-                    }
-                    round
-                        .commit(&mut session, tool_results)
-                        .context("commit query-vector tool round")?;
+                let mut all_hits = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    let QueryVectorToolsCall::SearchVectorMemory(call) = call;
+                    let output = self
+                        .search_vector_memory(call.input.clone())
+                        .await
+                        .context("run search_vector_memory tool")?;
+                    all_hits.extend(output.hits);
                 }
+                Ok(all_hits)
             }
         }
-
-        Ok(all_hits)
     }
 
     async fn search_vector_memory(
