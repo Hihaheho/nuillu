@@ -10,7 +10,10 @@ use nuillu_module::ports::{
     Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
     SystemClock,
 };
-use nuillu_module::{CapabilityProviders, LutumTiers, RuntimePolicy};
+use nuillu_module::{
+    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+    CapabilityProviders, LutumTiers, RuntimePolicy,
+};
 
 /// Test clock whose `now()` is the wall clock but whose `sleep_until` returns
 /// immediately. Cooldown deadlines and idle timers don't block test
@@ -49,20 +52,24 @@ fn test_caps_inner(
     let adapter = Arc::new(MockLlmAdapter::new());
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
     let lutum = Lutum::new(adapter, budget);
-    CapabilityProviders::new_with_runtime_policy(
-        blackboard,
-        Arc::new(NoopCognitionLogRepository),
-        Arc::new(NoopMemoryStore),
-        Vec::new(),
-        Arc::new(NoopFileSearchProvider),
-        Arc::new(NoopUtteranceSink),
-        clock,
-        LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
+    CapabilityProviders::new(CapabilityProviderConfig {
+        ports: CapabilityProviderPorts {
+            blackboard,
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store: Arc::new(NoopMemoryStore),
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider),
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock,
+            tiers: LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
         },
-        Arc::new(nuillu_module::NoopRuntimeEventSink),
-        policy,
-    )
+        runtime: CapabilityProviderRuntime {
+            policy,
+            ..CapabilityProviderRuntime::default()
+        },
+    })
 }

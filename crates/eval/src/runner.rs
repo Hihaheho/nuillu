@@ -33,6 +33,7 @@ use nuillu_module::ports::{
     NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
+    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
     RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
 };
@@ -863,18 +864,22 @@ async fn build_eval_environment(
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
         ..RuntimePolicy::default()
     };
-    let caps = CapabilityProviders::new_with_runtime_policy(
-        blackboard.clone(),
-        Arc::new(InMemoryCognitionLogRepository::new()),
-        memory.clone(),
-        Vec::new(),
-        file_search,
-        utterances.clone(),
-        clock.clone(),
-        tiers,
-        events.clone(),
-        runtime_policy,
-    );
+    let caps = CapabilityProviders::new(CapabilityProviderConfig {
+        ports: CapabilityProviderPorts {
+            blackboard: blackboard.clone(),
+            cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
+            primary_memory_store: memory.clone(),
+            memory_replicas: Vec::new(),
+            file_search,
+            utterance_sink: utterances.clone(),
+            clock: clock.clone(),
+            tiers,
+        },
+        runtime: CapabilityProviderRuntime {
+            event_sink: events.clone(),
+            policy: runtime_policy,
+        },
+    });
 
     Ok(EvalEnvironment {
         blackboard,
@@ -2599,20 +2604,20 @@ mod tests {
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        CapabilityProviders::new(
+        CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
-            Arc::new(NoopCognitionLogRepository),
-            Arc::new(NoopMemoryStore),
-            Vec::new(),
-            Arc::new(NoopFileSearchProvider),
-            Arc::new(NoopUtteranceSink),
-            Arc::new(SystemClock),
-            LutumTiers {
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store: Arc::new(NoopMemoryStore),
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider),
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
                 premium: lutum,
             },
-        )
+        })
     }
 
     fn attention_schema_tool_scenario(tool_call_id: &str, text: &str) -> MockTextScenario {

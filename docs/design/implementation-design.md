@@ -487,18 +487,20 @@ The boot layer injects time through `CapabilityProviders`:
 
 ```rust
 let caps = CapabilityProviders::new(
-    blackboard,
-    cognition_log_port,
-    primary_memory_store,
-    memory_replicas,
-    file_search,
-    utterance_sink,
-    Arc::new(SystemClock),
-    tiers,
+    CapabilityProviderPorts {
+        blackboard,
+        cognition_log_port,
+        primary_memory_store,
+        memory_replicas,
+        file_search,
+        utterance_sink,
+        clock: Arc::new(SystemClock),
+        tiers,
+    },
 );
 
-// Eval/sandbox boot may instead pass:
-let caps = CapabilityProviders::new(..., Arc::new(FixedClock::new(observed_now)), tiers);
+// Eval/sandbox boot uses the same field with a fixed clock:
+// clock: Arc::new(FixedClock::new(observed_now)),
 ```
 
 `CapabilityProviders` stores `Arc<dyn Clock>` and exposes `clock()` for modules that need current time. Capability handles that stamp time, such as `CognitionWriter` and `UtteranceWriter`, also receive the same clock. This keeps sandboxed eval deterministic and avoids direct `Utc::now()` calls in module code.

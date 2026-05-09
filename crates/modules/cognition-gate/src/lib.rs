@@ -443,7 +443,9 @@ mod tests {
         NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
         SystemClock,
     };
-    use nuillu_module::{CapabilityProviders, LutumTiers, Memo, ModuleRegistry};
+    use nuillu_module::{
+        CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
+    };
     use nuillu_types::builtin;
 
     use super::*;
@@ -455,20 +457,20 @@ mod tests {
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        CapabilityProviders::new(
+        CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
-            Arc::new(NoopCognitionLogRepository),
-            Arc::new(NoopMemoryStore),
-            Vec::new(),
-            Arc::new(NoopFileSearchProvider),
-            Arc::new(NoopUtteranceSink),
-            Arc::new(SystemClock),
-            LutumTiers {
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store: Arc::new(NoopMemoryStore),
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider),
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
                 premium: lutum,
             },
-        )
+        })
     }
 
     fn test_allocation() -> ResourceAllocation {

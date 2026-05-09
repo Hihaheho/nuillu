@@ -212,8 +212,8 @@ mod tests {
         SystemClock,
     };
     use nuillu_module::{
-        CapabilityProviders, CognitionLogUpdated, LutumTiers, MemoryImportance,
-        MemoryRequestMailbox, ModuleRegistry,
+        CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
+        MemoryImportance, MemoryRequestMailbox, ModuleRegistry,
     };
     use nuillu_types::{MemoryIndex, MemoryRank, ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::sync::Mutex;
@@ -226,20 +226,20 @@ mod tests {
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        CapabilityProviders::new(
-            nuillu_blackboard::Blackboard::default(),
-            Arc::new(NoopCognitionLogRepository),
-            primary,
-            Vec::new(),
-            Arc::new(NoopFileSearchProvider),
-            Arc::new(NoopUtteranceSink),
-            Arc::new(SystemClock),
-            LutumTiers {
+        CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard: nuillu_blackboard::Blackboard::default(),
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store: primary,
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider),
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
                 premium: lutum,
             },
-        )
+        })
     }
 
     #[derive(Default, Clone)]

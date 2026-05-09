@@ -69,19 +69,55 @@ struct CapabilityProvidersInner {
     scene: SceneRegistry,
 }
 
+/// Required external services for the root capability provider set.
+#[derive(Clone)]
+pub struct CapabilityProviderPorts {
+    pub blackboard: Blackboard,
+    pub cognition_log_port: Arc<dyn CognitionLogRepository>,
+    pub primary_memory_store: Arc<dyn MemoryStore>,
+    pub memory_replicas: Vec<Arc<dyn MemoryStore>>,
+    pub file_search: Arc<dyn FileSearchProvider>,
+    pub utterance_sink: Arc<dyn UtteranceSink>,
+    pub clock: Arc<dyn Clock>,
+    pub tiers: LutumTiers,
+}
+
+/// Runtime policy and observation hooks layered on top of the boot ports.
+#[derive(Clone)]
+pub struct CapabilityProviderRuntime {
+    pub event_sink: Arc<dyn RuntimeEventSink>,
+    pub policy: RuntimePolicy,
+}
+
+impl Default for CapabilityProviderRuntime {
+    fn default() -> Self {
+        Self {
+            event_sink: Arc::new(NoopRuntimeEventSink),
+            policy: RuntimePolicy::default(),
+        }
+    }
+}
+
+/// Full root provider boot config.
+#[derive(Clone)]
+pub struct CapabilityProviderConfig {
+    pub ports: CapabilityProviderPorts,
+    pub runtime: CapabilityProviderRuntime,
+}
+
+impl From<CapabilityProviderPorts> for CapabilityProviderConfig {
+    fn from(ports: CapabilityProviderPorts) -> Self {
+        Self {
+            ports,
+            runtime: CapabilityProviderRuntime::default(),
+        }
+    }
+}
+
 impl CapabilityProviders {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        blackboard: Blackboard,
-        cognition_log_port: Arc<dyn CognitionLogRepository>,
-        primary_memory_store: Arc<dyn MemoryStore>,
-        memory_replicas: Vec<Arc<dyn MemoryStore>>,
-        file_search: Arc<dyn FileSearchProvider>,
-        utterance_sink: Arc<dyn UtteranceSink>,
-        clock: Arc<dyn Clock>,
-        tiers: LutumTiers,
-    ) -> Self {
-        Self::new_with_runtime_events(
+    pub fn new(config: impl Into<CapabilityProviderConfig>) -> Self {
+        let CapabilityProviderConfig { ports, runtime } = config.into();
+        let CapabilityProviderPorts {
             blackboard,
             cognition_log_port,
             primary_memory_store,
@@ -90,50 +126,9 @@ impl CapabilityProviders {
             utterance_sink,
             clock,
             tiers,
-            Arc::new(NoopRuntimeEventSink),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_runtime_events(
-        blackboard: Blackboard,
-        cognition_log_port: Arc<dyn CognitionLogRepository>,
-        primary_memory_store: Arc<dyn MemoryStore>,
-        memory_replicas: Vec<Arc<dyn MemoryStore>>,
-        file_search: Arc<dyn FileSearchProvider>,
-        utterance_sink: Arc<dyn UtteranceSink>,
-        clock: Arc<dyn Clock>,
-        tiers: LutumTiers,
-        runtime_event_sink: Arc<dyn RuntimeEventSink>,
-    ) -> Self {
-        Self::new_with_runtime_policy(
-            blackboard,
-            cognition_log_port,
-            primary_memory_store,
-            memory_replicas,
-            file_search,
-            utterance_sink,
-            clock,
-            tiers,
-            runtime_event_sink,
-            RuntimePolicy::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_runtime_policy(
-        blackboard: Blackboard,
-        cognition_log_port: Arc<dyn CognitionLogRepository>,
-        primary_memory_store: Arc<dyn MemoryStore>,
-        memory_replicas: Vec<Arc<dyn MemoryStore>>,
-        file_search: Arc<dyn FileSearchProvider>,
-        utterance_sink: Arc<dyn UtteranceSink>,
-        clock: Arc<dyn Clock>,
-        tiers: LutumTiers,
-        runtime_event_sink: Arc<dyn RuntimeEventSink>,
-        policy: RuntimePolicy,
-    ) -> Self {
-        let runtime_events = RuntimeEventEmitter::new(runtime_event_sink);
+        } = ports;
+        let CapabilityProviderRuntime { event_sink, policy } = runtime;
+        let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         Self {
             inner: Arc::new(CapabilityProvidersInner {
@@ -989,20 +984,20 @@ mod tests {
         let adapter = Arc::new(lutum::MockLlmAdapter::new());
         let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
         let lutum = lutum::Lutum::new(adapter, budget);
-        CapabilityProviders::new(
+        CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port,
-            Arc::new(NoopMemoryStore) as Arc<dyn MemoryStore>,
-            Vec::new(),
-            Arc::new(NoopFileSearchProvider) as Arc<dyn FileSearchProvider>,
-            Arc::new(NoopUtteranceSink),
-            Arc::new(SystemClock),
-            LutumTiers {
+            primary_memory_store: Arc::new(NoopMemoryStore) as Arc<dyn MemoryStore>,
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider) as Arc<dyn FileSearchProvider>,
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
                 premium: lutum,
             },
-        )
+        })
     }
 
     struct NoopModule;

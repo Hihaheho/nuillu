@@ -258,24 +258,22 @@ An absent config is no-op for that key.
 
 ## 5. Runtime Policy Injection
 
-`CapabilityProviders::new()` and `new_with_runtime_events()` should keep current
-behavior by installing a disabled limiter.
+`CapabilityProviders::new(CapabilityProviderPorts { ... })` should keep current
+behavior by installing the default runtime config, including a disabled limiter.
 
-An additional constructor or policy builder should accept rate-limit policy:
+Callers that need runtime events or rate limits pass the full config:
 
 ```rust
-pub struct RuntimePolicy {
-    pub rate_limits: RateLimitPolicy,
-    pub module_batch_throttles: ModuleBatchThrottlePolicy,
-}
-
-impl CapabilityProviders {
-    pub fn new_with_runtime_policy(
-        /* existing boot ports */,
-        runtime_event_sink: Arc<dyn RuntimeEventSink>,
-        policy: RuntimePolicy,
-    ) -> Self;
-}
+let caps = CapabilityProviders::new(CapabilityProviderConfig {
+    ports: CapabilityProviderPorts { /* boot ports */ },
+    runtime: CapabilityProviderRuntime {
+        event_sink,
+        policy: RuntimePolicy {
+            rate_limits,
+            ..RuntimePolicy::default()
+        },
+    },
+});
 ```
 
 `ModuleCapabilityFactory` then passes the shared limiter into owner-stamped

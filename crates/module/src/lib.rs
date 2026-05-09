@@ -41,7 +41,8 @@ mod test_support;
 
 pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
-    AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviders, HostIo,
+    AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
+    CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
     InternalHarnessIo, ModuleCapabilityFactory, ModuleRegisterer, ModuleRegistry,
     ModuleRegistryError,
 };

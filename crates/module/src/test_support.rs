@@ -10,7 +10,10 @@ use crate::ports::{
     FileSearchProvider, MemoryStore, NoopCognitionLogRepository, NoopFileSearchProvider,
     NoopMemoryStore, NoopUtteranceSink, SystemClock,
 };
-use crate::{CapabilityProviders, LutumTiers, ModuleCapabilityFactory, RuntimePolicy};
+use crate::{
+    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+    CapabilityProviders, LutumTiers, ModuleCapabilityFactory, RuntimePolicy,
+};
 
 pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
     test_caps_with_policy(blackboard, RuntimePolicy::default())
@@ -57,22 +60,26 @@ pub(crate) fn test_caps_with_stores_and_adapter(
     let adapter = Arc::new(adapter);
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
     let lutum = Lutum::new(adapter, budget);
-    CapabilityProviders::new_with_runtime_policy(
-        blackboard,
-        Arc::new(NoopCognitionLogRepository),
-        primary_memory_store,
-        memory_replicas,
-        file_search,
-        Arc::new(NoopUtteranceSink),
-        Arc::new(SystemClock),
-        LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
+    CapabilityProviders::new(CapabilityProviderConfig {
+        ports: CapabilityProviderPorts {
+            blackboard,
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store,
+            memory_replicas,
+            file_search,
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
         },
-        Arc::new(crate::NoopRuntimeEventSink),
-        policy,
-    )
+        runtime: CapabilityProviderRuntime {
+            policy,
+            ..CapabilityProviderRuntime::default()
+        },
+    })
 }
 
 pub(crate) fn scoped(
