@@ -1,13 +1,13 @@
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Write},
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -65,6 +65,7 @@ use crate::{
 };
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -547,6 +548,7 @@ async fn execute_full_agent_case(
         config,
         full_agent_allocation(&case.limits, &case_modules),
         case.limits.max_llm_calls,
+        action_module_ids(&case_modules),
         Arc::new(NoopFileSearchProvider),
         case_id,
         reporter,
@@ -559,7 +561,7 @@ async fn execute_full_agent_case(
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
     let limits = case.limits.clone();
-    let utterances = env.utterances.clone();
+    let actions = env.actions.clone();
     let events = env.events.clone();
     let clock = env.clock.clone();
     let allocation_blackboard = env.blackboard.clone();
@@ -606,7 +608,9 @@ async fn execute_full_agent_case(
             let mut idle_ticks = 0_u64;
             let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, limits.tick_ms);
             for tick in 0..limits.max_ticks {
-                if utterances.has_completed() || events.stop_requested() {
+                if actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW)
+                    || events.stop_requested()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -653,7 +657,7 @@ async fn execute_full_agent_case(
     )
     .await?;
 
-    let mut artifact = if let Some(utterance) = env.utterances.first_complete() {
+    let mut artifact = if let Some(utterance) = env.utterances.last_complete() {
         CaseArtifact::new(utterance.text)
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
@@ -690,6 +694,7 @@ async fn execute_module_case(
         config,
         module_allocation(target, &case.limits, &case_modules),
         case.limits.max_llm_calls,
+        action_module_ids(&case_modules),
         module_file_search_provider(target, case),
         case_id,
         reporter,
@@ -821,6 +826,7 @@ struct EvalEnvironment {
     caps: CapabilityProviders,
     memory: Arc<dyn MemoryStore>,
     utterances: Arc<RecordingUtteranceSink>,
+    actions: Arc<ActionActivityTracker>,
     events: Arc<RecordingRuntimeEventSink>,
     clock: Arc<dyn Clock>,
 }
@@ -830,6 +836,7 @@ async fn build_eval_environment(
     config: &RunnerConfig,
     allocation: ResourceAllocation,
     max_llm_calls: Option<u64>,
+    action_modules: Vec<ModuleId>,
     file_search: Arc<dyn FileSearchProvider>,
     case_id: &str,
     reporter: &LiveReporter,
@@ -840,9 +847,11 @@ async fn build_eval_environment(
         max_llm_calls,
         reporter.clone(),
     ));
+    let actions = Arc::new(ActionActivityTracker::new(action_modules));
     let utterances = Arc::new(RecordingUtteranceSink::new(
         case_id.to_string(),
         reporter.clone(),
+        actions.clone(),
     ));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
@@ -869,9 +878,19 @@ async fn build_eval_environment(
         caps,
         memory,
         utterances,
+        actions,
         events,
         clock,
     })
+}
+
+fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
+    modules
+        .iter()
+        .copied()
+        .filter(|module| module.is_action_module())
+        .map(EvalModule::module_id)
+        .collect()
 }
 
 async fn connect_memory_store(
@@ -2191,9 +2210,61 @@ struct RecordedUtterance {
 }
 
 #[derive(Clone)]
+struct ActionActivityTracker {
+    action_modules: Arc<HashSet<ModuleId>>,
+    last_completed_at: Arc<Mutex<Option<Instant>>>,
+}
+
+impl ActionActivityTracker {
+    fn new(action_modules: Vec<ModuleId>) -> Self {
+        Self {
+            action_modules: Arc::new(action_modules.into_iter().collect()),
+            last_completed_at: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn record_completed(&self, module: &ModuleId) {
+        self.record_completed_at(module, Instant::now());
+    }
+
+    fn record_completed_at(&self, module: &ModuleId, completed_at: Instant) {
+        if !self.action_modules.contains(module) {
+            return;
+        }
+        let mut last_completed_at = self
+            .last_completed_at
+            .lock()
+            .expect("action activity lock poisoned");
+        let should_update = match *last_completed_at {
+            Some(previous) => completed_at >= previous,
+            None => true,
+        };
+        if should_update {
+            *last_completed_at = Some(completed_at);
+        }
+    }
+
+    fn silence_window_elapsed(&self, window: Duration) -> bool {
+        self.silence_window_elapsed_at(window, Instant::now())
+    }
+
+    fn silence_window_elapsed_at(&self, window: Duration, now: Instant) -> bool {
+        let last_completed_at = *self
+            .last_completed_at
+            .lock()
+            .expect("action activity lock poisoned");
+        last_completed_at.is_some_and(|completed_at| {
+            now.checked_duration_since(completed_at)
+                .is_some_and(|elapsed| elapsed >= window)
+        })
+    }
+}
+
+#[derive(Clone)]
 struct RecordingUtteranceSink {
     case_id: String,
     reporter: LiveReporter,
+    actions: Arc<ActionActivityTracker>,
     complete: Arc<Mutex<Vec<RecordedUtterance>>>,
 }
 
@@ -2217,27 +2288,20 @@ impl std::fmt::Debug for RecordingUtteranceSink {
 }
 
 impl RecordingUtteranceSink {
-    fn new(case_id: String, reporter: LiveReporter) -> Self {
+    fn new(case_id: String, reporter: LiveReporter, actions: Arc<ActionActivityTracker>) -> Self {
         Self {
             case_id,
             reporter,
+            actions,
             complete: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn has_completed(&self) -> bool {
-        !self
-            .complete
-            .lock()
-            .expect("utterance lock poisoned")
-            .is_empty()
-    }
-
-    fn first_complete(&self) -> Option<RecordedUtterance> {
+    fn last_complete(&self) -> Option<RecordedUtterance> {
         self.complete
             .lock()
             .expect("utterance lock poisoned")
-            .first()
+            .last()
             .cloned()
     }
 
@@ -2252,6 +2316,7 @@ impl RecordingUtteranceSink {
 #[async_trait(?Send)]
 impl UtteranceSink for RecordingUtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
+        let sender_module = utterance.sender.module.clone();
         let recorded = RecordedUtterance {
             sender: utterance.sender.to_string(),
             target: utterance.target,
@@ -2262,6 +2327,7 @@ impl UtteranceSink for RecordingUtteranceSink {
             .lock()
             .map_err(|_| PortError::Backend("utterance lock poisoned".into()))?
             .push(recorded.clone());
+        self.actions.record_completed(&sender_module);
         self.reporter.emit_port(
             Some(&self.case_id),
             "utterance_completed",
@@ -2637,6 +2703,70 @@ prompt = "Second?"
             normalize_eval_utterance_text("\"an \\\"apple\\\"\"".to_string()),
             "an \"apple\""
         );
+    }
+
+    #[tokio::test]
+    async fn recording_utterance_sink_returns_last_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let actions = Arc::new(ActionActivityTracker::new(vec![builtin::speak()]));
+        let sink = RecordingUtteranceSink::new("test-case".to_string(), reporter, actions.clone());
+        let emitted_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let sender = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+
+        sink.on_complete(Utterance {
+            sender: sender.clone(),
+            target: "peer".to_string(),
+            text: "first".to_string(),
+            emitted_at,
+        })
+        .await
+        .unwrap();
+        sink.on_complete(Utterance {
+            sender,
+            target: "peer".to_string(),
+            text: "second".to_string(),
+            emitted_at,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sink.snapshot().len(), 2);
+        assert_eq!(sink.last_complete().unwrap().text, "second");
+        assert!(!actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW));
+    }
+
+    #[test]
+    fn action_tracker_waits_for_silence_window_after_action_completion() {
+        let tracker = ActionActivityTracker::new(vec![builtin::speak()]);
+        let now = Instant::now();
+
+        tracker.record_completed_at(&builtin::speak(), now);
+
+        assert!(!tracker.silence_window_elapsed_at(Duration::from_secs(1), now));
+        assert!(
+            !tracker.silence_window_elapsed_at(
+                Duration::from_secs(1),
+                now + Duration::from_millis(999)
+            )
+        );
+        assert!(
+            tracker.silence_window_elapsed_at(Duration::from_secs(1), now + Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn action_tracker_ignores_non_action_module_completion() {
+        let tracker = ActionActivityTracker::new(vec![builtin::speak()]);
+        let completed_at = Instant::now();
+        let after_window = completed_at + Duration::from_secs(2);
+
+        tracker.record_completed_at(&builtin::query_vector(), completed_at);
+        assert!(!tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
+
+        tracker.record_completed_at(&builtin::speak(), completed_at);
+        tracker.record_completed_at(&builtin::query_vector(), after_window);
+        assert!(tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
     }
 
     #[tokio::test]

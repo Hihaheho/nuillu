@@ -216,6 +216,10 @@ impl EvalModule {
             Self::Speak => builtin::speak(),
         }
     }
+
+    pub fn is_action_module(self) -> bool {
+        matches!(self, Self::Speak)
+    }
 }
 
 impl FullAgentCase {
