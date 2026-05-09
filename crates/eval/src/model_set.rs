@@ -76,9 +76,7 @@ impl From<ReasoningEffort> for OpenAiReasoningEffort {
 
 impl ModelSetRole {
     pub fn endpoint(&self) -> Option<&str> {
-        self.endpoint
-            .as_deref()
-            .or_else(|| self.base_url.as_deref())
+        self.endpoint.as_deref().or(self.base_url.as_deref())
     }
 }
 

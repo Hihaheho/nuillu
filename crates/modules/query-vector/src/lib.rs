@@ -226,7 +226,7 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     let mut contents = Vec::new();
     for hit in hits {
         let content = hit.content.trim();
-        if !content.is_empty() && !contents.iter().any(|seen| *seen == content) {
+        if !content.is_empty() && !contents.contains(&content) {
             contents.push(content);
         }
     }

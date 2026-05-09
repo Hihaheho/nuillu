@@ -249,6 +249,32 @@ fn controller_input(
     })
 }
 
+#[async_trait(?Send)]
+impl Module for AttentionControllerModule {
+    type Batch = ();
+
+    fn id() -> &'static str {
+        "attention-controller"
+    }
+
+    fn role_description() -> &'static str {
+        "Allocates resources across modules — writes activation, guidance, and tier per registered module on memo updates."
+    }
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        AttentionControllerModule::next_batch(self).await
+    }
+
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
+        let _ = batch;
+        AttentionControllerModule::activate(self, cx).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,31 +351,5 @@ mod tests {
                 "controller_schema": {"schema": true},
             })
         );
-    }
-}
-
-#[async_trait(?Send)]
-impl Module for AttentionControllerModule {
-    type Batch = ();
-
-    fn id() -> &'static str {
-        "attention-controller"
-    }
-
-    fn role_description() -> &'static str {
-        "Allocates resources across modules — writes activation, guidance, and tier per registered module on memo updates."
-    }
-
-    async fn next_batch(&mut self) -> Result<Self::Batch> {
-        AttentionControllerModule::next_batch(self).await
-    }
-
-    async fn activate(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        batch: &Self::Batch,
-    ) -> Result<()> {
-        let _ = batch;
-        AttentionControllerModule::activate(self, cx).await
     }
 }

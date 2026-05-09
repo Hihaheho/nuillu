@@ -3,9 +3,8 @@ use std::cell::{Cell, RefCell};
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    ArtifactTextField, CaseArtifact, Check, EvalCase, RubricJudge, RubricJudgeError,
-    RubricJudgeInput, RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion,
-    evaluate_case, normalize_text_block, parse_case_file, parse_full_agent_case_file,
+    CaseArtifact, EvalCase, RubricJudge, RubricJudgeError, RubricJudgeInput, RubricJudgeRequest,
+    RubricJudgeVerdict, evaluate_case, parse_case_file, parse_full_agent_case_file,
     parse_module_case_file, render_judge_input,
 };
 
@@ -13,96 +12,6 @@ fn empty_trace() -> TraceSnapshot {
     TraceSnapshot {
         roots: Vec::new(),
         root_events: Vec::new(),
-    }
-}
-
-struct CaseDataJudge {
-    called: Cell<bool>,
-    expected_prompt: String,
-    expected_context: Option<String>,
-    expected_rubric: String,
-    expected_criteria_names: Vec<String>,
-    expected_pass_score: f64,
-    expected_judge_inputs: Vec<RubricJudgeInput>,
-    expected_judge_max_output_tokens: u32,
-}
-
-impl CaseDataJudge {
-    fn from_case(case: &EvalCase) -> Self {
-        let Some(Check::Rubric {
-            rubric,
-            criteria,
-            pass_score,
-            judge_inputs,
-            ..
-        }) = case
-            .checks()
-            .iter()
-            .find(|check| matches!(check, Check::Rubric { .. }))
-        else {
-            panic!("expected case to define a rubric check");
-        };
-
-        Self {
-            called: Cell::new(false),
-            expected_prompt: normalize_text_block(&case.prompt_for_judge()),
-            expected_context: case
-                .context_for_judge()
-                .map(|context| normalize_text_block(&context)),
-            expected_rubric: normalize_text_block(&rubric.content),
-            expected_criteria_names: criteria
-                .iter()
-                .map(|criterion| criterion.name.clone())
-                .collect(),
-            expected_pass_score: *pass_score,
-            expected_judge_inputs: judge_inputs.clone(),
-            expected_judge_max_output_tokens: case.scoring().judge_max_output_tokens,
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl RubricJudge for CaseDataJudge {
-    async fn judge(
-        &self,
-        _trace: &TraceSnapshot,
-        request: RubricJudgeRequest,
-    ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
-        assert_eq!(request.prompt, self.expected_prompt);
-        assert_eq!(request.context, self.expected_context);
-        assert_eq!(request.rubric, self.expected_rubric);
-        assert_eq!(
-            request
-                .criteria
-                .iter()
-                .map(|criterion| criterion.name.clone())
-                .collect::<Vec<_>>(),
-            self.expected_criteria_names
-        );
-        assert_eq!(request.pass_score, self.expected_pass_score);
-        assert_eq!(request.judge_inputs, self.expected_judge_inputs);
-        assert_eq!(
-            request.judge_max_output_tokens,
-            self.expected_judge_max_output_tokens
-        );
-        assert!(!request.artifact.output.trim().is_empty());
-        self.called.set(true);
-        Ok(RubricJudgeVerdict {
-            passed: true,
-            score: 0.92,
-            summary: "rubric request was built from the parsed case data".to_string(),
-            criteria: request
-                .criteria
-                .iter()
-                .map(|criterion| RubricJudgeVerdictCriterion {
-                    name: criterion.name.clone(),
-                    passed: true,
-                    score: 0.92,
-                    reason: "criterion came from the case rubric".to_string(),
-                    evidence: None,
-                })
-                .collect(),
-        })
     }
 }
 
@@ -154,33 +63,6 @@ impl RubricJudge for ModuleScopedJudge {
             criteria: Vec::new(),
         })
     }
-}
-
-fn artifact_from_output_checks(case: &EvalCase) -> CaseArtifact {
-    let mut output = String::new();
-    for check in case.checks() {
-        match check {
-            Check::ArtifactTextContains {
-                field, contains, ..
-            } if field.unwrap_or(ArtifactTextField::Output) == ArtifactTextField::Output => {
-                output.push_str(contains);
-                output.push('\n');
-            }
-            Check::ArtifactTextExact { field, exact, .. }
-                if field.unwrap_or(ArtifactTextField::Output) == ArtifactTextField::Output =>
-            {
-                output.push_str(&exact.content);
-                output.push('\n');
-            }
-            _ => {}
-        }
-    }
-
-    assert!(
-        !output.trim().is_empty(),
-        "expected case to define an output text check"
-    );
-    CaseArtifact::new(output)
 }
 
 #[test]

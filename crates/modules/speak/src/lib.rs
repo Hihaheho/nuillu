@@ -367,17 +367,16 @@ impl SpeakGateModule {
             .write(serde_json::to_string(&decision).context("serialize speak-gate decision memo")?)
             .await;
 
-        if decision.should_speak {
-            if let Some(generation_hint) = decision.generation_hint
-                && !generation_hint.trim().is_empty()
-                && self
-                    .speak
-                    .publish(SpeakRequest::new(generation_hint, decision.rationale))
-                    .await
-                    .is_err()
-            {
-                tracing::trace!("speak request had no active subscribers");
-            }
+        if decision.should_speak
+            && let Some(generation_hint) = decision.generation_hint
+            && !generation_hint.trim().is_empty()
+            && self
+                .speak
+                .publish(SpeakRequest::new(generation_hint, decision.rationale))
+                .await
+                .is_err()
+        {
+            tracing::trace!("speak request had no active subscribers");
         }
         Ok(())
     }
@@ -736,6 +735,56 @@ impl SpeakModule {
                 draft.rationale.clone(),
             ))
             .await;
+    }
+}
+
+#[async_trait(?Send)]
+impl Module for SpeakGateModule {
+    type Batch = ();
+
+    fn id() -> &'static str {
+        "speak-gate"
+    }
+
+    fn role_description() -> &'static str {
+        "Decides whether attention is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
+    }
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SpeakGateModule::next_batch(self).await
+    }
+
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        _batch: &Self::Batch,
+    ) -> Result<()> {
+        SpeakGateModule::activate(self, cx).await
+    }
+}
+
+#[async_trait(?Send)]
+impl Module for SpeakModule {
+    type Batch = batch::NextBatch;
+
+    fn id() -> &'static str {
+        "speak"
+    }
+
+    fn role_description() -> &'static str {
+        "Emits user-visible utterances on SpeakRequest; streams output and records the completed utterance to its memo."
+    }
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SpeakModule::next_batch(self).await
+    }
+
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
+        SpeakModule::activate(self, cx, batch.request.clone()).await
     }
 }
 
@@ -1301,55 +1350,5 @@ mod tests {
         assert!(!sensory_output.duplicate);
         assert_eq!(sensory_request.sender.module, builtin::speak_gate());
         assert_eq!(sensory_request.body.question, "what was just heard?");
-    }
-}
-
-#[async_trait(?Send)]
-impl Module for SpeakGateModule {
-    type Batch = ();
-
-    fn id() -> &'static str {
-        "speak-gate"
-    }
-
-    fn role_description() -> &'static str {
-        "Decides whether attention is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
-    }
-
-    async fn next_batch(&mut self) -> Result<Self::Batch> {
-        SpeakGateModule::next_batch(self).await
-    }
-
-    async fn activate(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        _batch: &Self::Batch,
-    ) -> Result<()> {
-        SpeakGateModule::activate(self, cx).await
-    }
-}
-
-#[async_trait(?Send)]
-impl Module for SpeakModule {
-    type Batch = batch::NextBatch;
-
-    fn id() -> &'static str {
-        "speak"
-    }
-
-    fn role_description() -> &'static str {
-        "Emits user-visible utterances on SpeakRequest; streams output and records the completed utterance to its memo."
-    }
-
-    async fn next_batch(&mut self) -> Result<Self::Batch> {
-        SpeakModule::next_batch(self).await
-    }
-
-    async fn activate(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        batch: &Self::Batch,
-    ) -> Result<()> {
-        SpeakModule::activate(self, cx, batch.request.clone()).await
     }
 }

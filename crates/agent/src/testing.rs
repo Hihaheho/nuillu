@@ -34,13 +34,6 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
     )
 }
 
-pub(crate) fn test_caps_with_policy(
-    blackboard: Blackboard,
-    policy: RuntimePolicy,
-) -> CapabilityProviders {
-    test_caps_inner(blackboard, policy, Arc::new(InstantSleepClock))
-}
-
 /// Like `test_caps` but uses the real wall-clock for sleeps. Pick this when a
 /// test specifically asserts that cooldown deadlines block long enough to
 /// coalesce subsequent work.

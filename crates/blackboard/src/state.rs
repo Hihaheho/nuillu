@@ -65,20 +65,18 @@ pub struct MemoLogRecord {
     pub content: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ModuleRunStatus {
+    #[default]
     Inactive,
     AwaitingBatch,
     PendingBatch,
     Activating,
-    Failed { phase: String, message: String },
-}
-
-impl Default for ModuleRunStatus {
-    fn default() -> Self {
-        Self::Inactive
-    }
+    Failed {
+        phase: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,7 +697,6 @@ impl BlackboardInner {
                 owner.module == builtin::attention_controller()
                     && owner.replica.get() < active_controller_replicas
             })
-            .map(|(owner, proposal)| (owner, proposal))
             .collect::<Vec<_>>();
         active_proposals.sort_by_key(|(owner, _)| owner.replica);
 

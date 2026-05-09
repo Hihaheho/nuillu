@@ -509,12 +509,12 @@ mod tests {
 
     use async_trait::async_trait;
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModulePolicy,
-        ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, Bpm, ModuleConfig, ModuleRunStatus, ResourceAllocation,
+        linear_ratio_fn,
     };
     use nuillu_module::{
         AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
-        ModuleRegistry, QueryInbox, QueryRequest, RuntimePolicy,
+        ModuleRegistry, QueryInbox, QueryRequest,
     };
     use nuillu_types::{ModelTier, ModuleId, builtin};
     use tokio::sync::oneshot;

@@ -383,6 +383,37 @@ fn is_user_directed_direction(direction: &str) -> bool {
     USER_DIRECTED_DIRECTIONS.contains(&direction.as_str())
 }
 
+#[async_trait(?Send)]
+impl Module for SensoryModule {
+    type Batch = SensoryBatch;
+
+    fn id() -> &'static str {
+        "sensory"
+    }
+
+    fn role_description() -> &'static str {
+        "Pre-attentive filter: receives external observations, scores their salience, and writes selected normalized observations to its memo."
+    }
+
+    async fn next_batch(&mut self) -> Result<Self::Batch> {
+        SensoryModule::next_batch(self).await
+    }
+
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
+        for input in batch.inputs.iter().cloned() {
+            self.handle(cx, input).await?;
+        }
+        for request in batch.detail_requests.iter().cloned() {
+            self.handle_detail_request(cx, request).await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,36 +453,5 @@ mod tests {
         assert!(is_user_directed_direction("USER"));
         assert!(!is_user_directed_direction("ryo"));
         assert!(!is_user_directed_direction("left"));
-    }
-}
-
-#[async_trait(?Send)]
-impl Module for SensoryModule {
-    type Batch = SensoryBatch;
-
-    fn id() -> &'static str {
-        "sensory"
-    }
-
-    fn role_description() -> &'static str {
-        "Pre-attentive filter: receives external observations, scores their salience, and writes selected normalized observations to its memo."
-    }
-
-    async fn next_batch(&mut self) -> Result<Self::Batch> {
-        SensoryModule::next_batch(self).await
-    }
-
-    async fn activate(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        batch: &Self::Batch,
-    ) -> Result<()> {
-        for input in batch.inputs.iter().cloned() {
-            self.handle(cx, input).await?;
-        }
-        for request in batch.detail_requests.iter().cloned() {
-            self.handle_detail_request(cx, request).await?;
-        }
-        Ok(())
     }
 }

@@ -245,7 +245,7 @@ fn hit_snippets(hits: &[QueryFileHit]) -> String {
     let mut snippets = Vec::new();
     for hit in hits {
         let snippet = hit.snippet.trim();
-        if !snippet.is_empty() && !snippets.iter().any(|seen| *seen == snippet) {
+        if !snippet.is_empty() && !snippets.contains(&snippet) {
             snippets.push(snippet);
         }
     }
@@ -258,24 +258,6 @@ fn guidance_question(guidance: &str, context_kind: &str) -> String {
         return format!("Act on current allocation guidance for useful {context_kind} context.");
     }
     format!("Act on this allocation guidance for {context_kind} lookup: {trimmed}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guidance_question_carries_concrete_guidance() {
-        let question = guidance_question(
-            "speech-evidence request: question=torus route; needed_fact=eastbound appears west",
-            "file",
-        );
-
-        assert_eq!(
-            question,
-            "Act on this allocation guidance for file lookup: speech-evidence request: question=torus route; needed_fact=eastbound appears west"
-        );
-    }
 }
 
 #[async_trait(?Send)]
@@ -306,5 +288,23 @@ impl Module for QueryAgenticModule {
             self.activate_guidance(cx).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_question_carries_concrete_guidance() {
+        let question = guidance_question(
+            "speech-evidence request: question=torus route; needed_fact=eastbound appears west",
+            "file",
+        );
+
+        assert_eq!(
+            question,
+            "Act on this allocation guidance for file lookup: speech-evidence request: question=torus route; needed_fact=eastbound appears west"
+        );
     }
 }

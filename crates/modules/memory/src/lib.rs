@@ -354,7 +354,7 @@ mod tests {
     }
 
     async fn build_memory(caps: &CapabilityProviders) -> nuillu_module::AllocatedModules {
-        let modules = ModuleRegistry::new()
+        ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.attention_stream_updated_inbox(),
@@ -368,8 +368,7 @@ mod tests {
             .unwrap()
             .build(caps)
             .await
-            .unwrap();
-        modules
+            .unwrap()
     }
 
     async fn build_memory_with_publisher(
