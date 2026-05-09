@@ -51,14 +51,14 @@ pub trait RubricJudge {
 
 #[derive(Debug, Clone)]
 pub struct JudgeOptions {
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     pub max_output_tokens: u32,
 }
 
 impl Default for JudgeOptions {
     fn default() -> Self {
         Self {
-            temperature: 0.0,
+            temperature: None,
             max_output_tokens: 1200,
         }
     }
@@ -106,15 +106,17 @@ impl RubricJudge for LlmRubricJudge {
         } else {
             request.judge_max_output_tokens
         };
-        let temperature = Temperature::new(self.options.temperature)
-            .map_err(|_| RubricJudgeError::InvalidTemperature(self.options.temperature))?;
-        let eval = JudgeEval::<
+        let mut eval = JudgeEval::<
             RubricJudgeRequest,
             RubricJudgeVerdict,
             fn(&TraceSnapshot, &RubricJudgeRequest) -> ModelInput,
         >::new(render_judge_model_input)
-        .temperature(temperature)
         .max_output_tokens(max_output_tokens);
+        if let Some(temperature) = self.options.temperature {
+            let temperature = Temperature::new(temperature)
+                .map_err(|_| RubricJudgeError::InvalidTemperature(temperature))?;
+            eval = eval.temperature(temperature);
+        }
 
         let mut verdict = eval
             .evaluate(&self.llm, trace, &request)
