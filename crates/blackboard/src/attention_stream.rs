@@ -44,6 +44,13 @@ pub struct AttentionStreamRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttentionLogRecord {
+    pub index: u64,
+    pub stream: ModuleInstanceId,
+    pub event: AttentionStreamEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgenticDeadlockMarker {
     pub at: DateTime<Utc>,
     pub idle_for: Duration,

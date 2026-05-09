@@ -4,13 +4,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use lutum::{
-    Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, TextTurnEvent, ToolResult,
+    Lutum, Session, StructuredStepOutcomeWithTools, StructuredTurnOutcome, TextTurnEvent,
+    ToolResult,
 };
 use nuillu_module::{
-    AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
-    ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest, SelfModelMailbox,
-    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox, SpeakInbox, SpeakMailbox,
-    SpeakRequest, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
+    AttentionLogRecord, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
+    SelfModelMailbox, SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox,
+    SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress, UtteranceProgressState,
+    UtteranceWriter,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::JsonSchema;
@@ -23,6 +25,8 @@ Decide whether the speak module may emit a user-visible utterance now. You may r
 cognitive attention-stream set, blackboard memos, memory metadata, scheduler-owned module status,
 and utterance progress. You may call evidence tools during this decision turn. You must not write
 attention, emit utterances, or change allocation.
+The persistent conversation history contains user messages named new_attention_stream_item; those
+messages are the cognitive attention stream history.
 
 Speak is not currently streaming. Use a strict readiness gate before setting should_speak=true:
 - The attention stream must contain the facts needed for the utterance, not only raw sensory
@@ -66,6 +70,8 @@ cancelled and replaced by publishing a new typed SpeakRequest. You may read the 
 attention-stream set, blackboard memos, memory metadata, scheduler-owned module status, and
 utterance progress. You may call evidence tools during this decision turn. You must not write
 attention, emit utterances, or change allocation.
+The persistent conversation history contains user messages named new_attention_stream_item; those
+messages are the cognitive attention stream history.
 
 Use an interruption gate:
 - Compare the new attention stream with the partial utterance and current generation hint.
@@ -192,14 +198,26 @@ fn gate_prompt_for<'a>(
     }
 }
 
-fn gate_input(
-    attention_json: serde_json::Value,
+fn attention_history_input(record: &AttentionLogRecord) -> serde_json::Value {
+    serde_json::json!({
+        "new_attention_stream_item": record,
+    })
+}
+
+fn push_attention_history(session: &mut Session, records: &[AttentionLogRecord]) {
+    for record in records {
+        session.push_user(attention_history_input(record).to_string());
+    }
+}
+
+fn gate_ephemeral_input(
+    attention_context_json: serde_json::Value,
     blackboard_json: serde_json::Value,
     speak_status: ModuleRunStatus,
     utterance_progress: Option<UtteranceProgress>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "attention_streams": attention_json,
+        "attention_context": attention_context_json,
         "blackboard": blackboard_json,
         "speak_module_status": speak_status,
         "current_utterance_progress": utterance_progress,
@@ -218,6 +236,7 @@ pub struct SpeakGateModule {
     memo: Memo,
     speak: SpeakMailbox,
     llm: LlmAccess,
+    session: Session,
     readiness_prompt: std::sync::OnceLock<String>,
     interruption_prompt: std::sync::OnceLock<String>,
 }
@@ -249,6 +268,7 @@ impl SpeakGateModule {
             memo,
             speak,
             llm,
+            session: Session::new(),
             readiness_prompt: std::sync::OnceLock::new(),
             interruption_prompt: std::sync::OnceLock::new(),
         }
@@ -268,7 +288,12 @@ impl SpeakGateModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let attention_json = self.attention.snapshot().await.compact_json();
+        let unread_attention = self.attention.unread_events().await;
+        push_attention_history(&mut self.session, &unread_attention);
+        let attention_snapshot = self.attention.snapshot().await;
+        let attention_context_json = serde_json::json!({
+            "agentic_deadlock_marker": attention_snapshot.agentic_deadlock_marker(),
+        });
         let speak_owner = speak_owner();
         let speak_status = self.module_status.status_for_instance(&speak_owner).await;
         let (blackboard_json, utterance_progress) = self
@@ -284,16 +309,17 @@ impl SpeakGateModule {
                 )
             })
             .await;
-        let mut session = Session::new();
-        session.push_system(gate_prompt_for(
+        let gate_prompt = gate_prompt_for(
             self.readiness_prompt(cx),
             self.interruption_prompt(cx),
             &speak_status,
             utterance_progress.as_ref(),
-        ));
-        session.push_user(
-            gate_input(
-                attention_json,
+        )
+        .to_owned();
+        self.session.push_ephemeral_system(gate_prompt);
+        self.session.push_ephemeral_user(
+            gate_ephemeral_input(
+                attention_context_json,
                 blackboard_json,
                 speak_status,
                 utterance_progress,
@@ -301,7 +327,8 @@ impl SpeakGateModule {
             .to_string(),
         );
 
-        let decision = self.run_decision_turn(&mut session).await?;
+        let lutum = self.llm.lutum().await;
+        let decision = self.run_decision_turn(&lutum).await?;
 
         self.memo
             .write(serde_json::to_string(&decision).context("serialize speak-gate decision memo")?)
@@ -322,14 +349,15 @@ impl SpeakGateModule {
         Ok(())
     }
 
-    async fn run_decision_turn(&self, session: &mut Session) -> Result<SpeakGateDecision> {
+    async fn run_decision_turn(&mut self, lutum: &Lutum) -> Result<SpeakGateDecision> {
         let mut memory_requests = HashSet::<String>::new();
         let mut self_model_requests = HashSet::<String>::new();
         let mut sensory_detail_requests = HashSet::<String>::new();
 
         for _ in 0..MAX_GATE_TOOL_ROUNDS {
-            let outcome = session
-                .structured_turn::<SpeakGateDecision>(&self.llm.lutum().await)
+            let outcome = self
+                .session
+                .structured_turn::<SpeakGateDecision>(lutum)
                 .tools::<SpeakGateTools>()
                 .available_tools([
                     SpeakGateToolsSelector::QueryMemory,
@@ -387,7 +415,7 @@ impl SpeakGateModule {
                         }
                     }
                     round
-                        .commit(session, results)
+                        .commit(&mut self.session, results)
                         .context("commit speak-gate tool round")?;
                 }
             }
@@ -681,10 +709,11 @@ mod tests {
         ModelInputItem, Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, ModuleConfig,
+        ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{
-        NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+        Clock, NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
         SystemClock,
     };
     use nuillu_module::{
@@ -775,6 +804,7 @@ mod tests {
 
     struct GateToolFixture {
         gate: SpeakGateModule,
+        blackboard: Blackboard,
         query_inbox: QueryInbox,
         self_model_inbox: SelfModelInbox,
         sensory_detail_inbox: SensoryDetailRequestInbox,
@@ -785,7 +815,7 @@ mod tests {
 
     async fn gate_tool_fixture() -> GateToolFixture {
         let blackboard = Blackboard::with_allocation(tool_test_allocation());
-        let caps = test_caps(blackboard);
+        let caps = test_caps(blackboard.clone());
 
         let gate_cell = Rc::new(RefCell::new(None));
         let query_inbox_cell = Rc::new(RefCell::new(None));
@@ -844,6 +874,7 @@ mod tests {
 
         GateToolFixture {
             gate: gate_cell.borrow_mut().take().unwrap(),
+            blackboard,
             query_inbox: query_inbox_cell.borrow_mut().take().unwrap(),
             self_model_inbox: self_model_inbox_cell.borrow_mut().take().unwrap(),
             sensory_detail_inbox: sensory_detail_inbox_cell.borrow_mut().take().unwrap(),
@@ -937,12 +968,12 @@ mod tests {
     }
 
     #[test]
-    fn gate_input_includes_module_status_and_current_utterance_progress() {
+    fn gate_ephemeral_input_includes_module_status_and_current_utterance_progress() {
         let progress =
             UtteranceProgress::streaming(5, 1, "Mika,", "answer Mika calmly", "peer is stressed");
 
-        let input = gate_input(
-            serde_json::json!({"streams": []}),
+        let input = gate_ephemeral_input(
+            serde_json::json!({"agentic_deadlock_marker": null}),
             serde_json::json!({"memos": {}}),
             ModuleRunStatus::Activating,
             Some(progress),
@@ -951,7 +982,7 @@ mod tests {
         assert_eq!(
             input,
             serde_json::json!({
-                "attention_streams": {"streams": []},
+                "attention_context": {"agentic_deadlock_marker": null},
                 "blackboard": {"memos": {}},
                 "speak_module_status": {"state": "activating"},
                 "current_utterance_progress": {
@@ -963,6 +994,82 @@ mod tests {
                     "rationale": "peer is stressed"
                 }
             })
+        );
+    }
+
+    fn attention_history_texts(session: &Session) -> Vec<String> {
+        session
+            .input()
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let ModelInputItem::Message { role, content } = item else {
+                    return None;
+                };
+                if role != &InputMessageRole::User {
+                    return None;
+                }
+                let [MessageContent::Text(text)] = content.as_slice() else {
+                    return None;
+                };
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                value
+                    .get("new_attention_stream_item")?
+                    .get("event")?
+                    .get("text")?
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_gate_attention_history_uses_reader_unread_cursor() {
+        let mut fixture = gate_tool_fixture().await;
+        let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
+        let clock = SystemClock;
+
+        fixture
+            .blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream: stream.clone(),
+                event: AttentionStreamEvent {
+                    at: clock.now(),
+                    text: "first".into(),
+                },
+            })
+            .await;
+
+        let first = fixture.gate.attention.unread_events().await;
+        push_attention_history(&mut fixture.gate.session, &first);
+        assert_eq!(
+            attention_history_texts(&fixture.gate.session),
+            vec!["first"]
+        );
+
+        let already_seen = fixture.gate.attention.unread_events().await;
+        push_attention_history(&mut fixture.gate.session, &already_seen);
+        assert_eq!(
+            attention_history_texts(&fixture.gate.session),
+            vec!["first"]
+        );
+
+        fixture
+            .blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream,
+                event: AttentionStreamEvent {
+                    at: clock.now(),
+                    text: "second".into(),
+                },
+            })
+            .await;
+
+        let second = fixture.gate.attention.unread_events().await;
+        push_attention_history(&mut fixture.gate.session, &second);
+        assert_eq!(
+            attention_history_texts(&fixture.gate.session),
+            vec!["first", "second"]
         );
     }
 

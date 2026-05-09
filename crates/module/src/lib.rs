@@ -14,7 +14,9 @@
 //! - LLM tier is read from allocation per-call inside [`LlmAccess`];
 //!   modules don't pick tiers themselves.
 
-pub use nuillu_blackboard::{ModuleRunStatus, UtteranceProgress, UtteranceProgressState};
+pub use nuillu_blackboard::{
+    AttentionLogRecord, ModuleRunStatus, UtteranceProgress, UtteranceProgressState,
+};
 
 mod allocation_writer;
 mod attention;
@@ -57,6 +59,7 @@ pub use memo::Memo;
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
+pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
 pub use prompt::format_system_prompt;
 pub use rate_limit::{
@@ -67,6 +70,5 @@ pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleSta
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
-pub use nuillu_types::ModuleId;
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
 pub use utterance::UtteranceWriter;

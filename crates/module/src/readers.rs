@@ -6,12 +6,14 @@
 //! cannot read the non-cognitive blackboard, regardless of what its
 //! `run` body tries.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use nuillu_blackboard::{
-    AttentionStream, Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus,
-    ModuleRunStatusRecord, ResourceAllocation,
+    AttentionLogRecord, AttentionStream, Blackboard, BlackboardInner, MemoLogRecord,
+    ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
@@ -84,11 +86,15 @@ impl BlackboardReader {
 #[derive(Clone)]
 pub struct AttentionReader {
     blackboard: Blackboard,
+    last_seen_attention_index: Rc<Cell<Option<u64>>>,
 }
 
 impl AttentionReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
-        Self { blackboard }
+        Self {
+            blackboard,
+            last_seen_attention_index: Rc::new(Cell::new(None)),
+        }
     }
 
     pub async fn read<R>(&self, f: impl FnOnce(&AttentionStream) -> R) -> R {
@@ -102,6 +108,18 @@ impl AttentionReader {
 
     pub async fn snapshot(&self) -> nuillu_blackboard::AttentionStreamSet {
         self.blackboard.read(|bb| bb.attention_stream_set()).await
+    }
+
+    pub async fn unread_events(&self) -> Vec<AttentionLogRecord> {
+        let last_seen = self.last_seen_attention_index.get();
+        let records = self
+            .blackboard
+            .read(|bb| bb.unread_attention_events(last_seen))
+            .await;
+        if let Some(index) = records.last().map(|record| record.index) {
+            self.last_seen_attention_index.set(Some(index));
+        }
+        records
     }
 }
 
@@ -222,7 +240,9 @@ mod tests {
     use super::*;
 
     use chrono::{TimeZone, Utc};
-    use nuillu_blackboard::{BlackboardCommand, Bpm, ModulePolicy, linear_ratio_fn};
+    use nuillu_blackboard::{
+        AttentionStreamEvent, BlackboardCommand, Bpm, ModulePolicy, linear_ratio_fn,
+    };
     use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
 
     fn test_policy(range: ReplicaCapRange) -> ModulePolicy {
@@ -377,6 +397,75 @@ mod tests {
             b_second
                 .iter()
                 .map(|record| (record.index, record.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "second")]
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_attention_events_advance_per_reader_cursor() {
+        let blackboard = Blackboard::default();
+        let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
+        let reader_a = AttentionReader::new(blackboard.clone());
+        let reader_a_clone = reader_a.clone();
+        let reader_b = AttentionReader::new(blackboard.clone());
+
+        blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream: stream.clone(),
+                event: AttentionStreamEvent {
+                    at: Utc.timestamp_opt(0, 0).unwrap(),
+                    text: "first".into(),
+                },
+            })
+            .await;
+
+        let a_first = reader_a.unread_events().await;
+        assert_eq!(
+            a_first
+                .iter()
+                .map(|record| (
+                    record.index,
+                    record.stream.clone(),
+                    record.event.text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, stream.clone(), "first")]
+        );
+        assert!(reader_a_clone.unread_events().await.is_empty());
+
+        let b_first = reader_b.unread_events().await;
+        assert_eq!(
+            b_first
+                .iter()
+                .map(|record| (record.index, record.event.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "first")]
+        );
+
+        blackboard
+            .apply(BlackboardCommand::AppendAttentionStream {
+                stream,
+                event: AttentionStreamEvent {
+                    at: Utc.timestamp_opt(1, 0).unwrap(),
+                    text: "second".into(),
+                },
+            })
+            .await;
+
+        let a_second = reader_a_clone.unread_events().await;
+        assert_eq!(
+            a_second
+                .iter()
+                .map(|record| (record.index, record.event.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "second")]
+        );
+        let b_second = reader_b.unread_events().await;
+        assert_eq!(
+            b_second
+                .iter()
+                .map(|record| (record.index, record.event.text.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
         );

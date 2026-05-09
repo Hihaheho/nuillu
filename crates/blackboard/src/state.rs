@@ -6,8 +6,9 @@ use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIn
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, AttentionStream, AttentionStreamRecord,
-    AttentionStreamSet, BlackboardCommand, MemoryMetadata, ModulePolicy, ResourceAllocation,
+    AgenticDeadlockMarker, AllocationLimits, AttentionLogRecord, AttentionStream,
+    AttentionStreamRecord, AttentionStreamSet, BlackboardCommand, MemoryMetadata, ModulePolicy,
+    ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -39,6 +40,8 @@ pub struct BlackboardInner {
     module_statuses: HashMap<ModuleInstanceId, ModuleRunStatus>,
     utterance_progresses: HashMap<ModuleInstanceId, UtteranceProgress>,
     attention_streams: HashMap<ModuleInstanceId, AttentionStream>,
+    attention_log: Vec<AttentionLogRecord>,
+    attention_next_index: u64,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     base_allocation: ResourceAllocation,
@@ -286,6 +289,8 @@ impl Default for BlackboardInner {
             module_statuses: HashMap::new(),
             utterance_progresses: HashMap::new(),
             attention_streams: HashMap::new(),
+            attention_log: Vec::new(),
+            attention_next_index: 0,
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
             base_allocation: ResourceAllocation::default(),
@@ -508,6 +513,14 @@ impl BlackboardInner {
         stream
     }
 
+    pub fn unread_attention_events(&self, last_seen_index: Option<u64>) -> Vec<AttentionLogRecord> {
+        self.attention_log
+            .iter()
+            .filter(|record| last_seen_index.is_none_or(|index| record.index > index))
+            .cloned()
+            .collect()
+    }
+
     pub fn attention_stream_set(&self) -> AttentionStreamSet {
         let mut records = self
             .attention_streams
@@ -582,6 +595,12 @@ impl BlackboardInner {
                 self.utterance_progresses.insert(owner, progress);
             }
             BlackboardCommand::AppendAttentionStream { stream, event } => {
+                self.attention_log.push(AttentionLogRecord {
+                    index: self.attention_next_index,
+                    stream: stream.clone(),
+                    event: event.clone(),
+                });
+                self.attention_next_index = self.attention_next_index.saturating_add(1);
                 self.attention_streams
                     .entry(stream)
                     .or_default()

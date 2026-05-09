@@ -29,8 +29,8 @@ pub use allocation::{
     replicas_only_ratio_fn,
 };
 pub use attention_stream::{
-    AgenticDeadlockMarker, AttentionStream, AttentionStreamEvent, AttentionStreamRecord,
-    AttentionStreamSet,
+    AgenticDeadlockMarker, AttentionLogRecord, AttentionStream, AttentionStreamEvent,
+    AttentionStreamRecord, AttentionStreamSet,
 };
 pub use command::BlackboardCommand;
 pub use memory::{MemoryMetaPatch, MemoryMetadata};
