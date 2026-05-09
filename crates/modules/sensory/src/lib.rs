@@ -75,12 +75,15 @@ struct StimulusState {
 }
 
 pub struct SensoryModule {
+    owner: nuillu_types::ModuleId,
     inbox: SensoryInputInbox,
     detail_requests: SensoryDetailRequestInbox,
     allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
+    detail_prompt: std::sync::OnceLock<String>,
     observations: Vec<ObservationRecord>,
     stimuli: HashMap<String, StimulusState>,
 }
@@ -95,15 +98,31 @@ impl SensoryModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("sensory id is valid"),
             inbox,
             detail_requests,
             allocation,
             memo,
             clock,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
+            detail_prompt: std::sync::OnceLock::new(),
             observations: Vec::new(),
             stimuli: HashMap::new(),
         }
+    }
+
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
+    fn detail_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.detail_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(DETAIL_PROMPT, cx.modules(), &self.owner)
+        })
     }
 
     fn format_age(now: DateTime<Utc>, observed_at: DateTime<Utc>) -> String {
@@ -137,7 +156,11 @@ impl SensoryModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn handle(&mut self, input: SensoryInput) -> Result<()> {
+    async fn handle(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        input: SensoryInput,
+    ) -> Result<()> {
         let now = self.clock.now();
         let (kind, direction, raw_content, observed_at) = match &input {
             SensoryInput::Heard {
@@ -167,7 +190,7 @@ impl SensoryModule {
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(prompt.to_string());
 
         let result = session
@@ -198,7 +221,11 @@ impl SensoryModule {
         Ok(())
     }
 
-    async fn handle_detail_request(&self, request: SensoryDetailRequest) -> Result<()> {
+    async fn handle_detail_request(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        request: SensoryDetailRequest,
+    ) -> Result<()> {
         let observations = self
             .observations
             .iter()
@@ -215,7 +242,7 @@ impl SensoryModule {
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(DETAIL_PROMPT);
+        session.push_system(self.detail_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "question": request.question,
@@ -416,12 +443,16 @@ impl Module for SensoryModule {
         SensoryModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
         for input in batch.inputs.iter().cloned() {
-            self.handle(input).await?;
+            self.handle(cx, input).await?;
         }
         for request in batch.detail_requests.iter().cloned() {
-            self.handle_detail_request(request).await?;
+            self.handle_detail_request(cx, request).await?;
         }
         Ok(())
     }

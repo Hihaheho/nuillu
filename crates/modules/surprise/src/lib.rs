@@ -45,6 +45,7 @@ pub struct SurpriseMemoryRequest {
 }
 
 pub struct SurpriseModule {
+    owner: nuillu_types::ModuleId,
     updates: AttentionStreamUpdatedInbox,
     attention: AttentionReader,
     allocation: AllocationReader,
@@ -52,9 +53,11 @@ pub struct SurpriseModule {
     memory_requests: MemoryRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl SurpriseModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         updates: AttentionStreamUpdatedInbox,
         attention: AttentionReader,
@@ -65,6 +68,8 @@ impl SurpriseModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("surprise id is valid"),
             updates,
             attention,
             allocation,
@@ -72,11 +77,18 @@ impl SurpriseModule {
             memory_requests,
             memo,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self) -> Result<()> {
+    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let recent_attention = self
             .attention
             .read(|stream| {
@@ -98,7 +110,7 @@ impl SurpriseModule {
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "recent_attention": recent_attention,
@@ -155,7 +167,11 @@ impl Module for SurpriseModule {
         SurpriseModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-        SurpriseModule::activate(self).await
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        _batch: &Self::Batch,
+    ) -> Result<()> {
+        SurpriseModule::activate(self, cx).await
     }
 }

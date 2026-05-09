@@ -179,11 +179,16 @@ fn is_speak_streaming(status: &ModuleRunStatus, progress: Option<&UtteranceProgr
         )
 }
 
-fn gate_prompt_for(status: &ModuleRunStatus, progress: Option<&UtteranceProgress>) -> &'static str {
+fn gate_prompt_for<'a>(
+    readiness: &'a str,
+    interruption: &'a str,
+    status: &ModuleRunStatus,
+    progress: Option<&UtteranceProgress>,
+) -> &'a str {
     if is_speak_streaming(status, progress) {
-        INTERRUPTION_GATE_PROMPT
+        interruption
     } else {
-        READINESS_GATE_PROMPT
+        readiness
     }
 }
 
@@ -202,6 +207,7 @@ fn gate_input(
 }
 
 pub struct SpeakGateModule {
+    owner: nuillu_types::ModuleId,
     attention_updates: AttentionStreamUpdatedInbox,
     attention: AttentionReader,
     blackboard: BlackboardReader,
@@ -212,9 +218,12 @@ pub struct SpeakGateModule {
     memo: Memo,
     speak: SpeakMailbox,
     llm: LlmAccess,
+    readiness_prompt: std::sync::OnceLock<String>,
+    interruption_prompt: std::sync::OnceLock<String>,
 }
 
 impl SpeakGateModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         attention_updates: AttentionStreamUpdatedInbox,
         attention: AttentionReader,
@@ -228,6 +237,8 @@ impl SpeakGateModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("speak-gate id is valid"),
             attention_updates,
             attention,
             blackboard,
@@ -238,11 +249,25 @@ impl SpeakGateModule {
             memo,
             speak,
             llm,
+            readiness_prompt: std::sync::OnceLock::new(),
+            interruption_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn readiness_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.readiness_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(READINESS_GATE_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
+    fn interruption_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.interruption_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(INTERRUPTION_GATE_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&mut self) -> Result<()> {
+    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let attention_json = self.attention.snapshot().await.compact_json();
         let speak_owner = speak_owner();
         let speak_status = self.module_status.status_for_instance(&speak_owner).await;
@@ -261,7 +286,12 @@ impl SpeakGateModule {
             .await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(gate_prompt_for(&speak_status, utterance_progress.as_ref()));
+        session.push_system(gate_prompt_for(
+            self.readiness_prompt(cx),
+            self.interruption_prompt(cx),
+            &speak_status,
+            utterance_progress.as_ref(),
+        ));
         session.push_user(
             gate_input(
                 attention_json,
@@ -484,8 +514,9 @@ fn push_generation_context(
     session: &mut Session,
     attention_json: serde_json::Value,
     draft: &GenerationDraft,
+    generation_prompt: &str,
 ) {
-    session.push_system(GENERATION_PROMPT);
+    session.push_system(generation_prompt);
     session.push_user(generation_input(attention_json, draft).to_string());
     if !draft.accumulated.is_empty() {
         session.push_assistant_text(draft.accumulated.clone());
@@ -499,11 +530,13 @@ enum GenerationStreamOutcome {
 }
 
 pub struct SpeakModule {
+    owner: nuillu_types::ModuleId,
     requests: SpeakInbox,
     attention: AttentionReader,
     memo: Memo,
     utterance: UtteranceWriter,
     llm: LlmAccess,
+    generation_prompt: std::sync::OnceLock<String>,
 }
 
 impl SpeakModule {
@@ -515,23 +548,36 @@ impl SpeakModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("speak id is valid"),
             requests,
             attention,
             memo,
             utterance,
             llm,
+            generation_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn generation_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.generation_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(GENERATION_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&mut self, request: SpeakRequest) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        request: SpeakRequest,
+    ) -> Result<()> {
         let mut attention_json = self.attention.snapshot().await.compact_json();
 
         let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), request);
 
         loop {
             self.record_streaming_progress(&draft).await;
-            match self.stream_generation(attention_json, &mut draft).await? {
+            match self.stream_generation(cx, attention_json, &mut draft).await? {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
                     attention_json = self.attention.snapshot().await.compact_json();
@@ -546,12 +592,13 @@ impl SpeakModule {
 
     async fn stream_generation(
         &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
         attention_json: serde_json::Value,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        push_generation_context(&mut session, attention_json, draft);
+        push_generation_context(&mut session, attention_json, draft, self.generation_prompt(cx));
 
         let mut stream = session
             .text_turn()
@@ -713,7 +760,11 @@ mod tests {
                     std::future::pending().await
                 }
 
-                async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
+                async fn activate(
+                    &mut self,
+                    _cx: &nuillu_module::ActivateCx<'_>,
+                    _batch: &Self::Batch,
+                ) -> Result<()> {
                     Ok(())
                 }
             }
@@ -810,7 +861,12 @@ mod tests {
         let draft = GenerationDraft::new(7, SpeakRequest::new("be concise", "respond"));
         let mut session = test_session();
 
-        push_generation_context(&mut session, serde_json::json!({"streams": []}), &draft);
+        push_generation_context(
+            &mut session,
+            serde_json::json!({"streams": []}),
+            &draft,
+            GENERATION_PROMPT,
+        );
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 7);
@@ -846,18 +902,40 @@ mod tests {
             UtteranceProgress::streaming(3, 2, "Koro, wait", "answer Koro", "peer request changed");
 
         assert!(
-            gate_prompt_for(&ModuleRunStatus::Inactive, None).contains("not currently streaming")
+            gate_prompt_for(
+                READINESS_GATE_PROMPT,
+                INTERRUPTION_GATE_PROMPT,
+                &ModuleRunStatus::Inactive,
+                None,
+            )
+            .contains("not currently streaming")
         );
         assert!(
-            gate_prompt_for(&ModuleRunStatus::Activating, Some(&progress))
-                .contains("currently streaming")
+            gate_prompt_for(
+                READINESS_GATE_PROMPT,
+                INTERRUPTION_GATE_PROMPT,
+                &ModuleRunStatus::Activating,
+                Some(&progress),
+            )
+            .contains("currently streaming")
         );
         assert!(
-            gate_prompt_for(&ModuleRunStatus::AwaitingBatch, Some(&progress))
-                .contains("not currently streaming")
+            gate_prompt_for(
+                READINESS_GATE_PROMPT,
+                INTERRUPTION_GATE_PROMPT,
+                &ModuleRunStatus::AwaitingBatch,
+                Some(&progress),
+            )
+            .contains("not currently streaming")
         );
         assert!(
-            gate_prompt_for(&ModuleRunStatus::Activating, None).contains("not currently streaming")
+            gate_prompt_for(
+                READINESS_GATE_PROMPT,
+                INTERRUPTION_GATE_PROMPT,
+                &ModuleRunStatus::Activating,
+                None,
+            )
+            .contains("not currently streaming")
         );
     }
 
@@ -898,7 +976,12 @@ mod tests {
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        push_generation_context(&mut session, serde_json::json!({"streams": []}), &draft);
+        push_generation_context(
+            &mut session,
+            serde_json::json!({"streams": []}),
+            &draft,
+            GENERATION_PROMPT,
+        );
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 11);
@@ -1073,8 +1156,12 @@ impl Module for SpeakGateModule {
         SpeakGateModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-        SpeakGateModule::activate(self).await
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        _batch: &Self::Batch,
+    ) -> Result<()> {
+        SpeakGateModule::activate(self, cx).await
     }
 }
 
@@ -1094,7 +1181,11 @@ impl Module for SpeakModule {
         SpeakModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
-        SpeakModule::activate(self, batch.request.clone()).await
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
+        SpeakModule::activate(self, cx, batch.request.clone()).await
     }
 }

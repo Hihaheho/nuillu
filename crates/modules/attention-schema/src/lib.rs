@@ -26,10 +26,12 @@ pub struct AttentionSchemaMemo {
 }
 
 pub struct AttentionSchemaModule {
+    owner: nuillu_types::ModuleId,
     updates: AttentionStreamUpdatedInbox,
     attention: AttentionReader,
     memo: Memo,
     llm: LlmAccess,
+    model_prompt: std::sync::OnceLock<String>,
 }
 
 impl AttentionSchemaModule {
@@ -40,22 +42,31 @@ impl AttentionSchemaModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("attention-schema id is valid"),
             updates,
             attention,
             memo,
             llm,
+            model_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.model_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(MODEL_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn update_model(&self) -> Result<()> {
+    async fn update_model(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let attention = self
             .attention
             .read(|stream| stream.entries().to_vec())
             .await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(MODEL_PROMPT);
+        session.push_system(self.model_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "attention_stream": attention,
@@ -96,9 +107,13 @@ impl Module for AttentionSchemaModule {
         AttentionSchemaModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
         if batch.update_model {
-            self.update_model().await?;
+            self.update_model(cx).await?;
         }
         Ok(())
     }

@@ -54,11 +54,13 @@ pub enum CompactionTools {
 }
 
 pub struct MemoryCompactionModule {
+    owner: nuillu_types::ModuleId,
     allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl MemoryCompactionModule {
@@ -70,16 +72,25 @@ impl MemoryCompactionModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("memory-compaction id is valid"),
             allocation_updates,
             allocation,
             blackboard,
             compactor,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self) -> Result<()> {
+    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -93,7 +104,7 @@ impl MemoryCompactionModule {
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "blackboard": snapshot,
@@ -215,7 +226,11 @@ impl Module for MemoryCompactionModule {
         MemoryCompactionModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-        MemoryCompactionModule::activate(self).await
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        _batch: &Self::Batch,
+    ) -> Result<()> {
+        MemoryCompactionModule::activate(self, cx).await
     }
 }

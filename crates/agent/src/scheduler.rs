@@ -6,10 +6,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_module::{
-    AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch, ModuleRunStatus,
-    ports::Clock,
+    ActivateCx, AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch,
+    ModuleRunStatus, ports::Clock,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModuleId, ModuleInstanceId};
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{Instant, sleep_until};
@@ -251,7 +251,16 @@ async fn refresh_active_and_schedule(
                 else {
                     unreachable!("module state changed while scheduling activation");
                 };
-                spawn_activate(tasks, index, module, batch, config, parent, subscriber);
+                spawn_activate(
+                    tasks,
+                    index,
+                    module,
+                    batch,
+                    config,
+                    runtime.module_catalog(),
+                    parent,
+                    subscriber,
+                );
             }
             ModuleState::PendingBatch { .. } => {
                 runtime
@@ -303,7 +312,16 @@ async fn handle_task_message(
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
                     states[index] = ModuleState::Activating;
-                    spawn_activate(tasks, index, module, batch, config, parent, subscriber);
+                    spawn_activate(
+                        tasks,
+                        index,
+                        module,
+                        batch,
+                        config,
+                        runtime.module_catalog(),
+                        parent,
+                        subscriber,
+                    );
                 } else {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
@@ -425,13 +443,14 @@ fn spawn_activate(
     module: AllocatedModule,
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
+    catalog: Vec<(ModuleId, &'static str)>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
             let (module, result) =
-                activate_with_retries(module, &batch, config.activate_retries).await;
+                activate_with_retries(module, &catalog, &batch, config.activate_retries).await;
             TaskMessage::Activate {
                 index,
                 module,
@@ -445,12 +464,14 @@ fn spawn_activate(
 
 async fn activate_with_retries(
     mut module: AllocatedModule,
+    catalog: &[(ModuleId, &'static str)],
     batch: &ModuleBatch,
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
+    let cx = ActivateCx::new(catalog);
     let mut retries = 0_u8;
     loop {
-        match module.activate(batch).await {
+        match module.activate(&cx, batch).await {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {
                 retries = retries.saturating_add(1);
@@ -536,7 +557,11 @@ mod tests {
             Ok(self.query_inbox.next_item().await?.body)
         }
 
-        async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             self.memo.write(format!("echoed {}", batch.question)).await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
@@ -577,7 +602,11 @@ mod tests {
             Ok(batch)
         }
 
-        async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             self.batches.borrow_mut().push(batch.clone());
             match self.batches.borrow().len() {
                 1 => {
@@ -621,7 +650,11 @@ mod tests {
             }
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             self.writer.append("novel-event").await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
@@ -658,7 +691,11 @@ mod tests {
             }
         }
 
-        async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             let attempt = self.attempts.get().saturating_add(1);
             self.attempts.set(attempt);
             if attempt < 3 {
@@ -699,7 +736,11 @@ mod tests {
             }
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("permanent activation failure")
         }
     }
@@ -726,7 +767,11 @@ mod tests {
             Ok(self.updates.next_item().await?.body)
         }
 
-        async fn activate(&mut self, batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             assert_eq!(batch, &AttentionStreamUpdated::AgenticDeadlockMarker);
             self.memo.write("observed deadlock marker").await;
             if let Some(tx) = self.on_done.take() {
@@ -754,7 +799,11 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             unreachable!("hanging batch stub never produces a batch")
         }
     }
@@ -785,7 +834,11 @@ mod tests {
             }
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             self.activated.set(true);
             Ok(())
         }
@@ -818,7 +871,11 @@ mod tests {
             }
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             if let Some(entered) = self.entered.take() {
                 let _ = entered.send(());
             }

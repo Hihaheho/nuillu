@@ -64,6 +64,7 @@ pub struct AllocationEntry {
 }
 
 pub struct AttentionControllerModule {
+    owner: ModuleId,
     updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
     attention: AttentionReader,
@@ -71,6 +72,7 @@ pub struct AttentionControllerModule {
     allocation_writer: AllocationWriter,
     memo: Memo,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl AttentionControllerModule {
@@ -84,6 +86,8 @@ impl AttentionControllerModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: ModuleId::new(<Self as Module>::id())
+                .expect("attention-controller id is valid"),
             updates,
             blackboard,
             attention,
@@ -91,11 +95,18 @@ impl AttentionControllerModule {
             allocation_writer,
             memo,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self) -> Result<()> {
+    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         Self::activate_with(
             &self.attention,
             &self.blackboard,
@@ -103,11 +114,13 @@ impl AttentionControllerModule {
             &self.allocation_writer,
             &self.memo,
             &self.llm,
+            self.system_prompt(cx),
         )
         .await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
+    #[allow(clippy::too_many_arguments)]
     async fn activate_with(
         attention_reader: &AttentionReader,
         blackboard_reader: &BlackboardReader,
@@ -115,6 +128,7 @@ impl AttentionControllerModule {
         allocation_writer: &AllocationWriter,
         memo: &Memo,
         llm: &LlmAccess,
+        system_prompt: &str,
     ) -> Result<()> {
         let attention = attention_reader
             .read(|stream| stream.entries().to_vec())
@@ -139,7 +153,7 @@ impl AttentionControllerModule {
 
         let lutum = llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(system_prompt);
         session.push_user(
             controller_input(
                 serde_json::to_value(&attention).context("serialize attention stream")?,
@@ -332,8 +346,12 @@ impl Module for AttentionControllerModule {
         AttentionControllerModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
         let _ = batch;
-        AttentionControllerModule::activate(self).await
+        AttentionControllerModule::activate(self, cx).await
     }
 }

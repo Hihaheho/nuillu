@@ -56,6 +56,7 @@ pub enum QueryVectorTools {
 }
 
 pub struct QueryVectorModule {
+    owner: nuillu_types::ModuleId,
     query: QueryInbox,
     attention_updates: AttentionStreamUpdatedInbox,
     allocation: AllocationReader,
@@ -63,9 +64,11 @@ pub struct QueryVectorModule {
     memory: VectorMemorySearcher,
     memo: Memo,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl QueryVectorModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         query: QueryInbox,
         attention_updates: AttentionStreamUpdatedInbox,
@@ -76,6 +79,8 @@ impl QueryVectorModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("query-vector id is valid"),
             query,
             attention_updates,
             allocation,
@@ -83,11 +88,22 @@ impl QueryVectorModule {
             memory,
             memo,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn handle_queries(&self, requests: Vec<QueryRequest>) -> Result<()> {
+    async fn handle_queries(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        requests: Vec<QueryRequest>,
+    ) -> Result<()> {
         let questions = requests
             .into_iter()
             .map(|request| request.question)
@@ -95,12 +111,12 @@ impl QueryVectorModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let hits = self.search_with_memory(&questions).await?;
+        let hits = self.search_with_memory(cx, &questions).await?;
         self.write_hits(&hits).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_attention_update(&self) -> Result<()> {
+    async fn activate_attention_update(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let question = self
             .blackboard
             .read(|bb| {
@@ -112,7 +128,7 @@ impl QueryVectorModule {
                 format!("Find stable memory that clarifies this attended context: {latest}")
             })
             .await;
-        let hits = self.search_with_memory(&[question]).await?;
+        let hits = self.search_with_memory(cx, &[question]).await?;
         self.write_hits(&hits).await
     }
 
@@ -124,7 +140,11 @@ impl QueryVectorModule {
         Ok(())
     }
 
-    async fn search_with_memory(&self, questions: &[String]) -> Result<Vec<QueryVectorMemoryHit>> {
+    async fn search_with_memory(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        questions: &[String],
+    ) -> Result<Vec<QueryVectorMemoryHit>> {
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -138,7 +158,7 @@ impl QueryVectorModule {
         let allocation = self.allocation.snapshot().await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "questions": questions,
@@ -245,12 +265,16 @@ impl Module for QueryVectorModule {
         QueryVectorModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
         if !batch.queries.is_empty() {
-            self.handle_queries(batch.queries.clone()).await?;
+            self.handle_queries(cx, batch.queries.clone()).await?;
         }
         if batch.attention_updated {
-            self.activate_attention_update().await?;
+            self.activate_attention_update(cx).await?;
         }
         Ok(())
     }

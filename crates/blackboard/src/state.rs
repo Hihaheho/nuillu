@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
@@ -16,10 +15,17 @@ const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
 /// The non-cognitive blackboard plus the cognitive surface and its
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
 /// implementation detail hidden behind its methods.
+///
+/// `module_catalog` lives outside the inner lock as a write-once
+/// `OnceLock<Vec<(ModuleId, &'static str)>>`: it is populated by
+/// `ModuleRegistry::build` before any module is constructed and never
+/// changes afterwards, so module constructors can read it synchronously
+/// without taking the async lock.
 #[derive(Debug, Clone)]
 pub struct Blackboard {
     inner: Arc<RwLock<BlackboardInner>>,
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
+    module_catalog: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
 }
 
 /// Inner blackboard state. Public so read closures in other crates can
@@ -155,6 +161,7 @@ impl Blackboard {
         Self {
             inner: Arc::new(RwLock::new(BlackboardInner::default())),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
+            module_catalog: Arc::new(OnceLock::new()),
         }
     }
 
@@ -167,7 +174,26 @@ impl Blackboard {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
+            module_catalog: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Install the registered-module catalog. Idempotent on first call;
+    /// subsequent calls are silently ignored to keep the post-boot snapshot
+    /// stable for prompt caching.
+    pub fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
+        let _ = self.module_catalog.set(catalog);
+    }
+
+    /// Read the registered-module catalog. Returns an empty slice before the
+    /// catalog is installed, which lets tests that skip registry boot still
+    /// build modules; the system prompt simply omits the peer list in that
+    /// case.
+    pub fn module_catalog(&self) -> &[(ModuleId, &'static str)] {
+        self.module_catalog
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Apply `f` to a borrowed snapshot. The read lock is held for the

@@ -224,6 +224,19 @@ impl CapabilityProviders {
             .await;
     }
 
+    pub(crate) fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
+        self.inner.blackboard.set_module_catalog(catalog);
+    }
+
+    /// Boot-time access to the post-boot module catalog (lives outside the
+    /// async lock so it can be read synchronously). The scheduler uses this
+    /// to construct the per-activate `ActivateCx`. Modules should not read
+    /// this directly: agent-global state is delivered to modules through the
+    /// [`ActivateCx`] passed to `activate`, not through capability handles.
+    pub(crate) fn module_catalog(&self) -> &[(ModuleId, &'static str)] {
+        self.inner.blackboard.module_catalog()
+    }
+
     pub(crate) async fn apply_runtime_policy(&self) {
         self.inner
             .blackboard
@@ -353,6 +366,12 @@ impl AgentRuntimeControl {
         self.clock.clone()
     }
 
+    /// Snapshot of the registered-module catalog. Cheap synchronous read; the
+    /// scheduler turns this into an [`ActivateCx`] for each `activate` call.
+    pub fn module_catalog(&self) -> Vec<(ModuleId, &'static str)> {
+        self.blackboard.module_catalog().to_vec()
+    }
+
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
         self.blackboard
             .apply(BlackboardCommand::SetModuleRunStatus { owner, status })
@@ -448,6 +467,12 @@ pub struct ModuleCapabilityFactory {
 }
 
 impl ModuleCapabilityFactory {
+    /// The owner this factory dispenses capabilities for. Capability handles
+    /// returned by this factory are stamped with this id.
+    pub fn owner(&self) -> &ModuleInstanceId {
+        &self.owner
+    }
+
     pub fn query_mailbox(&self) -> QueryMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
     }
@@ -648,8 +673,12 @@ impl AllocatedModule {
         self.module.next_batch().await
     }
 
-    pub async fn activate(&mut self, batch: &ModuleBatch) -> anyhow::Result<()> {
-        self.module.activate(batch).await
+    pub async fn activate(
+        &mut self,
+        cx: &crate::ActivateCx<'_>,
+        batch: &ModuleBatch,
+    ) -> anyhow::Result<()> {
+        self.module.activate(cx, batch).await
     }
 }
 
@@ -690,6 +719,7 @@ impl fmt::Debug for ModuleRegistry {
 
 struct ModuleRegistration {
     module: ModuleId,
+    role_description: &'static str,
     policy: ModulePolicy,
     builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
 }
@@ -698,6 +728,7 @@ impl fmt::Debug for ModuleRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleRegistration")
             .field("module", &self.module)
+            .field("role_description", &self.role_description)
             .field("policy", &self.policy)
             .finish_non_exhaustive()
     }
@@ -740,6 +771,7 @@ impl ModuleRegistry {
         B: ModuleRegisterer + 'static,
     {
         let module = ModuleId::new(<B::Module as Module>::id())?;
+        let role_description = <B::Module as Module>::role_description();
         if self
             .registrations
             .iter()
@@ -753,6 +785,7 @@ impl ModuleRegistry {
         let policy = ModulePolicy::new(range, rate_limit_range, activation_ratio_fn);
         self.registrations.push(ModuleRegistration {
             module,
+            role_description,
             policy,
             builder: Box::new(move |caps| Box::new(builder(caps))),
         });
@@ -771,6 +804,15 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
+        // Install the post-boot module catalog before any module is constructed
+        // so module constructors can read peers from `caps.module_catalog()`
+        // synchronously when they assemble their system prompts.
+        caps.set_module_catalog(
+            self.registrations
+                .iter()
+                .map(|registration| (registration.module.clone(), registration.role_description))
+                .collect(),
+        );
 
         let mut modules = Vec::new();
         for registration in &self.registrations {
@@ -835,7 +877,11 @@ mod tests {
             Ok(())
         }
 
-        async fn activate(&mut self, _batch: &Self::Batch) -> anyhow::Result<()> {
+        async fn activate(
+            &mut self,
+            _cx: &crate::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }

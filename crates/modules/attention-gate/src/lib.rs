@@ -32,12 +32,14 @@ pub struct AttentionGateDecision {
 }
 
 pub struct AttentionGateModule {
+    owner: nuillu_types::ModuleId,
     updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
     attention: AttentionWriter,
     time_division: TimeDivision,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl AttentionGateModule {
@@ -50,17 +52,26 @@ impl AttentionGateModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
+                .expect("attention-gate id is valid"),
             updates,
             blackboard,
             allocation,
             attention,
             time_division,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self) -> Result<()> {
+    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let snapshot = self.blackboard.unread_memo_logs().await;
         let context = self
             .blackboard
@@ -78,7 +89,7 @@ impl AttentionGateModule {
 
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "unread_memo_logs": snapshot,
@@ -124,7 +135,11 @@ impl Module for AttentionGateModule {
         AttentionGateModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, _batch: &Self::Batch) -> Result<()> {
-        AttentionGateModule::activate(self).await
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        _batch: &Self::Batch,
+    ) -> Result<()> {
+        AttentionGateModule::activate(self, cx).await
     }
 }

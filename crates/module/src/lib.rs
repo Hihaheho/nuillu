@@ -24,6 +24,7 @@ mod llm;
 mod memo;
 mod memory_caps;
 pub mod ports;
+mod prompt;
 mod rate_limit;
 mod readers;
 mod runtime_events;
@@ -57,6 +58,7 @@ pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
 pub use ports::Embedder;
+pub use prompt::format_system_prompt;
 pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
@@ -65,5 +67,6 @@ pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleSta
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
-pub use r#trait::{Module, ModuleBatch};
+pub use nuillu_types::ModuleId;
+pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
 pub use utterance::UtteranceWriter;

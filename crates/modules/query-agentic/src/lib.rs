@@ -64,6 +64,7 @@ pub enum QueryAgenticTools {
 }
 
 pub struct QueryAgenticModule {
+    owner: nuillu_module::ModuleId,
     query: QueryInbox,
     allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
@@ -71,6 +72,7 @@ pub struct QueryAgenticModule {
     files: FileSearcher,
     memo: Memo,
     llm: LlmAccess,
+    system_prompt: std::sync::OnceLock<String>,
 }
 
 impl QueryAgenticModule {
@@ -84,6 +86,8 @@ impl QueryAgenticModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: nuillu_module::ModuleId::new(<Self as Module>::id())
+                .expect("query-agentic id is valid"),
             query,
             allocation_updates,
             allocation,
@@ -91,11 +95,22 @@ impl QueryAgenticModule {
             files,
             memo,
             llm,
+            system_prompt: std::sync::OnceLock::new(),
         }
     }
 
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+        })
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn handle_queries(&self, requests: Vec<QueryRequest>) -> Result<()> {
+    async fn handle_queries(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        requests: Vec<QueryRequest>,
+    ) -> Result<()> {
         let questions = requests
             .into_iter()
             .map(|request| request.question)
@@ -103,12 +118,12 @@ impl QueryAgenticModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let hits = self.search_with_files(&questions).await?;
+        let hits = self.search_with_files(cx, &questions).await?;
         self.write_hits(&hits).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_guidance(&self) -> Result<()> {
+    async fn activate_guidance(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation
             .iter()
@@ -116,7 +131,7 @@ impl QueryAgenticModule {
             .map(|(_id, config)| config.guidance.as_str())
             .unwrap_or_default();
         let question = guidance_question(guidance, "file");
-        let hits = self.search_with_files(&[question]).await?;
+        let hits = self.search_with_files(cx, &[question]).await?;
         self.write_hits(&hits).await
     }
 
@@ -128,7 +143,11 @@ impl QueryAgenticModule {
         Ok(())
     }
 
-    async fn search_with_files(&self, questions: &[String]) -> Result<Vec<QueryFileHit>> {
+    async fn search_with_files(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        questions: &[String],
+    ) -> Result<Vec<QueryFileHit>> {
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -142,7 +161,7 @@ impl QueryAgenticModule {
         let allocation = self.allocation.snapshot().await;
         let lutum = self.llm.lutum().await;
         let mut session = Session::new(lutum);
-        session.push_system(SYSTEM_PROMPT);
+        session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
                 "questions": questions,
@@ -275,12 +294,16 @@ impl Module for QueryAgenticModule {
         QueryAgenticModule::next_batch(self).await
     }
 
-    async fn activate(&mut self, batch: &Self::Batch) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
+    ) -> Result<()> {
         if !batch.queries.is_empty() {
-            self.handle_queries(batch.queries.clone()).await?;
+            self.handle_queries(cx, batch.queries.clone()).await?;
         }
         if batch.guidance {
-            self.activate_guidance().await?;
+            self.activate_guidance(cx).await?;
         }
         Ok(())
     }
