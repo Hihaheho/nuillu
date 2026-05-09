@@ -34,16 +34,10 @@ impl VectorMemorySearcher {
         }
     }
 
-    pub async fn search(
-        &self,
-        query: &str,
-        limit: usize,
-        filter_rank: Option<MemoryRank>,
-    ) -> Result<Vec<MemoryRecord>, PortError> {
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, PortError> {
         let q = MemoryQuery {
             text: query.to_owned(),
             limit,
-            filter_rank,
         };
         let hits = self.primary_store.search(&q).await?;
 
@@ -582,7 +576,7 @@ mod tests {
 
         let hits = caps
             .vector_memory_searcher()
-            .search("matched", 10, None)
+            .search("matched", 10)
             .await
             .expect("search succeeds");
 

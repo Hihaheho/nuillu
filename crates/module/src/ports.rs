@@ -87,7 +87,6 @@ pub struct MemoryRecord {
 pub struct MemoryQuery {
     pub text: String,
     pub limit: usize,
-    pub filter_rank: Option<MemoryRank>,
 }
 
 /// Read-only grep-like search over application files.

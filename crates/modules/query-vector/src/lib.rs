@@ -31,7 +31,6 @@ or code fences."#;
 pub struct SearchVectorMemoryArgs {
     pub query: String,
     pub limit: usize,
-    pub filter_rank: Option<MemoryRank>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -207,7 +206,7 @@ impl QueryVectorModule {
         let limit = args.limit.clamp(1, 16);
         let records = self
             .memory
-            .search(&args.query, limit, args.filter_rank)
+            .search(&args.query, limit)
             .await
             .context("search vector memory")?;
         Ok(SearchVectorMemoryOutput {

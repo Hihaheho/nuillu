@@ -673,59 +673,27 @@ impl MemoryStore for LibsqlMemoryStore {
         let embedding_json = self.embed_json(&q.text).await?;
         let mut out = Vec::new();
 
-        match q.filter_rank {
-            Some(rank) => {
-                let sql = format!(
-                    r#"
-                    SELECT m.memory_index, m.content, m.rank
-                    FROM {memories} AS m
-                    JOIN {embeddings} AS e ON e.memory_id = m.id
-                    WHERE m.deleted_at_ms IS NULL
-                      AND e.content_updated_at_ms = m.updated_at_ms
-                      AND m.rank = ?2
-                    ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
-                             m.id ASC
-                    LIMIT ?3
-                    "#,
-                    memories = self.table_name,
-                    embeddings = self.embedding_table_name,
-                );
-                let mut rows = self
-                    .conn
-                    .query(
-                        &sql,
-                        params![embedding_json, rank_to_i64(rank), limit_to_i64(q.limit)],
-                    )
-                    .await
-                    .map_err(map_libsql_error)?;
-                while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
-                    out.push(Self::row_to_record(&row)?);
-                }
-            }
-            None => {
-                let sql = format!(
-                    r#"
-                    SELECT m.memory_index, m.content, m.rank
-                    FROM {memories} AS m
-                    JOIN {embeddings} AS e ON e.memory_id = m.id
-                    WHERE m.deleted_at_ms IS NULL
-                      AND e.content_updated_at_ms = m.updated_at_ms
-                    ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
-                             m.id ASC
-                    LIMIT ?2
-                    "#,
-                    memories = self.table_name,
-                    embeddings = self.embedding_table_name,
-                );
-                let mut rows = self
-                    .conn
-                    .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
-                    .await
-                    .map_err(map_libsql_error)?;
-                while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
-                    out.push(Self::row_to_record(&row)?);
-                }
-            }
+        let sql = format!(
+            r#"
+            SELECT m.memory_index, m.content, m.rank
+            FROM {memories} AS m
+            JOIN {embeddings} AS e ON e.memory_id = m.id
+            WHERE m.deleted_at_ms IS NULL
+              AND e.content_updated_at_ms = m.updated_at_ms
+            ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
+                     m.id ASC
+            LIMIT ?2
+            "#,
+            memories = self.table_name,
+            embeddings = self.embedding_table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
+            .await
+            .map_err(map_libsql_error)?;
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            out.push(Self::row_to_record(&row)?);
         }
 
         Ok(out)
@@ -976,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_uses_cosine_order_limit_and_rank_filter() {
+    async fn search_uses_cosine_order_and_limit() {
         let store = store().await;
         let alpha = store
             .insert(NewMemory {
@@ -985,7 +953,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let beta = store
+        store
             .insert(NewMemory {
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::LongTerm,
@@ -1004,23 +972,11 @@ mod tests {
             .search(&MemoryQuery {
                 text: "alpha".into(),
                 limit: 1,
-                filter_rank: None,
             })
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].index, alpha);
-
-        let filtered = store
-            .search(&MemoryQuery {
-                text: "alpha".into(),
-                limit: 10,
-                filter_rank: Some(MemoryRank::LongTerm),
-            })
-            .await
-            .unwrap();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].index, beta);
     }
 
     #[tokio::test]
@@ -1038,7 +994,6 @@ mod tests {
             .search(&MemoryQuery {
                 text: "alpha".into(),
                 limit: 0,
-                filter_rank: None,
             })
             .await
             .unwrap();
@@ -1064,7 +1019,6 @@ mod tests {
             .search(&MemoryQuery {
                 text: "alpha".into(),
                 limit: 10,
-                filter_rank: None,
             })
             .await
             .unwrap();
@@ -1230,7 +1184,6 @@ mod tests {
             .search(&MemoryQuery {
                 text: "beta".into(),
                 limit: 10,
-                filter_rank: None,
             })
             .await
             .unwrap();
@@ -1241,7 +1194,6 @@ mod tests {
             .search(&MemoryQuery {
                 text: "beta".into(),
                 limit: 10,
-                filter_rank: None,
             })
             .await
             .unwrap();
@@ -1268,7 +1220,6 @@ mod tests {
                 .search(&MemoryQuery {
                     text: "alpha".into(),
                     limit: 10,
-                    filter_rank: None,
                 })
                 .await
                 .unwrap()
@@ -1290,7 +1241,6 @@ mod tests {
                 .search(&MemoryQuery {
                     text: "beta".into(),
                     limit: 10,
-                    filter_rank: None,
                 })
                 .await
                 .unwrap()
@@ -1302,7 +1252,6 @@ mod tests {
                 .search(&MemoryQuery {
                     text: "beta".into(),
                     limit: 10,
-                    filter_rank: None,
                 })
                 .await
                 .unwrap()

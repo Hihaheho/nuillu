@@ -362,16 +362,12 @@ impl MemoryStore for LanceDbMemoryStore {
             return Ok(Vec::new());
         }
         let embedding = self.embed_text(&q.text).await?;
-        let mut query = self
+        let query = self
             .table
             .query()
             .nearest_to(embedding.as_slice())
             .map_err(map_lancedb_error)?
             .limit(q.limit);
-
-        if let Some(rank) = q.filter_rank {
-            query = query.only_if(format!("{COL_RANK} = {}", rank_to_i32(rank)));
-        }
 
         let batches = query
             .execute()
@@ -666,7 +662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_uses_nearest_limit_and_rank_filter() {
+    async fn search_uses_nearest_and_limit() {
         let store = store_with_indices(false).await;
         let alpha = store
             .insert(NewMemory {
@@ -675,7 +671,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let beta = store
+        store
             .insert(NewMemory {
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::LongTerm,
@@ -694,23 +690,11 @@ mod tests {
             .search(&MemoryQuery {
                 text: "alpha".into(),
                 limit: 1,
-                filter_rank: None,
             })
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].index, alpha);
-
-        let filtered = store
-            .search(&MemoryQuery {
-                text: "alpha".into(),
-                limit: 10,
-                filter_rank: Some(MemoryRank::LongTerm),
-            })
-            .await
-            .unwrap();
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].index, beta);
     }
 
     #[tokio::test]
@@ -728,7 +712,6 @@ mod tests {
             .search(&MemoryQuery {
                 text: "alpha".into(),
                 limit: 0,
-                filter_rank: None,
             })
             .await
             .unwrap();
