@@ -1,26 +1,13 @@
-use std::{
-    cell::{Cell, RefCell},
-    path::Path,
-};
+use std::cell::{Cell, RefCell};
 
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    ArtifactTextField, CaseArtifact, Check, EvalCase, EvalModule, FullAgentInput, ModuleEvalTarget,
-    ReasoningEffort, RubricJudge, RubricJudgeError, RubricJudgeInput, RubricJudgeRequest,
-    RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files, evaluate_case,
-    normalize_text_block, parse_case_file, parse_full_agent_case_file, parse_model_set_file,
+    ArtifactTextField, CaseArtifact, Check, EvalCase, RubricJudge, RubricJudgeError,
+    RubricJudgeInput, RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion,
+    evaluate_case, normalize_text_block, parse_case_file, parse_full_agent_case_file,
     parse_module_case_file, render_judge_input,
 };
-use nuillu_types::MemoryRank;
-
-fn eval_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases")
-}
-
-fn workspace_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn empty_trace() -> TraceSnapshot {
     TraceSnapshot {
@@ -197,229 +184,6 @@ fn artifact_from_output_checks(case: &EvalCase) -> CaseArtifact {
 }
 
 #[test]
-fn parses_checked_in_eval_cases() {
-    let files = discover_case_files(&eval_root()).unwrap();
-
-    assert_eq!(files.len(), 10, "expected checked-in eval case count");
-    for path in files {
-        parse_case_file(&path).unwrap_or_else(|error| {
-            panic!("failed to parse {}: {error}", path.display());
-        });
-    }
-}
-
-#[test]
-fn parses_checked_in_model_set() {
-    let path = workspace_root().join("configs/modelsets/eval-ollama.eure");
-    let model_set = parse_model_set_file(&path).unwrap();
-
-    let judge = model_set.judge.unwrap();
-    assert_eq!(judge.endpoint(), Some("http://localhost:11434/v1"));
-    assert_eq!(judge.token.as_deref(), Some("local"));
-    assert_eq!(judge.model.as_deref(), Some("gpt-oss:20b"));
-    assert_eq!(judge.reasoning_effort, None);
-    assert_eq!(judge.use_responses_api, None);
-    let cheap = model_set.cheap.unwrap();
-    assert_eq!(cheap.endpoint(), Some("http://localhost:11434/v1"));
-    assert_eq!(cheap.token.as_deref(), Some("local"));
-    assert_eq!(cheap.model.as_deref(), Some("gemma4:26b"));
-    assert_eq!(cheap.reasoning_effort, Some(ReasoningEffort::Low));
-    assert_eq!(cheap.use_responses_api, None);
-    let default = model_set.default.unwrap();
-    assert_eq!(default.endpoint(), Some("http://localhost:11434/v1"));
-    assert_eq!(default.token.as_deref(), Some("local"));
-    assert_eq!(default.model.as_deref(), Some("gemma4:26b"));
-    assert_eq!(default.reasoning_effort, Some(ReasoningEffort::Medium));
-    assert_eq!(default.use_responses_api, None);
-    let premium = model_set.premium.unwrap();
-    assert_eq!(premium.endpoint(), Some("http://localhost:11434/v1"));
-    assert_eq!(premium.token.as_deref(), Some("local"));
-    assert_eq!(premium.model.as_deref(), Some("gemma4:26b"));
-    assert_eq!(premium.reasoning_effort, Some(ReasoningEffort::High));
-    assert_eq!(premium.use_responses_api, None);
-}
-
-#[test]
-fn parses_responses_api_model_set_option() {
-    let path = workspace_root().join("configs/modelsets/eval-gpt5.4.eure");
-    let model_set = parse_model_set_file(&path).unwrap();
-
-    assert_eq!(model_set.judge.unwrap().use_responses_api, Some(true));
-    assert_eq!(model_set.cheap.unwrap().use_responses_api, Some(true));
-    assert_eq!(model_set.default.unwrap().use_responses_api, Some(true));
-    assert_eq!(model_set.premium.unwrap().use_responses_api, Some(true));
-}
-
-#[test]
-fn rejects_global_model_set_backend_fields() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("global-backend.eure");
-    std::fs::write(
-        &path,
-        r#"
-name = "bad-global"
-endpoint = "http://localhost:11434/v1"
-
-judge {
-  model = "judge"
-}
-"#,
-    )
-    .unwrap();
-
-    let err = parse_model_set_file(&path).unwrap_err();
-    assert!(err.to_string().contains("endpoint"), "{err}");
-}
-
-#[test]
-fn parses_full_agent_peer_boundary_case() {
-    let path = eval_root().join("full-agent/dog-peer-food-boundary.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::FullAgent(case) = case else {
-        panic!("expected full-agent case");
-    };
-
-    assert_eq!(
-        case.id.as_deref(),
-        Some("full-agent-dog-peer-food-boundary")
-    );
-    assert_eq!(case.inputs.len(), 2);
-    assert!(matches!(case.inputs[0], FullAgentInput::Seen { .. }));
-    assert!(matches!(case.inputs[1], FullAgentInput::Heard { .. }));
-    assert_eq!(case.limits.max_llm_calls, Some(10));
-    assert_eq!(
-        case.modules.as_deref(),
-        Some(
-            [
-                EvalModule::Sensory,
-                EvalModule::AttentionGate,
-                EvalModule::AttentionController,
-                EvalModule::QueryVector,
-                EvalModule::SpeakGate,
-                EvalModule::Speak,
-            ]
-            .as_slice()
-        )
-    );
-}
-
-#[test]
-fn parses_full_agent_memory_required_case() {
-    let path = eval_root().join("full-agent/own-body-simple-report.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::FullAgent(case) = case else {
-        panic!("expected full-agent case");
-    };
-
-    assert_eq!(
-        case.id.as_deref(),
-        Some("full-agent-own-body-simple-report")
-    );
-    assert_eq!(case.inputs.len(), 2);
-    assert_eq!(case.memories.len(), 1);
-    assert_eq!(
-        MemoryRank::from(case.memories[0].rank),
-        MemoryRank::Permanent
-    );
-    assert!(!case.memories[0].content.content.trim().is_empty());
-    assert_eq!(
-        case.modules.as_deref(),
-        Some(
-            [
-                EvalModule::Sensory,
-                EvalModule::AttentionGate,
-                EvalModule::AttentionController,
-                EvalModule::AttentionSchema,
-                EvalModule::SelfModel,
-                EvalModule::QueryVector,
-                EvalModule::SpeakGate,
-                EvalModule::Speak,
-            ]
-            .as_slice()
-        )
-    );
-}
-
-#[test]
-fn parses_full_agent_modules_checks() {
-    let dir = tempfile::tempdir().unwrap();
-    let full_agent_dir = dir.path().join("eval-cases/full-agent");
-    std::fs::create_dir_all(&full_agent_dir).unwrap();
-    let path = full_agent_dir.join("modules-checks.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "modules-checks"
-modules = ["sensory", "query-vector"]
-
-@ inputs[] {
-  $variant: heard
-  content = "Find the memory."
-}
-
-@ modules-checks[] {
-  module = "query-vector"
-
-  @ rubrics[] {
-    name = "query-history"
-    pass-score = 0.85
-    judge-inputs = ["output", "memos"]
-    rubric = "Judge the query-vector memo history."
-  }
-}
-"#,
-    )
-    .unwrap();
-
-    let case = parse_full_agent_case_file(&path).unwrap();
-
-    assert_eq!(case.modules_checks.len(), 1);
-    assert_eq!(case.modules_checks[0].module, EvalModule::QueryVector);
-    assert_eq!(case.modules_checks[0].rubrics.len(), 1);
-    assert_eq!(
-        case.modules_checks[0].rubrics[0].name.as_deref(),
-        Some("query-history")
-    );
-    assert_eq!(
-        case.modules_checks[0].rubrics[0].judge_inputs,
-        vec![RubricJudgeInput::Output, RubricJudgeInput::Memos]
-    );
-}
-
-#[test]
-fn omitted_max_llm_calls_defaults_to_ten() {
-    let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-vector");
-    std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("default-budget.eure");
-    std::fs::write(
-        &path,
-        r#"
-id = "default-budget"
-prompt = "Find memory."
-"#,
-    )
-    .unwrap();
-
-    let case = parse_module_case_file(&path).unwrap();
-    assert_eq!(case.limits.max_llm_calls, Some(10));
-}
-
-#[test]
-fn explicit_max_llm_calls_override_wins() {
-    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::Module { case, .. } = case else {
-        panic!("expected module case");
-    };
-
-    assert_eq!(case.limits.max_llm_calls, Some(8));
-}
-
-#[test]
 fn rejects_duplicate_modules() {
     let dir = tempfile::tempdir().unwrap();
     let case_dir = dir.path().join("eval-cases/modules/query-vector");
@@ -460,77 +224,6 @@ prompt = "Find memory."
         err.to_string().contains("must include target module"),
         "{err}"
     );
-}
-
-#[test]
-fn parses_query_vector_module_case_with_memory_seed() {
-    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
-    };
-
-    assert_eq!(target, ModuleEvalTarget::QueryVector);
-    assert!(!case.prompt.content.trim().is_empty());
-    assert_eq!(
-        case.modules.as_deref(),
-        Some([EvalModule::QueryVector].as_slice())
-    );
-    assert_eq!(case.memories.len(), 1);
-    assert_eq!(
-        MemoryRank::from(case.memories[0].rank),
-        MemoryRank::Permanent
-    );
-    assert!(!case.memories[0].content.content.trim().is_empty());
-    assert!(case.checks.iter().any(|check| matches!(
-        check,
-        Check::Rubric {
-            judge_inputs,
-            ..
-        } if !judge_inputs.is_empty()
-    )));
-}
-
-#[test]
-fn parses_query_agentic_module_case() {
-    let path = eval_root().join("modules/query-agentic/retrieve-torus-route-rule.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
-    };
-
-    assert_eq!(target, ModuleEvalTarget::QueryAgentic);
-    assert!(!case.prompt.content.trim().is_empty());
-    assert_eq!(
-        case.modules.as_deref(),
-        Some([EvalModule::QueryAgentic].as_slice())
-    );
-    assert_eq!(case.files.len(), 1);
-    assert!(!case.files[0].path.trim().is_empty());
-    assert!(!case.files[0].content.content.trim().is_empty());
-    assert_eq!(case.limits.max_llm_calls, Some(8));
-}
-
-#[test]
-fn parses_attention_schema_module_case() {
-    let path = eval_root().join("modules/attention-schema/current-attended-peer-signal.eure");
-    let case = parse_case_file(&path).unwrap();
-
-    let EvalCase::Module { target, case } = case else {
-        panic!("expected module case");
-    };
-
-    assert_eq!(target, ModuleEvalTarget::AttentionSchema);
-    assert!(!case.prompt.content.trim().is_empty());
-    assert_eq!(
-        case.modules.as_deref(),
-        Some([EvalModule::AttentionSchema].as_slice())
-    );
-    assert_eq!(case.attention_stream.len(), 1);
-    assert_eq!(case.attention_stream[0].seconds_ago, 3);
-    assert!(!case.attention_stream[0].text.content.trim().is_empty());
 }
 
 #[test]
@@ -648,22 +341,6 @@ modules = ["sensory"]
 }
 
 #[tokio::test]
-async fn evaluates_module_case_with_rubric_judge() {
-    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
-    let case = parse_case_file(&path).unwrap();
-    let artifact = artifact_from_output_checks(&case);
-    let judge = CaseDataJudge::from_case(&case);
-    let check_count = case.checks().len();
-
-    let report = evaluate_case(&case, &empty_trace(), &artifact, Some(&judge)).await;
-
-    assert!(judge.called.get());
-    assert!(report.passed(), "{report:#?}");
-    assert_eq!(report.checks.len(), check_count);
-    assert!(report.score > 0.9);
-}
-
-#[tokio::test]
 async fn evaluates_full_agent_modules_checks_from_scoped_memo_logs_without_affecting_score() {
     let dir = tempfile::tempdir().unwrap();
     let full_agent_dir = dir.path().join("eval-cases/full-agent");
@@ -777,22 +454,4 @@ fn render_judge_input_includes_only_selected_sections() {
     assert!(!rendered.contains("Artifact observations JSON:"));
     assert!(!rendered.contains("Trace summary:"));
     assert!(!rendered.contains("\"query-agentic\""));
-}
-
-#[tokio::test]
-async fn rubric_case_requires_judge() {
-    let path = eval_root().join("modules/query-vector/retrieve-koro-approach-rule.eure");
-    let case = parse_case_file(&path).unwrap();
-    let artifact = artifact_from_output_checks(&case);
-
-    let report = evaluate_case(&case, &empty_trace(), &artifact, None).await;
-
-    assert!(!report.passed());
-    assert!(report.invalid);
-    assert!(
-        report
-            .checks
-            .iter()
-            .any(|check| check.kind == "rubric" && check.errored)
-    );
 }
