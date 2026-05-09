@@ -260,6 +260,7 @@ async fn refresh_active_and_schedule(
                     module,
                     batch,
                     config,
+                    runtime.clone(),
                     catalog,
                     identity_memories,
                     parent,
@@ -324,6 +325,7 @@ async fn handle_task_message(
                         module,
                         batch,
                         config,
+                        runtime.clone(),
                         catalog,
                         identity_memories,
                         parent,
@@ -448,6 +450,7 @@ fn spawn_activate(
     module: AllocatedModule,
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
+    runtime: AgentRuntimeControl,
     catalog: Vec<(ModuleId, &'static str)>,
     identity_memories: Vec<IdentityMemoryRecord>,
     parent: &tracing::Span,
@@ -457,6 +460,7 @@ fn spawn_activate(
         async move {
             let (module, result) = activate_with_retries(
                 module,
+                &runtime,
                 &catalog,
                 &identity_memories,
                 &batch,
@@ -476,12 +480,17 @@ fn spawn_activate(
 
 async fn activate_with_retries(
     mut module: AllocatedModule,
+    runtime: &AgentRuntimeControl,
     catalog: &[(ModuleId, &'static str)],
     identity_memories: &[IdentityMemoryRecord],
     batch: &ModuleBatch,
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
-    let cx = ActivateCx::new(catalog, identity_memories);
+    let cx = ActivateCx::new(
+        catalog,
+        identity_memories,
+        runtime.session_compaction_lutum(),
+    );
     let mut retries = 0_u8;
     loop {
         match module.activate(&cx, batch).await {

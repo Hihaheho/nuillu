@@ -2,6 +2,7 @@ use std::any::Any;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use lutum::Lutum;
 use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleId;
 
@@ -13,16 +14,19 @@ use nuillu_types::ModuleId;
 pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
+    session_compaction_lutum: &'a Lutum,
 }
 
 impl<'a> ActivateCx<'a> {
     pub fn new(
         modules: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
+        session_compaction_lutum: &'a Lutum,
     ) -> Self {
         Self {
             modules,
             identity_memories,
+            session_compaction_lutum,
         }
     }
 
@@ -35,6 +39,11 @@ impl<'a> ActivateCx<'a> {
     /// store before modules are activated.
     pub fn identity_memories(&self) -> &[IdentityMemoryRecord] {
         self.identity_memories
+    }
+
+    /// Cheap shared LLM handle for module-owned session compaction.
+    pub fn session_compaction_lutum(&self) -> &Lutum {
+        self.session_compaction_lutum
     }
 }
 

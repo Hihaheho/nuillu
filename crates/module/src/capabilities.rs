@@ -3,6 +3,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lutum::Lutum;
 use nuillu_blackboard::{
     ActivationRatioFn, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
     ModuleRunStatus,
@@ -278,6 +279,7 @@ impl CapabilityProviders {
                 self.inner.cognition_log_updates.clone(),
             ),
             clock: self.inner.clock.clone(),
+            session_compaction_lutum: self.inner.tiers.cheap.clone(),
             runtime_events: self.inner.runtime_events.clone(),
         }
     }
@@ -366,6 +368,7 @@ pub struct AgentRuntimeControl {
     blackboard: Blackboard,
     cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Arc<dyn Clock>,
+    session_compaction_lutum: Lutum,
     runtime_events: RuntimeEventEmitter,
 }
 
@@ -378,6 +381,10 @@ impl AgentRuntimeControl {
 
     pub fn clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
+    }
+
+    pub fn session_compaction_lutum(&self) -> &Lutum {
+        &self.session_compaction_lutum
     }
 
     /// Snapshot of the registered-module catalog. Cheap synchronous read; the
