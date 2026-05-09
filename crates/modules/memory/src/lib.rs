@@ -100,8 +100,7 @@ impl MemoryModule {
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -122,7 +121,7 @@ impl MemoryModule {
 
         for _ in 0..4 {
             let outcome = session
-                .text_turn()
+                .text_turn(&self.llm.lutum().await)
                 .tools::<MemoryTools>()
                 .available_tools([MemoryToolsSelector::InsertMemory])
                 .collect()

@@ -102,8 +102,7 @@ impl MemoryCompactionModule {
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -115,7 +114,7 @@ impl MemoryCompactionModule {
 
         for _ in 0..6 {
             let outcome = session
-                .text_turn()
+                .text_turn(&self.llm.lutum().await)
                 .tools::<CompactionTools>()
                 .available_tools([
                     CompactionToolsSelector::GetMemories,

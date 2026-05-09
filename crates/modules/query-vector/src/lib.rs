@@ -156,8 +156,7 @@ impl QueryVectorModule {
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -170,8 +169,9 @@ impl QueryVectorModule {
 
         let mut all_hits = Vec::new();
         for _ in 0..MAX_QUERY_ROUNDS {
+            let lutum = self.llm.lutum().await;
             let turn = session
-                .structured_turn::<QueryVectorSearchCompletion>()
+                .structured_turn::<QueryVectorSearchCompletion>(&lutum)
                 .tools::<QueryVectorTools>()
                 .available_tools([QueryVectorToolsSelector::SearchVectorMemory]);
             let turn = if all_hits.is_empty() {

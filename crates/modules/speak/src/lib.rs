@@ -284,8 +284,7 @@ impl SpeakGateModule {
                 )
             })
             .await;
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(gate_prompt_for(
             self.readiness_prompt(cx),
             self.interruption_prompt(cx),
@@ -330,7 +329,7 @@ impl SpeakGateModule {
 
         for _ in 0..MAX_GATE_TOOL_ROUNDS {
             let outcome = session
-                .structured_turn::<SpeakGateDecision>()
+                .structured_turn::<SpeakGateDecision>(&self.llm.lutum().await)
                 .tools::<SpeakGateTools>()
                 .available_tools([
                     SpeakGateToolsSelector::QueryMemory,
@@ -596,12 +595,12 @@ impl SpeakModule {
         attention_json: serde_json::Value,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         push_generation_context(&mut session, attention_json, draft, self.generation_prompt(cx));
 
+        let lutum = self.llm.lutum().await;
         let mut stream = session
-            .text_turn()
+            .text_turn(&lutum)
             .stream()
             .await
             .context("speak generation stream failed")?;
@@ -696,9 +695,7 @@ mod tests {
     use super::*;
 
     fn test_session() -> Session {
-        let adapter = MockLlmAdapter::new();
-        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-        Session::new(lutum::Lutum::new(Arc::new(adapter), budget))
+        Session::new()
     }
 
     fn test_caps(blackboard: Blackboard) -> CapabilityProviders {

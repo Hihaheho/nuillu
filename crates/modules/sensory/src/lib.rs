@@ -188,13 +188,12 @@ impl SensoryModule {
             "allocation": allocation,
         });
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(prompt.to_string());
 
         let result = session
-            .structured_turn::<SensoryDecision>()
+            .structured_turn::<SensoryDecision>(&self.llm.lutum().await)
             .collect()
             .await
             .context("sensory structured turn failed")?;
@@ -240,8 +239,7 @@ impl SensoryModule {
             .collect::<Vec<_>>();
         let allocation = self.allocation.snapshot().await;
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.detail_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -253,7 +251,7 @@ impl SensoryModule {
         );
 
         let result = session
-            .structured_turn::<SensoryDetailAnswer>()
+            .structured_turn::<SensoryDetailAnswer>(&self.llm.lutum().await)
             .collect()
             .await
             .context("sensory detail structured turn failed")?;

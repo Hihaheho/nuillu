@@ -108,8 +108,7 @@ impl SurpriseModule {
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -122,7 +121,7 @@ impl SurpriseModule {
         );
 
         let result = session
-            .structured_turn::<SurpriseAssessment>()
+            .structured_turn::<SurpriseAssessment>(&self.llm.lutum().await)
             .collect()
             .await
             .context("surprise structured turn failed")?;

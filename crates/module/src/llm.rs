@@ -13,9 +13,9 @@ use crate::runtime_events::RuntimeEventEmitter;
 /// owning module and returns the [`Lutum`] handle bound to the
 /// allocation's tier.
 ///
-/// Modules consume the returned `Lutum` directly — typically by feeding
-/// it into `lutum::Session::new(lutum)` for a single-turn or agent-loop
-/// activation. The capability deliberately stops at the `Lutum`
+/// Modules consume the returned `Lutum` directly — typically by passing
+/// it into `lutum::Session`'s turn builders (e.g. `session.text_turn(&lutum)`)
+/// for a single-turn or agent-loop activation. The capability deliberately stops at the `Lutum`
 /// boundary; everything past it (Session shape, prompts, tools) is the
 /// module's own concern.
 #[derive(Clone)]

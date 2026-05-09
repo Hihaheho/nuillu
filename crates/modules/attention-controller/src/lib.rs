@@ -151,8 +151,7 @@ impl AttentionControllerModule {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
 
-        let lutum = llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(system_prompt);
         session.push_user(
             controller_input(
@@ -167,7 +166,7 @@ impl AttentionControllerModule {
         let result = CONTROLLER_DECISION_SCHEMA
             .scope(output_schema, async {
                 session
-                    .structured_turn::<AllocationDecision>()
+                    .structured_turn::<AllocationDecision>(&llm.lutum().await)
                     .collect()
                     .await
             })

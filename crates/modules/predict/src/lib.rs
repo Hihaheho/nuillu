@@ -87,8 +87,7 @@ impl PredictModule {
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -100,7 +99,7 @@ impl PredictModule {
         );
 
         let result = session
-            .structured_turn::<PredictionMemo>()
+            .structured_turn::<PredictionMemo>(&self.llm.lutum().await)
             .collect()
             .await
             .context("predict structured turn failed")?;

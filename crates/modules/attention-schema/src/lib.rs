@@ -64,8 +64,7 @@ impl AttentionSchemaModule {
             .attention
             .read(|stream| stream.entries().to_vec())
             .await;
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.model_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -75,7 +74,7 @@ impl AttentionSchemaModule {
         );
 
         let result = session
-            .structured_turn::<AttentionSchemaMemo>()
+            .structured_turn::<AttentionSchemaMemo>(&self.llm.lutum().await)
             .collect()
             .await
             .context("attention-schema model update failed")?;

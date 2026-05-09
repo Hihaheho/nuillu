@@ -81,8 +81,7 @@ impl SelfModelModule {
             .map(|request| request.question)
             .collect::<Vec<_>>();
 
-        let lutum = self.llm.lutum().await;
-        let mut session = Session::new(lutum);
+        let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
@@ -94,7 +93,7 @@ impl SelfModelModule {
         );
 
         let result = session
-            .structured_turn::<SelfModelReport>()
+            .structured_turn::<SelfModelReport>(&self.llm.lutum().await)
             .collect()
             .await
             .context("self-model structured turn failed")?;
