@@ -25,12 +25,28 @@ impl AttentionSchemaModule {
     }
 
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
-        self.updates.next_item().await?;
+        tokio::select! {
+            update = self.memo_updates.next_item() => {
+                let _ = update?;
+            }
+            update = self.allocation_updates.next_item() => {
+                let _ = update?;
+            }
+            update = self.cognition_updates.next_item() => {
+                let _ = update?;
+            }
+        }
         Ok(NextBatch::model_update())
     }
 
     fn collect_ready_events_into_batch(&mut self, batch: &mut NextBatch) -> Result<()> {
-        if !self.updates.take_ready_items()?.items.is_empty() {
+        if !self.memo_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_model_update();
+        }
+        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_model_update();
+        }
+        if !self.cognition_updates.take_ready_items()?.items.is_empty() {
             batch.mark_model_update();
         }
         Ok(())
@@ -42,7 +58,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multiple_attention_updates_collapse_to_one_model_update() {
+    fn multiple_model_inputs_collapse_to_one_model_update() {
         let mut batch = NextBatch::model_update();
         batch.mark_model_update();
 

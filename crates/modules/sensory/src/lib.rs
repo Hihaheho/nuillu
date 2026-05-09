@@ -20,7 +20,7 @@ Return a structured SensoryDecision object:
 - normalized: the concise plain-text observation to write into your memo when notable is true.
 Use the deterministic salience features as guidance; repeated low-change stimuli should usually
 be ignored or folded into summary.
-Do not write to the attention stream, memory, or emit utterances. Do not return a bare string;
+Do not write to the cognition log, memory, or emit utterances. Do not return a bare string;
 the only textual observation belongs in the normalized field. Return only raw JSON for the
 structured object; do not wrap it in Markdown or code fences."#;
 

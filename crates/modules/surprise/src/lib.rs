@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
     Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
 };
 use nuillu_types::builtin;
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the surprise module.
-Detect unexpected attention events. If a predict memo is present, frame the assessment as
+Detect unexpected cognition-log entries. If a predict memo is present, frame the assessment as
 divergence from pending predictions. If no predict memo is present, judge novelty against recent
-attention history. Do not generate forward predictions. Request memory only when the event is
+cognition-log history. Do not generate forward predictions. Request memory only when the event is
 significant enough to preserve. Return only raw JSON for the structured object; do not wrap it in
 Markdown or code fences."#;
 
-const RECENT_ATTENTION_LIMIT: usize = 12;
+const RECENT_COGNITION_LOG_LIMIT: usize = 12;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SurpriseAssessment {
@@ -46,8 +46,8 @@ pub struct SurpriseMemoryRequest {
 
 pub struct SurpriseModule {
     owner: nuillu_types::ModuleId,
-    updates: AttentionStreamUpdatedInbox,
-    attention: AttentionReader,
+    updates: CognitionLogUpdatedInbox,
+    cognition_log: CognitionLogReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory_requests: MemoryRequestMailbox,
@@ -59,8 +59,8 @@ pub struct SurpriseModule {
 impl SurpriseModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        updates: AttentionStreamUpdatedInbox,
-        attention: AttentionReader,
+        updates: CognitionLogUpdatedInbox,
+        cognition_log: CognitionLogReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory_requests: MemoryRequestMailbox,
@@ -71,7 +71,7 @@ impl SurpriseModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("surprise id is valid"),
             updates,
-            attention,
+            cognition_log,
             allocation,
             blackboard,
             memory_requests,
@@ -94,11 +94,11 @@ impl SurpriseModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let recent_attention = self
-            .attention
-            .read(|stream| {
-                let entries = stream.entries();
-                let start = entries.len().saturating_sub(RECENT_ATTENTION_LIMIT);
+        let recent_cognition_log = self
+            .cognition_log
+            .read(|log| {
+                let entries = log.entries();
+                let start = entries.len().saturating_sub(RECENT_COGNITION_LOG_LIMIT);
                 entries[start..].to_vec()
             })
             .await;
@@ -117,7 +117,7 @@ impl SurpriseModule {
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
-                "recent_attention": recent_attention,
+                "recent_cognition_log": recent_cognition_log,
                 "predict_memo": predict_memo,
                 "memos": memos,
                 "allocation": allocation,
@@ -164,7 +164,7 @@ impl Module for SurpriseModule {
     }
 
     fn role_description() -> &'static str {
-        "Detects unexpected attention events by comparing new entries against predict's memo or recent attention; can request memory preservation."
+        "Detects unexpected cognition-log entries by comparing new entries against predict's memo or recent cognition-log history; can request memory preservation."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

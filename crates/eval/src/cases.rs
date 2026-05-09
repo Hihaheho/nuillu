@@ -20,7 +20,11 @@ fn default_memory_decay_secs() -> i64 {
     86_400
 }
 
-fn default_attention_seconds_ago() -> i64 {
+fn default_seed_seconds_ago() -> i64 {
+    0
+}
+
+fn default_memo_replica() -> u8 {
     0
 }
 
@@ -78,6 +82,8 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
+    pub memos: Vec<MemoSeed>,
+    #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
@@ -128,9 +134,11 @@ pub struct ModuleCase {
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
+    pub memos: Vec<MemoSeed>,
+    #[eure(default)]
     pub files: Vec<FileSeed>,
     #[eure(default)]
-    pub attention_stream: Vec<AttentionSeed>,
+    pub cognition_log: Vec<CognitionLogSeed>,
     #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
@@ -143,7 +151,7 @@ pub struct ModuleCase {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub enum EvalModule {
     Sensory,
-    AttentionGate,
+    CognitionGate,
     AttentionController,
     AttentionSchema,
     SelfModel,
@@ -159,7 +167,7 @@ pub enum EvalModule {
 
 pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Sensory,
-    EvalModule::AttentionGate,
+    EvalModule::CognitionGate,
     EvalModule::AttentionController,
     EvalModule::AttentionSchema,
     EvalModule::SelfModel,
@@ -176,7 +184,7 @@ impl EvalModule {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sensory => "sensory",
-            Self::AttentionGate => "attention-gate",
+            Self::CognitionGate => "cognition-gate",
             Self::AttentionController => "attention-controller",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
@@ -194,7 +202,7 @@ impl EvalModule {
     pub fn module_id(self) -> ModuleId {
         match self {
             Self::Sensory => builtin::sensory(),
-            Self::AttentionGate => builtin::attention_gate(),
+            Self::CognitionGate => builtin::cognition_gate(),
             Self::AttentionController => builtin::attention_controller(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::SelfModel => builtin::self_model(),
@@ -388,6 +396,17 @@ pub struct MemorySeed {
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct MemoSeed {
+    pub module: String,
+    #[eure(default = "default_memo_replica")]
+    pub replica: u8,
+    pub content: Text,
+    #[eure(default = "default_seed_seconds_ago")]
+    pub seconds_ago: i64,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct FileSeed {
     pub path: String,
     pub content: Text,
@@ -395,9 +414,9 @@ pub struct FileSeed {
 
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct AttentionSeed {
+pub struct CognitionLogSeed {
     pub text: Text,
-    #[eure(default = "default_attention_seconds_ago")]
+    #[eure(default = "default_seed_seconds_ago")]
     pub seconds_ago: i64,
 }
 
@@ -482,7 +501,7 @@ pub enum RubricJudgeInput {
     Blackboard,
     Memory,
     Memos,
-    Attention,
+    Cognition,
     Allocation,
 }
 
@@ -752,7 +771,13 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
     }
     validate_modules(path, case.modules.as_deref())?;
     validate_module_checks(path, case)?;
-    validate_common(path, &case.memories, &case.limits, &case.checks)
+    validate_common(
+        path,
+        &case.memories,
+        &case.memos,
+        &case.limits,
+        &case.checks,
+    )
 }
 
 fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileError> {
@@ -776,22 +801,28 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             });
         }
     }
-    for (index, seed) in case.attention_stream.iter().enumerate() {
+    for (index, seed) in case.cognition_log.iter().enumerate() {
         if seed.text.content.trim().is_empty() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
-                message: format!("attention-stream[{index}].text must not be empty"),
+                message: format!("cognition-log[{index}].text must not be empty"),
             });
         }
         if seed.seconds_ago < 0 {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
-                message: format!("attention-stream[{index}].seconds-ago must not be negative"),
+                message: format!("cognition-log[{index}].seconds-ago must not be negative"),
             });
         }
     }
     validate_modules(path, case.modules.as_deref())?;
-    validate_common(path, &case.memories, &case.limits, &case.checks)
+    validate_common(
+        path,
+        &case.memories,
+        &case.memos,
+        &case.limits,
+        &case.checks,
+    )
 }
 
 fn validate_module_case_target(
@@ -901,6 +932,7 @@ fn validate_module_checks(path: &Path, case: &FullAgentCase) -> Result<(), CaseF
 fn validate_common(
     path: &Path,
     memories: &[MemorySeed],
+    memos: &[MemoSeed],
     limits: &EvalLimits,
     checks: &[Check],
 ) -> Result<(), CaseFileError> {
@@ -934,6 +966,33 @@ fn validate_common(
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("memories[{index}].decay-secs must not be negative"),
+            });
+        }
+    }
+
+    for (index, memo) in memos.iter().enumerate() {
+        if memo.module.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memos[{index}].module must not be empty"),
+            });
+        }
+        if let Err(error) = ModuleId::new(memo.module.clone()) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memos[{index}].module is invalid: {error}"),
+            });
+        }
+        if memo.content.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memos[{index}].content must not be empty"),
+            });
+        }
+        if memo.seconds_ago < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memos[{index}].seconds-ago must not be negative"),
             });
         }
     }

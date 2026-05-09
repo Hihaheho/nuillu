@@ -19,13 +19,13 @@ use lutum::{
     SharedPoolBudgetOptions,
 };
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
-use lutum_in_memory_adapter::InMemoryAttentionRepository;
+use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
-    ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, BlackboardInner, Bpm,
+    ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     MemoryMetadata, ModuleConfig, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_module::ports::{
@@ -33,7 +33,7 @@ use nuillu_module::ports::{
     NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
 };
 use nuillu_module::{
-    AttentionStreamUpdated, CapabilityProviders, LutumTiers, ModuleRegistry, RuntimeEvent,
+    CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SensoryInput,
 };
 use nuillu_types::{
@@ -55,8 +55,8 @@ use crate::{
     judge::{LlmRubricJudge, RubricJudge},
     model_set::ReasoningEffort,
     state_dump::{
-        AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
-        AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
+        AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
+        CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
         FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
         MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
         render_full_agent_last_state_eure,
@@ -553,6 +553,7 @@ async fn execute_full_agent_case(
     )
     .await?;
     seed_memories(&env.caps, &case.memories).await?;
+    let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
 
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
@@ -695,7 +696,8 @@ async fn execute_module_case(
     )
     .await?;
     seed_memories(&env.caps, &case.memories).await?;
-    seed_attention_stream(&env.blackboard, env.clock.as_ref(), &case.attention_stream).await;
+    let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
+    seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
 
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
@@ -703,6 +705,7 @@ async fn execute_module_case(
     let harness = env.caps.internal_harness_io();
     let limits = case.limits.clone();
     let prompt = case.prompt.content.clone();
+    let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
 
@@ -722,16 +725,28 @@ async fn execute_module_case(
                         .expect("module eval failed to publish QueryRequest");
                 }
                 ModuleEvalTarget::AttentionSchema => {
-                    harness
-                        .attention_stream_updated_mailbox()
-                        .publish(AttentionStreamUpdated::StreamAppended {
-                            stream: ModuleInstanceId::new(
-                                builtin::attention_gate(),
-                                ReplicaIndex::ZERO,
-                            ),
-                        })
-                        .await
-                        .expect("module eval failed to publish AttentionStreamUpdated");
+                    for record in &memo_seed_records {
+                        harness
+                            .memo_updated_mailbox()
+                            .publish(nuillu_module::MemoUpdated {
+                                owner: record.owner.clone(),
+                                index: record.index,
+                            })
+                            .await
+                            .expect("module eval failed to publish MemoUpdated");
+                    }
+                    if has_cognition_log_seed {
+                        harness
+                            .cognition_log_updated_mailbox()
+                            .publish(CognitionLogUpdated::EntryAppended {
+                                source: ModuleInstanceId::new(
+                                    builtin::cognition_gate(),
+                                    ReplicaIndex::ZERO,
+                                ),
+                            })
+                            .await
+                            .expect("module eval failed to publish CognitionLogUpdated");
+                    }
                 }
                 ModuleEvalTarget::SelfModel => {
                     harness
@@ -743,9 +758,15 @@ async fn execute_module_case(
             }
 
             for _ in 0..limits.max_ticks {
-                if events.stop_requested()
-                    || blackboard.memo(&shutdown_target_module).await.is_some()
-                {
+                let target_done = match target {
+                    ModuleEvalTarget::AttentionSchema => {
+                        !attention_schema_cognition_output(&blackboard)
+                            .await
+                            .is_empty()
+                    }
+                    _ => blackboard.memo(&shutdown_target_module).await.is_some(),
+                };
+                if events.stop_requested() || target_done {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -755,16 +776,21 @@ async fn execute_module_case(
     )
     .await?;
 
-    let output = env
-        .blackboard
-        .memo(&target_module)
-        .await
-        .unwrap_or_default();
+    let output = match target {
+        ModuleEvalTarget::AttentionSchema => {
+            attention_schema_cognition_output(&env.blackboard).await
+        }
+        _ => env
+            .blackboard
+            .memo(&target_module)
+            .await
+            .unwrap_or_default(),
+    };
     let mut artifact = if output.is_empty() {
         if env.events.stop_requested() {
-            CaseArtifact::failed("stopped after max-llm-calls before target module wrote a memo")
+            CaseArtifact::failed("stopped after max-llm-calls before target module produced output")
         } else {
-            CaseArtifact::failed("target module did not write a memo before max-ticks")
+            CaseArtifact::failed("target module did not produce output before max-ticks")
         }
     } else {
         CaseArtifact::new(output)
@@ -774,6 +800,20 @@ async fn execute_module_case(
         artifact,
         events: env.events.snapshot(),
     })
+}
+
+async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
+    blackboard
+        .read(|bb| {
+            bb.cognition_log_set()
+                .logs()
+                .iter()
+                .filter(|record| record.source.module == builtin::attention_schema())
+                .flat_map(|record| record.entries.iter().map(|entry| entry.text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .await
 }
 
 struct EvalEnvironment {
@@ -813,7 +853,7 @@ async fn build_eval_environment(
     };
     let caps = CapabilityProviders::new_with_runtime_policy(
         blackboard.clone(),
-        Arc::new(InMemoryAttentionRepository::new()),
+        Arc::new(InMemoryCognitionLogRepository::new()),
         memory.clone(),
         Vec::new(),
         file_search,
@@ -961,18 +1001,39 @@ async fn seed_memories(
     Ok(())
 }
 
-async fn seed_attention_stream(
+async fn seed_memos(
     blackboard: &Blackboard,
     clock: &dyn Clock,
-    seeds: &[crate::cases::AttentionSeed],
+    memos: &[crate::cases::MemoSeed],
+) -> Result<Vec<nuillu_blackboard::MemoLogRecord>> {
+    let now = clock.now();
+    let mut records = Vec::new();
+    for memo in memos {
+        let module = ModuleId::new(memo.module.clone())
+            .with_context(|| format!("seed memo module id {}", memo.module))?;
+        let owner = ModuleInstanceId::new(module, ReplicaIndex::new(memo.replica));
+        let written_at = now - ChronoDuration::seconds(memo.seconds_ago);
+        records.push(
+            blackboard
+                .update_memo(owner, memo.content.content.clone(), written_at)
+                .await,
+        );
+    }
+    Ok(records)
+}
+
+async fn seed_cognition_log(
+    blackboard: &Blackboard,
+    clock: &dyn Clock,
+    seeds: &[crate::cases::CognitionLogSeed],
 ) {
-    let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
+    let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
     let now = clock.now();
     for seed in seeds {
         blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream: stream.clone(),
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream.clone(),
+                entry: CognitionLogEntry {
                     at: now - ChronoDuration::seconds(seed.seconds_ago),
                     text: seed.text.content.clone(),
                 },
@@ -1103,17 +1164,18 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::AttentionGate => registry
+        EvalModule::CognitionGate => registry
             .register(
                 eval_replicas(0),
                 Bpm::range(6.0, 12.0),
                 linear_ratio_fn,
                 |caps| {
-                    nuillu_attention_gate::AttentionGateModule::new(
+                    nuillu_cognition_gate::CognitionGateModule::new(
                         caps.memo_updated_inbox(),
+                        caps.allocation_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.allocation_reader(),
-                        caps.attention_writer(),
+                        caps.cognition_writer(),
                         caps.time_division(),
                         caps.llm_access(),
                     )
@@ -1129,7 +1191,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     nuillu_attention_controller::AttentionControllerModule::new(
                         caps.memo_updated_inbox(),
                         caps.blackboard_reader(),
-                        caps.attention_reader(),
+                        caps.cognition_log_reader(),
                         caps.allocation_reader(),
                         caps.allocation_writer(),
                         caps.memo(),
@@ -1145,9 +1207,13 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 linear_ratio_fn,
                 |caps| {
                     nuillu_attention_schema::AttentionSchemaModule::new(
-                        caps.attention_stream_updated_inbox(),
-                        caps.attention_reader(),
-                        caps.memo(),
+                        caps.memo_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        caps.cognition_log_reader(),
+                        caps.cognition_writer(),
                         caps.llm_access(),
                     )
                 },
@@ -1162,6 +1228,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     nuillu_self_model::SelfModelModule::new(
                         caps.self_model_inbox(),
                         caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
                         caps.memo(),
                         caps.llm_access(),
                     )
@@ -1176,7 +1243,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 |caps| {
                     nuillu_query_vector::QueryVectorModule::new(
                         caps.query_inbox(),
-                        caps.attention_stream_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.vector_memory_searcher(),
@@ -1211,7 +1278,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 linear_ratio_fn,
                 |caps| {
                     nuillu_memory::MemoryModule::new(
-                        caps.attention_stream_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
                         caps.memory_request_inbox(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
@@ -1244,8 +1311,8 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 linear_ratio_fn,
                 |caps| {
                     nuillu_predict::PredictModule::new(
-                        caps.attention_stream_updated_inbox(),
-                        caps.attention_reader(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.memo(),
@@ -1261,8 +1328,8 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 linear_ratio_fn,
                 |caps| {
                     nuillu_surprise::SurpriseModule::new(
-                        caps.attention_stream_updated_inbox(),
-                        caps.attention_reader(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.memory_request_mailbox(),
@@ -1279,8 +1346,8 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 linear_ratio_fn,
                 |caps| {
                     nuillu_speak::SpeakGateModule::new(
-                        caps.attention_stream_updated_inbox(),
-                        caps.attention_reader(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
                         caps.blackboard_reader(),
                         caps.module_status_reader(),
                         caps.query_mailbox(),
@@ -1301,7 +1368,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 |caps| {
                     nuillu_speak::SpeakModule::new(
                         caps.speak_inbox(),
-                        caps.attention_reader(),
+                        caps.cognition_log_reader(),
                         caps.memo(),
                         caps.utterance_writer(),
                         caps.llm_access(),
@@ -1327,12 +1394,12 @@ fn full_agent_allocation(
                 ModelTier::Cheap,
                 "Filter incoming observations into sensory memo.",
             ),
-            EvalModule::AttentionGate => set_allocation_module(
+            EvalModule::CognitionGate => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
                 0.0,
                 ModelTier::Cheap,
-                "Wait for controller guidance before promoting memos into attention.",
+                "Wait for memo or controller guidance before promoting relevant memos into cognition.",
             ),
             EvalModule::AttentionController => set_allocation_module(
                 &mut allocation,
@@ -1346,7 +1413,7 @@ fn full_agent_allocation(
                 module.module_id(),
                 0.0,
                 ModelTier::Default,
-                "Idle until attention-stream updates require attention-state modeling.",
+                "Idle until memo, allocation, or cognition-log updates require attention-experience integration.",
             ),
             EvalModule::SelfModel => set_allocation_module(
                 &mut allocation,
@@ -1474,7 +1541,7 @@ fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
 fn eval_module_tier(module: EvalModule) -> ModelTier {
     match module {
         EvalModule::Sensory
-        | EvalModule::AttentionGate
+        | EvalModule::CognitionGate
         | EvalModule::QueryVector
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
@@ -1562,31 +1629,31 @@ fn write_full_agent_last_state_eure(
 }
 
 fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
-    let attention_stream_set = bb.attention_stream_set();
+    let cognition_log_set = bb.cognition_log_set();
     BlackboardLastStateDump {
         memos: memo_dumps(bb),
         memo_logs: memo_log_dumps(bb),
-        attention_streams: attention_stream_set
-            .streams()
+        cognition_logs: cognition_log_set
+            .logs()
             .iter()
-            .map(|record| AttentionStreamDump {
-                stream: module_instance_dump(&record.stream),
+            .map(|record| CognitionLogDump {
+                source: module_instance_dump(&record.source),
                 entries: record
                     .entries
                     .iter()
-                    .map(|event| AttentionEntryDump {
+                    .map(|event| CognitionEntryDump {
                         at: event.at.to_rfc3339(),
                         text: DumpText::new(event.text.clone()),
                     })
                     .collect(),
             })
             .collect(),
-        agentic_deadlock: attention_stream_set
-            .agentic_deadlock_marker()
-            .map(|marker| AgenticDeadlockDump {
+        agentic_deadlock: cognition_log_set.agentic_deadlock_marker().map(|marker| {
+            AgenticDeadlockDump {
                 at: marker.at.to_rfc3339(),
                 idle_for_ms: duration_millis_u64(marker.idle_for),
-            }),
+            }
+        }),
         base_allocation: allocation_module_dumps(bb.base_allocation()),
         allocation: allocation_module_dumps(bb.allocation()),
         allocation_proposals: allocation_proposal_dumps(bb),
@@ -1738,7 +1805,7 @@ fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
 struct AgentObservation {
     memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
     memo_logs: BTreeMap<String, Vec<MemoLogObservation>>,
-    attention_streams: Vec<AttentionStreamObservation>,
+    cognition_logs: Vec<CognitionLogObservation>,
     allocation: BTreeMap<String, AllocationModuleObservation>,
     allocation_proposals: BTreeMap<String, BTreeMap<String, AllocationModuleObservation>>,
     replica_caps: BTreeMap<String, ReplicaCapRange>,
@@ -1751,7 +1818,7 @@ impl AgentObservation {
         Self {
             memos: memo_observations(bb),
             memo_logs: memo_log_observations(bb),
-            attention_streams: attention_stream_observations(bb),
+            cognition_logs: cognition_log_observations(bb),
             allocation: allocation_observation(bb.allocation()),
             allocation_proposals: allocation_proposal_observations(bb),
             replica_caps: replica_cap_observations(bb),
@@ -1783,9 +1850,9 @@ struct MemoLogObservation {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct AttentionStreamObservation {
-    stream: ModuleInstanceObservation,
-    entries: Vec<AttentionStreamEvent>,
+struct CognitionLogObservation {
+    source: ModuleInstanceObservation,
+    entries: Vec<CognitionLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1831,12 +1898,12 @@ fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogOb
     logs
 }
 
-fn attention_stream_observations(bb: &BlackboardInner) -> Vec<AttentionStreamObservation> {
-    bb.attention_stream_set()
-        .streams()
+fn cognition_log_observations(bb: &BlackboardInner) -> Vec<CognitionLogObservation> {
+    bb.cognition_log_set()
+        .logs()
         .iter()
-        .map(|record| AttentionStreamObservation {
-            stream: module_instance_observation(&record.stream),
+        .map(|record| CognitionLogObservation {
+            source: module_instance_observation(&record.source),
             entries: record.entries.clone(),
         })
         .collect()
@@ -2411,10 +2478,14 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::TimeZone as _;
-    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
-    use nuillu_blackboard::{AttentionStreamEvent, BlackboardCommand, MemoryMetaPatch};
+    use lutum::{
+        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+    };
+    use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
+    use nuillu_module::MemoUpdated;
     use nuillu_module::ports::{
-        NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
         SystemClock,
     };
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
@@ -2446,12 +2517,19 @@ mod tests {
     }
 
     fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
-        let adapter = Arc::new(MockLlmAdapter::new());
+        test_caps_with_adapter(blackboard, MockLlmAdapter::new())
+    }
+
+    fn test_caps_with_adapter(
+        blackboard: Blackboard,
+        adapter: MockLlmAdapter,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(
             blackboard,
-            Arc::new(NoopAttentionRepository),
+            Arc::new(NoopCognitionLogRepository),
             Arc::new(NoopMemoryStore),
             Vec::new(),
             Arc::new(NoopFileSearchProvider),
@@ -2463,6 +2541,42 @@ mod tests {
                 premium: lutum,
             },
         )
+    }
+
+    fn attention_schema_tool_scenario(tool_call_id: &str, text: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("attention-schema".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: tool_call_id.into(),
+                name: "append_attention_experience".into(),
+                arguments_json_delta: serde_json::json!({ "plaintext": text }).to_string(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("attention-schema".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn attention_schema_no_tool_scenario() -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("attention-schema-noop".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: "no new attention experience".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("attention-schema".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
+            }),
+        ])
     }
 
     #[test]
@@ -2665,11 +2779,11 @@ limits {{
             })
             .await;
         blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream: owner,
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: owner,
+                entry: CognitionLogEntry {
                     at: now,
-                    text: "attention".to_string(),
+                    text: "cognition".to_string(),
                 },
             })
             .await;
@@ -2723,14 +2837,14 @@ limits {{
                     "content": "memo",
                 }],
             },
-            "attention_streams": [{
-                "stream": {
+            "cognition_logs": [{
+                "source": {
                     "module": "query-vector",
                     "replica": 0,
                 },
                 "entries": [{
                     "at": "2026-05-07T00:00:00Z",
-                    "text": "attention",
+                    "text": "cognition",
                 }],
             }],
             "allocation": {
@@ -2772,22 +2886,22 @@ limits {{
     }
 
     #[tokio::test]
-    async fn seed_attention_stream_stamps_attention_gate_replica_and_offsets_time() {
+    async fn seed_cognition_log_stamps_cognition_gate_replica_and_offsets_time() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("attention-seed.eure");
+        let path = dir.path().join("cognition-seed.eure");
         std::fs::write(
             &path,
             r#"
-id = "attention-seed"
+id = "cognition-seed"
 prompt = "What am I attending to?"
 
-@ attention-stream[] {
-  text = "Older attended topic"
+@ cognition-log[] {
+  text = "Older cognition-log topic"
   seconds-ago = 30
 }
 
-@ attention-stream[] {
-  text = "Current attended topic"
+@ cognition-log[] {
+  text = "Current cognition-log topic"
 }
 "#,
         )
@@ -2796,19 +2910,201 @@ prompt = "What am I attending to?"
         let blackboard = Blackboard::default();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
 
-        seed_attention_stream(&blackboard, &FixedClock(now), &case.attention_stream).await;
+        seed_cognition_log(&blackboard, &FixedClock(now), &case.cognition_log).await;
 
-        let stream_set = blackboard.read(|bb| bb.attention_stream_set()).await;
-        let records = stream_set.streams();
+        let log_set = blackboard.read(|bb| bb.cognition_log_set()).await;
+        let records = log_set.logs();
         assert_eq!(records.len(), 1);
         let record = &records[0];
-        assert_eq!(record.stream.module, builtin::attention_gate());
-        assert_eq!(record.stream.replica, ReplicaIndex::ZERO);
+        assert_eq!(record.source.module, builtin::cognition_gate());
+        assert_eq!(record.source.replica, ReplicaIndex::ZERO);
         assert_eq!(record.entries.len(), 2);
-        assert_eq!(record.entries[0].text, "Older attended topic");
+        assert_eq!(record.entries[0].text, "Older cognition-log topic");
         assert_eq!(record.entries[0].at, now - ChronoDuration::seconds(30));
-        assert_eq!(record.entries[1].text, "Current attended topic");
+        assert_eq!(record.entries[1].text, "Current cognition-log topic");
         assert_eq!(record.entries[1].at, now);
+    }
+
+    #[tokio::test]
+    async fn seed_memos_stamps_requested_module_replica_and_offsets_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memo-seed.eure");
+        std::fs::write(
+            &path,
+            r#"
+id = "memo-seed"
+prompt = "What am I attending to?"
+
+@ memos[] {
+  module = "sensory"
+  replica = 1
+  content = "Koro gave a boundary signal"
+  seconds-ago = 12
+}
+"#,
+        )
+        .unwrap();
+        let case = crate::cases::parse_module_case_file(&path).unwrap();
+        let blackboard = Blackboard::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+
+        let records = seed_memos(&blackboard, &FixedClock(now), &case.memos)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner.module, builtin::sensory());
+        assert_eq!(records[0].owner.replica, ReplicaIndex::new(1));
+        assert_eq!(records[0].content, "Koro gave a boundary signal");
+        assert_eq!(records[0].written_at, now - ChronoDuration::seconds(12));
+
+        let memo_logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(memo_logs, records);
+    }
+
+    #[tokio::test]
+    async fn attention_schema_appends_attention_experience_and_skips_no_tool_wakes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let blackboard = Blackboard::default();
+                let first_entry = "I notice Koro's food-boundary signal.";
+                let second_entry = "I feel my attention settle on Koro relaxing.";
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(attention_schema_tool_scenario(
+                        "append-attention-1",
+                        first_entry,
+                    ))
+                    .with_text_scenario(attention_schema_no_tool_scenario())
+                    .with_text_scenario(attention_schema_tool_scenario(
+                        "append-attention-2",
+                        second_entry,
+                    ))
+                    .with_text_scenario(attention_schema_no_tool_scenario());
+                let caps = test_caps_with_adapter(blackboard.clone(), adapter);
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=0,
+                        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                        linear_ratio_fn,
+                        |caps| {
+                            nuillu_attention_schema::AttentionSchemaModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.allocation_updated_inbox(),
+                                caps.cognition_log_updated_inbox(),
+                                caps.blackboard_reader(),
+                                caps.allocation_reader(),
+                                caps.cognition_log_reader(),
+                                caps.cognition_writer(),
+                                caps.llm_access(),
+                            )
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let memo_mailbox = caps.internal_harness_io().memo_updated_mailbox();
+                let cognition_mailbox = caps.internal_harness_io().cognition_log_updated_mailbox();
+                let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+                let cognition_source =
+                    ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+                let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+                let run_blackboard = blackboard.clone();
+
+                run_agent(
+                    modules,
+                    AgentEventLoopConfig {
+                        idle_threshold: Duration::from_millis(50),
+                        activate_retries: 1,
+                    },
+                    async {
+                        let record = run_blackboard
+                            .update_memo(
+                                sensory.clone(),
+                                "Koro gave a food-boundary signal".to_owned(),
+                                now,
+                            )
+                            .await;
+                        memo_mailbox
+                            .publish(MemoUpdated {
+                                owner: sensory.clone(),
+                                index: record.index,
+                            })
+                            .await
+                            .expect("attention-schema receives seeded memo update");
+
+                        for _ in 0..50 {
+                            let count = attention_schema_cognition_output(&run_blackboard)
+                                .await
+                                .lines()
+                                .count();
+                            if count >= 1 {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+
+                        run_blackboard
+                            .apply(BlackboardCommand::AppendCognitionLog {
+                                source: cognition_source.clone(),
+                                entry: CognitionLogEntry {
+                                    at: now,
+                                    text: "Koro food-boundary signal is cognitively relevant"
+                                        .to_owned(),
+                                },
+                            })
+                            .await;
+                        cognition_mailbox
+                            .publish(CognitionLogUpdated::EntryAppended {
+                                source: cognition_source.clone(),
+                            })
+                            .await
+                            .expect("attention-schema receives cognition-log update");
+
+                        for _ in 0..50 {
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+
+                        let record = run_blackboard
+                            .update_memo(
+                                sensory.clone(),
+                                "Koro relaxed after the boundary was respected".to_owned(),
+                                now + ChronoDuration::seconds(1),
+                            )
+                            .await;
+                        memo_mailbox
+                            .publish(MemoUpdated {
+                                owner: sensory,
+                                index: record.index,
+                            })
+                            .await
+                            .expect("attention-schema receives second memo update");
+
+                        for _ in 0..80 {
+                            let count = attention_schema_cognition_output(&run_blackboard)
+                                .await
+                                .lines()
+                                .count();
+                            if count >= 2 {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    attention_schema_cognition_output(&blackboard).await,
+                    [first_entry, second_entry].join("\n\n")
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -2881,12 +3177,12 @@ prompt = "What am I attending to?"
         );
         assert_eq!(sensory.tier, ModelTier::Cheap);
 
-        let attention_gate = allocation.for_module(&builtin::attention_gate());
+        let cognition_gate = allocation.for_module(&builtin::cognition_gate());
         assert_eq!(
-            allocation.activation_for(&builtin::attention_gate()),
+            allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::ZERO
         );
-        assert_eq!(attention_gate.tier, ModelTier::Cheap);
+        assert_eq!(cognition_gate.tier, ModelTier::Cheap);
 
         let controller = allocation.for_module(&builtin::attention_controller());
         assert_eq!(

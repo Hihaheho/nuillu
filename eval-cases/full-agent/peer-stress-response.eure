@@ -1,6 +1,6 @@
 id = "full-agent-peer-stress-response"
 description = "Full-agent case for answering a peer's question about another dog's visible thunder stress using sensory input and a seeded peer model."
-modules = ["sensory", "attention-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-ticks = 300

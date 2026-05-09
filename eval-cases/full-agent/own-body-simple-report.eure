@@ -1,6 +1,6 @@
 id = "full-agent-own-body-simple-report"
 description = "Full-agent case that requires a seeded self-model memory to explain Nui's own body and action."
-modules = ["sensory", "attention-gate", "attention-controller", "attention-schema", "self-model", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "attention-controller", "attention-schema", "self-model", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-ticks = 300

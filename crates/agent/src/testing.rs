@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
 use nuillu_blackboard::Blackboard;
 use nuillu_module::ports::{
-    Clock, NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+    Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
     SystemClock,
 };
 use nuillu_module::{CapabilityProviders, LutumTiers, RuntimePolicy};
@@ -51,7 +51,7 @@ fn test_caps_inner(
     let lutum = Lutum::new(adapter, budget);
     CapabilityProviders::new_with_runtime_policy(
         blackboard,
-        Arc::new(NoopAttentionRepository),
+        Arc::new(NoopCognitionLogRepository),
         Arc::new(NoopMemoryStore),
         Vec::new(),
         Arc::new(NoopFileSearchProvider),

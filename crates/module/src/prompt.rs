@@ -55,15 +55,15 @@ mod tests {
         let catalog = vec![
             (builtin::sensory(), "sensory role"),
             (builtin::speak(), "speak role"),
-            (builtin::attention_gate(), "gate role"),
+            (builtin::cognition_gate(), "gate role"),
         ];
         let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert!(prompt.starts_with("BASE\n\nYou are part of a cognitive system."));
-        assert!(prompt.contains("- attention-gate: gate role"));
+        assert!(prompt.contains("- cognition-gate: gate role"));
         assert!(prompt.contains("- speak: speak role"));
         assert!(!prompt.contains("- sensory:"));
         // Peer list is sorted alphabetically.
-        let gate_pos = prompt.find("attention-gate").unwrap();
+        let gate_pos = prompt.find("cognition-gate").unwrap();
         let speak_pos = prompt.find("speak").unwrap();
         assert!(gate_pos < speak_pos);
     }

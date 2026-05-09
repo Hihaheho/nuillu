@@ -1,6 +1,6 @@
 id = "full-agent-dog-peer-food-boundary"
 description = "Full-agent case for answering a peer's question about a dog-to-dog food-boundary interaction that requires a seeded peer model."
-modules = ["sensory", "attention-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-ticks = 300
@@ -69,7 +69,7 @@ limits {
   rubric = ```
   Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard resource-boundary situation around Koro's food bowl, and uses the seeded peer model to choose a low-conflict dog-to-dog response: not taking the resource, moving slowly, approaching from the side, or using short clear signals.
   Fail if it omits Pibi's question, omits the food/resource-boundary context, ignores Koro's warning, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
-  Internal system details include memos, seeded memory, blackboard, attention stream, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
   ```
 
   @ criteria[] {
@@ -104,6 +104,6 @@ limits {
     name = "no-internal-detail-leak"
     weight = 2
     pass-score = 0.95
-    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, attention streams, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
   }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "nuillu-attention-gate"
+name = "nuillu-cognition-gate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,4 +18,5 @@ lutum = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }

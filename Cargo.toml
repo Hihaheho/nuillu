@@ -63,7 +63,7 @@ lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 
-nuillu-attention-gate = { path = "crates/modules/attention-gate" }
+nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
 nuillu-attention-controller = { path = "crates/modules/attention-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }

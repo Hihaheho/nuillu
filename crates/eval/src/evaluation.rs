@@ -667,12 +667,8 @@ fn scoped_agent_observation(
     );
     insert_if_some(
         &mut scoped,
-        "attention_streams",
-        filter_array_by_nested_module(
-            agent.get("attention_streams"),
-            &["stream", "module"],
-            module,
-        ),
+        "cognition_logs",
+        filter_array_by_nested_module(agent.get("cognition_logs"), &["source", "module"], module),
     );
     insert_if_some(
         &mut scoped,
@@ -745,10 +741,10 @@ fn scoped_last_state_blackboard(
     );
     insert_if_some(
         &mut scoped,
-        "attention_streams",
+        "cognition_logs",
         filter_array_by_nested_module(
-            blackboard.get("attention_streams"),
-            &["stream", "module"],
+            blackboard.get("cognition_logs"),
+            &["source", "module"],
             module,
         ),
     );

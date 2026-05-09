@@ -6,26 +6,26 @@ use crate::QueryVectorModule;
 #[derive(Debug, Default)]
 pub struct NextBatch {
     pub(crate) queries: Vec<QueryRequest>,
-    pub(crate) attention_updated: bool,
+    pub(crate) cognition_updated: bool,
 }
 
 impl NextBatch {
-    fn attention_updated() -> Self {
+    fn cognition_updated() -> Self {
         Self {
             queries: Vec::new(),
-            attention_updated: true,
+            cognition_updated: true,
         }
     }
 
     fn query(request: QueryRequest) -> Self {
         Self {
             queries: vec![request],
-            attention_updated: false,
+            cognition_updated: false,
         }
     }
 
-    fn mark_attention_updated(&mut self) {
-        self.attention_updated = true;
+    fn mark_cognition_updated(&mut self) {
+        self.cognition_updated = true;
     }
 
     fn extend_queries(&mut self, requests: impl IntoIterator<Item = QueryRequest>) {
@@ -42,9 +42,9 @@ impl QueryVectorModule {
 
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
         let batch = tokio::select! {
-            update = self.attention_updates.next_item() => {
+            update = self.cognition_updates.next_item() => {
                 let _ = update?;
-                NextBatch::attention_updated()
+                NextBatch::cognition_updated()
             }
             request = self.query.next_item() => {
                 let envelope = request?;
@@ -63,8 +63,8 @@ impl QueryVectorModule {
                 .map(|envelope| envelope.body),
         );
 
-        if !self.attention_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_attention_updated();
+        if !self.cognition_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_cognition_updated();
         }
 
         Ok(())
@@ -89,11 +89,11 @@ mod tests {
     }
 
     #[test]
-    fn attention_update_flag_can_share_batch_with_queries() {
+    fn cognition_log_update_flag_can_share_batch_with_queries() {
         let mut batch = NextBatch::query(QueryRequest::new("question"));
-        batch.mark_attention_updated();
+        batch.mark_cognition_updated();
 
-        assert!(batch.attention_updated);
+        assert!(batch.cognition_updated);
         assert_eq!(batch.queries.len(), 1);
     }
 }

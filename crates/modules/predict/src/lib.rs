@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
     Memo, Module,
 };
 use schemars::JsonSchema;
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the predict module.
-Maintain forward predictions about the current attention targets.
+Maintain forward predictions about the current cognition-log targets.
 Generate predictions only; do not assess whether earlier predictions were correct and do not
-request memory writes. Keep predictions concise, grounded in the current attention stream and
+request memory writes. Keep predictions concise, grounded in the current cognition log and
 blackboard context. Return only raw JSON for the structured object; do not wrap it in Markdown or
 code fences."#;
 
@@ -33,8 +33,8 @@ pub struct PredictionEntry {
 
 pub struct PredictModule {
     owner: nuillu_module::ModuleId,
-    updates: AttentionStreamUpdatedInbox,
-    attention: AttentionReader,
+    updates: CognitionLogUpdatedInbox,
+    cognition_log: CognitionLogReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memo: Memo,
@@ -44,8 +44,8 @@ pub struct PredictModule {
 
 impl PredictModule {
     pub fn new(
-        updates: AttentionStreamUpdatedInbox,
-        attention: AttentionReader,
+        updates: CognitionLogUpdatedInbox,
+        cognition_log: CognitionLogReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memo: Memo,
@@ -55,7 +55,7 @@ impl PredictModule {
             owner: nuillu_module::ModuleId::new(<Self as Module>::id())
                 .expect("predict id is valid"),
             updates,
-            attention,
+            cognition_log,
             allocation,
             blackboard,
             memo,
@@ -77,10 +77,7 @@ impl PredictModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let attention = self
-            .attention
-            .read(|stream| stream.entries().to_vec())
-            .await;
+        let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
         let context = self
             .blackboard
             .read(|bb| {
@@ -96,7 +93,7 @@ impl PredictModule {
         session.push_system(self.system_prompt(cx));
         session.push_user(
             serde_json::json!({
-                "attention_stream": attention,
+                "cognition_log": cognition_log,
                 "blackboard_context": context,
                 "allocation": allocation,
             })
@@ -128,7 +125,7 @@ impl Module for PredictModule {
     }
 
     fn role_description() -> &'static str {
-        "Generates forward predictions about currently attended subjects on each attention update and writes them to its memo."
+        "Generates forward predictions about current cognition-log subjects on each cognition-log update and writes them to its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

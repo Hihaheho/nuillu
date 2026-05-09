@@ -6,8 +6,8 @@ use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIn
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, AttentionLogRecord, AttentionStream,
-    AttentionStreamRecord, AttentionStreamSet, BlackboardCommand, IdentityMemoryRecord,
+    AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
+    CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, IdentityMemoryRecord,
     MemoryMetadata, ModulePolicy, ResourceAllocation,
 };
 
@@ -39,9 +39,9 @@ pub struct BlackboardInner {
     memo_retained_per_owner: usize,
     module_statuses: HashMap<ModuleInstanceId, ModuleRunStatus>,
     utterance_progresses: HashMap<ModuleInstanceId, UtteranceProgress>,
-    attention_streams: HashMap<ModuleInstanceId, AttentionStream>,
-    attention_log: Vec<AttentionLogRecord>,
-    attention_next_index: u64,
+    cognition_logs: HashMap<ModuleInstanceId, CognitionLog>,
+    cognition_entry_log: Vec<CognitionLogEntryRecord>,
+    cognition_next_index: u64,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     identity_memories: Vec<IdentityMemoryRecord>,
@@ -292,9 +292,9 @@ impl Default for BlackboardInner {
             memo_retained_per_owner: DEFAULT_MEMO_RETAINED_PER_OWNER,
             module_statuses: HashMap::new(),
             utterance_progresses: HashMap::new(),
-            attention_streams: HashMap::new(),
-            attention_log: Vec::new(),
-            attention_next_index: 0,
+            cognition_logs: HashMap::new(),
+            cognition_entry_log: Vec::new(),
+            cognition_next_index: 0,
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
             identity_memories: Vec::new(),
@@ -504,45 +504,48 @@ impl BlackboardInner {
         serde_json::json!(grouped)
     }
 
-    pub fn attention_stream(&self) -> AttentionStream {
+    pub fn cognition_log(&self) -> CognitionLog {
         let mut entries = self
-            .attention_streams
+            .cognition_logs
             .values()
-            .flat_map(|stream| stream.entries().iter().cloned())
+            .flat_map(|log| log.entries().iter().cloned())
             .collect::<Vec<_>>();
-        entries.sort_by_key(|event| event.at);
-        let mut stream = AttentionStream::default();
-        for event in entries {
-            stream.append(event);
+        entries.sort_by_key(|entry| entry.at);
+        let mut log = CognitionLog::default();
+        for entry in entries {
+            log.append(entry);
         }
-        stream
+        log
     }
 
-    pub fn unread_attention_events(&self, last_seen_index: Option<u64>) -> Vec<AttentionLogRecord> {
-        self.attention_log
+    pub fn unread_cognition_log_entries(
+        &self,
+        last_seen_index: Option<u64>,
+    ) -> Vec<CognitionLogEntryRecord> {
+        self.cognition_entry_log
             .iter()
             .filter(|record| last_seen_index.is_none_or(|index| record.index > index))
             .cloned()
             .collect()
     }
 
-    pub fn attention_stream_set(&self) -> AttentionStreamSet {
+    pub fn cognition_log_set(&self) -> CognitionLogSet {
         let mut records = self
-            .attention_streams
+            .cognition_logs
             .iter()
-            .map(|(owner, stream)| AttentionStreamRecord {
-                stream: owner.clone(),
-                entries: stream.entries().to_vec(),
+            .map(|(owner, log)| CognitionLogRecord {
+                source: owner.clone(),
+                entries: log.entries().to_vec(),
             })
             .collect::<Vec<_>>();
         records.sort_by(|a, b| {
-            a.stream
+            a.source
                 .module
                 .as_str()
-                .cmp(b.stream.module.as_str())
-                .then_with(|| a.stream.replica.cmp(&b.stream.replica))
+                .cmp(b.source.module.as_str())
+                .then_with(|| a.source.replica.cmp(&b.source.replica))
         });
-        AttentionStreamSet::new(records, self.agentic_deadlock_marker.clone())
+        CognitionLogSet::new(records, self.agentic_deadlock_marker.clone())
     }
 
     pub fn agentic_deadlock_marker(&self) -> Option<&AgenticDeadlockMarker> {
@@ -603,17 +606,14 @@ impl BlackboardInner {
             BlackboardCommand::SetUtteranceProgress { owner, progress } => {
                 self.utterance_progresses.insert(owner, progress);
             }
-            BlackboardCommand::AppendAttentionStream { stream, event } => {
-                self.attention_log.push(AttentionLogRecord {
-                    index: self.attention_next_index,
-                    stream: stream.clone(),
-                    event: event.clone(),
+            BlackboardCommand::AppendCognitionLog { source, entry } => {
+                self.cognition_entry_log.push(CognitionLogEntryRecord {
+                    index: self.cognition_next_index,
+                    source: source.clone(),
+                    entry: entry.clone(),
                 });
-                self.attention_next_index = self.attention_next_index.saturating_add(1);
-                self.attention_streams
-                    .entry(stream)
-                    .or_default()
-                    .append(event);
+                self.cognition_next_index = self.cognition_next_index.saturating_add(1);
+                self.cognition_logs.entry(source).or_default().append(entry);
             }
             BlackboardCommand::RecordAgenticDeadlockMarker(marker) => {
                 self.agentic_deadlock_marker = Some(marker);
@@ -858,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn memo_round_trip() {
         let bb = Blackboard::new();
-        let id = builtin::attention_gate();
+        let id = builtin::cognition_gate();
         bb.apply(BlackboardCommand::UpdateMemo {
             owner: ModuleInstanceId::new(id.clone(), ReplicaIndex::ZERO),
             memo: "noted".into(),

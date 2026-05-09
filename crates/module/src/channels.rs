@@ -324,9 +324,9 @@ pub struct MemoryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum AttentionStreamUpdated {
-    StreamAppended { stream: ModuleInstanceId },
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CognitionLogUpdated {
+    EntryAppended { source: ModuleInstanceId },
     AgenticDeadlockMarker,
 }
 
@@ -349,8 +349,8 @@ pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
 pub type SpeakInbox = TopicInbox<SpeakRequest>;
 pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
 pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
-pub type AttentionStreamUpdatedMailbox = TopicMailbox<AttentionStreamUpdated>;
-pub type AttentionStreamUpdatedInbox = TopicInbox<AttentionStreamUpdated>;
+pub type CognitionLogUpdatedMailbox = TopicMailbox<CognitionLogUpdated>;
+pub type CognitionLogUpdatedInbox = TopicInbox<CognitionLogUpdated>;
 pub type AllocationUpdatedMailbox = TopicMailbox<AllocationUpdated>;
 pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;

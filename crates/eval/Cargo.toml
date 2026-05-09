@@ -36,7 +36,7 @@ nuillu-query-vector = { workspace = true }
 nuillu-sensory = { workspace = true }
 nuillu-self-model = { workspace = true }
 nuillu-speak = { workspace = true }
-nuillu-attention-gate = { workspace = true }
+nuillu-cognition-gate = { workspace = true }
 nuillu-surprise = { workspace = true }
 nuillu-types = { workspace = true }
 schemars = { workspace = true }

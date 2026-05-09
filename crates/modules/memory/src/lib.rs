@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, MemoryRequest,
+    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, MemoryRequest,
     MemoryRequestInbox, MemoryWriter, Module,
 };
 use nuillu_types::MemoryRank;
@@ -14,7 +14,7 @@ pub use batch::NextBatch as MemoryBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
 Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
-Use current attention plus unread/recent module memo logs as candidate evidence. MemoryRequest
+Use the current cognition log plus unread/recent module memo logs as candidate evidence. MemoryRequest
 messages are explicit preservation candidates from other modules, not write commands. You may
 reject, normalize, merge, and deduplicate observations and requests. Use insert_memory only for
 concrete information likely to matter later."#;
@@ -42,7 +42,7 @@ pub enum MemoryTools {
 
 pub struct MemoryModule {
     owner: nuillu_types::ModuleId,
-    attention_updates: AttentionStreamUpdatedInbox,
+    cognition_updates: CognitionLogUpdatedInbox,
     requests: MemoryRequestInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -53,7 +53,7 @@ pub struct MemoryModule {
 
 impl MemoryModule {
     pub fn new(
-        attention_updates: AttentionStreamUpdatedInbox,
+        cognition_updates: CognitionLogUpdatedInbox,
         requests: MemoryRequestInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -62,7 +62,7 @@ impl MemoryModule {
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
-            attention_updates,
+            cognition_updates,
             requests,
             allocation,
             blackboard,
@@ -88,7 +88,7 @@ impl MemoryModule {
         &self,
         cx: &nuillu_module::ActivateCx<'_>,
         requests: Vec<MemoryRequest>,
-        attention_updated: bool,
+        cognition_updated: bool,
     ) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         let snapshot = self
@@ -97,7 +97,7 @@ impl MemoryModule {
                 serde_json::json!({
                     "latest_memos": bb.memos(),
                     "recent_memo_logs": bb.recent_memo_logs(),
-                    "attention_stream": bb.attention_stream().entries(),
+                    "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
@@ -111,7 +111,7 @@ impl MemoryModule {
                 "blackboard": snapshot,
                 "unread_memo_logs": unread_memo_logs,
                 "memory_requests": requests,
-                "attention_updated": attention_updated,
+                "cognition_updated": cognition_updated,
                 "allocation": allocation,
                 "request_policy": {
                     "normal_request_default_decay_secs": NORMAL_REQUEST_DECAY_SECS,
@@ -177,7 +177,7 @@ impl Module for MemoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Preserves useful information by inserting normalized, deduplicated memory entries from attended evidence and surprise-driven preservation requests."
+        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and surprise-driven preservation requests."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -189,7 +189,7 @@ impl Module for MemoryModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        MemoryModule::activate(self, cx, batch.requests.clone(), batch.attention_updated).await
+        MemoryModule::activate(self, cx, batch.requests.clone(), batch.cognition_updated).await
     }
 }
 
@@ -207,11 +207,12 @@ mod tests {
     };
     use nuillu_blackboard::{Bpm, linear_ratio_fn};
     use nuillu_module::ports::{
-        IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NoopAttentionRepository,
-        NoopFileSearchProvider, NoopUtteranceSink, PortError, SystemClock,
+        IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopUtteranceSink, PortError,
+        SystemClock,
     };
     use nuillu_module::{
-        AttentionStreamUpdated, CapabilityProviders, LutumTiers, MemoryImportance,
+        CapabilityProviders, CognitionLogUpdated, LutumTiers, MemoryImportance,
         MemoryRequestMailbox, ModuleRegistry,
     };
     use nuillu_types::{MemoryIndex, MemoryRank, ModuleInstanceId, ReplicaIndex, builtin};
@@ -227,7 +228,7 @@ mod tests {
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(
             nuillu_blackboard::Blackboard::default(),
-            Arc::new(NoopAttentionRepository),
+            Arc::new(NoopCognitionLogRepository),
             primary,
             Vec::new(),
             Arc::new(NoopFileSearchProvider),
@@ -365,7 +366,7 @@ mod tests {
         ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
-                    caps.attention_stream_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
                     caps.memory_request_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -392,7 +393,7 @@ mod tests {
             .unwrap()
             .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
-                    caps.attention_stream_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
                     caps.memory_request_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -428,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attention_update_does_not_insert_without_llm_tool_decision() {
+    async fn cognition_log_update_does_not_insert_without_llm_tool_decision() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -436,15 +437,13 @@ mod tests {
                 let adapter = MockLlmAdapter::new().with_text_scenario(final_text_scenario("done"));
                 let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
                 let modules = build_memory(&caps).await;
-                let attention = caps
-                    .internal_harness_io()
-                    .attention_stream_updated_mailbox();
+                let cognition_log = caps.internal_harness_io().cognition_log_updated_mailbox();
 
                 run_modules(modules, async {
-                    attention
-                        .publish(AttentionStreamUpdated::StreamAppended {
-                            stream: ModuleInstanceId::new(
-                                builtin::attention_gate(),
+                    cognition_log
+                        .publish(CognitionLogUpdated::EntryAppended {
+                            source: ModuleInstanceId::new(
+                                builtin::cognition_gate(),
                                 ReplicaIndex::ZERO,
                             ),
                         })
@@ -463,27 +462,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attention_update_allows_llm_to_insert_memory() {
+    async fn cognition_log_update_allows_llm_to_insert_memory() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let primary = RecordingMemoryStore::default();
                 let adapter = MockLlmAdapter::new()
                     .with_text_scenario(memory_insert_tool_scenario(
-                        "Ryo wants attention-driven memory implemented.",
+                        "Ryo wants cognition-driven memory implemented.",
                     ))
                     .with_text_scenario(final_text_scenario("memory-complete"));
                 let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
                 let modules = build_memory(&caps).await;
-                let attention = caps
-                    .internal_harness_io()
-                    .attention_stream_updated_mailbox();
+                let cognition_log = caps.internal_harness_io().cognition_log_updated_mailbox();
 
                 run_modules(modules, async {
-                    attention
-                        .publish(AttentionStreamUpdated::StreamAppended {
-                            stream: ModuleInstanceId::new(
-                                builtin::attention_gate(),
+                    cognition_log
+                        .publish(CognitionLogUpdated::EntryAppended {
+                            source: ModuleInstanceId::new(
+                                builtin::cognition_gate(),
                                 ReplicaIndex::ZERO,
                             ),
                         })

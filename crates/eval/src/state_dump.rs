@@ -64,7 +64,7 @@ pub struct FullAgentLastStateCaseDump {
 pub struct BlackboardLastStateDump {
     pub memos: Vec<MemoDump>,
     pub memo_logs: Vec<MemoLogDump>,
-    pub attention_streams: Vec<AttentionStreamDump>,
+    pub cognition_logs: Vec<CognitionLogDump>,
     pub agentic_deadlock: Option<AgenticDeadlockDump>,
     pub base_allocation: Vec<AllocationModuleDump>,
     pub allocation: Vec<AllocationModuleDump>,
@@ -92,14 +92,14 @@ pub struct MemoLogDump {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct AttentionStreamDump {
-    pub stream: ModuleInstanceDump,
-    pub entries: Vec<AttentionEntryDump>,
+pub struct CognitionLogDump {
+    pub source: ModuleInstanceDump,
+    pub entries: Vec<CognitionEntryDump>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct AttentionEntryDump {
+pub struct CognitionEntryDump {
     pub at: String,
     pub text: DumpText,
 }
@@ -228,14 +228,14 @@ mod tests {
                     written_at: "2026-05-08T00:00:00Z".to_string(),
                     content: DumpText::new("memo\nwith newline"),
                 }],
-                attention_streams: vec![AttentionStreamDump {
-                    stream: ModuleInstanceDump {
-                        module: "attention-gate".to_string(),
+                cognition_logs: vec![CognitionLogDump {
+                    source: ModuleInstanceDump {
+                        module: "cognition-gate".to_string(),
                         replica: 0,
                     },
-                    entries: vec![AttentionEntryDump {
+                    entries: vec![CognitionEntryDump {
                         at: "2026-05-08T00:00:00Z".to_string(),
-                        text: DumpText::new("attention"),
+                        text: DumpText::new("cognition"),
                     }],
                 }],
                 agentic_deadlock: None,

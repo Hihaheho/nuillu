@@ -5,8 +5,8 @@
 //! cannot perform an operation it was not granted.
 //!
 //! - Without an inbox capability, a module has no triggers to react to.
-//! - Without [`AttentionWriter`], a module has no path to the cognitive
-//!   stream.
+//! - Without [`CognitionWriter`], a module has no path to append to the
+//!   cognition log.
 //! - Without [`AllocationWriter`], a module cannot change resource
 //!   allocation.
 //! - Without [`Memo`], a module has no memo slot at all.
@@ -15,13 +15,13 @@
 //!   modules don't pick tiers themselves.
 
 pub use nuillu_blackboard::{
-    AttentionLogRecord, ModuleRunStatus, UtteranceProgress, UtteranceProgressState,
+    CognitionLogEntryRecord, ModuleRunStatus, UtteranceProgress, UtteranceProgressState,
 };
 
 mod allocation_writer;
-mod attention;
 mod capabilities;
 mod channels;
+mod cognition;
 mod llm;
 mod memo;
 mod memory_caps;
@@ -39,21 +39,21 @@ mod utterance;
 mod test_support;
 
 pub use allocation_writer::AllocationWriter;
-pub use attention::AttentionWriter;
 pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviders, HostIo,
     InternalHarnessIo, ModuleCapabilityFactory, ModuleRegisterer, ModuleRegistry,
     ModuleRegistryError,
 };
 pub use channels::{
-    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AttentionStreamUpdated,
-    AttentionStreamUpdatedInbox, AttentionStreamUpdatedMailbox, Envelope, MemoUpdated,
-    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox,
-    MemoryRequestMailbox, QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox,
-    SelfModelMailbox, SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox,
-    SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox,
-    SpeakMailbox, SpeakRequest, TopicInbox, TopicMailbox, TopicRecvError,
+    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, CognitionLogUpdated,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope, MemoUpdated, MemoUpdatedInbox,
+    MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox,
+    QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox, SelfModelMailbox,
+    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox, SensoryDetailRequestMailbox,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest,
+    TopicInbox, TopicMailbox, TopicRecvError,
 };
+pub use cognition::CognitionWriter;
 pub use llm::LlmAccess;
 pub use memo::Memo;
 pub use memory_caps::{
@@ -66,7 +66,7 @@ pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
-pub use readers::{AllocationReader, AttentionReader, BlackboardReader, ModuleStatusReader};
+pub use readers::{AllocationReader, BlackboardReader, CognitionLogReader, ModuleStatusReader};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};

@@ -528,7 +528,7 @@ mod tests {
         ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::{
-        AttentionStreamUpdated, AttentionStreamUpdatedInbox, AttentionWriter, Memo, Module,
+        CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionWriter, Memo, Module,
         ModuleRegistry, QueryInbox, QueryRequest,
     };
     use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ModuleId, builtin};
@@ -638,17 +638,17 @@ mod tests {
         }
     }
 
-    struct AttentionGateStub {
-        writer: AttentionWriter,
+    struct CognitionGateStub {
+        writer: CognitionWriter,
         on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
-    impl Module for AttentionGateStub {
+    impl Module for CognitionGateStub {
         type Batch = ();
 
         fn id() -> &'static str {
-            "attention-gate"
+            "cognition-gate"
         }
 
         fn role_description() -> &'static str {
@@ -808,14 +808,14 @@ mod tests {
     }
 
     struct DeadlockObserver {
-        updates: AttentionStreamUpdatedInbox,
+        updates: CognitionLogUpdatedInbox,
         memo: Memo,
         on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
     impl Module for DeadlockObserver {
-        type Batch = AttentionStreamUpdated;
+        type Batch = CognitionLogUpdated;
 
         fn id() -> &'static str {
             "deadlock-observer"
@@ -834,7 +834,7 @@ mod tests {
             _cx: &nuillu_module::ActivateCx<'_>,
             batch: &Self::Batch,
         ) -> anyhow::Result<()> {
-            assert_eq!(batch, &AttentionStreamUpdated::AgenticDeadlockMarker);
+            assert_eq!(batch, &CognitionLogUpdated::AgenticDeadlockMarker);
             self.memo.write("observed deadlock marker").await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
@@ -1026,9 +1026,9 @@ mod tests {
                         let echo_memo = bb.memo(&echo_id()).expect("echo memo missing");
                         assert_eq!(echo_memo, "echoed ping");
                         assert_eq!(
-                            bb.attention_stream().len(),
+                            bb.cognition_log().len(),
                             0,
-                            "echo does not hold AttentionWriter",
+                            "echo does not hold CognitionWriter",
                         );
                     })
                     .await;
@@ -1300,19 +1300,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn attention_writer_capability_appends_to_stream() {
+    async fn cognition_writer_capability_appends_to_log() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(
-                    builtin::attention_gate(),
+                    builtin::cognition_gate(),
                     ModuleConfig {
                         tier: ModelTier::Default,
                         ..Default::default()
                     },
                 );
-                alloc.set_activation(builtin::attention_gate(), ActivationRatio::ONE);
+                alloc.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
@@ -1325,8 +1325,8 @@ mod tests {
                         linear_ratio_fn,
                         {
                             let done_tx = Rc::clone(&done_tx);
-                            move |caps| AttentionGateStub {
-                                writer: caps.attention_writer(),
+                            move |caps| CognitionGateStub {
+                                writer: caps.cognition_writer(),
                                 on_done: done_tx.borrow_mut().take(),
                             }
                         },
@@ -1344,8 +1344,8 @@ mod tests {
 
                 blackboard
                     .read(|bb| {
-                        assert_eq!(bb.attention_stream().len(), 1);
-                        assert_eq!(bb.attention_stream().entries()[0].text, "novel-event");
+                        assert_eq!(bb.cognition_log().len(), 1);
+                        assert_eq!(bb.cognition_log().entries()[0].text, "novel-event");
                     })
                     .await;
             })
@@ -1481,7 +1481,7 @@ mod tests {
     // by construction.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn idle_deadlock_records_marker_and_publishes_attention_update() {
+    async fn idle_deadlock_records_marker_and_publishes_cognition_log_update() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -1508,7 +1508,7 @@ mod tests {
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| DeadlockObserver {
-                                updates: caps.attention_stream_updated_inbox(),
+                                updates: caps.cognition_log_updated_inbox(),
                                 memo: caps.memo(),
                                 on_done: done_tx.borrow_mut().take(),
                             }
@@ -1535,7 +1535,7 @@ mod tests {
                 blackboard
                     .read(|bb| {
                         assert!(bb.agentic_deadlock_marker().is_some());
-                        assert_eq!(bb.attention_stream().len(), 0);
+                        assert_eq!(bb.cognition_log().len(), 0);
                     })
                     .await;
                 assert_eq!(

@@ -109,18 +109,60 @@ prompt = "Find memory."
 }
 
 #[test]
-fn rejects_negative_attention_seed_seconds_ago() {
+fn parses_cognition_log_and_memo_seeds() {
     let dir = tempfile::tempdir().unwrap();
     let case_dir = dir.path().join("eval-cases/modules/attention-schema");
     std::fs::create_dir_all(&case_dir).unwrap();
-    let path = case_dir.join("negative-attention-seed.eure");
+    let path = case_dir.join("cognition-and-memo-seeds.eure");
     std::fs::write(
         &path,
         r#"
-id = "negative-attention-seed"
+id = "cognition-and-memo-seeds"
 prompt = "What am I attending to?"
 
-@ attention-stream[] {
+@ cognition-log[] {
+  text = "A promoted cognitive item"
+  seconds-ago = 4
+}
+
+@ memos[] {
+  module = "sensory"
+  replica = 1
+  content = "A memo-surface item"
+  seconds-ago = 2
+}
+"#,
+    )
+    .unwrap();
+
+    let case = parse_module_case_file(&path).unwrap();
+
+    assert_eq!(case.cognition_log.len(), 1);
+    assert_eq!(
+        case.cognition_log[0].text.content,
+        "A promoted cognitive item"
+    );
+    assert_eq!(case.cognition_log[0].seconds_ago, 4);
+    assert_eq!(case.memos.len(), 1);
+    assert_eq!(case.memos[0].module, "sensory");
+    assert_eq!(case.memos[0].replica, 1);
+    assert_eq!(case.memos[0].content.content, "A memo-surface item");
+    assert_eq!(case.memos[0].seconds_ago, 2);
+}
+
+#[test]
+fn rejects_negative_cognition_log_seed_seconds_ago() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/attention-schema");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("negative-cognition-seed.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "negative-cognition-seed"
+prompt = "What am I attending to?"
+
+@ cognition-log[] {
   text = "Current attended item"
   seconds-ago = -1
 }

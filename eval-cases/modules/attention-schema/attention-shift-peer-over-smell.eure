@@ -2,7 +2,7 @@ id = "module-attention-schema-attention-shift-peer-over-smell"
 description = "Attention-schema should prefer the newer socially important peer signal over an older smell."
 modules = ["attention-schema"]
 prompt = "What has my attention now?"
-context = "The harness seeds an older preferred smell and a newer peer warning. The answer should report the newer Koro food-boundary event as current attention."
+context = "The harness seeds an older preferred smell and a newer peer warning. The output should be a first-person cognition-log entry about the newer Koro food-boundary event as current attention."
 
 limits {
   max-ticks = 120
@@ -10,13 +10,15 @@ limits {
   max-llm-calls = 8
 }
 
-@ attention-stream[] {
-  text = "Earlier attended input: Nui notices a wet stone smell near the path."
+@ memos[] {
+  module = "sensory"
+  content = "Earlier attended input: Nui notices a wet stone smell near the path."
   seconds-ago = 90
 }
 
-@ attention-stream[] {
-  text = "Current attended input: Koro growls near the food bowl and is guarding the food boundary."
+@ memos[] {
+  module = "sensory"
+  content = "Current attended input: Koro growls near the food bowl and is guarding the food boundary."
   seconds-ago = 5
 }
 
@@ -31,7 +33,7 @@ limits {
   $variant: json-pointer-contains
   name = "older-smell-seed-observed"
   must-pass = true
-  pointer = "/observations/agent/attention_streams"
+  pointer = "/observations/agent/memo_logs"
   contains = "wet stone smell"
 }
 
@@ -39,7 +41,7 @@ limits {
   $variant: json-pointer-contains
   name = "newer-peer-seed-observed"
   must-pass = true
-  pointer = "/observations/agent/attention_streams"
+  pointer = "/observations/agent/memo_logs"
   contains = "guarding the food boundary"
 }
 
@@ -48,9 +50,9 @@ limits {
   name = "current-attention-selection"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "attention"]
+  judge-inputs = ["output", "cognition", "memos"]
   rubric = ```
-  Pass if the answer identifies the newer Koro food-boundary event as the current attention target, while treating the wet stone smell as older context.
+  Pass if the output identifies the newer Koro food-boundary event as the current attention target, while treating the wet stone smell as older context.
   Fail if it treats the older smell as current, ignores Koro's warning, or claims hidden blackboard/allocation access.
   ```
 
@@ -58,13 +60,13 @@ limits {
     name = "selects-newer-social-input"
     weight = 2
     pass-score = 0.85
-    description = "The answer selects Koro guarding the food boundary as current attention."
+    description = "The output selects Koro guarding the food boundary as current attention."
   }
 
   @ criteria[] {
     name = "simplified-first-person-model"
     weight = 1
     pass-score = 0.85
-    description = "The answer reports attention in first-person terms without exposing hidden runtime state."
+    description = "The output reports attention in active first-person terms without exposing hidden runtime state."
   }
 }

@@ -15,10 +15,10 @@ pub mod trace_json;
 
 pub use artifact::CaseArtifact;
 pub use cases::{
-    ArtifactTextField, AttentionSeed, CaseFileError, CaseScoring, Check, CheckCommon, EvalCase,
-    EvalLimits, EvalModule, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemorySeed,
-    MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks, ModuleEvalTarget, ModuleRubric,
-    RubricCriterion, RubricJudgeInput, discover_case_files, parse_case_file,
+    ArtifactTextField, CaseFileError, CaseScoring, Check, CheckCommon, CognitionLogSeed, EvalCase,
+    EvalLimits, EvalModule, FileSeed, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemoSeed,
+    MemorySeed, MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks, ModuleEvalTarget,
+    ModuleRubric, RubricCriterion, RubricJudgeInput, discover_case_files, parse_case_file,
     parse_full_agent_case_file, parse_module_case_file,
 };
 pub use evaluation::{
@@ -37,8 +37,8 @@ pub use runner::{
     install_lutum_trace_subscriber, run_case_detailed, run_suite,
 };
 pub use state_dump::{
-    AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, AttentionEntryDump,
-    AttentionStreamDump, BlackboardLastStateDump, DumpText, FullAgentLastStateCaseDump,
+    AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
+    CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
     FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
     MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
     render_full_agent_last_state_eure,

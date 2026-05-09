@@ -256,16 +256,16 @@ fn render_judge_input_section(
                 ],
             ),
         ),
-        RubricJudgeInput::Attention => section(
-            "Attention JSON",
+        RubricJudgeInput::Cognition => section(
+            "Cognition JSON",
             render_observation_paths(
                 &request.artifact,
                 &[
                     (
-                        "last_state.blackboard.attention_streams",
-                        &["last_state", "blackboard", "attention_streams"],
+                        "last_state.blackboard.cognition_logs",
+                        &["last_state", "blackboard", "cognition_logs"],
                     ),
-                    ("agent.attention_streams", &["agent", "attention_streams"]),
+                    ("agent.cognition_logs", &["agent", "cognition_logs"]),
                 ],
             ),
         ),
@@ -376,7 +376,7 @@ fn agent_blackboard_observation(artifact: &CaseArtifact) -> Option<serde_json::V
     for key in [
         "memos",
         "memo_logs",
-        "attention_streams",
+        "cognition_logs",
         "allocation",
         "allocation_proposals",
         "replica_caps",

@@ -7,7 +7,7 @@ use nuillu_blackboard::Blackboard;
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
 
 use crate::ports::{
-    FileSearchProvider, MemoryStore, NoopAttentionRepository, NoopFileSearchProvider,
+    FileSearchProvider, MemoryStore, NoopCognitionLogRepository, NoopFileSearchProvider,
     NoopMemoryStore, NoopUtteranceSink, SystemClock,
 };
 use crate::{CapabilityProviders, LutumTiers, ModuleCapabilityFactory, RuntimePolicy};
@@ -59,7 +59,7 @@ pub(crate) fn test_caps_with_stores_and_adapter(
     let lutum = Lutum::new(adapter, budget);
     CapabilityProviders::new_with_runtime_policy(
         blackboard,
-        Arc::new(NoopAttentionRepository),
+        Arc::new(NoopCognitionLogRepository),
         primary_memory_store,
         memory_replicas,
         file_search,

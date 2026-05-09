@@ -86,7 +86,7 @@ pub enum TopicKind {
     SensoryInput,
     SensoryDetailRequest,
     MemoryRequest,
-    AttentionStreamUpdated,
+    CognitionLogUpdated,
     AllocationUpdated,
     MemoUpdated,
 }
@@ -348,7 +348,7 @@ not change queue capacity or overflow behavior; it only delays before routing.
 Bounded mailboxes are a separate runtime policy because overflow semantics differ
 by topic:
 
-- Wake-only topics (`AttentionStreamUpdated`, `MemoUpdated`,
+- Wake-only topics (`CognitionLogUpdated`, `MemoUpdated`,
   `AllocationUpdated`) may coalesce redundant queued wakes because durable state
   is the source of truth.
 - Work-carrying topics (`QueryRequest`, `SelfModelRequest`, `SpeakRequest`,

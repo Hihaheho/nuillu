@@ -13,7 +13,7 @@ use nuillu_types::{
 
 use crate::channels::{Topic, TopicPolicy};
 use crate::ports::{
-    AttentionRepository, Clock, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
+    Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
 };
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
@@ -21,14 +21,15 @@ use crate::r#trait::ErasedModule;
 use crate::utterance::UtteranceWriter;
 use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
-    AllocationWriter, AttentionReader, AttentionStreamUpdated, AttentionStreamUpdatedInbox,
-    AttentionStreamUpdatedMailbox, AttentionWriter, BlackboardReader, FileSearcher, LlmAccess,
-    LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoryCompactor, MemoryContentReader,
-    MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter, Module, ModuleBatch,
-    ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest, SelfModelInbox, SelfModelMailbox,
-    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox, SensoryDetailRequestMailbox,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest,
-    TimeDivision, TopicInbox, TopicMailbox, VectorMemorySearcher,
+    AllocationWriter, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, FileSearcher, LlmAccess,
+    LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryCompactor,
+    MemoryContentReader, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter,
+    Module, ModuleBatch, ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest,
+    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
+    SensoryDetailRequestInbox, SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, TimeDivision, TopicInbox,
+    TopicMailbox, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -48,11 +49,11 @@ struct CapabilityProvidersInner {
     sensory_detail_topic: Topic<SensoryDetailRequest>,
     speak_topic: Topic<SpeakRequest>,
     memory_request_topic: Topic<MemoryRequest>,
-    attention_updates: Topic<AttentionStreamUpdated>,
+    cognition_log_updates: Topic<CognitionLogUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
-    attention_port: Arc<dyn AttentionRepository>,
+    cognition_log_port: Arc<dyn CognitionLogRepository>,
     primary_memory_store: Arc<dyn MemoryStore>,
     memory_replicas: Vec<Arc<dyn MemoryStore>>,
     file_search: Arc<dyn FileSearchProvider>,
@@ -69,7 +70,7 @@ impl CapabilityProviders {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         blackboard: Blackboard,
-        attention_port: Arc<dyn AttentionRepository>,
+        cognition_log_port: Arc<dyn CognitionLogRepository>,
         primary_memory_store: Arc<dyn MemoryStore>,
         memory_replicas: Vec<Arc<dyn MemoryStore>>,
         file_search: Arc<dyn FileSearchProvider>,
@@ -79,7 +80,7 @@ impl CapabilityProviders {
     ) -> Self {
         Self::new_with_runtime_events(
             blackboard,
-            attention_port,
+            cognition_log_port,
             primary_memory_store,
             memory_replicas,
             file_search,
@@ -93,7 +94,7 @@ impl CapabilityProviders {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_runtime_events(
         blackboard: Blackboard,
-        attention_port: Arc<dyn AttentionRepository>,
+        cognition_log_port: Arc<dyn CognitionLogRepository>,
         primary_memory_store: Arc<dyn MemoryStore>,
         memory_replicas: Vec<Arc<dyn MemoryStore>>,
         file_search: Arc<dyn FileSearchProvider>,
@@ -104,7 +105,7 @@ impl CapabilityProviders {
     ) -> Self {
         Self::new_with_runtime_policy(
             blackboard,
-            attention_port,
+            cognition_log_port,
             primary_memory_store,
             memory_replicas,
             file_search,
@@ -119,7 +120,7 @@ impl CapabilityProviders {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_runtime_policy(
         blackboard: Blackboard,
-        attention_port: Arc<dyn AttentionRepository>,
+        cognition_log_port: Arc<dyn CognitionLogRepository>,
         primary_memory_store: Arc<dyn MemoryStore>,
         memory_replicas: Vec<Arc<dyn MemoryStore>>,
         file_search: Arc<dyn FileSearchProvider>,
@@ -168,10 +169,10 @@ impl CapabilityProviders {
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
-                attention_updates: Topic::new(
+                cognition_log_updates: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::AttentionStreamUpdated,
+                    TopicKind::CognitionLogUpdated,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -197,7 +198,7 @@ impl CapabilityProviders {
                     runtime_events.clone(),
                 ),
                 blackboard,
-                attention_port,
+                cognition_log_port,
                 primary_memory_store,
                 memory_replicas,
                 file_search,
@@ -272,9 +273,9 @@ impl CapabilityProviders {
         );
         AgentRuntimeControl {
             blackboard: self.inner.blackboard.clone(),
-            attention_updates: AttentionStreamUpdatedMailbox::new(
+            cognition_log_updates: CognitionLogUpdatedMailbox::new(
                 owner,
-                self.inner.attention_updates.clone(),
+                self.inner.cognition_log_updates.clone(),
             ),
             clock: self.inner.clock.clone(),
             runtime_events: self.inner.runtime_events.clone(),
@@ -285,8 +286,8 @@ impl CapabilityProviders {
         BlackboardReader::new(self.inner.blackboard.clone())
     }
 
-    pub fn attention_reader(&self) -> AttentionReader {
-        AttentionReader::new(self.inner.blackboard.clone())
+    pub fn cognition_log_reader(&self) -> CognitionLogReader {
+        CognitionLogReader::new(self.inner.blackboard.clone())
     }
 
     pub fn allocation_reader(&self) -> AllocationReader {
@@ -363,7 +364,7 @@ impl CapabilityProviders {
 #[derive(Clone)]
 pub struct AgentRuntimeControl {
     blackboard: Blackboard,
-    attention_updates: AttentionStreamUpdatedMailbox,
+    cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Arc<dyn Clock>,
     runtime_events: RuntimeEventEmitter,
 }
@@ -424,12 +425,12 @@ impl AgentRuntimeControl {
             .await;
 
         if self
-            .attention_updates
-            .publish(AttentionStreamUpdated::AgenticDeadlockMarker)
+            .cognition_log_updates
+            .publish(CognitionLogUpdated::AgenticDeadlockMarker)
             .await
             .is_err()
         {
-            tracing::trace!("agentic deadlock attention update had no active subscribers");
+            tracing::trace!("agentic deadlock cognition-log update had no active subscribers");
         }
     }
 }
@@ -471,11 +472,15 @@ impl InternalHarnessIo {
         )
     }
 
-    pub fn attention_stream_updated_mailbox(&self) -> AttentionStreamUpdatedMailbox {
+    pub fn cognition_log_updated_mailbox(&self) -> CognitionLogUpdatedMailbox {
         TopicMailbox::new(
             self.owner.clone(),
-            self.root.inner.attention_updates.clone(),
+            self.root.inner.cognition_log_updates.clone(),
         )
+    }
+
+    pub fn memo_updated_mailbox(&self) -> MemoUpdatedMailbox {
+        TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone())
     }
 }
 
@@ -544,10 +549,10 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn attention_stream_updated_inbox(&self) -> AttentionStreamUpdatedInbox {
-        TopicInbox::new(
+    pub fn cognition_log_updated_inbox(&self) -> CognitionLogUpdatedInbox {
+        TopicInbox::new_excluding_self(
             self.owner.clone(),
-            self.root.inner.attention_updates.clone(),
+            self.root.inner.cognition_log_updates.clone(),
         )
     }
 
@@ -600,8 +605,8 @@ impl ModuleCapabilityFactory {
         self.root.blackboard_reader()
     }
 
-    pub fn attention_reader(&self) -> AttentionReader {
-        self.root.attention_reader()
+    pub fn cognition_log_reader(&self) -> CognitionLogReader {
+        self.root.cognition_log_reader()
     }
 
     pub fn allocation_reader(&self) -> AllocationReader {
@@ -632,14 +637,14 @@ impl ModuleCapabilityFactory {
         self.root.file_searcher()
     }
 
-    pub fn attention_writer(&self) -> AttentionWriter {
-        AttentionWriter::new(
+    pub fn cognition_writer(&self) -> CognitionWriter {
+        CognitionWriter::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
-            self.root.inner.attention_port.clone(),
-            AttentionStreamUpdatedMailbox::new(
+            self.root.inner.cognition_log_port.clone(),
+            CognitionLogUpdatedMailbox::new(
                 self.owner.clone(),
-                self.root.inner.attention_updates.clone(),
+                self.root.inner.cognition_log_updates.clone(),
             ),
             self.root.inner.clock.clone(),
         )
@@ -875,14 +880,83 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, ModuleConfig, ResourceAllocation,
-        UtteranceProgress,
+        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
+        ResourceAllocation, UtteranceProgress,
     };
     use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ReplicaCapRange, builtin};
 
-    use crate::ports::{IndexedMemory, MemoryQuery, MemoryRecord, NewMemory};
+    use crate::ports::{
+        CognitionLogRepository, FileSearchProvider, IndexedMemory, MemoryQuery, MemoryRecord,
+        MemoryStore, NewMemory, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
+        PortError, SystemClock,
+    };
     use crate::test_support::{scoped, test_caps, test_caps_with_stores};
+
+    #[derive(Clone, Default)]
+    struct RecordingCognitionLogRepository {
+        records: Arc<std::sync::Mutex<Vec<(ModuleInstanceId, CognitionLogEntry)>>>,
+    }
+
+    impl RecordingCognitionLogRepository {
+        fn records(&self) -> Vec<(ModuleInstanceId, CognitionLogEntry)> {
+            self.records.lock().expect("records mutex poisoned").clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl CognitionLogRepository for RecordingCognitionLogRepository {
+        async fn append(
+            &self,
+            source: ModuleInstanceId,
+            entry: CognitionLogEntry,
+        ) -> Result<(), PortError> {
+            self.records
+                .lock()
+                .expect("records mutex poisoned")
+                .push((source, entry));
+            Ok(())
+        }
+
+        async fn since(
+            &self,
+            source: &ModuleInstanceId,
+            from: DateTime<Utc>,
+        ) -> Result<Vec<CognitionLogEntry>, PortError> {
+            Ok(self
+                .records
+                .lock()
+                .expect("records mutex poisoned")
+                .iter()
+                .filter(|(record_source, entry)| record_source == source && entry.at >= from)
+                .map(|(_, entry)| entry.clone())
+                .collect())
+        }
+    }
+
+    fn test_caps_with_cognition_repo(
+        blackboard: Blackboard,
+        cognition_log_port: Arc<dyn CognitionLogRepository>,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(lutum::MockLlmAdapter::new());
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        CapabilityProviders::new(
+            blackboard,
+            cognition_log_port,
+            Arc::new(NoopMemoryStore) as Arc<dyn MemoryStore>,
+            Vec::new(),
+            Arc::new(NoopFileSearchProvider) as Arc<dyn FileSearchProvider>,
+            Arc::new(NoopUtteranceSink),
+            Arc::new(SystemClock),
+            LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        )
+    }
 
     struct NoopModule;
 
@@ -1050,27 +1124,90 @@ mod tests {
     #[tokio::test]
     async fn capabilities_are_non_exclusive() {
         let caps = test_caps(Blackboard::default());
-        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let _w1 = attention_gate.attention_writer();
-        let _w2 = attention_gate.attention_writer();
+        let _w1 = cognition_gate.cognition_writer();
+        let _w2 = cognition_gate.cognition_writer();
         let _a1 = controller.allocation_writer();
         let _a2 = controller.allocation_writer();
     }
 
     #[tokio::test]
+    async fn cognition_writer_appends_persists_publishes_and_owner_stamps() {
+        let blackboard = Blackboard::default();
+        let repo = RecordingCognitionLogRepository::default();
+        let caps = test_caps_with_cognition_repo(blackboard.clone(), Arc::new(repo.clone()));
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 1);
+        let subscriber = scoped(&caps, builtin::predict(), 0);
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::new(1));
+        let mut updates = subscriber.cognition_log_updated_inbox();
+
+        cognition_gate
+            .cognition_writer()
+            .append("food boundary changed")
+            .await;
+
+        let entries = blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "food boundary changed");
+
+        let records = repo.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, owner);
+        assert_eq!(records[0].1.text, "food boundary changed");
+
+        let update = updates.next_item().await.unwrap();
+        assert_eq!(update.sender, owner);
+        assert_eq!(
+            update.body,
+            CognitionLogUpdated::EntryAppended {
+                source: owner.clone()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn memo_updated_inbox_filters_self_writes() {
         let caps = test_caps(Blackboard::default());
-        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let sensory = scoped(&caps, builtin::sensory(), 0);
-        let mut inbox = attention_gate.memo_updated_inbox();
+        let mut inbox = cognition_gate.memo_updated_inbox();
 
-        attention_gate.memo().write("own memo").await;
+        cognition_gate.memo().write("own memo").await;
         sensory.memo().write("sensory memo").await;
 
         let event = inbox.next_item().await.unwrap();
         assert_eq!(event.sender.module, builtin::sensory());
         assert_eq!(event.body.owner.module, builtin::sensory());
+        assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cognition_log_updated_inbox_filters_self_writes() {
+        let caps = test_caps(Blackboard::default());
+        let attention_schema = scoped(&caps, builtin::attention_schema(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
+        let mut inbox = attention_schema.cognition_log_updated_inbox();
+
+        attention_schema
+            .cognition_writer()
+            .append("own attention experience")
+            .await;
+        cognition_gate
+            .cognition_writer()
+            .append("promoted external evidence")
+            .await;
+
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::cognition_gate());
+        assert_eq!(
+            event.body,
+            CognitionLogUpdated::EntryAppended {
+                source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO)
+            }
+        );
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
     }
 
@@ -1090,7 +1227,7 @@ mod tests {
                         ),
                     ),
                     (
-                        builtin::attention_gate(),
+                        builtin::cognition_gate(),
                         nuillu_blackboard::ModulePolicy::new(
                             ReplicaCapRange::new(0, 0).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
@@ -1103,19 +1240,19 @@ mod tests {
             .await;
         let caps = test_caps(blackboard);
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let writer = controller.allocation_writer();
-        let mut inbox = attention_gate.allocation_updated_inbox();
+        let mut inbox = cognition_gate.allocation_updated_inbox();
 
         let mut proposal = ResourceAllocation::default();
         proposal.set(
-            builtin::attention_gate(),
+            builtin::cognition_gate(),
             ModuleConfig {
                 guidance: "promote current sensory memo into attention".into(),
                 tier: ModelTier::Default,
             },
         );
-        proposal.set_activation(builtin::attention_gate(), ActivationRatio::ONE);
+        proposal.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
         writer.set(proposal.clone()).await;
         let event = inbox.next_item().await.unwrap();
@@ -1127,14 +1264,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attention_stream_updates_do_not_wake_controller_memo_inbox() {
+    async fn cognition_log_updates_do_not_wake_controller_memo_inbox() {
         let caps = test_caps(Blackboard::default());
         let controller = scoped(&caps, builtin::attention_controller(), 0);
-        let attention_gate = scoped(&caps, builtin::attention_gate(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let mut memo_updates = controller.memo_updated_inbox();
 
-        attention_gate
-            .attention_writer()
+        cognition_gate
+            .cognition_writer()
             .append("user question needs a summary")
             .await;
 

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, AttentionStreamEvent, IdentityMemoryRecord,
+    AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, IdentityMemoryRecord,
     MemoryMetaPatch, ModulePolicy, ModuleRunStatus, ResourceAllocation, UtteranceProgress,
 };
 
@@ -13,8 +13,8 @@ use crate::{
 /// Modules never see this enum — they hold capability handles whose
 /// methods build and apply the appropriate command. That is what enforces
 /// the design invariants at the type level: a module without
-/// [`AttentionWriter`](nuillu_module::AttentionWriter) cannot construct
-/// `AppendAttentionStream`, etc.
+/// [`CognitionWriter`](nuillu_module::CognitionWriter) cannot construct
+/// `AppendCognitionLog`, etc.
 #[derive(Debug, Clone)]
 pub enum BlackboardCommand {
     UpdateMemo {
@@ -30,9 +30,9 @@ pub enum BlackboardCommand {
         owner: ModuleInstanceId,
         progress: UtteranceProgress,
     },
-    AppendAttentionStream {
-        stream: ModuleInstanceId,
-        event: AttentionStreamEvent,
+    AppendCognitionLog {
+        source: ModuleInstanceId,
+        entry: CognitionLogEntry,
     },
     RecordAgenticDeadlockMarker(AgenticDeadlockMarker),
     UpsertMemoryMetadata {

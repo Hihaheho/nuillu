@@ -170,7 +170,7 @@ pub mod builtin {
 
     builtin!(
         sensory               => "sensory",
-        attention_gate        => "attention-gate",
+        cognition_gate        => "cognition-gate",
         attention_controller  => "attention-controller",
         attention_schema      => "attention-schema",
         self_model            => "self-model",
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn builtins_parse() {
-        let _ = builtin::attention_gate();
+        let _ = builtin::cognition_gate();
         let _ = builtin::attention_controller();
         let _ = builtin::attention_schema();
         let _ = builtin::self_model();

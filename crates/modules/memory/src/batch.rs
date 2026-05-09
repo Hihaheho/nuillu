@@ -6,26 +6,26 @@ use crate::MemoryModule;
 #[derive(Debug, Default)]
 pub struct NextBatch {
     pub(crate) requests: Vec<MemoryRequest>,
-    pub(crate) attention_updated: bool,
+    pub(crate) cognition_updated: bool,
 }
 
 impl NextBatch {
-    fn attention_update() -> Self {
+    fn cognition_log_update() -> Self {
         Self {
             requests: Vec::new(),
-            attention_updated: true,
+            cognition_updated: true,
         }
     }
 
     fn request(request: MemoryRequest) -> Option<Self> {
         Some(Self {
             requests: vec![Self::accepted_request(request)?],
-            attention_updated: false,
+            cognition_updated: false,
         })
     }
 
-    fn mark_attention_updated(&mut self) {
-        self.attention_updated = true;
+    fn mark_cognition_updated(&mut self) {
+        self.cognition_updated = true;
     }
 
     fn accepted_request(request: MemoryRequest) -> Option<MemoryRequest> {
@@ -53,9 +53,9 @@ impl MemoryModule {
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
         loop {
             let batch = tokio::select! {
-                update = self.attention_updates.next_item() => {
+                update = self.cognition_updates.next_item() => {
                     let _ = update?;
-                    NextBatch::attention_update()
+                    NextBatch::cognition_log_update()
                 }
                 request = self.requests.next_item() => {
                     let envelope = request?;
@@ -75,8 +75,8 @@ impl MemoryModule {
             batch.push_request(envelope.body);
         }
 
-        if !self.attention_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_attention_updated();
+        if !self.cognition_updates.take_ready_items()?.items.is_empty() {
+            batch.mark_cognition_updated();
         }
 
         Ok(())
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_memory_requests_are_not_actionable_without_attention_work() {
+    fn empty_memory_requests_are_not_actionable_without_cognition_log_work() {
         assert!(NextBatch::request(request("  ")).is_none());
     }
 
@@ -116,12 +116,12 @@ mod tests {
     }
 
     #[test]
-    fn attention_update_flag_survives_empty_request_filtering() {
-        let mut batch = NextBatch::attention_update();
+    fn cognition_log_update_flag_survives_empty_request_filtering() {
+        let mut batch = NextBatch::cognition_log_update();
         batch.push_request(request(""));
-        batch.mark_attention_updated();
+        batch.mark_cognition_updated();
 
-        assert!(batch.attention_updated);
+        assert!(batch.cognition_updated);
         assert!(batch.requests.is_empty());
     }
 }

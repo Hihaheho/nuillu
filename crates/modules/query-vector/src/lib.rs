@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredStepOutcomeWithTools};
 use nuillu_module::{
-    AllocationReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
+    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
     QueryInbox, QueryRequest, VectorMemorySearcher,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
@@ -58,7 +58,7 @@ pub enum QueryVectorTools {
 pub struct QueryVectorModule {
     owner: nuillu_types::ModuleId,
     query: QueryInbox,
-    attention_updates: AttentionStreamUpdatedInbox,
+    cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: VectorMemorySearcher,
@@ -71,7 +71,7 @@ impl QueryVectorModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         query: QueryInbox,
-        attention_updates: AttentionStreamUpdatedInbox,
+        cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: VectorMemorySearcher,
@@ -82,7 +82,7 @@ impl QueryVectorModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("query-vector id is valid"),
             query,
-            attention_updates,
+            cognition_updates,
             allocation,
             blackboard,
             memory,
@@ -121,16 +121,16 @@ impl QueryVectorModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_attention_update(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate_cognition_update(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let question = self
             .blackboard
             .read(|bb| {
-                let entries = bb.attention_stream().entries().to_vec();
+                let entries = bb.cognition_log().entries().to_vec();
                 let latest = entries
                     .last()
                     .map(|entry| entry.text.as_str())
-                    .unwrap_or("current attention stream");
-                format!("Find stable memory that clarifies this attended context: {latest}")
+                    .unwrap_or("current cognition log");
+                format!("Find stable memory that clarifies this cognition-log context: {latest}")
             })
             .await;
         let hits = self.search_with_memory(cx, &[question]).await?;
@@ -155,7 +155,7 @@ impl QueryVectorModule {
             .read(|bb| {
                 serde_json::json!({
                     "memos": bb.memos(),
-                    "attention_stream": bb.attention_stream().entries(),
+                    "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
@@ -247,7 +247,7 @@ impl Module for QueryVectorModule {
     }
 
     fn role_description() -> &'static str {
-        "Vector-memory/RAG retrieval: surfaces stored memory content into its memo on QueryRequest or attention updates; never synthesizes answers."
+        "Vector-memory/RAG retrieval: surfaces stored memory content into its memo on QueryRequest or cognition-log updates; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -262,8 +262,8 @@ impl Module for QueryVectorModule {
         if !batch.queries.is_empty() {
             self.handle_queries(cx, batch.queries.clone()).await?;
         }
-        if batch.attention_updated {
-            self.activate_attention_update(cx).await?;
+        if batch.cognition_updated {
+            self.activate_cognition_update(cx).await?;
         }
         Ok(())
     }

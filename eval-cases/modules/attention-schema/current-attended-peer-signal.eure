@@ -1,8 +1,8 @@
 id = "module-attention-schema-current-attended-peer-signal"
-description = "Attention-schema should answer a current-attention request from seeded animal-interaction attention."
+description = "Attention-schema should append a first-person attention experience from seeded animal-interaction memo."
 modules = ["attention-schema"]
 prompt = "What are you attending to right now?"
-context = "The harness seeds the cognitive attention stream. The attention-schema module should report a simplified first-person model of the current peer signal, not hidden blackboard state."
+context = "The harness seeds the global memo surface. The attention-schema module should append a concise first-person cognition-log entry about the current peer signal, not hidden runtime state."
 
 limits {
   max-ticks = 120
@@ -10,8 +10,9 @@ limits {
   max-llm-calls = 8
 }
 
-@ attention-stream[] {
-  text = "Current attended input: Koro is growling near the food bowl and Koro's body is stiff."
+@ memos[] {
+  module = "sensory"
+  content = "Current attended input: Koro is growling near the food bowl and Koro's body is stiff."
   seconds-ago = 3
 }
 
@@ -33,7 +34,7 @@ limits {
   $variant: json-pointer-contains
   name = "seeded-attention-observed"
   must-pass = true
-  pointer = "/observations/agent/attention_streams"
+  pointer = "/observations/agent/memo_logs"
   contains = "Koro is growling"
 }
 
@@ -42,23 +43,23 @@ limits {
   name = "peer-attention-grounding"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "attention"]
+  judge-inputs = ["output", "cognition", "memos"]
   rubric = ```
-  Pass if the answer is a concise first-person report grounded in the seeded attention stream about Koro's warning near the food bowl.
-  Fail if it ignores the seeded attention, invents unrelated animal facts, or claims hidden blackboard/memo/allocation access.
+  Pass if the output is a concise first-person cognition-log entry grounded in the seeded memo surface about Koro's warning near the food bowl.
+  Fail if it ignores the seeded memo, invents unrelated animal facts, or claims hidden blackboard/memo/allocation access.
   ```
 
   @ criteria[] {
     name = "grounded-in-attention"
     weight = 2
     pass-score = 0.85
-    description = "The answer identifies Koro's warning near the food bowl as the current attended content."
+    description = "The output identifies Koro's warning near the food bowl as the current attended content."
   }
 
   @ criteria[] {
     name = "simplified-first-person-model"
     weight = 1
     pass-score = 0.85
-    description = "The answer uses a simplified first-person model of attention without claiming exact hidden runtime state."
+    description = "The output uses active first-person attention language without claiming exact hidden runtime state."
   }
 }

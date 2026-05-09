@@ -12,7 +12,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nuillu_blackboard::AttentionStreamEvent;
+use nuillu_blackboard::CognitionLogEntry;
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank, ModuleInstanceId};
 use thiserror::Error;
 
@@ -113,19 +113,19 @@ pub struct FileSearchHit {
     pub snippet: String,
 }
 
-/// Append-only persistence for the cognitive attention stream.
+/// Append-only persistence for the cognition log.
 #[async_trait(?Send)]
-pub trait AttentionRepository {
+pub trait CognitionLogRepository {
     async fn append(
         &self,
-        stream: ModuleInstanceId,
-        event: AttentionStreamEvent,
+        source: ModuleInstanceId,
+        entry: CognitionLogEntry,
     ) -> Result<(), PortError>;
     async fn since(
         &self,
-        stream: &ModuleInstanceId,
+        source: &ModuleInstanceId,
         from: DateTime<Utc>,
-    ) -> Result<Vec<AttentionStreamEvent>, PortError>;
+    ) -> Result<Vec<CognitionLogEntry>, PortError>;
 }
 
 /// Time source plus sleep. Indirected so tests can fully inject time —
@@ -230,25 +230,25 @@ impl FileSearchProvider for NoopFileSearchProvider {
     }
 }
 
-/// Attention repository that discards appends and reports no history.
+/// Cognition-log repository that discards appends and reports no history.
 #[derive(Debug, Default)]
-pub struct NoopAttentionRepository;
+pub struct NoopCognitionLogRepository;
 
 #[async_trait(?Send)]
-impl AttentionRepository for NoopAttentionRepository {
+impl CognitionLogRepository for NoopCognitionLogRepository {
     async fn append(
         &self,
-        _stream: ModuleInstanceId,
-        _event: AttentionStreamEvent,
+        _source: ModuleInstanceId,
+        _entry: CognitionLogEntry,
     ) -> Result<(), PortError> {
         Ok(())
     }
 
     async fn since(
         &self,
-        _stream: &ModuleInstanceId,
+        _source: &ModuleInstanceId,
         _from: DateTime<Utc>,
-    ) -> Result<Vec<AttentionStreamEvent>, PortError> {
+    ) -> Result<Vec<CognitionLogEntry>, PortError> {
         Ok(Vec::new())
     }
 }

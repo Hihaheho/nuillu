@@ -2015,27 +2015,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-attention-gate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "nuillu-module",
- "nuillu-types",
- "schemars",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "nuillu-attention-schema"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "lutum",
+ "lutum-protocol",
  "nuillu-module",
  "nuillu-types",
  "schemars",
@@ -2054,6 +2040,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "nuillu-cognition-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2077,9 +2079,9 @@ dependencies = [
  "lutum-trace",
  "nuillu-agent",
  "nuillu-attention-controller",
- "nuillu-attention-gate",
  "nuillu-attention-schema",
  "nuillu-blackboard",
+ "nuillu-cognition-gate",
  "nuillu-memory",
  "nuillu-memory-compaction",
  "nuillu-module",
@@ -2213,6 +2215,7 @@ dependencies = [
  "async-trait",
  "lutum",
  "nuillu-module",
+ "nuillu-types",
  "schemars",
  "serde",
  "serde_json",

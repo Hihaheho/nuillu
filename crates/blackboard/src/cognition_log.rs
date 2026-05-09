@@ -3,28 +3,24 @@ use nuillu_types::ModuleInstanceId;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// A single (time, event) entry on the cognitive attention stream.
-///
-/// Per the design, the attention-gate module is the *only* module that may
-/// produce these. Enforcement lives in the agent scheduler and a workspace
-/// test, not in this struct.
+/// A single (time, event) entry on the cognition log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AttentionStreamEvent {
+pub struct CognitionLogEntry {
     pub at: DateTime<Utc>,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AttentionStream {
-    entries: Vec<AttentionStreamEvent>,
+pub struct CognitionLog {
+    entries: Vec<CognitionLogEntry>,
 }
 
-impl AttentionStream {
-    pub fn append(&mut self, event: AttentionStreamEvent) {
-        self.entries.push(event);
+impl CognitionLog {
+    pub fn append(&mut self, entry: CognitionLogEntry) {
+        self.entries.push(entry);
     }
 
-    pub fn entries(&self) -> &[AttentionStreamEvent] {
+    pub fn entries(&self) -> &[CognitionLogEntry] {
         &self.entries
     }
 
@@ -38,16 +34,16 @@ impl AttentionStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AttentionStreamRecord {
-    pub stream: ModuleInstanceId,
-    pub entries: Vec<AttentionStreamEvent>,
+pub struct CognitionLogRecord {
+    pub source: ModuleInstanceId,
+    pub entries: Vec<CognitionLogEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AttentionLogRecord {
+pub struct CognitionLogEntryRecord {
     pub index: u64,
-    pub stream: ModuleInstanceId,
-    pub event: AttentionStreamEvent,
+    pub source: ModuleInstanceId,
+    pub entry: CognitionLogEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,24 +53,24 @@ pub struct AgenticDeadlockMarker {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct AttentionStreamSet {
-    streams: Vec<AttentionStreamRecord>,
+pub struct CognitionLogSet {
+    logs: Vec<CognitionLogRecord>,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
 }
 
-impl AttentionStreamSet {
+impl CognitionLogSet {
     pub fn new(
-        streams: Vec<AttentionStreamRecord>,
+        logs: Vec<CognitionLogRecord>,
         agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     ) -> Self {
         Self {
-            streams,
+            logs,
             agentic_deadlock_marker,
         }
     }
 
-    pub fn streams(&self) -> &[AttentionStreamRecord] {
-        &self.streams
+    pub fn logs(&self) -> &[CognitionLogRecord] {
+        &self.logs
     }
 
     pub fn agentic_deadlock_marker(&self) -> Option<&AgenticDeadlockMarker> {
@@ -82,15 +78,15 @@ impl AttentionStreamSet {
     }
 
     pub fn compact_json(&self) -> serde_json::Value {
-        if self.agentic_deadlock_marker.is_none() && self.streams.len() == 1 {
-            return serde_json::json!(self.streams[0].entries);
+        if self.agentic_deadlock_marker.is_none() && self.logs.len() == 1 {
+            return serde_json::json!(self.logs[0].entries);
         }
         if let Some(marker) = &self.agentic_deadlock_marker {
             return serde_json::json!({
-                "streams": self.streams,
+                "logs": self.logs,
                 "agentic_deadlock_marker": marker,
             });
         }
-        serde_json::json!(self.streams)
+        serde_json::json!(self.logs)
     }
 }

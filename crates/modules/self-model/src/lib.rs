@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
-use nuillu_module::{BlackboardReader, LlmAccess, Memo, Module, SelfModelInbox, SelfModelRequest};
+use nuillu_module::{
+    BlackboardReader, CognitionLogReader, LlmAccess, Memo, Module, SelfModelInbox, SelfModelRequest,
+};
+use nuillu_types::builtin;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -9,11 +12,11 @@ mod batch;
 pub use batch::NextBatch as SelfModelBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the self-model module.
-Maintain a current first-person self-description from module memos, especially the attention-schema
-memo, and self-related facts that query or memory modules have surfaced in their memos.
+Maintain a current first-person self-description from module memos, first-person attention
+experiences written by attention-schema to the cognition log, and self-related facts that query or
+memory modules have surfaced in their memos.
 Stable self-knowledge may be present in retrieved memory memos, but do not claim direct access to
-raw hidden memories or the attention stream unless those facts are present in the provided memo
-context. Answer explicit self-model questions from this current self model.
+raw hidden memories. Answer explicit self-model questions from this current self model.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -32,6 +35,7 @@ pub struct SelfModelModule {
     owner: nuillu_module::ModuleId,
     requests: SelfModelInbox,
     blackboard: BlackboardReader,
+    cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
     system_prompt: std::sync::OnceLock<String>,
@@ -41,6 +45,7 @@ impl SelfModelModule {
     pub fn new(
         requests: SelfModelInbox,
         blackboard: BlackboardReader,
+        cognition_log: CognitionLogReader,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
@@ -49,6 +54,7 @@ impl SelfModelModule {
                 .expect("self-model id is valid"),
             requests,
             blackboard,
+            cognition_log,
             memo,
             llm,
             system_prompt: std::sync::OnceLock::new(),
@@ -80,6 +86,15 @@ impl SelfModelModule {
                 })
             })
             .await;
+        let cognition_context = self
+            .cognition_log
+            .snapshot()
+            .await
+            .logs()
+            .iter()
+            .filter(|record| record.source.module == builtin::attention_schema())
+            .cloned()
+            .collect::<Vec<_>>();
         let previous_self_model = self.memo.read().await.unwrap_or_default();
         let questions = requests
             .into_iter()
@@ -92,6 +107,7 @@ impl SelfModelModule {
             serde_json::json!({
                 "questions": questions,
                 "memo_context": context,
+                "attention_schema_cognition_log": cognition_context,
                 "previous_self_model": previous_self_model,
             })
             .to_string(),
@@ -122,7 +138,7 @@ impl Module for SelfModelModule {
     }
 
     fn role_description() -> &'static str {
-        "Integrates attention-schema, peer module memos, and retrieved self-knowledge into a current first-person self-description; answers self-model requests."
+        "Integrates attention-schema cognition-log entries, peer module memos, and retrieved self-knowledge into a current first-person self-description; answers self-model requests."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

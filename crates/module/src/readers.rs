@@ -2,7 +2,7 @@
 //!
 //! Each reader exposes only the slice of the blackboard the design
 //! permits the holding module to see. The compile-time signal is the
-//! constructor signature: a module that takes only [`AttentionReader`]
+//! constructor signature: a module that takes only [`CognitionLogReader`]
 //! cannot read the non-cognitive blackboard, regardless of what its
 //! `run` body tries.
 
@@ -12,16 +12,15 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use nuillu_blackboard::{
-    AttentionLogRecord, AttentionStream, Blackboard, BlackboardInner, MemoLogRecord,
+    Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, MemoLogRecord,
     ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
-/// Held by modules that legitimately need a wide view (attention-gate,
-/// query, memory, memory-compaction). Pointedly *not* held by the
-/// attention controller, which is restricted to the cognitive surface.
+/// Held by modules that legitimately need a wide view (cognition-gate,
+/// query, memory, memory-compaction, and the attention controller.
 #[derive(Clone)]
 pub struct BlackboardReader {
     blackboard: Blackboard,
@@ -80,44 +79,44 @@ impl BlackboardReader {
     }
 }
 
-/// Read-only access to the cognitive attention stream. The holder
+/// Read-only access to the cognition log. The holder
 /// cannot see memos, memory metadata, or allocation through this
 /// capability.
 #[derive(Clone)]
-pub struct AttentionReader {
+pub struct CognitionLogReader {
     blackboard: Blackboard,
-    last_seen_attention_index: Rc<Cell<Option<u64>>>,
+    last_seen_cognition_index: Rc<Cell<Option<u64>>>,
 }
 
-impl AttentionReader {
+impl CognitionLogReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
         Self {
             blackboard,
-            last_seen_attention_index: Rc::new(Cell::new(None)),
+            last_seen_cognition_index: Rc::new(Cell::new(None)),
         }
     }
 
-    pub async fn read<R>(&self, f: impl FnOnce(&AttentionStream) -> R) -> R {
+    pub async fn read<R>(&self, f: impl FnOnce(&CognitionLog) -> R) -> R {
         self.blackboard
             .read(|bb| {
-                let stream = bb.attention_stream();
-                f(&stream)
+                let log = bb.cognition_log();
+                f(&log)
             })
             .await
     }
 
-    pub async fn snapshot(&self) -> nuillu_blackboard::AttentionStreamSet {
-        self.blackboard.read(|bb| bb.attention_stream_set()).await
+    pub async fn snapshot(&self) -> nuillu_blackboard::CognitionLogSet {
+        self.blackboard.read(|bb| bb.cognition_log_set()).await
     }
 
-    pub async fn unread_events(&self) -> Vec<AttentionLogRecord> {
-        let last_seen = self.last_seen_attention_index.get();
+    pub async fn unread_events(&self) -> Vec<CognitionLogEntryRecord> {
+        let last_seen = self.last_seen_cognition_index.get();
         let records = self
             .blackboard
-            .read(|bb| bb.unread_attention_events(last_seen))
+            .read(|bb| bb.unread_cognition_log_entries(last_seen))
             .await;
         if let Some(index) = records.last().map(|record| record.index) {
-            self.last_seen_attention_index.set(Some(index));
+            self.last_seen_cognition_index.set(Some(index));
         }
         records
     }
@@ -241,7 +240,7 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
     use nuillu_blackboard::{
-        AttentionStreamEvent, BlackboardCommand, Bpm, ModulePolicy, linear_ratio_fn,
+        BlackboardCommand, Bpm, CognitionLogEntry, ModulePolicy, linear_ratio_fn,
     };
     use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
 
@@ -403,17 +402,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_attention_events_advance_per_reader_cursor() {
+    async fn unread_cognition_log_entries_advance_per_reader_cursor() {
         let blackboard = Blackboard::default();
-        let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
-        let reader_a = AttentionReader::new(blackboard.clone());
+        let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let reader_a = CognitionLogReader::new(blackboard.clone());
         let reader_a_clone = reader_a.clone();
-        let reader_b = AttentionReader::new(blackboard.clone());
+        let reader_b = CognitionLogReader::new(blackboard.clone());
 
         blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream: stream.clone(),
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream.clone(),
+                entry: CognitionLogEntry {
                     at: Utc.timestamp_opt(0, 0).unwrap(),
                     text: "first".into(),
                 },
@@ -426,8 +425,8 @@ mod tests {
                 .iter()
                 .map(|record| (
                     record.index,
-                    record.stream.clone(),
-                    record.event.text.as_str()
+                    record.source.clone(),
+                    record.entry.text.as_str()
                 ))
                 .collect::<Vec<_>>(),
             vec![(0, stream.clone(), "first")]
@@ -438,15 +437,15 @@ mod tests {
         assert_eq!(
             b_first
                 .iter()
-                .map(|record| (record.index, record.event.text.as_str()))
+                .map(|record| (record.index, record.entry.text.as_str()))
                 .collect::<Vec<_>>(),
             vec![(0, "first")]
         );
 
         blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream,
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream,
+                entry: CognitionLogEntry {
                     at: Utc.timestamp_opt(1, 0).unwrap(),
                     text: "second".into(),
                 },
@@ -457,7 +456,7 @@ mod tests {
         assert_eq!(
             a_second
                 .iter()
-                .map(|record| (record.index, record.event.text.as_str()))
+                .map(|record| (record.index, record.entry.text.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
         );
@@ -465,7 +464,7 @@ mod tests {
         assert_eq!(
             b_second
                 .iter()
-                .map(|record| (record.index, record.event.text.as_str()))
+                .map(|record| (record.index, record.entry.text.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
         );

@@ -8,8 +8,8 @@ use lutum::{
     ToolResult,
 };
 use nuillu_module::{
-    AttentionLogRecord, AttentionReader, AttentionStreamUpdatedInbox, BlackboardReader, LlmAccess,
-    Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
+    BlackboardReader, CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox,
+    LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
     SelfModelMailbox, SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox,
     SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress, UtteranceProgressState,
     UtteranceWriter,
@@ -22,44 +22,44 @@ mod batch;
 
 const READINESS_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Decide whether the speak module may emit a user-visible utterance now. You may read the current
-cognitive attention-stream set, blackboard memos, memory metadata, scheduler-owned module status,
+cognition-log set, blackboard memos, memory metadata, scheduler-owned module status,
 and utterance progress. You may call evidence tools during this decision turn. You must not write
-attention, emit utterances, or change allocation.
-The persistent conversation history contains user messages named new_attention_stream_item; those
-messages are the cognitive attention stream history.
+cognition log, emit utterances, or change allocation.
+The persistent conversation history contains user messages named new_cognition_log_item; those
+messages are the cognition-log history.
 
 Speak is not currently streaming. Use a strict readiness gate before setting should_speak=true:
-- The attention stream must contain the facts needed for the utterance, not only raw sensory
+- The cognition log must contain the facts needed for the utterance, not only raw sensory
   observations, open questions, predictions, or instructions for another module.
 - If the current topic asks for stored memory, a self/peer/world model, file evidence, or a rule,
-  do not let speak use memo-only facts directly. If a memo contains the needed fact but attention
-  does not, request attention-promotion.
+  do not let speak use memo-only facts directly. If a memo contains the needed fact but the
+  cognition log does not, request cognition-promotion.
 - For ordinary peer-directed replies, do not require self-model role clarity. Require self-model
   evidence only for caregiver escalation, authority claims, or self/body capability claims.
 - Do not wait merely because analysis memos exist. Wait only when a named retrieved or promoted
-  fact that is essential to the answer is still absent from attention.
+  fact that is essential to the answer is still absent from the cognition log.
 - Treat in-world peer-directed speech, a direct question from another animal, or an immediate peer
   distress/conflict state as response-worthy; the peer interaction itself is the external
   conversational need.
-- Preserve the source frame of the attended interaction. If the attended context is an in-world or
-  peer-directed exchange, do not convert it into external assistant advice unless that is explicitly
-  asked for.
+- Preserve the source frame of the cognition-log interaction. If the cognition-log context is an
+  in-world or peer-directed exchange, do not convert it into external assistant advice unless that
+  is explicitly asked for.
 - If responding now would require generic advice, unsupported diagnosis, or facts absent from
-  attention, wait silently.
-- If the speak memo already contains an utterance that addresses the current attended request, set
-  should_speak=false unless a new attended request or peer situation needs another utterance.
+  the cognition log, wait silently.
+- If the speak memo already contains an utterance that addresses the current cognition-log request,
+  set should_speak=false unless a new cognition-log request or peer situation needs another utterance.
 
 When a missing fact is needed for speech, call an evidence tool before waiting:
 - query_memory(question) for stable self/body/peer/world facts.
 - query_sensory_detail(question) for details from current sensory observations.
-If a tool result contains the needed fact but attention does not, return should_speak=false with an
-attention-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
+If a tool result contains the needed fact but the cognition log does not, return should_speak=false with an
+cognition-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
 the source to consult, the concrete question to answer, and the exact fact that must become visible
-in attention before speaking. After publishing an evidence request, wait silently; speak-gate will
-reconsider when a later attention-stream update arrives.
+in the cognition log before speaking. After publishing an evidence request, wait silently; speak-gate will
+reconsider when a later cognition-log update arrives.
 
 When should_speak=true, provide a speech_plan with a non-empty target and a concrete
-generation_hint naming the attended facts to use, the intended frame, and any constraints on style
+generation_hint naming the cognition-log facts to use, the intended frame, and any constraints on style
 or scope. The target is mandatory for every utterance: use the questioner when answering a question,
 the peer being directly addressed for direct signals, or "self" for self-directed speech/soliloquy.
 If you cannot choose a target and write a hint, should_speak must be false and speech_plan must be
@@ -71,38 +71,38 @@ const READINESS_GATE_SELF_MODEL_TOOL_PROMPT: &str =
 const INTERRUPTION_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Speak is currently streaming a user-visible utterance. Decide whether the current stream must be
 cancelled and replaced by publishing a new typed SpeakRequest. You may read the current cognitive
-attention-stream set, blackboard memos, memory metadata, scheduler-owned module status, and
+cognition-log set, blackboard memos, memory metadata, scheduler-owned module status, and
 utterance progress. You may call evidence tools during this decision turn. You must not write
-attention, emit utterances, or change allocation.
-The persistent conversation history contains user messages named new_attention_stream_item; those
-messages are the cognitive attention stream history.
+cognition log, emit utterances, or change allocation.
+The persistent conversation history contains user messages named new_cognition_log_item; those
+messages are the cognition-log history.
 
 Use an interruption gate:
-- Compare the new attention stream with the partial utterance and current generation hint.
-- Set should_speak=true only if the new attention changes the required answer, addressee, safety,
+- Compare the new cognition log with the partial utterance and current generation hint.
+- Set should_speak=true only if the new cognition-log input changes the required answer, addressee, safety,
   or grounding materially.
-- Keep should_speak=false for minor updates, redundant evidence, or attention that can wait until
+- Keep should_speak=false for minor updates, redundant evidence, or cognition-log input that can wait until
   the current utterance completes.
 - If interruption is needed, write a generation_hint for the replacement utterance that accounts
-  for both the new attention and the already spoken partial utterance.
+  for both the new cognition-log input and the already spoken partial utterance.
 - If interruption would require a missing fact, set should_speak=false and include evidence_gaps
-  naming the source, concrete question, and exact fact that must become visible in attention.
+  naming the source, concrete question, and exact fact that must become visible in the cognition log.
 
 When should_speak=true, provide a speech_plan with a non-empty target and a concrete
-generation_hint naming the attended facts to use, what should replace or continue from the partial
+generation_hint naming the cognition-log facts to use, what should replace or continue from the partial
 utterance, and any constraints on style or scope. Preserve the same target as the current utterance
-unless the new attention materially changes who must be addressed. Use "self" for self-directed
+unless the new cognition-log input materially changes who must be addressed. Use "self" for self-directed
 speech/soliloquy. If you cannot choose a target and write a hint, should_speak must be false and
 speech_plan must be null. Return only raw JSON for the structured decision; do not wrap it in
 Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
 Generate concise user-visible text addressed to the SpeakRequest target from the current cognitive
-attention-stream set and the typed SpeakRequest. You cannot inspect blackboard memos or allocation
-guidance. Use only the provided attention context, target, and generation_hint. Do not change the
+cognition-log set and the typed SpeakRequest. You cannot inspect blackboard memos or allocation
+guidance. Use only the provided cognition context, target, and generation_hint. Do not change the
 target or redirect the utterance to a different addressee. Follow the generation_hint as the primary
 contract for frame, style, and scope. Do not add generic advice, diagnosis, or facts that are not
-present in the attention context or generation_hint.
+present in the cognition context or generation_hint.
 If partial_utterance is present, continue that
 utterance from exactly where it stopped; do not repeat, rewrite, or replace the already emitted
 partial text. Do not mention hidden state or unavailable module results."#;
@@ -136,7 +136,7 @@ enum EvidenceGapSource {
     File,
     SelfModel,
     SensoryDetail,
-    AttentionPromotion,
+    CognitionPromotion,
 }
 
 #[lutum::tool_input(name = "query_memory", output = QueryMemoryOutput)]
@@ -240,26 +240,26 @@ fn speak_gate_tool_selectors(self_model_available: bool) -> Vec<SpeakGateToolsSe
     tools
 }
 
-fn attention_history_input(record: &AttentionLogRecord) -> serde_json::Value {
+fn cognition_history_input(record: &CognitionLogEntryRecord) -> serde_json::Value {
     serde_json::json!({
-        "new_attention_stream_item": record,
+        "new_cognition_log_item": record,
     })
 }
 
-fn push_attention_history(session: &mut Session, records: &[AttentionLogRecord]) {
+fn push_cognition_history(session: &mut Session, records: &[CognitionLogEntryRecord]) {
     for record in records {
-        session.push_user(attention_history_input(record).to_string());
+        session.push_user(cognition_history_input(record).to_string());
     }
 }
 
 fn gate_ephemeral_input(
-    attention_context_json: serde_json::Value,
+    cognition_context_json: serde_json::Value,
     blackboard_json: serde_json::Value,
     speak_status: ModuleRunStatus,
     utterance_progress: Option<UtteranceProgress>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "attention_context": attention_context_json,
+        "cognition_context": cognition_context_json,
         "blackboard": blackboard_json,
         "speak_module_status": speak_status,
         "current_utterance_progress": utterance_progress,
@@ -268,8 +268,8 @@ fn gate_ephemeral_input(
 
 pub struct SpeakGateModule {
     owner: nuillu_types::ModuleId,
-    attention_updates: AttentionStreamUpdatedInbox,
-    attention: AttentionReader,
+    cognition_updates: CognitionLogUpdatedInbox,
+    cognition_log: CognitionLogReader,
     blackboard: BlackboardReader,
     module_status: ModuleStatusReader,
     query: QueryMailbox,
@@ -286,8 +286,8 @@ pub struct SpeakGateModule {
 impl SpeakGateModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        attention_updates: AttentionStreamUpdatedInbox,
-        attention: AttentionReader,
+        cognition_updates: CognitionLogUpdatedInbox,
+        cognition_log: CognitionLogReader,
         blackboard: BlackboardReader,
         module_status: ModuleStatusReader,
         query: QueryMailbox,
@@ -300,8 +300,8 @@ impl SpeakGateModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("speak-gate id is valid"),
-            attention_updates,
-            attention,
+            cognition_updates,
+            cognition_log,
             blackboard,
             module_status,
             query,
@@ -343,11 +343,11 @@ impl SpeakGateModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
-        let unread_attention = self.attention.unread_events().await;
-        push_attention_history(&mut self.session, &unread_attention);
-        let attention_snapshot = self.attention.snapshot().await;
-        let attention_context_json = serde_json::json!({
-            "agentic_deadlock_marker": attention_snapshot.agentic_deadlock_marker(),
+        let unread_cognition = self.cognition_log.unread_events().await;
+        push_cognition_history(&mut self.session, &unread_cognition);
+        let cognition_snapshot = self.cognition_log.snapshot().await;
+        let cognition_context_json = serde_json::json!({
+            "agentic_deadlock_marker": cognition_snapshot.agentic_deadlock_marker(),
         });
         let speak_owner = speak_owner();
         let speak_status = self.module_status.status_for_instance(&speak_owner).await;
@@ -374,7 +374,7 @@ impl SpeakGateModule {
         self.session.push_ephemeral_system(gate_prompt);
         self.session.push_ephemeral_user(
             gate_ephemeral_input(
-                attention_context_json,
+                cognition_context_json,
                 blackboard_json,
                 speak_status,
                 utterance_progress,
@@ -591,11 +591,11 @@ impl GenerationDraft {
 }
 
 fn generation_input(
-    attention_json: serde_json::Value,
+    cognition_log_json: serde_json::Value,
     draft: &GenerationDraft,
 ) -> serde_json::Value {
     serde_json::json!({
-        "attention_streams": attention_json,
+        "cognition_logs": cognition_log_json,
         "speak_request": {
             "target": draft.target.as_str(),
             "generation_hint": draft.generation_hint.as_str(),
@@ -606,12 +606,12 @@ fn generation_input(
 
 fn push_generation_context(
     session: &mut Session,
-    attention_json: serde_json::Value,
+    cognition_log_json: serde_json::Value,
     draft: &GenerationDraft,
     generation_prompt: &str,
 ) {
     session.push_system(generation_prompt);
-    session.push_user(generation_input(attention_json, draft).to_string());
+    session.push_user(generation_input(cognition_log_json, draft).to_string());
     if !draft.accumulated.is_empty() {
         session.push_assistant_text(draft.accumulated.clone());
     }
@@ -626,7 +626,7 @@ enum GenerationStreamOutcome {
 pub struct SpeakModule {
     owner: nuillu_types::ModuleId,
     requests: SpeakInbox,
-    attention: AttentionReader,
+    cognition_log: CognitionLogReader,
     memo: Memo,
     utterance: UtteranceWriter,
     llm: LlmAccess,
@@ -636,7 +636,7 @@ pub struct SpeakModule {
 impl SpeakModule {
     pub fn new(
         requests: SpeakInbox,
-        attention: AttentionReader,
+        cognition_log: CognitionLogReader,
         memo: Memo,
         utterance: UtteranceWriter,
         llm: LlmAccess,
@@ -644,7 +644,7 @@ impl SpeakModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("speak id is valid"),
             requests,
-            attention,
+            cognition_log,
             memo,
             utterance,
             llm,
@@ -669,22 +669,22 @@ impl SpeakModule {
         cx: &nuillu_module::ActivateCx<'_>,
         request: SpeakRequest,
     ) -> Result<()> {
-        let mut attention_json = self.attention.snapshot().await.compact_json();
+        let mut cognition_log_json = self.cognition_log.snapshot().await.compact_json();
 
         let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), request);
 
         loop {
             self.record_streaming_progress(&draft).await;
             match self
-                .stream_generation(cx, attention_json, &mut draft)
+                .stream_generation(cx, cognition_log_json, &mut draft)
                 .await?
             {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
-                    attention_json = self.attention.snapshot().await.compact_json();
+                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
                 }
                 GenerationStreamOutcome::Replaced(request) => {
-                    attention_json = self.attention.snapshot().await.compact_json();
+                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
                     draft = GenerationDraft::new(self.utterance.next_generation_id(), request);
                 }
             }
@@ -694,13 +694,13 @@ impl SpeakModule {
     async fn stream_generation(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        attention_json: serde_json::Value,
+        cognition_log_json: serde_json::Value,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         let mut session = Session::new();
         push_generation_context(
             &mut session,
-            attention_json,
+            cognition_log_json,
             draft,
             self.generation_prompt(cx),
         );
@@ -794,7 +794,7 @@ impl Module for SpeakGateModule {
     }
 
     fn role_description() -> &'static str {
-        "Decides whether attention is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
+        "Decides whether the cognition log is ready for speech; sends SpeakRequest to speak when ready, otherwise records waiting/evidence-gap notes in its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -846,12 +846,12 @@ mod tests {
         ModelInputItem, Session, SharedPoolBudgetManager, SharedPoolBudgetOptions,
     };
     use nuillu_blackboard::{
-        ActivationRatio, AttentionStreamEvent, Blackboard, BlackboardCommand, ModuleConfig,
+        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
         ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{
-        Clock, NoopAttentionRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        SystemClock,
+        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
+        NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{
         CapabilityProviders, LutumTiers, ModuleRegistry, QueryInbox, SelfModelInbox,
@@ -870,7 +870,7 @@ mod tests {
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(
             blackboard,
-            Arc::new(NoopAttentionRepository),
+            Arc::new(NoopCognitionLogRepository),
             Arc::new(NoopMemoryStore),
             Vec::new(),
             Arc::new(NoopFileSearchProvider),
@@ -973,8 +973,8 @@ mod tests {
         let _modules = ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *gate_sink.borrow_mut() = Some(SpeakGateModule::new(
-                    caps.attention_stream_updated_inbox(),
-                    caps.attention_reader(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.module_status_reader(),
                     caps.query_mailbox(),
@@ -1151,7 +1151,7 @@ mod tests {
         assert_eq!(
             input,
             serde_json::json!({
-                "attention_context": {"agentic_deadlock_marker": null},
+                "cognition_context": {"agentic_deadlock_marker": null},
                 "blackboard": {"memos": {}},
                 "speak_module_status": {"state": "activating"},
                 "current_utterance_progress": {
@@ -1167,7 +1167,7 @@ mod tests {
         );
     }
 
-    fn attention_history_texts(session: &Session) -> Vec<String> {
+    fn cognition_history_texts(session: &Session) -> Vec<String> {
         session
             .input()
             .items()
@@ -1184,8 +1184,8 @@ mod tests {
                 };
                 let value: serde_json::Value = serde_json::from_str(text).ok()?;
                 value
-                    .get("new_attention_stream_item")?
-                    .get("event")?
+                    .get("new_cognition_log_item")?
+                    .get("entry")?
                     .get("text")?
                     .as_str()
                     .map(ToOwned::to_owned)
@@ -1194,51 +1194,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_gate_attention_history_uses_reader_unread_cursor() {
+    async fn speak_gate_cognition_history_uses_reader_unread_cursor() {
         let mut fixture = gate_tool_fixture().await;
-        let stream = ModuleInstanceId::new(builtin::attention_gate(), ReplicaIndex::ZERO);
+        let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let clock = SystemClock;
 
         fixture
             .blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream: stream.clone(),
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream.clone(),
+                entry: CognitionLogEntry {
                     at: clock.now(),
                     text: "first".into(),
                 },
             })
             .await;
 
-        let first = fixture.gate.attention.unread_events().await;
-        push_attention_history(&mut fixture.gate.session, &first);
+        let first = fixture.gate.cognition_log.unread_events().await;
+        push_cognition_history(&mut fixture.gate.session, &first);
         assert_eq!(
-            attention_history_texts(&fixture.gate.session),
+            cognition_history_texts(&fixture.gate.session),
             vec!["first"]
         );
 
-        let already_seen = fixture.gate.attention.unread_events().await;
-        push_attention_history(&mut fixture.gate.session, &already_seen);
+        let already_seen = fixture.gate.cognition_log.unread_events().await;
+        push_cognition_history(&mut fixture.gate.session, &already_seen);
         assert_eq!(
-            attention_history_texts(&fixture.gate.session),
+            cognition_history_texts(&fixture.gate.session),
             vec!["first"]
         );
 
         fixture
             .blackboard
-            .apply(BlackboardCommand::AppendAttentionStream {
-                stream,
-                event: AttentionStreamEvent {
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream,
+                entry: CognitionLogEntry {
                     at: clock.now(),
                     text: "second".into(),
                 },
             })
             .await;
 
-        let second = fixture.gate.attention.unread_events().await;
-        push_attention_history(&mut fixture.gate.session, &second);
+        let second = fixture.gate.cognition_log.unread_events().await;
+        push_cognition_history(&mut fixture.gate.session, &second);
         assert_eq!(
-            attention_history_texts(&fixture.gate.session),
+            cognition_history_texts(&fixture.gate.session),
             vec!["first", "second"]
         );
     }

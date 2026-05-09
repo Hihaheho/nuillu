@@ -1,7 +1,7 @@
 //! Passive data hub for the agent.
 //!
 //! - per-module memos
-//! - cognitive attention stream
+//! - cognition log
 //! - scheduler-owned module run status
 //! - current utterance stream progress
 //! - memory metadata mirror (content lives in the external `MemoryStore`)
@@ -19,7 +19,7 @@
 //! other blackboard state.
 
 mod allocation;
-mod attention_stream;
+mod cognition_log;
 mod command;
 mod memory;
 mod state;
@@ -29,9 +29,9 @@ pub use allocation::{
     RateLimitRatio, ReplicasRatio, ResourceAllocation, linear_ratio_fn, rate_only_ratio_fn,
     replicas_only_ratio_fn,
 };
-pub use attention_stream::{
-    AgenticDeadlockMarker, AttentionLogRecord, AttentionStream, AttentionStreamEvent,
-    AttentionStreamRecord, AttentionStreamSet,
+pub use cognition_log::{
+    AgenticDeadlockMarker, CognitionLog, CognitionLogEntry, CognitionLogEntryRecord,
+    CognitionLogRecord, CognitionLogSet,
 };
 pub use command::BlackboardCommand;
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};

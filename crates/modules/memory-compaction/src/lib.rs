@@ -100,7 +100,7 @@ impl MemoryCompactionModule {
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "attention_stream": bb.attention_stream().entries(),
+                    "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })

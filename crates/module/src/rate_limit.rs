@@ -17,7 +17,7 @@ pub enum TopicKind {
     SensoryInput,
     SensoryDetailRequest,
     MemoryRequest,
-    AttentionStreamUpdated,
+    CognitionLogUpdated,
     AllocationUpdated,
     MemoUpdated,
 }

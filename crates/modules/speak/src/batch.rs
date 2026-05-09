@@ -10,8 +10,8 @@ pub struct NextBatch {
 
 impl SpeakGateModule {
     pub(crate) async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.attention_updates.next_item().await?;
-        let _ = self.attention_updates.take_ready_items()?;
+        let _ = self.cognition_updates.next_item().await?;
+        let _ = self.cognition_updates.take_ready_items()?;
         Ok(())
     }
 }

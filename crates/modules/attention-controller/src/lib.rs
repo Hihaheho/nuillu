@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
-    AllocationReader, AllocationWriter, AttentionReader, BlackboardReader, LlmAccess, Memo,
+    AllocationReader, AllocationWriter, BlackboardReader, CognitionLogReader, LlmAccess, Memo,
     MemoUpdatedInbox, Module,
 };
 use nuillu_types::{ModelTier, ModuleId};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
-You wake on memo updates. Use blackboard memos, the attention stream, current allocation, and
+You wake on memo updates. Use blackboard memos, the cognition log, current allocation, and
 registry schema to write guidance-based allocation for registered modules.
 Return one allocation entry for every registered module. Use guidance to tell modules what work
 should be done now and what other module work should be considered. Do not invent module ids.
@@ -67,7 +67,7 @@ pub struct AttentionControllerModule {
     owner: ModuleId,
     updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
-    attention: AttentionReader,
+    cognition_log: CognitionLogReader,
     allocation_reader: AllocationReader,
     allocation_writer: AllocationWriter,
     memo: Memo,
@@ -79,7 +79,7 @@ impl AttentionControllerModule {
     pub fn new(
         updates: MemoUpdatedInbox,
         blackboard: BlackboardReader,
-        attention: AttentionReader,
+        cognition_log: CognitionLogReader,
         allocation_reader: AllocationReader,
         allocation_writer: AllocationWriter,
         memo: Memo,
@@ -89,7 +89,7 @@ impl AttentionControllerModule {
             owner: ModuleId::new(<Self as Module>::id()).expect("attention-controller id is valid"),
             updates,
             blackboard,
-            attention,
+            cognition_log,
             allocation_reader,
             allocation_writer,
             memo,
@@ -112,7 +112,7 @@ impl AttentionControllerModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         Self::activate_with(
-            &self.attention,
+            &self.cognition_log,
             &self.blackboard,
             &self.allocation_reader,
             &self.allocation_writer,
@@ -126,7 +126,7 @@ impl AttentionControllerModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     #[allow(clippy::too_many_arguments)]
     async fn activate_with(
-        attention_reader: &AttentionReader,
+        cognition_log_reader: &CognitionLogReader,
         blackboard_reader: &BlackboardReader,
         allocation_reader: &AllocationReader,
         allocation_writer: &AllocationWriter,
@@ -134,8 +134,8 @@ impl AttentionControllerModule {
         llm: &LlmAccess,
         system_prompt: &str,
     ) -> Result<()> {
-        let attention = attention_reader
-            .read(|stream| stream.entries().to_vec())
+        let cognition_log = cognition_log_reader
+            .read(|log| log.entries().to_vec())
             .await;
         let blackboard = blackboard_reader
             .read(|bb| {
@@ -159,7 +159,7 @@ impl AttentionControllerModule {
         session.push_system(system_prompt);
         session.push_user(
             controller_input(
-                serde_json::to_value(&attention).context("serialize attention stream")?,
+                serde_json::to_value(&cognition_log).context("serialize cognition log")?,
                 blackboard,
                 serde_json::to_value(&current).context("serialize current allocation")?,
                 controller_schema,
@@ -241,13 +241,13 @@ fn fallback_allocation_decision_schema() -> Schema {
 }
 
 fn controller_input(
-    attention: serde_json::Value,
+    cognition_log: serde_json::Value,
     blackboard: serde_json::Value,
     allocation: serde_json::Value,
     controller_schema: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
-        "attention_stream": attention,
+        "cognition_log": cognition_log,
         "blackboard": blackboard,
         "allocation": allocation,
         "controller_schema": controller_schema,
@@ -307,7 +307,7 @@ mod tests {
                     AllocationEntry {
                         module_id: "speak".into(),
                         activation_ratio: 9.0,
-                        guidance: "respond from attention when ready".into(),
+                        guidance: "respond from cognition log when ready".into(),
                         tier: ModelTier::Premium,
                     },
                 ],
@@ -326,7 +326,7 @@ mod tests {
             applied.allocation.activation_for(&builtin::speak()),
             ActivationRatio::ONE
         );
-        assert_eq!(speak.guidance, "respond from attention when ready");
+        assert_eq!(speak.guidance, "respond from cognition log when ready");
         assert_eq!(speak.tier, ModelTier::Premium);
     }
 
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(
             input,
             serde_json::json!({
-                "attention_stream": [],
+                "cognition_log": [],
                 "blackboard": {
                     "memos": {
                         "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
