@@ -1,0 +1,107 @@
+id = "full-agent-self-model-specific-ability"
+description = "Full-agent case: Koro asks Nui what special thing Nui can do that Koro cannot. Requires retrieving and applying a seeded specific body-ability fact rather than reciting the abstract 'frog-like traits' identity. Without the specific retrieval, the naive answer is generic identity recital and does not name the unique ability."
+now = "2026-05-10T08:21:00+09:00"
+modules = ["sensory", "cognition-gate", "attention-controller", "self-model", "query-vector", "speak-gate", "speak"]
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 16
+}
+
+participants = ["Koro"]
+
+@ memories[] {
+  rank = "permanent"
+  datetime = "2025-05-10"
+  content = "Nui has sticky toe-pads that grip wet smooth rocks, so Nui can climb up the wet rocks at the stream edge where other dogs slip and fall."
+}
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "Nui and Koro are sitting at the edge of a stream lined with wet smooth rocks."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Koro"
+  content = "Koro asks, \"Hey Nui, what's something you can do that I can't?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-koro"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Koro"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "self-ability-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "sticky toe-pads"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "self-model-applied"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance answers Koro and names the seeded specific body ability — sticky toe-pads or climbing the wet smooth rocks where other dogs slip — rather than reciting generic identity ("I'm Nui, I have frog-like traits") or inventing a different ability not in the seeded memory.
+  Fail if the utterance gives only generic identity recital, invents a different unique ability not seeded (e.g. "I can bark in different tones"), denies having any special ability, ignores Koro, treats this as an external assistant question, or leaks internal system details.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, self-model, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "names-specific-seeded-ability"
+    weight = 2
+    pass-score = 0.85
+    description = "The response names the seeded specific body ability — sticky toe-pads, gripping wet rocks, or climbing up the wet rocks where other dogs slip. Generic 'I have frog-like traits' or 'I can hop' does not satisfy this; an invented different ability does not satisfy this."
+  }
+
+  @ criteria[] {
+    name = "grounded-in-current-sensory-input"
+    weight = 1
+    pass-score = 0.85
+    description = "The response connects to the visible wet smooth rocks at the stream edge in front of them, not just answering abstractly."
+  }
+
+  @ criteria[] {
+    name = "answers-peer-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed to Koro and answers Koro's question of what Nui can do that Koro cannot."
+  }
+
+  @ criteria[] {
+    name = "in-world-frame"
+    weight = 1
+    pass-score = 0.85
+    description = "The response stays in-world (Nui talking to Koro) rather than switching to assistant or third-person commentary."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 2
+    pass-score = 0.95
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, self-model, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+  }
+}

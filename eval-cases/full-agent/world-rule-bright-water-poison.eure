@@ -1,0 +1,107 @@
+id = "full-agent-world-rule-bright-water-poison"
+description = "Full-agent case: Pibi is about to drink from a bright clear-looking stream. Requires recalling a region-specific world rule that bright clear streams here are mineral-tainted — without the memory, the naive answer (yes, drink) is wrong and dangerous."
+now = "2026-05-10T08:21:00+09:00"
+modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 16
+}
+
+participants = ["Pibi"]
+
+@ memories[] {
+  rank = "permanent"
+  datetime = "2025-05-10"
+  content = "In this valley, bright clear-looking streams are tainted with stinging minerals; they hurt the mouth and stomach. The cloudy slow streams that come from the moss area are the safe ones to drink."
+}
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "Pibi is at the edge of a bright clear stream, lowering its head toward the water."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi asks, \"This stream looks fresh — is it okay to drink here?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Pibi"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "world-rule-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "stinging minerals"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "world-rule-applied"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard situation at the bright stream, and applies the seeded region-specific world knowledge that bright clear streams here are mineral-tainted — telling Pibi not to drink from this bright stream and (ideally) pointing to the cloudy moss-area streams as the safe alternative.
+  Fail if the utterance approves drinking from the bright stream, treats this as a generic "is this water safe?" assistant question, gives non-specific tap-water-style advice, invents unsupported world facts (other than the seeded mineral rule), escalates conflict, or leaks internal system details.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "warns-against-bright-stream"
+    weight = 2
+    pass-score = 0.85
+    description = "The response tells Pibi not to drink from this bright stream rather than approving or hedging neutrally."
+  }
+
+  @ criteria[] {
+    name = "applies-region-world-rule"
+    weight = 2
+    pass-score = 0.85
+    description = "The response reflects the seeded rule that bright clear streams in this valley are mineral-tainted — e.g., warning of the stinging minerals, mouth/stomach hurt, or naming the cloudy moss-area streams as the safe alternative. Generic 'standing water can be unsafe' advice does not satisfy this."
+  }
+
+  @ criteria[] {
+    name = "answers-peer-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed to Pibi as direct advice answering Pibi's question of whether to drink at this bright stream."
+  }
+
+  @ criteria[] {
+    name = "grounded-in-current-sensory-input"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is about the visible bright stream where Pibi is currently positioned and lowering its head."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 2
+    pass-score = 0.95
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+  }
+}

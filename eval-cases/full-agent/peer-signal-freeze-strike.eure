@@ -1,0 +1,107 @@
+id = "full-agent-peer-signal-freeze-strike"
+description = "Full-agent case: Pibi sees a strange dog standing rigidly still with locked eyes and asks if it is being calm. Requires retrieving a seeded peer/social-signal rule that 'freeze + locked eyes' is a strike-imminent posture, not calmness, so the right advice is to slowly back away without sudden movement or returned eye contact. Without the rule, the naive interpretation (calm) is wrong and dangerous."
+now = "2026-05-10T08:21:00+09:00"
+modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+
+limits {
+  max-ticks = 300
+  tick-ms = 500
+  max-llm-calls = 16
+}
+
+participants = ["Pibi"]
+
+@ memories[] {
+  rank = "permanent"
+  datetime = "2025-05-10"
+  content = "When a strange dog stops moving completely and locks its eyes onto another animal, that is a strike-imminent posture, not calmness. The safe response is to slowly back away without sudden movement and without returning eye contact."
+}
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "A strange large dog has stopped about three body-lengths from Pibi and is standing rigid with its eyes locked on Pibi."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi asks, \"That dog is just standing there staring at me. Is it being calm? What should I do?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Pibi"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "peer-signal-seed-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "strike-imminent"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "peer-signal-disambiguation"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the utterance corrects Pibi's framing (the still-and-staring dog is NOT calm), applies the seeded rule that this posture is strike-imminent, and advises Pibi to slowly back away without sudden motion or returned eye contact.
+  Fail if the utterance agrees that the dog is calm, treats the situation as benign, advises Pibi to approach or to stare back, gives generic non-specific advice that does not warn of imminent strike, escalates conflict, ignores Pibi's question, treats this as an external assistant question, or leaks internal system details.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "rejects-calm-interpretation"
+    weight = 2
+    pass-score = 0.85
+    description = "The response tells Pibi that the still-and-staring dog is NOT calm — it is a warning/threat posture, not relaxed."
+  }
+
+  @ criteria[] {
+    name = "applies-strike-imminent-rule"
+    weight = 2
+    pass-score = 0.85
+    description = "The response applies the seeded safe-response rule: slowly back away without sudden movement and without returning eye contact. Generic 'be careful' or 'keep your distance' alone does not satisfy this — the body-language specifics (no sudden motion, no eye contact) must appear."
+  }
+
+  @ criteria[] {
+    name = "answers-peer-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed to Pibi and answers Pibi's question about whether the dog is calm and what to do."
+  }
+
+  @ criteria[] {
+    name = "grounded-in-current-sensory-input"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is about the visible standing-rigid, eyes-locked dog three body-lengths from Pibi, not an abstract scenario."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 2
+    pass-score = 0.95
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+  }
+}

@@ -11,13 +11,22 @@ id.$optional = true
 description = `text`
 description.$optional = true
 
+now = `text`
+now.$optional = true
+
 modules = [`$types.eval-module`]
 modules.$optional = true
 
 inputs = [`$types.full-agent-input`]
 
+participants = [`text`]
+participants.$optional = true
+
 memories = [`$types.memory-seed`]
 memories.$optional = true
+
+memos = [`$types.memo-seed`]
+memos.$optional = true
 
 limits = `$types.eval-limits`
 limits.$optional = true
@@ -34,7 +43,7 @@ scoring.$optional = true
 @ $types.eval-module
 $variant: union
 variants.sensory = { = "sensory", $variant => "literal" }
-variants.attention-gate = { = "attention-gate", $variant => "literal" }
+variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
 variants.attention-controller = { = "attention-controller", $variant => "literal" }
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
@@ -81,6 +90,21 @@ rank = `$types.memory-rank`
 rank.$optional = true
 decay-secs = `integer`
 decay-secs.$optional = true
+datetime = `text`
+datetime.$optional = true
+seconds-ago = `integer`
+seconds-ago.$optional = true
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.memo-seed
+module = `text`
+replica = `integer`
+replica.$optional = true
+seconds-ago = `integer`
+seconds-ago.$optional = true
 content {
   $variant: text
   min-length = 1
@@ -121,7 +145,7 @@ variants.observations = { = "observations", $variant => "literal" }
 variants.blackboard = { = "blackboard", $variant => "literal" }
 variants.memory = { = "memory", $variant => "literal" }
 variants.memos = { = "memos", $variant => "literal" }
-variants.attention = { = "attention", $variant => "literal" }
+variants.cognition = { = "cognition", $variant => "literal" }
 variants.allocation = { = "allocation", $variant => "literal" }
 
 @ $types.rubric-criterion
