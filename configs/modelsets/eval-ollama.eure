@@ -16,14 +16,14 @@ cheap {
 default {
   endpoint = "http://localhost:11434/v1"
   token = "local"
-  model = "gemma4:26b"
-  reasoning-effort = "low"
+  model = "gemma4:e4b"
+  reasoning-effort = "medium"
 }
 
 premium {
   endpoint = "http://localhost:11434/v1"
   // token-env = "OPENROUTER_API_KEY"
   token = "local"
-  model = "gemma4:26b"
-  reasoning-effort = "medium"
+  model = "gemma4:e4b"
+  reasoning-effort = "high"
 }
