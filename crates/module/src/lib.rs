@@ -9,7 +9,9 @@
 //!   cognition log.
 //! - Without [`AllocationWriter`], a module cannot change resource
 //!   allocation.
-//! - Without [`Memo`], a module has no memo slot at all.
+//! - Without [`Memo`] or [`TypedMemo`], a module has no memo slot at all.
+//!   Memo is single-issued per module construction so a module owner has one
+//!   payload type.
 //! - Typed mailbox sends are owner-stamped; identities cannot be forged.
 //! - LLM tier is read from allocation per-call inside [`LlmAccess`];
 //!   modules don't pick tiers themselves.
@@ -59,7 +61,7 @@ pub use channels::{
 };
 pub use cognition::CognitionWriter;
 pub use llm::LlmAccess;
-pub use memo::Memo;
+pub use memo::{Memo, TypedMemo};
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };

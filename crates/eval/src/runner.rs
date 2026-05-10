@@ -1264,7 +1264,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.vector_memory_searcher(),
-                    caps.memo(),
+                    caps.typed_memo::<nuillu_query_vector::QueryVectorMemo>(),
                     caps.llm_access(),
                 )
             })

@@ -2197,6 +2197,7 @@ dependencies = [
  "async-trait",
  "lutum",
  "lutum-protocol",
+ "nuillu-blackboard",
  "nuillu-module",
  "nuillu-types",
  "schemars",

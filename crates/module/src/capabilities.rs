@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +33,7 @@ use crate::{
     SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
     SensoryDetailRequestInbox, SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox,
     SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, TimeDivision, TopicInbox,
-    TopicMailbox, VectorMemorySearcher,
+    TopicMailbox, TypedMemo, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -225,6 +227,7 @@ impl CapabilityProviders {
         ModuleCapabilityFactory {
             owner,
             root: self.clone(),
+            memo_issued: Rc::new(Cell::new(false)),
         }
     }
 
@@ -526,6 +529,9 @@ impl InternalHarnessIo {
 pub struct ModuleCapabilityFactory {
     owner: ModuleInstanceId,
     root: CapabilityProviders,
+    // Memo is the only single-issued capability: typed memo safety relies on
+    // one payload type per module owner.
+    memo_issued: Rc<Cell<bool>>,
 }
 
 impl ModuleCapabilityFactory {
@@ -619,8 +625,27 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    fn claim_memo(&self) {
+        assert!(
+            !self.memo_issued.replace(true),
+            "module requested multiple memo capabilities; choose exactly one of memo() or typed_memo::<T>()"
+        );
+    }
+
     pub fn memo(&self) -> Memo {
+        self.claim_memo();
         Memo::new(
+            self.owner.clone(),
+            self.root.inner.blackboard.clone(),
+            TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
+            self.root.inner.clock.clone(),
+            self.root.inner.runtime_events.clone(),
+        )
+    }
+
+    pub fn typed_memo<T: 'static>(&self) -> TypedMemo<T> {
+        self.claim_memo();
+        TypedMemo::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
@@ -1222,6 +1247,74 @@ mod tests {
         assert_eq!(event.sender.module, builtin::sensory());
         assert_eq!(event.body.owner.module, builtin::sensory());
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_memo_writes_plaintext_publishes_and_keeps_typed_payload() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct TestMemoPayload {
+            value: String,
+        }
+
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let mut inbox = cognition_gate.memo_updated_inbox();
+
+        query_vector
+            .typed_memo::<TestMemoPayload>()
+            .write(
+                TestMemoPayload {
+                    value: "typed".into(),
+                },
+                "plain",
+            )
+            .await;
+
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender, owner);
+        assert_eq!(event.body.owner, owner);
+        assert_eq!(event.body.index, 0);
+
+        let plaintext = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(plaintext.len(), 1);
+        assert_eq!(plaintext[0].content, "plain");
+
+        let typed = blackboard.typed_memo_logs::<TestMemoPayload>(&owner).await;
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0].content, "plain");
+        assert_eq!(
+            typed[0].data(),
+            &TestMemoPayload {
+                value: "typed".into()
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "module requested multiple memo capabilities; choose exactly one of memo() or typed_memo::<T>()"
+    )]
+    fn memo_then_typed_memo_panics() {
+        let caps = test_caps(Blackboard::default());
+        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+
+        let _plain = query_vector.memo();
+        let _typed = query_vector.typed_memo::<u8>();
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "module requested multiple memo capabilities; choose exactly one of memo() or typed_memo::<T>()"
+    )]
+    fn typed_memo_then_typed_memo_panics() {
+        let caps = test_caps(Blackboard::default());
+        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+
+        let _first = query_vector.typed_memo::<u8>();
+        let _second = query_vector.typed_memo::<u16>();
     }
 
     #[tokio::test]

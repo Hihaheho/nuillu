@@ -1,4 +1,7 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -35,7 +38,7 @@ pub struct Blackboard {
 /// [`BlackboardCommand`].
 #[derive(Debug)]
 pub struct BlackboardInner {
-    memos: HashMap<ModuleInstanceId, VecDeque<MemoLogRecord>>,
+    memos: HashMap<ModuleInstanceId, VecDeque<MemoLogEntry>>,
     memo_next_indices: HashMap<ModuleInstanceId, u64>,
     memo_retained_per_owner: usize,
     module_statuses: HashMap<ModuleInstanceId, ModuleRunStatus>,
@@ -59,6 +62,58 @@ pub struct MemoLogRecord {
     pub index: u64,
     pub written_at: DateTime<Utc>,
     pub content: String,
+}
+
+#[derive(Clone)]
+pub struct TypedMemoLogRecord<T> {
+    pub owner: ModuleInstanceId,
+    pub index: u64,
+    pub written_at: DateTime<Utc>,
+    pub content: String,
+    payload: Arc<dyn Any>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: 'static> TypedMemoLogRecord<T> {
+    pub fn data(&self) -> &T {
+        self.payload.downcast_ref::<T>().expect(
+            "typed memo payload type mismatch: entries for this owner must be written through one TypedMemo<T> payload type",
+        )
+    }
+}
+
+struct MemoLogEntry {
+    record: MemoLogRecord,
+    payload: Arc<dyn Any>,
+}
+
+impl fmt::Debug for MemoLogEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoLogEntry")
+            .field("record", &self.record)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemoLogEntry {
+    fn new(record: MemoLogRecord, payload: Arc<dyn Any>) -> Self {
+        Self { record, payload }
+    }
+
+    fn record(&self) -> MemoLogRecord {
+        self.record.clone()
+    }
+
+    fn typed_record<T: 'static>(&self) -> TypedMemoLogRecord<T> {
+        TypedMemoLogRecord {
+            owner: self.record.owner.clone(),
+            index: self.record.index,
+            written_at: self.record.written_at,
+            content: self.record.content.clone(),
+            payload: Arc::clone(&self.payload),
+            _marker: PhantomData,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -236,8 +291,25 @@ impl Blackboard {
         memo: String,
         written_at: DateTime<Utc>,
     ) -> MemoLogRecord {
+        self.update_typed_memo(owner, memo, (), written_at).await
+    }
+
+    pub async fn update_typed_memo<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        payload: T,
+        written_at: DateTime<Utc>,
+    ) -> MemoLogRecord {
         let mut guard = self.inner.write().await;
-        guard.append_memo(owner, memo, written_at)
+        guard.append_memo(owner, memo, Arc::new(payload), written_at)
+    }
+
+    pub async fn typed_memo_logs<T: 'static>(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Vec<TypedMemoLogRecord<T>> {
+        self.read(|bb| bb.typed_memo_logs(owner)).await
     }
 
     /// Register a one-shot notification for the next time `owner` is active.
@@ -358,7 +430,7 @@ impl BlackboardInner {
         let mut records = self
             .memos
             .values()
-            .flat_map(|records| records.iter().cloned())
+            .flat_map(|records| records.iter().map(MemoLogEntry::record))
             .collect::<Vec<_>>();
         sort_memo_logs(&mut records);
         records
@@ -373,14 +445,25 @@ impl BlackboardInner {
             .iter()
             .flat_map(|(owner, records)| {
                 let last_seen = last_seen_indices.get(owner).copied();
-                records.iter().filter(move |record| {
-                    last_seen.is_none_or(|last_seen| record.index > last_seen)
+                records.iter().filter(move |entry| {
+                    last_seen.is_none_or(|last_seen| entry.record.index > last_seen)
                 })
             })
-            .cloned()
+            .map(MemoLogEntry::record)
             .collect::<Vec<_>>();
         sort_memo_logs(&mut records);
         records
+    }
+
+    pub fn typed_memo_logs<T: 'static>(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Vec<TypedMemoLogRecord<T>> {
+        self.memos
+            .get(owner)
+            .into_iter()
+            .flat_map(|records| records.iter().map(MemoLogEntry::typed_record))
+            .collect()
     }
 
     pub fn module_status_for_instance(&self, id: &ModuleInstanceId) -> Option<&ModuleRunStatus> {
@@ -558,7 +641,7 @@ impl BlackboardInner {
                 memo,
                 written_at,
             } => {
-                self.append_memo(owner, memo, written_at);
+                self.append_memo(owner, memo, Arc::new(()), written_at);
             }
             BlackboardCommand::SetModuleRunStatus { owner, status } => {
                 self.module_statuses.insert(owner, status);
@@ -631,6 +714,7 @@ impl BlackboardInner {
         &mut self,
         owner: ModuleInstanceId,
         content: String,
+        payload: Arc<dyn Any>,
         written_at: DateTime<Utc>,
     ) -> MemoLogRecord {
         let index = self.memo_next_indices.entry(owner.clone()).or_default();
@@ -644,7 +728,7 @@ impl BlackboardInner {
 
         let retained = self.memo_retained_per_owner.max(1);
         let records = self.memos.entry(owner).or_default();
-        records.push_back(record.clone());
+        records.push_back(MemoLogEntry::new(record.clone(), payload));
         while records.len() > retained {
             records.pop_front();
         }
@@ -831,6 +915,60 @@ mod tests {
                 written_at: memo_time(0),
                 content: "noted".into(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_memo_round_trip_keeps_plaintext_view() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct TestPayload {
+            value: String,
+        }
+
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        bb.update_typed_memo(
+            owner.clone(),
+            "plain memo".into(),
+            TestPayload {
+                value: "structured".into(),
+            },
+            memo_time(0),
+        )
+        .await;
+
+        let logs = bb.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(
+            logs,
+            vec![MemoLogRecord {
+                owner: owner.clone(),
+                index: 0,
+                written_at: memo_time(0),
+                content: "plain memo".into(),
+            }]
+        );
+
+        let typed_logs = bb.typed_memo_logs::<TestPayload>(&owner).await;
+        assert_eq!(typed_logs.len(), 1);
+        assert_eq!(typed_logs[0].content, "plain memo");
+        assert_eq!(
+            typed_logs[0].data(),
+            &TestPayload {
+                value: "structured".into()
+            }
+        );
+
+        let json = bb.read(|bb| bb.memo_logs()).await;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "query-vector": [{
+                    "replica": 0,
+                    "index": 0,
+                    "written_at": memo_time(0),
+                    "content": "plain memo",
+                }]
+            })
         );
     }
 
