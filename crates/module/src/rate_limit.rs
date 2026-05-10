@@ -13,7 +13,6 @@ use tokio::time::{Instant, sleep_until};
 pub enum TopicKind {
     Query,
     SelfModel,
-    Speak,
     SensoryInput,
     SensoryDetailRequest,
     MemoryRequest,

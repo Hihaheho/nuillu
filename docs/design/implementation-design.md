@@ -21,7 +21,7 @@ This document is the implementation source of truth. It describes the desired ar
 10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. `QueryRequest` and `SelfModelRequest` are internal module messages; eval may publish them only from module-level harnesses.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
 12. **Streaming for user-visible output, collect for internal work** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules use `.collect()` for control decisions, tool loops, and complete free-form notes written through `Memo`. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
-13. **SpeakRequest-only interruption of speak streaming** — Speak streaming is cancelled only by a new typed `SpeakRequest`. Cognition-log updates wake SpeakGate, which reads scheduler-owned module status plus utterance progress and decides whether the new cognition log warrants sending a replacement request.
+13. **Activation-gated speech** — Cognition-log updates wake Speak. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<SpeakModule>` holders such as SpeakGate and waits for allow/suppress votes.
 14. **Local deterministic inbox batching** — Modules may batch transient inbox activations immediately before LLM work. Batching is module-local, bounded by boot-time module registration, and deterministic; it does not add a shared runtime batch type or ask an LLM to decide batch membership.
 15. **Replica-capped persistent module instances** — Boot registers modules as `(module_id, cap_range, builder)`, creates module instances up to `cap_range.max`, and never destroys those instances when allocation lowers replica count. Allocation changes routing and event-loop scheduling.
 16. **Controller proposals with deterministic effective allocation** — Attention-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, computes active replicas from each module's boot-time cap range, then applies `RuntimePolicy` hard limits such as max total active replicas and max Premium replicas.
@@ -211,13 +211,6 @@ pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 pub struct AllocationUpdated;
 pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 
-pub struct SpeakRequest {
-    pub generation_hint: String,
-    pub rationale: String,
-}
-pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
-pub type SpeakInbox   = TopicInbox<SpeakRequest>;
-
 pub struct SensoryDetailRequest {
     pub question: String,
 }
@@ -244,7 +237,7 @@ Delivery policy is per topic:
 - `CognitionLogUpdated` is fanout: every active subscriber replica receives the wake signal.
 - `MemoUpdated` is fanout with self-filtering at the inbox handle: every active subscriber replica receives memo writes except its own writes.
 - `AllocationUpdated` is fanout: every active subscriber replica receives the wake signal when effective allocation or guidance changes.
-- `QueryRequest`, `SelfModelRequest`, `SpeakRequest`, `SensoryInput`, `SensoryDetailRequest`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
+- `QueryRequest`, `SelfModelRequest`, `SensoryInput`, `SensoryDetailRequest`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
 `SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
@@ -290,9 +283,9 @@ pub struct UtteranceDelta {
 
 - `emit(target, text)` — stamps `emitted_at`, owner, target, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
 - `emit_delta(target, generation_id, sequence, delta)` — sends a targeted `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
-- `record_progress(progress)` — owner-stamps the latest utterance progress on the blackboard so SpeakGate can inspect partial speech while deciding whether a replacement `SpeakRequest` is needed.
+- `record_progress(progress)` — owner-stamps the latest utterance progress on the blackboard so SpeakGate can inspect speech state while deciding future Speak activations.
 
-`UtteranceDelta` carries no durability semantics. When generation is interrupted by an LLM retry, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Speak cancels a current stream only when it receives a newer typed `SpeakRequest`; cognition-log updates wake SpeakGate, which may send that replacement request after inspecting module status and utterance progress. Sinks append resumed retry chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
+`UtteranceDelta` carries no durability semantics. When generation retries, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Cognition-log updates that arrive during streaming remain queued in Speak's inbox and are considered after the current activation completes. Sinks append resumed retry chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
 
 ### Allocation updates
 
@@ -316,7 +309,7 @@ The awaited receive and ready drain are module-local. Active-replica gating happ
 
 Wake-only activations such as `CognitionLogUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as cognition logs, memo logs, or allocation. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `SensoryDetailRequest`, `SensoryInput`, and `MemoryRequest` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until the event loop activates the replica.
 
-If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation. Speak's v1 preemption rule is narrower: only a newer typed `SpeakRequest` cancels the active stream.
+If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation, including active Speak streams.
 
 Boot policy should register `attention-controller` with `cap_range.min >= 1`. If all controller replicas are disabled by host policy, only the host or explicit boot wiring can recover allocation.
 
@@ -349,7 +342,7 @@ Module conventions:
 - Cognition-log-update modules, such as attention-schema, predict, and surprise, collapse multiple ready cognition-log updates into one wake activation and reread the cognition log as source of truth. `CognitionLogUpdatedInbox` drops self-sent updates so a module cannot wake itself by appending to its own cognition log.
 - Query and self-model modules collect ready explicit requests into a module-local batch and answer the batch in one LLM turn. The module decides answer granularity and memo write policy; channel responses and request/response correlation remain out of scope.
 - Memory wakes from cognition-log updates and explicit `MemoryRequest` messages, reads the current cognition log plus indexed memo logs, and writes only through `insert_memory` tool calls. Memo logs, cognition-log entries, and memory requests are candidate evidence, not durable write commands; the memory module may deduplicate, merge, normalize, or reject candidates.
-- Speak may batch queued `SpeakRequest` values while waiting to start work. During a generation stream, only a newer `SpeakRequest` is an immediate interruption signal; cognition-log updates wake SpeakGate rather than Speak.
+- Speak batches ready `CognitionLogUpdated` wake signals, then activation gates decide whether that batch may run. Cognition-log updates received during a generation stream remain queued for the next Speak batch.
 - Sensory batching is deferred in v1 because its batching policy is tied to salience, habituation, and stimulus decay rather than generic activation collapse.
 
 ### Replica-owned blackboard views
@@ -537,7 +530,7 @@ Wakes only on memo updates, excluding its own memo writes. It reads unread memo-
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
 
-When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps `speak` and `speak-gate` active, keeps or raises query and cognition-gate activation ratios/tier, and writes guidance for the modules that can gather or promote the missing evidence. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state and memo-log history indicate that enough evidence is available for a user-visible answer, SpeakGate can send Speak a typed `SpeakRequest`.
+When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps `speak` and `speak-gate` active, keeps or raises query and cognition-gate activation ratios/tier, and writes guidance for the modules that can gather or promote the missing evidence. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state and memo-log history indicate that enough evidence is available for a user-visible answer, SpeakGate can allow the pending Speak activation.
 
 This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, cognition logs, and allocation state, while query results remain durable only through query-module memo logs.
 
@@ -599,21 +592,21 @@ The v1 surprise threshold is represented by the structured LLM field `significan
 
 ### SpeakGate
 
-Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `BlackboardReader`, `ModuleStatusReader`, `QueryMailbox`, `SelfModelMailbox`, `SensoryDetailRequestMailbox`, `Memo`, `SpeakMailbox`, `LlmAccess`.
+Capabilities: `ActivationGate<SpeakModule>`, `CognitionLogReader`, `BlackboardReader`, `ModuleStatusReader`, `QueryMailbox`, `SelfModelMailbox`, `SensoryDetailRequestMailbox`, `Memo`, `LlmAccess`.
 
-Activates only on cognition-log updates. Reads unread memo-log entries into its persistent `Session`, plus the cognition-log set, scheduler-owned module status, and utterance progress, to decide whether the current cognitive surface is speech-ready. It can call evidence tools that publish memory query, self-model, and sensory-detail work. Those tools only report whether work was requested or duplicate; available memo evidence is already in SpeakGate's session from unread memo logs. After publishing missing evidence work, SpeakGate waits for a later cognition-log update to reconsider. If speak is not currently streaming, it uses the normal readiness prompt. If speak is currently activating and utterance progress is streaming, it uses an interruption prompt that compares the new cognition log with the partial utterance and current generation hint. If speech is ready or the current utterance should be replaced, it publishes a typed `SpeakRequest`; otherwise it writes the wait decision and any missing-evidence notes to its memo log. SpeakGate does not emit utterances, write cognition-log entries, write allocation, or write memory.
+Activates only on pending Speak activation-gate events. Reads unread memo-log entries into its persistent `Session`, plus the cognition-log set, scheduler-owned module status, and utterance progress, to decide whether the pending Speak batch is speech-ready. It can call evidence tools that publish memory query, self-model, and sensory-detail work. Those tools only report whether work was requested or duplicate; available memo evidence is already in SpeakGate's session from unread memo logs. After publishing missing evidence work, SpeakGate suppresses the current activation and waits for a later Speak batch to reconsider. If speech is ready, it returns `Allow`; otherwise it returns `Suppress` and writes the wait decision and any missing-evidence notes to its memo log. SpeakGate does not emit utterances, write cognition-log entries, write allocation, or write memory.
 
 ### Speak
 
-Capabilities: `SpeakInbox`, `CognitionLogReader`, `UtteranceWriter`, `Memo`, `Clock`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `SceneReader`, `UtteranceWriter`, `Memo`, `Clock`, `LlmAccess`.
 
 Emits user-visible text. The module is named `speak`, not `talk`, because it represents the concrete speech action capability rather than the whole conversational process.
 
-Speak reads only the cognition-log set and a typed `SpeakRequest` — it has no `BlackboardReader`, no `AllocationReader`, and does not inspect other modules' memo logs or allocation guidance. This keeps the utterance boundary narrow: speak distills the admitted cognitive surface according to the generation hint selected by SpeakGate.
+Speak reads only the cognition-log set and the current scene target schema — it has no `BlackboardReader`, no `AllocationReader`, and does not inspect other modules' memo logs or allocation guidance. This keeps the utterance boundary narrow: speak distills the admitted cognitive surface after SpeakGate has allowed the activation.
 
-Speak has no decision turn. It waits on `SpeakInbox`; receiving a `SpeakRequest` starts a generation turn. If multiple requests are queued, the latest request wins. During `text_turn().stream()`, each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()` and mirrored into utterance progress as the current partial utterance. The only stream-cancel path is receiving another `SpeakRequest`; cognition-log updates cannot cancel speak directly.
+Speak waits on `CognitionLogUpdatedInbox`; a ready batch reaches generation only after activation gates allow it. Speak first runs a short structured target-selection turn constrained by `SceneReader`, then streams text to that target. During `text_turn().stream()`, each `TextTurnEvent::TextDelta { delta }` chunk is forwarded immediately via `emit_delta()` and mirrored into utterance progress as the current partial utterance. Cognition-log updates do not cancel an active stream; they remain queued for a later Speak batch.
 
-Speak does not publish query or self-model requests. If an external observation has entered the cognition log but supporting work has not completed, SpeakGate may publish explicit evidence requests during its decision turn, records its wait decision in a memo-log entry, and then waits for a later cognition-log update rather than polling for completion. A completed utterance memo-log entry wakes the controller as ordinary output context, but speech start itself is not controlled through memo structure, memo JSON, or allocation guidance.
+Speak does not publish query or self-model requests. If an external observation has entered the cognition log but supporting work has not completed, SpeakGate may publish explicit evidence requests during its gate decision, records its wait decision in a memo-log entry, and then waits for a later Speak batch rather than polling for completion. A completed utterance memo-log entry wakes the controller as ordinary output context, but speech start itself is not controlled through memo structure, memo JSON, or allocation guidance.
 
 ---
 
@@ -676,7 +669,7 @@ Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` in
 `UtteranceSink` is not a query response channel. It is an observable action log for host applications and eval harnesses. It exposes two notification surfaces:
 
 - `on_complete(utterance: Utterance)` — a complete, timestamped utterance. Every compliant sink must implement this.
-- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. If generation retries, speak resumes the same utterance with the same `generation_id` and the next `sequence`; if a newer `SpeakRequest` replaces the stream, speak starts a new generation. Sinks append resumed retry chunks to the partial text they already accepted.
+- `on_delta(delta: UtteranceDelta)` — a streaming chunk during generation. This method has a default no-op implementation; sinks that do not need progressive output ignore it. If generation retries, speak resumes the same utterance with the same `generation_id` and the next `sequence`. Sinks append resumed retry chunks to the partial text they already accepted.
 
 Implementations may persist utterances, stream deltas to UI, or both. The `on_complete` call always follows the full `on_delta` sequence for the same `generation_id`, so a UI adapter that consumed deltas can use `on_complete` as a framing signal rather than re-rendering the text.
 
@@ -725,10 +718,10 @@ This keeps realistic artifacts observable without adding request/response correl
 | Sensory cannot answer, route work, or alter cognition directly | it receives no `QueryMailbox`, `SelfModelMailbox`, `UtteranceWriter`, `CognitionWriter`, `AllocationWriter`, memory capabilities, or readers |
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `CognitionWriter`, `AllocationWriter`, or memory capabilities |
-| Speak reads only cognition log and typed speech requests | it receives `CognitionLogReader` and `SpeakInbox`, not `BlackboardReader` or `AllocationReader` |
-| Speak start is channel-controlled | `SpeakRequest` from SpeakGate is the only speech-start protocol; allocation guidance is not parsed by speak |
+| Speak reads only cognition log and scene targets | it receives `CognitionLogReader`, `CognitionLogUpdatedInbox`, and `SceneReader`, not `BlackboardReader` or `AllocationReader` |
+| Speak start is activation-gate-controlled | `ActivationGate<SpeakModule>` votes from SpeakGate decide whether a pending Speak batch activates; allocation guidance is not parsed by speak |
 | Speak still does not route query work | evidence gathering is driven by SpeakGate, query memo logs, and cognition-log updates; speak receives no `QueryMailbox` |
-| Speak interrupts streaming only on `SpeakRequest` | cognition-log updates wake SpeakGate, which may send a replacement `SpeakRequest`; speak does not subscribe to `CognitionLogUpdatedInbox` |
+| Speak does not interrupt active streams on cognition updates | cognition-log updates received during streaming remain queued for the next Speak batch |
 | Cognition-gate is the only non-cognitive promotion path | boot-time wiring grants cognition-gate memo/allocation read paths plus `CognitionWriter`; attention-schema also has `CognitionWriter` but no `Memo` output or non-cognitive promotion role |
 | Cognition-log inboxes filter self writes | `CognitionLogUpdatedInbox` is constructed with the same self-exclusion policy as `MemoUpdatedInbox` |
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |

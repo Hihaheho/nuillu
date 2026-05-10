@@ -1407,7 +1407,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         EvalModule::SpeakGate => registry
             .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_speak::SpeakGateModule::new(
-                    caps.cognition_log_updated_inbox(),
+                    caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.module_status_reader(),
@@ -1415,23 +1415,21 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.self_model_mailbox(),
                     caps.sensory_detail_mailbox(),
                     caps.memo(),
-                    caps.speak_mailbox(),
                     caps.llm_access(),
-                    caps.scene_reader(),
                 )
             })
             .expect("eval module registration should be unique"),
-        // Reactive on SpeakRequest; idle waits on inbox and does not call
-        // the LLM, so the periodic pace mainly governs streaming progress
-        // checks. Match speak-gate so the pair stays in sync.
+        // Reactive on cognition-log updates after speak-gate allows the
+        // activation. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
             .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_speak::SpeakModule::new(
-                    caps.speak_inbox(),
+                    caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
                     caps.memo(),
                     caps.utterance_writer(),
                     caps.llm_access(),
+                    caps.scene_reader(),
                 )
             })
             .expect("eval module registration should be unique"),
@@ -1536,7 +1534,7 @@ fn full_agent_allocation(
                 module.module_id(),
                 0.0,
                 ModelTier::Premium,
-                "Idle until speak-gate publishes a typed SpeakRequest.",
+                "Idle until cognition-log updates are allowed through speak-gate.",
             ),
         }
     }

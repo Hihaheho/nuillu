@@ -652,7 +652,7 @@ mod tests {
         session_history: Vec<String>,
     ) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(1..=1, test_bpm(), linear_ratio_fn, move |caps| {
                 let mut inner = SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.sensory_detail_inbox(),

@@ -349,8 +349,8 @@ by topic:
 - Wake-only topics (`CognitionLogUpdated`, `MemoUpdated`,
   `AllocationUpdated`) may coalesce redundant queued wakes because durable state
   is the source of truth.
-- Work-carrying topics (`QueryRequest`, `SelfModelRequest`, `SpeakRequest`,
-  `SensoryInput`, `SensoryDetailRequest`, `MemoryRequest`) must not silently
+- Work-carrying topics (`QueryRequest`, `SelfModelRequest`, `SensoryInput`,
+  `SensoryDetailRequest`, `MemoryRequest`) must not silently
   drop by default because the payload is the work.
 - If a work-carrying topic is made lossy, that must be explicit per topic, traced
   as a runtime event, and justified by the caller's semantics.

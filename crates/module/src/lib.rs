@@ -21,6 +21,7 @@ pub use nuillu_blackboard::{
     UtteranceProgressState,
 };
 
+mod activation_gate;
 mod allocation_writer;
 mod capabilities;
 mod channels;
@@ -44,6 +45,9 @@ mod utterance;
 #[cfg(test)]
 mod test_support;
 
+pub use activation_gate::{
+    ActivationGate, ActivationGateEvent, ActivationGateRecvError, ActivationGateVote,
+};
 pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
@@ -57,8 +61,7 @@ pub use channels::{
     MemoUpdatedMailbox, MemoryImportance, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox,
     QueryInbox, QueryMailbox, QueryRequest, ReadyItems, SelfModelInbox, SelfModelMailbox,
     SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestInbox, SensoryDetailRequestMailbox,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest,
-    TopicInbox, TopicMailbox, TopicRecvError,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
 pub use llm::LlmAccess;

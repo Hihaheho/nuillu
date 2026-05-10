@@ -10,8 +10,8 @@ pub const TARGET_EVERYONE: &str = "everyone";
 /// A being currently in the agent's scene.
 ///
 /// `name` is the canonical identifier the agent uses to address the participant
-/// in speech (`SpeakRequest.target`, `Utterance.target`). The host (game runtime,
-/// eval harness, etc.) decides naming.
+/// in speech (`Utterance.target`). The host (game runtime, eval harness, etc.)
+/// decides naming.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
     pub name: String,

@@ -415,7 +415,7 @@ mod tests {
 
     async fn build_memory(caps: &CapabilityProviders) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
+            .register(1..=1, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.memory_request_inbox(),
@@ -442,7 +442,7 @@ mod tests {
                 PublisherStub
             })
             .unwrap()
-            .register(0..=0, test_bpm(), linear_ratio_fn, |caps| {
+            .register(1..=1, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.memory_request_inbox(),

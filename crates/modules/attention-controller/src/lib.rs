@@ -27,10 +27,10 @@ flow because each module keeps a minimum replica. Position in the array maps to 
 activation table; positions beyond the table fall to zero, so prioritise tightly. Do not invent
 module ids and do not duplicate ids.
 
-Speech output is driven by a typed SpeakRequest from speak-gate to speak, not by allocation
-priority. Speech is the agent's primary outward action in its world, not a chat-style response
-gated on a user request — keep speak and speak-gate near the top of priority so the agent can
-address peers, answer questions directed at it, and express in-world intent. Dropping speak or
+Speech output is driven by cognition-log updates that pass speak-gate's activation gate, not by
+allocation priority. Speech is the agent's primary outward action in its world, not a chat-style
+response gated on a user request — keep speak and speak-gate near the top of priority so the agent
+can address peers, answer questions directed at it, and express in-world intent. Dropping speak or
 speak-gate from the priority list is suppressing the agent's voice.
 
 The memo field is a free-form controller note; preserve the reasoning needed by other modules but

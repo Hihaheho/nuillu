@@ -1,4 +1,5 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -86,16 +87,34 @@ pub trait Module {
 }
 
 pub struct ModuleBatch {
-    inner: Box<dyn Any>,
+    inner: Rc<dyn Any>,
 }
 
 impl ModuleBatch {
-    fn new(inner: Box<dyn Any>) -> Self {
-        Self { inner }
+    pub(crate) fn new<T: 'static>(inner: T) -> Self {
+        Self {
+            inner: Rc::new(inner),
+        }
     }
 
-    fn as_any(&self) -> &dyn Any {
+    pub fn type_id(&self) -> TypeId {
+        self.inner.as_ref().type_id()
+    }
+
+    pub fn downcast_rc<T: 'static>(&self) -> Option<Rc<T>> {
+        self.inner.clone().downcast::<T>().ok()
+    }
+
+    pub(crate) fn as_any(&self) -> &dyn Any {
         self.inner.as_ref()
+    }
+}
+
+impl Clone for ModuleBatch {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
     }
 }
 
@@ -111,9 +130,7 @@ where
     M: Module + 'static,
 {
     async fn next_batch(&mut self) -> Result<ModuleBatch> {
-        Module::next_batch(self)
-            .await
-            .map(|batch| ModuleBatch::new(Box::new(batch)))
+        Module::next_batch(self).await.map(ModuleBatch::new)
     }
 
     async fn activate(&mut self, cx: &ActivateCx<'_>, batch: &ModuleBatch) -> Result<()> {

@@ -1,30 +1,32 @@
 use anyhow::Result;
-use nuillu_module::SpeakRequest;
+use nuillu_module::{ActivationGateEvent, CognitionLogUpdated};
 
 use crate::{SpeakGateModule, SpeakModule};
 
 #[derive(Debug)]
-pub struct NextBatch {
-    pub(crate) request: SpeakRequest,
+pub struct SpeakBatch {
+    pub(crate) updates: Vec<CognitionLogUpdated>,
 }
 
 impl SpeakGateModule {
-    pub(crate) async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.cognition_updates.next_item().await?;
-        let _ = self.cognition_updates.take_ready_items()?;
-        Ok(())
+    pub(crate) async fn next_batch(&mut self) -> Result<ActivationGateEvent<SpeakModule>> {
+        Ok(self.activation_gate.next_event().await?)
     }
 }
 
 impl SpeakModule {
-    pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
-        let first = self.requests.next_item().await?;
-        let mut request = first.body;
-        for ready in self.requests.take_ready_items()?.items {
-            request = ready.body;
-        }
+    pub(crate) async fn next_batch(&mut self) -> Result<SpeakBatch> {
+        let first = self.cognition_updates.next_item().await?;
+        let mut updates = vec![first.body];
+        updates.extend(
+            self.cognition_updates
+                .take_ready_items()?
+                .items
+                .into_iter()
+                .map(|envelope| envelope.body),
+        );
 
-        Ok(NextBatch { request })
+        Ok(SpeakBatch { updates })
     }
 }
 
@@ -33,12 +35,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn latest_ready_request_wins() {
-        let mut batch = NextBatch {
-            request: SpeakRequest::new("Koro"),
+    fn speak_batch_keeps_drained_updates() {
+        let batch = SpeakBatch {
+            updates: vec![CognitionLogUpdated::AgenticDeadlockMarker],
         };
-        batch.request = SpeakRequest::new("Pibi");
 
-        assert_eq!(batch.request.target, "Pibi");
+        assert_eq!(
+            batch.updates,
+            vec![CognitionLogUpdated::AgenticDeadlockMarker]
+        );
     }
 }

@@ -122,6 +122,7 @@ pub enum ModuleRunStatus {
     #[default]
     Inactive,
     AwaitingBatch,
+    PendingActivationGate,
     PendingBatch,
     Activating,
     Failed {

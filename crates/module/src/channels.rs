@@ -295,25 +295,6 @@ impl SensoryDetailRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SpeakRequest {
-    pub target: String,
-}
-
-impl SpeakRequest {
-    pub fn new(target: impl Into<String>) -> Self {
-        Self::try_new(target).expect("speak request target must be non-empty")
-    }
-
-    pub fn try_new(target: impl Into<String>) -> Option<Self> {
-        let target = target.into().trim().to_owned();
-        if target.is_empty() {
-            return None;
-        }
-        Some(Self { target })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum MemoryImportance {
     Normal,
@@ -349,8 +330,6 @@ pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
 pub type SelfModelInbox = TopicInbox<SelfModelRequest>;
 pub type SensoryDetailRequestMailbox = TopicMailbox<SensoryDetailRequest>;
 pub type SensoryDetailRequestInbox = TopicInbox<SensoryDetailRequest>;
-pub type SpeakMailbox = TopicMailbox<SpeakRequest>;
-pub type SpeakInbox = TopicInbox<SpeakRequest>;
 pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
 pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
 pub type CognitionLogUpdatedMailbox = TopicMailbox<CognitionLogUpdated>;
@@ -452,22 +431,6 @@ mod tests {
         );
         assert!(query_inbox.take_ready_items().unwrap().items.is_empty());
         assert!(self_inbox.take_ready_items().unwrap().items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn speak_mailbox_delivers_typed_request_to_active_speak() {
-        let caps = test_caps(Blackboard::default());
-        let publisher = scoped(&caps, builtin::speak_gate(), 0).speak_mailbox();
-        let mut speak = scoped(&caps, builtin::speak(), 0).speak_inbox();
-
-        publisher
-            .publish(SpeakRequest::new("Koro"))
-            .await
-            .expect("speak subscriber exists");
-
-        let envelope = speak.next_item().await.expect("speak receives request");
-        assert_eq!(envelope.sender.module, builtin::speak_gate());
-        assert_eq!(envelope.body.target, "Koro");
     }
 
     #[tokio::test]

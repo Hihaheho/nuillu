@@ -14,6 +14,7 @@ use nuillu_types::{
     MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
 };
 
+use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
 use crate::ports::{
     Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
@@ -32,8 +33,7 @@ use crate::{
     Module, ModuleBatch, ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest,
     SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
     SensoryDetailRequestInbox, SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, TimeDivision, TopicInbox,
-    TopicMailbox, TypedMemo, VectorMemorySearcher,
+    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -51,12 +51,12 @@ struct CapabilityProvidersInner {
     query_topic: Topic<QueryRequest>,
     self_model_topic: Topic<SelfModelRequest>,
     sensory_detail_topic: Topic<SensoryDetailRequest>,
-    speak_topic: Topic<SpeakRequest>,
     memory_request_topic: Topic<MemoryRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
+    activation_gates: ActivationGateHub,
     cognition_log_port: Arc<dyn CognitionLogRepository>,
     primary_memory_store: Arc<dyn MemoryStore>,
     memory_replicas: Vec<Arc<dyn MemoryStore>>,
@@ -155,13 +155,6 @@ impl CapabilityProviders {
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
-                speak_topic: Topic::new(
-                    blackboard.clone(),
-                    TopicPolicy::RoleLoadBalanced,
-                    TopicKind::Speak,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
                 memory_request_topic: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::RoleLoadBalanced,
@@ -197,6 +190,7 @@ impl CapabilityProviders {
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
+                activation_gates: ActivationGateHub::new(blackboard.clone()),
                 blackboard,
                 cognition_log_port,
                 primary_memory_store,
@@ -292,6 +286,7 @@ impl CapabilityProviders {
             clock: self.inner.clock.clone(),
             session_compaction_lutum: self.inner.tiers.cheap.clone(),
             runtime_events: self.inner.runtime_events.clone(),
+            activation_gates: self.inner.activation_gates.clone(),
         }
     }
 
@@ -381,6 +376,7 @@ pub struct AgentRuntimeControl {
     clock: Arc<dyn Clock>,
     session_compaction_lutum: Lutum,
     runtime_events: RuntimeEventEmitter,
+    activation_gates: ActivationGateHub,
 }
 
 impl AgentRuntimeControl {
@@ -474,6 +470,14 @@ impl AgentRuntimeControl {
         {
             tracing::trace!("agentic deadlock cognition-log update had no active subscribers");
         }
+    }
+
+    pub async fn activation_gate_requests(
+        &self,
+        target: &ModuleInstanceId,
+        batch: ModuleBatch,
+    ) -> Vec<tokio::sync::oneshot::Receiver<crate::ActivationGateVote>> {
+        self.activation_gates.dispatch(target, batch).await
     }
 }
 
@@ -572,14 +576,6 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn speak_mailbox(&self) -> SpeakMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.speak_topic.clone())
-    }
-
-    pub fn speak_inbox(&self) -> SpeakInbox {
-        TopicInbox::new(self.owner.clone(), self.root.inner.speak_topic.clone())
-    }
-
     pub fn memory_request_mailbox(&self) -> MemoryRequestMailbox {
         TopicMailbox::new(
             self.owner.clone(),
@@ -624,6 +620,13 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.sensory_input_topic.clone(),
         )
+    }
+
+    pub fn activation_gate_for<M: Module + 'static>(&self) -> crate::ActivationGate<M> {
+        self.root
+            .inner
+            .activation_gates
+            .subscribe::<M>(self.owner.clone())
     }
 
     fn claim_memo(&self) {

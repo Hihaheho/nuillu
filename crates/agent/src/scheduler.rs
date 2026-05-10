@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord};
 use nuillu_module::{
-    ActivateCx, AgentRuntimeControl, AllocatedModule, AllocatedModules, ModuleBatch,
-    ModuleRunStatus, ports::Clock,
+    ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
+    ModuleBatch, ModuleRunStatus, ports::Clock,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 use thiserror::Error;
@@ -163,7 +163,9 @@ enum ModuleState {
     PendingBatch {
         module: AllocatedModule,
         batch: ModuleBatch,
+        gate_approved: bool,
     },
+    PendingActivationGate,
     Activating,
 }
 
@@ -183,6 +185,12 @@ enum TaskMessage {
         module: AllocatedModule,
         activation_elapsed: Duration,
         result: Result<(), String>,
+    },
+    ActivationGate {
+        index: usize,
+        module: AllocatedModule,
+        batch: ModuleBatch,
+        outcome: ActivationGateOutcome,
     },
 }
 
@@ -260,32 +268,61 @@ async fn refresh_active_and_schedule(
                     .await;
             }
             ModuleState::PendingBatch { .. } if active[index] => {
-                runtime
-                    .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
-                    .await;
-                let ModuleState::PendingBatch { module, batch } =
-                    std::mem::replace(&mut states[index], ModuleState::Activating)
+                let ModuleState::PendingBatch {
+                    module,
+                    batch,
+                    gate_approved,
+                } = std::mem::replace(&mut states[index], ModuleState::Activating)
                 else {
                     unreachable!("module state changed while scheduling activation");
                 };
-                let catalog = runtime.module_catalog();
-                let identity_memories = runtime.identity_memories().await;
-                spawn_activate(
-                    tasks,
-                    index,
-                    module,
-                    batch,
-                    config,
-                    runtime.clone(),
-                    catalog,
-                    identity_memories,
-                    parent,
-                    subscriber,
-                );
+                if gate_approved {
+                    runtime
+                        .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
+                        .await;
+                    let catalog = runtime.module_catalog();
+                    let identity_memories = runtime.identity_memories().await;
+                    spawn_activate(
+                        tasks,
+                        index,
+                        module,
+                        batch,
+                        config,
+                        runtime.clone(),
+                        catalog,
+                        identity_memories,
+                        parent,
+                        subscriber,
+                    );
+                } else {
+                    let scheduled = spawn_activation_gate_or_activate(
+                        runtime,
+                        tasks,
+                        index,
+                        owners[index].clone(),
+                        module,
+                        batch,
+                        config,
+                        parent,
+                        subscriber,
+                    )
+                    .await;
+                    states[index] = scheduled.module_state();
+                }
             }
             ModuleState::PendingBatch { .. } => {
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
+                    .await;
+            }
+            ModuleState::PendingActivationGate => {
+                let status = if active[index] {
+                    ModuleRunStatus::PendingActivationGate
+                } else {
+                    ModuleRunStatus::Inactive
+                };
+                runtime
+                    .record_module_status(owners[index].clone(), status)
                     .await;
             }
             ModuleState::Activating => {
@@ -329,29 +366,28 @@ async fn handle_task_message(
         } => match result {
             Ok(batch) => {
                 if runtime.is_active(&owners[index]).await {
-                    runtime
-                        .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
-                        .await;
-                    states[index] = ModuleState::Activating;
-                    let catalog = runtime.module_catalog();
-                    let identity_memories = runtime.identity_memories().await;
-                    spawn_activate(
+                    let scheduled = spawn_activation_gate_or_activate(
+                        runtime,
                         tasks,
                         index,
+                        owners[index].clone(),
                         module,
                         batch,
                         config,
-                        runtime.clone(),
-                        catalog,
-                        identity_memories,
                         parent,
                         subscriber,
-                    );
+                    )
+                    .await;
+                    states[index] = scheduled.module_state();
                 } else {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
                         .await;
-                    states[index] = ModuleState::PendingBatch { module, batch };
+                    states[index] = ModuleState::PendingBatch {
+                        module,
+                        batch,
+                        gate_approved: false,
+                    };
                 }
                 Ok(())
             }
@@ -419,6 +455,114 @@ async fn handle_task_message(
                 })
             }
         },
+        TaskMessage::ActivationGate {
+            index,
+            module,
+            batch,
+            outcome,
+        } => {
+            if outcome.allowed() {
+                if runtime.is_active(&owners[index]).await {
+                    runtime
+                        .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
+                        .await;
+                    states[index] = ModuleState::Activating;
+                    let catalog = runtime.module_catalog();
+                    let identity_memories = runtime.identity_memories().await;
+                    spawn_activate(
+                        tasks,
+                        index,
+                        module,
+                        batch,
+                        config,
+                        runtime.clone(),
+                        catalog,
+                        identity_memories,
+                        parent,
+                        subscriber,
+                    );
+                } else {
+                    runtime
+                        .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
+                        .await;
+                    states[index] = ModuleState::PendingBatch {
+                        module,
+                        batch,
+                        gate_approved: true,
+                    };
+                }
+            } else {
+                states[index] = ModuleState::Stored {
+                    module,
+                    next_batch_throttle: None,
+                };
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn spawn_activation_gate_or_activate(
+    runtime: &AgentRuntimeControl,
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    owner: ModuleInstanceId,
+    module: AllocatedModule,
+    batch: ModuleBatch,
+    config: AgentEventLoopConfig,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) -> ActivationScheduling {
+    let gate_requests = runtime
+        .activation_gate_requests(&owner, batch.clone())
+        .await;
+    if gate_requests.is_empty() {
+        runtime
+            .record_module_status(owner, ModuleRunStatus::Activating)
+            .await;
+        let catalog = runtime.module_catalog();
+        let identity_memories = runtime.identity_memories().await;
+        spawn_activate(
+            tasks,
+            index,
+            module,
+            batch,
+            config,
+            runtime.clone(),
+            catalog,
+            identity_memories,
+            parent,
+            subscriber,
+        );
+        ActivationScheduling::Activating
+    } else {
+        runtime
+            .record_module_status(owner, ModuleRunStatus::PendingActivationGate)
+            .await;
+        spawn_activation_gate_wait(
+            tasks,
+            index,
+            module,
+            batch,
+            gate_requests,
+            parent,
+            subscriber,
+        );
+        ActivationScheduling::PendingActivationGate
+    }
+}
+
+enum ActivationScheduling {
+    Activating,
+    PendingActivationGate,
+}
+
+impl ActivationScheduling {
+    fn module_state(self) -> ModuleState {
+        match self {
+            Self::Activating => ModuleState::Activating,
+            Self::PendingActivationGate => ModuleState::PendingActivationGate,
+        }
     }
 }
 
@@ -475,6 +619,30 @@ fn spawn_batch_cooldown(
     ));
 }
 
+fn spawn_activation_gate_wait(
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    module: AllocatedModule,
+    batch: ModuleBatch,
+    requests: Vec<tokio::sync::oneshot::Receiver<ActivationGateVote>>,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) {
+    tasks.push(spawn_local(
+        async move {
+            let outcome = collect_activation_gate_votes(requests).await;
+            TaskMessage::ActivationGate {
+                index,
+                module,
+                batch,
+                outcome,
+            }
+        }
+        .instrument(parent.clone())
+        .with_subscriber(subscriber.clone()),
+    ));
+}
+
 fn spawn_activate(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
@@ -510,6 +678,36 @@ fn spawn_activate(
         .instrument(parent.clone())
         .with_subscriber(subscriber.clone()),
     ));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivationGateOutcome {
+    allow: usize,
+    suppress: usize,
+}
+
+impl ActivationGateOutcome {
+    fn allowed(self) -> bool {
+        if self.allow == 0 && self.suppress == 0 {
+            return true;
+        }
+        self.allow > self.suppress
+    }
+}
+
+async fn collect_activation_gate_votes(
+    requests: Vec<tokio::sync::oneshot::Receiver<ActivationGateVote>>,
+) -> ActivationGateOutcome {
+    let mut allow = 0;
+    let mut suppress = 0;
+    for request in requests {
+        match request.await {
+            Ok(ActivationGateVote::Allow) => allow += 1,
+            Ok(ActivationGateVote::Suppress) => suppress += 1,
+            Err(_) => {}
+        }
+    }
+    ActivationGateOutcome { allow, suppress }
 }
 
 async fn activate_with_retries(
@@ -574,10 +772,11 @@ mod tests {
         ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::{
-        CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionWriter, Memo, Module,
-        ModuleRegistry, QueryInbox, QueryRequest,
+        ActivationGate, ActivationGateEvent, ActivationGateVote, CognitionLogUpdated,
+        CognitionLogUpdatedInbox, CognitionWriter, Memo, Module, ModuleRegistry, QueryInbox,
+        QueryRequest,
     };
-    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ModuleId, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModuleId, builtin};
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
@@ -683,6 +882,90 @@ mod tests {
             Ok(())
         }
     }
+
+    struct GatedEchoModule {
+        query_inbox: QueryInbox,
+        memo: Memo,
+        activations: Rc<Cell<u8>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for GatedEchoModule {
+        type Batch = QueryRequest;
+
+        fn id() -> &'static str {
+            "gated-echo"
+        }
+
+        fn role_description() -> &'static str {
+            "test gated target"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.query_inbox.next_item().await?.body)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.activations
+                .set(self.activations.get().saturating_add(1));
+            self.memo
+                .write(format!("gated echo handled {}", batch.question))
+                .await;
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    macro_rules! activation_gate_stub {
+        ($name:ident, $id:literal) => {
+            struct $name {
+                gate: ActivationGate<GatedEchoModule>,
+                votes: Rc<RefCell<VecDeque<Option<ActivationGateVote>>>>,
+                on_seen: Option<oneshot::Sender<()>>,
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ActivationGateEvent<GatedEchoModule>;
+
+                fn id() -> &'static str {
+                    $id
+                }
+
+                fn role_description() -> &'static str {
+                    "test activation gate"
+                }
+
+                async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+                    Ok(self.gate.next_event().await?)
+                }
+
+                async fn activate(
+                    &mut self,
+                    _cx: &nuillu_module::ActivateCx<'_>,
+                    batch: &Self::Batch,
+                ) -> anyhow::Result<()> {
+                    if let Some(vote) = self.votes.borrow_mut().pop_front().flatten() {
+                        batch.respond(vote);
+                    }
+                    if let Some(done) = self.on_seen.take() {
+                        let _ = done.send(());
+                    }
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    activation_gate_stub!(PrimaryGateStub, "primary-gate");
+    activation_gate_stub!(SecondaryGateStub, "secondary-gate");
 
     struct TimedQueryBatchRecorder {
         query_inbox: QueryInbox,
@@ -1141,6 +1424,215 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    async fn run_gated_echo_case(
+        primary_votes: Vec<Option<ActivationGateVote>>,
+        secondary_votes: Vec<Option<ActivationGateVote>>,
+        expect_target_activation: bool,
+    ) -> (u8, Vec<nuillu_blackboard::MemoLogRecord>) {
+        let target_id = ModuleId::new(GatedEchoModule::id()).unwrap();
+        let primary_id = ModuleId::new(PrimaryGateStub::id()).unwrap();
+        let secondary_id = ModuleId::new(SecondaryGateStub::id()).unwrap();
+        let mut alloc = ResourceAllocation::default();
+        alloc.set(target_id.clone(), ModuleConfig::default());
+        alloc.set_activation(target_id.clone(), ActivationRatio::ONE);
+        if !primary_votes.is_empty() {
+            alloc.set(primary_id.clone(), ModuleConfig::default());
+            alloc.set_activation(primary_id.clone(), ActivationRatio::ONE);
+        }
+        if !secondary_votes.is_empty() {
+            alloc.set(secondary_id.clone(), ModuleConfig::default());
+            alloc.set_activation(secondary_id.clone(), ActivationRatio::ONE);
+        }
+
+        let blackboard = Blackboard::with_allocation(alloc);
+        let caps = test_caps(blackboard.clone());
+        let activations = Rc::new(Cell::new(0_u8));
+        let (target_tx, target_rx) = oneshot::channel();
+        let target_tx = Rc::new(RefCell::new(Some(target_tx)));
+
+        let primary_votes = Rc::new(RefCell::new(VecDeque::from(primary_votes)));
+        let secondary_votes = Rc::new(RefCell::new(VecDeque::from(secondary_votes)));
+        let mut primary_seen_rx = Vec::new();
+        let mut primary_seen_tx = VecDeque::new();
+        for _ in 0..primary_votes.borrow().len() {
+            let (tx, rx) = oneshot::channel();
+            primary_seen_tx.push_back(tx);
+            primary_seen_rx.push(rx);
+        }
+        let mut secondary_seen_rx = Vec::new();
+        let mut secondary_seen_tx = VecDeque::new();
+        for _ in 0..secondary_votes.borrow().len() {
+            let (tx, rx) = oneshot::channel();
+            secondary_seen_tx.push_back(tx);
+            secondary_seen_rx.push(rx);
+        }
+        let primary_seen_tx = Rc::new(RefCell::new(primary_seen_tx));
+        let secondary_seen_tx = Rc::new(RefCell::new(secondary_seen_tx));
+
+        let mut registry = ModuleRegistry::new()
+            .register(
+                1..=1,
+                Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                linear_ratio_fn,
+                {
+                    let activations = Rc::clone(&activations);
+                    let target_tx = Rc::clone(&target_tx);
+                    move |caps| GatedEchoModule {
+                        query_inbox: caps.query_inbox(),
+                        memo: caps.memo(),
+                        activations: Rc::clone(&activations),
+                        on_done: target_tx.borrow_mut().take(),
+                    }
+                },
+            )
+            .unwrap();
+
+        if !primary_votes.borrow().is_empty() {
+            registry = registry
+                .register(
+                    0..=u8::try_from(primary_votes.borrow().len()).unwrap(),
+                    Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                    linear_ratio_fn,
+                    {
+                        let primary_votes = Rc::clone(&primary_votes);
+                        let primary_seen_tx = Rc::clone(&primary_seen_tx);
+                        move |caps| PrimaryGateStub {
+                            gate: caps.activation_gate_for::<GatedEchoModule>(),
+                            votes: Rc::clone(&primary_votes),
+                            on_seen: primary_seen_tx.borrow_mut().pop_front(),
+                        }
+                    },
+                )
+                .unwrap();
+        }
+
+        if !secondary_votes.borrow().is_empty() {
+            registry = registry
+                .register(
+                    0..=u8::try_from(secondary_votes.borrow().len()).unwrap(),
+                    Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                    linear_ratio_fn,
+                    {
+                        let secondary_votes = Rc::clone(&secondary_votes);
+                        let secondary_seen_tx = Rc::clone(&secondary_seen_tx);
+                        move |caps| SecondaryGateStub {
+                            gate: caps.activation_gate_for::<GatedEchoModule>(),
+                            votes: Rc::clone(&secondary_votes),
+                            on_seen: secondary_seen_tx.borrow_mut().pop_front(),
+                        }
+                    },
+                )
+                .unwrap();
+        }
+
+        let modules = registry.build(&caps).await.unwrap();
+        let mailbox = caps.internal_harness_io().query_mailbox();
+
+        super::run(modules, test_config(), async move {
+            mailbox
+                .publish(QueryRequest::new("gated"))
+                .await
+                .expect("query should route to gated echo");
+            if expect_target_activation {
+                let _ = target_rx.await;
+            } else {
+                for rx in primary_seen_rx {
+                    let _ = rx.await;
+                }
+                for rx in secondary_seen_rx {
+                    let _ = rx.await;
+                }
+            }
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler returned err");
+
+        let memos = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        (activations.get(), memos)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_gate_zero_votes_allows_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (activations, memos) = run_gated_echo_case(Vec::new(), Vec::new(), true).await;
+
+                assert_eq!(activations, 1);
+                assert!(
+                    memos
+                        .iter()
+                        .any(|record| record.content == "gated echo handled gated")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_gate_suppresses_single_suppress_vote() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (activations, memos) = run_gated_echo_case(
+                    vec![Some(ActivationGateVote::Suppress)],
+                    Vec::new(),
+                    false,
+                )
+                .await;
+
+                assert_eq!(activations, 0);
+                assert!(
+                    !memos
+                        .iter()
+                        .any(|record| record.content == "gated echo handled gated")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_gate_tie_suppresses_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (activations, _) = run_gated_echo_case(
+                    vec![Some(ActivationGateVote::Allow)],
+                    vec![Some(ActivationGateVote::Suppress)],
+                    false,
+                )
+                .await;
+
+                assert_eq!(activations, 0);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_gate_majority_allow_and_closed_abstain_allow_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (majority_activations, _) = run_gated_echo_case(
+                    vec![
+                        Some(ActivationGateVote::Allow),
+                        Some(ActivationGateVote::Allow),
+                    ],
+                    vec![Some(ActivationGateVote::Suppress)],
+                    true,
+                )
+                .await;
+                assert_eq!(majority_activations, 1);
+
+                let (closed_activations, _) =
+                    run_gated_echo_case(vec![None], Vec::new(), true).await;
+                assert_eq!(closed_activations, 1);
             })
             .await;
     }

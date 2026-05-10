@@ -9,11 +9,11 @@ use lutum::{
     ToolResult, TurnRole,
 };
 use nuillu_module::{
-    BlackboardReader, CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox,
-    LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
-    SceneReader, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
-    SensoryDetailRequestMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress,
-    UtteranceProgressState, UtteranceWriter, push_unread_memo_logs,
+    ActivationGate, ActivationGateEvent, ActivationGateVote, BlackboardReader,
+    CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
+    ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest, SceneReader, SelfModelMailbox,
+    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox, UtteranceProgress,
+    UtteranceWriter, push_unread_memo_logs,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -63,49 +63,23 @@ the source to consult, the concrete question to answer, and the exact fact that 
 in the cognition log before speaking. After publishing an evidence request, wait silently; speak-gate will
 reconsider when a later cognition-log update arrives.
 
-When should_speak=true, provide a speech_target naming the participant the agent is addressing.
-The target is mandatory for every utterance and is constrained to the schema enum: pick the
-participant the agent is addressing (the questioner when answering a question, the peer being
-directly addressed for direct signals); use "self" for self-directed speech/soliloquy; use
-"everyone" for broadcast speech intended for all present participants. Do not invent a name not in
-the enum, and do not append qualifiers (e.g. "(and others)") — the value must be exactly one enum
-string. The speak module reads the cognition log directly, so do not summarize or restate cognition
-facts here — speech content is decided in speak from the cognition log, not in this gate.
-If you cannot choose a target, should_speak must be false and speech_target must be null.
-Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
+When should_speak=true, you are only allowing the pending speak activation to run. Do not choose
+an addressee or summarize speech content here; Speak will choose the target from the cognition log
+after this gate allows activation. Return only raw JSON for the structured decision; do not wrap it
+in Markdown or code fences."#;
 
 const READINESS_GATE_SELF_MODEL_TOOL_PROMPT: &str =
     "- query_self_model(question) for current first-person model facts.\n";
 
-const INTERRUPTION_GATE_PROMPT: &str = r#"You are the speak-gate module.
-Speak is currently streaming a user-visible utterance. Decide whether the current stream must be
-cancelled and replaced by publishing a new typed SpeakRequest. You may read the current cognitive
-cognition-log set, blackboard memos, memory metadata, scheduler-owned module status, and
-utterance progress. You may call evidence tools during this decision turn. You must not write
-cognition log, emit utterances, or change allocation.
-The persistent conversation history contains user messages named new_cognition_log_item; those
-messages are the cognition-log history.
-
-Use an interruption gate:
-- Compare the new cognition log with the partial utterance.
-- Set should_speak=true only if the new cognition-log input changes the required answer, addressee, safety,
-  or grounding materially.
-- Keep should_speak=false for minor updates, redundant evidence, or cognition-log input that can wait until
-  the current utterance completes.
-- If interruption would require a missing fact, set should_speak=false and include evidence_gaps
-  naming the source, concrete question, and exact fact that must become visible in the cognition log.
-
-When should_speak=true, provide a speech_target naming the participant the agent is addressing.
-The target is constrained to the schema enum (participant names, "self", or "everyone"); preserve
-the same target as the current utterance unless the new cognition-log input materially changes who
-must be addressed. The speak module reads the cognition log directly, so do not summarize or
-restate cognition facts here — replacement speech content is decided in speak from the updated
-cognition log, not in this gate. If you cannot choose a target, should_speak must be false and
-speech_target must be null. Return only raw JSON for the structured decision; do not wrap it in
-Markdown or code fences."#;
+const TARGET_SELECTION_PROMPT: &str = r#"You are the speak module target selector.
+Choose exactly one addressee for the pending utterance from the current cognition-log set. The
+target is constrained to the schema enum: pick the participant the agent is addressing; use "self"
+for self-directed speech/soliloquy; use "everyone" for broadcast speech intended for all present
+participants. Do not invent a name not in the enum, and do not append qualifiers. Return only raw
+JSON for the structured decision; do not wrap it in Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
-Generate a concise user-visible utterance addressed to the SpeakRequest target from the current
+Generate a concise user-visible utterance addressed to the selected target from the current
 cognition-log set. You cannot inspect blackboard memos or allocation guidance. Use only the
 provided cognition context and target.
 
@@ -125,7 +99,7 @@ repeat, rewrite, or replace the already emitted partial text. Do not mention hid
 unavailable module results."#;
 
 tokio::task_local! {
-    /// JSON Schema for `SpeakGateDecision.speech_target` derived from the live `SceneReader`.
+    /// JSON Schema for `SpeakTargetDecision.target` derived from the live `SceneReader`.
     /// `.scope`d around each `structured_turn` so the LLM sees an enum of
     /// `[self, everyone, ...participants]`.
     static SPEECH_TARGET_SCHEMA: Schema;
@@ -140,14 +114,18 @@ fn fallback_speech_target_schema() -> Schema {
 struct SpeakGateDecision {
     should_speak: bool,
     rationale: String,
-    speech_target: Option<SpeechTarget>,
     #[serde(default)]
     evidence_gaps: Vec<EvidenceGap>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct SpeakTargetDecision {
+    target: SpeechTarget,
+}
+
 /// Wire-format string with a JSON Schema dynamically constrained to the
 /// current scene's targets. Stored as `String` so existing serialization,
-/// downstream `SpeakRequest.target`, and `Utterance.target` are unchanged.
+/// downstream `Utterance.target` are unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 struct SpeechTarget(String);
@@ -256,7 +234,7 @@ const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
 const COMPACTED_SPEAK_GATE_SESSION_PREFIX: &str = "Compacted speak-gate session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the speak-gate module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve information that future speak-gate
-decisions need: cognition-log facts, prior gate decisions, speech plans, evidence requests, evidence
+decisions need: cognition-log facts, prior allow/suppress decisions, evidence requests, evidence
 gaps, and tool results. Do not invent facts. Keep the summary concise, explicit, and faithful.
 Return plain text only."#;
 
@@ -279,25 +257,12 @@ fn speak_owner() -> ModuleInstanceId {
     ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO)
 }
 
-fn is_speak_streaming(status: &ModuleRunStatus, progress: Option<&UtteranceProgress>) -> bool {
-    matches!(status, ModuleRunStatus::Activating)
-        && matches!(
-            progress.map(|progress| progress.state),
-            Some(UtteranceProgressState::Streaming)
-        )
-}
-
 fn gate_prompt_for<'a>(
     readiness: &'a str,
-    interruption: &'a str,
-    status: &ModuleRunStatus,
-    progress: Option<&UtteranceProgress>,
+    _status: &ModuleRunStatus,
+    _progress: Option<&UtteranceProgress>,
 ) -> &'a str {
-    if is_speak_streaming(status, progress) {
-        interruption
-    } else {
-        readiness
-    }
+    readiness
 }
 
 fn has_registered_module(modules: &[(ModuleId, &'static str)], module: &ModuleId) -> bool {
@@ -321,7 +286,6 @@ fn apply_requested_evidence_guard(
     let sources = sources.join(", ");
     let original_rationale = decision.rationale.trim();
     decision.should_speak = false;
-    decision.speech_target = None;
     decision.rationale = if original_rationale.is_empty() {
         format!("Waiting after requesting evidence from {sources}.")
     } else {
@@ -542,7 +506,7 @@ fn render_session_items_for_compaction(items: &[ModelInputItem]) -> serde_json::
 
 pub struct SpeakGateModule {
     owner: nuillu_types::ModuleId,
-    cognition_updates: CognitionLogUpdatedInbox,
+    activation_gate: ActivationGate<SpeakModule>,
     cognition_log: CognitionLogReader,
     blackboard: BlackboardReader,
     module_status: ModuleStatusReader,
@@ -550,19 +514,16 @@ pub struct SpeakGateModule {
     self_model: SelfModelMailbox,
     sensory_detail: SensoryDetailRequestMailbox,
     memo: Memo,
-    speak: SpeakMailbox,
     llm: LlmAccess,
-    scene: SceneReader,
     session: Session,
     session_compaction: SpeakGateSessionCompactionConfig,
     readiness_prompt: std::sync::OnceLock<String>,
-    interruption_prompt: std::sync::OnceLock<String>,
 }
 
 impl SpeakGateModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cognition_updates: CognitionLogUpdatedInbox,
+        activation_gate: ActivationGate<SpeakModule>,
         cognition_log: CognitionLogReader,
         blackboard: BlackboardReader,
         module_status: ModuleStatusReader,
@@ -570,14 +531,12 @@ impl SpeakGateModule {
         self_model: SelfModelMailbox,
         sensory_detail: SensoryDetailRequestMailbox,
         memo: Memo,
-        speak: SpeakMailbox,
         llm: LlmAccess,
-        scene: SceneReader,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("speak-gate id is valid"),
-            cognition_updates,
+            activation_gate,
             cognition_log,
             blackboard,
             module_status,
@@ -585,13 +544,10 @@ impl SpeakGateModule {
             self_model,
             sensory_detail,
             memo,
-            speak,
             llm,
-            scene,
             session: Session::new(),
             session_compaction: SpeakGateSessionCompactionConfig::default(),
             readiness_prompt: std::sync::OnceLock::new(),
-            interruption_prompt: std::sync::OnceLock::new(),
         }
     }
 
@@ -614,20 +570,12 @@ impl SpeakGateModule {
         })
     }
 
-    fn interruption_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.interruption_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                INTERRUPTION_GATE_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
-        })
-    }
-
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        event: &ActivationGateEvent<SpeakModule>,
+    ) -> Result<()> {
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_cognition = self.cognition_log.unread_events().await;
         push_cognition_history(&mut self.session, &unread_cognition);
@@ -653,7 +601,6 @@ impl SpeakGateModule {
             .await;
         let gate_prompt = gate_prompt_for(
             self.readiness_prompt(cx),
-            self.interruption_prompt(cx),
             &speak_status,
             utterance_progress.as_ref(),
         )
@@ -670,21 +617,12 @@ impl SpeakGateModule {
         );
 
         let lutum = self.llm.lutum().await;
-        let target_schema = self.scene.target_schema();
-        let decision = SPEECH_TARGET_SCHEMA
-            .scope(
-                target_schema,
-                self.run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available),
-            )
+        let decision = self
+            .run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available)
             .await?;
 
         self.memo.write(render_speak_gate_memo(&decision)).await;
-
-        if let Some(request) = speak_request_from_decision(&decision)
-            && self.speak.publish(request).await.is_err()
-        {
-            tracing::trace!("speak request had no active subscribers");
-        }
+        event.respond(gate_vote_from_decision(&decision));
         Ok(())
     }
 
@@ -900,12 +838,12 @@ impl SpeakGateModule {
     }
 }
 
-fn speak_request_from_decision(decision: &SpeakGateDecision) -> Option<SpeakRequest> {
-    if !decision.should_speak {
-        return None;
+fn gate_vote_from_decision(decision: &SpeakGateDecision) -> ActivationGateVote {
+    if decision.should_speak {
+        ActivationGateVote::Allow
+    } else {
+        ActivationGateVote::Suppress
     }
-    let target = decision.speech_target.as_ref()?;
-    SpeakRequest::try_new(target.0.as_str())
 }
 
 fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
@@ -918,12 +856,6 @@ fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
         },
         decision.rationale.trim(),
     );
-    if let Some(target) = &decision.speech_target {
-        memo.push_str("\nSpeech target: ");
-        memo.push_str(target.0.trim());
-    } else {
-        memo.push_str("\nSpeech target: none");
-    }
     if decision.evidence_gaps.is_empty() {
         memo.push_str("\nEvidence gaps: none");
     } else {
@@ -960,12 +892,12 @@ struct GenerationDraft {
 }
 
 impl GenerationDraft {
-    fn new(generation_id: u64, request: SpeakRequest) -> GenerationDraft {
+    fn new(generation_id: u64, target: impl Into<String>) -> GenerationDraft {
         GenerationDraft {
             generation_id,
             sequence: 0,
             accumulated: String::new(),
-            target: request.target,
+            target: target.into(),
         }
     }
 
@@ -991,7 +923,7 @@ fn generation_input(
 ) -> serde_json::Value {
     serde_json::json!({
         "cognition_logs": cognition_log_json,
-        "speak_request": {
+        "speech_target": {
             "target": draft.target.as_str(),
         },
     })
@@ -1013,36 +945,52 @@ fn push_generation_context(
 enum GenerationStreamOutcome {
     Completed,
     Retry,
-    Replaced(SpeakRequest),
 }
 
 pub struct SpeakModule {
     owner: nuillu_types::ModuleId,
-    requests: SpeakInbox,
+    cognition_updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
     memo: Memo,
     utterance: UtteranceWriter,
     llm: LlmAccess,
+    scene: SceneReader,
+    target_prompt: std::sync::OnceLock<String>,
     generation_prompt: std::sync::OnceLock<String>,
 }
 
 impl SpeakModule {
     pub fn new(
-        requests: SpeakInbox,
+        cognition_updates: CognitionLogUpdatedInbox,
         cognition_log: CognitionLogReader,
         memo: Memo,
         utterance: UtteranceWriter,
         llm: LlmAccess,
+        scene: SceneReader,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("speak id is valid"),
-            requests,
+            cognition_updates,
             cognition_log,
             memo,
             utterance,
             llm,
+            scene,
+            target_prompt: std::sync::OnceLock::new(),
             generation_prompt: std::sync::OnceLock::new(),
         }
+    }
+
+    fn target_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.target_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(
+                TARGET_SELECTION_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+                cx.now(),
+            )
+        })
     }
 
     fn generation_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -1061,11 +1009,12 @@ impl SpeakModule {
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        request: SpeakRequest,
+        batch: &batch::SpeakBatch,
     ) -> Result<()> {
+        let _update_count = batch.updates.len();
         let mut cognition_log_json = self.cognition_log.snapshot().await.compact_json();
-
-        let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), request);
+        let target = self.select_target(cx, &cognition_log_json).await?;
+        let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), target);
 
         loop {
             self.record_streaming_progress(&draft).await;
@@ -1077,12 +1026,44 @@ impl SpeakModule {
                 GenerationStreamOutcome::Retry => {
                     cognition_log_json = self.cognition_log.snapshot().await.compact_json();
                 }
-                GenerationStreamOutcome::Replaced(request) => {
-                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
-                    draft = GenerationDraft::new(self.utterance.next_generation_id(), request);
-                }
             }
         }
+    }
+
+    async fn select_target(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        cognition_log_json: &serde_json::Value,
+    ) -> Result<String> {
+        let mut session = Session::new();
+        session.push_system(self.target_prompt(cx));
+        session.push_user(
+            serde_json::json!({
+                "cognition_logs": cognition_log_json,
+            })
+            .to_string(),
+        );
+
+        let lutum = self.llm.lutum().await;
+        let target_schema = self.scene.target_schema();
+        let decision = SPEECH_TARGET_SCHEMA
+            .scope(target_schema, async {
+                let result = session
+                    .structured_turn::<SpeakTargetDecision>(&lutum)
+                    .collect()
+                    .await
+                    .context("speak target selection turn failed")?;
+                let StructuredTurnOutcome::Structured(decision) = result.semantic else {
+                    anyhow::bail!("speak target selection turn refused");
+                };
+                Ok::<_, anyhow::Error>(decision)
+            })
+            .await?;
+        let target = decision.target.0.trim().to_owned();
+        if target.is_empty() {
+            anyhow::bail!("speak target selection produced an empty target");
+        }
+        Ok(target)
     }
 
     async fn stream_generation(
@@ -1145,14 +1126,6 @@ impl SpeakModule {
                         Some(Err(error)) => return Err(error).context("speak generation stream event failed"),
                     }
                 }
-                request = self.requests.next_item() => {
-                    let envelope = request?;
-                    let mut replacement = envelope.body;
-                    for ready in self.requests.take_ready_items()?.items {
-                        replacement = ready.body;
-                    }
-                    return Ok(GenerationStreamOutcome::Replaced(replacement));
-                }
             }
         }
     }
@@ -1171,14 +1144,14 @@ impl SpeakModule {
 
 #[async_trait(?Send)]
 impl Module for SpeakGateModule {
-    type Batch = ();
+    type Batch = ActivationGateEvent<SpeakModule>;
 
     fn id() -> &'static str {
         "speak-gate"
     }
 
     fn role_description() -> &'static str {
-        "Decides when the agent should speak from cognition-log evidence. If needed query, sensory-detail, or self-model results have not been promoted by cognition-gate, speaking becomes a guess; request evidence or wait. Sends SpeakRequest to speak when ready; otherwise records waiting/evidence-gap notes in its memo."
+        "Decides whether pending speak activations may run from cognition-log evidence. If needed query, sensory-detail, or self-model results have not been promoted by cognition-gate, speaking becomes a guess; request evidence or suppress. Records waiting/evidence-gap notes in its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1188,22 +1161,22 @@ impl Module for SpeakGateModule {
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        _batch: &Self::Batch,
+        batch: &Self::Batch,
     ) -> Result<()> {
-        SpeakGateModule::activate(self, cx).await
+        SpeakGateModule::activate(self, cx, batch).await
     }
 }
 
 #[async_trait(?Send)]
 impl Module for SpeakModule {
-    type Batch = batch::NextBatch;
+    type Batch = batch::SpeakBatch;
 
     fn id() -> &'static str {
         "speak"
     }
 
     fn role_description() -> &'static str {
-        "Emits the agent's spoken utterances into its world from typed SpeakRequest only. It cannot inspect memo logs or query results directly, so missing evidence not promoted to cognition before speak-gate plans the request will lead to guessed speech."
+        "Emits the agent's spoken utterances into its world after cognition-log updates pass activation gates. It cannot inspect memo logs or query results directly, so missing evidence not promoted to cognition before speak-gate allows activation will lead to guessed speech."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1215,7 +1188,7 @@ impl Module for SpeakModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        SpeakModule::activate(self, cx, batch.request.clone()).await
+        SpeakModule::activate(self, cx, batch).await
     }
 }
 
@@ -1235,12 +1208,12 @@ mod tests {
         ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{
-        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
-        NoopUtteranceSink, SystemClock,
+        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, PortError,
+        SystemClock, Utterance, UtteranceSink,
     };
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry, QueryInbox,
-        SelfModelInbox, SensoryDetailRequestInbox,
+        CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
+        ModuleRegistry, Participant, QueryInbox, SelfModelInbox, SensoryDetailRequestInbox,
     };
 
     use super::*;
@@ -1253,6 +1226,18 @@ mod tests {
         blackboard: Blackboard,
         adapter: MockLlmAdapter,
     ) -> CapabilityProviders {
+        test_caps_with_adapter_and_sink(
+            blackboard,
+            adapter,
+            Arc::new(nuillu_module::ports::NoopUtteranceSink),
+        )
+    }
+
+    fn test_caps_with_adapter_and_sink(
+        blackboard: Blackboard,
+        adapter: MockLlmAdapter,
+        utterance_sink: Arc<dyn UtteranceSink>,
+    ) -> CapabilityProviders {
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
@@ -1262,7 +1247,7 @@ mod tests {
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
-            utterance_sink: Arc::new(NoopUtteranceSink),
+            utterance_sink,
             clock: Arc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
@@ -1285,6 +1270,24 @@ mod tests {
             allocation.set_activation(module, ActivationRatio::ONE);
         }
         allocation
+    }
+
+    struct CapturingUtteranceSink {
+        completed: Rc<RefCell<Vec<(String, String)>>>,
+        done: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl UtteranceSink for CapturingUtteranceSink {
+        async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
+            self.completed
+                .borrow_mut()
+                .push((utterance.target, utterance.text));
+            if let Some(done) = self.done.borrow_mut().take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
     }
 
     fn test_bpm() -> std::ops::RangeInclusive<nuillu_blackboard::Bpm> {
@@ -1323,6 +1326,7 @@ mod tests {
     }
 
     noop_stub!(SpeakGateStub, "speak-gate");
+    noop_stub!(SpeakStub, "speak");
     noop_stub!(QueryVectorStub, "query-vector");
     noop_stub!(SelfModelStub, "self-model");
     noop_stub!(SensoryStub, "sensory");
@@ -1356,7 +1360,7 @@ mod tests {
         let _modules = ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *gate_sink.borrow_mut() = Some(SpeakGateModule::new(
-                    caps.cognition_log_updated_inbox(),
+                    caps.activation_gate_for::<SpeakModule>(),
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.module_status_reader(),
@@ -1364,9 +1368,7 @@ mod tests {
                     caps.self_model_mailbox(),
                     caps.sensory_detail_mailbox(),
                     caps.memo(),
-                    caps.speak_mailbox(),
                     caps.llm_access(),
-                    caps.scene_reader(),
                 ));
                 SpeakGateStub
             })
@@ -1416,7 +1418,6 @@ mod tests {
                 json_delta: serde_json::json!({
                     "should_speak": false,
                     "rationale": rationale,
-                    "speech_target": null,
                     "evidence_gaps": [],
                 })
                 .to_string(),
@@ -1425,6 +1426,41 @@ mod tests {
                 request_id: Some("gate-finished".into()),
                 finish_reason: FinishReason::Stop,
                 usage: structured_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn target_decision_scenario(target: &str) -> MockStructuredScenario {
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("target".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk {
+                json_delta: serde_json::json!({
+                    "target": target,
+                })
+                .to_string(),
+            }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("target".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn generation_text_scenario(text: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("speak-text".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("speak-text".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
             }),
         ])
     }
@@ -1598,7 +1634,7 @@ mod tests {
 
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
-        let draft = GenerationDraft::new(7, SpeakRequest::new("Koro"));
+        let draft = GenerationDraft::new(7, "Koro");
         let mut session = test_session();
 
         push_generation_context(
@@ -1630,53 +1666,91 @@ mod tests {
             panic!("expected one text content item");
         };
         let json: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(json["speak_request"]["target"], "Koro");
-        assert!(json["speak_request"].get("generation_hint").is_none());
-        assert!(json["speak_request"].get("rationale").is_none());
+        assert_eq!(json["speech_target"]["target"], "Koro");
         assert!(json.get("allocation").is_none());
         assert!(json.get("partial_utterance").is_none());
     }
 
-    #[test]
-    fn gate_prompt_switches_only_for_active_streaming_speak() {
-        let progress = UtteranceProgress::streaming(3, 2, "Koro", "Koro, wait");
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_selects_target_from_cognition_log_before_streaming() {
+        let adapter = MockLlmAdapter::new()
+            .with_structured_scenario(target_decision_scenario("Koro"))
+            .with_text_scenario(generation_text_scenario("Koro, stay close."));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let sink = Arc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(Some(done_tx)),
+        });
+        let caps = test_caps_with_adapter_and_sink(blackboard.clone(), adapter, sink);
+        caps.scene().set([Participant::new("Koro")]);
+        let module_cell = Rc::new(RefCell::new(None));
+        let module_sink = Rc::clone(&module_cell);
 
-        assert!(
-            gate_prompt_for(
-                READINESS_GATE_PROMPT,
-                INTERRUPTION_GATE_PROMPT,
-                &ModuleRunStatus::Inactive,
-                None,
-            )
-            .contains("not currently streaming")
+        let _modules = ModuleRegistry::new()
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+                *module_sink.borrow_mut() = Some(SpeakModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.utterance_writer(),
+                    caps.llm_access(),
+                    caps.scene_reader(),
+                ));
+                SpeakStub
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+        let mut module = module_cell.borrow_mut().take().unwrap();
+        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: source.clone(),
+                entry: CognitionLogEntry {
+                    at: SystemClock.now(),
+                    text: "Koro asks Nuillu to help them stay safe.".into(),
+                },
+            })
+            .await;
+        caps.internal_harness_io()
+            .cognition_log_updated_mailbox()
+            .publish(CognitionLogUpdated::EntryAppended { source })
+            .await
+            .unwrap();
+
+        let batch = module.next_batch().await.unwrap();
+        let catalog = Vec::new();
+        let identity_memories = Vec::new();
+        let compaction_lutum = module.llm.lutum().await;
+        let clock = SystemClock;
+        let cx = nuillu_module::ActivateCx::new(
+            &catalog,
+            &identity_memories,
+            &compaction_lutum,
+            clock.now(),
         );
-        assert!(
-            gate_prompt_for(
-                READINESS_GATE_PROMPT,
-                INTERRUPTION_GATE_PROMPT,
-                &ModuleRunStatus::Activating,
-                Some(&progress),
-            )
-            .contains("currently streaming")
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+        let _ = done_rx.await;
+
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[("Koro".to_string(), "Koro, stay close.".to_string())]
         );
-        assert!(
-            gate_prompt_for(
-                READINESS_GATE_PROMPT,
-                INTERRUPTION_GATE_PROMPT,
-                &ModuleRunStatus::AwaitingBatch,
-                Some(&progress),
-            )
-            .contains("not currently streaming")
-        );
-        assert!(
-            gate_prompt_for(
-                READINESS_GATE_PROMPT,
-                INTERRUPTION_GATE_PROMPT,
-                &ModuleRunStatus::Activating,
-                None,
-            )
-            .contains("not currently streaming")
-        );
+        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        let progress = blackboard
+            .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
+            .await
+            .unwrap();
+        assert_eq!(progress.target, "Koro");
+        assert_eq!(progress.partial_utterance, "Koro, stay close.");
     }
 
     #[test]
@@ -1731,14 +1805,12 @@ mod tests {
         let decision = SpeakGateDecision {
             should_speak: true,
             rationale: "tool request is enough".into(),
-            speech_target: Some("Pibi".into()),
             evidence_gaps: Vec::new(),
         };
 
         let guarded = apply_requested_evidence_guard(decision, &[EvidenceGapSource::Memory]);
 
         assert!(!guarded.should_speak);
-        assert!(guarded.speech_target.is_none());
         assert!(
             guarded
                 .rationale
@@ -1829,7 +1901,7 @@ mod tests {
 
     #[test]
     fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
-        let mut draft = GenerationDraft::new(11, SpeakRequest::new("Koro"));
+        let mut draft = GenerationDraft::new(11, "Koro");
         let mut session = test_session();
 
         assert_eq!(draft.push_delta("hello "), 0);
@@ -1871,7 +1943,6 @@ mod tests {
         let decision = SpeakGateDecision {
             should_speak: false,
             rationale: "missing body fact".into(),
-            speech_target: None,
             evidence_gaps: vec![EvidenceGap {
                 source: EvidenceGapSource::Memory,
                 question: "What body should I report?".into(),
@@ -1883,7 +1954,6 @@ mod tests {
 
         assert!(memo.contains("Speak decision: wait silently"));
         assert!(memo.contains("Rationale: missing body fact"));
-        assert!(memo.contains("Speech target: none"));
         assert!(memo.contains(
             "Source: memory; question: What body should I report?; needed fact: frog body"
         ));
@@ -1891,28 +1961,23 @@ mod tests {
     }
 
     #[test]
-    fn speak_request_from_decision_requires_target() {
+    fn gate_vote_from_decision_allows_only_speak_decisions() {
         let valid = SpeakGateDecision {
             should_speak: true,
             rationale: "ready".into(),
-            speech_target: Some(" Koro ".into()),
             evidence_gaps: Vec::new(),
         };
 
-        let request = speak_request_from_decision(&valid).unwrap();
-        assert_eq!(request.target, "Koro");
-
-        let empty_target = SpeakGateDecision {
-            speech_target: Some(" ".into()),
-            ..valid.clone()
-        };
-        assert!(speak_request_from_decision(&empty_target).is_none());
+        assert_eq!(gate_vote_from_decision(&valid), ActivationGateVote::Allow);
 
         let waiting = SpeakGateDecision {
             should_speak: false,
             ..valid
         };
-        assert!(speak_request_from_decision(&waiting).is_none());
+        assert_eq!(
+            gate_vote_from_decision(&waiting),
+            ActivationGateVote::Suppress
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
