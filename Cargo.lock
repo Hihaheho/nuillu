@@ -1695,7 +1695,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "lutum"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1711,7 +1711,7 @@ dependencies = [
 [[package]]
 name = "lutum-eval"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "async-trait",
  "lutum",
@@ -1751,7 +1751,7 @@ dependencies = [
 [[package]]
 name = "lutum-macros"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -1773,7 +1773,7 @@ dependencies = [
 [[package]]
 name = "lutum-openai"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1795,7 +1795,7 @@ dependencies = [
 [[package]]
 name = "lutum-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "async-trait",
  "bon",
@@ -1811,7 +1811,7 @@ dependencies = [
 [[package]]
 name = "lutum-trace"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#aa171e34232ae7c8cfcda99c1bfc4da1eacd2fcb"
+source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
 dependencies = [
  "lutum-protocol",
  "serde_json",
@@ -2195,6 +2195,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "lutum",
  "lutum-protocol",
  "nuillu-blackboard",

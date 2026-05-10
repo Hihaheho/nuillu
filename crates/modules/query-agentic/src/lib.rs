@@ -218,6 +218,19 @@ impl QueryAgenticModule {
                     .await;
                     return Ok(all_hits);
                 }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(all_hits);
+                }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let input_tokens = round.usage.input_tokens;
                     let mut tool_results: Vec<ToolResult> = Vec::new();

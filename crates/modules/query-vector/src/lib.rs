@@ -279,6 +279,19 @@ impl QueryVectorModule {
                 .await;
                 Ok(QueryVectorRetrieval::default())
             }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                compact_session_if_needed(
+                    &mut self.session,
+                    result.usage.input_tokens,
+                    cx.session_compaction_lutum(),
+                    self.session_compaction,
+                    Self::id(),
+                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
+                Ok(QueryVectorRetrieval::default())
+            }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let input_tokens = round.usage.input_tokens;
                 if round.tool_calls.is_empty() {

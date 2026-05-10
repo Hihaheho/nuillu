@@ -132,6 +132,7 @@ impl MemoryCompactionModule {
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(_) => return Ok(()),
+                TextStepOutcomeWithTools::FinishedNoOutput(_) => return Ok(()),
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let mut results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {

@@ -161,6 +161,19 @@ impl MemoryModule {
                     .await;
                     return Ok(());
                 }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_MEMORY_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let input_tokens = round.usage.input_tokens;
                     let mut results: Vec<ToolResult> = Vec::new();
