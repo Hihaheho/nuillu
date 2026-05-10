@@ -291,7 +291,7 @@ impl Module for QueryVectorModule {
     }
 
     fn role_description() -> &'static str {
-        "Recalls stored memories by semantic similarity: surfaces relevant past memory content into its memo on QueryRequest or cognition-log updates; never synthesizes answers."
+        "Recalls stored memories by semantic similarity: writes relevant memory evidence to its memo log on QueryRequest or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

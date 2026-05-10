@@ -15,7 +15,8 @@
 //!   modules don't pick tiers themselves.
 
 pub use nuillu_blackboard::{
-    CognitionLogEntryRecord, ModuleRunStatus, UtteranceProgress, UtteranceProgressState,
+    CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord, UtteranceProgress,
+    UtteranceProgressState,
 };
 
 mod allocation_writer;

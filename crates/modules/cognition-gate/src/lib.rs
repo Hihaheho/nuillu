@@ -406,7 +406,7 @@ impl Module for CognitionGateModule {
     }
 
     fn role_description() -> &'static str {
-        "Filters blackboard memos into the cognition log: appends cognitively relevant, novel, changed, or controller-requested events when promotion is warranted."
+        "Promotes durable module memo-log evidence into the cognition log: appends concise, relevant, novel, changed, or controller-requested facts so downstream modules can act on them."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

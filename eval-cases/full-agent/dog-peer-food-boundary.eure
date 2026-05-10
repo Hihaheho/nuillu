@@ -40,7 +40,7 @@ participants = ["Pibi", "Koro"]
 @ inputs[] {
   $variant: heard
   direction = "Pibi"
-  content = "Pibi asks, \"Koro is growling at his food bowl. What should I do?\""
+  content = "Pibi asks, \"Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?\""
 }
 
 @ checks[] {

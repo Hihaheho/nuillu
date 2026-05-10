@@ -303,7 +303,7 @@ impl Module for QueryAgenticModule {
     }
 
     fn role_description() -> &'static str {
-        "Read-only file-search retrieval: surfaces snippets from project files into its memo on QueryRequest or allocation cues; never synthesizes answers."
+        "Read-only file-search retrieval: writes relevant file snippets to its memo log on QueryRequest or allocation cues; cognition-gate must promote useful snippets before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

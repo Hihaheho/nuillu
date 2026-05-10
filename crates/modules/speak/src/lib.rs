@@ -33,6 +33,9 @@ messages are the cognition-log history.
 Speak is not currently streaming. Use a strict readiness gate before setting should_speak=true:
 - The cognition log must contain the facts needed for the utterance, not only raw sensory
   observations, open questions, predictions, or instructions for another module.
+- query-vector/query-agentic retrieve evidence into memo logs; self-model writes self evidence
+  into memo logs; cognition-gate promotes relevant memo-log facts into the cognition log.
+  speak-gate and speak will guess if needed query results have not reached cognition.
 - If the current topic asks for stored memory, a self/peer/world model, file evidence, or a rule,
   do not let speak use memo-only facts directly. If a memo contains the needed fact but the
   cognition log does not, request cognition-promotion.
@@ -189,6 +192,18 @@ enum EvidenceGapSource {
     CognitionPromotion,
 }
 
+impl EvidenceGapSource {
+    fn as_request_source_text(self) -> &'static str {
+        match self {
+            EvidenceGapSource::Memory => "memory",
+            EvidenceGapSource::File => "file",
+            EvidenceGapSource::SelfModel => "self-model",
+            EvidenceGapSource::SensoryDetail => "sensory detail",
+            EvidenceGapSource::CognitionPromotion => "cognition promotion",
+        }
+    }
+}
+
 #[lutum::tool_input(name = "query_memory", output = QueryMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct QueryMemoryArgs {
@@ -284,6 +299,41 @@ fn gate_prompt_for<'a>(
 
 fn has_registered_module(modules: &[(ModuleId, &'static str)], module: &ModuleId) -> bool {
     modules.iter().any(|(id, _)| id == module)
+}
+
+fn apply_requested_evidence_guard(
+    mut decision: SpeakGateDecision,
+    requested_sources: &[EvidenceGapSource],
+) -> SpeakGateDecision {
+    if !decision.should_speak || requested_sources.is_empty() {
+        return decision;
+    }
+
+    let mut sources = requested_sources
+        .iter()
+        .map(|source| source.as_request_source_text())
+        .collect::<Vec<_>>();
+    sources.sort_unstable();
+    sources.dedup();
+    let sources = sources.join(", ");
+    let original_rationale = decision.rationale.trim();
+    decision.should_speak = false;
+    decision.speech_plan = None;
+    decision.rationale = if original_rationale.is_empty() {
+        format!("Waiting after requesting evidence from {sources}.")
+    } else {
+        format!(
+            "Waiting after requesting evidence from {sources}. Original speak decision: {original_rationale}"
+        )
+    };
+    decision.evidence_gaps.push(EvidenceGap {
+        source: EvidenceGapSource::CognitionPromotion,
+        question: "Wait for requested evidence to be written and promoted before speaking.".into(),
+        needed_fact: format!(
+            "Requested evidence from {sources} must be visible in the cognition log."
+        ),
+    });
+    decision
 }
 
 fn readiness_gate_prompt(self_model_available: bool) -> String {
@@ -642,6 +692,7 @@ impl SpeakGateModule {
         let mut memory_requests = HashSet::<String>::new();
         let mut self_model_requests = HashSet::<String>::new();
         let mut sensory_detail_requests = HashSet::<String>::new();
+        let mut requested_evidence_sources = Vec::<EvidenceGapSource>::new();
         let available_tools = speak_gate_tool_selectors(self_model_available);
 
         for _ in 0..MAX_GATE_TOOL_ROUNDS {
@@ -661,7 +712,10 @@ impl SpeakGateModule {
                         anyhow::bail!("speak-gate decision turn refused");
                     };
                     self.compact_if_needed(input_tokens, compaction_lutum).await;
-                    return Ok(decision);
+                    return Ok(apply_requested_evidence_guard(
+                        decision,
+                        &requested_evidence_sources,
+                    ));
                 }
                 StructuredStepOutcomeWithTools::NeedsTools(round) => {
                     let input_tokens = round.usage.input_tokens;
@@ -673,6 +727,9 @@ impl SpeakGateModule {
                                     .query_memory(call.input.clone(), &mut memory_requests)
                                     .await
                                     .context("run query_memory tool")?;
+                                if output.requested {
+                                    requested_evidence_sources.push(EvidenceGapSource::Memory);
+                                }
                                 results.push(
                                     call.complete(output)
                                         .context("complete query_memory tool call")?,
@@ -683,6 +740,9 @@ impl SpeakGateModule {
                                     .query_self_model(call.input.clone(), &mut self_model_requests)
                                     .await
                                     .context("run query_self_model tool")?;
+                                if output.requested {
+                                    requested_evidence_sources.push(EvidenceGapSource::SelfModel);
+                                }
                                 results.push(
                                     call.complete(output)
                                         .context("complete query_self_model tool call")?,
@@ -696,6 +756,10 @@ impl SpeakGateModule {
                                     )
                                     .await
                                     .context("run query_sensory_detail tool")?;
+                                if output.requested {
+                                    requested_evidence_sources
+                                        .push(EvidenceGapSource::SensoryDetail);
+                                }
                                 results.push(
                                     call.complete(output)
                                         .context("complete query_sensory_detail tool call")?,
@@ -1128,7 +1192,7 @@ impl Module for SpeakGateModule {
     }
 
     fn role_description() -> &'static str {
-        "Decides when the agent should speak based on the cognition log. Speech is warranted when a peer addresses the agent, when the agent has formed an intent worth expressing, or when the situation calls for an in-world utterance — speech is not gated on a user request. Sends SpeakRequest to speak when ready; otherwise records waiting/evidence-gap notes in its memo."
+        "Decides when the agent should speak from cognition-log evidence. If needed query, sensory-detail, or self-model results have not been promoted by cognition-gate, speaking becomes a guess; request evidence or wait. Sends SpeakRequest to speak when ready; otherwise records waiting/evidence-gap notes in its memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1153,7 +1217,7 @@ impl Module for SpeakModule {
     }
 
     fn role_description() -> &'static str {
-        "Emits the agent's spoken utterances into its world — speech is the agent's primary outward action, addressed to peers, animals, or people present in the scene, not to a user or operator. Driven by typed SpeakRequest from speak-gate; streams output and records the completed utterance to its memo."
+        "Emits the agent's spoken utterances into its world from typed SpeakRequest only. It cannot inspect memo logs or query results directly, so missing evidence not promoted to cognition before speak-gate plans the request will lead to guessed speech."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1690,6 +1754,34 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn requested_evidence_guard_turns_same_turn_speak_into_wait() {
+        let decision = SpeakGateDecision {
+            should_speak: true,
+            rationale: "tool request is enough".into(),
+            speech_plan: Some(SpeechPlan {
+                target: "Pibi".into(),
+                generation_hint: "answer from memory result".into(),
+            }),
+            evidence_gaps: Vec::new(),
+        };
+
+        let guarded = apply_requested_evidence_guard(decision, &[EvidenceGapSource::Memory]);
+
+        assert!(!guarded.should_speak);
+        assert!(guarded.speech_plan.is_none());
+        assert!(
+            guarded
+                .rationale
+                .contains("Waiting after requesting evidence from memory")
+        );
+        assert_eq!(guarded.evidence_gaps.len(), 1);
+        assert!(matches!(
+            guarded.evidence_gaps[0].source,
+            EvidenceGapSource::CognitionPromotion
+        ));
     }
 
     fn cognition_history_texts(session: &Session) -> Vec<String> {

@@ -140,7 +140,7 @@ impl Module for SelfModelModule {
     }
 
     fn role_description() -> &'static str {
-        "Integrates attention-schema cognition-log entries, peer module memos, and retrieved self-knowledge into a current first-person self-description; answers self-model requests."
+        "Integrates attention-schema cognition-log entries, peer module memo logs, and retrieved self-knowledge into current first-person self evidence in its memo log; cognition-gate must promote useful self-model facts before speech uses them."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
