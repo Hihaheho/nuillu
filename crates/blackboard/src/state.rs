@@ -899,7 +899,7 @@ mod tests {
             policies: vec![
                 (
                     builtin::attention_controller(),
-                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
+                    test_policy(ReplicaCapRange::new(1, 2).unwrap()),
                 ),
                 (
                     builtin::query_vector(),
@@ -907,7 +907,7 @@ mod tests {
                 ),
                 (
                     builtin::speak(),
-                    test_policy(ReplicaCapRange::new(0, 0).unwrap()),
+                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
                 ),
             ],
         })
@@ -972,7 +972,7 @@ mod tests {
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         let query = effective.for_module(&builtin::query_vector());
         let query_activation = effective.activation_for(&builtin::query_vector());
-        assert_eq!(effective.active_replicas(&builtin::query_vector()), 3);
+        assert_eq!(effective.active_replicas(&builtin::query_vector()), 2);
         assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
         assert_eq!(query.tier, ModelTier::Default);
         assert_eq!(
@@ -996,7 +996,7 @@ mod tests {
             policies: vec![
                 (
                     builtin::attention_controller(),
-                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
+                    test_policy(ReplicaCapRange::new(1, 2).unwrap()),
                 ),
                 (
                     builtin::speak(),
@@ -1030,10 +1030,9 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        // speak has min=1 base-active-1 policy; inactive controller's "ONE"
-        // activation is filtered out, only the active controller's ZERO is
-        // applied — but base-active-1 still keeps it at 1 active replica.
-        assert_eq!(effective.active_replicas(&builtin::speak()), 1);
+        // Inactive controller's "ONE" activation is filtered out, only the
+        // active controller's ZERO is applied.
+        assert_eq!(effective.active_replicas(&builtin::speak()), 0);
         assert_eq!(
             effective.activation_for(&builtin::speak()),
             crate::ActivationRatio::ZERO
@@ -1048,7 +1047,7 @@ mod tests {
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![(
                 builtin::attention_controller(),
-                test_policy(ReplicaCapRange::new(0, 0).unwrap()),
+                test_policy(ReplicaCapRange::new(1, 1).unwrap()),
             )],
         })
         .await;

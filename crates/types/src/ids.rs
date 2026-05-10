@@ -117,9 +117,8 @@ pub struct ReplicaCapRange {
 impl ReplicaCapRange {
     pub const V1_MAX: u8 = 2;
 
-    /// Construct a range of *additional* replicas above the always-on base of
-    /// 1. So `new(0, 0)` means "always exactly 1 active replica" and
-    /// `new(0, 2)` means "1 base + 0..=2 extras, i.e. 1..=3 total active".
+    /// Construct a range of total active replicas. `new(0, 1)` means the
+    /// module can be fully disabled or run one active replica.
     pub fn new(min: u8, max: u8) -> Result<Self, ReplicaCapRangeError> {
         if min > max {
             return Err(ReplicaCapRangeError::MinGreaterThanMax);

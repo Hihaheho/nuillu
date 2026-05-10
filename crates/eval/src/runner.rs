@@ -1179,266 +1179,195 @@ fn eval_registry(modules: &[EvalModule]) -> ModuleRegistry {
     registry
 }
 
-/// Default per-module additional-replica range. `0..=0` means "always exactly
-/// 1 active replica" (the always-on base).
-fn eval_replicas(max_extra: u8) -> std::ops::RangeInclusive<u8> {
-    0..=max_extra
-}
-
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
     match module {
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
         EvalModule::Sensory => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_sensory::SensoryModule::new(
-                        caps.sensory_input_inbox(),
-                        caps.sensory_detail_inbox(),
-                        caps.allocation_reader(),
-                        caps.memo(),
-                        caps.clock(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_sensory::SensoryModule::new(
+                    caps.sensory_input_inbox(),
+                    caps.sensory_detail_inbox(),
+                    caps.allocation_reader(),
+                    caps.memo(),
+                    caps.clock(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Gates the speak path; must re-fire fast as memos accumulate so
         // the cognition log is current by the time speak-gate considers it.
         EvalModule::CognitionGate => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_cognition_gate::CognitionGateModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.allocation_reader(),
-                        caps.cognition_writer(),
-                        caps.time_division(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_cognition_gate::CognitionGateModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.allocation_reader(),
+                    caps.cognition_writer(),
+                    caps.time_division(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Expensive (premium tier in default model-set), heavy reasoning.
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(3.0, 6.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_attention_controller::AttentionControllerModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.allocation_writer(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+                nuillu_attention_controller::AttentionControllerModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.allocation_writer(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Periodic first-person attention narration; not on the critical
         // path for the speak loop.
         EvalModule::AttentionSchema => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(3.0, 6.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_attention_schema::AttentionSchemaModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.allocation_reader(),
-                        caps.cognition_log_reader(),
-                        caps.cognition_writer(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+                nuillu_attention_schema::AttentionSchemaModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.allocation_reader(),
+                    caps.cognition_log_reader(),
+                    caps.cognition_writer(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // On-demand: only fires when a SelfModelRequest arrives.
         EvalModule::SelfModel => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(3.0, 6.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_self_model::SelfModelModule::new(
-                        caps.self_model_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+                nuillu_self_model::SelfModelModule::new(
+                    caps.self_model_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 15.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_query_vector::QueryVectorModule::new(
-                        caps.query_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.vector_memory_searcher(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 15.0), linear_ratio_fn, |caps| {
+                nuillu_query_vector::QueryVectorModule::new(
+                    caps.query_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.vector_memory_searcher(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(2.0, 6.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_query_agentic::QueryAgenticModule::new(
-                        caps.query_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.file_searcher(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+                nuillu_query_agentic::QueryAgenticModule::new(
+                    caps.query_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.file_searcher(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_memory::MemoryModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.memory_request_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.memory_writer(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_memory::MemoryModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.memory_request_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_writer(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(2.0, 6.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_memory_compaction::MemoryCompactionModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.memory_compactor(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+                nuillu_memory_compaction::MemoryCompactionModule::new(
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_compactor(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_predict::PredictModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_predict::PredictModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; should be quick enough to flag
         // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_surprise::SurpriseModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        caps.memory_request_mailbox(),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_surprise::SurpriseModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memory_request_mailbox(),
+                    caps.memo(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // On the critical path: must respond quickly to cognition-log
         // updates so it can decide to speak before the moment passes.
         EvalModule::SpeakGate => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_speak::SpeakGateModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.blackboard_reader(),
-                        caps.module_status_reader(),
-                        caps.query_mailbox(),
-                        caps.self_model_mailbox(),
-                        caps.sensory_detail_mailbox(),
-                        caps.memo(),
-                        caps.speak_mailbox(),
-                        caps.llm_access(),
-                        caps.scene_reader(),
-                    )
-                },
-            )
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_speak::SpeakGateModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.blackboard_reader(),
+                    caps.module_status_reader(),
+                    caps.query_mailbox(),
+                    caps.self_model_mailbox(),
+                    caps.sensory_detail_mailbox(),
+                    caps.memo(),
+                    caps.speak_mailbox(),
+                    caps.llm_access(),
+                    caps.scene_reader(),
+                )
+            })
             .expect("eval module registration should be unique"),
         // Reactive on SpeakRequest; idle waits on inbox and does not call
         // the LLM, so the periodic pace mainly governs streaming progress
         // checks. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
-            .register(
-                eval_replicas(0),
-                Bpm::range(6.0, 18.0),
-                linear_ratio_fn,
-                |caps| {
-                    nuillu_speak::SpeakModule::new(
-                        caps.speak_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        caps.utterance_writer(),
-                        caps.llm_access(),
-                    )
-                },
-            )
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+                nuillu_speak::SpeakModule::new(
+                    caps.speak_inbox(),
+                    caps.cognition_log_reader(),
+                    caps.memo(),
+                    caps.utterance_writer(),
+                    caps.llm_access(),
+                )
+            })
             .expect("eval module registration should be unique"),
     }
 }
@@ -1454,9 +1383,9 @@ fn full_agent_allocation(
             EvalModule::Sensory => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
-                1.0,
+                0.0,
                 ModelTier::Cheap,
-                "Filter incoming observations into sensory memo.",
+                "Queued sensory input is waiting; activate when the controller is ready to process external observations.",
             ),
             EvalModule::CognitionGate => set_allocation_module(
                 &mut allocation,
@@ -1470,7 +1399,7 @@ fn full_agent_allocation(
                 module.module_id(),
                 1.0,
                 ModelTier::Default,
-                "Allocate modules from memo updates and write natural-language guidance.",
+                "Bootstrap the case: activate sensory first so queued external observations become memo logs, then allocate cognition, query, and speech modules as evidence becomes ready.",
             ),
             EvalModule::AttentionSchema => set_allocation_module(
                 &mut allocation,
@@ -1531,16 +1460,16 @@ fn full_agent_allocation(
             EvalModule::SpeakGate => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
-                1.0,
+                0.0,
                 ModelTier::Premium,
-                "Decide whether attention is ready for speech or which evidence is missing.",
+                "Idle until cognition contains the evidence needed for speech readiness.",
             ),
             EvalModule::Speak => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
-                1.0,
+                0.0,
                 ModelTier::Premium,
-                "Wait for typed SpeakRequest.",
+                "Idle until speak-gate publishes a typed SpeakRequest.",
             ),
         }
     }
@@ -3119,7 +3048,7 @@ prompt = "What am I attending to?"
                 let caps = test_caps_with_adapter(blackboard.clone(), adapter);
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
                         linear_ratio_fn,
                         |caps| {
@@ -3308,7 +3237,7 @@ prompt = "What am I attending to?"
         let sensory = allocation.for_module(&builtin::sensory());
         assert_eq!(
             allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ONE
+            ActivationRatio::ZERO
         );
         assert_eq!(sensory.tier, ModelTier::Cheap);
 
@@ -3329,14 +3258,14 @@ prompt = "What am I attending to?"
         let speak_gate = allocation.for_module(&builtin::speak_gate());
         assert_eq!(
             allocation.activation_for(&builtin::speak_gate()),
-            ActivationRatio::ONE
+            ActivationRatio::ZERO
         );
         assert_eq!(speak_gate.tier, ModelTier::Premium);
 
         let speak = allocation.for_module(&builtin::speak());
         assert_eq!(
             allocation.activation_for(&builtin::speak()),
-            ActivationRatio::ONE
+            ActivationRatio::ZERO
         );
         assert_eq!(speak.tier, ModelTier::Premium);
 

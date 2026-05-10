@@ -151,8 +151,7 @@ pub fn replicas_only_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRa
     (ReplicasRatio::from_f64(r.as_f64()), RateLimitRatio::ONE)
 }
 
-/// Activation scales rate limit; replicas pinned at the minimum (which is the
-/// always-on base under the new model).
+/// Activation scales rate limit; replicas are pinned at the registered minimum.
 pub fn rate_only_ratio_fn(r: ActivationRatio) -> (ReplicasRatio, RateLimitRatio) {
     (ReplicasRatio::ZERO, RateLimitRatio::from_f64(r.as_f64()))
 }
@@ -189,25 +188,22 @@ impl ModulePolicy {
         Bpm::from_f64(bpm).cooldown()
     }
 
-    /// Total active replica count for a given `replicas_ratio`. The stored
-    /// `replicas_range` represents *additional* replicas above the always-on
-    /// base of 1, so the total is always at least 1 — `register(0..=0)`
-    /// produces exactly 1 active replica.
+    /// Total active replica count for a given `replicas_ratio`, clamped to the
+    /// registered total replica range. A range with `min = 0` can be fully
+    /// inactive.
     pub fn active_replicas_for(&self, ratio: ReplicasRatio) -> u8 {
-        let max_extra = self.replicas_range.max;
-        let extra = if max_extra == 0 {
-            0
-        } else {
-            let requested = (ratio.as_f64() * f64::from(max_extra)).ceil() as i64;
-            requested.clamp(i64::from(self.replicas_range.min), i64::from(max_extra)) as u8
-        };
-        extra.saturating_add(1)
+        if self.replicas_range.max == 0 {
+            return 0;
+        }
+        let requested = (ratio.as_f64() * f64::from(self.replicas_range.max)).ceil() as u8;
+        self.replicas_range.clamp(requested)
     }
 
-    /// Total maximum active replica count this module can ever have under the
-    /// registered policy: the additional max plus the always-on base of 1.
+    /// Number of persistent replica instances to build for this module. Even a
+    /// fully allocation-disabled `0..=0` module still gets replica 0 so typed
+    /// messages can queue until boot wiring or a later policy makes it active.
     pub fn max_active_replicas(&self) -> u8 {
-        self.replicas_range.max.saturating_add(1)
+        self.replicas_range.max.max(1)
     }
 }
 
@@ -282,15 +278,7 @@ impl ResourceAllocation {
     }
 
     pub fn active_replicas(&self, id: &ModuleId) -> u8 {
-        self.active_replicas
-            .get(id)
-            .copied()
-            // Modules without a registered policy fall back to the implicit
-            // always-on base of 1. This matches the new model's "every module
-            // always has at least 1 active replica" floor and keeps tests that
-            // construct ad-hoc allocations without registering policies
-            // working without each test having to install a policy table.
-            .unwrap_or(1)
+        self.active_replicas.get(id).copied().unwrap_or_default()
     }
 
     pub fn is_replica_active(&self, owner: &ModuleInstanceId) -> bool {
@@ -458,9 +446,9 @@ mod tests {
         set(&mut allocation, "gamma", 0.8, ModelTier::Premium);
 
         let mut policies = HashMap::new();
-        policies.insert(id("alpha"), linear_policy(0, 0));
-        policies.insert(id("beta"), linear_policy(0, 0));
-        policies.insert(id("gamma"), linear_policy(0, 0));
+        policies.insert(id("alpha"), linear_policy(0, 1));
+        policies.insert(id("beta"), linear_policy(0, 1));
+        policies.insert(id("gamma"), linear_policy(0, 1));
 
         let limited = allocation.derived(&policies).limited(AllocationLimits {
             max_total_active_replicas: None,
@@ -480,9 +468,9 @@ mod tests {
         set(&mut allocation, "beta", 0.7, ModelTier::Cheap);
 
         let mut policies = HashMap::new();
-        policies.insert(id("alpha"), linear_policy(0, 0));
-        policies.insert(id("beta"), linear_policy(0, 0));
-        policies.insert(id("gamma"), linear_policy(0, 0));
+        policies.insert(id("alpha"), linear_policy(0, 1));
+        policies.insert(id("beta"), linear_policy(0, 1));
+        policies.insert(id("gamma"), linear_policy(0, 1));
 
         let limited = allocation.derived(&policies).limited(AllocationLimits {
             max_total_active_replicas: Some(2),
@@ -506,21 +494,26 @@ mod tests {
     }
 
     #[test]
-    fn module_policy_active_replicas_adds_implicit_base_replica() {
-        // additional 0..=0 — always exactly 1 total active.
-        let none_extra = linear_policy(0, 0);
-        assert_eq!(none_extra.active_replicas_for(ReplicasRatio::ZERO), 1);
-        assert_eq!(none_extra.active_replicas_for(ReplicasRatio::ONE), 1);
+    fn module_policy_active_replicas_uses_total_replica_range() {
+        let disabled = linear_policy(0, 0);
+        assert_eq!(disabled.active_replicas_for(ReplicasRatio::ZERO), 0);
+        assert_eq!(disabled.active_replicas_for(ReplicasRatio::ONE), 0);
 
-        // additional 0..=1 — base 1 plus 0..=1 extras = 1 to 2 total active.
-        let one_extra = linear_policy(0, 1);
-        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ZERO), 1);
-        // Half of 1 rounds up to 1 extra → 2 total.
+        let optional_one = linear_policy(0, 1);
+        assert_eq!(optional_one.active_replicas_for(ReplicasRatio::ZERO), 0);
         assert_eq!(
-            one_extra.active_replicas_for(ReplicasRatio::from_f64(0.5)),
-            2
+            optional_one.active_replicas_for(ReplicasRatio::from_f64(0.5)),
+            1
         );
-        assert_eq!(one_extra.active_replicas_for(ReplicasRatio::ONE), 2);
+        assert_eq!(optional_one.active_replicas_for(ReplicasRatio::ONE), 1);
+
+        let one_to_two = linear_policy(1, 2);
+        assert_eq!(one_to_two.active_replicas_for(ReplicasRatio::ZERO), 1);
+        assert_eq!(
+            one_to_two.active_replicas_for(ReplicasRatio::from_f64(0.5)),
+            1
+        );
+        assert_eq!(one_to_two.active_replicas_for(ReplicasRatio::ONE), 2);
     }
 
     #[test]

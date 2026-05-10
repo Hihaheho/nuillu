@@ -140,11 +140,22 @@ impl<T: Clone> TopicMailbox<T> {
 
         match self.topic.policy {
             TopicPolicy::Fanout => {
-                for subscriber in inner
-                    .subscribers
-                    .iter()
-                    .filter(|subscriber| allocation.is_replica_active(&subscriber.owner))
-                {
+                let mut active_by_role = HashMap::<ModuleId, bool>::new();
+                for subscriber in &inner.subscribers {
+                    let active = allocation.is_replica_active(&subscriber.owner);
+                    active_by_role
+                        .entry(subscriber.owner.module.clone())
+                        .and_modify(|any_active| *any_active |= active)
+                        .or_insert(active);
+                }
+                for subscriber in inner.subscribers.iter().filter(|subscriber| {
+                    allocation.is_replica_active(&subscriber.owner)
+                        || (!active_by_role
+                            .get(&subscriber.owner.module)
+                            .copied()
+                            .unwrap_or(false)
+                            && subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO)
+                }) {
                     if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
                         delivered += 1;
                     }
@@ -152,13 +163,21 @@ impl<T: Clone> TopicMailbox<T> {
             }
             TopicPolicy::RoleLoadBalanced => {
                 let mut by_role = HashMap::<ModuleId, Vec<usize>>::new();
+                let mut fallback_by_role = HashMap::<ModuleId, usize>::new();
                 for (idx, subscriber) in inner.subscribers.iter().enumerate() {
                     if allocation.is_replica_active(&subscriber.owner) {
                         by_role
                             .entry(subscriber.owner.module.clone())
                             .or_default()
                             .push(idx);
+                    } else if subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO {
+                        fallback_by_role
+                            .entry(subscriber.owner.module.clone())
+                            .or_insert(idx);
                     }
+                }
+                for (role, idx) in fallback_by_role {
+                    by_role.entry(role).or_insert_with(|| vec![idx]);
                 }
 
                 for (role, indexes) in by_role {
@@ -486,7 +505,7 @@ mod tests {
                     (
                         builtin::query_vector(),
                         nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 1).unwrap(),
+                            ReplicaCapRange::new(0, 2).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
                                 ..=nuillu_blackboard::Bpm::from_f64(60.0),
                             nuillu_blackboard::linear_ratio_fn,
@@ -495,7 +514,7 @@ mod tests {
                     (
                         builtin::query_agentic(),
                         nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 0).unwrap(),
+                            ReplicaCapRange::new(0, 1).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
                                 ..=nuillu_blackboard::Bpm::from_f64(60.0),
                             nuillu_blackboard::linear_ratio_fn,
@@ -529,11 +548,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn role_topics_do_not_route_to_disabled_replicas() {
+    async fn role_topics_route_to_replica_zero_when_role_is_inactive() {
         let mut alloc = ResourceAllocation::default();
         alloc.set(builtin::query_vector(), ModuleConfig::default());
-        // additional capacity 1, but no activation → only the base replica is
-        // active, so replica 1 stays out of routing.
         alloc.set_activation(builtin::query_vector(), ActivationRatio::ZERO);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard
@@ -541,7 +558,7 @@ mod tests {
                 policies: vec![(
                     builtin::query_vector(),
                     nuillu_blackboard::ModulePolicy::new(
-                        ReplicaCapRange::new(0, 1).unwrap(),
+                        ReplicaCapRange::new(0, 2).unwrap(),
                         nuillu_blackboard::Bpm::from_f64(60.0)
                             ..=nuillu_blackboard::Bpm::from_f64(60.0),
                         nuillu_blackboard::linear_ratio_fn,

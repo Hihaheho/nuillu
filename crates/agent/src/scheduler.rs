@@ -1100,7 +1100,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1166,7 +1166,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1241,7 +1241,7 @@ mod tests {
                 // activation_ratio=1.0.
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(2000.0)..=Bpm::from_f64(2000.0),
                         linear_ratio_fn,
                         {
@@ -1327,7 +1327,7 @@ mod tests {
                 // should be ~120ms rather than a full 200ms.
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(300.0)..=Bpm::from_f64(300.0),
                         linear_ratio_fn,
                         {
@@ -1409,7 +1409,7 @@ mod tests {
                 // takes longer than that, no extra cooldown should be added.
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(500.0)..=Bpm::from_f64(500.0),
                         linear_ratio_fn,
                         {
@@ -1485,7 +1485,7 @@ mod tests {
                 // during cooldown and expects the second batch before deadline.
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(120.0)..=Bpm::from_f64(120.0),
                         linear_ratio_fn,
                         {
@@ -1571,7 +1571,7 @@ mod tests {
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         |_| HangingBatchStub,
@@ -1597,10 +1597,8 @@ mod tests {
             .await;
     }
 
-    // The "PendingBatch when replica deactivates mid-flight" scenario is no
-    // longer reachable: registered modules always have replicas_range.min >= 1
-    // active replicas, so a controller cannot deactivate them via the
-    // allocation alone. The DelayedBatchStub itself is retained for future use.
+    // The DelayedBatchStub is retained for future inactive/pending transition
+    // coverage.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn scheduler_records_activating_status() {
@@ -1630,7 +1628,7 @@ mod tests {
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1686,7 +1684,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1741,7 +1739,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1803,7 +1801,7 @@ mod tests {
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         |_| AlwaysFailStub { batch_sent: false },
@@ -1843,9 +1841,8 @@ mod tests {
             .await;
     }
 
-    // The "inactive replica is not started" scenario is no longer reachable:
-    // registered modules always have replicas_range.min >= 1 active replicas
-    // by construction.
+    // Inactive replicas keep state and queued inbox messages, but the scheduler
+    // does not start semantic work for them until allocation makes them active.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn idle_deadlock_records_marker_and_publishes_cognition_log_update() {
@@ -1869,7 +1866,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=0,
+                        1..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {

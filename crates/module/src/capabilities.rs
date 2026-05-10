@@ -823,7 +823,7 @@ impl ModuleRegistry {
         }
     }
 
-    /// Register a module type with its base-active replica range, BPM tempo
+    /// Register a module type with its total active replica range, BPM tempo
     /// range, and per-module activation-ratio mapping. The module's identity
     /// comes from [`Module::id`] / [`Module::role_description`].
     pub fn register<B>(
@@ -845,8 +845,6 @@ impl ModuleRegistry {
         {
             return Err(ModuleRegistryError::DuplicateModule { module });
         }
-        // The supplied range counts *additional* replicas above the always-on
-        // base of 1; total active replicas = additional + 1.
         let range = ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end())?;
         let policy = ModulePolicy::new(range, rate_limit_range, activation_ratio_fn);
         self.registrations.push(ModuleRegistration {
@@ -885,8 +883,8 @@ impl ModuleRegistry {
 
         let mut modules = Vec::new();
         for registration in &self.registrations {
-            // Build every possible replica up to (additional max + base 1);
-            // allocation and the agent event loop decide which are active.
+            // Build every possible replica up to the registered max, with a
+            // replica-0 floor so inactive modules can retain queued messages.
             let total_replicas = registration.policy.max_active_replicas();
             for replica in 0..total_replicas {
                 let owner =
@@ -1262,7 +1260,7 @@ mod tests {
                     (
                         builtin::attention_controller(),
                         nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 0).unwrap(),
+                            ReplicaCapRange::new(1, 1).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
                                 ..=nuillu_blackboard::Bpm::from_f64(60.0),
                             nuillu_blackboard::linear_ratio_fn,
@@ -1271,7 +1269,7 @@ mod tests {
                     (
                         builtin::cognition_gate(),
                         nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 0).unwrap(),
+                            ReplicaCapRange::new(0, 1).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
                                 ..=nuillu_blackboard::Bpm::from_f64(60.0),
                             nuillu_blackboard::linear_ratio_fn,
