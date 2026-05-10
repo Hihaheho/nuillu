@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Write},
+    num::NonZeroUsize,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -98,6 +99,7 @@ pub struct RunnerConfig {
     pub premium_backend: LlmBackendConfig,
     pub model_dir: PathBuf,
     pub fail_fast: bool,
+    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
 }
 
@@ -283,6 +285,7 @@ pub async fn run_suite_with_hooks(
                 "default": backend_report(&config.default_backend),
                 "premium": backend_report(&config.premium_backend),
             },
+            "max_concurrent_llm_calls": config.max_concurrent_llm_calls.map(NonZeroUsize::get),
         }),
         format!(
             "eval suite start run={} cases={} output={}",
@@ -1620,6 +1623,7 @@ async fn build_eval_environment(
     let tiers = build_tiers(config)?;
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
+        max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         ..RuntimePolicy::default()
     };
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
@@ -3753,6 +3757,7 @@ limits {{
             premium_backend: test_backend_config(),
             model_dir: dir.path().join("missing-model"),
             fail_fast: false,
+            max_concurrent_llm_calls: None,
             case_patterns: Vec::new(),
         };
 

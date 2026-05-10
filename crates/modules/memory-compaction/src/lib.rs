@@ -119,8 +119,9 @@ impl MemoryCompactionModule {
         );
 
         for _ in 0..6 {
+            let lutum = self.llm.lutum().await;
             let outcome = session
-                .text_turn(&self.llm.lutum().await)
+                .text_turn(&lutum)
                 .tools::<CompactionTools>()
                 .available_tools([
                     CompactionToolsSelector::GetMemories,

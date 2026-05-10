@@ -138,9 +138,10 @@ impl MemoryModule {
         );
 
         for _ in 0..4 {
+            let lutum = self.llm.lutum().await;
             let outcome = self
                 .session
-                .text_turn(&self.llm.lutum().await)
+                .text_turn(&lutum)
                 .tools::<MemoryTools>()
                 .available_tools([MemoryToolsSelector::InsertMemory])
                 .collect()

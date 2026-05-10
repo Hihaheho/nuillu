@@ -16,6 +16,7 @@ use nuillu_types::{
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
+use crate::llm::LlmConcurrencyLimiter;
 use crate::ports::{
     Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
 };
@@ -67,6 +68,7 @@ struct CapabilityProvidersInner {
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
+    llm_concurrency_limiter: LlmConcurrencyLimiter,
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
 }
@@ -132,6 +134,7 @@ impl CapabilityProviders {
         let CapabilityProviderRuntime { event_sink, policy } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
+        let llm_concurrency_limiter = LlmConcurrencyLimiter::new(policy.max_concurrent_llm_calls);
         Self {
             inner: Arc::new(CapabilityProvidersInner {
                 query_topic: Topic::new(
@@ -202,6 +205,7 @@ impl CapabilityProviders {
                 tiers,
                 runtime_events,
                 rate_limiter,
+                llm_concurrency_limiter,
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
             }),
@@ -665,6 +669,7 @@ impl ModuleCapabilityFactory {
             self.root.inner.blackboard.clone(),
             self.root.inner.runtime_events.clone(),
             self.root.inner.rate_limiter.clone(),
+            self.root.inner.llm_concurrency_limiter.clone(),
         )
     }
 

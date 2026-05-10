@@ -130,9 +130,10 @@ impl AttentionSchemaModule {
             .to_string(),
         );
 
+        let lutum = self.llm.lutum().await;
         let outcome = self
             .session
-            .text_turn(&self.llm.lutum().await)
+            .text_turn(&lutum)
             .tools::<AttentionSchemaTools>()
             .available_tools([AttentionSchemaToolsSelector::AppendAttentionExperience])
             .collect()

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -75,6 +75,10 @@ struct Args {
     #[arg(long)]
     fail_fast: bool,
 
+    /// Maximum concurrent agent LLM calls. Defaults to unlimited.
+    #[arg(long, env = "NUILLU_EVAL_MAX_CONCURRENT_LLM_CALLS")]
+    max_concurrent_llm_calls: Option<NonZeroUsize>,
+
     /// Run the reusable egui visualizer while the eval suite executes.
     #[arg(long)]
     gui: bool,
@@ -127,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         premium_backend,
         model_dir: args.model_dir,
         fail_fast: args.fail_fast,
+        max_concurrent_llm_calls: args.max_concurrent_llm_calls,
         case_patterns: args.patterns,
     };
 

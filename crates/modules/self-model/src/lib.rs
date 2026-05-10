@@ -108,9 +108,10 @@ impl SelfModelModule {
             .to_string(),
         );
 
+        let lutum = self.llm.lutum().await;
         let result = self
             .session
-            .text_turn(&self.llm.lutum().await)
+            .text_turn(&lutum)
             .collect()
             .await
             .context("self-model text turn failed")?;

@@ -64,7 +64,7 @@ pub use channels::{
     SensoryInput, SensoryInputInbox, SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
-pub use llm::LlmAccess;
+pub use llm::{LlmAccess, LlmLease};
 pub use memo::{Memo, TypedMemo};
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,

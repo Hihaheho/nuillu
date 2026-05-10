@@ -126,9 +126,10 @@ impl SurpriseModule {
             .to_string(),
         );
 
+        let lutum = self.llm.lutum().await;
         let result = self
             .session
-            .structured_turn::<SurpriseAssessment>(&self.llm.lutum().await)
+            .structured_turn::<SurpriseAssessment>(&lutum)
             .collect()
             .await
             .context("surprise structured turn failed")?;

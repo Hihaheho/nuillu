@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -112,6 +113,7 @@ pub struct RuntimePolicy {
     pub rate_limits: RateLimitPolicy,
     pub allocation_limits: AllocationLimits,
     pub memo_retained_per_owner: usize,
+    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
 }
 
 impl Default for RuntimePolicy {
@@ -120,6 +122,7 @@ impl Default for RuntimePolicy {
             rate_limits: RateLimitPolicy::default(),
             allocation_limits: AllocationLimits::default(),
             memo_retained_per_owner: 8,
+            max_concurrent_llm_calls: None,
         }
     }
 }

@@ -1,16 +1,76 @@
+use std::num::NonZeroUsize;
+use std::ops::Deref;
+use std::sync::Arc;
+
 use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
 use nuillu_types::ModuleInstanceId;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::LutumTiers;
 use crate::rate_limit::{CapabilityKind, RateLimiter};
 use crate::runtime_events::RuntimeEventEmitter;
 
+/// Shared admission control for LLM turns.
+#[derive(Clone)]
+pub(crate) struct LlmConcurrencyLimiter {
+    semaphore: Option<Arc<Semaphore>>,
+}
+
+impl LlmConcurrencyLimiter {
+    pub(crate) fn new(max_concurrent_calls: Option<NonZeroUsize>) -> Self {
+        Self {
+            semaphore: max_concurrent_calls.map(|max| Arc::new(Semaphore::new(max.get()))),
+        }
+    }
+
+    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        let semaphore = self.semaphore.as_ref()?;
+        Some(
+            semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("LLM concurrency semaphore is never closed"),
+        )
+    }
+}
+
+/// A [`Lutum`] handle plus any runtime admission permit held for its use.
+///
+/// Dropping this value releases the concurrent-call slot. It dereferences to
+/// [`Lutum`] so module code can bind the value and pass `&lutum`.
+pub struct LlmLease {
+    lutum: Lutum,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl LlmLease {
+    fn new(lutum: Lutum, permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self {
+            lutum,
+            _permit: permit,
+        }
+    }
+
+    pub fn lutum(&self) -> &Lutum {
+        &self.lutum
+    }
+}
+
+impl Deref for LlmLease {
+    type Target = Lutum;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lutum
+    }
+}
+
 /// LLM-access capability.
 ///
 /// Owner-stamped: `lutum()` reads the current
 /// [`ResourceAllocation`](nuillu_blackboard::ResourceAllocation) for the
-/// owning module and returns the [`Lutum`] handle bound to the
+/// owning module and returns a leased [`Lutum`] handle bound to the
 /// allocation's tier.
 ///
 /// Modules consume the returned `Lutum` directly — typically by passing
@@ -25,6 +85,7 @@ pub struct LlmAccess {
     blackboard: Blackboard,
     events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
+    concurrency_limiter: LlmConcurrencyLimiter,
 }
 
 impl LlmAccess {
@@ -34,6 +95,7 @@ impl LlmAccess {
         blackboard: Blackboard,
         events: RuntimeEventEmitter,
         rate_limiter: RateLimiter,
+        concurrency_limiter: LlmConcurrencyLimiter,
     ) -> Self {
         Self {
             owner,
@@ -41,14 +103,15 @@ impl LlmAccess {
             blackboard,
             events,
             rate_limiter,
+            concurrency_limiter,
         }
     }
 
-    /// The [`Lutum`] for the owner module's currently allocated tier.
+    /// A leased [`Lutum`] for the owner module's currently allocated tier.
     /// Tier resolution is per-call so allocation changes between
     /// activations take effect on the next call without re-issuing the
     /// capability.
-    pub async fn lutum(&self) -> Lutum {
+    pub async fn lutum(&self) -> LlmLease {
         let outcome = self
             .rate_limiter
             .acquire(&self.owner, CapabilityKind::LlmCall)
@@ -62,13 +125,14 @@ impl LlmAccess {
                 )
                 .await;
         }
+        let permit = self.concurrency_limiter.acquire().await;
 
         let tier = self
             .blackboard
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
         self.events.llm_accessed(self.owner.clone(), tier).await;
-        self.tiers.pick(tier)
+        LlmLease::new(self.tiers.pick(tier), permit)
     }
 }
 
@@ -86,7 +150,7 @@ mod tests {
     use crate::rate_limit::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RateLimiter};
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
-    use super::LlmAccess;
+    use super::{LlmAccess, LlmConcurrencyLimiter};
 
     #[derive(Debug, Default)]
     struct RecordingSink {
@@ -123,6 +187,7 @@ mod tests {
             blackboard,
             events,
             RateLimiter::disabled(),
+            LlmConcurrencyLimiter::new(None),
         );
 
         let _ = access.lutum().await;
@@ -170,7 +235,14 @@ mod tests {
             )
             .unwrap(),
         );
-        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events, limiter);
+        let access = LlmAccess::new(
+            owner.clone(),
+            tiers,
+            blackboard,
+            events,
+            limiter,
+            LlmConcurrencyLimiter::new(None),
+        );
 
         let _ = access.lutum().await;
         let _ = access.lutum().await;
@@ -202,5 +274,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn lutum_waits_for_concurrency_permit_until_prior_lease_is_dropped() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let adapter = Arc::new(MockLlmAdapter::new());
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        let tiers = crate::LutumTiers {
+            cheap: lutum.clone(),
+            default: lutum.clone(),
+            premium: lutum,
+        };
+        let sink = Arc::new(RecordingSink::default());
+        let events = RuntimeEventEmitter::new(sink);
+        let access = LlmAccess::new(
+            owner,
+            tiers,
+            blackboard,
+            events,
+            RateLimiter::disabled(),
+            LlmConcurrencyLimiter::new(Some(std::num::NonZeroUsize::new(1).unwrap())),
+        );
+
+        let first = access.lutum().await;
+        let second = tokio::time::timeout(Duration::from_millis(5), access.lutum()).await;
+        assert!(second.is_err());
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_millis(50), access.lutum()).await;
+        assert!(second.is_ok());
     }
 }

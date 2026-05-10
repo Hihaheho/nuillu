@@ -177,10 +177,11 @@ impl AttentionControllerModule {
             .to_string(),
         );
 
+        let lutum = self.llm.lutum().await;
         let result = CONTROLLER_DECISION_SCHEMA
             .scope(output_schema, async {
                 self.session
-                    .structured_turn::<AllocationDecision>(&self.llm.lutum().await)
+                    .structured_turn::<AllocationDecision>(&lutum)
                     .collect()
                     .await
             })
