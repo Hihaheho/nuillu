@@ -1165,21 +1165,14 @@ fn eval_replicas(max_extra: u8) -> std::ops::RangeInclusive<u8> {
     0..=max_extra
 }
 
-fn eval_bpm_range() -> std::ops::RangeInclusive<Bpm> {
-    // Idle pace 3 BPM (20s between batch starts) up to fully-active 18 BPM
-    // (~3.3s). The scheduler subtracts activation elapsed time from the
-    // cooldown, so this range expresses target batch-start tempo.
-    // Time is injected via the Clock trait, so tests with a mock Clock can
-    // skip cooldowns entirely.
-    Bpm::range(3.0, 9.0)
-}
-
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
     match module {
+        // Input-driven and bursty: bursts of inputs need a fast active pace
+        // so observations are normalized within the same tick window.
         EvalModule::Sensory => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_sensory::SensoryModule::new(
@@ -1193,10 +1186,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Gates the speak path; must re-fire fast as memos accumulate so
+        // the cognition log is current by the time speak-gate considers it.
         EvalModule::CognitionGate => registry
             .register(
                 eval_replicas(0),
-                Bpm::range(6.0, 36.0),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_cognition_gate::CognitionGateModule::new(
@@ -1211,10 +1206,13 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Expensive (premium tier in default model-set), heavy reasoning.
+        // Should only fire on meaningful state shifts — slow base pace so
+        // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(3.0, 6.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_attention_controller::AttentionControllerModule::new(
@@ -1229,10 +1227,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Periodic first-person attention narration; not on the critical
+        // path for the speak loop.
         EvalModule::AttentionSchema => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(3.0, 6.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_attention_schema::AttentionSchemaModule::new(
@@ -1248,10 +1248,11 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // On-demand: only fires when a SelfModelRequest arrives.
         EvalModule::SelfModel => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(3.0, 6.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_self_model::SelfModelModule::new(
@@ -1264,10 +1265,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Memory retrieval is on the critical path between cognition-gate
+        // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 15.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_query_vector::QueryVectorModule::new(
@@ -1282,10 +1285,11 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(2.0, 6.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_query_agentic::QueryAgenticModule::new(
@@ -1300,10 +1304,11 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_memory::MemoryModule::new(
@@ -1317,10 +1322,11 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(2.0, 6.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_memory_compaction::MemoryCompactionModule::new(
@@ -1333,10 +1339,11 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_predict::PredictModule::new(
@@ -1350,10 +1357,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Cognition-log triggered; should be quick enough to flag
+        // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_surprise::SurpriseModule::new(
@@ -1368,10 +1377,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // On the critical path: must respond quickly to cognition-log
+        // updates so it can decide to speak before the moment passes.
         EvalModule::SpeakGate => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_speak::SpeakGateModule::new(
@@ -1390,10 +1401,13 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 },
             )
             .expect("eval module registration should be unique"),
+        // Reactive on SpeakRequest; idle waits on inbox and does not call
+        // the LLM, so the periodic pace mainly governs streaming progress
+        // checks. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
             .register(
                 eval_replicas(0),
-                eval_bpm_range(),
+                Bpm::range(6.0, 18.0),
                 linear_ratio_fn,
                 |caps| {
                     nuillu_speak::SpeakModule::new(
@@ -1435,7 +1449,7 @@ fn full_agent_allocation(
                 &mut allocation,
                 module.module_id(),
                 1.0,
-                ModelTier::Premium,
+                ModelTier::Default,
                 "Allocate modules from memo updates and write natural-language guidance.",
             ),
             EvalModule::AttentionSchema => set_allocation_module(
@@ -1576,10 +1590,10 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
         | EvalModule::Predict => ModelTier::Cheap,
-        EvalModule::AttentionController
-        | EvalModule::QueryAgentic
-        | EvalModule::SpeakGate
-        | EvalModule::Speak => ModelTier::Premium,
+        EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => {
+            ModelTier::Premium
+        }
+        EvalModule::AttentionController => ModelTier::Default,
         EvalModule::AttentionSchema | EvalModule::SelfModel | EvalModule::Surprise => {
             ModelTier::Default
         }
@@ -3330,7 +3344,7 @@ prompt = "What am I attending to?"
             allocation.activation_for(&builtin::attention_controller()),
             ActivationRatio::ONE
         );
-        assert_eq!(controller.tier, ModelTier::Premium);
+        assert_eq!(controller.tier, ModelTier::Default);
 
         let speak_gate = allocation.for_module(&builtin::speak_gate());
         assert_eq!(
