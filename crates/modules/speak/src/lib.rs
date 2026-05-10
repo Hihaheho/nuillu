@@ -98,6 +98,30 @@ If partial_utterance is present, continue that utterance from exactly where it s
 repeat, rewrite, or replace the already emitted partial text. Do not mention hidden state or
 unavailable module results."#;
 
+const ABORT_JUDGE_PROMPT: &str = r#"You are deciding, on behalf of a cognitive system, whether
+to interrupt a speech that is currently in progress.
+
+Another agent is currently speaking to a target peer. They began speaking from a particular
+state of the agent's conscious workspace, given to you below as cognition_log_at_start. They are
+unaware of newer pieces of awareness that have entered the workspace since they began, given to
+you below as new_cognition_entries.
+
+Your job is to judge whether it is worth interrupting the current speech to share these new
+entries with the speaker, so they can re-plan from the updated awareness — or whether the new
+entries are minor enough that the current speech should be allowed to finish.
+
+Interrupt when the new entries:
+- introduce a fact that contradicts or invalidates what the speaker likely planned to say
+- shift the load-bearing safety, peer-model, or task constraint the speech depends on
+- change who should be addressed or what the most pressing concern is
+
+Let the speech continue when the new entries:
+- restate or elaborate facts already in the starting awareness
+- add minor context that does not affect the core message
+- describe internal cognitive process rather than world-relevant change
+
+Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+
 tokio::task_local! {
     /// JSON Schema for `SpeakTargetDecision.target` derived from the live `SceneReader`.
     /// `.scope`d around each `structured_turn` so the LLM sees an enum of
@@ -121,6 +145,12 @@ struct SpeakGateDecision {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct SpeakTargetDecision {
     target: SpeechTarget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct AbortJudgement {
+    inform_now: bool,
+    rationale: String,
 }
 
 /// Wire-format string with a JSON Schema dynamically constrained to the
@@ -945,6 +975,7 @@ fn push_generation_context(
 enum GenerationStreamOutcome {
     Completed,
     Retry,
+    Aborted,
 }
 
 pub struct SpeakModule {
@@ -957,6 +988,7 @@ pub struct SpeakModule {
     scene: SceneReader,
     target_prompt: std::sync::OnceLock<String>,
     generation_prompt: std::sync::OnceLock<String>,
+    abort_judge_prompt: std::sync::OnceLock<String>,
 }
 
 impl SpeakModule {
@@ -978,6 +1010,7 @@ impl SpeakModule {
             scene,
             target_prompt: std::sync::OnceLock::new(),
             generation_prompt: std::sync::OnceLock::new(),
+            abort_judge_prompt: std::sync::OnceLock::new(),
         }
     }
 
@@ -997,6 +1030,18 @@ impl SpeakModule {
         self.generation_prompt.get_or_init(|| {
             nuillu_module::format_system_prompt(
                 GENERATION_PROMPT,
+                cx.modules(),
+                &self.owner,
+                cx.identity_memories(),
+                cx.now(),
+            )
+        })
+    }
+
+    fn abort_judge_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.abort_judge_prompt.get_or_init(|| {
+            nuillu_module::format_system_prompt(
+                ABORT_JUDGE_PROMPT,
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
@@ -1025,6 +1070,11 @@ impl SpeakModule {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
                     cognition_log_json = self.cognition_log.snapshot().await.compact_json();
+                }
+                GenerationStreamOutcome::Aborted => {
+                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
+                    let new_target = self.select_target(cx, &cognition_log_json).await?;
+                    draft = GenerationDraft::new(self.utterance.next_generation_id(), new_target);
                 }
             }
         }
@@ -1072,6 +1122,9 @@ impl SpeakModule {
         cognition_log_json: serde_json::Value,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
+        let stream_started_at = cx.now();
+        let cognition_log_at_start_json = cognition_log_json.clone();
+
         let mut session = Session::new();
         push_generation_context(
             &mut session,
@@ -1126,8 +1179,69 @@ impl SpeakModule {
                         Some(Err(error)) => return Err(error).context("speak generation stream event failed"),
                     }
                 }
+                update = self.cognition_updates.next_item() => {
+                    let _ = update.context("speak abort watch lost cognition update")?;
+                    let _ = self.cognition_updates.take_ready_items()
+                        .context("speak abort watch failed to drain cognition updates")?;
+
+                    let new_entries = self
+                        .new_cognition_entries_since(stream_started_at)
+                        .await;
+                    if new_entries.is_empty() {
+                        continue;
+                    }
+
+                    if self
+                        .judge_abort(cx, &cognition_log_at_start_json, &new_entries)
+                        .await?
+                    {
+                        return Ok(GenerationStreamOutcome::Aborted);
+                    }
+                }
             }
         }
+    }
+
+    async fn new_cognition_entries_since(
+        &self,
+        threshold: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let snapshot = self.cognition_log.snapshot().await;
+        snapshot
+            .logs()
+            .iter()
+            .flat_map(|record| record.entries.iter())
+            .filter(|entry| entry.at > threshold)
+            .map(|entry| entry.text.clone())
+            .collect()
+    }
+
+    async fn judge_abort(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        cognition_log_at_start_json: &serde_json::Value,
+        new_entries: &[String],
+    ) -> Result<bool> {
+        let mut session = Session::new();
+        session.push_system(self.abort_judge_prompt(cx));
+        session.push_user(
+            serde_json::json!({
+                "cognition_log_at_start": cognition_log_at_start_json,
+                "new_cognition_entries": new_entries,
+            })
+            .to_string(),
+        );
+
+        let lutum = self.llm.lutum().await;
+        let result = session
+            .structured_turn::<AbortJudgement>(&lutum)
+            .collect()
+            .await
+            .context("speak abort-judge turn failed")?;
+        let StructuredTurnOutcome::Structured(judgement) = result.semantic else {
+            anyhow::bail!("speak abort-judge turn refused");
+        };
+        Ok(judgement.inform_now)
     }
 
     async fn record_streaming_progress(&self, draft: &GenerationDraft) {
