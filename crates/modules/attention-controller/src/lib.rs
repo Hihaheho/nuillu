@@ -88,7 +88,6 @@ pub struct AttentionControllerModule {
     session: Session,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
-    initial_batch_pending: bool,
 }
 
 impl AttentionControllerModule {
@@ -113,7 +112,6 @@ impl AttentionControllerModule {
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            initial_batch_pending: true,
         }
     }
 

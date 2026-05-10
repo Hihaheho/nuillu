@@ -3223,7 +3223,7 @@ prompt = "What am I attending to?"
     }
 
     #[test]
-    fn full_agent_allocation_bootstraps_controller_instead_of_every_module() {
+    fn full_agent_allocation_starts_speech_path_inactive() {
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
