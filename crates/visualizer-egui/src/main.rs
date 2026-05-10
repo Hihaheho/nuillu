@@ -1,4 +1,7 @@
-use eframe::egui;
+pub use eframe;
+pub use egui;
+pub use egui_hooks;
+
 use egui::{Pos2, Vec2, Window};
 use egui_hooks::UseHookExt;
 
@@ -39,6 +42,7 @@ impl ChatWindow {
     fn ui(self, ui: &mut egui::Ui) {
         let pos = ui.use_persisted_state(|| Pos2::new(0.0, 0.0), ());
         if let Some(res) = Window::new("Chat")
+            .id("Chat".into())
             .current_pos(*pos)
             .movable(true)
             .show(ui.ctx(), |ui| {})
