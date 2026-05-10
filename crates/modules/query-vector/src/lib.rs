@@ -16,7 +16,8 @@ mod batch;
 pub use batch::NextBatch as QueryVectorBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
-Choose vector-memory searches only. Use search_vector_memory for factual memory lookup, then stop.
+Choose vector-memory searches only. Use search_vector_memory for factual memory lookup when needed,
+then stop.
 If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
 phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
@@ -24,9 +25,11 @@ question is available.
 You may call search_vector_memory multiple times in the same turn when the input contains multiple
 distinct questions or evidence requests. Prefer multiple targeted searches in one turn over broad
 generic searches or later follow-up turns.
+If the requested facts are already covered by prior query-vector memo logs, previous tool results,
+or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
-results. You must call search_vector_memory. The runtime memoizes only memory hit content returned
-by tools. Any final text is ignored; do not use a final answer as a data channel."#;
+results. The runtime memoizes only memory hit content returned by tools. Any final text is ignored;
+do not use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_VECTOR_SESSION_PREFIX: &str = "Compacted query-vector session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-vector module's persistent session history.
@@ -55,13 +58,28 @@ pub struct QueryVectorMemoryHit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryVectorMemo {
+    pub requests: Vec<String>,
+    pub searches: Vec<QueryVectorMemoSearch>,
     pub hits: Vec<QueryVectorMemoHit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryVectorMemoSearch {
+    pub query: String,
+    pub limit: usize,
+    pub hit_indices: Vec<MemoryIndex>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryVectorMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
+}
+
+#[derive(Debug, Default)]
+struct QueryVectorRetrieval {
+    searches: Vec<QueryVectorMemoSearch>,
+    hits: Vec<QueryVectorMemoryHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -134,8 +152,8 @@ impl QueryVectorModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let hits = self.search_with_memory(cx, &questions).await?;
-        self.write_hits(&hits).await
+        let retrieval = self.search_with_memory(cx, &questions).await?;
+        self.write_retrieval(&questions, retrieval).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -154,15 +172,22 @@ impl QueryVectorModule {
                 format!("Find stable memory that clarifies this cognition-log context: {latest}")
             })
             .await;
-        let hits = self.search_with_memory(cx, &[question]).await?;
-        self.write_hits(&hits).await
+        let questions = [question];
+        let retrieval = self.search_with_memory(cx, &questions).await?;
+        self.write_retrieval(&questions, retrieval).await
     }
 
-    async fn write_hits(&self, hits: &[QueryVectorMemoryHit]) -> Result<()> {
-        let hits = self.fresh_hits(hits).await;
-        let content = hit_contents(&hits);
+    async fn write_retrieval(
+        &self,
+        requests: &[String],
+        retrieval: QueryVectorRetrieval,
+    ) -> Result<()> {
+        let hits = self.fresh_hits(&retrieval.hits).await;
+        let content = render_memo(requests, &retrieval.searches, &hits);
         if !content.is_empty() {
             let payload = QueryVectorMemo {
+                requests: requests.to_vec(),
+                searches: retrieval.searches,
                 hits: hits
                     .iter()
                     .map(|hit| QueryVectorMemoHit {
@@ -194,9 +219,10 @@ impl QueryVectorModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
-    ) -> Result<Vec<QueryVectorMemoryHit>> {
+    ) -> Result<QueryVectorRetrieval> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_unread_memo_logs(&mut self.session, &unread_memo_logs);
+        let prior_query_vector_searches = self.prior_query_vector_searches().await;
         let snapshot = self
             .blackboard
             .read(|bb| {
@@ -219,6 +245,7 @@ impl QueryVectorModule {
             serde_json::json!({
                 "blackboard": snapshot,
                 "allocation": allocation,
+                "prior_query_vector_searches": prior_query_vector_searches,
             })
             .to_string(),
         );
@@ -229,7 +256,6 @@ impl QueryVectorModule {
             .text_turn(&lutum)
             .tools::<QueryVectorTools>()
             .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
-            .require_tool(QueryVectorToolsSelector::SearchVectorMemory)
             .collect()
             .await
             .context("query-vector text turn failed")?;
@@ -246,21 +272,38 @@ impl QueryVectorModule {
                     SESSION_COMPACTION_PROMPT,
                 )
                 .await;
-                anyhow::bail!("query-vector completed without calling search_vector_memory");
+                Ok(QueryVectorRetrieval::default())
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let input_tokens = round.usage.input_tokens;
                 if round.tool_calls.is_empty() {
-                    anyhow::bail!("query-vector produced no valid search_vector_memory tool calls");
+                    compact_session_if_needed(
+                        &mut self.session,
+                        input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(QueryVectorRetrieval::default());
                 }
                 let mut all_hits = Vec::new();
+                let mut searches = Vec::new();
                 let mut tool_results: Vec<ToolResult> = Vec::new();
                 for call in round.tool_calls.iter().cloned() {
                     let QueryVectorToolsCall::SearchVectorMemory(call) = call;
+                    let input = call.input.clone();
                     let output = self
-                        .search_vector_memory(call.input.clone())
+                        .search_vector_memory(input.clone())
                         .await
                         .context("run search_vector_memory tool")?;
+                    searches.push(QueryVectorMemoSearch {
+                        query: input.query,
+                        limit: input.limit.clamp(1, 16),
+                        hit_indices: output.hits.iter().map(|hit| hit.index.clone()).collect(),
+                    });
                     all_hits.extend(output.hits.clone());
                     tool_results.push(
                         call.complete(output)
@@ -280,9 +323,37 @@ impl QueryVectorModule {
                     SESSION_COMPACTION_PROMPT,
                 )
                 .await;
-                Ok(all_hits)
+                Ok(QueryVectorRetrieval {
+                    searches,
+                    hits: all_hits,
+                })
             }
         }
+    }
+
+    async fn prior_query_vector_searches(&self) -> serde_json::Value {
+        let records = self.memo.recent_logs().await;
+        serde_json::Value::Array(
+            records
+                .iter()
+                .map(|record| {
+                    let data = record.data();
+                    serde_json::json!({
+                        "index": record.index,
+                        "written_at": record.written_at,
+                        "requests": data.requests,
+                        "searches": data.searches.iter().map(|search| {
+                            serde_json::json!({
+                                "query": search.query,
+                                "limit": search.limit,
+                                "hit_indices": search.hit_indices,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "hit_indices": data.hits.iter().map(|hit| &hit.index).collect::<Vec<_>>(),
+                    })
+                })
+                .collect(),
+        )
     }
 
     async fn search_vector_memory(
@@ -319,6 +390,38 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     contents.join("\n\n")
 }
 
+fn render_memo(
+    requests: &[String],
+    searches: &[QueryVectorMemoSearch],
+    hits: &[QueryVectorMemoryHit],
+) -> String {
+    let retrieved = hit_contents(hits);
+    if retrieved.is_empty() {
+        return String::new();
+    }
+
+    let mut sections = Vec::new();
+    let request_lines = bullet_lines(requests.iter().map(String::as_str));
+    if !request_lines.is_empty() {
+        sections.push(format!("Query intent:\n{request_lines}"));
+    }
+    let search_lines = bullet_lines(searches.iter().map(|search| search.query.as_str()));
+    if !search_lines.is_empty() {
+        sections.push(format!("Search queries:\n{search_lines}"));
+    }
+    sections.push(format!("Retrieved memories:\n{retrieved}"));
+    sections.join("\n\n")
+}
+
+fn bullet_lines<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[async_trait(?Send)]
 impl Module for QueryVectorModule {
     type Batch = QueryVectorBatch;
@@ -328,7 +431,7 @@ impl Module for QueryVectorModule {
     }
 
     fn role_description() -> &'static str {
-        "Recalls stored memories by semantic similarity: writes relevant memory evidence to its memo log on QueryRequest or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
+        "Recalls stored memories by semantic similarity when evidence is not already available: writes query intent and fresh memory evidence to its memo log on QueryRequest or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -450,6 +553,23 @@ mod tests {
         ])
     }
 
+    fn final_text_scenario(id: &str) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some(id.into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: "already covered".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some(id.into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
     fn memory_record(index: &str, content: &str) -> MemoryRecord {
         MemoryRecord {
             index: MemoryIndex::new(index),
@@ -517,9 +637,18 @@ mod tests {
         runtime: &nuillu_module::AgentRuntimeControl,
         module: &mut nuillu_module::AllocatedModule,
     ) {
+        activate_query_with_question(caps, runtime, module, "koro").await;
+    }
+
+    async fn activate_query_with_question(
+        caps: &CapabilityProviders,
+        runtime: &nuillu_module::AgentRuntimeControl,
+        module: &mut nuillu_module::AllocatedModule,
+        question: &str,
+    ) {
         caps.internal_harness_io()
             .query_mailbox()
-            .publish(QueryRequest::new("koro"))
+            .publish(QueryRequest::new(question))
             .await
             .expect("query published");
         let batch = module.next_batch().await.expect("query batch received");
@@ -534,7 +663,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn query_vector_does_not_write_repeated_memory_index() {
+    async fn query_vector_memo_includes_request_search_query_and_fresh_memory() {
+        let blackboard = Blackboard::default();
+        let store = Arc::new(MutableMemoryStore::default());
+        store.set_records(vec![memory_record(
+            "mem-1",
+            "Koro approaches from the left.",
+        )]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(tool_scenario("first"));
+        let caps = test_caps(blackboard.clone(), store.clone(), adapter);
+        let (runtime, mut module) = build_query_vector(&caps).await;
+
+        activate_query_with_question(&caps, &runtime, &mut module, "food bowl clue").await;
+
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].content,
+            "Query intent:\n- food bowl clue\n\nSearch queries:\n- koro\n\nRetrieved memories:\nKoro approaches from the left."
+        );
+
+        let typed_logs = blackboard.typed_memo_logs::<QueryVectorMemo>(&owner).await;
+        assert_eq!(typed_logs.len(), 1);
+        assert_eq!(
+            typed_logs[0].data(),
+            &QueryVectorMemo {
+                requests: vec!["food bowl clue".into()],
+                searches: vec![QueryVectorMemoSearch {
+                    query: "koro".into(),
+                    limit: 8,
+                    hit_indices: vec![MemoryIndex::new("mem-1")],
+                }],
+                hits: vec![QueryVectorMemoHit {
+                    index: MemoryIndex::new("mem-1"),
+                    rank: MemoryRank::Permanent,
+                }],
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_equivalent_query_can_finish_without_tool_and_writes_no_memo() {
+        let blackboard = Blackboard::default();
+        let store = Arc::new(MutableMemoryStore::default());
+        store.set_records(vec![memory_record(
+            "mem-1",
+            "Koro approaches from the left.",
+        )]);
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(tool_scenario("first"))
+            .with_text_scenario(final_text_scenario("second"));
+        let caps = test_caps(blackboard.clone(), store.clone(), adapter);
+        let (runtime, mut module) = build_query_vector(&caps).await;
+
+        activate_query(&caps, &runtime, &mut module).await;
+        activate_query(&caps, &runtime, &mut module).await;
+
+        let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].content.contains("Koro approaches from the left."));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_returning_only_previously_memoized_hits_writes_no_memo() {
         let blackboard = Blackboard::default();
         let store = Arc::new(MutableMemoryStore::default());
         store.set_records(vec![memory_record(
@@ -553,13 +745,19 @@ mod tests {
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].content, "Koro approaches from the left.");
+        assert!(logs[0].content.contains("Koro approaches from the left."));
 
         let typed_logs = blackboard.typed_memo_logs::<QueryVectorMemo>(&owner).await;
         assert_eq!(typed_logs.len(), 1);
         assert_eq!(
             typed_logs[0].data(),
             &QueryVectorMemo {
+                requests: vec!["koro".into()],
+                searches: vec![QueryVectorMemoSearch {
+                    query: "koro".into(),
+                    limit: 8,
+                    hit_indices: vec![MemoryIndex::new("mem-1")],
+                }],
                 hits: vec![QueryVectorMemoHit {
                     index: MemoryIndex::new("mem-1"),
                     rank: MemoryRank::Permanent,
@@ -592,14 +790,27 @@ mod tests {
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
         assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0].content, "Koro approaches from the left.");
-        assert_eq!(logs[1].content, "Koro relaxes when the route is clear.");
+        assert!(logs[0].content.contains("Koro approaches from the left."));
+        assert!(logs[1].content.contains("Query intent:\n- koro"));
+        assert!(logs[1].content.contains("Search queries:\n- koro"));
+        assert!(
+            logs[1]
+                .content
+                .contains("Koro relaxes when the route is clear.")
+        );
+        assert!(!logs[1].content.contains("Koro approaches from the left."));
 
         let typed_logs = blackboard.typed_memo_logs::<QueryVectorMemo>(&owner).await;
         assert_eq!(typed_logs.len(), 2);
         assert_eq!(
             typed_logs[1].data(),
             &QueryVectorMemo {
+                requests: vec!["koro".into()],
+                searches: vec![QueryVectorMemoSearch {
+                    query: "koro".into(),
+                    limit: 8,
+                    hit_indices: vec![MemoryIndex::new("mem-1"), MemoryIndex::new("mem-2")],
+                }],
                 hits: vec![QueryVectorMemoHit {
                     index: MemoryIndex::new("mem-2"),
                     rank: MemoryRank::Permanent,

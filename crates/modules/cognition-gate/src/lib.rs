@@ -26,6 +26,8 @@ If allocation guidance asks for speech evidence promotion and a query, self-mode
 other memo contains the requested fact, promote that fact into the cognition log in plain speech-ready form.
 Include the retrieved fact and the immediate cognition-log question or peer situation. Do not promote
 generic advice, speculation, hidden module mechanics, or facts not present in memos.
+In query-vector memos, "Query intent" and "Search queries" describe retrieval intent; use them as
+context, but promote retrieved memory facts rather than treating query text itself as a world fact.
 Return only raw JSON for the structured object;
 do not wrap it in Markdown or code fences."#;
 
