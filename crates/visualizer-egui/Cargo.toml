@@ -1,0 +1,19 @@
+[package]
+name = "nuillu-visualizer-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "visualizer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.34.2", features = ["persistence"] }
+egui = "0.34.2"
+egui_hooks = { version = "0.11.0", features = ["persistence"] }
+
+[lints]
+workspace = true

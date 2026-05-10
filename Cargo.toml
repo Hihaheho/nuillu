@@ -9,7 +9,7 @@ members = [
     "crates/adapters/libsql",
     "crates/adapters/model2vec",
     "crates/modules/*",
-    "crates/eval",
+    "crates/eval", "crates/visualizer-egui",
 ]
 
 [workspace.package]
