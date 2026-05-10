@@ -10,7 +10,9 @@ use thiserror::Error;
 /// the type system. Module ids are kebab-case: lowercase ASCII words separated
 /// by single hyphens. The well-known cognitive modules from the design have
 /// constants in [`builtin`] for ergonomic equality checks and routing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct ModuleId(String);
 
 impl ModuleId {

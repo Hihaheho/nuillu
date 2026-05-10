@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, builtin};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, builtin};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
@@ -780,17 +780,13 @@ impl BlackboardInner {
             .collect();
 
         let mut effective = ResourceAllocation::default();
+        // Carry host-set tier and activation-table state through unchanged.
+        effective.set_activation_table(self.base_allocation.activation_table().to_vec());
+        for (id, tier) in self.base_allocation.iter_model_override() {
+            effective.set_model_override(id.clone(), tier);
+        }
         for id in module_ids {
-            let configs = active_proposals
-                .iter()
-                .map(|(_, proposal)| {
-                    proposal
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| self.base_allocation.for_module(&id))
-                })
-                .collect::<Vec<_>>();
-            let count = configs.len() as u32;
+            let count = active_proposals.len() as u32;
             let activation_sum = active_proposals
                 .iter()
                 .map(|(_, proposal)| {
@@ -802,10 +798,6 @@ impl BlackboardInner {
                     u32::from(ratio.raw())
                 })
                 .sum::<u32>();
-            let tier_sum = configs
-                .iter()
-                .map(|cfg| tier_to_ordinal(cfg.tier))
-                .sum::<u32>();
             let guidance =
                 combine_guidance(active_proposals.iter().filter_map(|(owner, proposal)| {
                     proposal
@@ -813,13 +805,7 @@ impl BlackboardInner {
                         .map(|cfg| (owner.to_string(), cfg.guidance.trim().to_owned()))
                 }));
 
-            effective.set(
-                id.clone(),
-                crate::ModuleConfig {
-                    tier: ordinal_to_tier(rounded_div(tier_sum, count)),
-                    guidance,
-                },
-            );
+            effective.set(id.clone(), crate::ModuleConfig { guidance });
             effective.set_activation(
                 id,
                 crate::ActivationRatio::from_raw(rounded_div(activation_sum, count) as u16),
@@ -863,23 +849,6 @@ fn combine_guidance(items: impl IntoIterator<Item = (String, String)>) -> String
         .map(|(owner, guidance)| format!("{owner}: {guidance}"))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn tier_to_ordinal(tier: ModelTier) -> u32 {
-    match tier {
-        ModelTier::Cheap => 0,
-        ModelTier::Default => 1,
-        ModelTier::Premium => 2,
-    }
-}
-
-fn ordinal_to_tier(ordinal: u32) -> ModelTier {
-    match ordinal {
-        0 => ModelTier::Cheap,
-        1 => ModelTier::Default,
-        2 => ModelTier::Premium,
-        other => unreachable!("model tier ordinal {other} is outside the known tier range"),
-    }
 }
 
 #[cfg(test)]
@@ -1056,7 +1025,6 @@ mod tests {
             builtin::query_vector(),
             crate::ModuleConfig {
                 guidance: "query cheaply".into(),
-                tier: ModelTier::Cheap,
             },
         );
         proposal_a.set_activation(
@@ -1067,7 +1035,6 @@ mod tests {
             builtin::speak(),
             crate::ModuleConfig {
                 guidance: "wait".into(),
-                ..Default::default()
             },
         );
         proposal_a.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
@@ -1077,7 +1044,6 @@ mod tests {
             builtin::query_vector(),
             crate::ModuleConfig {
                 guidance: "query deeply".into(),
-                tier: ModelTier::Premium,
             },
         );
         proposal_b.set_activation(builtin::query_vector(), crate::ActivationRatio::ONE);
@@ -1085,7 +1051,6 @@ mod tests {
             builtin::speak(),
             crate::ModuleConfig {
                 guidance: "respond if attention is ready".into(),
-                ..Default::default()
             },
         );
         proposal_b.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
@@ -1112,7 +1077,10 @@ mod tests {
         let query_activation = effective.activation_for(&builtin::query_vector());
         assert_eq!(effective.active_replicas(&builtin::query_vector()), 2);
         assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
-        assert_eq!(query.tier, ModelTier::Default);
+        assert_eq!(
+            effective.tier_for(&builtin::query_vector()),
+            ModelTier::Default
+        );
         assert_eq!(
             query.guidance,
             "attention-controller: query cheaply\nattention-controller[1]: query deeply"
@@ -1196,7 +1164,6 @@ mod tests {
             unknown.clone(),
             crate::ModuleConfig {
                 guidance: "ignore me".into(),
-                tier: ModelTier::Premium,
             },
         );
         proposal.set_activation(unknown.clone(), crate::ActivationRatio::ONE);

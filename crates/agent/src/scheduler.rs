@@ -1085,13 +1085,7 @@ mod tests {
         local
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    echo_id(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(echo_id(), ModuleConfig::default());
                 alloc.set_activation(echo_id(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1219,13 +1213,7 @@ mod tests {
             .run_until(async {
                 let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1302,13 +1290,7 @@ mod tests {
             .run_until(async {
                 let module_id = ModuleId::new(TimedQueryBatchRecorder::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1385,13 +1367,7 @@ mod tests {
             .run_until(async {
                 let module_id = ModuleId::new(TimedQueryBatchRecorder::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1465,13 +1441,7 @@ mod tests {
             .run_until(async {
                 let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::from_f64(0.5));
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1520,13 +1490,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(50)).await;
 
                     let mut raised = ResourceAllocation::default();
-                    raised.set(
-                        module_id.clone(),
-                        ModuleConfig {
-                            tier: ModelTier::Default,
-                            ..Default::default()
-                        },
-                    );
+                    raised.set(module_id.clone(), ModuleConfig::default());
                     raised.set_activation(module_id, ActivationRatio::ONE);
                     let started = tokio::time::Instant::now();
                     blackboard
@@ -1558,13 +1522,7 @@ mod tests {
                     nuillu_types::ReplicaIndex::ZERO,
                 );
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1611,13 +1569,7 @@ mod tests {
                     nuillu_types::ReplicaIndex::ZERO,
                 );
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    module_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(module_id.clone(), ModuleConfig::default());
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1669,13 +1621,7 @@ mod tests {
         local
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    builtin::cognition_gate(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(builtin::cognition_gate(), ModuleConfig::default());
                 alloc.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1723,13 +1669,7 @@ mod tests {
             .run_until(async {
                 let retry_id = ModuleId::new(RetryStub::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    retry_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(retry_id.clone(), ModuleConfig::default());
                 alloc.set_activation(retry_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1788,13 +1728,7 @@ mod tests {
             .run_until(async {
                 let fail_id = ModuleId::new(AlwaysFailStub::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    fail_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(fail_id.clone(), ModuleConfig::default());
                 alloc.set_activation(fail_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
@@ -1851,13 +1785,7 @@ mod tests {
             .run_until(async {
                 let observer_id = ModuleId::new(DeadlockObserver::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
-                alloc.set(
-                    observer_id.clone(),
-                    ModuleConfig {
-                        tier: ModelTier::Default,
-                        ..Default::default()
-                    },
-                );
+                alloc.set(observer_id.clone(), ModuleConfig::default());
                 alloc.set_activation(observer_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);

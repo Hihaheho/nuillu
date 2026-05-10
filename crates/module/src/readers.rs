@@ -149,7 +149,7 @@ impl AllocationReader {
         let ids = self.registered_module_ids().await;
         let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
 
-        let patch_items = if module_ids.is_empty() {
+        let priority_items = if module_ids.is_empty() {
             serde_json::Value::Bool(false)
         } else {
             serde_json::json!({
@@ -159,23 +159,12 @@ impl AllocationReader {
                     "module_id": {
                         "enum": module_ids,
                     },
-                    "activation_ratio": {
-                        "type": "number",
-                        "description": "Runtime clamps activation_ratio to 0.0..=1.0 before deriving active replicas.",
-                    },
-                    "guidance": {
+                    "hint": {
                         "type": "string",
-                    },
-                    "tier": {
-                        "enum": ["Cheap", "Default", "Premium"],
+                        "description": "One concise sentence justifying why this module needs activation right now.",
                     },
                 },
-                "required": [
-                    "module_id",
-                    "activation_ratio",
-                    "guidance",
-                    "tier",
-                ],
+                "required": ["module_id", "hint"],
             })
         };
 
@@ -186,12 +175,13 @@ impl AllocationReader {
                 "memo": {
                     "type": "string",
                 },
-                "allocations": {
+                "priority": {
                     "type": "array",
-                    "items": patch_items,
+                    "description": "Modules to activate, in descending priority order. Modules omitted from this list receive zero activation. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                    "items": priority_items,
                 },
             },
-            "required": ["memo", "allocations"],
+            "required": ["memo", "priority"],
         })
     }
 }
@@ -273,8 +263,9 @@ mod tests {
                     "memo": {
                         "type": "string",
                     },
-                    "allocations": {
+                    "priority": {
                         "type": "array",
+                        "description": "Modules to activate, in descending priority order. Modules omitted from this list receive zero activation. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -282,27 +273,16 @@ mod tests {
                                 "module_id": {
                                     "enum": ["query-vector", "speak"],
                                 },
-                                "activation_ratio": {
-                                    "type": "number",
-                                    "description": "Runtime clamps activation_ratio to 0.0..=1.0 before deriving active replicas.",
-                                },
-                                "guidance": {
+                                "hint": {
                                     "type": "string",
-                                },
-                                "tier": {
-                                    "enum": ["Cheap", "Default", "Premium"],
+                                    "description": "One concise sentence justifying why this module needs activation right now.",
                                 },
                             },
-                            "required": [
-                                "module_id",
-                                "activation_ratio",
-                                "guidance",
-                                "tier",
-                            ],
+                            "required": ["module_id", "hint"],
                         },
                     },
                 },
-                "required": ["memo", "allocations"],
+                "required": ["memo", "priority"],
             })
         );
     }

@@ -63,12 +63,12 @@ impl LlmAccess {
                 .await;
         }
 
-        let cfg = self
+        let tier = self
             .blackboard
-            .read(|bb| bb.allocation().for_module(&self.owner.module))
+            .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
-        self.events.llm_accessed(self.owner.clone(), cfg.tier).await;
-        self.tiers.pick(cfg.tier)
+        self.events.llm_accessed(self.owner.clone(), tier).await;
+        self.tiers.pick(tier)
     }
 }
 
@@ -79,7 +79,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
-    use nuillu_blackboard::{Blackboard, ModuleConfig, ResourceAllocation};
+    use nuillu_blackboard::{Blackboard, ResourceAllocation};
     use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
 
     use crate::ports::PortError;
@@ -104,13 +104,7 @@ mod tests {
     #[tokio::test]
     async fn lutum_emits_one_runtime_event_per_acquisition() {
         let mut allocation = ResourceAllocation::default();
-        allocation.set(
-            builtin::cognition_gate(),
-            ModuleConfig {
-                tier: ModelTier::Premium,
-                ..Default::default()
-            },
-        );
+        allocation.set_model_override(builtin::cognition_gate(), ModelTier::Premium);
         let blackboard = Blackboard::with_allocation(allocation);
         let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let adapter = Arc::new(MockLlmAdapter::new());

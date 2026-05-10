@@ -9,26 +9,32 @@ use nuillu_module::{
     MemoUpdatedInbox, Module, SessionCompactionConfig, compact_session_if_needed,
     push_unread_memo_logs,
 };
-use nuillu_types::{ModelTier, ModuleId};
+use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
-You wake on memo updates. Use blackboard memos, the cognition log, current allocation, and
-registry schema to write guidance-based allocation for registered modules.
-Return one allocation entry for every registered module. Use guidance to tell modules what work
-should be done now and what other module work should be considered. Do not invent module ids.
-The memo field is a free-form controller note for the shared memo surface; preserve the reasoning
-needed by other modules, but do not encode that memo text as JSON, YAML, a code block, or any fixed
-schema.
+You wake on memo updates. Use blackboard memos, the cognition log, the current allocation, and
+the registry schema to decide which modules deserve activation right now.
+
+Output shape: a `memo` (free-form controller note for the shared memo surface) plus a `priority`
+array. The array lists modules to activate in descending priority order, each entry pairing a
+`module_id` (must be a registered module) with a `hint` — one concise sentence saying why that
+module needs activation now. Modules you omit receive zero activation; their typed mailboxes still
+flow because each module keeps a minimum replica. Position in the array maps to the host-configured
+activation table; positions beyond the table fall to zero, so prioritise tightly. Do not invent
+module ids and do not duplicate ids.
 
 Speech output is driven by a typed SpeakRequest from speak-gate to speak, not by allocation
-guidance. Do not use speak guidance as a speech protocol. Speech is the agent's primary outward
-action in its world, not a chat-style response gated on a user request — keep speak and speak-gate
-fully active so the agent can address peers, answer questions directed at it, and express
-in-world intent. Suppressing speak/speak-gate is suppressing the agent's voice.
+priority. Speech is the agent's primary outward action in its world, not a chat-style response
+gated on a user request — keep speak and speak-gate near the top of priority so the agent can
+address peers, answer questions directed at it, and express in-world intent. Dropping speak or
+speak-gate from the priority list is suppressing the agent's voice.
+
+The memo field is a free-form controller note; preserve the reasoning needed by other modules but
+do not encode it as JSON, YAML, a code block, or any fixed schema.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 const COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX: &str =
@@ -45,7 +51,7 @@ tokio::task_local! {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllocationDecision {
     pub memo: String,
-    pub allocations: Vec<AllocationEntry>,
+    pub priority: Vec<PriorityEntry>,
 }
 
 impl JsonSchema for AllocationDecision {
@@ -69,11 +75,9 @@ impl JsonSchema for AllocationDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct AllocationEntry {
+pub struct PriorityEntry {
     pub module_id: String,
-    pub activation_ratio: f64,
-    pub guidance: String,
-    pub tier: ModelTier,
+    pub hint: String,
 }
 
 pub struct AttentionControllerModule {
@@ -216,7 +220,19 @@ fn apply_decision(
     decision: AllocationDecision,
 ) -> AppliedDecision {
     let mut next = current;
-    for entry in decision.allocations {
+    let table = next.activation_table().to_vec();
+
+    // Controller's baseline: zero out every registered module. Entries listed
+    // in `priority` will overwrite below; everything else stays at 0.0 so the
+    // module relies on its replicas-min floor only.
+    for id in registered {
+        next.set_activation(id.clone(), ActivationRatio::ZERO);
+        let mut config: ModuleConfig = next.for_module(id);
+        config.guidance.clear();
+        next.set(id.clone(), config);
+    }
+
+    for (rank, entry) in decision.priority.into_iter().enumerate() {
         let Ok(id) = ModuleId::new(entry.module_id) else {
             tracing::warn!("attention-controller ignored invalid module id");
             continue;
@@ -225,11 +241,11 @@ fn apply_decision(
             tracing::warn!(module = %id, "attention-controller ignored unregistered module id");
             continue;
         }
+        let ratio = table.get(rank).copied().unwrap_or(ActivationRatio::ZERO);
         let mut config: ModuleConfig = next.for_module(&id);
-        config.guidance = entry.guidance;
-        config.tier = entry.tier;
+        config.guidance = entry.hint;
         next.set(id.clone(), config);
-        next.set_activation(id, ActivationRatio::from_f64(entry.activation_ratio));
+        next.set_activation(id, ratio);
     }
 
     AppliedDecision {
@@ -246,12 +262,12 @@ fn fallback_allocation_decision_schema() -> Schema {
             "memo": {
                 "type": "string",
             },
-            "allocations": {
+            "priority": {
                 "type": "array",
                 "items": false,
             },
         },
-        "required": ["memo", "allocations"],
+        "required": ["memo", "priority"],
     }))
     .expect("fallback allocation decision schema must be a JSON object")
 }
@@ -279,7 +295,7 @@ impl Module for AttentionControllerModule {
     }
 
     fn role_description() -> &'static str {
-        "Allocates resources across modules — writes activation, guidance, and tier per registered module on memo updates."
+        "Allocates resources across modules — emits a priority-ordered list of modules to activate, each with a one-line hint, on memo updates. Tier is host-fixed; activation_ratio comes from a host-set table indexed by priority position."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -304,46 +320,71 @@ mod tests {
     use nuillu_types::builtin;
 
     #[test]
-    fn apply_decision_ignores_unregistered_modules_and_clamps_activation_ratio() {
+    fn apply_decision_assigns_table_by_rank_and_zeroes_unlisted() {
         let mut registered = std::collections::HashSet::new();
         registered.insert(builtin::speak());
+        registered.insert(builtin::sensory());
+        registered.insert(builtin::cognition_gate());
+
+        let mut current = ResourceAllocation::default();
+        current.set_activation_table(vec![ActivationRatio::ONE, ActivationRatio::from_f64(0.5)]);
+        // Stale activation that the controller should clear because the module
+        // is not in the new priority list.
+        current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
         let applied = apply_decision(
-            ResourceAllocation::default(),
+            current,
             &registered,
             AllocationDecision {
                 memo: "checked".into(),
-                allocations: vec![
-                    AllocationEntry {
+                priority: vec![
+                    PriorityEntry {
                         module_id: "invented-module".into(),
-                        activation_ratio: 1.0,
-                        guidance: "ignore".into(),
-                        tier: ModelTier::Premium,
+                        hint: "ignore".into(),
                     },
-                    AllocationEntry {
+                    PriorityEntry {
                         module_id: "speak".into(),
-                        activation_ratio: 9.0,
-                        guidance: "respond from cognition log when ready".into(),
-                        tier: ModelTier::Premium,
+                        hint: "respond from cognition log when ready".into(),
+                    },
+                    PriorityEntry {
+                        module_id: "sensory".into(),
+                        hint: "keep watching the food bowl".into(),
                     },
                 ],
             },
         );
 
         assert_eq!(applied.memo, "checked");
+        // Unregistered module is dropped.
         assert!(
             applied
                 .allocation
                 .get(&ModuleId::new("invented-module").unwrap())
                 .is_none()
         );
-        let speak = applied.allocation.for_module(&builtin::speak());
+        // Speak landed at rank 1 (after the discarded invented-module entry):
+        // table[1] = 0.5.
         assert_eq!(
             applied.allocation.activation_for(&builtin::speak()),
-            ActivationRatio::ONE
+            ActivationRatio::from_f64(0.5)
         );
-        assert_eq!(speak.guidance, "respond from cognition log when ready");
-        assert_eq!(speak.tier, ModelTier::Premium);
+        assert_eq!(
+            applied.allocation.for_module(&builtin::speak()).guidance,
+            "respond from cognition log when ready"
+        );
+        // Sensory landed at rank 2; table only has 2 entries so the rest fall
+        // to ZERO.
+        assert_eq!(
+            applied.allocation.activation_for(&builtin::sensory()),
+            ActivationRatio::ZERO
+        );
+        // Cognition-gate was registered but absent from priority — zero.
+        assert_eq!(
+            applied
+                .allocation
+                .activation_for(&builtin::cognition_gate()),
+            ActivationRatio::ZERO
+        );
     }
 
     #[test]

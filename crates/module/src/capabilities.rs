@@ -950,7 +950,7 @@ mod tests {
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
         ResourceAllocation, UtteranceProgress,
     };
-    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ReplicaCapRange, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ReplicaCapRange, builtin};
 
     use crate::ports::{
         CognitionLogRepository, FileSearchProvider, IndexedMemory, MemoryQuery, MemoryRecord,
@@ -1382,7 +1382,6 @@ mod tests {
             builtin::cognition_gate(),
             ModuleConfig {
                 guidance: "promote current sensory memo into attention".into(),
-                tier: ModelTier::Default,
             },
         );
         proposal.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);

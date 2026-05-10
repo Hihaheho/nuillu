@@ -1377,6 +1377,7 @@ fn full_agent_allocation(
     modules: &[EvalModule],
 ) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
+    allocation.set_activation_table(eval_activation_table());
 
     for module in modules {
         match module {
@@ -1482,10 +1483,12 @@ fn module_allocation(
     modules: &[EvalModule],
 ) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
+    allocation.set_activation_table(eval_activation_table());
     let target_module = target.module();
     for module in modules {
         let is_target = *module == target_module;
         let id = module.module_id();
+        allocation.set_model_override(id.clone(), eval_module_tier(*module));
         allocation.set(
             id.clone(),
             ModuleConfig {
@@ -1495,7 +1498,6 @@ fn module_allocation(
                     "Registered for this module eval; idle unless activated by a typed signal."
                         .into()
                 },
-                tier: eval_module_tier(*module),
             },
         );
         allocation.set_activation(
@@ -1517,14 +1519,21 @@ fn set_allocation_module(
     tier: ModelTier,
     guidance: impl Into<String>,
 ) {
+    allocation.set_model_override(id.clone(), tier);
     allocation.set(
         id.clone(),
         ModuleConfig {
             guidance: guidance.into(),
-            tier,
         },
     );
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
+}
+
+fn eval_activation_table() -> Vec<ActivationRatio> {
+    [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
+        .into_iter()
+        .map(ActivationRatio::from_f64)
+        .collect()
 }
 
 fn module_id_for_target(target: ModuleEvalTarget) -> ModuleId {
@@ -1671,7 +1680,7 @@ fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationMod
             module: module.as_str().to_owned(),
             activation_ratio: allocation.activation_for(module).as_f64(),
             active_replicas: allocation.active_replicas(module),
-            tier: model_tier_name(config.tier).to_owned(),
+            tier: model_tier_name(allocation.tier_for(module)).to_owned(),
             guidance: DumpText::new(config.guidance.clone()),
         })
         .collect::<Vec<_>>();
@@ -1877,7 +1886,7 @@ fn allocation_observation(
                 AllocationModuleObservation {
                     activation_ratio: allocation.activation_for(module),
                     guidance: config.guidance.clone(),
-                    tier: config.tier,
+                    tier: allocation.tier_for(module),
                 },
             )
         })
@@ -1916,12 +1925,11 @@ fn active_module_observations(bb: &BlackboardInner) -> Vec<ActiveModuleObservati
             if active_replicas == 0 {
                 return None;
             }
-            let config = bb.allocation().for_module(&module);
             Some(ActiveModuleObservation {
                 module: module.as_str().to_owned(),
                 active_replicas,
                 activation_ratio: bb.allocation().activation_for(&module),
-                tier: config.tier,
+                tier: bb.allocation().tier_for(&module),
             })
         })
         .collect()
@@ -2828,11 +2836,11 @@ limits {{
     async fn agent_observation_serializes_string_keyed_blackboard_maps() {
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
         let mut allocation = ResourceAllocation::default();
+        allocation.set_model_override(builtin::query_vector(), ModelTier::Default);
         allocation.set(
             builtin::query_vector(),
             ModuleConfig {
                 guidance: "test guidance".into(),
-                tier: ModelTier::Default,
             },
         );
         allocation.set_activation(builtin::query_vector(), ActivationRatio::ONE);
@@ -3234,40 +3242,44 @@ prompt = "What am I attending to?"
             &selected,
         );
 
-        let sensory = allocation.for_module(&builtin::sensory());
         assert_eq!(
             allocation.activation_for(&builtin::sensory()),
             ActivationRatio::ZERO
         );
-        assert_eq!(sensory.tier, ModelTier::Cheap);
+        assert_eq!(allocation.tier_for(&builtin::sensory()), ModelTier::Cheap);
 
-        let cognition_gate = allocation.for_module(&builtin::cognition_gate());
         assert_eq!(
             allocation.activation_for(&builtin::cognition_gate()),
             ActivationRatio::ZERO
         );
-        assert_eq!(cognition_gate.tier, ModelTier::Cheap);
+        assert_eq!(
+            allocation.tier_for(&builtin::cognition_gate()),
+            ModelTier::Cheap
+        );
 
-        let controller = allocation.for_module(&builtin::attention_controller());
         assert_eq!(
             allocation.activation_for(&builtin::attention_controller()),
             ActivationRatio::ONE
         );
-        assert_eq!(controller.tier, ModelTier::Default);
+        assert_eq!(
+            allocation.tier_for(&builtin::attention_controller()),
+            ModelTier::Default
+        );
 
-        let speak_gate = allocation.for_module(&builtin::speak_gate());
         assert_eq!(
             allocation.activation_for(&builtin::speak_gate()),
             ActivationRatio::ZERO
         );
-        assert_eq!(speak_gate.tier, ModelTier::Premium);
+        assert_eq!(
+            allocation.tier_for(&builtin::speak_gate()),
+            ModelTier::Premium
+        );
 
-        let speak = allocation.for_module(&builtin::speak());
         assert_eq!(
             allocation.activation_for(&builtin::speak()),
             ActivationRatio::ZERO
         );
-        assert_eq!(speak.tier, ModelTier::Premium);
+        assert_eq!(allocation.tier_for(&builtin::speak()), ModelTier::Premium);
 
         for module in [
             builtin::attention_schema(),
