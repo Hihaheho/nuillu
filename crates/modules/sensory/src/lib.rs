@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, LlmAccess, Memo, Module, SensoryDetailRequest, SensoryDetailRequestInbox,
-    SensoryInput, SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed,
-    ports::Clock,
+    AllocationReader, AllocationUpdatedInbox, LlmAccess, Memo, Module, SensoryInput,
+    SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed, ports::Clock,
 };
 use serde::Serialize;
 use tokio::time::Instant;
@@ -70,7 +69,7 @@ struct StimulusState {
 pub struct SensoryModule {
     owner: nuillu_types::ModuleId,
     inbox: SensoryInputInbox,
-    detail_requests: SensoryDetailRequestInbox,
+    allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
@@ -102,7 +101,7 @@ impl Default for SensoryBurstConfig {
 impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
-        detail_requests: SensoryDetailRequestInbox,
+        allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         memo: Memo,
         clock: Arc<dyn Clock>,
@@ -112,7 +111,7 @@ impl SensoryModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("sensory id is valid"),
             inbox,
-            detail_requests,
+            allocation_updates,
             allocation,
             memo,
             clock,
@@ -282,19 +281,17 @@ impl SensoryModule {
         }
     }
 
-    async fn handle_detail_request(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        request: SensoryDetailRequest,
-    ) -> Result<()> {
+    async fn handle_detail_guidance(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let allocation = self.allocation.snapshot().await;
+        let guidance = allocation.for_module(&self.owner).guidance;
+        if guidance.trim().is_empty() {
+            return Ok(());
+        }
         let system_prompt = self.detail_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(
             serde_json::json!({
-                "sensory_detail_request": {
-                    "question": request.question,
-                },
+                "sensory_detail_request": guidance,
                 "retained_sensory_observations": &self.observations,
             })
             .to_string(),
@@ -388,18 +385,18 @@ impl SensoryModule {
         let mut batch = tokio::select! {
             input = self.inbox.next_item() => SensoryBatch {
                 inputs: vec![input?.body],
-                detail_requests: Vec::new(),
+                allocation_updated: false,
             },
-            request = self.detail_requests.next_item() => SensoryBatch {
+            update = self.allocation_updates.next_item() => {
+                let _ = update?;
+                SensoryBatch {
                 inputs: Vec::new(),
-                detail_requests: vec![request?.body],
-            },
+                    allocation_updated: true,
+                }
+            }
         };
         let ready = self.collect_ready_events_into_batch(&mut batch)?;
-        if !batch.inputs.is_empty()
-            && ready.detail_requests == 0
-            && batch.detail_requests.is_empty()
-        {
+        if !batch.inputs.is_empty() && ready.allocation_updates == 0 && !batch.allocation_updated {
             self.collect_sensory_burst(&mut batch).await?;
         }
         Ok(batch)
@@ -420,19 +417,20 @@ impl SensoryModule {
                     batch.inputs.push(input?.body);
                     waited += std::cmp::min(started.elapsed(), wait_for);
                     let ready = self.collect_ready_events_into_batch(batch)?;
-                    if ready.detail_requests > 0 {
+                    if ready.allocation_updates > 0 {
                         break;
                     }
                 }
-                request = self.detail_requests.next_item() => {
-                    batch.detail_requests.push(request?.body);
+                update = self.allocation_updates.next_item() => {
+                    let _ = update?;
+                    batch.allocation_updated = true;
                     let _ = self.collect_ready_events_into_batch(batch)?;
                     break;
                 }
                 _ = tokio::time::sleep(wait_for) => {
                     waited += wait_for;
                     let ready = self.collect_ready_events_into_batch(batch)?;
-                    if ready.detail_requests > 0 {
+                    if ready.allocation_updates > 0 {
                         break;
                     }
                     if ready.inputs == 0 {
@@ -451,18 +449,14 @@ impl SensoryModule {
             .inputs
             .extend(ready_inputs.items.into_iter().map(|envelope| envelope.body));
 
-        let ready_detail_requests = self.detail_requests.take_ready_items()?;
-        let detail_request_count = ready_detail_requests.items.len();
-        batch.detail_requests.extend(
-            ready_detail_requests
-                .items
-                .into_iter()
-                .map(|envelope| envelope.body),
-        );
+        let allocation_updates = self.allocation_updates.take_ready_items()?.items.len();
+        if allocation_updates > 0 {
+            batch.allocation_updated = true;
+        }
 
         Ok(ReadyCounts {
             inputs: input_count,
-            detail_requests: detail_request_count,
+            allocation_updates,
         })
     }
 }
@@ -470,13 +464,13 @@ impl SensoryModule {
 #[derive(Debug, Default)]
 pub struct SensoryBatch {
     inputs: Vec<SensoryInput>,
-    detail_requests: Vec<SensoryDetailRequest>,
+    allocation_updated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReadyCounts {
     inputs: usize,
-    detail_requests: usize,
+    allocation_updates: usize,
 }
 
 fn plural(n: u64) -> &'static str {
@@ -512,8 +506,8 @@ impl Module for SensoryModule {
         if !batch.inputs.is_empty() {
             self.handle_inputs(cx, &batch.inputs).await?;
         }
-        for request in batch.detail_requests.iter().cloned() {
-            self.handle_detail_request(cx, request).await?;
+        if batch.allocation_updated {
+            self.handle_detail_guidance(cx).await?;
         }
         Ok(())
     }
@@ -531,15 +525,16 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
+        linear_ratio_fn,
     };
     use nuillu_module::ports::{
         NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
         SystemClock,
     };
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
-        render_session_items_for_compaction,
+        AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers,
+        ModuleRegistry, render_session_items_for_compaction,
     };
     use nuillu_types::builtin;
     use tokio::task::LocalSet;
@@ -552,7 +547,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct SensoryTestRecorder {
-        batches: Rc<RefCell<Vec<(usize, usize)>>>,
+        batches: Rc<RefCell<Vec<(usize, bool)>>>,
         rendered_sessions: Rc<RefCell<Vec<String>>>,
     }
 
@@ -585,7 +580,7 @@ mod tests {
             self.recorder
                 .batches
                 .borrow_mut()
-                .push((batch.inputs.len(), batch.detail_requests.len()));
+                .push((batch.inputs.len(), batch.allocation_updated));
             <SensoryModule as Module>::activate(&mut self.inner, cx, batch).await?;
             self.recorder.rendered_sessions.borrow_mut().push(
                 render_session_items_for_compaction(self.inner.session.input().items()).to_string(),
@@ -657,7 +652,7 @@ mod tests {
             .register(1..=1, test_bpm(), linear_ratio_fn, move |caps| {
                 let mut inner = SensoryModule::new(
                     caps.sensory_input_inbox(),
-                    caps.sensory_detail_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.memo(),
                     caps.clock(),
@@ -788,7 +783,7 @@ mod tests {
                 })
                 .await;
 
-                assert_eq!(recorder.batches.borrow().as_slice(), &[(2, 0)]);
+                assert_eq!(recorder.batches.borrow().as_slice(), &[(2, false)]);
             })
             .await;
     }
@@ -815,7 +810,6 @@ mod tests {
                 )
                 .await;
                 let sensory = caps.host_io().sensory_input_mailbox();
-                let detail = caps.internal_harness_io().sensory_detail_mailbox();
 
                 run_modules(modules, async {
                     sensory
@@ -823,12 +817,18 @@ mod tests {
                         .await
                         .expect("sensory subscriber exists");
                     wait_for_memo_log_count(&blackboard, 1).await;
-                    detail
-                        .publish(SensoryDetailRequest::new(
-                            "What did the agent hear from Koro?",
-                        ))
+                    let mut allocation = sensory_allocation();
+                    let mut config = allocation.for_module(&builtin::sensory());
+                    config.guidance = "What did the agent hear from Koro?".into();
+                    allocation.set(builtin::sensory(), config);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(allocation))
+                        .await;
+                    caps.internal_harness_io()
+                        .allocation_updated_mailbox()
+                        .publish(AllocationUpdated)
                         .await
-                        .expect("sensory detail subscriber exists");
+                        .expect("allocation update subscriber exists");
                     wait_for_memo_log_count(&blackboard, 2).await;
                 })
                 .await;
@@ -845,7 +845,10 @@ mod tests {
                         "Koro growled from the front.",
                     ]
                 );
-                assert_eq!(recorder.batches.borrow().as_slice(), &[(1, 0), (0, 1)]);
+                assert_eq!(
+                    recorder.batches.borrow().as_slice(),
+                    &[(1, false), (0, true)]
+                );
             })
             .await;
     }

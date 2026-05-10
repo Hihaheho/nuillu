@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module, SessionCompactionConfig,
-    compact_session_if_needed, push_unread_memo_logs,
+    AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, MemoryImportance, Module,
+    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ pub struct SurpriseModule {
     cognition_log: CognitionLogReader,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
-    memory_requests: MemoryRequestMailbox,
+    attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
     session: Session,
@@ -70,7 +70,7 @@ impl SurpriseModule {
         cognition_log: CognitionLogReader,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
-        memory_requests: MemoryRequestMailbox,
+        attention_control: AttentionControlRequestMailbox,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
@@ -81,7 +81,7 @@ impl SurpriseModule {
             cognition_log,
             allocation,
             blackboard,
-            memory_requests,
+            attention_control,
             memo,
             llm,
             session: Session::new(),
@@ -154,12 +154,12 @@ impl SurpriseModule {
             && !request.content.trim().is_empty()
         {
             let _ = self
-                .memory_requests
-                .publish(MemoryRequest {
-                    content: request.content.trim().to_owned(),
-                    importance: request.importance,
-                    reason: request.reason.trim().to_owned(),
-                })
+                .attention_control
+                .publish(AttentionControlRequest::memory(
+                    request.content.trim(),
+                    request.importance,
+                    request.reason.trim(),
+                ))
                 .await;
         }
 

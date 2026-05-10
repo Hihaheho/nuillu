@@ -18,7 +18,7 @@ This document is the implementation source of truth. It describes the desired ar
 7. **Kebab-case module ids** — `ModuleId(String)` accepts only `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`. Builtins live in `nuillu_types::builtin::*`.
 8. **Non-exclusive capabilities** — Root providers and replica-scoped capability factories issue handles without uniqueness checks; any capability may be granted to multiple module instances. Single-writer roles are upheld by boot-time wiring and replica-owned state, not by issuer enforcement.
 9. **No periodic activation** — Modules wake from typed channels only. Controller guidance in `ResourceAllocation` replaces period/cadence fields; modules decide from allocation guidance whether an allocation wake should produce work or remain silent.
-10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. `QueryRequest` and `SelfModelRequest` are internal module messages; eval may publish them only from module-level harnesses.
+10. **Sensory/action boundaries** — The only app-facing external input is `SensoryInput`, consumed by the `sensory` module. Full-agent runs publish observations through that boundary and collect user-visible text from `speak` / `UtteranceSink`. Internal evidence requests enter through `AttentionControlRequest`, consumed only by attention-controller.
 11. **Injectable time** — All module-visible current time comes from an injected `Clock` capability. Production boot uses `SystemClock`; eval/sandbox boot can pass a fixed or scripted clock. Capabilities and modules must not call `Utc::now()` directly.
 12. **Streaming for user-visible output, collect for internal work** — The `speak` module uses `.stream()` for LLM text generation so that `UtteranceWriter` can emit progressive deltas to `UtteranceSink` before the turn completes. All other modules use `.collect()` for control decisions, tool loops, and complete free-form notes written through `Memo`. Streaming does not remove the final memo write; it adds progressive forwarding at the utterance boundary only.
 13. **Activation-gated speech** — Cognition-log updates wake Speak. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<SpeakModule>` holders such as SpeakGate and waits for allow/suppress votes.
@@ -100,7 +100,7 @@ Application boot registers modules as `(module_id, cap_range, builder)`:
 ```rust
 let registry = ModuleRegistry::new().register(builtin::query_vector(), 0..=3, |caps| {
     QueryVectorModule::new(
-        caps.query_inbox(),
+        caps.allocation_updated_inbox(),
         caps.cognition_log_updated_inbox(),
         caps.allocation_reader(),
         caps.blackboard_reader(),
@@ -174,13 +174,14 @@ pub struct Envelope<T> {
     pub body: T,
 }
 
-pub struct QueryRequest { pub question: String }
-pub type QueryMailbox = TopicMailbox<QueryRequest>;
-pub type QueryInbox = TopicInbox<QueryRequest>;
-
-pub struct SelfModelRequest { pub question: String }
-pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
-pub type SelfModelInbox = TopicInbox<SelfModelRequest>;
+pub enum AttentionControlRequest {
+    Query { question: String, reason: Option<String> },
+    SelfModel { question: String, reason: Option<String> },
+    Memory { content: String, importance: MemoryImportance, reason: String },
+    SensoryDetail { question: String, reason: Option<String> },
+}
+pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
+pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
 
 pub enum SensoryInput {
     Heard {
@@ -211,33 +212,20 @@ pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 pub struct AllocationUpdated;
 pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 
-pub struct SensoryDetailRequest {
-    pub question: String,
-}
-pub type SensoryDetailRequestMailbox = TopicMailbox<SensoryDetailRequest>;
-pub type SensoryDetailRequestInbox   = TopicInbox<SensoryDetailRequest>;
-
 pub enum MemoryImportance {
     Normal,
     High,
 }
-pub struct MemoryRequest {
-    pub content: String,
-    pub importance: MemoryImportance,
-    pub reason: String,
-}
-pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
-pub type MemoryRequestInbox   = TopicInbox<MemoryRequest>;
 ```
 
-Typed topics are backed by per-replica inbox queues and route only to currently active target replicas. Holding a publish capability permits sending on that typed topic; holding an inbox permits subscribing. Payloads are Rust types, not serialized enums.
+Typed topics are backed by per-replica inbox queues and route only to currently active target replicas. Holding a publish capability permits sending on that typed topic; holding an inbox permits subscribing. Payloads are Rust types, not ad-hoc JSON.
 
 Delivery policy is per topic:
 
 - `CognitionLogUpdated` is fanout: every active subscriber replica receives the wake signal.
 - `MemoUpdated` is fanout with self-filtering at the inbox handle: every active subscriber replica receives memo writes except its own writes.
 - `AllocationUpdated` is fanout: every active subscriber replica receives the wake signal when effective allocation or guidance changes.
-- `QueryRequest`, `SelfModelRequest`, `SensoryInput`, `SensoryDetailRequest`, and `MemoryRequest` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin.
+- `AttentionControlRequest` and `SensoryInput` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin. Boot wiring grants `AttentionControlRequestInbox` only to attention-controller.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
 `SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
@@ -256,7 +244,7 @@ Delivery policy is per topic:
 
 Examples: `Ryo said "..." 42 seconds ago`, `Ryo said "..." 1 minute 20 seconds ago`, `screen showed "..." 3 hours 40 minutes ago`, `Ryo said "..." 2 days 5 hours ago`. Future timestamps caused by host clock skew should be clamped to `0 seconds ago`.
 
-The sensory module does not publish derived typed work requests. `QueryMailbox` and `SelfModelMailbox` are internal messaging surfaces; module-level eval harnesses may hold them to isolate query modules or self-model, but app-facing/full-agent eval cases must not use them as external inputs. A separate routing/planning module may own those mailboxes in a later design.
+The sensory module does not publish derived typed work requests. Internal work bids use `AttentionControlRequestMailbox` and are consumed by attention-controller; app-facing/full-agent eval cases must not use them as external inputs.
 
 Speech actions are app-facing port writes rather than channel messages:
 
@@ -307,7 +295,7 @@ Ok(batch)
 
 The awaited receive and ready drain are module-local. Active-replica gating happens outside the module in the event loop before `next_batch` starts and before `activate(&batch)` runs.
 
-Wake-only activations such as `CognitionLogUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as cognition logs, memo logs, or allocation. Work-carrying activations such as `QueryRequest`, `SelfModelRequest`, `SensoryDetailRequest`, `SensoryInput`, and `MemoryRequest` must not be silently discarded because the payload is the work; modules retain them in their existing module-local batch/request shape until the event loop activates the replica.
+Wake-only activations such as `CognitionLogUpdated`, `MemoUpdated`, and `AllocationUpdated` may be collapsed into a single pending wake because the source of truth is durable state such as cognition logs, memo logs, or allocation. Work-carrying activations such as `SensoryInput` and `AttentionControlRequest` must not be silently discarded by the transport because the payload is the work. `AttentionControlRequest` is controller-only: attention-controller may admit, defer, or reject it in its memo and allocation guidance; there is no durable pending queue after that judgement.
 
 If a replica is disabled while it has no pending work, the event loop leaves it stored and does not start `next_batch`. If a batch is already available when the replica becomes inactive, the event loop holds that batch and defers activation until the replica is active again. Allocation changes do not preempt an already-running activation, including active Speak streams.
 
@@ -315,7 +303,7 @@ Boot policy should register `attention-controller` with `cap_range.min >= 1`. If
 
 ### Inbox batching
 
-Inbox batching is a per-module activation prelude. A module waits for exactly one activation event, collects already-ready events without awaiting, then deterministically converts those events into a module-local `NextBatch` before any LLM call or side effect:
+Inbox batching is a per-module activation prelude. A module waits for an activation event, deterministically collects module-local transient events, and converts them into a private `NextBatch` before any LLM call or side effect. Most modules use the immediate ready-drain pattern:
 
 ```rust
 async fn next_batch(&mut self) -> Result<NextBatch> {
@@ -326,7 +314,8 @@ async fn next_batch(&mut self) -> Result<NextBatch> {
 ```
 
 Rules:
-- The first event is the only awaited receive. The ready collection must use `take_ready_items()` and must not wait for more work.
+- By default, the first event is the only awaited receive. The ready collection uses `take_ready_items()` and does not wait for more work.
+- Domain-specific burst batching is allowed only as module-local deterministic policy. Sensory and attention-controller use a short silent window with a one-second total budget to coalesce bursts before activation.
 - `TopicInbox::next_item()` and `TopicInbox::take_ready_items()` hide transport details from modules. Closed inboxes are application-shutdown signals and propagate as `TopicRecvError::Closed`.
 - After the deterministic batch is collected, the event loop owns semantic processing. If the replica is inactive, the event loop performs no LLM call, memo write, or side effect and keeps the pending batch for later activation.
 - v1 does not impose a shared `max_ready_events` limit. If a future module needs burst limits, that policy should be added as module-local domain logic rather than as a scheduler allocation field.
@@ -334,16 +323,16 @@ Rules:
 - Cross-inbox event ordering has no runtime-wide meaning. Each module defines whether `calculate_next_batch` preserves order, groups by source, or reduces wake signals into booleans.
 - Batching is deterministic computation over already-received transient events. It must not call an LLM to decide batch membership. Module-local LLM work may still decide semantic output over the deterministic batch, such as memory candidate deduplication.
 - Closed inboxes terminate the module loop by propagating a typed receive error to the module's `run_loop`.
-- When explicit requests and wake signals are ready together, explicit requests are handled first. `self-model` refreshes the current self-description before answering if a self-model request and relevant memo/context wake are batched together.
+- When attention-control requests and memo wakes arrive during attention-controller's silent window, attention-controller considers them in one allocation decision.
 
 Module conventions:
-- Allocation-update modules, such as cognition-gate and memory-compaction, collapse multiple ready allocation updates into one guidance activation and reread allocation as source of truth.
-- Memo-update modules, such as attention-controller, collapse multiple ready memo updates into one wake activation and reread the blackboard as source of truth. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
+- Allocation-update modules, such as cognition-gate, query, self-model, sensory-detail handling, memory, and memory-compaction, collapse multiple ready allocation updates into one guidance activation and reread allocation as source of truth.
+- Memo-update modules, such as attention-controller, collapse multiple ready memo updates into one wake activation and reread the blackboard as source of truth. Attention-controller also waits a bounded silent window so near-simultaneous memo wakes and attention-control requests share one allocation decision. `MemoUpdatedInbox` drops self-sent updates so a module cannot wake itself by writing its own memo.
 - Cognition-log-update modules, such as attention-schema, predict, and surprise, collapse multiple ready cognition-log updates into one wake activation and reread the cognition log as source of truth. `CognitionLogUpdatedInbox` drops self-sent updates so a module cannot wake itself by appending to its own cognition log.
-- Query and self-model modules collect ready explicit requests into a module-local batch and answer the batch in one LLM turn. The module decides answer granularity and memo write policy; channel responses and request/response correlation remain out of scope.
-- Memory wakes from cognition-log updates and explicit `MemoryRequest` messages, reads the current cognition log plus indexed memo logs, and writes only through `insert_memory` tool calls. Memo logs, cognition-log entries, and memory requests are candidate evidence, not durable write commands; the memory module may deduplicate, merge, normalize, or reject candidates.
+- Query and self-model modules no longer receive explicit request payloads. They wake from allocation guidance and write memo-authoritative results from the controller's guidance plus blackboard context.
+- Memory wakes from cognition-log updates and allocation guidance, reads the current cognition log plus indexed memo logs, and writes only through `insert_memory` tool calls. Memo logs, cognition-log entries, and preservation guidance are candidate evidence, not durable write commands; the memory module may deduplicate, merge, normalize, or reject candidates.
 - Speak batches ready `CognitionLogUpdated` wake signals, then activation gates decide whether that batch may run. Cognition-log updates received during a generation stream remain queued for the next Speak batch.
-- Sensory batching is deferred in v1 because its batching policy is tied to salience, habituation, and stimulus decay rather than generic activation collapse.
+- Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring, while allocation updates interrupt that input burst and run detail guidance handling.
 
 ### Replica-owned blackboard views
 
@@ -376,12 +365,8 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `SensoryInputInbox` | yes | subscribe to external observations |
 | `MemoUpdatedInbox` | yes | subscribe to memo-update wake signals, excluding the holder's own memo writes |
 | `AllocationUpdatedInbox` | yes | subscribe to effective allocation/guidance changes |
-| `QueryMailbox` / `SelfModelMailbox` | yes | publish typed work requests |
-| `QueryInbox` / `SelfModelInbox` | yes | subscribe to typed work requests |
-| `SensoryDetailRequestMailbox` | yes | publish explicit detail requests to the sensory module |
-| `SensoryDetailRequestInbox` | yes | subscribe to explicit sensory detail requests |
-| `MemoryRequestMailbox` | yes | publish explicit preservation candidates to the memory module |
-| `MemoryRequestInbox` | yes | subscribe to explicit preservation candidates |
+| `AttentionControlRequestMailbox` | yes | publish internal attention-control bids to attention-controller |
+| `AttentionControlRequestInbox` | yes | subscribe to internal attention-control bids; boot wiring grants this only to attention-controller |
 | `Memo` | yes | append/read holder instance's own bounded indexed memo queue |
 | `LlmAccess` | yes | get the current-tier `lutum::Lutum` for the holder's module allocation |
 | `BlackboardReader` | no | read whole blackboard through compact grouped views |
@@ -524,47 +509,47 @@ The module may summarize content as part of its decision, but its architectural 
 
 ### Attention Controller
 
-Capabilities: `MemoUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
 
-Wakes only on memo updates, excluding its own memo writes. It reads unread memo-log entries into a persistent `Session`, plus memory metadata, cognition-log set, effective allocation, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
+Wakes on memo updates, excluding its own memo writes, and internal `AttentionControlRequest` bids. It reads unread memo-log entries into a persistent `Session`, plus current attention-control requests, memory metadata, cognition-log set, effective allocation, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
 
 When current memo logs and cognition logs suggest that the agent should gather evidence before speaking, the controller enters an evidence-gathering allocation phase: it keeps `speak` and `speak-gate` active, keeps or raises query and cognition-gate activation ratios/tier, and writes guidance for the modules that can gather or promote the missing evidence. Query modules continue to write memo-authoritative results as log entries; cognition-gate may later promote useful query memo-log content into cognition logs. Once cognition-log state and memo-log history indicate that enough evidence is available for a user-visible answer, SpeakGate can allow the pending Speak activation.
 
-This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, cognition logs, and allocation state, while query results remain durable only through query-module memo logs.
+This is not a request/response wait and not a query-completion correlation protocol. The controller allocates work from memo logs, attention-control requests, cognition logs, and allocation state, while query results remain durable only through query-module memo logs. Attention-control requests are admitted, deferred, or rejected in the controller memo; deferred requests are not stored in a separate pending queue.
 
 ### Attention Schema
 
 Capabilities: `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `CognitionLogReader`, `CognitionWriter`, `LlmAccess`.
 
-Reads unread memo-log entries into a persistent `Session`, plus allocation state and cognition-log set, to decide whether the current attention state should become admitted cognitive evidence. Its tool set offers a single append operation whose input payload contains plaintext; calling the tool appends a concise first-person attention experience to this replica's cognition log, while not calling the tool means no new attention experience should be admitted. It does not receive `Memo`, `SelfModelInbox`, allocation-write, or memory-write capabilities.
+Reads unread memo-log entries into a persistent `Session`, plus allocation state and cognition-log set, to decide whether the current attention state should become admitted cognitive evidence. Its tool set offers a single append operation whose input payload contains plaintext; calling the tool appends a concise first-person attention experience to this replica's cognition log, while not calling the tool means no new attention experience should be admitted. It does not receive `Memo`, attention-control inbox, allocation-write, or memory-write capabilities.
 
 ### Self Model
 
-Capabilities: `SelfModelInbox`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
+Capabilities: `AllocationUpdatedInbox`, `AllocationReader`, `BlackboardReader` for memo-log/context reads, `CognitionLogReader`, `Memo`, `LlmAccess`.
 
-Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, and self-related knowledge that query modules surface from memory. Explicit self-model questions arrive on `SelfModelInbox`; topic routing load-balances requests across active self-model replicas. Output is appended to this replica's memo log, which is memo-authoritative for self-model answers.
+Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, self-related knowledge that query modules surface from memory, and the attention-controller guidance that requested self-model work. Output is appended to this replica's memo log, which is memo-authoritative for self-model answers.
 
 Stable self-knowledge belongs in memory and is surfaced through query-module memo logs; the self-model module is the dynamic integration layer over that knowledge, current attention, active task context, uncertainty, and recent module outputs. v1 should avoid granting broad direct memory search to self-model unless a later narrow self-knowledge capability is introduced; if `BlackboardReader` proves too wide for this role, introduce a narrower memo-log/context reader before implementation. Object/world models remain distributed through sensory, query, predict, and surprise memo logs in v1; add a dedicated `world-model` only if those fragments need one owner.
 
 ### Query Vector
 
-Capabilities: `QueryInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `VectorMemorySearcher`, `Memo`, `LlmAccess`.
+Capabilities: `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `VectorMemorySearcher`, `Memo`, `LlmAccess`.
 
-Handles vector-memory/RAG queries only. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-vector replicas. Cognition-log updates may wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model questions. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results.
+Handles vector-memory/RAG retrieval only. Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results.
 
 ### Query Agentic
 
-Capabilities: `QueryInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `FileSearcher`, `Memo`, `LlmAccess`.
+Capabilities: `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `FileSearcher`, `Memo`, `LlmAccess`.
 
-Handles read-only file-search queries. Explicit query requests arrive on `QueryInbox`; topic routing load-balances requests across active query-agentic replicas. Allocation updates may wake it to act on guidance with the current blackboard context. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is appended to this replica's memo log, and those entries contain only retrieved file content/snippets copied from query results.
+Handles read-only file-search retrieval from controller guidance. Allocation updates wake it to act on guidance with the current blackboard context. Its file-search tool exposes only ripgrep-like controls: `pattern`, `regex`, `invert_match`, `case_sensitive`, `context`, and `max_matches`. It does not receive raw filesystem or shell access. Output is appended to this replica's memo log, and those entries contain only retrieved file content/snippets copied from query results.
 
 ### Memory
 
-Capabilities: `CognitionLogUpdatedInbox`, `MemoryRequestInbox`, `BlackboardReader`, `AllocationReader`, `MemoryWriter`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryWriter`, `LlmAccess`.
 
-Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and explicit `MemoryRequest` messages are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and explicit requests as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`.
+Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and allocation guidance are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and preservation guidance as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`.
 
 ### Memory Compaction
 
@@ -582,19 +567,19 @@ Predict does not detect divergence and does not write memory.
 
 ### Surprise
 
-Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `MemoryRequestMailbox`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `AttentionControlRequestMailbox`, `LlmAccess`.
 
 Activates on each cognition-log update. Uses an LLM to assess whether the updated cognition log is expected or surprising, with allocation guidance in context. When predict memo logs are available in session context, the assessment is framed as divergence from pending predictions. When predict is absent, the assessment is framed as novelty from recent cognition-log history alone. Runtime reads the `significant` and `memory_request` decision fields for preservation side effects, then writes the same assessment information to this replica's free-form memo log.
 
-Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes a `MemoryRequest` as a candidate for the memory module rather than writing memory directly.
+Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes an `AttentionControlRequest::Memory` bid for attention-controller rather than writing memory directly.
 
 The v1 surprise threshold is represented by the structured LLM field `significant`; there is no numeric global threshold yet.
 
 ### SpeakGate
 
-Capabilities: `ActivationGate<SpeakModule>`, `CognitionLogReader`, `BlackboardReader`, `ModuleStatusReader`, `QueryMailbox`, `SelfModelMailbox`, `SensoryDetailRequestMailbox`, `Memo`, `LlmAccess`.
+Capabilities: `ActivationGate<SpeakModule>`, `CognitionLogReader`, `BlackboardReader`, `ModuleStatusReader`, `AttentionControlRequestMailbox`, `Memo`, `LlmAccess`.
 
-Activates only on pending Speak activation-gate events. Reads unread memo-log entries into its persistent `Session`, plus the cognition-log set, scheduler-owned module status, and utterance progress, to decide whether the pending Speak batch is speech-ready. It can call evidence tools that publish memory query, self-model, and sensory-detail work. Those tools only report whether work was requested or duplicate; available memo evidence is already in SpeakGate's session from unread memo logs. After publishing missing evidence work, SpeakGate suppresses the current activation and waits for a later Speak batch to reconsider. If speech is ready, it returns `Allow`; otherwise it returns `Suppress` and writes the wait decision and any missing-evidence notes to its memo log. SpeakGate does not emit utterances, write cognition-log entries, write allocation, or write memory.
+Activates only on pending Speak activation-gate events. Reads unread memo-log entries into its persistent `Session`, plus the cognition-log set, scheduler-owned module status, and utterance progress, to decide whether the pending Speak batch is speech-ready. It can call evidence tools that publish memory query, self-model, and sensory-detail `AttentionControlRequest` bids. Those tools only report whether work was requested or duplicate; available memo evidence is already in SpeakGate's session from unread memo logs. After publishing missing evidence work, SpeakGate suppresses the current activation and waits for a later Speak batch to reconsider. If speech is ready, it returns `Allow`; otherwise it returns `Suppress` and writes the wait decision and any missing-evidence notes to its memo log. SpeakGate does not emit utterances, write cognition-log entries, write allocation, or write memory.
 
 ### Speak
 
@@ -683,7 +668,7 @@ Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. The
 
 Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query, memory, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may publish `QueryRequest` to query modules or `SelfModelRequest` to self-model through `CapabilityProviders::internal_harness_io()`, then score the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
+Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
 
 Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum values in the `.eure` case: `output`, `utterance`, `failure`, `trace`, `observations`, `blackboard`, `memory`, `memos`, `cognition`, and `allocation`. The `memos` judge input renders `memo_logs`. The rubric text and criteria are always included; the selected judge inputs control only evidence sections. This keeps full-agent rubrics focused on utterance/memory/blackboard state and query rubrics focused on output plus trace without always passing the whole artifact observation payload.
 
@@ -714,20 +699,20 @@ This keeps realistic artifacts observable without adding request/response correl
 | Controller, attention schema, and self-model are separate modules | separate crates and separate constructor capabilities |
 | Controller wakes only on memo updates | it receives `MemoUpdatedInbox`, not `CognitionLogUpdatedInbox`; memo inbox filters self writes |
 | Sensory is the full-agent observation boundary | full-agent boot wiring grants `SensoryInputInbox` only to sensory |
-| Full-agent external input is sensory-only | app/full-agent eval uses `HostIo` with only `SensoryInputMailbox`; `QueryRequest` and `SelfModelRequest` are internal messages |
-| Sensory cannot answer, route work, or alter cognition directly | it receives no `QueryMailbox`, `SelfModelMailbox`, `UtteranceWriter`, `CognitionWriter`, `AllocationWriter`, memory capabilities, or readers |
+| Full-agent external input is sensory-only | app/full-agent eval uses `HostIo` with only `SensoryInputMailbox`; `AttentionControlRequest` is internal and controller-only |
+| Sensory cannot answer, route work, or alter cognition directly | it receives no `AttentionControlRequestMailbox`, `UtteranceWriter`, `CognitionWriter`, `AllocationWriter`, memory capabilities, or broad readers |
 | Speak is the full-agent utterance boundary | full-agent boot wiring grants `UtteranceWriter` only to speak |
 | Speak cannot route work or mutate cognition | it receives no query/self-model mailbox, `CognitionWriter`, `AllocationWriter`, or memory capabilities |
 | Speak reads only cognition log and scene targets | it receives `CognitionLogReader`, `CognitionLogUpdatedInbox`, and `SceneReader`, not `BlackboardReader` or `AllocationReader` |
 | Speak start is activation-gate-controlled | `ActivationGate<SpeakModule>` votes from SpeakGate decide whether a pending Speak batch activates; allocation guidance is not parsed by speak |
-| Speak still does not route query work | evidence gathering is driven by SpeakGate, query memo logs, and cognition-log updates; speak receives no `QueryMailbox` |
+| Speak still does not route query work | evidence gathering is driven by SpeakGate, attention-controller guidance, query memo logs, and cognition-log updates; speak receives no `AttentionControlRequestMailbox` |
 | Speak does not interrupt active streams on cognition updates | cognition-log updates received during streaming remain queued for the next Speak batch |
 | Cognition-gate is the only non-cognitive promotion path | boot-time wiring grants cognition-gate memo/allocation read paths plus `CognitionWriter`; attention-schema also has `CognitionWriter` but no `Memo` output or non-cognitive promotion role |
 | Cognition-log inboxes filter self writes | `CognitionLogUpdatedInbox` is constructed with the same self-exclusion policy as `MemoUpdatedInbox` |
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
 | Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to attention-controller registrations; runtime computes effective allocation |
-| Attention schema models attention only | it receives memo, allocation, and cognition-log read/wake capabilities plus `CognitionWriter` and `LlmAccess`, not `Memo`, `SelfModelInbox`, `AllocationWriter`, or memory capabilities |
-| Self-model handles self-report | callers need `SelfModelMailbox`; self-model receives `SelfModelInbox` and writes self-model answers to its own memo |
+| Attention schema models attention only | it receives memo, allocation, and cognition-log read/wake capabilities plus `CognitionWriter` and `LlmAccess`, not `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
+| Self-model handles self-report | attention-controller writes self-model guidance; self-model receives `AllocationUpdatedInbox` and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema cognition-log entries and current memo-log context |
 | Query vector is memory/RAG only | it receives `VectorMemorySearcher`, not file or self-model capabilities |
 | Query agentic is file-search only | it receives `FileSearcher`, not memory or self-model capabilities |

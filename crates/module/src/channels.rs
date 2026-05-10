@@ -256,45 +256,6 @@ impl<T: Clone> TopicInbox<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct QueryRequest {
-    pub question: String,
-}
-
-impl QueryRequest {
-    pub fn new(question: impl Into<String>) -> Self {
-        Self {
-            question: question.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SelfModelRequest {
-    pub question: String,
-}
-
-impl SelfModelRequest {
-    pub fn new(question: impl Into<String>) -> Self {
-        Self {
-            question: question.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SensoryDetailRequest {
-    pub question: String,
-}
-
-impl SensoryDetailRequest {
-    pub fn new(question: impl Into<String>) -> Self {
-        Self {
-            question: question.into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum MemoryImportance {
     Normal,
@@ -302,10 +263,84 @@ pub enum MemoryImportance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryRequest {
-    pub content: String,
-    pub importance: MemoryImportance,
-    pub reason: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttentionControlRequest {
+    Query {
+        question: String,
+        reason: Option<String>,
+    },
+    SelfModel {
+        question: String,
+        reason: Option<String>,
+    },
+    Memory {
+        content: String,
+        importance: MemoryImportance,
+        reason: String,
+    },
+    SensoryDetail {
+        question: String,
+        reason: Option<String>,
+    },
+}
+
+impl AttentionControlRequest {
+    pub fn query(question: impl Into<String>) -> Self {
+        Self::Query {
+            question: question.into(),
+            reason: None,
+        }
+    }
+
+    pub fn query_with_reason(question: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Query {
+            question: question.into(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn self_model(question: impl Into<String>) -> Self {
+        Self::SelfModel {
+            question: question.into(),
+            reason: None,
+        }
+    }
+
+    pub fn self_model_with_reason(question: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::SelfModel {
+            question: question.into(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn memory(
+        content: impl Into<String>,
+        importance: MemoryImportance,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Memory {
+            content: content.into(),
+            importance,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn sensory_detail(question: impl Into<String>) -> Self {
+        Self::SensoryDetail {
+            question: question.into(),
+            reason: None,
+        }
+    }
+
+    pub fn sensory_detail_with_reason(
+        question: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::SensoryDetail {
+            question: question.into(),
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -324,14 +359,8 @@ pub struct MemoUpdated {
     pub index: u64,
 }
 
-pub type QueryMailbox = TopicMailbox<QueryRequest>;
-pub type QueryInbox = TopicInbox<QueryRequest>;
-pub type SelfModelMailbox = TopicMailbox<SelfModelRequest>;
-pub type SelfModelInbox = TopicInbox<SelfModelRequest>;
-pub type SensoryDetailRequestMailbox = TopicMailbox<SensoryDetailRequest>;
-pub type SensoryDetailRequestInbox = TopicInbox<SensoryDetailRequest>;
-pub type MemoryRequestMailbox = TopicMailbox<MemoryRequest>;
-pub type MemoryRequestInbox = TopicInbox<MemoryRequest>;
+pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
+pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
 pub type CognitionLogUpdatedMailbox = TopicMailbox<CognitionLogUpdated>;
 pub type CognitionLogUpdatedInbox = TopicInbox<CognitionLogUpdated>;
 pub type AllocationUpdatedMailbox = TopicMailbox<AllocationUpdated>;
@@ -373,132 +402,39 @@ mod tests {
         ModuleId::new("ticker").unwrap()
     }
 
-    fn echo_id() -> ModuleId {
-        ModuleId::new("echo").unwrap()
-    }
-
     #[tokio::test]
-    async fn query_mailbox_fans_out_to_multiple_subscribers_with_owner_stamp() {
+    async fn attention_control_mailbox_delivers_to_controller_with_owner_stamp() {
         let caps = test_caps(Blackboard::default());
-        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
-        let mut vector = scoped(&caps, builtin::query_vector(), 0).query_inbox();
-        let mut agentic = scoped(&caps, builtin::query_agentic(), 0).query_inbox();
+        let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
+        let mut controller =
+            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
 
         publisher
-            .publish(QueryRequest::new("find memories about rust"))
+            .publish(AttentionControlRequest::query("find memories about rust"))
             .await
-            .expect("query topic should have subscribers");
+            .expect("attention-control topic should have subscribers");
 
-        let vector_env = vector
+        let envelope = controller
             .next_item()
             .await
-            .expect("vector subscriber receives query");
-        let agentic_env = agentic
-            .next_item()
-            .await
-            .expect("agentic subscriber receives query");
-
-        assert_eq!(vector_env.sender, agentic_env.sender);
-        assert_eq!(vector_env.sender.module, ticker_id());
-        assert_eq!(vector_env.body.question, "find memories about rust");
-        assert_eq!(agentic_env.body.question, "find memories about rust");
-    }
-
-    #[tokio::test]
-    async fn self_model_mailbox_is_a_separate_typed_topic() {
-        let caps = test_caps(Blackboard::default());
-        let query_publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
-        let self_publisher = scoped(&caps, echo_id(), 0).self_model_mailbox();
-        let mut query_inbox = scoped(&caps, builtin::query_vector(), 0).query_inbox();
-        let mut self_inbox = scoped(&caps, builtin::self_model(), 0).self_model_inbox();
-
-        query_publisher
-            .publish(QueryRequest::new("memory only"))
-            .await
-            .expect("query subscriber exists");
-        self_publisher
-            .publish(SelfModelRequest::new("what are you aware of?"))
-            .await
-            .expect("self-model subscriber exists");
-
+            .expect("controller subscriber receives request");
+        assert_eq!(envelope.sender.module, ticker_id());
         assert_eq!(
-            query_inbox.next_item().await.unwrap().body.question,
-            "memory only"
+            envelope.body,
+            AttentionControlRequest::query("find memories about rust")
         );
-        assert_eq!(
-            self_inbox.next_item().await.unwrap().body.question,
-            "what are you aware of?"
-        );
-        assert!(query_inbox.take_ready_items().unwrap().items.is_empty());
-        assert!(self_inbox.take_ready_items().unwrap().items.is_empty());
     }
 
     #[tokio::test]
-    async fn role_topics_load_balance_across_active_replicas() {
+    async fn attention_control_load_balances_across_active_controller_replicas() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::query_vector(), ModuleConfig::default());
-        alloc.set_activation(builtin::query_vector(), ActivationRatio::ONE);
-        alloc.set(builtin::query_agentic(), ModuleConfig::default());
-        alloc.set_activation(builtin::query_agentic(), ActivationRatio::ONE);
-        let blackboard = Blackboard::with_allocation(alloc);
-        blackboard
-            .apply(BlackboardCommand::SetModulePolicies {
-                policies: vec![
-                    (
-                        builtin::query_vector(),
-                        nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 2).unwrap(),
-                            nuillu_blackboard::Bpm::from_f64(60.0)
-                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
-                            nuillu_blackboard::linear_ratio_fn,
-                        ),
-                    ),
-                    (
-                        builtin::query_agentic(),
-                        nuillu_blackboard::ModulePolicy::new(
-                            ReplicaCapRange::new(0, 1).unwrap(),
-                            nuillu_blackboard::Bpm::from_f64(60.0)
-                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
-                            nuillu_blackboard::linear_ratio_fn,
-                        ),
-                    ),
-                ],
-            })
-            .await;
-        let caps = test_caps(blackboard);
-        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
-        let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
-        let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();
-        let mut agentic_0 = scoped(&caps, builtin::query_agentic(), 0).query_inbox();
-
-        publisher.publish(QueryRequest::new("first")).await.unwrap();
-        publisher
-            .publish(QueryRequest::new("second"))
-            .await
-            .unwrap();
-
-        assert_eq!(vector_0.next_item().await.unwrap().body.question, "first");
-        assert_eq!(vector_1.next_item().await.unwrap().body.question, "second");
-        let agentic = agentic_0
-            .take_ready_items()
-            .unwrap()
-            .items
-            .into_iter()
-            .map(|item| item.body.question)
-            .collect::<Vec<_>>();
-        assert_eq!(agentic, vec!["first", "second"]);
-    }
-
-    #[tokio::test]
-    async fn role_topics_route_to_replica_zero_when_role_is_inactive() {
-        let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::query_vector(), ModuleConfig::default());
-        alloc.set_activation(builtin::query_vector(), ActivationRatio::ZERO);
+        alloc.set(builtin::attention_controller(), ModuleConfig::default());
+        alloc.set_activation(builtin::attention_controller(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![(
-                    builtin::query_vector(),
+                    builtin::attention_controller(),
                     nuillu_blackboard::ModulePolicy::new(
                         ReplicaCapRange::new(0, 2).unwrap(),
                         nuillu_blackboard::Bpm::from_f64(60.0)
@@ -509,20 +445,67 @@ mod tests {
             })
             .await;
         let caps = test_caps(blackboard);
-        let publisher = scoped(&caps, ticker_id(), 0).query_mailbox();
-        let mut vector_0 = scoped(&caps, builtin::query_vector(), 0).query_inbox();
-        let mut vector_1 = scoped(&caps, builtin::query_vector(), 1).query_inbox();
+        let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
+        let mut controller_0 =
+            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+        let mut controller_1 =
+            scoped(&caps, builtin::attention_controller(), 1).attention_control_inbox();
 
         publisher
-            .publish(QueryRequest::new("active only"))
+            .publish(AttentionControlRequest::query("first"))
+            .await
+            .unwrap();
+        publisher
+            .publish(AttentionControlRequest::query("second"))
             .await
             .unwrap();
 
         assert_eq!(
-            vector_0.next_item().await.unwrap().body.question,
-            "active only"
+            controller_0.next_item().await.unwrap().body,
+            AttentionControlRequest::query("first")
         );
-        assert!(vector_1.take_ready_items().unwrap().items.is_empty());
+        assert_eq!(
+            controller_1.next_item().await.unwrap().body,
+            AttentionControlRequest::query("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn attention_control_routes_to_replica_zero_when_controller_is_inactive() {
+        let mut alloc = ResourceAllocation::default();
+        alloc.set(builtin::attention_controller(), ModuleConfig::default());
+        alloc.set_activation(builtin::attention_controller(), ActivationRatio::ZERO);
+        let blackboard = Blackboard::with_allocation(alloc);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![(
+                    builtin::attention_controller(),
+                    nuillu_blackboard::ModulePolicy::new(
+                        ReplicaCapRange::new(0, 2).unwrap(),
+                        nuillu_blackboard::Bpm::from_f64(60.0)
+                            ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                        nuillu_blackboard::linear_ratio_fn,
+                    ),
+                )],
+            })
+            .await;
+        let caps = test_caps(blackboard);
+        let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
+        let mut controller_0 =
+            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+        let mut controller_1 =
+            scoped(&caps, builtin::attention_controller(), 1).attention_control_inbox();
+
+        publisher
+            .publish(AttentionControlRequest::query("active only"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            controller_0.next_item().await.unwrap().body,
+            AttentionControlRequest::query("active only")
+        );
+        assert!(controller_1.take_ready_items().unwrap().items.is_empty());
     }
 
     #[tokio::test]
@@ -534,7 +517,7 @@ mod tests {
                 rate_limits: RateLimitPolicy::for_module(
                     publisher_id.clone(),
                     CapabilityKind::ChannelPublish {
-                        topic: TopicKind::Query,
+                        topic: TopicKind::AttentionControlRequest,
                     },
                     RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
                 )
@@ -542,18 +525,28 @@ mod tests {
                 ..RuntimePolicy::default()
             },
         );
-        let publisher = scoped(&caps, publisher_id, 0).query_mailbox();
-        let mut vector = scoped(&caps, builtin::query_vector(), 0).query_inbox();
+        let publisher = scoped(&caps, publisher_id, 0).attention_control_mailbox();
+        let mut controller =
+            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
 
-        publisher.publish(QueryRequest::new("first")).await.unwrap();
+        publisher
+            .publish(AttentionControlRequest::query("first"))
+            .await
+            .unwrap();
         let started = Instant::now();
         publisher
-            .publish(QueryRequest::new("second"))
+            .publish(AttentionControlRequest::query("second"))
             .await
             .unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(8));
-        assert_eq!(vector.next_item().await.unwrap().body.question, "first");
-        assert_eq!(vector.next_item().await.unwrap().body.question, "second");
+        assert_eq!(
+            controller.next_item().await.unwrap().body,
+            AttentionControlRequest::query("first")
+        );
+        assert_eq!(
+            controller.next_item().await.unwrap().body,
+            AttentionControlRequest::query("second")
+        );
     }
 }

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, MemoryRequest,
-    MemoryRequestInbox, MemoryWriter, Module, SessionCompactionConfig, compact_session_if_needed,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
+    LlmAccess, MemoryWriter, Module, SessionCompactionConfig, compact_session_if_needed,
     push_unread_memo_logs,
 };
 use nuillu_types::MemoryRank;
@@ -15,10 +15,10 @@ pub use batch::NextBatch as MemoryBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
 Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
-Use the current cognition log plus unread/recent module memo logs as candidate evidence. MemoryRequest
-messages are explicit preservation candidates from other modules, not write commands. You may
-reject, normalize, merge, and deduplicate observations and requests. Use insert_memory only for
-concrete information likely to matter later."#;
+Use the current cognition log plus unread/recent module memo logs as candidate evidence. Allocation
+guidance from attention-controller may contain explicit preservation candidates from other modules,
+but those candidates are not write commands. You may reject, normalize, merge, and deduplicate
+observations and guidance. Use insert_memory only for concrete information likely to matter later."#;
 
 const NORMAL_REQUEST_DECAY_SECS: i64 = 86_400;
 const HIGH_REQUEST_DECAY_SECS: i64 = 604_800;
@@ -49,7 +49,7 @@ pub enum MemoryTools {
 pub struct MemoryModule {
     owner: nuillu_types::ModuleId,
     cognition_updates: CognitionLogUpdatedInbox,
-    requests: MemoryRequestInbox,
+    allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: MemoryWriter,
@@ -62,7 +62,7 @@ pub struct MemoryModule {
 impl MemoryModule {
     pub fn new(
         cognition_updates: CognitionLogUpdatedInbox,
-        requests: MemoryRequestInbox,
+        allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: MemoryWriter,
@@ -71,7 +71,7 @@ impl MemoryModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
             cognition_updates,
-            requests,
+            allocation_updates,
             allocation,
             blackboard,
             memory,
@@ -98,7 +98,7 @@ impl MemoryModule {
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        requests: Vec<MemoryRequest>,
+        allocation_updated: bool,
         cognition_updated: bool,
     ) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
@@ -113,12 +113,14 @@ impl MemoryModule {
             })
             .await;
         let allocation = self.allocation.snapshot().await;
+        let allocation_guidance = allocation.for_module(&self.owner).guidance;
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(
             serde_json::json!({
-                "memory_requests": requests,
+                "allocation_guidance": allocation_guidance,
+                "allocation_updated": allocation_updated,
                 "cognition_updated": cognition_updated,
             })
             .to_string(),
@@ -229,7 +231,7 @@ impl Module for MemoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and surprise-driven preservation requests."
+        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and attention-controller preservation guidance."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -241,7 +243,7 @@ impl Module for MemoryModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        MemoryModule::activate(self, cx, batch.requests.clone(), batch.cognition_updated).await
+        MemoryModule::activate(self, cx, batch.allocation_updated, batch.cognition_updated).await
     }
 }
 
@@ -249,23 +251,23 @@ impl Module for MemoryModule {
 mod tests {
     use super::*;
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::{Arc, atomic::AtomicU64};
 
     use lutum::{
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
-    use nuillu_blackboard::{Bpm, linear_ratio_fn};
+    use nuillu_blackboard::{
+        Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+    };
     use nuillu_module::ports::{
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory,
         NoopCognitionLogRepository, NoopFileSearchProvider, NoopUtteranceSink, PortError,
         SystemClock,
     };
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
-        MemoryImportance, MemoryRequestMailbox, ModuleRegistry,
+        AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated,
+        LutumTiers, ModuleRegistry,
     };
     use nuillu_types::{MemoryIndex, MemoryRank, ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::sync::Mutex;
@@ -274,12 +276,13 @@ mod tests {
     fn test_caps_with_adapter(
         primary: Arc<dyn MemoryStore>,
         adapter: MockLlmAdapter,
-    ) -> CapabilityProviders {
+    ) -> (Blackboard, CapabilityProviders) {
+        let blackboard = Blackboard::default();
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        CapabilityProviders::new(CapabilityProviderPorts {
-            blackboard: nuillu_blackboard::Blackboard::default(),
+        let caps = CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard: blackboard.clone(),
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: primary,
             memory_replicas: Vec::new(),
@@ -291,7 +294,8 @@ mod tests {
                 default: lutum.clone(),
                 premium: lutum,
             },
-        })
+        });
+        (blackboard, caps)
     }
 
     #[derive(Default, Clone)]
@@ -347,33 +351,6 @@ mod tests {
         }
     }
 
-    struct PublisherStub;
-
-    #[async_trait(?Send)]
-    impl Module for PublisherStub {
-        type Batch = ();
-
-        fn id() -> &'static str {
-            "surprise"
-        }
-
-        fn role_description() -> &'static str {
-            "test stub"
-        }
-
-        async fn next_batch(&mut self) -> Result<Self::Batch> {
-            std::future::pending().await
-        }
-
-        async fn activate(
-            &mut self,
-            _cx: &nuillu_module::ActivateCx<'_>,
-            _batch: &Self::Batch,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
     fn memory_insert_tool_scenario(content: &str) -> MockTextScenario {
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
@@ -419,7 +396,7 @@ mod tests {
             .register(1..=1, test_bpm(), linear_ratio_fn, |caps| {
                 MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
-                    caps.memory_request_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memory_writer(),
@@ -430,38 +407,6 @@ mod tests {
             .build(caps)
             .await
             .unwrap()
-    }
-
-    async fn build_memory_with_publisher(
-        caps: &CapabilityProviders,
-    ) -> (nuillu_module::AllocatedModules, MemoryRequestMailbox) {
-        let publisher_cell: Rc<RefCell<Option<MemoryRequestMailbox>>> = Rc::new(RefCell::new(None));
-        let publisher_clone = Rc::clone(&publisher_cell);
-        let modules = ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
-                *publisher_clone.borrow_mut() = Some(caps.memory_request_mailbox());
-                PublisherStub
-            })
-            .unwrap()
-            .register(1..=1, test_bpm(), linear_ratio_fn, |caps| {
-                MemoryModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.memory_request_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_writer(),
-                    caps.llm_access(),
-                )
-            })
-            .unwrap()
-            .build(caps)
-            .await
-            .unwrap();
-        let publisher = publisher_cell
-            .borrow_mut()
-            .take()
-            .expect("publisher captured");
-        (modules, publisher)
     }
 
     async fn run_modules<F: std::future::Future<Output = ()>>(
@@ -487,7 +432,8 @@ mod tests {
             .run_until(async {
                 let primary = RecordingMemoryStore::default();
                 let adapter = MockLlmAdapter::new().with_text_scenario(final_text_scenario("done"));
-                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
+                let (_blackboard, caps) =
+                    test_caps_with_adapter(Arc::new(primary.clone()), adapter);
                 let modules = build_memory(&caps).await;
                 let cognition_log = caps.internal_harness_io().cognition_log_updated_mailbox();
 
@@ -524,7 +470,8 @@ mod tests {
                         "Ryo wants cognition-driven memory implemented.",
                     ))
                     .with_text_scenario(final_text_scenario("memory-complete"));
-                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
+                let (_blackboard, caps) =
+                    test_caps_with_adapter(Arc::new(primary.clone()), adapter);
                 let modules = build_memory(&caps).await;
                 let cognition_log = caps.internal_harness_io().cognition_log_updated_mailbox();
 
@@ -555,7 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_request_allows_surprise_to_trigger_insert_decision() {
+    async fn allocation_guidance_allows_controller_to_trigger_insert_decision() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -565,16 +512,20 @@ mod tests {
                         "Koro stiffened at the food bowl.",
                     ))
                     .with_text_scenario(final_text_scenario("memory-complete"));
-                let caps = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
-                let (modules, publisher) = build_memory_with_publisher(&caps).await;
+                let (blackboard, caps) = test_caps_with_adapter(Arc::new(primary.clone()), adapter);
+                let modules = build_memory(&caps).await;
 
                 run_modules(modules, async {
-                    publisher
-                        .publish(MemoryRequest {
-                            content: "Koro stiffened at the food bowl.".into(),
-                            importance: MemoryImportance::High,
-                            reason: "surprising peer food-guarding posture".into(),
-                        })
+                    let mut allocation = ResourceAllocation::default();
+                    let mut config = ModuleConfig::default();
+                    config.guidance = "Consider preserving high-importance surprise: Koro stiffened at the food bowl. Reason: surprising peer food-guarding posture".into();
+                    allocation.set(builtin::memory(), config);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(allocation))
+                        .await;
+                    caps.internal_harness_io()
+                        .allocation_updated_mailbox()
+                        .publish(AllocationUpdated)
                         .await
                         .expect("memory module subscribed");
 

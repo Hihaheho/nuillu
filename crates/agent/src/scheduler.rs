@@ -786,9 +786,9 @@ mod tests {
         ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::{
-        ActivationGate, ActivationGateEvent, ActivationGateVote, CognitionLogUpdated,
-        CognitionLogUpdatedInbox, CognitionWriter, Memo, Module, ModuleRegistry, QueryInbox,
-        QueryRequest,
+        ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
+        AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
+        CognitionWriter, Memo, Module, ModuleRegistry,
     };
     use nuillu_types::{MemoryContent, MemoryIndex, ModuleId, builtin};
     use tokio::sync::oneshot;
@@ -807,15 +807,29 @@ mod tests {
         ModuleId::new("echo").unwrap()
     }
 
+    fn request_question(request: &AttentionControlRequest) -> &str {
+        match request {
+            AttentionControlRequest::Query { question, .. } => question,
+            _ => "",
+        }
+    }
+
+    fn request_question_owned(request: AttentionControlRequest) -> String {
+        match request {
+            AttentionControlRequest::Query { question, .. } => question,
+            _ => String::new(),
+        }
+    }
+
     struct EchoModule {
-        query_inbox: QueryInbox,
+        attention_control_inbox: AttentionControlRequestInbox,
         memo: Memo,
         on_done: Option<oneshot::Sender<()>>,
     }
 
     #[async_trait(?Send)]
     impl Module for EchoModule {
-        type Batch = QueryRequest;
+        type Batch = AttentionControlRequest;
 
         fn id() -> &'static str {
             "echo"
@@ -826,7 +840,7 @@ mod tests {
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            Ok(self.query_inbox.next_item().await?.body)
+            Ok(self.attention_control_inbox.next_item().await?.body)
         }
 
         async fn activate(
@@ -834,7 +848,9 @@ mod tests {
             _cx: &nuillu_module::ActivateCx<'_>,
             batch: &Self::Batch,
         ) -> anyhow::Result<()> {
-            self.memo.write(format!("echoed {}", batch.question)).await;
+            self.memo
+                .write(format!("echoed {}", request_question(batch)))
+                .await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
             }
@@ -843,7 +859,7 @@ mod tests {
     }
 
     struct QueryBatchRecorder {
-        query_inbox: QueryInbox,
+        attention_control_inbox: AttentionControlRequestInbox,
         batches: Rc<RefCell<Vec<Vec<String>>>>,
         first_done: Option<oneshot::Sender<()>>,
         second_done: Option<oneshot::Sender<()>>,
@@ -862,14 +878,15 @@ mod tests {
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            let first = self.query_inbox.next_item().await?.body.question;
+            let first =
+                request_question_owned(self.attention_control_inbox.next_item().await?.body);
             let mut batch = vec![first];
             batch.extend(
-                self.query_inbox
+                self.attention_control_inbox
                     .take_ready_items()?
                     .items
                     .into_iter()
-                    .map(|envelope| envelope.body.question),
+                    .map(|envelope| request_question_owned(envelope.body)),
             );
             Ok(batch)
         }
@@ -898,7 +915,7 @@ mod tests {
     }
 
     struct GatedEchoModule {
-        query_inbox: QueryInbox,
+        attention_control_inbox: AttentionControlRequestInbox,
         memo: Memo,
         activations: Rc<Cell<u8>>,
         on_done: Option<oneshot::Sender<()>>,
@@ -906,7 +923,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Module for GatedEchoModule {
-        type Batch = QueryRequest;
+        type Batch = AttentionControlRequest;
 
         fn id() -> &'static str {
             "gated-echo"
@@ -917,7 +934,7 @@ mod tests {
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            Ok(self.query_inbox.next_item().await?.body)
+            Ok(self.attention_control_inbox.next_item().await?.body)
         }
 
         async fn activate(
@@ -928,7 +945,7 @@ mod tests {
             self.activations
                 .set(self.activations.get().saturating_add(1));
             self.memo
-                .write(format!("gated echo handled {}", batch.question))
+                .write(format!("gated echo handled {}", request_question(batch)))
                 .await;
             if let Some(done) = self.on_done.take() {
                 let _ = done.send(());
@@ -982,7 +999,7 @@ mod tests {
     activation_gate_stub!(SecondaryGateStub, "secondary-gate");
 
     struct TimedQueryBatchRecorder {
-        query_inbox: QueryInbox,
+        attention_control_inbox: AttentionControlRequestInbox,
         batches: Rc<RefCell<Vec<Vec<String>>>>,
         activation_delays: Rc<RefCell<VecDeque<Duration>>>,
         first_done: Option<oneshot::Sender<()>>,
@@ -1002,14 +1019,15 @@ mod tests {
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            let first = self.query_inbox.next_item().await?.body.question;
+            let first =
+                request_question_owned(self.attention_control_inbox.next_item().await?.body);
             let mut batch = vec![first];
             batch.extend(
-                self.query_inbox
+                self.attention_control_inbox
                     .take_ready_items()?
                     .items
                     .into_iter()
-                    .map(|envelope| envelope.body.question),
+                    .map(|envelope| request_question_owned(envelope.body)),
             );
             Ok(batch)
         }
@@ -1398,7 +1416,7 @@ mod tests {
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| EchoModule {
-                                query_inbox: caps.query_inbox(),
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 memo: caps.memo(),
                                 on_done: done_tx.borrow_mut().take(),
                             }
@@ -1408,13 +1426,13 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let mailbox = caps.internal_harness_io().query_mailbox();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(QueryRequest::new("ping"))
+                        .publish(AttentionControlRequest::query("ping"))
                         .await
-                        .expect("query should route to echo");
+                        .expect("attention request should route to echo");
                     let _ = done_rx.await;
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
@@ -1496,7 +1514,7 @@ mod tests {
                     let activations = Rc::clone(&activations);
                     let target_tx = Rc::clone(&target_tx);
                     move |caps| GatedEchoModule {
-                        query_inbox: caps.query_inbox(),
+                        attention_control_inbox: caps.attention_control_inbox(),
                         memo: caps.memo(),
                         activations: Rc::clone(&activations),
                         on_done: target_tx.borrow_mut().take(),
@@ -1544,13 +1562,13 @@ mod tests {
         }
 
         let modules = registry.build(&caps).await.unwrap();
-        let mailbox = caps.internal_harness_io().query_mailbox();
+        let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
         super::run(modules, test_config(), async move {
             mailbox
-                .publish(QueryRequest::new("gated"))
+                .publish(AttentionControlRequest::query("gated"))
                 .await
-                .expect("query should route to gated echo");
+                .expect("attention request should route to gated echo");
             if expect_target_activation {
                 let _ = target_rx.await;
             } else {
@@ -1745,7 +1763,7 @@ mod tests {
                             let first_tx = Rc::clone(&first_tx);
                             let second_tx = Rc::clone(&second_tx);
                             move |caps| QueryBatchRecorder {
-                                query_inbox: caps.query_inbox(),
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 batches: Rc::clone(&batches),
                                 first_done: first_tx.borrow_mut().take(),
                                 second_done: second_tx.borrow_mut().take(),
@@ -1756,24 +1774,24 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let mailbox = caps.internal_harness_io().query_mailbox();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(QueryRequest::new("first"))
+                        .publish(AttentionControlRequest::query("first"))
                         .await
-                        .expect("first query should route");
+                        .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(QueryRequest::new("second"))
+                        .publish(AttentionControlRequest::query("second"))
                         .await
-                        .expect("second query should route");
+                        .expect("second attention request should route");
                     mailbox
-                        .publish(QueryRequest::new("third"))
+                        .publish(AttentionControlRequest::query("third"))
                         .await
-                        .expect("third query should route");
+                        .expect("third attention request should route");
                     let _ = second_rx.await;
                     assert!(started.elapsed() >= std::time::Duration::from_millis(20));
                 })
@@ -1826,7 +1844,7 @@ mod tests {
                             let first_tx = Rc::clone(&first_tx);
                             let second_tx = Rc::clone(&second_tx);
                             move |caps| TimedQueryBatchRecorder {
-                                query_inbox: caps.query_inbox(),
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 batches: Rc::clone(&batches),
                                 activation_delays: Rc::clone(&activation_delays),
                                 first_done: first_tx.borrow_mut().take(),
@@ -1838,20 +1856,20 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let mailbox = caps.internal_harness_io().query_mailbox();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(QueryRequest::new("first"))
+                        .publish(AttentionControlRequest::query("first"))
                         .await
-                        .expect("first query should route");
+                        .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(QueryRequest::new("second"))
+                        .publish(AttentionControlRequest::query("second"))
                         .await
-                        .expect("second query should route");
+                        .expect("second attention request should route");
                     let _ = second_rx.await;
                     let elapsed = started.elapsed();
                     assert!(elapsed >= Duration::from_millis(90), "{elapsed:?}");
@@ -1902,7 +1920,7 @@ mod tests {
                             let first_tx = Rc::clone(&first_tx);
                             let second_tx = Rc::clone(&second_tx);
                             move |caps| TimedQueryBatchRecorder {
-                                query_inbox: caps.query_inbox(),
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 batches: Rc::clone(&batches),
                                 activation_delays: Rc::clone(&activation_delays),
                                 first_done: first_tx.borrow_mut().take(),
@@ -1914,20 +1932,20 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let mailbox = caps.internal_harness_io().query_mailbox();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(QueryRequest::new("first"))
+                        .publish(AttentionControlRequest::query("first"))
                         .await
-                        .expect("first query should route");
+                        .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(QueryRequest::new("second"))
+                        .publish(AttentionControlRequest::query("second"))
                         .await
-                        .expect("second query should route");
+                        .expect("second attention request should route");
                     let _ = second_rx.await;
                     assert!(started.elapsed() < Duration::from_millis(80));
                 })
@@ -1971,7 +1989,7 @@ mod tests {
                             let first_tx = Rc::clone(&first_tx);
                             let second_tx = Rc::clone(&second_tx);
                             move |caps| QueryBatchRecorder {
-                                query_inbox: caps.query_inbox(),
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 batches: Rc::clone(&batches),
                                 first_done: first_tx.borrow_mut().take(),
                                 second_done: second_tx.borrow_mut().take(),
@@ -1982,19 +2000,19 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let mailbox = caps.internal_harness_io().query_mailbox();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(QueryRequest::new("first"))
+                        .publish(AttentionControlRequest::query("first"))
                         .await
-                        .expect("first query should route");
+                        .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     mailbox
-                        .publish(QueryRequest::new("second"))
+                        .publish(AttentionControlRequest::query("second"))
                         .await
-                        .expect("second query should route");
+                        .expect("second attention request should route");
                     tokio::time::sleep(Duration::from_millis(50)).await;
 
                     let mut raised = ResourceAllocation::default();

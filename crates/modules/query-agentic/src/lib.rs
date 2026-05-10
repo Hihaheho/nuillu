@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
-    Module, QueryInbox, QueryRequest, SessionCompactionConfig, compact_session_if_needed,
-    ports::FileSearchQuery, push_unread_memo_logs,
+    Module, SessionCompactionConfig, compact_session_if_needed, ports::FileSearchQuery,
+    push_unread_memo_logs,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -65,7 +65,6 @@ pub enum QueryAgenticTools {
 
 pub struct QueryAgenticModule {
     owner: nuillu_module::ModuleId,
-    query: QueryInbox,
     allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -79,7 +78,6 @@ pub struct QueryAgenticModule {
 
 impl QueryAgenticModule {
     pub fn new(
-        query: QueryInbox,
         allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -90,7 +88,6 @@ impl QueryAgenticModule {
         Self {
             owner: nuillu_module::ModuleId::new(<Self as Module>::id())
                 .expect("query-agentic id is valid"),
-            query,
             allocation_updates,
             allocation,
             blackboard,
@@ -113,23 +110,6 @@ impl QueryAgenticModule {
                 cx.now(),
             )
         })
-    }
-
-    #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn handle_queries(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        requests: Vec<QueryRequest>,
-    ) -> Result<()> {
-        let questions = requests
-            .into_iter()
-            .map(|request| request.question)
-            .collect::<Vec<_>>();
-        if questions.is_empty() {
-            return Ok(());
-        }
-        let hits = self.search_with_files(cx, &questions).await?;
-        self.write_hits(&hits).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -317,7 +297,7 @@ impl Module for QueryAgenticModule {
     }
 
     fn role_description() -> &'static str {
-        "Read-only file-search retrieval: writes relevant file snippets to its memo log on QueryRequest or allocation cues; cognition-gate must promote useful snippets before speech uses them; never synthesizes answers."
+        "Read-only file-search retrieval: writes relevant file snippets to its memo log on allocation guidance cues; cognition-gate must promote useful snippets before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -329,9 +309,6 @@ impl Module for QueryAgenticModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if !batch.queries.is_empty() {
-            self.handle_queries(cx, batch.queries.clone()).await?;
-        }
         if batch.guidance {
             self.activate_guidance(cx).await?;
         }

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    BlackboardReader, CognitionLogReader, LlmAccess, Memo, Module, SelfModelInbox,
-    SelfModelRequest, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader, LlmAccess,
+    Memo, Module, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 use nuillu_types::builtin;
 
@@ -15,7 +15,8 @@ Maintain a current first-person self-description from module memos, first-person
 experiences written by attention-schema to the cognition log, and self-related facts that query or
 memory modules have surfaced in their memos.
 Stable self-knowledge may be present in retrieved memory memos, but do not claim direct access to
-raw hidden memories. Answer explicit self-model questions from this current self model.
+raw hidden memories. Treat allocation guidance as the current self-model question or refresh
+instruction from attention-controller.
 Write the memo as free-form prose. Preserve the current self-description and every explicit
 question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
@@ -27,7 +28,8 @@ and corrections. Do not invent facts. Return plain text only."#;
 
 pub struct SelfModelModule {
     owner: nuillu_module::ModuleId,
-    requests: SelfModelInbox,
+    allocation_updates: AllocationUpdatedInbox,
+    allocation: AllocationReader,
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
     memo: Memo,
@@ -39,7 +41,8 @@ pub struct SelfModelModule {
 
 impl SelfModelModule {
     pub fn new(
-        requests: SelfModelInbox,
+        allocation_updates: AllocationUpdatedInbox,
+        allocation: AllocationReader,
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
         memo: Memo,
@@ -48,7 +51,8 @@ impl SelfModelModule {
         Self {
             owner: nuillu_module::ModuleId::new(<Self as Module>::id())
                 .expect("self-model id is valid"),
-            requests,
+            allocation_updates,
+            allocation,
             blackboard,
             cognition_log,
             memo,
@@ -72,11 +76,16 @@ impl SelfModelModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn answer_batch(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        requests: Vec<SelfModelRequest>,
-    ) -> Result<()> {
+    async fn answer_from_guidance(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+        let guidance = self
+            .allocation
+            .snapshot()
+            .await
+            .for_module(&self.owner)
+            .guidance;
+        if guidance.trim().is_empty() {
+            return Ok(());
+        }
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let cognition_context = self
@@ -88,16 +97,11 @@ impl SelfModelModule {
             .filter(|record| record.source.module == builtin::attention_schema())
             .cloned()
             .collect::<Vec<_>>();
-        let questions = requests
-            .into_iter()
-            .map(|request| request.question)
-            .collect::<Vec<_>>();
-
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(
             serde_json::json!({
-                "questions": questions,
+                "allocation_guidance": guidance,
             })
             .to_string(),
         );
@@ -154,8 +158,8 @@ impl Module for SelfModelModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if !batch.requests.is_empty() {
-            self.answer_batch(cx, batch.requests.clone()).await?;
+        if batch.allocation_updated {
+            self.answer_from_guidance(cx).await?;
         }
         Ok(())
     }

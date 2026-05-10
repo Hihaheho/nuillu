@@ -27,14 +27,13 @@ use crate::r#trait::ErasedModule;
 use crate::utterance::UtteranceWriter;
 use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
-    AllocationWriter, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
+    AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
+    AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, FileSearcher, LlmAccess,
     LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryCompactor,
-    MemoryContentReader, MemoryRequest, MemoryRequestInbox, MemoryRequestMailbox, MemoryWriter,
-    Module, ModuleBatch, ModuleStatusReader, QueryInbox, QueryMailbox, QueryRequest,
-    SelfModelInbox, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
-    SensoryDetailRequestInbox, SensoryDetailRequestMailbox, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VectorMemorySearcher,
+    MemoryContentReader, MemoryWriter, Module, ModuleBatch, ModuleStatusReader, SensoryInput,
+    SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
+    VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -49,10 +48,7 @@ pub struct CapabilityProviders {
 
 struct CapabilityProvidersInner {
     blackboard: Blackboard,
-    query_topic: Topic<QueryRequest>,
-    self_model_topic: Topic<SelfModelRequest>,
-    sensory_detail_topic: Topic<SensoryDetailRequest>,
-    memory_request_topic: Topic<MemoryRequest>,
+    attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
     memo_updates: Topic<MemoUpdated>,
@@ -137,31 +133,10 @@ impl CapabilityProviders {
         let llm_concurrency_limiter = LlmConcurrencyLimiter::new(policy.max_concurrent_llm_calls);
         Self {
             inner: Arc::new(CapabilityProvidersInner {
-                query_topic: Topic::new(
+                attention_control_requests: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::RoleLoadBalanced,
-                    TopicKind::Query,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
-                self_model_topic: Topic::new(
-                    blackboard.clone(),
-                    TopicPolicy::RoleLoadBalanced,
-                    TopicKind::SelfModel,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
-                sensory_detail_topic: Topic::new(
-                    blackboard.clone(),
-                    TopicPolicy::RoleLoadBalanced,
-                    TopicKind::SensoryDetailRequest,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
-                memory_request_topic: Topic::new(
-                    blackboard.clone(),
-                    TopicPolicy::RoleLoadBalanced,
-                    TopicKind::MemoryRequest,
+                    TopicKind::AttentionControlRequest,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -507,18 +482,10 @@ pub struct InternalHarnessIo {
 }
 
 impl InternalHarnessIo {
-    pub fn query_mailbox(&self) -> QueryMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
-    }
-
-    pub fn self_model_mailbox(&self) -> SelfModelMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
-    }
-
-    pub fn sensory_detail_mailbox(&self) -> SensoryDetailRequestMailbox {
+    pub fn attention_control_mailbox(&self) -> AttentionControlRequestMailbox {
         TopicMailbox::new(
             self.owner.clone(),
-            self.root.inner.sensory_detail_topic.clone(),
+            self.root.inner.attention_control_requests.clone(),
         )
     }
 
@@ -526,6 +493,13 @@ impl InternalHarnessIo {
         TopicMailbox::new(
             self.owner.clone(),
             self.root.inner.cognition_log_updates.clone(),
+        )
+    }
+
+    pub fn allocation_updated_mailbox(&self) -> AllocationUpdatedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.allocation_updates.clone(),
         )
     }
 
@@ -550,47 +524,17 @@ impl ModuleCapabilityFactory {
         &self.owner
     }
 
-    pub fn query_mailbox(&self) -> QueryMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
-    }
-
-    pub fn query_inbox(&self) -> QueryInbox {
-        TopicInbox::new(self.owner.clone(), self.root.inner.query_topic.clone())
-    }
-
-    pub fn self_model_mailbox(&self) -> SelfModelMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
-    }
-
-    pub fn self_model_inbox(&self) -> SelfModelInbox {
-        TopicInbox::new(self.owner.clone(), self.root.inner.self_model_topic.clone())
-    }
-
-    pub fn sensory_detail_mailbox(&self) -> SensoryDetailRequestMailbox {
+    pub fn attention_control_mailbox(&self) -> AttentionControlRequestMailbox {
         TopicMailbox::new(
             self.owner.clone(),
-            self.root.inner.sensory_detail_topic.clone(),
+            self.root.inner.attention_control_requests.clone(),
         )
     }
 
-    pub fn sensory_detail_inbox(&self) -> SensoryDetailRequestInbox {
+    pub fn attention_control_inbox(&self) -> AttentionControlRequestInbox {
         TopicInbox::new(
             self.owner.clone(),
-            self.root.inner.sensory_detail_topic.clone(),
-        )
-    }
-
-    pub fn memory_request_mailbox(&self) -> MemoryRequestMailbox {
-        TopicMailbox::new(
-            self.owner.clone(),
-            self.root.inner.memory_request_topic.clone(),
-        )
-    }
-
-    pub fn memory_request_inbox(&self) -> MemoryRequestInbox {
-        TopicInbox::new(
-            self.owner.clone(),
-            self.root.inner.memory_request_topic.clone(),
+            self.root.inner.attention_control_requests.clone(),
         )
     }
 

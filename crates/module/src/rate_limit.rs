@@ -12,11 +12,8 @@ use tokio::time::{Instant, sleep_until};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicKind {
-    Query,
-    SelfModel,
+    AttentionControlRequest,
     SensoryInput,
-    SensoryDetailRequest,
-    MemoryRequest,
     CognitionLogUpdated,
     AllocationUpdated,
     MemoUpdated,
@@ -352,7 +349,7 @@ mod tests {
         let policy = RateLimitPolicy::for_module(
             owner_0.module.clone(),
             CapabilityKind::ChannelPublish {
-                topic: TopicKind::Query,
+                topic: TopicKind::AttentionControlRequest,
             },
             RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
         )
@@ -363,7 +360,7 @@ mod tests {
             .acquire(
                 &owner_0,
                 CapabilityKind::ChannelPublish {
-                    topic: TopicKind::Query,
+                    topic: TopicKind::AttentionControlRequest,
                 },
             )
             .await;
@@ -371,7 +368,7 @@ mod tests {
             .acquire(
                 &owner_1,
                 CapabilityKind::ChannelPublish {
-                    topic: TopicKind::Query,
+                    topic: TopicKind::AttentionControlRequest,
                 },
             )
             .await;
@@ -386,7 +383,7 @@ mod tests {
         let policy = RateLimitPolicy::for_module(
             owner.module.clone(),
             CapabilityKind::ChannelPublish {
-                topic: TopicKind::Query,
+                topic: TopicKind::AttentionControlRequest,
             },
             RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
         )
@@ -397,7 +394,7 @@ mod tests {
             .acquire(
                 &owner,
                 CapabilityKind::ChannelPublish {
-                    topic: TopicKind::Query,
+                    topic: TopicKind::AttentionControlRequest,
                 },
             )
             .await;
@@ -405,7 +402,7 @@ mod tests {
             .acquire(
                 &owner,
                 CapabilityKind::ChannelPublish {
-                    topic: TopicKind::SensoryDetailRequest,
+                    topic: TopicKind::SensoryInput,
                 },
             )
             .await;

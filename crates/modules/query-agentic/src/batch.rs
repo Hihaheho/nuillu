@@ -1,35 +1,19 @@
 use anyhow::Result;
-use nuillu_module::QueryRequest;
 
 use crate::QueryAgenticModule;
 
 #[derive(Debug, Default)]
 pub struct NextBatch {
-    pub(crate) queries: Vec<QueryRequest>,
     pub(crate) guidance: bool,
 }
 
 impl NextBatch {
     fn guidance() -> Self {
-        Self {
-            queries: Vec::new(),
-            guidance: true,
-        }
-    }
-
-    fn query(request: QueryRequest) -> Self {
-        Self {
-            queries: vec![request],
-            guidance: false,
-        }
+        Self { guidance: true }
     }
 
     fn mark_guidance(&mut self) {
         self.guidance = true;
-    }
-
-    fn extend_queries(&mut self, requests: impl IntoIterator<Item = QueryRequest>) {
-        self.queries.extend(requests);
     }
 }
 
@@ -46,23 +30,11 @@ impl QueryAgenticModule {
                 let _ = update?;
                 NextBatch::guidance()
             }
-            request = self.query.next_item() => {
-                let envelope = request?;
-                NextBatch::query(envelope.body)
-            }
         };
         Ok(batch)
     }
 
     fn collect_ready_events_into_batch(&mut self, batch: &mut NextBatch) -> Result<()> {
-        let ready_queries = self.query.take_ready_items()?;
-        batch.extend_queries(
-            ready_queries
-                .items
-                .into_iter()
-                .map(|envelope| envelope.body),
-        );
-
         if !self.allocation_updates.take_ready_items()?.items.is_empty() {
             batch.mark_guidance();
         }
@@ -76,24 +48,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_batch_preserves_request_order() {
-        let mut batch = NextBatch::query(QueryRequest::new("first"));
-        batch.extend_queries([QueryRequest::new("second")]);
-
-        let questions = batch
-            .queries
-            .iter()
-            .map(|request| request.question.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(questions, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn guidance_flag_can_share_batch_with_queries() {
-        let mut batch = NextBatch::query(QueryRequest::new("question"));
+    fn guidance_flag_can_be_marked() {
+        let mut batch = NextBatch::default();
         batch.mark_guidance();
 
         assert!(batch.guidance);
-        assert_eq!(batch.queries.len(), 1);
     }
 }

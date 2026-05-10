@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module, QueryInbox,
-    QueryRequest, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
+    LlmAccess, Module, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
     compact_session_if_needed, push_unread_memo_logs, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
@@ -92,7 +92,7 @@ pub enum QueryVectorTools {
 
 pub struct QueryVectorModule {
     owner: nuillu_types::ModuleId,
-    query: QueryInbox,
+    allocation_updates: AllocationUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -107,7 +107,7 @@ pub struct QueryVectorModule {
 impl QueryVectorModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        query: QueryInbox,
+        allocation_updates: AllocationUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -118,7 +118,7 @@ impl QueryVectorModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("query-vector id is valid"),
-            query,
+            allocation_updates,
             cognition_updates,
             allocation,
             blackboard,
@@ -144,15 +144,17 @@ impl QueryVectorModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn handle_queries(
+    async fn activate_allocation_guidance(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        requests: Vec<QueryRequest>,
     ) -> Result<()> {
-        let questions = requests
-            .into_iter()
-            .map(|request| request.question)
-            .collect::<Vec<_>>();
+        let guidance = self
+            .allocation
+            .snapshot()
+            .await
+            .for_module(&self.owner)
+            .guidance;
+        let questions = guidance_questions(&guidance);
         if questions.is_empty() {
             return Ok(());
         }
@@ -165,9 +167,14 @@ impl QueryVectorModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
+        let owner = self.owner.clone();
         let question = self
             .blackboard
-            .read(|bb| {
+            .read(move |bb| {
+                let guidance = bb.allocation().for_module(&owner).guidance;
+                if !guidance.trim().is_empty() {
+                    return guidance;
+                }
                 let entries = bb.cognition_log().entries().to_vec();
                 let latest = entries
                     .last()
@@ -456,7 +463,7 @@ impl Module for QueryVectorModule {
     }
 
     fn role_description() -> &'static str {
-        "Recalls stored memories by semantic similarity when evidence is not already available: writes query intent and fresh memory evidence to its memo log on QueryRequest or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
+        "Recalls stored memories by semantic similarity when evidence is not already available: writes query intent and fresh memory evidence to its memo log from allocation guidance or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -468,13 +475,22 @@ impl Module for QueryVectorModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if !batch.queries.is_empty() {
-            self.handle_queries(cx, batch.queries.clone()).await?;
+        if batch.allocation_updated {
+            self.activate_allocation_guidance(cx).await?;
         }
         if batch.cognition_updated {
             self.activate_cognition_update(cx).await?;
         }
         Ok(())
+    }
+}
+
+fn guidance_questions(guidance: &str) -> Vec<String> {
+    let trimmed = guidance.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![trimmed.to_owned()]
     }
 }
 
@@ -490,15 +506,17 @@ mod tests {
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
-    use nuillu_blackboard::{Blackboard, Bpm, linear_ratio_fn};
+    use nuillu_blackboard::{
+        Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+    };
     use nuillu_module::ports::{
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory,
         NoopCognitionLogRepository, NoopFileSearchProvider, NoopUtteranceSink, PortError,
         SystemClock,
     };
     use nuillu_module::{
-        ActivateCx, CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
-        QueryRequest,
+        ActivateCx, AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers,
+        ModuleRegistry,
     };
     use nuillu_types::{MemoryContent, ModuleInstanceId, ReplicaIndex, builtin};
 
@@ -659,7 +677,7 @@ mod tests {
                 linear_ratio_fn,
                 |caps| {
                     QueryVectorModule::new(
-                        caps.query_inbox(),
+                        caps.allocation_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
@@ -678,24 +696,33 @@ mod tests {
     }
 
     async fn activate_query(
+        blackboard: &Blackboard,
         caps: &CapabilityProviders,
         runtime: &nuillu_module::AgentRuntimeControl,
         module: &mut nuillu_module::AllocatedModule,
     ) {
-        activate_query_with_question(caps, runtime, module, "koro").await;
+        activate_query_with_question(blackboard, caps, runtime, module, "koro").await;
     }
 
     async fn activate_query_with_question(
+        blackboard: &Blackboard,
         caps: &CapabilityProviders,
         runtime: &nuillu_module::AgentRuntimeControl,
         module: &mut nuillu_module::AllocatedModule,
         question: &str,
     ) {
+        let mut allocation = ResourceAllocation::default();
+        let mut config = ModuleConfig::default();
+        config.guidance = question.into();
+        allocation.set(builtin::query_vector(), config);
+        blackboard
+            .apply(BlackboardCommand::SetAllocation(allocation))
+            .await;
         caps.internal_harness_io()
-            .query_mailbox()
-            .publish(QueryRequest::new(question))
+            .allocation_updated_mailbox()
+            .publish(AllocationUpdated)
             .await
-            .expect("query published");
+            .expect("allocation update published");
         let batch = module.next_batch().await.expect("query batch received");
         let catalog = runtime.module_catalog();
         let identity_memories = Vec::new();
@@ -720,7 +747,8 @@ mod tests {
         let caps = test_caps(blackboard.clone(), store.clone(), adapter);
         let (runtime, mut module) = build_query_vector(&caps).await;
 
-        activate_query_with_question(&caps, &runtime, &mut module, "food bowl clue").await;
+        activate_query_with_question(&blackboard, &caps, &runtime, &mut module, "food bowl clue")
+            .await;
 
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
@@ -764,7 +792,8 @@ mod tests {
         let caps = test_caps(blackboard.clone(), store.clone(), adapter);
         let (runtime, mut module) = build_query_vector(&caps).await;
 
-        activate_query_with_question(&caps, &runtime, &mut module, "food bowl clue").await;
+        activate_query_with_question(&blackboard, &caps, &runtime, &mut module, "food bowl clue")
+            .await;
 
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
@@ -789,8 +818,8 @@ mod tests {
         let caps = test_caps(blackboard.clone(), store.clone(), adapter);
         let (runtime, mut module) = build_query_vector(&caps).await;
 
-        activate_query(&caps, &runtime, &mut module).await;
-        activate_query(&caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
 
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
         assert_eq!(logs.len(), 1);
@@ -811,8 +840,8 @@ mod tests {
         let caps = test_caps(blackboard.clone(), store.clone(), adapter);
         let (runtime, mut module) = build_query_vector(&caps).await;
 
-        activate_query(&caps, &runtime, &mut module).await;
-        activate_query(&caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
 
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
@@ -853,12 +882,12 @@ mod tests {
         let caps = test_caps(blackboard.clone(), store.clone(), adapter);
         let (runtime, mut module) = build_query_vector(&caps).await;
 
-        activate_query(&caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
         store.set_records(vec![
             memory_record("mem-1", "Koro approaches from the left."),
             memory_record("mem-2", "Koro relaxes when the route is clear."),
         ]);
-        activate_query(&caps, &runtime, &mut module).await;
+        activate_query(&blackboard, &caps, &runtime, &mut module).await;
 
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
         let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;

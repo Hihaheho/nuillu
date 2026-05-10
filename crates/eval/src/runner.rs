@@ -35,9 +35,10 @@ use nuillu_module::ports::{
     NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceDelta, UtteranceSink,
 };
 use nuillu_module::{
-    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
-    RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox,
+    AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
+    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, LutumTiers,
+    ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
+    SensoryInputMailbox,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
@@ -1178,6 +1179,7 @@ async fn execute_module_case(
 
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
+    let run_target_module = target_module.clone();
     let modules = eval_registry(&case_modules).build(&env.caps).await?;
     let harness = env.caps.internal_harness_io();
     let limits = case.limits.clone();
@@ -1199,11 +1201,18 @@ async fn execute_module_case(
         async move {
             match target {
                 ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
+                    let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+                    let mut config = allocation.for_module(&run_target_module);
+                    config.guidance = prompt.clone();
+                    allocation.set(run_target_module.clone(), config);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(allocation))
+                        .await;
                     harness
-                        .query_mailbox()
-                        .publish(nuillu_module::QueryRequest::new(prompt))
+                        .allocation_updated_mailbox()
+                        .publish(AllocationUpdated)
                         .await
-                        .expect("module eval failed to publish QueryRequest");
+                        .expect("module eval failed to publish AllocationUpdated");
                 }
                 ModuleEvalTarget::AttentionSchema => {
                     for record in &memo_seed_records {
@@ -1230,11 +1239,18 @@ async fn execute_module_case(
                     }
                 }
                 ModuleEvalTarget::SelfModel => {
+                    let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+                    let mut config = allocation.for_module(&run_target_module);
+                    config.guidance = prompt.clone();
+                    allocation.set(run_target_module.clone(), config);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(allocation))
+                        .await;
                     harness
-                        .self_model_mailbox()
-                        .publish(nuillu_module::SelfModelRequest::new(prompt))
+                        .allocation_updated_mailbox()
+                        .publish(AllocationUpdated)
                         .await
-                        .expect("module eval failed to publish SelfModelRequest");
+                        .expect("module eval failed to publish AllocationUpdated");
                 }
             }
 
@@ -1950,7 +1966,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
-                    caps.sensory_detail_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.memo(),
                     caps.clock(),
@@ -1980,6 +1996,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_attention_controller::AttentionControllerModule::new(
                     caps.memo_updated_inbox(),
+                    caps.attention_control_inbox(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
@@ -2005,11 +2022,12 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 )
             })
             .expect("eval module registration should be unique"),
-        // On-demand: only fires when a SelfModelRequest arrives.
+        // On-demand: fires on controller allocation guidance.
         EvalModule::SelfModel => registry
             .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_self_model::SelfModelModule::new(
-                    caps.self_model_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.memo(),
@@ -2022,7 +2040,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         EvalModule::QueryVector => registry
             .register(1..=1, Bpm::range(6.0, 15.0), linear_ratio_fn, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
-                    caps.query_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -2036,7 +2054,6 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         EvalModule::QueryAgentic => registry
             .register(1..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
-                    caps.query_inbox(),
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -2051,7 +2068,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_memory::MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
-                    caps.memory_request_inbox(),
+                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memory_writer(),
@@ -2093,7 +2110,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
-                    caps.memory_request_mailbox(),
+                    caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
                 )
@@ -2108,9 +2125,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.module_status_reader(),
-                    caps.query_mailbox(),
-                    caps.self_model_mailbox(),
-                    caps.sensory_detail_mailbox(),
+                    caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
                 )
@@ -2256,7 +2271,7 @@ fn module_allocation(
                 guidance: if is_target {
                     "Handle the module eval request.".into()
                 } else {
-                    "Registered for this module eval; idle unless activated by a typed signal."
+                    "Registered for this module eval; idle unless activated by allocation guidance."
                         .into()
                 },
             },

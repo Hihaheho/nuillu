@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
-    AllocationReader, AllocationWriter, BlackboardReader, CognitionLogReader, LlmAccess, Memo,
-    MemoUpdatedInbox, Module, SessionCompactionConfig, compact_session_if_needed,
-    push_unread_memo_logs,
+    AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
+    BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
+    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
-You wake on memo updates. Use blackboard memos, the cognition log, the current allocation, and
-the registry schema to decide which modules deserve activation right now.
+You wake on memo updates and internal attention-control requests. Use blackboard memos, attention
+control requests, the cognition log, the current allocation, and the registry schema to decide which
+modules deserve activation right now.
 
 Output shape: a `memo` (free-form controller note for the shared memo surface) plus a `priority`
 array. The array lists modules to activate in descending priority order, each entry pairing a
@@ -26,6 +27,12 @@ module needs activation now. Modules you omit receive zero activation; their typ
 flow because each module keeps a minimum replica. Position in the array maps to the host-configured
 activation table; positions beyond the table fall to zero, so prioritise tightly. Do not invent
 module ids and do not duplicate ids.
+
+Attention-control requests are not target-module work queues. They are current attention bids that
+you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
+concrete requested work in that module's guidance hint. If you defer or reject a request, do not
+activate a module for it. In every case, record the admit/defer/reject judgement and reason in
+`memo`; there is no durable pending request queue outside this controller note.
 
 Speech output is driven by cognition-log updates that pass speak-gate's activation gate, not by
 allocation priority. Speech is the agent's primary outward action in its world, not a chat-style
@@ -83,6 +90,7 @@ pub struct PriorityEntry {
 pub struct AttentionControllerModule {
     owner: ModuleId,
     updates: MemoUpdatedInbox,
+    requests: AttentionControlRequestInbox,
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
     allocation_reader: AllocationReader,
@@ -91,12 +99,14 @@ pub struct AttentionControllerModule {
     llm: LlmAccess,
     session: Session,
     session_compaction: SessionCompactionConfig,
+    batching: batch::AttentionControlBatchConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
 impl AttentionControllerModule {
     pub fn new(
         updates: MemoUpdatedInbox,
+        requests: AttentionControlRequestInbox,
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
         allocation_reader: AllocationReader,
@@ -107,6 +117,7 @@ impl AttentionControllerModule {
         Self {
             owner: ModuleId::new(<Self as Module>::id()).expect("attention-controller id is valid"),
             updates,
+            requests,
             blackboard,
             cognition_log,
             allocation_reader,
@@ -115,8 +126,15 @@ impl AttentionControllerModule {
             llm,
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
+            batching: batch::AttentionControlBatchConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_batch_config(mut self, batching: batch::AttentionControlBatchConfig) -> Self {
+        self.batching = batching;
+        self
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -132,17 +150,11 @@ impl AttentionControllerModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.activate_with(&system_prompt, cx.session_compaction_lutum())
-            .await
-    }
-
-    #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_with(
         &mut self,
         system_prompt: &str,
         compaction_lutum: &lutum::Lutum,
+        requests: &[AttentionControlRequest],
     ) -> Result<()> {
         let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
@@ -170,6 +182,7 @@ impl AttentionControllerModule {
         self.session.push_ephemeral_user(
             controller_input(
                 serde_json::to_value(&cognition_log).context("serialize cognition log")?,
+                serde_json::to_value(requests).context("serialize attention-control requests")?,
                 blackboard,
                 serde_json::to_value(&current).context("serialize current allocation")?,
                 controller_schema,
@@ -276,12 +289,14 @@ fn fallback_allocation_decision_schema() -> Schema {
 
 fn controller_input(
     cognition_log: serde_json::Value,
+    attention_control_requests: serde_json::Value,
     blackboard: serde_json::Value,
     allocation: serde_json::Value,
     controller_schema: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "cognition_log": cognition_log,
+        "attention_control_requests": attention_control_requests,
         "blackboard": blackboard,
         "allocation": allocation,
         "controller_schema": controller_schema,
@@ -290,7 +305,7 @@ fn controller_input(
 
 #[async_trait(?Send)]
 impl Module for AttentionControllerModule {
-    type Batch = ();
+    type Batch = batch::NextBatch;
 
     fn id() -> &'static str {
         "attention-controller"
@@ -309,8 +324,13 @@ impl Module for AttentionControllerModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        let _ = batch;
-        AttentionControllerModule::activate(self, cx).await
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.activate_with(
+            &system_prompt,
+            cx.session_compaction_lutum(),
+            &batch.requests,
+        )
+        .await
     }
 }
 
@@ -393,6 +413,13 @@ mod tests {
     fn controller_input_includes_blackboard_memos_without_special_protocol() {
         let input = controller_input(
             serde_json::json!([]),
+            serde_json::json!([
+                {
+                    "kind": "query",
+                    "question": "which route is safe?",
+                    "reason": "speak-gate requested evidence"
+                }
+            ]),
             serde_json::json!({
                 "memos": {
                     "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
@@ -406,6 +433,13 @@ mod tests {
             input,
             serde_json::json!({
                 "cognition_log": [],
+                "attention_control_requests": [
+                    {
+                        "kind": "query",
+                        "question": "which route is safe?",
+                        "reason": "speak-gate requested evidence"
+                    }
+                ],
                 "blackboard": {
                     "memos": {
                         "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"

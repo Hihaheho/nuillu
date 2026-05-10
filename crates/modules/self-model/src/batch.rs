@@ -1,22 +1,17 @@
 use anyhow::Result;
-use nuillu_module::SelfModelRequest;
 
 use crate::SelfModelModule;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct NextBatch {
-    pub(crate) requests: Vec<SelfModelRequest>,
+    pub(crate) allocation_updated: bool,
 }
 
 impl NextBatch {
-    fn request(request: SelfModelRequest) -> Self {
+    fn allocation_updated() -> Self {
         Self {
-            requests: vec![request],
+            allocation_updated: true,
         }
-    }
-
-    fn extend_requests(&mut self, requests: impl IntoIterator<Item = SelfModelRequest>) {
-        self.requests.extend(requests);
     }
 }
 
@@ -28,18 +23,14 @@ impl SelfModelModule {
     }
 
     async fn await_first_batch(&mut self) -> Result<NextBatch> {
-        let envelope = self.requests.next_item().await?;
-        Ok(NextBatch::request(envelope.body))
+        let _ = self.allocation_updates.next_item().await?;
+        Ok(NextBatch::allocation_updated())
     }
 
     fn collect_ready_events_into_batch(&mut self, batch: &mut NextBatch) -> Result<()> {
-        let ready_requests = self.requests.take_ready_items()?;
-        batch.extend_requests(
-            ready_requests
-                .items
-                .into_iter()
-                .map(|envelope| envelope.body),
-        );
+        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
+            batch.allocation_updated = true;
+        }
         Ok(())
     }
 }
@@ -49,15 +40,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requests_preserve_receive_order() {
-        let mut batch = NextBatch::request(SelfModelRequest::new("first"));
-        batch.extend_requests([SelfModelRequest::new("second")]);
+    fn allocation_update_batch_marks_guidance_work() {
+        let batch = NextBatch::allocation_updated();
 
-        let questions = batch
-            .requests
-            .into_iter()
-            .map(|request| request.question)
-            .collect::<Vec<_>>();
-        assert_eq!(questions, vec!["first", "second"]);
+        assert!(batch.allocation_updated);
     }
 }

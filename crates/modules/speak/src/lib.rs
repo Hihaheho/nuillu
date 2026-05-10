@@ -9,11 +9,10 @@ use lutum::{
     ToolResult, TurnRole,
 };
 use nuillu_module::{
-    ActivationGate, ActivationGateEvent, ActivationGateVote, BlackboardReader,
-    CognitionLogEntryRecord, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
-    ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest, SceneReader, SelfModelMailbox,
-    SelfModelRequest, SensoryDetailRequest, SensoryDetailRequestMailbox, UtteranceProgress,
-    UtteranceWriter, push_unread_memo_logs,
+    ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
+    AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
+    CognitionLogUpdatedInbox, LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader,
+    SceneReader, UtteranceProgress, UtteranceWriter, push_unread_memo_logs,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -540,9 +539,7 @@ pub struct SpeakGateModule {
     cognition_log: CognitionLogReader,
     blackboard: BlackboardReader,
     module_status: ModuleStatusReader,
-    query: QueryMailbox,
-    self_model: SelfModelMailbox,
-    sensory_detail: SensoryDetailRequestMailbox,
+    attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
     session: Session,
@@ -557,9 +554,7 @@ impl SpeakGateModule {
         cognition_log: CognitionLogReader,
         blackboard: BlackboardReader,
         module_status: ModuleStatusReader,
-        query: QueryMailbox,
-        self_model: SelfModelMailbox,
-        sensory_detail: SensoryDetailRequestMailbox,
+        attention_control: AttentionControlRequestMailbox,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
@@ -570,9 +565,7 @@ impl SpeakGateModule {
             cognition_log,
             blackboard,
             module_status,
-            query,
-            self_model,
-            sensory_detail,
+            attention_control,
             memo,
             llm,
             session: Session::new(),
@@ -814,8 +807,11 @@ impl SpeakGateModule {
         let requested = if duplicate {
             false
         } else {
-            self.query
-                .publish(QueryRequest::new(question))
+            self.attention_control
+                .publish(AttentionControlRequest::query_with_reason(
+                    question,
+                    "speak-gate query_memory evidence tool",
+                ))
                 .await
                 .is_ok()
         };
@@ -835,8 +831,11 @@ impl SpeakGateModule {
         let requested = if duplicate {
             false
         } else {
-            self.self_model
-                .publish(SelfModelRequest::new(question))
+            self.attention_control
+                .publish(AttentionControlRequest::self_model_with_reason(
+                    question,
+                    "speak-gate query_self_model evidence tool",
+                ))
                 .await
                 .is_ok()
         };
@@ -856,8 +855,11 @@ impl SpeakGateModule {
         let requested = if duplicate {
             false
         } else {
-            self.sensory_detail
-                .publish(SensoryDetailRequest::new(question))
+            self.attention_control
+                .publish(AttentionControlRequest::sensory_detail_with_reason(
+                    question,
+                    "speak-gate query_sensory_detail evidence tool",
+                ))
                 .await
                 .is_ok()
         };
@@ -1326,8 +1328,8 @@ mod tests {
         SystemClock, Utterance, UtteranceSink,
     };
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
-        ModuleRegistry, Participant, QueryInbox, SelfModelInbox, SensoryDetailRequestInbox,
+        AttentionControlRequestInbox, CapabilityProviderPorts, CapabilityProviders,
+        CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
     };
 
     use super::*;
@@ -1375,6 +1377,7 @@ mod tests {
         let mut allocation = ResourceAllocation::default();
         for module in [
             builtin::speak_gate(),
+            builtin::attention_controller(),
             builtin::query_vector(),
             builtin::self_model(),
             builtin::sensory(),
@@ -1441,16 +1444,12 @@ mod tests {
 
     noop_stub!(SpeakGateStub, "speak-gate");
     noop_stub!(SpeakStub, "speak");
-    noop_stub!(QueryVectorStub, "query-vector");
-    noop_stub!(SelfModelStub, "self-model");
-    noop_stub!(SensoryStub, "sensory");
+    noop_stub!(AttentionControllerStub, "attention-controller");
 
     struct GateToolFixture {
         gate: SpeakGateModule,
         blackboard: Blackboard,
-        query_inbox: QueryInbox,
-        self_model_inbox: SelfModelInbox,
-        sensory_detail_inbox: SensoryDetailRequestInbox,
+        attention_control_inbox: AttentionControlRequestInbox,
     }
 
     async fn gate_tool_fixture() -> GateToolFixture {
@@ -1462,14 +1461,10 @@ mod tests {
         let caps = test_caps_with_adapter(blackboard.clone(), adapter);
 
         let gate_cell = Rc::new(RefCell::new(None));
-        let query_inbox_cell = Rc::new(RefCell::new(None));
-        let self_model_inbox_cell = Rc::new(RefCell::new(None));
-        let sensory_detail_inbox_cell = Rc::new(RefCell::new(None));
+        let attention_control_inbox_cell = Rc::new(RefCell::new(None));
 
         let gate_sink = Rc::clone(&gate_cell);
-        let query_inbox_sink = Rc::clone(&query_inbox_cell);
-        let self_model_inbox_sink = Rc::clone(&self_model_inbox_cell);
-        let sensory_detail_inbox_sink = Rc::clone(&sensory_detail_inbox_cell);
+        let attention_control_inbox_sink = Rc::clone(&attention_control_inbox_cell);
 
         let _modules = ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
@@ -1478,9 +1473,7 @@ mod tests {
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.module_status_reader(),
-                    caps.query_mailbox(),
-                    caps.self_model_mailbox(),
-                    caps.sensory_detail_mailbox(),
+                    caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
                 ));
@@ -1488,18 +1481,8 @@ mod tests {
             })
             .unwrap()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
-                *query_inbox_sink.borrow_mut() = Some(caps.query_inbox());
-                QueryVectorStub
-            })
-            .unwrap()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
-                *self_model_inbox_sink.borrow_mut() = Some(caps.self_model_inbox());
-                SelfModelStub
-            })
-            .unwrap()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
-                *sensory_detail_inbox_sink.borrow_mut() = Some(caps.sensory_detail_inbox());
-                SensoryStub
+                *attention_control_inbox_sink.borrow_mut() = Some(caps.attention_control_inbox());
+                AttentionControllerStub
             })
             .unwrap()
             .build(&caps)
@@ -1509,9 +1492,7 @@ mod tests {
         GateToolFixture {
             gate: gate_cell.borrow_mut().take().unwrap(),
             blackboard,
-            query_inbox: query_inbox_cell.borrow_mut().take().unwrap(),
-            self_model_inbox: self_model_inbox_cell.borrow_mut().take().unwrap(),
-            sensory_detail_inbox: sensory_detail_inbox_cell.borrow_mut().take().unwrap(),
+            attention_control_inbox: attention_control_inbox_cell.borrow_mut().take().unwrap(),
         }
     }
 
@@ -2109,11 +2090,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let memory_request = fixture.query_inbox.next_item().await.unwrap();
+        let memory_request = fixture.attention_control_inbox.next_item().await.unwrap();
         assert!(memory_output.requested);
         assert!(!memory_output.duplicate);
         assert_eq!(memory_request.sender.module, builtin::speak_gate());
-        assert_eq!(memory_request.body.question, "body fact?");
+        assert_eq!(
+            memory_request.body,
+            AttentionControlRequest::query_with_reason(
+                "body fact?",
+                "speak-gate query_memory evidence tool"
+            )
+        );
 
         let duplicate_memory_output = fixture
             .gate
@@ -2129,7 +2116,7 @@ mod tests {
         assert!(duplicate_memory_output.duplicate);
         assert!(
             fixture
-                .query_inbox
+                .attention_control_inbox
                 .take_ready_items()
                 .unwrap()
                 .items
@@ -2147,11 +2134,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let self_model_request = fixture.self_model_inbox.next_item().await.unwrap();
+        let self_model_request = fixture.attention_control_inbox.next_item().await.unwrap();
         assert!(self_model_output.requested);
         assert!(!self_model_output.duplicate);
         assert_eq!(self_model_request.sender.module, builtin::speak_gate());
-        assert_eq!(self_model_request.body.question, "current role?");
+        assert_eq!(
+            self_model_request.body,
+            AttentionControlRequest::self_model_with_reason(
+                "current role?",
+                "speak-gate query_self_model evidence tool"
+            )
+        );
 
         let mut sensory_detail_requests = HashSet::new();
         let sensory_output = fixture
@@ -2164,10 +2157,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let sensory_request = fixture.sensory_detail_inbox.next_item().await.unwrap();
+        let sensory_request = fixture.attention_control_inbox.next_item().await.unwrap();
         assert!(sensory_output.requested);
         assert!(!sensory_output.duplicate);
         assert_eq!(sensory_request.sender.module, builtin::speak_gate());
-        assert_eq!(sensory_request.body.question, "what was just heard?");
+        assert_eq!(
+            sensory_request.body,
+            AttentionControlRequest::sensory_detail_with_reason(
+                "what was just heard?",
+                "speak-gate query_sensory_detail evidence tool"
+            )
+        );
     }
 }
