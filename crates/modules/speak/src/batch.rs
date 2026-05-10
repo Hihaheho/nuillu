@@ -35,12 +35,10 @@ mod tests {
     #[test]
     fn latest_ready_request_wins() {
         let mut batch = NextBatch {
-            request: SpeakRequest::new("Koro", "first", "old"),
+            request: SpeakRequest::new("Koro"),
         };
-        batch.request = SpeakRequest::new("Pibi", "second", "new");
+        batch.request = SpeakRequest::new("Pibi");
 
         assert_eq!(batch.request.target, "Pibi");
-        assert_eq!(batch.request.generation_hint, "second");
-        assert_eq!(batch.request.rationale, "new");
     }
 }

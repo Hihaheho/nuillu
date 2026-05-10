@@ -63,15 +63,16 @@ the source to consult, the concrete question to answer, and the exact fact that 
 in the cognition log before speaking. After publishing an evidence request, wait silently; speak-gate will
 reconsider when a later cognition-log update arrives.
 
-When should_speak=true, provide a speech_plan with a target and a concrete generation_hint naming
-the cognition-log facts to use, the intended frame, and any constraints on style or scope. The
-target is mandatory for every utterance and is constrained to the schema enum: pick the participant
-the agent is addressing (the questioner when answering a question, the peer being directly
-addressed for direct signals); use "self" for self-directed speech/soliloquy; use "everyone" for
-broadcast speech intended for all present participants. Do not invent a name not in the enum, and
-do not append qualifiers (e.g. "(and others)") — the value must be exactly one enum string.
-If you cannot choose a target and write a hint, should_speak must be false and speech_plan must be
-null. Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
+When should_speak=true, provide a speech_target naming the participant the agent is addressing.
+The target is mandatory for every utterance and is constrained to the schema enum: pick the
+participant the agent is addressing (the questioner when answering a question, the peer being
+directly addressed for direct signals); use "self" for self-directed speech/soliloquy; use
+"everyone" for broadcast speech intended for all present participants. Do not invent a name not in
+the enum, and do not append qualifiers (e.g. "(and others)") — the value must be exactly one enum
+string. The speak module reads the cognition log directly, so do not summarize or restate cognition
+facts here — speech content is decided in speak from the cognition log, not in this gate.
+If you cannot choose a target, should_speak must be false and speech_target must be null.
+Return only raw JSON for the structured decision; do not wrap it in Markdown or code fences."#;
 
 const READINESS_GATE_SELF_MODEL_TOOL_PROMPT: &str =
     "- query_self_model(question) for current first-person model facts.\n";
@@ -86,37 +87,45 @@ The persistent conversation history contains user messages named new_cognition_l
 messages are the cognition-log history.
 
 Use an interruption gate:
-- Compare the new cognition log with the partial utterance and current generation hint.
+- Compare the new cognition log with the partial utterance.
 - Set should_speak=true only if the new cognition-log input changes the required answer, addressee, safety,
   or grounding materially.
 - Keep should_speak=false for minor updates, redundant evidence, or cognition-log input that can wait until
   the current utterance completes.
-- If interruption is needed, write a generation_hint for the replacement utterance that accounts
-  for both the new cognition-log input and the already spoken partial utterance.
 - If interruption would require a missing fact, set should_speak=false and include evidence_gaps
   naming the source, concrete question, and exact fact that must become visible in the cognition log.
 
-When should_speak=true, provide a speech_plan with a target and a concrete generation_hint naming
-the cognition-log facts to use, what should replace or continue from the partial utterance, and any
-constraints on style or scope. The target is constrained to the schema enum (participant names,
-"self", or "everyone"); preserve the same target as the current utterance unless the new
-cognition-log input materially changes who must be addressed. If you cannot choose a target and
-write a hint, should_speak must be false and speech_plan must be null. Return only raw JSON for
-the structured decision; do not wrap it in Markdown or code fences."#;
+When should_speak=true, provide a speech_target naming the participant the agent is addressing.
+The target is constrained to the schema enum (participant names, "self", or "everyone"); preserve
+the same target as the current utterance unless the new cognition-log input materially changes who
+must be addressed. The speak module reads the cognition log directly, so do not summarize or
+restate cognition facts here — replacement speech content is decided in speak from the updated
+cognition log, not in this gate. If you cannot choose a target, should_speak must be false and
+speech_target must be null. Return only raw JSON for the structured decision; do not wrap it in
+Markdown or code fences."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
-Generate concise user-visible text addressed to the SpeakRequest target from the current cognitive
-cognition-log set and the typed SpeakRequest. You cannot inspect blackboard memos or allocation
-guidance. Use only the provided cognition context, target, and generation_hint. Do not change the
-target or redirect the utterance to a different addressee. Follow the generation_hint as the primary
-contract for frame, style, and scope. Do not add generic advice, diagnosis, or facts that are not
-present in the cognition context or generation_hint.
-If partial_utterance is present, continue that
-utterance from exactly where it stopped; do not repeat, rewrite, or replace the already emitted
-partial text. Do not mention hidden state or unavailable module results."#;
+Generate a concise user-visible utterance addressed to the SpeakRequest target from the current
+cognition-log set. You cannot inspect blackboard memos or allocation guidance. Use only the
+provided cognition context and target.
+
+Stay in the cognition-log frame: if the cognition log records an in-world or peer-directed
+exchange, respond in that frame; do not switch to external assistant advice.
+
+Address the target directly. Cover the cognition-log facts that are load-bearing for answering the
+target's question or for the target's safety in the current situation — preserve specific,
+actionable details (postural, spatial, behavioral, or other concrete constraints) rather than
+collapsing them into a generic summary. Brevity matters, but never at the cost of dropping a
+load-bearing safety or peer-model fact that the cognition log makes available. Do not change the
+target or redirect the utterance to a different addressee. Do not invent diagnoses, generic
+advice, or facts that are not present in the cognition context.
+
+If partial_utterance is present, continue that utterance from exactly where it stopped; do not
+repeat, rewrite, or replace the already emitted partial text. Do not mention hidden state or
+unavailable module results."#;
 
 tokio::task_local! {
-    /// JSON Schema for `SpeechPlan.target` derived from the live `SceneReader`.
+    /// JSON Schema for `SpeakGateDecision.speech_target` derived from the live `SceneReader`.
     /// `.scope`d around each `structured_turn` so the LLM sees an enum of
     /// `[self, everyone, ...participants]`.
     static SPEECH_TARGET_SCHEMA: Schema;
@@ -131,15 +140,9 @@ fn fallback_speech_target_schema() -> Schema {
 struct SpeakGateDecision {
     should_speak: bool,
     rationale: String,
-    speech_plan: Option<SpeechPlan>,
+    speech_target: Option<SpeechTarget>,
     #[serde(default)]
     evidence_gaps: Vec<EvidenceGap>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct SpeechPlan {
-    target: SpeechTarget,
-    generation_hint: String,
 }
 
 /// Wire-format string with a JSON Schema dynamically constrained to the
@@ -318,7 +321,7 @@ fn apply_requested_evidence_guard(
     let sources = sources.join(", ");
     let original_rationale = decision.rationale.trim();
     decision.should_speak = false;
-    decision.speech_plan = None;
+    decision.speech_target = None;
     decision.rationale = if original_rationale.is_empty() {
         format!("Waiting after requesting evidence from {sources}.")
     } else {
@@ -901,15 +904,8 @@ fn speak_request_from_decision(decision: &SpeakGateDecision) -> Option<SpeakRequ
     if !decision.should_speak {
         return None;
     }
-    let plan = decision.speech_plan.as_ref()?;
-    if plan.generation_hint.trim().is_empty() {
-        return None;
-    }
-    SpeakRequest::try_new(
-        plan.target.0.as_str(),
-        plan.generation_hint.clone(),
-        decision.rationale.clone(),
-    )
+    let target = decision.speech_target.as_ref()?;
+    SpeakRequest::try_new(target.0.as_str())
 }
 
 fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
@@ -922,13 +918,11 @@ fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
         },
         decision.rationale.trim(),
     );
-    if let Some(plan) = &decision.speech_plan {
+    if let Some(target) = &decision.speech_target {
         memo.push_str("\nSpeech target: ");
-        memo.push_str(plan.target.0.trim());
-        memo.push_str("\nGeneration hint: ");
-        memo.push_str(plan.generation_hint.trim());
+        memo.push_str(target.0.trim());
     } else {
-        memo.push_str("\nSpeech plan: none");
+        memo.push_str("\nSpeech target: none");
     }
     if decision.evidence_gaps.is_empty() {
         memo.push_str("\nEvidence gaps: none");
@@ -963,8 +957,6 @@ struct GenerationDraft {
     sequence: u32,
     accumulated: String,
     target: String,
-    generation_hint: String,
-    rationale: String,
 }
 
 impl GenerationDraft {
@@ -974,8 +966,6 @@ impl GenerationDraft {
             sequence: 0,
             accumulated: String::new(),
             target: request.target,
-            generation_hint: request.generation_hint,
-            rationale: request.rationale,
         }
     }
 
@@ -989,10 +979,9 @@ impl GenerationDraft {
 
 fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> String {
     format!(
-        "Completed utterance to {}:\n{}\nRationale: {}",
+        "Completed utterance to {}:\n{}",
         draft.target.trim(),
         text.trim(),
-        draft.rationale.trim(),
     )
 }
 
@@ -1004,8 +993,6 @@ fn generation_input(
         "cognition_logs": cognition_log_json,
         "speak_request": {
             "target": draft.target.as_str(),
-            "generation_hint": draft.generation_hint.as_str(),
-            "rationale": draft.rationale.as_str(),
         },
     })
 }
@@ -1147,8 +1134,6 @@ impl SpeakModule {
                                     draft.sequence,
                                     draft.target.clone(),
                                     text.clone(),
-                                    draft.generation_hint.clone(),
-                                    draft.rationale.clone(),
                                 ))
                                 .await;
                             if !text.is_empty() {
@@ -1179,8 +1164,6 @@ impl SpeakModule {
                 draft.sequence,
                 draft.target.clone(),
                 draft.accumulated.clone(),
-                draft.generation_hint.clone(),
-                draft.rationale.clone(),
             ))
             .await;
     }
@@ -1433,7 +1416,7 @@ mod tests {
                 json_delta: serde_json::json!({
                     "should_speak": false,
                     "rationale": rationale,
-                    "speech_plan": null,
+                    "speech_target": null,
                     "evidence_gaps": [],
                 })
                 .to_string(),
@@ -1615,7 +1598,7 @@ mod tests {
 
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
-        let draft = GenerationDraft::new(7, SpeakRequest::new("Koro", "be concise", "respond"));
+        let draft = GenerationDraft::new(7, SpeakRequest::new("Koro"));
         let mut session = test_session();
 
         push_generation_context(
@@ -1648,22 +1631,15 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(json["speak_request"]["target"], "Koro");
-        assert_eq!(json["speak_request"]["generation_hint"], "be concise");
-        assert_eq!(json["speak_request"]["rationale"], "respond");
+        assert!(json["speak_request"].get("generation_hint").is_none());
+        assert!(json["speak_request"].get("rationale").is_none());
         assert!(json.get("allocation").is_none());
         assert!(json.get("partial_utterance").is_none());
     }
 
     #[test]
     fn gate_prompt_switches_only_for_active_streaming_speak() {
-        let progress = UtteranceProgress::streaming(
-            3,
-            2,
-            "Koro",
-            "Koro, wait",
-            "answer Koro",
-            "peer request changed",
-        );
+        let progress = UtteranceProgress::streaming(3, 2, "Koro", "Koro, wait");
 
         assert!(
             gate_prompt_for(
@@ -1724,14 +1700,7 @@ mod tests {
 
     #[test]
     fn gate_ephemeral_input_includes_module_status_and_current_utterance_progress() {
-        let progress = UtteranceProgress::streaming(
-            5,
-            1,
-            "Mika",
-            "Mika,",
-            "answer Mika calmly",
-            "peer is stressed",
-        );
+        let progress = UtteranceProgress::streaming(5, 1, "Mika", "Mika,");
 
         let input = gate_ephemeral_input(
             serde_json::json!({"agentic_deadlock_marker": null}),
@@ -1751,9 +1720,7 @@ mod tests {
                     "generation_id": 5,
                     "sequence": 1,
                     "target": "Mika",
-                    "partial_utterance": "Mika,",
-                    "generation_hint": "answer Mika calmly",
-                    "rationale": "peer is stressed"
+                    "partial_utterance": "Mika,"
                 }
             })
         );
@@ -1764,17 +1731,14 @@ mod tests {
         let decision = SpeakGateDecision {
             should_speak: true,
             rationale: "tool request is enough".into(),
-            speech_plan: Some(SpeechPlan {
-                target: "Pibi".into(),
-                generation_hint: "answer from memory result".into(),
-            }),
+            speech_target: Some("Pibi".into()),
             evidence_gaps: Vec::new(),
         };
 
         let guarded = apply_requested_evidence_guard(decision, &[EvidenceGapSource::Memory]);
 
         assert!(!guarded.should_speak);
-        assert!(guarded.speech_plan.is_none());
+        assert!(guarded.speech_target.is_none());
         assert!(
             guarded
                 .rationale
@@ -1865,7 +1829,7 @@ mod tests {
 
     #[test]
     fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
-        let mut draft = GenerationDraft::new(11, SpeakRequest::new("Koro", "continue", "respond"));
+        let mut draft = GenerationDraft::new(11, SpeakRequest::new("Koro"));
         let mut session = test_session();
 
         assert_eq!(draft.push_delta("hello "), 0);
@@ -1907,7 +1871,7 @@ mod tests {
         let decision = SpeakGateDecision {
             should_speak: false,
             rationale: "missing body fact".into(),
-            speech_plan: None,
+            speech_target: None,
             evidence_gaps: vec![EvidenceGap {
                 source: EvidenceGapSource::Memory,
                 question: "What body should I report?".into(),
@@ -1919,7 +1883,7 @@ mod tests {
 
         assert!(memo.contains("Speak decision: wait silently"));
         assert!(memo.contains("Rationale: missing body fact"));
-        assert!(memo.contains("Speech plan: none"));
+        assert!(memo.contains("Speech target: none"));
         assert!(memo.contains(
             "Source: memory; question: What body should I report?; needed fact: frog body"
         ));
@@ -1927,39 +1891,22 @@ mod tests {
     }
 
     #[test]
-    fn speak_request_from_decision_requires_target_and_hint() {
+    fn speak_request_from_decision_requires_target() {
         let valid = SpeakGateDecision {
             should_speak: true,
             rationale: "ready".into(),
-            speech_plan: Some(SpeechPlan {
-                target: " Koro ".into(),
-                generation_hint: "answer Koro".into(),
-            }),
+            speech_target: Some(" Koro ".into()),
             evidence_gaps: Vec::new(),
         };
 
         let request = speak_request_from_decision(&valid).unwrap();
         assert_eq!(request.target, "Koro");
-        assert_eq!(request.generation_hint, "answer Koro");
-        assert_eq!(request.rationale, "ready");
 
         let empty_target = SpeakGateDecision {
-            speech_plan: Some(SpeechPlan {
-                target: " ".into(),
-                generation_hint: "answer".into(),
-            }),
+            speech_target: Some(" ".into()),
             ..valid.clone()
         };
         assert!(speak_request_from_decision(&empty_target).is_none());
-
-        let empty_hint = SpeakGateDecision {
-            speech_plan: Some(SpeechPlan {
-                target: "Koro".into(),
-                generation_hint: " ".into(),
-            }),
-            ..valid.clone()
-        };
-        assert!(speak_request_from_decision(&empty_hint).is_none());
 
         let waiting = SpeakGateDecision {
             should_speak: false,

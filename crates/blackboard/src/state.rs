@@ -150,8 +150,6 @@ pub struct UtteranceProgress {
     pub sequence: u32,
     pub target: String,
     pub partial_utterance: String,
-    pub generation_hint: String,
-    pub rationale: String,
 }
 
 impl UtteranceProgress {
@@ -160,8 +158,6 @@ impl UtteranceProgress {
         sequence: u32,
         target: impl Into<String>,
         partial_utterance: impl Into<String>,
-        generation_hint: impl Into<String>,
-        rationale: impl Into<String>,
     ) -> Self {
         Self {
             state: UtteranceProgressState::Streaming,
@@ -169,8 +165,6 @@ impl UtteranceProgress {
             sequence,
             target: target.into(),
             partial_utterance: partial_utterance.into(),
-            generation_hint: generation_hint.into(),
-            rationale: rationale.into(),
         }
     }
 
@@ -179,8 +173,6 @@ impl UtteranceProgress {
         sequence: u32,
         target: impl Into<String>,
         utterance: impl Into<String>,
-        generation_hint: impl Into<String>,
-        rationale: impl Into<String>,
     ) -> Self {
         Self {
             state: UtteranceProgressState::Completed,
@@ -188,8 +180,6 @@ impl UtteranceProgress {
             sequence,
             target: target.into(),
             partial_utterance: utterance.into(),
-            generation_hint: generation_hint.into(),
-            rationale: rationale.into(),
         }
     }
 }

@@ -1436,14 +1436,7 @@ mod tests {
 
         speak
             .utterance_writer()
-            .record_progress(UtteranceProgress::streaming(
-                7,
-                2,
-                "Koro",
-                "Koro, wait",
-                "answer Koro",
-                "peer needs response",
-            ))
+            .record_progress(UtteranceProgress::streaming(7, 2, "Koro", "Koro, wait"))
             .await;
 
         let records = blackboard.read(|bb| bb.utterance_progress_records()).await;
@@ -1451,14 +1444,7 @@ mod tests {
         assert_eq!(records[0].owner.module, builtin::speak());
         assert_eq!(
             records[0].progress,
-            UtteranceProgress::streaming(
-                7,
-                2,
-                "Koro",
-                "Koro, wait",
-                "answer Koro",
-                "peer needs response",
-            )
+            UtteranceProgress::streaming(7, 2, "Koro", "Koro, wait")
         );
     }
 }
