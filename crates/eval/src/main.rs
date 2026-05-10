@@ -4,8 +4,10 @@ use anyhow::Context as _;
 use clap::Parser;
 use nuillu_eval::{
     LlmBackendConfig, ModelSet, ModelSetRole, ReasoningEffort, RunnerConfig, default_run_id,
-    install_lutum_trace_subscriber, parse_model_set_file, run_suite,
+    gui::run_suite_with_visualizer, install_lutum_trace_subscriber, parse_model_set_file,
+    run_suite,
 };
+use tokio::runtime::Builder;
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
 const DEFAULT_OPENAI_COMPAT_TOKEN: &str = "local";
@@ -73,13 +75,16 @@ struct Args {
     #[arg(long)]
     fail_fast: bool,
 
+    /// Run the reusable egui visualizer while the eval suite executes.
+    #[arg(long)]
+    gui: bool,
+
     /// Optional case id/path substring patterns. When present, only matching cases run.
     #[arg(value_name = "PATTERN")]
     patterns: Vec<String>,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     install_lutum_trace_subscriber()?;
     let args = Args::parse();
     let run_id = args.run_id.unwrap_or_else(default_run_id);
@@ -125,7 +130,15 @@ async fn main() -> anyhow::Result<()> {
         case_patterns: args.patterns,
     };
 
-    let report = run_suite(&config).await?;
+    if args.gui {
+        return run_suite_with_visualizer(config);
+    }
+
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build eval tokio runtime")?;
+    let report = runtime.block_on(run_suite(&config))?;
     println!(
         "cases={} passed={} failed={} invalid={} output={}",
         report.case_count,

@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod cases;
 pub mod evaluation;
+pub mod gui;
 pub mod judge;
 pub mod model_set;
 pub mod runner;
@@ -33,8 +34,9 @@ pub use model_set::{
     ModelSet, ModelSetError, ModelSetFile, ModelSetRole, ReasoningEffort, parse_model_set_file,
 };
 pub use runner::{
-    CaseRunOutput, LlmBackendConfig, RunnerConfig, RunnerError, default_run_id,
-    install_lutum_trace_subscriber, run_case_detailed, run_suite,
+    CaseRunOutput, LlmBackendConfig, RunnerConfig, RunnerError, RunnerHooks, VisualizerHook,
+    default_run_id, install_lutum_trace_subscriber, run_case_detailed, run_suite,
+    run_suite_with_hooks,
 };
 pub use state_dump::{
     AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,

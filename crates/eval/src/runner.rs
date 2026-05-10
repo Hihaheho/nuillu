@@ -23,22 +23,30 @@ use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
+use lutum_trace::{FieldValue as TraceFieldValue, TraceEvent};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     MemoryMetadata, ModuleConfig, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_module::ports::{
-    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryStore,
-    NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceSink,
+    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryQuery, MemoryStore,
+    NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceDelta, UtteranceSink,
 };
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
-    RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
+    RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
+};
+use nuillu_visualizer_egui::{
+    AllocationView, BlackboardSnapshot, ChatInputKind, CognitionEntryView, CognitionLogView,
+    LlmChatItemKind, LlmChatMessage, LlmChatRole, LlmChatTranscript, LlmTraceEvent, MemoView,
+    MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleStatusView, TabStatus,
+    UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerCommand, VisualizerEvent,
+    VisualizerTabId,
 };
 use regex::RegexBuilder;
 use serde::Serialize;
@@ -93,6 +101,106 @@ pub struct RunnerConfig {
     pub case_patterns: Vec<String>,
 }
 
+pub struct RunnerHooks {
+    pub visualizer: Option<VisualizerHook>,
+}
+
+impl RunnerHooks {
+    pub fn none() -> Self {
+        Self { visualizer: None }
+    }
+
+    pub fn with_visualizer(visualizer: VisualizerHook) -> Self {
+        Self {
+            visualizer: Some(visualizer),
+        }
+    }
+}
+
+pub struct VisualizerHook {
+    events: std::sync::mpsc::Sender<VisualizerEvent>,
+    commands: std::sync::mpsc::Receiver<VisualizerCommand>,
+    memory_cache: BTreeMap<String, Vec<MemoryRecordView>>,
+}
+
+impl VisualizerHook {
+    pub fn new(
+        events: std::sync::mpsc::Sender<VisualizerEvent>,
+        commands: std::sync::mpsc::Receiver<VisualizerCommand>,
+    ) -> Self {
+        Self {
+            events,
+            commands,
+            memory_cache: BTreeMap::new(),
+        }
+    }
+
+    pub fn event_sender(&self) -> std::sync::mpsc::Sender<VisualizerEvent> {
+        self.events.clone()
+    }
+
+    fn set_memory_cache(&mut self, case_id: &str, records: Vec<MemoryRecordView>) {
+        self.memory_cache.insert(case_id.to_string(), records);
+    }
+
+    fn cached_memory_page(&self, case_id: &str, page: usize, per_page: usize) -> MemoryPage {
+        memory_page_from_records(
+            self.memory_cache
+                .get(case_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            page,
+            per_page,
+        )
+    }
+
+    fn drain_cached_commands_until_shutdown(&mut self) {
+        while let Ok(command) = self.commands.recv() {
+            match command {
+                VisualizerCommand::Shutdown => break,
+                VisualizerCommand::ListMemories {
+                    tab_id,
+                    page,
+                    per_page,
+                } => {
+                    let page = self.cached_memory_page(tab_id.as_str(), page, per_page);
+                    let _ = self
+                        .events
+                        .send(VisualizerEvent::MemoryPage { tab_id, page });
+                }
+                VisualizerCommand::QueryMemory {
+                    tab_id,
+                    query,
+                    limit,
+                } => {
+                    let needle = query.to_lowercase();
+                    let records = self
+                        .memory_cache
+                        .get(tab_id.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|record| record.content.to_lowercase().contains(&needle))
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    let _ = self.events.send(VisualizerEvent::MemoryQueryResult {
+                        tab_id,
+                        query,
+                        records,
+                    });
+                }
+                VisualizerCommand::SendSensoryInput { tab_id, .. } => {
+                    let _ = self.events.send(VisualizerEvent::Log {
+                        tab_id,
+                        message: "eval case is no longer running".to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CaseRunOutput {
     pub case_path: PathBuf,
@@ -142,6 +250,14 @@ struct CaseOutputContext<'a> {
 }
 
 pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError> {
+    let mut hooks = RunnerHooks::none();
+    run_suite_with_hooks(config, &mut hooks).await
+}
+
+pub async fn run_suite_with_hooks(
+    config: &RunnerConfig,
+    hooks: &mut RunnerHooks,
+) -> Result<SuiteReport, RunnerError> {
     install_lutum_trace_subscriber()?;
     let mut case_paths =
         discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
@@ -192,7 +308,7 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
     let mut cases = Vec::new();
     for path in case_paths {
         let output =
-            run_case_detailed_with_reporter(&path, config, Some(&judge), &reporter).await?;
+            run_case_detailed_with_reporter(&path, config, Some(&judge), &reporter, hooks).await?;
         let failed = !output.summary.passed || output.summary.invalid;
         cases.push(output.summary);
         if failed && config.fail_fast {
@@ -222,6 +338,9 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
             report.mean_score
         ),
     )?;
+    if let Some(visualizer) = hooks.visualizer.as_mut() {
+        visualizer.drain_cached_commands_until_shutdown();
+    }
     Ok(report)
 }
 
@@ -246,7 +365,8 @@ pub async fn run_case_detailed(
         source,
     })?;
     let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
-    run_case_detailed_with_reporter(case_path, config, judge, &reporter).await
+    let mut hooks = RunnerHooks::none();
+    run_case_detailed_with_reporter(case_path, config, judge, &reporter, &mut hooks).await
 }
 
 fn filter_case_paths(
@@ -310,6 +430,7 @@ async fn run_case_detailed_with_reporter(
     config: &RunnerConfig,
     judge: Option<&dyn RubricJudge>,
     reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
 ) -> Result<CaseRunOutput, RunnerError> {
     let case = parse_case_file(case_path)?;
     let id = case_id(case_path, &case);
@@ -335,20 +456,40 @@ async fn run_case_detailed_with_reporter(
             output_dir.display()
         ),
     )?;
+    emit_visualizer_open_tab(hooks, &id);
 
+    let trace_sender = hooks.visualizer.as_ref().map(VisualizerHook::event_sender);
     let local = LocalSet::new();
-    let collected = local
-        .run_until(lutum_trace::capture_raw(
-            AssertUnwindSafe(execute_case(&case, config, &output_dir, &id, reporter))
-                .catch_unwind(),
+    let mut capture = lutum_trace::capture_raw(
+        AssertUnwindSafe(execute_case(
+            &case,
+            config,
+            &output_dir,
+            &id,
+            reporter,
+            hooks,
         ))
-        .await;
+        .catch_unwind(),
+    );
+    if let Some(sender) = trace_sender {
+        let case_id = id.clone();
+        capture = capture.listen_events(move |event| {
+            emit_visualizer_trace_event(&case_id, &sender, event);
+        });
+    }
+    let collected = local.run_until(capture).await;
 
     let trace = collected.trace;
     let raw_trace = collected.raw;
     let execution = match collected.output {
         Ok(Ok(execution)) => execution,
         Ok(Err(error)) => {
+            if let Some(visualizer) = hooks.visualizer.as_ref() {
+                let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+                    tab_id: VisualizerTabId::new(id.clone()),
+                    status: TabStatus::Invalid,
+                });
+            }
             return write_runtime_failure_case_output(
                 CaseOutputContext {
                     case_path,
@@ -364,6 +505,12 @@ async fn run_case_detailed_with_reporter(
         }
         Err(payload) => {
             let message = format!("panic: {}", panic_payload_message(payload.as_ref()));
+            if let Some(visualizer) = hooks.visualizer.as_ref() {
+                let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+                    tab_id: VisualizerTabId::new(id.clone()),
+                    status: TabStatus::Invalid,
+                });
+            }
             return write_runtime_failure_case_output(
                 CaseOutputContext {
                     case_path,
@@ -408,6 +555,7 @@ async fn run_case_detailed_with_reporter(
         )?;
     }
     emit_case_finished(reporter, &summary, events.len())?;
+    emit_visualizer_case_status(hooks, &summary);
 
     Ok(CaseRunOutput {
         case_path: case_path.to_path_buf(),
@@ -520,19 +668,253 @@ fn emit_case_finished(
     )
 }
 
+fn emit_visualizer_case_status(hooks: &RunnerHooks, summary: &CaseSummary) {
+    let Some(visualizer) = hooks.visualizer.as_ref() else {
+        return;
+    };
+    let status = if summary.invalid {
+        TabStatus::Invalid
+    } else if summary.passed {
+        TabStatus::Passed
+    } else {
+        TabStatus::Failed
+    };
+    let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+        tab_id: VisualizerTabId::new(summary.id.clone()),
+        status,
+    });
+}
+
+fn emit_visualizer_open_tab(hooks: &RunnerHooks, id: &str) {
+    let Some(visualizer) = hooks.visualizer.as_ref() else {
+        return;
+    };
+    let _ = visualizer.events.send(VisualizerEvent::OpenTab {
+        tab_id: VisualizerTabId::new(id.to_string()),
+        title: id.to_string(),
+    });
+}
+
+fn emit_visualizer_trace_event(
+    case_id: &str,
+    sender: &std::sync::mpsc::Sender<VisualizerEvent>,
+    event: TraceEvent,
+) {
+    let tab_id = VisualizerTabId::new(case_id.to_string());
+    match event {
+        TraceEvent::SpanOpened {
+            span_id,
+            parent_span_id,
+            name,
+            fields,
+            ..
+        } if name == "llm_turn" => {
+            let _ = sender.send(VisualizerEvent::LlmTrace {
+                tab_id,
+                event: LlmTraceEvent::SpanOpened {
+                    span_id: span_id.0.to_string(),
+                    parent_span_id: parent_span_id.map(|id| id.0.to_string()),
+                    kind: trace_field_string(&fields, "kind"),
+                    model: trace_field_string(&fields, "model"),
+                },
+            });
+        }
+        TraceEvent::SpanOpened {
+            span_id,
+            name,
+            fields,
+            ..
+        } if name == "module_activate" => {
+            if let Some(owner) = trace_field_string(&fields, "owner") {
+                let _ = sender.send(VisualizerEvent::LlmTrace {
+                    tab_id,
+                    event: LlmTraceEvent::ModuleSpanOpened {
+                        span_id: span_id.0.to_string(),
+                        owner,
+                    },
+                });
+            }
+        }
+        TraceEvent::SpanRecorded { span_id, fields } => {
+            let model = trace_field_string(&fields, "model");
+            let request_id = trace_field_string(&fields, "request_id");
+            let finish_reason = trace_field_string(&fields, "finish_reason");
+            if model.is_some() || request_id.is_some() || finish_reason.is_some() {
+                let _ = sender.send(VisualizerEvent::LlmTrace {
+                    tab_id,
+                    event: LlmTraceEvent::SpanRecorded {
+                        span_id: span_id.0.to_string(),
+                        model,
+                        request_id,
+                        finish_reason,
+                    },
+                });
+            }
+        }
+        TraceEvent::Event {
+            parent_span_id: Some(parent_span_id),
+            record,
+        } if record.message() == Some("llm_input_transcript") => {
+            if let Some(transcript) = trace_record_string(&record.fields, "transcript") {
+                let _ = sender.send(VisualizerEvent::LlmTrace {
+                    tab_id,
+                    event: LlmTraceEvent::Input {
+                        span_id: parent_span_id.0.to_string(),
+                        transcript: parse_lutum_transcript(&transcript),
+                    },
+                });
+            }
+        }
+        TraceEvent::Event {
+            parent_span_id: Some(parent_span_id),
+            record,
+        } if record.message() == Some("llm_output") => {
+            if let Some(output) = trace_record_string(&record.fields, "output") {
+                let _ = sender.send(VisualizerEvent::LlmTrace {
+                    tab_id,
+                    event: LlmTraceEvent::OutputCompleted {
+                        span_id: parent_span_id.0.to_string(),
+                        transcript: parse_lutum_output(&output),
+                    },
+                });
+            }
+        }
+        TraceEvent::SpanClosed { span_id } => {
+            let _ = sender.send(VisualizerEvent::LlmTrace {
+                tab_id,
+                event: LlmTraceEvent::SpanClosed {
+                    span_id: span_id.0.to_string(),
+                },
+            });
+        }
+        _ => {}
+    }
+}
+
+fn trace_field_string(fields: &[(String, TraceFieldValue)], key: &str) -> Option<String> {
+    trace_record_string(fields, key).filter(|value| !value.is_empty())
+}
+
+fn trace_record_string(fields: &[(String, TraceFieldValue)], key: &str) -> Option<String> {
+    fields.iter().find_map(|(name, value)| {
+        if name == key {
+            match value {
+                TraceFieldValue::Str(value) => Some(value.clone()),
+                TraceFieldValue::Bool(value) => Some(value.to_string()),
+                TraceFieldValue::I64(value) => Some(value.to_string()),
+                TraceFieldValue::U64(value) => Some(value.to_string()),
+                TraceFieldValue::I128(value) => Some(value.to_string()),
+                TraceFieldValue::U128(value) => Some(value.to_string()),
+                TraceFieldValue::F64(value) => Some(value.to_string()),
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_lutum_output(output: &str) -> LlmChatTranscript {
+    let mut transcript = LlmChatTranscript::default();
+    let trimmed = output.trim();
+    if !trimmed.is_empty() {
+        transcript.push(LlmChatMessage {
+            role: LlmChatRole::Assistant,
+            kind: infer_lutum_message_kind(trimmed),
+            content: trimmed.to_string(),
+            ephemeral: false,
+            streaming: false,
+            source: None,
+        });
+    }
+    transcript
+}
+
+fn parse_lutum_transcript(transcript: &str) -> LlmChatTranscript {
+    let mut out = LlmChatTranscript::default();
+    let mut current_header: Option<String> = None;
+    let mut current_body = String::new();
+
+    for line in transcript.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            push_lutum_transcript_message(&mut out, current_header.take(), &mut current_body);
+            current_header = Some(trimmed.trim_matches(&['[', ']'][..]).to_string());
+        } else {
+            current_body.push_str(line);
+            current_body.push('\n');
+        }
+    }
+    push_lutum_transcript_message(&mut out, current_header, &mut current_body);
+    out
+}
+
+fn push_lutum_transcript_message(
+    transcript: &mut LlmChatTranscript,
+    header: Option<String>,
+    body: &mut String,
+) {
+    let content = body.trim().to_string();
+    body.clear();
+    if content.is_empty() && header.is_none() {
+        return;
+    }
+    let header = header.unwrap_or_else(|| "user".to_string());
+    let header_lower = header.to_lowercase();
+    let role = if header_lower.starts_with("system") {
+        LlmChatRole::System
+    } else if header_lower.starts_with("developer") {
+        LlmChatRole::Developer
+    } else if header_lower.starts_with("user") {
+        LlmChatRole::User
+    } else if header_lower.starts_with("assistant") {
+        LlmChatRole::Assistant
+    } else if header_lower.starts_with("tool_result") {
+        LlmChatRole::Tool
+    } else {
+        LlmChatRole::Other(header.clone())
+    };
+    let kind = if header_lower.starts_with("tool_result") {
+        LlmChatItemKind::ToolResult
+    } else {
+        infer_lutum_message_kind(&content)
+    };
+    transcript.push(LlmChatMessage {
+        role,
+        kind,
+        content,
+        ephemeral: false,
+        streaming: false,
+        source: Some(header),
+    });
+}
+
+fn infer_lutum_message_kind(content: &str) -> LlmChatItemKind {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("<reasoning>") {
+        LlmChatItemKind::Reasoning
+    } else if trimmed.starts_with("<refusal>") {
+        LlmChatItemKind::Refusal
+    } else if trimmed.starts_with("<tool_call") {
+        LlmChatItemKind::ToolCall
+    } else {
+        LlmChatItemKind::Text
+    }
+}
+
 async fn execute_case(
     case: &EvalCase,
     config: &RunnerConfig,
     output_dir: &Path,
     case_id: &str,
     reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
 ) -> Result<CaseExecution> {
     match case {
         EvalCase::FullAgent(case) => {
-            execute_full_agent_case(case, config, output_dir, case_id, reporter).await
+            execute_full_agent_case(case, config, output_dir, case_id, reporter, hooks).await
         }
         EvalCase::Module { target, case } => {
-            execute_module_case(*target, case, config, output_dir, case_id, reporter).await
+            execute_module_case(*target, case, config, output_dir, case_id, reporter, hooks).await
         }
     }
 }
@@ -543,6 +925,7 @@ async fn execute_full_agent_case(
     output_dir: &Path,
     case_id: &str,
     reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
 ) -> Result<CaseExecution> {
     let case_modules = full_agent_case_modules(case);
     let case_now = parse_case_now(case.now.as_deref())
@@ -558,6 +941,7 @@ async fn execute_full_agent_case(
         case_now,
         case_id,
         reporter,
+        hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
     env.caps
@@ -565,6 +949,18 @@ async fn execute_full_agent_case(
         .set(case.participants.iter().map(Participant::new));
     seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
+    if let Some(visualizer) = hooks.visualizer.as_mut() {
+        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
+        emit_visualizer_memory_page(
+            case_id,
+            visualizer,
+            &env.blackboard,
+            env.memory.as_ref(),
+            0,
+            25,
+        )
+        .await;
+    }
 
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
@@ -573,12 +969,14 @@ async fn execute_full_agent_case(
     let actions = env.actions.clone();
     let events = env.events.clone();
     let clock = env.clock.clone();
+    let memory = env.memory.clone();
     let allocation_blackboard = env.blackboard.clone();
     let mut allocation_reporter =
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
     let live_reporter = reporter.clone();
     let case_id_for_idle = case_id.to_string();
     let modules = eval_registry(&case_modules).build(&env.caps).await?;
+    let mut visualizer = hooks.visualizer.as_mut();
 
     run_agent(
         modules,
@@ -590,6 +988,12 @@ async fn execute_full_agent_case(
             let _ = allocation_reporter
                 .emit_if_changed(&allocation_blackboard)
                 .await;
+            emit_visualizer_blackboard_snapshot(
+                &case_id_for_idle,
+                &allocation_blackboard,
+                visualizer.as_deref(),
+            )
+            .await;
             let now = clock.now();
             for input in inputs {
                 let body = match input {
@@ -608,9 +1012,15 @@ async fn execute_full_agent_case(
                     },
                 };
                 sensory
-                    .publish(body)
+                    .publish(body.clone())
                     .await
                     .expect("full-agent eval failed to publish SensoryInput");
+                if let Some(visualizer) = visualizer.as_ref() {
+                    let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
+                        tab_id: VisualizerTabId::new(case_id_for_idle.clone()),
+                        input: body,
+                    });
+                }
             }
 
             let mut last_event_count = events.event_count();
@@ -627,6 +1037,26 @@ async fn execute_full_agent_case(
                 let _ = allocation_reporter
                     .emit_if_changed(&allocation_blackboard)
                     .await;
+                if let Some(visualizer) = visualizer.as_deref_mut() {
+                    if handle_visualizer_commands(
+                        &case_id_for_idle,
+                        visualizer,
+                        Some(&sensory),
+                        &allocation_blackboard,
+                        memory.as_ref(),
+                        clock.as_ref(),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                emit_visualizer_blackboard_snapshot(
+                    &case_id_for_idle,
+                    &allocation_blackboard,
+                    visualizer.as_deref(),
+                )
+                .await;
                 let event_count = events.event_count();
                 if event_count == last_event_count {
                     idle_ticks = idle_ticks.saturating_add(1);
@@ -686,6 +1116,18 @@ async fn execute_full_agent_case(
     .await?;
     add_last_state_observation(&mut artifact, &last_state)?;
     write_full_agent_last_state_eure(output_dir, last_state)?;
+    if let Some(visualizer) = hooks.visualizer.as_mut() {
+        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
+        emit_visualizer_memory_page(
+            case_id,
+            visualizer,
+            &env.blackboard,
+            env.memory.as_ref(),
+            0,
+            25,
+        )
+        .await;
+    }
     Ok(CaseExecution { artifact, events })
 }
 
@@ -696,6 +1138,7 @@ async fn execute_module_case(
     output_dir: &Path,
     case_id: &str,
     reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
 ) -> Result<CaseExecution> {
     let case_modules = module_case_modules(target, case);
     let case_now = parse_case_now(case.now.as_deref())
@@ -711,11 +1154,24 @@ async fn execute_module_case(
         case_now,
         case_id,
         reporter,
+        hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
     seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
+    if let Some(visualizer) = hooks.visualizer.as_mut() {
+        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
+        emit_visualizer_memory_page(
+            case_id,
+            visualizer,
+            &env.blackboard,
+            env.memory.as_ref(),
+            0,
+            25,
+        )
+        .await;
+    }
 
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
@@ -726,6 +1182,10 @@ async fn execute_module_case(
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
+    let memory = env.memory.clone();
+    let clock = env.clock.clone();
+    let case_id_for_gui = case_id.to_string();
+    let mut visualizer = hooks.visualizer.as_mut();
 
     run_agent(
         modules,
@@ -776,6 +1236,26 @@ async fn execute_module_case(
             }
 
             for _ in 0..limits.max_ticks {
+                if let Some(visualizer) = visualizer.as_deref_mut() {
+                    if handle_visualizer_commands(
+                        &case_id_for_gui,
+                        visualizer,
+                        None,
+                        &blackboard,
+                        memory.as_ref(),
+                        clock.as_ref(),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                emit_visualizer_blackboard_snapshot(
+                    &case_id_for_gui,
+                    &blackboard,
+                    visualizer.as_deref(),
+                )
+                .await;
                 let target_done = match target {
                     ModuleEvalTarget::AttentionSchema => {
                         !attention_schema_cognition_output(&blackboard)
@@ -814,6 +1294,18 @@ async fn execute_module_case(
         CaseArtifact::new(output)
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    if let Some(visualizer) = hooks.visualizer.as_mut() {
+        emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
+        emit_visualizer_memory_page(
+            case_id,
+            visualizer,
+            &env.blackboard,
+            env.memory.as_ref(),
+            0,
+            25,
+        )
+        .await;
+    }
     Ok(CaseExecution {
         artifact,
         events: env.events.snapshot(),
@@ -852,6 +1344,204 @@ async fn last_memo_log_content_for_module(
                 .map(|record| record.content)
         })
         .await
+}
+
+async fn emit_visualizer_blackboard_snapshot(
+    case_id: &str,
+    blackboard: &Blackboard,
+    visualizer: Option<&VisualizerHook>,
+) {
+    let Some(visualizer) = visualizer else {
+        return;
+    };
+    let snapshot = blackboard.read(visualizer_blackboard_snapshot).await;
+    let _ = visualizer.events.send(VisualizerEvent::BlackboardSnapshot {
+        tab_id: VisualizerTabId::new(case_id.to_string()),
+        snapshot,
+    });
+}
+
+async fn handle_visualizer_commands(
+    case_id: &str,
+    visualizer: &mut VisualizerHook,
+    sensory: Option<&SensoryInputMailbox>,
+    blackboard: &Blackboard,
+    memory: &dyn MemoryStore,
+    clock: &dyn Clock,
+) -> bool {
+    let mut shutdown = false;
+    while let Ok(command) = visualizer.commands.try_recv() {
+        match command {
+            VisualizerCommand::Shutdown => {
+                shutdown = true;
+            }
+            VisualizerCommand::SendSensoryInput { tab_id, input } if tab_id.as_str() == case_id => {
+                let Some(sensory) = sensory else {
+                    let _ = visualizer.events.send(VisualizerEvent::Log {
+                        tab_id,
+                        message: "this runtime does not accept sensory input".to_string(),
+                    });
+                    continue;
+                };
+                let observed_at = clock.now();
+                let body = match input.kind {
+                    ChatInputKind::Heard => SensoryInput::Heard {
+                        direction: input.direction,
+                        content: input.content,
+                        observed_at,
+                    },
+                    ChatInputKind::Seen => SensoryInput::Seen {
+                        direction: input.direction,
+                        appearance: input.content,
+                        observed_at,
+                    },
+                };
+                let _ = sensory.publish(body.clone()).await;
+                let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
+                    tab_id,
+                    input: body,
+                });
+            }
+            VisualizerCommand::QueryMemory {
+                tab_id,
+                query,
+                limit,
+            } if tab_id.as_str() == case_id => {
+                let records = memory
+                    .search(&MemoryQuery {
+                        text: query.clone(),
+                        limit,
+                    })
+                    .await
+                    .map(|records| records.into_iter().map(memory_record_view).collect())
+                    .unwrap_or_default();
+                let _ = visualizer.events.send(VisualizerEvent::MemoryQueryResult {
+                    tab_id,
+                    query,
+                    records,
+                });
+            }
+            VisualizerCommand::ListMemories {
+                tab_id,
+                page,
+                per_page,
+            } if tab_id.as_str() == case_id => {
+                let all_records = list_all_visualizer_memories(blackboard, memory).await;
+                visualizer.set_memory_cache(case_id, all_records.clone());
+                let records = memory_page_from_records(&all_records, page, per_page);
+                let _ = visualizer.events.send(VisualizerEvent::MemoryPage {
+                    tab_id,
+                    page: records,
+                });
+            }
+            _ => {}
+        }
+    }
+    shutdown
+}
+
+async fn emit_visualizer_memory_page(
+    case_id: &str,
+    visualizer: &mut VisualizerHook,
+    blackboard: &Blackboard,
+    memory: &dyn MemoryStore,
+    page: usize,
+    per_page: usize,
+) {
+    let records = list_all_visualizer_memories(blackboard, memory).await;
+    visualizer.set_memory_cache(case_id, records.clone());
+    let page = memory_page_from_records(&records, page, per_page);
+    let _ = visualizer.events.send(VisualizerEvent::MemoryPage {
+        tab_id: VisualizerTabId::new(case_id.to_string()),
+        page,
+    });
+}
+
+async fn list_all_visualizer_memories(
+    blackboard: &Blackboard,
+    memory: &dyn MemoryStore,
+) -> Vec<MemoryRecordView> {
+    let indexes = blackboard
+        .read(|bb| {
+            let mut records = bb
+                .memory_metadata()
+                .iter()
+                .map(|(index, metadata)| {
+                    (index.clone(), metadata.occurred_at, metadata.last_accessed)
+                })
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then_with(|| right.2.cmp(&left.2))
+                    .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+            });
+            records
+                .into_iter()
+                .map(|(index, _, _)| index)
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+    let mut records = Vec::new();
+    for index in indexes {
+        if let Ok(Some(record)) = memory.get(&index).await {
+            records.push(memory_record_view(record));
+        }
+    }
+
+    if records.is_empty() {
+        let mut seen = HashSet::new();
+        for rank in [
+            MemoryRank::Identity,
+            MemoryRank::Permanent,
+            MemoryRank::LongTerm,
+            MemoryRank::MidTerm,
+            MemoryRank::ShortTerm,
+        ] {
+            if let Ok(rank_records) = memory.list_by_rank(rank).await {
+                for record in rank_records {
+                    if seen.insert(record.index.clone()) {
+                        records.push(memory_record_view(record));
+                    }
+                }
+            }
+        }
+        records.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+    }
+
+    records
+}
+
+fn memory_page_from_records(
+    records: &[MemoryRecordView],
+    page: usize,
+    per_page: usize,
+) -> MemoryPage {
+    let total = records.len();
+    let start = page.saturating_mul(per_page).min(records.len());
+    let end = start.saturating_add(per_page).min(records.len());
+    MemoryPage {
+        page,
+        per_page,
+        total,
+        records: records[start..end].to_vec(),
+    }
+}
+
+fn memory_record_view(record: nuillu_module::ports::MemoryRecord) -> MemoryRecordView {
+    MemoryRecordView {
+        index: record.index.as_str().to_owned(),
+        rank: memory_rank_name(record.rank).to_owned(),
+        occurred_at: record.occurred_at,
+        content: record.content.as_str().to_owned(),
+    }
 }
 
 struct EvalEnvironment {
@@ -906,18 +1596,21 @@ async fn build_eval_environment(
     case_now: Option<DateTime<FixedOffset>>,
     case_id: &str,
     reporter: &LiveReporter,
+    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
 ) -> Result<EvalEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
     let events = Arc::new(RecordingRuntimeEventSink::new(
         case_id.to_string(),
         max_llm_calls,
         reporter.clone(),
+        visualizer.clone(),
     ));
     let actions = Arc::new(ActionActivityTracker::new(action_modules));
     let utterances = Arc::new(RecordingUtteranceSink::new(
         case_id.to_string(),
         reporter.clone(),
         actions.clone(),
+        visualizer.clone(),
     ));
     let clock: Arc<dyn Clock> = match case_now {
         Some(now) => Arc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
@@ -1724,6 +2417,85 @@ fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
     }
 }
 
+fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
+    let cognition_log_set = bb.cognition_log_set();
+    let mut memory_metadata = bb
+        .memory_metadata()
+        .iter()
+        .map(|(index, metadata)| MemoryMetadataView {
+            index: index.as_str().to_owned(),
+            rank: memory_rank_name(metadata.rank).to_owned(),
+            occurred_at: metadata.occurred_at,
+            last_accessed: metadata.last_accessed,
+            access_count: metadata.access_count,
+        })
+        .collect::<Vec<_>>();
+    memory_metadata.sort_by(|left, right| left.index.cmp(&right.index));
+
+    BlackboardSnapshot {
+        module_statuses: bb
+            .module_status_records()
+            .into_iter()
+            .map(|record| ModuleStatusView {
+                owner: record.owner.to_string(),
+                module: record.owner.module.as_str().to_owned(),
+                replica: record.owner.replica.get(),
+                status: format!("{:?}", record.status),
+            })
+            .collect(),
+        allocation: allocation_module_dumps(bb.allocation())
+            .into_iter()
+            .map(|module| AllocationView {
+                module: module.module,
+                activation_ratio: module.activation_ratio,
+                active_replicas: module.active_replicas,
+                tier: module.tier,
+                guidance: module.guidance.as_str().to_owned(),
+            })
+            .collect(),
+        memos: bb
+            .recent_memo_logs()
+            .into_iter()
+            .map(|record| MemoView {
+                owner: record.owner.to_string(),
+                module: record.owner.module.as_str().to_owned(),
+                replica: record.owner.replica.get(),
+                index: record.index,
+                written_at: record.written_at,
+                content: record.content,
+            })
+            .collect(),
+        cognition_logs: cognition_log_set
+            .logs()
+            .iter()
+            .map(|record| CognitionLogView {
+                source: record.source.to_string(),
+                entries: record
+                    .entries
+                    .iter()
+                    .map(|entry| CognitionEntryView {
+                        at: entry.at,
+                        text: entry.text.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        utterance_progresses: bb
+            .utterance_progress_records()
+            .into_iter()
+            .map(|record| UtteranceProgressView {
+                owner: record.owner.to_string(),
+                target: record.progress.target,
+                generation_id: record.progress.generation_id,
+                sequence: record.progress.sequence,
+                state: format!("{:?}", record.progress.state),
+                partial_utterance: record.progress.partial_utterance,
+            })
+            .collect(),
+        memory_metadata,
+    }
+}
+
 fn memo_log_dumps(bb: &BlackboardInner) -> Vec<MemoLogDump> {
     bb.recent_memo_logs()
         .into_iter()
@@ -2279,6 +3051,7 @@ struct RecordingUtteranceSink {
     reporter: LiveReporter,
     actions: Arc<ActionActivityTracker>,
     complete: Arc<Mutex<Vec<RecordedUtterance>>>,
+    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
 }
 
 fn normalize_eval_utterance_text(text: String) -> String {
@@ -2301,12 +3074,18 @@ impl std::fmt::Debug for RecordingUtteranceSink {
 }
 
 impl RecordingUtteranceSink {
-    fn new(case_id: String, reporter: LiveReporter, actions: Arc<ActionActivityTracker>) -> Self {
+    fn new(
+        case_id: String,
+        reporter: LiveReporter,
+        actions: Arc<ActionActivityTracker>,
+        visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+    ) -> Self {
         Self {
             case_id,
             reporter,
             actions,
             complete: Arc::new(Mutex::new(Vec::new())),
+            visualizer,
         }
     }
 
@@ -2358,6 +3137,33 @@ impl UtteranceSink for RecordingUtteranceSink {
                 recorded.text.chars().count()
             ),
         )?;
+        if let Some(visualizer) = &self.visualizer {
+            let _ = visualizer.send(VisualizerEvent::UtteranceCompleted {
+                tab_id: VisualizerTabId::new(self.case_id.clone()),
+                utterance: UtteranceView {
+                    sender: recorded.sender,
+                    target: recorded.target,
+                    text: recorded.text,
+                    emitted_at: utterance.emitted_at,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    async fn on_delta(&self, delta: UtteranceDelta) -> Result<(), PortError> {
+        if let Some(visualizer) = &self.visualizer {
+            let _ = visualizer.send(VisualizerEvent::UtteranceDelta {
+                tab_id: VisualizerTabId::new(self.case_id.clone()),
+                utterance: UtteranceDeltaView {
+                    sender: delta.sender.to_string(),
+                    target: delta.target,
+                    generation_id: delta.generation_id,
+                    sequence: delta.sequence,
+                    delta: delta.delta,
+                },
+            });
+        }
         Ok(())
     }
 }
@@ -2369,16 +3175,23 @@ struct RecordingRuntimeEventSink {
     case_id: String,
     max_llm_calls: Option<u64>,
     reporter: LiveReporter,
+    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
 }
 
 impl RecordingRuntimeEventSink {
-    fn new(case_id: String, max_llm_calls: Option<u64>, reporter: LiveReporter) -> Self {
+    fn new(
+        case_id: String,
+        max_llm_calls: Option<u64>,
+        reporter: LiveReporter,
+        visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+    ) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
             case_id,
             max_llm_calls,
             reporter,
+            visualizer,
         }
     }
 
@@ -2456,6 +3269,12 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             serde_json::json!({ "event": event }),
             live_message,
         )?;
+        if let Some(visualizer) = &self.visualizer {
+            let _ = visualizer.send(VisualizerEvent::RuntimeEvent {
+                tab_id: VisualizerTabId::new(self.case_id.clone()),
+                event,
+            });
+        }
         if should_stop && !self.stop.swap(true, Ordering::Relaxed) {
             self.reporter.emit_port(
                 Some(&self.case_id),
@@ -2595,6 +3414,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn visualizer_open_tab_uses_case_id_as_tab_id() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (_command_tx, command_rx) = std::sync::mpsc::channel();
+        let hooks = RunnerHooks::with_visualizer(VisualizerHook::new(event_tx, command_rx));
+
+        emit_visualizer_open_tab(&hooks, "case-1");
+
+        let event = event_rx.recv().expect("visualizer event");
+        let VisualizerEvent::OpenTab { tab_id, title } = event else {
+            panic!("expected open-tab event");
+        };
+        assert_eq!(tab_id.as_str(), "case-1");
+        assert_eq!(title, "case-1");
+    }
+
+    #[test]
+    fn trace_transcript_parser_builds_chat_messages() {
+        let transcript = "[System]\npolicy\n\n[User]\nhello\n\n[assistant]\nold reply\n";
+
+        let parsed = parse_lutum_transcript(transcript);
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].role, LlmChatRole::System);
+        assert_eq!(parsed.messages[0].content, "policy");
+        assert_eq!(parsed.messages[1].role, LlmChatRole::User);
+        assert_eq!(parsed.messages[1].content, "hello");
+        assert_eq!(parsed.messages[2].role, LlmChatRole::Assistant);
+        assert_eq!(parsed.messages[2].content, "old reply");
+    }
+
+    #[test]
+    fn visualizer_hook_serves_cached_memory_query_results() {
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let mut hook = VisualizerHook::new(event_tx, command_rx);
+        hook.set_memory_cache(
+            "case-1",
+            vec![MemoryRecordView {
+                index: "m1".to_string(),
+                rank: "long-term".to_string(),
+                occurred_at: None,
+                content: "rust memory".to_string(),
+            }],
+        );
+
+        command_tx
+            .send(VisualizerCommand::QueryMemory {
+                tab_id: VisualizerTabId::new("case-1"),
+                query: "rust".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+        command_tx.send(VisualizerCommand::Shutdown).unwrap();
+        hook.drain_cached_commands_until_shutdown();
+
+        let event = event_rx.recv().expect("memory query event");
+        let VisualizerEvent::MemoryQueryResult { records, .. } = event else {
+            panic!("expected memory query result");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].content, "rust memory");
+    }
+
     fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
         test_caps_with_adapter(blackboard, MockLlmAdapter::new())
     }
@@ -2723,7 +3606,8 @@ prompt = "Second?"
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
         let actions = Arc::new(ActionActivityTracker::new(vec![builtin::speak()]));
-        let sink = RecordingUtteranceSink::new("test-case".to_string(), reporter, actions.clone());
+        let sink =
+            RecordingUtteranceSink::new("test-case".to_string(), reporter, actions.clone(), None);
         let emitted_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let sender = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
 
@@ -2786,7 +3670,7 @@ prompt = "Second?"
     async fn max_llm_calls_requests_stop_after_limit_event() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter);
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter, None);
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
 
         sink.on_event(RuntimeEvent::LlmAccessed {

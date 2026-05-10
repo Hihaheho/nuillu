@@ -265,7 +265,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -651,7 +651,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -1235,7 +1235,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1572,7 +1572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2866,7 +2866,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "lutum"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2882,7 +2882,7 @@ dependencies = [
 [[package]]
 name = "lutum-eval"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "async-trait",
  "lutum",
@@ -2922,7 +2922,7 @@ dependencies = [
 [[package]]
 name = "lutum-macros"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -2944,7 +2944,7 @@ dependencies = [
 [[package]]
 name = "lutum-openai"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2966,7 +2966,7 @@ dependencies = [
 [[package]]
 name = "lutum-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "async-trait",
  "bon",
@@ -2982,7 +2982,7 @@ dependencies = [
 [[package]]
 name = "lutum-trace"
 version = "0.1.0"
-source = "git+https://github.com/Hihaheho/lutum#bb9a39f8beb309359d004bcd8566def4d5506e0a"
+source = "git+https://github.com/Hihaheho/lutum#7275980a050715529174fcb1da847369c8025740"
 dependencies = [
  "lutum-protocol",
  "serde_json",
@@ -3234,7 +3234,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3355,6 +3355,7 @@ dependencies = [
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
+ "nuillu-visualizer-egui",
  "regex",
  "schemars",
  "serde",
@@ -3549,9 +3550,14 @@ dependencies = [
 name = "nuillu-visualizer-egui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eframe",
  "egui",
  "egui_hooks",
+ "nuillu-module",
+ "nuillu-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4424,7 +4430,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4756,7 +4762,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4815,7 +4821,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4990,7 +4996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5401,7 +5407,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6508,7 +6514,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

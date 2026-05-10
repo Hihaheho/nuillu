@@ -726,7 +726,21 @@ async fn activate_with_retries(
     );
     let mut retries = 0_u8;
     loop {
-        match module.activate(&cx, batch).await {
+        let owner = module.owner().clone();
+        let activation_span = tracing::info_span!(
+            target: "lutum",
+            "module_activate",
+            lutum.capture = true,
+            owner = %owner,
+            module = %owner.module,
+            replica = owner.replica.get(),
+            retry = retries,
+        );
+        match module
+            .activate(&cx, batch)
+            .instrument(activation_span)
+            .await
+        {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {
                 retries = retries.saturating_add(1);

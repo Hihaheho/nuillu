@@ -1,54 +1,21 @@
-pub use eframe;
-pub use egui;
-pub use egui_hooks;
+use std::sync::mpsc;
 
-use egui::{Pos2, Vec2, Window};
-use egui_hooks::UseHookExt;
+use nuillu_visualizer_egui::{VisualizerApp, VisualizerChannels};
 
-fn main() {
-    let native_options = eframe::NativeOptions::default();
+fn main() -> eframe::Result<()> {
+    let (_event_tx, event_rx) = mpsc::channel();
+    let (command_tx, _command_rx) = mpsc::channel();
     eframe::run_native(
-        "My egui App",
-        native_options,
-        Box::new(|cc| Ok(Box::new(MyEguiApp::new(cc)))),
+        "Nuillu Visualizer",
+        eframe::NativeOptions::default(),
+        Box::new(|cc| {
+            Ok(Box::new(VisualizerApp::new(
+                cc,
+                VisualizerChannels {
+                    events: event_rx,
+                    commands: command_tx,
+                },
+            )))
+        }),
     )
-    .unwrap();
-}
-
-#[derive(Default)]
-struct MyEguiApp {}
-
-impl MyEguiApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_global_style.
-        // Restore app state using cc.storage (requires the "persistence" feature).
-        // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
-        // for e.g. egui::PaintCallback.
-        Self::default()
-    }
-}
-
-impl eframe::App for MyEguiApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.push_id("chat", |ui| {
-            ChatWindow {}.ui(ui);
-        });
-    }
-}
-
-pub struct ChatWindow {}
-
-impl ChatWindow {
-    fn ui(self, ui: &mut egui::Ui) {
-        let pos = ui.use_persisted_state(|| Pos2::new(0.0, 0.0), ());
-        if let Some(res) = Window::new("Chat")
-            .id("Chat".into())
-            .current_pos(*pos)
-            .movable(true)
-            .show(ui.ctx(), |ui| {})
-        {
-            let delta = res.response.drag_delta();
-            pos.set_next(Pos2::new(pos.x + delta.x, pos.y + delta.y));
-        }
-    }
 }

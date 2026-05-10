@@ -11,9 +11,14 @@ name = "visualizer"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
 eframe = { version = "0.34.2", features = ["persistence"] }
 egui = "0.34.2"
 egui_hooks = { version = "0.11.0", features = ["persistence"] }
+nuillu-module = { workspace = true }
+nuillu-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
