@@ -140,6 +140,7 @@ impl SensoryModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
@@ -151,6 +152,7 @@ impl SensoryModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }

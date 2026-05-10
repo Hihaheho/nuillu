@@ -248,6 +248,7 @@ impl CapabilityProviders {
             .map(|record| nuillu_blackboard::IdentityMemoryRecord {
                 index: record.index,
                 content: record.content,
+                occurred_at: record.occurred_at,
             })
             .collect::<Vec<_>>();
         records.sort_by(|a, b| a.index.as_str().cmp(b.index.as_str()));
@@ -1143,16 +1144,19 @@ mod tests {
                     index: MemoryIndex::new("identity-b"),
                     content: MemoryContent::new("second"),
                     rank: MemoryRank::Identity,
+                    occurred_at: None,
                 },
                 MemoryRecord {
                     index: MemoryIndex::new("other"),
                     content: MemoryContent::new("ordinary"),
                     rank: MemoryRank::Permanent,
+                    occurred_at: None,
                 },
                 MemoryRecord {
                     index: MemoryIndex::new("identity-a"),
                     content: MemoryContent::new("first"),
                     rank: MemoryRank::Identity,
+                    occurred_at: None,
                 },
             ],
         };

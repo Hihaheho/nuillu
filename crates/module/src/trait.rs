@@ -2,6 +2,7 @@ use std::any::Any;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use lutum::Lutum;
 use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleId;
@@ -15,6 +16,7 @@ pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
     session_compaction_lutum: &'a Lutum,
+    now: DateTime<Utc>,
 }
 
 impl<'a> ActivateCx<'a> {
@@ -22,11 +24,13 @@ impl<'a> ActivateCx<'a> {
         modules: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
         session_compaction_lutum: &'a Lutum,
+        now: DateTime<Utc>,
     ) -> Self {
         Self {
             modules,
             identity_memories,
             session_compaction_lutum,
+            now,
         }
     }
 
@@ -44,6 +48,10 @@ impl<'a> ActivateCx<'a> {
     /// Cheap shared LLM handle for module-owned session compaction.
     pub fn session_compaction_lutum(&self) -> &Lutum {
         self.session_compaction_lutum
+    }
+
+    pub fn now(&self) -> DateTime<Utc> {
+        self.now
     }
 }
 

@@ -68,6 +68,7 @@ pub trait MemoryStore {
 pub struct NewMemory {
     pub content: MemoryContent,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,7 @@ pub struct IndexedMemory {
     pub index: MemoryIndex,
     pub content: MemoryContent,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,7 @@ pub struct MemoryRecord {
     pub index: MemoryIndex,
     pub content: MemoryContent,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]

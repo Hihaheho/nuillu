@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub struct IdentityMemoryRecord {
     pub index: MemoryIndex,
     pub content: MemoryContent,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 /// Mutable metadata about a memory entry. Durable content and adapter-local
@@ -19,6 +20,7 @@ pub struct IdentityMemoryRecord {
 pub struct MemoryMetadata {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
     pub decay_remaining_secs: i64,
     pub remember_tokens: u32,
     pub last_accessed: DateTime<Utc>,
@@ -31,12 +33,14 @@ impl MemoryMetadata {
     pub fn new_at(
         index: MemoryIndex,
         rank: MemoryRank,
+        occurred_at: Option<DateTime<Utc>>,
         decay_remaining_secs: i64,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
             index,
             rank,
+            occurred_at,
             decay_remaining_secs,
             remember_tokens: 0,
             last_accessed: now,
@@ -60,6 +64,7 @@ impl MemoryMetadata {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryMetaPatch {
     pub rank: Option<MemoryRank>,
+    pub occurred_at: Option<Option<DateTime<Utc>>>,
     pub decay_remaining_secs: Option<i64>,
     pub increment_remember_tokens: Option<u32>,
     pub record_access: bool,
@@ -69,6 +74,9 @@ impl MemoryMetaPatch {
     pub fn apply_at(&self, meta: &mut MemoryMetadata, now: DateTime<Utc>) {
         if let Some(r) = self.rank {
             meta.rank = r;
+        }
+        if let Some(occurred_at) = self.occurred_at {
+            meta.occurred_at = occurred_at;
         }
         if let Some(d) = self.decay_remaining_secs {
             meta.decay_remaining_secs = d;

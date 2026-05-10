@@ -286,6 +286,7 @@ impl CognitionGateModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
@@ -440,8 +441,8 @@ mod tests {
         linear_ratio_fn,
     };
     use nuillu_module::ports::{
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        SystemClock,
+        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
+        NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
@@ -733,7 +734,8 @@ mod tests {
             (builtin::sensory(), "test stub"),
         ];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
-        let cx = nuillu_module::ActivateCx::new(&modules, &identity_memories, &lutum);
+        let cx =
+            nuillu_module::ActivateCx::new(&modules, &identity_memories, &lutum, SystemClock.now());
 
         fixture.gate.activate(&cx).await.unwrap();
 

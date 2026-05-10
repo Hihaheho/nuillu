@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use futures::FutureExt as _;
 use lutum::{
     Lutum, ModelName, RawTelemetryConfig, RequestExtensions, SharedPoolBudgetManager,
@@ -51,6 +51,7 @@ use crate::{
     cases::{
         CaseFileError, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule, FullAgentCase,
         FullAgentInput, ModuleCase, ModuleEvalTarget, discover_case_files, parse_case_file,
+        parse_case_now, parse_memory_datetime,
     },
     evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
     judge::{LlmRubricJudge, RubricJudge},
@@ -544,6 +545,9 @@ async fn execute_full_agent_case(
     reporter: &LiveReporter,
 ) -> Result<CaseExecution> {
     let case_modules = full_agent_case_modules(case);
+    let case_now = parse_case_now(case.now.as_deref())
+        .map_err(anyhow::Error::msg)
+        .context("parse full-agent case now")?;
     let env = build_eval_environment(
         output_dir,
         config,
@@ -551,6 +555,7 @@ async fn execute_full_agent_case(
         case.limits.max_llm_calls,
         action_module_ids(&case_modules),
         Arc::new(NoopFileSearchProvider),
+        case_now,
         case_id,
         reporter,
     )
@@ -558,7 +563,7 @@ async fn execute_full_agent_case(
     env.caps
         .scene()
         .set(case.participants.iter().map(Participant::new));
-    seed_memories(&env.caps, &case.memories).await?;
+    seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
 
     let host = env.caps.host_io();
@@ -693,6 +698,9 @@ async fn execute_module_case(
     reporter: &LiveReporter,
 ) -> Result<CaseExecution> {
     let case_modules = module_case_modules(target, case);
+    let case_now = parse_case_now(case.now.as_deref())
+        .map_err(anyhow::Error::msg)
+        .context("parse module case now")?;
     let env = build_eval_environment(
         output_dir,
         config,
@@ -700,11 +708,12 @@ async fn execute_module_case(
         case.limits.max_llm_calls,
         action_module_ids(&case_modules),
         module_file_search_provider(target, case),
+        case_now,
         case_id,
         reporter,
     )
     .await?;
-    seed_memories(&env.caps, &case.memories).await?;
+    seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
 
@@ -855,6 +864,38 @@ struct EvalEnvironment {
     clock: Arc<dyn Clock>,
 }
 
+struct AnchoredRealtimeClock {
+    base: DateTime<Utc>,
+    started: Instant,
+}
+
+impl AnchoredRealtimeClock {
+    fn new(base: DateTime<Utc>) -> Self {
+        Self {
+            base,
+            started: Instant::now(),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Clock for AnchoredRealtimeClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.base + ChronoDuration::from_std(self.started.elapsed()).unwrap_or_default()
+    }
+
+    async fn sleep_until(&self, deadline: DateTime<Utc>) {
+        let remaining = deadline - self.now();
+        let Ok(duration) = remaining.to_std() else {
+            return;
+        };
+        if duration.is_zero() {
+            return;
+        }
+        tokio::time::sleep(duration).await;
+    }
+}
+
 async fn build_eval_environment(
     output_dir: &Path,
     config: &RunnerConfig,
@@ -862,6 +903,7 @@ async fn build_eval_environment(
     max_llm_calls: Option<u64>,
     action_modules: Vec<ModuleId>,
     file_search: Arc<dyn FileSearchProvider>,
+    case_now: Option<DateTime<FixedOffset>>,
     case_id: &str,
     reporter: &LiveReporter,
 ) -> Result<EvalEnvironment> {
@@ -877,7 +919,10 @@ async fn build_eval_environment(
         reporter.clone(),
         actions.clone(),
     ));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = match case_now {
+        Some(now) => Arc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
+        None => Arc::new(SystemClock),
+    };
     let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
     let tiers = build_tiers(config)?;
     let runtime_policy = RuntimePolicy {
@@ -1032,20 +1077,41 @@ impl FileSearchProvider for SeededFileSearchProvider {
 
 async fn seed_memories(
     caps: &CapabilityProviders,
+    clock: &dyn Clock,
+    case_now: Option<DateTime<FixedOffset>>,
     memories: &[crate::cases::MemorySeed],
 ) -> Result<()> {
     let writer = caps.memory_writer();
     for memory in memories {
+        let occurred_at = memory_seed_occurred_at(clock, case_now, memory)?;
         writer
-            .insert(
+            .insert_with_occurred_at(
                 memory.content.content.clone(),
                 MemoryRank::from(memory.rank),
                 memory.decay_secs,
+                occurred_at,
             )
             .await
             .context("seed eval memory")?;
     }
     Ok(())
+}
+
+fn memory_seed_occurred_at(
+    clock: &dyn Clock,
+    case_now: Option<DateTime<FixedOffset>>,
+    memory: &crate::cases::MemorySeed,
+) -> Result<Option<DateTime<Utc>>> {
+    if let Some(datetime) = &memory.datetime {
+        return parse_memory_datetime(datetime, case_now)
+            .map(Some)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("parse memory datetime {datetime}"));
+    }
+    if let Some(seconds_ago) = memory.seconds_ago {
+        return Ok(Some(clock.now() - ChronoDuration::seconds(seconds_ago)));
+    }
+    Ok(None)
 }
 
 async fn seed_memos(
@@ -1729,6 +1795,7 @@ fn memory_metadata_dump_records(bb: &BlackboardInner) -> Vec<(String, MemoryMeta
                 index.as_str().to_owned(),
                 MemoryMetadataDump {
                     rank: memory_rank_name(metadata.rank).to_owned(),
+                    occurred_at: metadata.occurred_at.map(|at| at.to_rfc3339()),
                     decay_remaining_secs: metadata.decay_remaining_secs,
                     remember_tokens: metadata.remember_tokens,
                     last_accessed: metadata.last_accessed.to_rfc3339(),
@@ -1762,6 +1829,7 @@ async fn memory_last_state_dump(
                 index,
                 content: Some(DumpText::new(record.content.as_str().to_owned())),
                 content_rank: Some(memory_rank_name(record.rank).to_owned()),
+                occurred_at: record.occurred_at.map(|at| at.to_rfc3339()),
                 metadata,
                 missing_content: false,
             },
@@ -1769,6 +1837,7 @@ async fn memory_last_state_dump(
                 index,
                 content: None,
                 content_rank: None,
+                occurred_at: None,
                 metadata,
                 missing_content: true,
             },
@@ -2888,6 +2957,7 @@ limits {{
             .apply(BlackboardCommand::UpsertMemoryMetadata {
                 index: MemoryIndex::new("mem-1"),
                 rank_if_new: MemoryRank::Permanent,
+                occurred_at_if_new: None,
                 decay_if_new_secs: 0,
                 now,
                 patch: MemoryMetaPatch::default(),
@@ -2943,6 +3013,7 @@ limits {{
                 "mem-1": {
                     "index": "mem-1",
                     "rank": "Permanent",
+                    "occurred_at": null,
                     "decay_remaining_secs": 0,
                     "remember_tokens": 0,
                     "last_accessed": "2026-05-07T00:00:00Z",

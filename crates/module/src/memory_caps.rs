@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, MemoryMetaPatch};
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 
@@ -47,6 +48,7 @@ impl VectorMemorySearcher {
                     .apply(BlackboardCommand::UpsertMemoryMetadata {
                         index: hit.index.clone(),
                         rank_if_new: hit.rank,
+                        occurred_at_if_new: hit.occurred_at,
                         decay_if_new_secs: 0,
                         now: self.clock.now(),
                         patch: MemoryMetaPatch {
@@ -129,9 +131,21 @@ impl MemoryWriter {
         rank: MemoryRank,
         decay_secs: i64,
     ) -> Result<MemoryIndex, PortError> {
+        self.insert_with_occurred_at(content, rank, decay_secs, Some(self.clock.now()))
+            .await
+    }
+
+    pub async fn insert_with_occurred_at(
+        &self,
+        content: String,
+        rank: MemoryRank,
+        decay_secs: i64,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> Result<MemoryIndex, PortError> {
         let new = NewMemory {
             content: MemoryContent::new(content.clone()),
             rank,
+            occurred_at,
         };
 
         let index = self.primary_store.insert(new).await?;
@@ -139,6 +153,7 @@ impl MemoryWriter {
             index: index.clone(),
             content: MemoryContent::new(content),
             rank,
+            occurred_at,
         };
 
         let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
@@ -155,10 +170,12 @@ impl MemoryWriter {
             .apply(BlackboardCommand::UpsertMemoryMetadata {
                 index: index.clone(),
                 rank_if_new: rank,
+                occurred_at_if_new: occurred_at,
                 decay_if_new_secs: decay_secs,
                 now: self.clock.now(),
                 patch: MemoryMetaPatch {
                     rank: Some(rank),
+                    occurred_at: Some(occurred_at),
                     decay_remaining_secs: Some(decay_secs),
                     ..Default::default()
                 },
@@ -203,9 +220,17 @@ impl MemoryCompactor {
         merged_rank: MemoryRank,
         decay_secs: i64,
     ) -> Result<MemoryIndex, PortError> {
+        let occurred_at = self
+            .get_many(sources)
+            .await?
+            .into_iter()
+            .filter_map(|record| record.occurred_at)
+            .min()
+            .or_else(|| Some(self.clock.now()));
         let new = NewMemory {
             content: MemoryContent::new(merged_content.clone()),
             rank: merged_rank,
+            occurred_at,
         };
 
         let id = self.primary_store.compact(new, sources).await?;
@@ -213,6 +238,7 @@ impl MemoryCompactor {
             index: id.clone(),
             content: MemoryContent::new(merged_content),
             rank: merged_rank,
+            occurred_at,
         };
 
         let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
@@ -229,10 +255,12 @@ impl MemoryCompactor {
             .apply(BlackboardCommand::UpsertMemoryMetadata {
                 index: id.clone(),
                 rank_if_new: merged_rank,
+                occurred_at_if_new: occurred_at,
                 decay_if_new_secs: decay_secs,
                 now: self.clock.now(),
                 patch: MemoryMetaPatch {
                     rank: Some(merged_rank),
+                    occurred_at: Some(occurred_at),
                     decay_remaining_secs: Some(decay_secs),
                     increment_remember_tokens: Some(sources.len() as u32),
                     ..Default::default()
@@ -268,7 +296,7 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
-    use chrono::Utc;
+    use chrono::{TimeZone as _, Utc};
     use tokio::sync::Mutex;
 
     use crate::ports::NoopFileSearchProvider;
@@ -301,6 +329,8 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingMemoryStoreState {
+        inserted: Vec<NewMemory>,
+        put: Vec<IndexedMemory>,
         inserted_indexes: Vec<MemoryIndex>,
         put_indexes: Vec<MemoryIndex>,
         compacted_indexes: Vec<MemoryIndex>,
@@ -314,6 +344,14 @@ mod tests {
 
         async fn put_indexes(&self) -> Vec<MemoryIndex> {
             self.state.lock().await.put_indexes.clone()
+        }
+
+        async fn inserted(&self) -> Vec<NewMemory> {
+            self.state.lock().await.inserted.clone()
+        }
+
+        async fn put(&self) -> Vec<IndexedMemory> {
+            self.state.lock().await.put.clone()
         }
 
         async fn compacted_indexes(&self) -> Vec<MemoryIndex> {
@@ -337,12 +375,14 @@ mod tests {
 
     #[async_trait(?Send)]
     impl MemoryStore for RecordingMemoryStore {
-        async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
+        async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError> {
             if self.fail_insert {
                 return Err(PortError::Backend("insert failed".into()));
             }
             let index = self.next_generated_index();
-            self.state.lock().await.inserted_indexes.push(index.clone());
+            let mut state = self.state.lock().await;
+            state.inserted.push(mem);
+            state.inserted_indexes.push(index.clone());
             Ok(index)
         }
 
@@ -350,7 +390,9 @@ mod tests {
             if self.fail_put {
                 return Err(PortError::Backend("put failed".into()));
             }
-            self.state.lock().await.put_indexes.push(mem.index);
+            let mut state = self.state.lock().await;
+            state.put_indexes.push(mem.index.clone());
+            state.put.push(mem);
             Ok(())
         }
 
@@ -490,11 +532,63 @@ mod tests {
 
         assert_eq!(written, index);
         assert_eq!(primary.inserted_indexes().await, vec![index.clone()]);
+        let inserted = primary.inserted().await;
+        assert!(inserted[0].occurred_at.is_some());
         assert!(secondary.put_indexes().await.is_empty());
-        let metadata_present = blackboard
-            .read(|bb| bb.memory_metadata().contains_key(&index))
+        let metadata_occurred_at = blackboard
+            .read(|bb| {
+                bb.memory_metadata()
+                    .get(&index)
+                    .and_then(|meta| meta.occurred_at)
+            })
             .await;
-        assert!(metadata_present);
+        assert_eq!(metadata_occurred_at, inserted[0].occurred_at);
+    }
+
+    #[tokio::test]
+    async fn memory_writer_can_insert_explicit_or_absent_occurred_at() {
+        let blackboard = Blackboard::default();
+        let primary = RecordingMemoryStore::default();
+        let caps = test_caps_with_stores(
+            blackboard.clone(),
+            Arc::new(primary.clone()),
+            Vec::new(),
+            Arc::new(NoopFileSearchProvider),
+        );
+        let occurred_at = Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap();
+
+        let explicit = caps
+            .memory_writer()
+            .insert_with_occurred_at(
+                "explicit".into(),
+                MemoryRank::LongTerm,
+                30,
+                Some(occurred_at),
+            )
+            .await
+            .expect("explicit insert succeeds");
+        let absent = caps
+            .memory_writer()
+            .insert_with_occurred_at("absent".into(), MemoryRank::LongTerm, 30, None)
+            .await
+            .expect("absent insert succeeds");
+
+        let inserted = primary.inserted().await;
+        assert_eq!(inserted[0].occurred_at, Some(occurred_at));
+        assert_eq!(inserted[1].occurred_at, None);
+        let metadata = blackboard
+            .read(|bb| {
+                (
+                    bb.memory_metadata()
+                        .get(&explicit)
+                        .and_then(|meta| meta.occurred_at),
+                    bb.memory_metadata()
+                        .get(&absent)
+                        .and_then(|meta| meta.occurred_at),
+                )
+            })
+            .await;
+        assert_eq!(metadata, (Some(occurred_at), None));
     }
 
     #[tokio::test]
@@ -522,6 +616,10 @@ mod tests {
         assert_eq!(written, index.clone());
         assert_eq!(primary.inserted_indexes().await, vec![index.clone()]);
         assert_eq!(secondary.put_indexes().await, vec![index]);
+        assert_eq!(
+            secondary.put().await[0].occurred_at,
+            primary.inserted().await[0].occurred_at
+        );
     }
 
     #[tokio::test]
@@ -563,6 +661,7 @@ mod tests {
             .apply(BlackboardCommand::UpsertMemoryMetadata {
                 index: miss_index.clone(),
                 rank_if_new: MemoryRank::MidTerm,
+                occurred_at_if_new: None,
                 decay_if_new_secs: 0,
                 now: Utc::now(),
                 patch: MemoryMetaPatch::default(),
@@ -573,6 +672,7 @@ mod tests {
                 index: hit_index.clone(),
                 content: MemoryContent::new("matched content"),
                 rank: MemoryRank::MidTerm,
+                occurred_at: None,
             }],
             ..Default::default()
         };
@@ -610,9 +710,16 @@ mod tests {
     async fn memory_compactor_uses_atomic_compaction_and_updates_metadata() {
         let blackboard = Blackboard::default();
         let source = MemoryIndex::new("source");
+        let older = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let merged = MemoryIndex::new("merged");
         let primary = RecordingMemoryStore {
             generated_index: merged.clone(),
+            search_hits: vec![MemoryRecord {
+                index: source.clone(),
+                content: MemoryContent::new("source content"),
+                rank: MemoryRank::LongTerm,
+                occurred_at: Some(older),
+            }],
             ..Default::default()
         };
         let secondary = RecordingMemoryStore::default();
@@ -638,10 +745,14 @@ mod tests {
         assert_eq!(primary.compacted_sources().await, vec![source.clone()]);
         assert_eq!(secondary.compacted_indexes().await, vec![merged.clone()]);
         assert_eq!(secondary.compacted_sources().await, vec![source]);
-        let has_metadata = blackboard
-            .read(|bb| bb.memory_metadata().contains_key(&merged))
+        let metadata_occurred_at = blackboard
+            .read(|bb| {
+                bb.memory_metadata()
+                    .get(&merged)
+                    .and_then(|meta| meta.occurred_at)
+            })
             .await;
-        assert!(has_metadata);
+        assert_eq!(metadata_occurred_at, Some(older));
     }
 
     #[tokio::test]

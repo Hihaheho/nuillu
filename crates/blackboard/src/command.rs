@@ -38,6 +38,7 @@ pub enum BlackboardCommand {
     UpsertMemoryMetadata {
         index: MemoryIndex,
         rank_if_new: MemoryRank,
+        occurred_at_if_new: Option<DateTime<Utc>>,
         decay_if_new_secs: i64,
         now: DateTime<Utc>,
         patch: MemoryMetaPatch,

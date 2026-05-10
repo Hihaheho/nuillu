@@ -1,5 +1,8 @@
+use chrono::{DateTime, Utc};
 use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleId;
+
+use crate::render_memory_for_llm;
 
 /// Build a system prompt that prepends a one-line description of every other
 /// module registered in the agent. The owner module is excluded so each
@@ -13,6 +16,7 @@ pub fn format_system_prompt(
     catalog: &[(ModuleId, &'static str)],
     owner: &ModuleId,
     identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
 ) -> String {
     let mut peers = catalog
         .iter()
@@ -38,7 +42,11 @@ pub fn format_system_prompt(
             prompt.push_str("- [");
             prompt.push_str(memory.index.as_str());
             prompt.push_str("] ");
-            prompt.push_str(memory.content.as_str());
+            prompt.push_str(&render_memory_for_llm(
+                memory.content.as_str(),
+                memory.occurred_at,
+                now,
+            ));
             prompt.push('\n');
         }
     }
@@ -48,6 +56,7 @@ pub fn format_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
     use nuillu_types::builtin;
 
     #[test]
@@ -57,7 +66,7 @@ mod tests {
             (builtin::speak(), "speak role"),
             (builtin::cognition_gate(), "gate role"),
         ];
-        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[], test_now());
         assert!(prompt.starts_with("BASE\n\nYou are part of a cognitive system."));
         assert!(prompt.contains("- cognition-gate: gate role"));
         assert!(prompt.contains("- speak: speak role"));
@@ -70,14 +79,14 @@ mod tests {
 
     #[test]
     fn empty_catalog_returns_base_unchanged() {
-        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &[]);
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &[], test_now());
         assert_eq!(prompt, "BASE");
     }
 
     #[test]
     fn solo_module_returns_base_unchanged() {
         let catalog = vec![(builtin::sensory(), "sensory role")];
-        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[], test_now());
         assert_eq!(prompt, "BASE");
     }
 
@@ -86,13 +95,32 @@ mod tests {
         let memories = vec![IdentityMemoryRecord {
             index: nuillu_types::MemoryIndex::new("memory-1"),
             content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
+            occurred_at: None,
         }];
 
-        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &memories);
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &memories, test_now());
 
         assert_eq!(
             prompt,
             "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
         );
+    }
+
+    #[test]
+    fn identity_memory_can_include_temporal_context() {
+        let memories = vec![IdentityMemoryRecord {
+            index: nuillu_types::MemoryIndex::new("memory-1"),
+            content: nuillu_types::MemoryContent::new("The agent met Koro."),
+            occurred_at: Some(chrono::Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap()),
+        }];
+
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &memories, test_now());
+
+        assert!(prompt.contains("<one-year-ago occurred-at=\"2025-05-10T00:00:00Z\">"));
+        assert!(prompt.contains("The agent met Koro."));
+    }
+
+    fn test_now() -> DateTime<Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap()
     }
 }

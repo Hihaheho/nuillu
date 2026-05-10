@@ -110,6 +110,7 @@ impl QueryAgenticModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }

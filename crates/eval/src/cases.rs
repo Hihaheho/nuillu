@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use chrono::{DateTime, Datelike as _, FixedOffset, NaiveDate, TimeZone as _, Utc};
 use eure::{FromEure, value::Text};
 use nuillu_types::{MemoryRank, ModuleId, builtin};
 use thiserror::Error;
@@ -76,6 +77,8 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub description: Option<Text>,
     #[eure(default)]
+    pub now: Option<String>,
+    #[eure(default)]
     pub modules: Option<Vec<EvalModule>>,
     #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
@@ -128,6 +131,8 @@ pub struct ModuleCase {
     pub id: Option<String>,
     #[eure(default)]
     pub description: Option<Text>,
+    #[eure(default)]
+    pub now: Option<String>,
     #[eure(default)]
     pub modules: Option<Vec<EvalModule>>,
     pub prompt: Text,
@@ -397,6 +402,10 @@ pub struct MemorySeed {
     pub rank: MemorySeedRank,
     #[eure(default = "default_memory_decay_secs")]
     pub decay_secs: i64,
+    #[eure(default)]
+    pub datetime: Option<String>,
+    #[eure(default)]
+    pub seconds_ago: Option<i64>,
     pub content: Text,
 }
 
@@ -687,6 +696,36 @@ pub fn parse_module_case_file(path: &Path) -> Result<ModuleCase, CaseFileError> 
     Ok(file.case)
 }
 
+pub(crate) fn parse_case_now(now: Option<&str>) -> Result<Option<DateTime<FixedOffset>>, String> {
+    now.map(|value| {
+        DateTime::parse_from_rfc3339(value.trim())
+            .map_err(|error| format!("now must be RFC3339 datetime: {error}"))
+    })
+    .transpose()
+}
+
+pub(crate) fn parse_memory_datetime(
+    value: &str,
+    case_now: Option<DateTime<FixedOffset>>,
+) -> Result<DateTime<Utc>, String> {
+    let value = value.trim();
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return Ok(datetime.with_timezone(&Utc));
+    }
+
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
+        format!("memory datetime must be RFC3339 datetime or YYYY-MM-DD: {error}")
+    })?;
+    let offset = case_now
+        .map(|now| *now.offset())
+        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("zero offset is valid"));
+    offset
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .ok_or_else(|| format!("memory datetime date is not representable: {value}"))
+        .map(|datetime| datetime.with_timezone(&Utc))
+}
+
 fn read_case(path: &Path) -> Result<String, CaseFileError> {
     fs::read_to_string(path).map_err(|source| CaseFileError::Read {
         path: path.to_path_buf(),
@@ -779,6 +818,7 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
     validate_module_checks(path, case)?;
     validate_common(
         path,
+        case.now.as_deref(),
         &case.memories,
         &case.memos,
         &case.limits,
@@ -824,6 +864,7 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
     validate_modules(path, case.modules.as_deref())?;
     validate_common(
         path,
+        case.now.as_deref(),
         &case.memories,
         &case.memos,
         &case.limits,
@@ -937,6 +978,7 @@ fn validate_module_checks(path: &Path, case: &FullAgentCase) -> Result<(), CaseF
 
 fn validate_common(
     path: &Path,
+    now: Option<&str>,
     memories: &[MemorySeed],
     memos: &[MemoSeed],
     limits: &EvalLimits,
@@ -960,6 +1002,10 @@ fn validate_common(
             message: "limits.max-llm-calls must be greater than zero when present".to_string(),
         });
     }
+    let case_now = parse_case_now(now).map_err(|message| CaseFileError::Validation {
+        path: path.to_path_buf(),
+        message,
+    })?;
 
     for (index, memory) in memories.iter().enumerate() {
         if memory.content.content.trim().is_empty() {
@@ -973,6 +1019,28 @@ fn validate_common(
                 path: path.to_path_buf(),
                 message: format!("memories[{index}].decay-secs must not be negative"),
             });
+        }
+        if memory.datetime.is_some() && memory.seconds_ago.is_some() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "memories[{index}] must not specify both datetime and seconds-ago"
+                ),
+            });
+        }
+        if matches!(memory.seconds_ago, Some(seconds_ago) if seconds_ago < 0) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("memories[{index}].seconds-ago must not be negative"),
+            });
+        }
+        if let Some(datetime) = &memory.datetime {
+            parse_memory_datetime(datetime, case_now).map_err(|message| {
+                CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("memories[{index}].datetime is invalid: {message}"),
+                }
+            })?;
         }
     }
 
@@ -1129,4 +1197,52 @@ fn validate_pass_score(path: &Path, score: f64, name: &str) -> Result<(), CaseFi
         path: path.to_path_buf(),
         message: format!("pass score for '{name}' must be between 0.0 and 1.0"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_only_memory_datetime_uses_case_now_offset() {
+        let case_now = parse_case_now(Some("2026-05-10T08:21:00+09:00"))
+            .unwrap()
+            .unwrap();
+
+        let occurred_at = parse_memory_datetime("2025-05-10", Some(case_now)).unwrap();
+
+        assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T15:00:00+00:00");
+    }
+
+    #[test]
+    fn memory_datetime_accepts_rfc3339() {
+        let occurred_at = parse_memory_datetime("2025-05-10T08:21:00+09:00", None).unwrap();
+
+        assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T23:21:00+00:00");
+    }
+
+    #[test]
+    fn memory_seed_rejects_datetime_and_seconds_ago_together() {
+        let memory = MemorySeed {
+            rank: MemorySeedRank::Permanent,
+            decay_secs: 0,
+            datetime: Some("2025-05-10".to_string()),
+            seconds_ago: Some(60),
+            content: Text::plaintext("memory"),
+        };
+
+        let error = validate_common(
+            Path::new("case.eure"),
+            Some("2026-05-10T08:21:00+09:00"),
+            &[memory],
+            &[],
+            &EvalLimits::default(),
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("must not specify both datetime and seconds-ago"))
+        );
+    }
 }

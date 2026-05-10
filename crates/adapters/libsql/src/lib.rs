@@ -221,6 +221,7 @@ impl LibsqlMemoryStore {
               memory_index TEXT NOT NULL UNIQUE,
               content TEXT NOT NULL,
               rank INTEGER NOT NULL,
+              occurred_at_ms INTEGER,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
               source_ids TEXT,
@@ -249,9 +250,40 @@ impl LibsqlMemoryStore {
             .execute_batch(&ddl)
             .await
             .map_err(map_libsql_error)?;
+        self.add_column_if_missing(&self.table_name, "occurred_at_ms", "INTEGER")
+            .await?;
 
         self.register_active_profile().await?;
         self.create_active_embedding_table().await
+    }
+
+    async fn add_column_if_missing(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        column_type: &str,
+    ) -> Result<(), PortError> {
+        validate_identifier("migration table name", table_name)?;
+        validate_identifier("migration column name", column_name)?;
+        let pragma = format!("PRAGMA table_info({table_name})");
+        let mut rows = self
+            .conn
+            .query(&pragma, ())
+            .await
+            .map_err(map_libsql_error)?;
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let name: String = row.get(1).map_err(map_libsql_error)?;
+            if name == column_name {
+                return Ok(());
+            }
+        }
+
+        let sql = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
+        self.conn
+            .execute(&sql, ())
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
     }
 
     async fn register_active_profile(&self) -> Result<(), PortError> {
@@ -370,6 +402,7 @@ impl LibsqlMemoryStore {
         index: &MemoryIndex,
         content: &str,
         rank: MemoryRank,
+        occurred_at: Option<chrono::DateTime<chrono::Utc>>,
         source_ids_json: Option<&str>,
         now: i64,
     ) -> Result<(i64, i64), PortError> {
@@ -379,16 +412,18 @@ impl LibsqlMemoryStore {
               memory_index,
               content,
               rank,
+              occurred_at_ms,
               created_at_ms,
               updated_at_ms,
               source_ids,
               metadata_json,
               deleted_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)
             ON CONFLICT(memory_index) DO UPDATE SET
               content = excluded.content,
               rank = excluded.rank,
+              occurred_at_ms = excluded.occurred_at_ms,
               updated_at_ms = excluded.updated_at_ms,
               source_ids = excluded.source_ids,
               deleted_at_ms = NULL
@@ -401,6 +436,7 @@ impl LibsqlMemoryStore {
                 index.as_str(),
                 content,
                 rank_to_i64(rank),
+                occurred_at.map(|at| at.timestamp_millis()),
                 now,
                 now,
                 source_ids_json,
@@ -538,10 +574,12 @@ impl LibsqlMemoryStore {
         let index: String = row.get(0).map_err(map_libsql_error)?;
         let content: String = row.get(1).map_err(map_libsql_error)?;
         let rank: i64 = row.get(2).map_err(map_libsql_error)?;
+        let occurred_at_ms: Option<i64> = row.get(3).map_err(map_libsql_error)?;
         Ok(MemoryRecord {
             index: MemoryIndex::new(index),
             content: MemoryContent::new(content),
             rank: rank_from_i64(rank)?,
+            occurred_at: occurred_at_ms.and_then(chrono::DateTime::from_timestamp_millis),
         })
     }
 
@@ -559,6 +597,7 @@ impl LibsqlMemoryStore {
                 &mem.index,
                 mem.content.as_str(),
                 mem.rank,
+                mem.occurred_at,
                 source_ids_json.as_deref(),
                 now,
             )
@@ -578,7 +617,15 @@ impl MemoryStore for LibsqlMemoryStore {
         let now = now_ms();
         let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
         let (memory_id, updated_at_ms) = self
-            .upsert_memory_tx(&tx, &index, mem.content.as_str(), mem.rank, None, now)
+            .upsert_memory_tx(
+                &tx,
+                &index,
+                mem.content.as_str(),
+                mem.rank,
+                mem.occurred_at,
+                None,
+                now,
+            )
             .await?;
         self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
             .await?;
@@ -606,6 +653,7 @@ impl MemoryStore for LibsqlMemoryStore {
                 &index,
                 mem.content.as_str(),
                 mem.rank,
+                mem.occurred_at,
                 Some(&source_ids_json),
                 now,
             )
@@ -632,6 +680,7 @@ impl MemoryStore for LibsqlMemoryStore {
                 &mem.index,
                 mem.content.as_str(),
                 mem.rank,
+                mem.occurred_at,
                 Some(&source_ids_json),
                 now,
             )
@@ -646,7 +695,7 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT memory_index, content, rank
+            SELECT memory_index, content, rank, occurred_at_ms
             FROM {memories}
             WHERE memory_index = ?1
               AND deleted_at_ms IS NULL
@@ -668,7 +717,7 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT memory_index, content, rank
+            SELECT memory_index, content, rank, occurred_at_ms
             FROM {memories}
             WHERE rank = ?1
               AND deleted_at_ms IS NULL
@@ -698,7 +747,7 @@ impl MemoryStore for LibsqlMemoryStore {
 
         let sql = format!(
             r#"
-            SELECT m.memory_index, m.content, m.rank
+            SELECT m.memory_index, m.content, m.rank, m.occurred_at_ms
             FROM {memories} AS m
             JOIN {embeddings} AS e ON e.memory_id = m.id
             WHERE m.deleted_at_ms IS NULL
@@ -846,6 +895,7 @@ fn map_libsql_error(error: libsql::Error) -> PortError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -925,10 +975,12 @@ mod tests {
     #[tokio::test]
     async fn insert_then_get_roundtrips_content_and_rank() {
         let store = store().await;
+        let occurred_at = chrono::Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap();
         let id = store
             .insert(NewMemory {
                 content: MemoryContent::new("alpha beta"),
                 rank: MemoryRank::LongTerm,
+                occurred_at: Some(occurred_at),
             })
             .await
             .unwrap();
@@ -937,6 +989,45 @@ mod tests {
         assert_eq!(got.index, id);
         assert_eq!(got.content.as_str(), "alpha beta");
         assert_eq!(got.rank, MemoryRank::LongTerm);
+        assert_eq!(got.occurred_at, Some(occurred_at));
+    }
+
+    #[tokio::test]
+    async fn migrate_adds_occurred_at_column_to_existing_memory_table() {
+        let path = test_db_path();
+        let database = libsql::Builder::new_local(path.clone())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE memories (
+              id INTEGER PRIMARY KEY,
+              memory_index TEXT NOT NULL UNIQUE,
+              content TEXT NOT NULL,
+              rank INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              source_ids TEXT,
+              metadata_json TEXT,
+              deleted_at_ms INTEGER
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        drop(database);
+
+        let store = LibsqlMemoryStore::connect(
+            LibsqlMemoryStoreConfig::local(path, 3),
+            TestEmbedder::new(3),
+        )
+        .await
+        .unwrap();
+
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "occurred_at_ms").await);
     }
 
     #[tokio::test]
@@ -953,6 +1044,7 @@ mod tests {
                 index: MemoryIndex::new("identity-b"),
                 content: MemoryContent::new("second"),
                 rank: MemoryRank::Identity,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -961,6 +1053,7 @@ mod tests {
                 index: MemoryIndex::new("identity-a"),
                 content: MemoryContent::new("first"),
                 rank: MemoryRank::Identity,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -969,6 +1062,7 @@ mod tests {
                 index: MemoryIndex::new("ordinary"),
                 content: MemoryContent::new("ordinary"),
                 rank: MemoryRank::Permanent,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -994,6 +1088,7 @@ mod tests {
                 index: id.clone(),
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1005,6 +1100,7 @@ mod tests {
                 index: id.clone(),
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::Permanent,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1021,6 +1117,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1028,6 +1125,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::LongTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1035,6 +1133,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("gamma"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1057,6 +1156,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1078,6 +1178,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1103,6 +1204,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1110,6 +1212,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1119,6 +1222,7 @@ mod tests {
                 NewMemory {
                     content: MemoryContent::new("alpha beta"),
                     rank: MemoryRank::LongTerm,
+                    occurred_at: None,
                 },
                 &[first.clone(), second.clone()],
             )
@@ -1145,6 +1249,7 @@ mod tests {
                 index: first.clone(),
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1153,6 +1258,7 @@ mod tests {
                 index: second.clone(),
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1164,6 +1270,7 @@ mod tests {
                     index: merged.clone(),
                     content: MemoryContent::new("alpha beta"),
                     rank: MemoryRank::LongTerm,
+                    occurred_at: None,
                 },
                 &[first.clone(), second.clone()],
             )
@@ -1194,6 +1301,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap_err();
@@ -1211,6 +1319,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1237,6 +1346,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1247,6 +1357,7 @@ mod tests {
                 index: MemoryIndex::new("beta-only-b"),
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1280,6 +1391,7 @@ mod tests {
             .insert(NewMemory {
                 content: MemoryContent::new("alpha"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1303,6 +1415,7 @@ mod tests {
                 index: id,
                 content: MemoryContent::new("beta"),
                 rank: MemoryRank::ShortTerm,
+                occurred_at: None,
             })
             .await
             .unwrap();
@@ -1421,6 +1534,21 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         row.get(0).unwrap()
+    }
+
+    async fn column_exists(store: &LibsqlMemoryStore, table: &str, column: &str) -> bool {
+        let mut rows = store
+            .conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let name: String = row.get(1).unwrap();
+            if name == column {
+                return true;
+            }
+        }
+        false
     }
 
     async fn source_ids_for(store: &LibsqlMemoryStore, index: &MemoryIndex) -> Vec<String> {

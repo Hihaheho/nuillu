@@ -28,6 +28,7 @@ mod cognition;
 mod llm;
 mod memo;
 mod memory_caps;
+mod memory_render;
 pub mod ports;
 mod prompt;
 mod rate_limit;
@@ -65,6 +66,7 @@ pub use memo::{Memo, TypedMemo};
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
+pub use memory_render::render_memory_for_llm;
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
 pub use prompt::format_system_prompt;

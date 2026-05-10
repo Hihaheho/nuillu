@@ -664,6 +664,7 @@ impl BlackboardInner {
             BlackboardCommand::UpsertMemoryMetadata {
                 index,
                 rank_if_new,
+                occurred_at_if_new,
                 decay_if_new_secs,
                 now,
                 patch,
@@ -672,7 +673,13 @@ impl BlackboardInner {
                     .memory_metadata
                     .entry(index.clone())
                     .or_insert_with(|| {
-                        MemoryMetadata::new_at(index, rank_if_new, decay_if_new_secs, now)
+                        MemoryMetadata::new_at(
+                            index,
+                            rank_if_new,
+                            occurred_at_if_new,
+                            decay_if_new_secs,
+                            now,
+                        )
                     });
                 patch.apply_at(entry, now);
             }
@@ -947,10 +954,12 @@ mod tests {
         let first = IdentityMemoryRecord {
             index: MemoryIndex::new("identity-1"),
             content: MemoryContent::new("first identity"),
+            occurred_at: None,
         };
         let second = IdentityMemoryRecord {
             index: MemoryIndex::new("identity-2"),
             content: MemoryContent::new("second identity"),
+            occurred_at: None,
         };
 
         bb.apply(BlackboardCommand::SetIdentityMemories(vec![first.clone()]))

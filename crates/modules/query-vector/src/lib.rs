@@ -2,11 +2,12 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module, QueryInbox,
     QueryRequest, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
-    compact_session_if_needed, push_unread_memo_logs,
+    compact_session_if_needed, push_unread_memo_logs, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -54,6 +55,7 @@ pub struct QueryVectorMemoryHit {
     pub index: MemoryIndex,
     pub content: String,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +76,7 @@ pub struct QueryVectorMemoSearch {
 pub struct QueryVectorMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +138,7 @@ impl QueryVectorModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
@@ -193,6 +197,7 @@ impl QueryVectorModule {
                     .map(|hit| QueryVectorMemoHit {
                         index: hit.index.clone(),
                         rank: hit.rank,
+                        occurred_at: hit.occurred_at,
                     })
                     .collect(),
             };
@@ -296,7 +301,7 @@ impl QueryVectorModule {
                     let QueryVectorToolsCall::SearchVectorMemory(call) = call;
                     let input = call.input.clone();
                     let output = self
-                        .search_vector_memory(input.clone())
+                        .search_vector_memory(input.clone(), cx.now())
                         .await
                         .context("run search_vector_memory tool")?;
                     searches.push(QueryVectorMemoSearch {
@@ -350,6 +355,7 @@ impl QueryVectorModule {
                             })
                         }).collect::<Vec<_>>(),
                         "hit_indices": data.hits.iter().map(|hit| &hit.index).collect::<Vec<_>>(),
+                        "occurred_at": data.hits.iter().map(|hit| hit.occurred_at).collect::<Vec<_>>(),
                     })
                 })
                 .collect(),
@@ -359,6 +365,7 @@ impl QueryVectorModule {
     async fn search_vector_memory(
         &self,
         args: SearchVectorMemoryArgs,
+        now: DateTime<Utc>,
     ) -> Result<SearchVectorMemoryOutput> {
         let limit = args.limit.clamp(1, 16);
         let records = self
@@ -371,8 +378,13 @@ impl QueryVectorModule {
                 .into_iter()
                 .map(|record| QueryVectorMemoryHit {
                     index: record.index,
-                    content: record.content.as_str().to_owned(),
+                    content: render_memory_for_llm(
+                        record.content.as_str(),
+                        record.occurred_at,
+                        now,
+                    ),
                     rank: record.rank,
+                    occurred_at: record.occurred_at,
                 })
                 .collect(),
         })
@@ -460,6 +472,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use chrono::TimeZone as _;
     use lutum::{
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
@@ -575,7 +588,26 @@ mod tests {
             index: MemoryIndex::new(index),
             content: MemoryContent::new(content),
             rank: MemoryRank::Permanent,
+            occurred_at: None,
         }
+    }
+
+    fn memory_record_at(
+        index: &str,
+        content: &str,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryRecord {
+        MemoryRecord {
+            index: MemoryIndex::new(index),
+            content: MemoryContent::new(content),
+            rank: MemoryRank::Permanent,
+            occurred_at: Some(occurred_at),
+        }
+    }
+
+    fn test_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone as _;
+        chrono::Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap()
     }
 
     fn test_caps(
@@ -658,6 +690,7 @@ mod tests {
             &catalog,
             &identity_memories,
             runtime.session_compaction_lutum(),
+            test_now(),
         );
         module.activate(&cx, &batch).await.expect("query activated");
     }
@@ -698,9 +731,35 @@ mod tests {
                 hits: vec![QueryVectorMemoHit {
                     index: MemoryIndex::new("mem-1"),
                     rank: MemoryRank::Permanent,
+                    occurred_at: None,
                 }],
             }
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_vector_memo_renders_memory_occurred_at() {
+        let blackboard = Blackboard::default();
+        let store = Arc::new(MutableMemoryStore::default());
+        let occurred_at = chrono::Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap();
+        store.set_records(vec![memory_record_at(
+            "mem-1",
+            "Koro approaches from the left.",
+            occurred_at,
+        )]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(tool_scenario("first"));
+        let caps = test_caps(blackboard.clone(), store.clone(), adapter);
+        let (runtime, mut module) = build_query_vector(&caps).await;
+
+        activate_query_with_question(&caps, &runtime, &mut module, "food bowl clue").await;
+
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+        assert!(logs[0].content.contains(
+            "<one-year-ago occurred-at=\"2025-05-10T00:00:00Z\">\nKoro approaches from the left.\n</one-year-ago>"
+        ));
+        let typed_logs = blackboard.typed_memo_logs::<QueryVectorMemo>(&owner).await;
+        assert_eq!(typed_logs[0].data().hits[0].occurred_at, Some(occurred_at));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -761,6 +820,7 @@ mod tests {
                 hits: vec![QueryVectorMemoHit {
                     index: MemoryIndex::new("mem-1"),
                     rank: MemoryRank::Permanent,
+                    occurred_at: None,
                 }],
             }
         );
@@ -814,6 +874,7 @@ mod tests {
                 hits: vec![QueryVectorMemoHit {
                     index: MemoryIndex::new("mem-2"),
                     rank: MemoryRank::Permanent,
+                    occurred_at: None,
                 }],
             }
         );

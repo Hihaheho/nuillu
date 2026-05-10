@@ -524,6 +524,7 @@ async fn activate_with_retries(
         catalog,
         identity_memories,
         runtime.session_compaction_lutum(),
+        runtime.clock().now(),
     );
     let mut retries = 0_u8;
     loop {
@@ -1182,6 +1183,7 @@ mod tests {
                         IdentityMemoryRecord {
                             index: MemoryIndex::new("identity-1"),
                             content: MemoryContent::new("The agent is named Nuillu."),
+                            occurred_at: None,
                         },
                     ]))
                     .await;

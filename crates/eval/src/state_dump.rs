@@ -146,6 +146,7 @@ pub struct MemoryEntryDump {
     pub index: String,
     pub content: Option<DumpText>,
     pub content_rank: Option<String>,
+    pub occurred_at: Option<String>,
     pub metadata: MemoryMetadataDump,
     pub missing_content: bool,
 }
@@ -154,6 +155,7 @@ pub struct MemoryEntryDump {
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemoryMetadataDump {
     pub rank: String,
+    pub occurred_at: Option<String>,
     pub decay_remaining_secs: i64,
     pub remember_tokens: u32,
     pub last_accessed: String,
@@ -235,8 +237,10 @@ mod tests {
                     index: "memory-1".to_string(),
                     content: Some(DumpText::new("remember this")),
                     content_rank: Some("permanent".to_string()),
+                    occurred_at: Some("2026-05-07T00:00:00Z".to_string()),
                     metadata: MemoryMetadataDump {
                         rank: "permanent".to_string(),
+                        occurred_at: Some("2026-05-07T00:00:00Z".to_string()),
                         decay_remaining_secs: 0,
                         remember_tokens: 1,
                         last_accessed: "2026-05-08T00:00:00Z".to_string(),

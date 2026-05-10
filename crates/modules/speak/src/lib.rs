@@ -606,6 +606,7 @@ impl SpeakGateModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
@@ -617,6 +618,7 @@ impl SpeakGateModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
@@ -1063,6 +1065,7 @@ impl SpeakModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.now(),
             )
         })
     }
