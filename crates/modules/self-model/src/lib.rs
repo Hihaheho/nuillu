@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    BlackboardReader, CognitionLogReader, LlmAccess, Memo, Module, SelfModelInbox, SelfModelRequest,
+    BlackboardReader, CognitionLogReader, LlmAccess, Memo, Module, SelfModelInbox,
+    SelfModelRequest, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 use nuillu_types::builtin;
 
@@ -18,6 +19,12 @@ raw hidden memories. Answer explicit self-model questions from this current self
 Write the memo as free-form prose. Preserve the current self-description and every explicit
 question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
+const COMPACTED_SELF_MODEL_SESSION_PREFIX: &str = "Compacted self-model session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the self-model module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve self-descriptions, self-model questions
+and answers, memo-log facts about the agent, attention-schema first-person cognition, uncertainty,
+and corrections. Do not invent facts. Return plain text only."#;
+
 pub struct SelfModelModule {
     owner: nuillu_module::ModuleId,
     requests: SelfModelInbox,
@@ -25,6 +32,8 @@ pub struct SelfModelModule {
     cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -44,6 +53,8 @@ impl SelfModelModule {
             cognition_log,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -61,18 +72,12 @@ impl SelfModelModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn answer_batch(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         requests: Vec<SelfModelRequest>,
     ) -> Result<()> {
-        let context = self
-            .blackboard
-            .read(|bb| {
-                serde_json::json!({
-                    "memos": bb.memos(),
-                })
-            })
-            .await;
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let cognition_context = self
             .cognition_log
             .snapshot()
@@ -82,29 +87,42 @@ impl SelfModelModule {
             .filter(|record| record.source.module == builtin::attention_schema())
             .cloned()
             .collect::<Vec<_>>();
-        let previous_self_model = self.memo.read().await.unwrap_or_default();
         let questions = requests
             .into_iter()
             .map(|request| request.question)
             .collect::<Vec<_>>();
 
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_user(
             serde_json::json!({
                 "questions": questions,
-                "memo_context": context,
+            })
+            .to_string(),
+        );
+        self.session.push_ephemeral_user(
+            serde_json::json!({
                 "attention_schema_cognition_log": cognition_context,
-                "previous_self_model": previous_self_model,
             })
             .to_string(),
         );
 
-        let result = session
+        let result = self
+            .session
             .text_turn(&self.llm.lutum().await)
             .collect()
             .await
             .context("self-model text turn failed")?;
+        compact_session_if_needed(
+            &mut self.session,
+            result.usage.input_tokens,
+            cx.session_compaction_lutum(),
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_SELF_MODEL_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
         let memo = result.assistant_text();
         if !memo.trim().is_empty() {
             self.memo.write(memo).await;

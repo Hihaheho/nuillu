@@ -39,8 +39,8 @@ pub use runner::{
 pub use state_dump::{
     AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
     CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
-    FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
-    MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
+    FullAgentLastStateDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump, MemoryMetadataDump,
+    ModuleInstanceDump, ReplicaCapDump, StateDumpRenderError, UtteranceDump,
     render_full_agent_last_state_eure,
 };
 pub use trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json};

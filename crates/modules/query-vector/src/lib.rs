@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
-    QueryInbox, QueryRequest, VectorMemorySearcher,
+    QueryInbox, QueryRequest, SessionCompactionConfig, VectorMemorySearcher,
+    compact_session_if_needed, push_unread_memo_logs,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -24,6 +25,12 @@ generic searches or later follow-up turns.
 Do not answer questions, explain results, describe this module, or add any text from outside tool
 results. You must call search_vector_memory. The runtime memoizes only memory hit content returned
 by tools. Any final text is ignored; do not use a final answer as a data channel."#;
+
+const COMPACTED_QUERY_VECTOR_SESSION_PREFIX: &str = "Compacted query-vector session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-vector module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, vector
+search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
+future retrieval should remember. Do not invent facts. Return plain text only."#;
 
 #[lutum::tool_input(name = "search_vector_memory", output = SearchVectorMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +65,8 @@ pub struct QueryVectorModule {
     memory: VectorMemorySearcher,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -82,6 +91,8 @@ impl QueryVectorModule {
             memory,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -99,7 +110,7 @@ impl QueryVectorModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn handle_queries(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         requests: Vec<QueryRequest>,
     ) -> Result<()> {
@@ -115,7 +126,10 @@ impl QueryVectorModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_cognition_update(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate_cognition_update(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+    ) -> Result<()> {
         let question = self
             .blackboard
             .read(|bb| {
@@ -140,26 +154,32 @@ impl QueryVectorModule {
     }
 
     async fn search_with_memory(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
     ) -> Result<Vec<QueryVectorMemoryHit>> {
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let snapshot = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
                     "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_user(
             serde_json::json!({
                 "questions": questions,
+            })
+            .to_string(),
+        );
+        self.session.push_ephemeral_user(
+            serde_json::json!({
                 "blackboard": snapshot,
                 "allocation": allocation,
             })
@@ -167,7 +187,8 @@ impl QueryVectorModule {
         );
 
         let lutum = self.llm.lutum().await;
-        let outcome = session
+        let outcome = self
+            .session
             .text_turn(&lutum)
             .tools::<QueryVectorTools>()
             .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
@@ -177,22 +198,51 @@ impl QueryVectorModule {
             .context("query-vector text turn failed")?;
 
         match outcome {
-            TextStepOutcomeWithTools::Finished(_) => {
+            TextStepOutcomeWithTools::Finished(result) => {
+                compact_session_if_needed(
+                    &mut self.session,
+                    result.usage.input_tokens,
+                    cx.session_compaction_lutum(),
+                    self.session_compaction,
+                    Self::id(),
+                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
                 anyhow::bail!("query-vector completed without calling search_vector_memory");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
+                let input_tokens = round.usage.input_tokens;
                 if round.tool_calls.is_empty() {
                     anyhow::bail!("query-vector produced no valid search_vector_memory tool calls");
                 }
                 let mut all_hits = Vec::new();
+                let mut tool_results: Vec<ToolResult> = Vec::new();
                 for call in round.tool_calls.iter().cloned() {
                     let QueryVectorToolsCall::SearchVectorMemory(call) = call;
                     let output = self
                         .search_vector_memory(call.input.clone())
                         .await
                         .context("run search_vector_memory tool")?;
-                    all_hits.extend(output.hits);
+                    all_hits.extend(output.hits.clone());
+                    tool_results.push(
+                        call.complete(output)
+                            .context("complete search_vector_memory tool call")?,
+                    );
                 }
+                round
+                    .commit(&mut self.session, tool_results)
+                    .context("commit query-vector tool round")?;
+                compact_session_if_needed(
+                    &mut self.session,
+                    input_tokens,
+                    cx.session_compaction_lutum(),
+                    self.session_compaction,
+                    Self::id(),
+                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
                 Ok(all_hits)
             }
         }

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
+use nuillu_types::{MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, builtin};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
@@ -51,12 +51,6 @@ pub struct BlackboardInner {
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
     module_policies: HashMap<ModuleId, ModulePolicy>,
     allocation_limits: AllocationLimits,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoRecord {
-    pub owner: ModuleInstanceId,
-    pub memo: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -246,15 +240,6 @@ impl Blackboard {
         guard.append_memo(owner, memo, written_at)
     }
 
-    pub async fn memo(&self, id: &ModuleId) -> Option<String> {
-        self.read(|bb| bb.memo(id).map(String::from)).await
-    }
-
-    pub async fn memo_for_instance(&self, id: &ModuleInstanceId) -> Option<String> {
-        self.read(|bb| bb.memo_for_instance(id).map(String::from))
-            .await
-    }
-
     /// Register a one-shot notification for the next time `owner` is active.
     ///
     /// Returns `None` when the owner is already active in the current
@@ -369,55 +354,6 @@ impl Default for BlackboardInner {
 }
 
 impl BlackboardInner {
-    pub fn memo(&self, id: &ModuleId) -> Option<&str> {
-        if let Some((_, memo)) = self
-            .memos
-            .iter()
-            .filter_map(|(owner, records)| latest_memo_content(records).map(|memo| (owner, memo)))
-            .find(|(owner, _)| &owner.module == id && owner.replica == ReplicaIndex::ZERO)
-        {
-            return Some(memo);
-        }
-        let mut matching = self
-            .memos
-            .iter()
-            .filter(|(owner, records)| &owner.module == id && !records.is_empty())
-            .filter_map(|(_, records)| latest_memo_content(records));
-        let first = matching.next()?;
-        if matching.next().is_none() {
-            Some(first)
-        } else {
-            None
-        }
-    }
-
-    pub fn memo_for_instance(&self, id: &ModuleInstanceId) -> Option<&str> {
-        self.memos
-            .get(id)
-            .and_then(|records| latest_memo_content(records))
-    }
-
-    pub fn memo_records(&self) -> Vec<MemoRecord> {
-        let mut records = self
-            .memos
-            .iter()
-            .filter_map(|(owner, logs)| {
-                latest_memo_content(logs).map(|memo| MemoRecord {
-                    owner: owner.clone(),
-                    memo: memo.to_owned(),
-                })
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| {
-            a.owner
-                .module
-                .as_str()
-                .cmp(b.owner.module.as_str())
-                .then_with(|| a.owner.replica.cmp(&b.owner.replica))
-        });
-        records
-    }
-
     pub fn recent_memo_logs(&self) -> Vec<MemoLogRecord> {
         let mut records = self
             .memos
@@ -508,43 +444,6 @@ impl BlackboardInner {
         let mut object = serde_json::Map::new();
         for record in self.utterance_progress_records() {
             object.insert(record.owner.to_string(), serde_json::json!(record.progress));
-        }
-        serde_json::Value::Object(object)
-    }
-
-    pub fn memos(&self) -> serde_json::Value {
-        let mut grouped = std::collections::BTreeMap::<String, Vec<(u8, String)>>::new();
-        for (owner, records) in &self.memos {
-            let Some(memo) = latest_memo_content(records) else {
-                continue;
-            };
-            grouped
-                .entry(owner.module.as_str().to_owned())
-                .or_default()
-                .push((owner.replica.get(), memo.to_owned()));
-        }
-
-        let mut object = serde_json::Map::new();
-        for (module, mut entries) in grouped {
-            entries.sort_by_key(|(replica, _)| *replica);
-            if entries.len() == 1 {
-                object.insert(module, serde_json::Value::String(entries.remove(0).1));
-            } else {
-                object.insert(
-                    module,
-                    serde_json::Value::Array(
-                        entries
-                            .into_iter()
-                            .map(|(replica, memo)| {
-                                serde_json::json!({
-                                    "replica": replica,
-                                    "memo": memo,
-                                })
-                            })
-                            .collect(),
-                    ),
-                );
-            }
         }
         serde_json::Value::Object(object)
     }
@@ -849,10 +748,6 @@ impl BlackboardInner {
     }
 }
 
-fn latest_memo_content(records: &VecDeque<MemoLogRecord>) -> Option<&str> {
-    records.back().map(|record| record.content.as_str())
-}
-
 fn sort_memo_logs(records: &mut [MemoLogRecord]) {
     records.sort_by(|a, b| {
         a.owner
@@ -920,13 +815,23 @@ mod tests {
     async fn memo_round_trip() {
         let bb = Blackboard::new();
         let id = builtin::cognition_gate();
+        let owner = ModuleInstanceId::new(id, ReplicaIndex::ZERO);
         bb.apply(BlackboardCommand::UpdateMemo {
-            owner: ModuleInstanceId::new(id.clone(), ReplicaIndex::ZERO),
+            owner: owner.clone(),
             memo: "noted".into(),
             written_at: memo_time(0),
         })
         .await;
-        assert_eq!(bb.memo(&id).await.as_deref(), Some("noted"));
+        let logs = bb.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(
+            logs,
+            vec![MemoLogRecord {
+                owner,
+                index: 0,
+                written_at: memo_time(0),
+                content: "noted".into(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -983,7 +888,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "second"), (2, "third")]
         );
-        assert_eq!(bb.memo(&builtin::sensory()).await.as_deref(), Some("third"));
     }
 
     #[tokio::test]

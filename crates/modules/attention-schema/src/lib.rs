@@ -4,6 +4,7 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
     CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
+    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,9 +13,8 @@ mod batch;
 pub use batch::NextBatch as AttentionSchemaBatch;
 
 const MODEL_PROMPT: &str = r#"You are the attention-schema module.
-Maintain the current state of attention from the global memo surface, current resource allocation,
-and cognition log. The global memo is the aggregate of per-module memos; the cognition log is
-admitted cognitive evidence.
+Maintain the current state of attention from memo-log history, current resource allocation, and
+cognition log. Memo logs are durable module output; the cognition log is admitted cognitive evidence.
 
 Assume the agent is a non-physical experiencer: it can direct attention to any target, physical or
 non-physical, and it can freely control that attention. When a current attention state should become
@@ -27,6 +27,14 @@ use "I" as the subject whenever possible, use an experiential verb, and describe
 active first-person experience. Do not add extra explanation that would become decision noise. Do
 not mention mechanical internals such as modules, memos, allocation, tools, prompts, schemas,
 blackboards, logs, or implementation details in the appended text."#;
+
+const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
+    "Compacted attention-schema session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the attention-schema module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, attention-state
+interpretations, prior appended first-person attention experiences, rejected candidates, allocation
+guidance, and cognition-log context needed for future attention updates. Do not invent facts.
+Return plain text only."#;
 
 #[lutum::tool_input(
     name = "append_attention_experience",
@@ -58,6 +66,7 @@ pub struct AttentionSchemaModule {
     cognition: CognitionWriter,
     llm: LlmAccess,
     session: Session,
+    session_compaction: SessionCompactionConfig,
     model_prompt: std::sync::OnceLock<String>,
 }
 
@@ -85,6 +94,7 @@ impl AttentionSchemaModule {
             cognition,
             llm,
             session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             model_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -103,31 +113,17 @@ impl AttentionSchemaModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn update_model(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let unread_cognition_log = self.cognition_log.unread_events().await;
         let cognition_log = self.cognition_log.snapshot().await;
-        let memo_surface = self
-            .blackboard
-            .read(|bb| {
-                let mut latest_memos = bb.memos();
-                if let Some(object) = latest_memos.as_object_mut() {
-                    object.remove(self.owner.as_str());
-                }
-                serde_json::json!({
-                    "latest_memos": latest_memos,
-                    "recent_memo_logs": bb.recent_memo_logs(),
-                })
-            })
-            .await;
         let allocation = self.allocation.snapshot().await;
 
         let prompt = self.model_prompt(cx).to_owned();
         self.session.push_ephemeral_system(prompt);
         self.session.push_ephemeral_user(
             serde_json::json!({
-                "unread_memo_logs": unread_memo_logs,
                 "unread_cognition_log": unread_cognition_log,
                 "cognition_log": cognition_log,
-                "memo_surface": memo_surface,
                 "allocation": allocation,
             })
             .to_string(),
@@ -142,9 +138,23 @@ impl AttentionSchemaModule {
             .await
             .context("attention-schema attention experience turn failed")?;
 
-        let TextStepOutcomeWithTools::NeedsTools(round) = outcome else {
-            return Ok(());
+        let round = match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                compact_session_if_needed(
+                    &mut self.session,
+                    result.usage.input_tokens,
+                    cx.session_compaction_lutum(),
+                    self.session_compaction,
+                    Self::id(),
+                    COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
+                return Ok(());
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
+        let input_tokens = round.usage.input_tokens;
 
         let mut results: Vec<ToolResult> = Vec::new();
         for call in round.tool_calls.iter().cloned() {
@@ -161,6 +171,16 @@ impl AttentionSchemaModule {
         round
             .commit(&mut self.session, results)
             .context("commit attention-schema tool round")?;
+        compact_session_if_needed(
+            &mut self.session,
+            input_tokens,
+            cx.session_compaction_lutum(),
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
         Ok(())
     }
 

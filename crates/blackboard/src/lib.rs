@@ -36,6 +36,6 @@ pub use cognition_log::{
 pub use command::BlackboardCommand;
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
 pub use state::{
-    Blackboard, BlackboardInner, MemoLogRecord, MemoRecord, ModuleRunStatus, ModuleRunStatusRecord,
+    Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord,
     UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
 };

@@ -13,7 +13,7 @@ use nuillu_module::{
     LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader, QueryMailbox, QueryRequest,
     SceneReader, SelfModelMailbox, SelfModelRequest, SensoryDetailRequest,
     SensoryDetailRequestMailbox, SpeakInbox, SpeakMailbox, SpeakRequest, UtteranceProgress,
-    UtteranceProgressState, UtteranceWriter,
+    UtteranceProgressState, UtteranceWriter, push_unread_memo_logs,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -197,7 +197,6 @@ struct QueryMemoryArgs {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct QueryMemoryOutput {
-    latest_memo: Option<String>,
     requested: bool,
     duplicate: bool,
 }
@@ -210,7 +209,6 @@ struct QuerySelfModelArgs {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct QuerySelfModelOutput {
-    latest_memo: Option<String>,
     requested: bool,
     duplicate: bool,
 }
@@ -223,7 +221,6 @@ struct QuerySensoryDetailArgs {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct QuerySensoryDetailOutput {
-    latest_memo: Option<String>,
     requested: bool,
     duplicate: bool,
 }
@@ -579,6 +576,8 @@ impl SpeakGateModule {
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_cognition = self.cognition_log.unread_events().await;
         push_cognition_history(&mut self.session, &unread_cognition);
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let cognition_snapshot = self.cognition_log.snapshot().await;
         let cognition_context_json = serde_json::json!({
             "agentic_deadlock_marker": cognition_snapshot.agentic_deadlock_marker(),
@@ -590,7 +589,6 @@ impl SpeakGateModule {
             .read(|bb| {
                 (
                     serde_json::json!({
-                        "memos": bb.memos(),
                         "memory_metadata": bb.memory_metadata(),
                         "utterance_progresses": bb.utterance_progresses(),
                     }),
@@ -785,7 +783,6 @@ impl SpeakGateModule {
                 .is_ok()
         };
         Ok(QueryMemoryOutput {
-            latest_memo: self.latest_module_memo(&builtin::query_vector()).await,
             requested,
             duplicate,
         })
@@ -798,7 +795,6 @@ impl SpeakGateModule {
     ) -> Result<QuerySelfModelOutput> {
         let question = args.question.trim().to_owned();
         let duplicate = !requested_questions.insert(question.clone());
-        let before = self.latest_module_memo(&builtin::self_model()).await;
         let requested = if duplicate {
             false
         } else {
@@ -808,7 +804,6 @@ impl SpeakGateModule {
                 .is_ok()
         };
         Ok(QuerySelfModelOutput {
-            latest_memo: before,
             requested,
             duplicate,
         })
@@ -821,7 +816,6 @@ impl SpeakGateModule {
     ) -> Result<QuerySensoryDetailOutput> {
         let question = args.question.trim().to_owned();
         let duplicate = !requested_questions.insert(question.clone());
-        let before = self.latest_module_memo(&builtin::sensory()).await;
         let requested = if duplicate {
             false
         } else {
@@ -831,14 +825,9 @@ impl SpeakGateModule {
                 .is_ok()
         };
         Ok(QuerySensoryDetailOutput {
-            latest_memo: before,
             requested,
             duplicate,
         })
-    }
-
-    async fn latest_module_memo(&self, module: &ModuleId) -> Option<String> {
-        self.blackboard.latest_memo_for_module(module).await
     }
 }
 
@@ -1294,9 +1283,6 @@ mod tests {
         query_inbox: QueryInbox,
         self_model_inbox: SelfModelInbox,
         sensory_detail_inbox: SensoryDetailRequestInbox,
-        query_memo: Memo,
-        self_model_memo: Memo,
-        sensory_memo: Memo,
     }
 
     async fn gate_tool_fixture() -> GateToolFixture {
@@ -1311,17 +1297,11 @@ mod tests {
         let query_inbox_cell = Rc::new(RefCell::new(None));
         let self_model_inbox_cell = Rc::new(RefCell::new(None));
         let sensory_detail_inbox_cell = Rc::new(RefCell::new(None));
-        let query_memo_cell = Rc::new(RefCell::new(None));
-        let self_model_memo_cell = Rc::new(RefCell::new(None));
-        let sensory_memo_cell = Rc::new(RefCell::new(None));
 
         let gate_sink = Rc::clone(&gate_cell);
         let query_inbox_sink = Rc::clone(&query_inbox_cell);
-        let query_memo_sink = Rc::clone(&query_memo_cell);
         let self_model_inbox_sink = Rc::clone(&self_model_inbox_cell);
-        let self_model_memo_sink = Rc::clone(&self_model_memo_cell);
         let sensory_detail_inbox_sink = Rc::clone(&sensory_detail_inbox_cell);
-        let sensory_memo_sink = Rc::clone(&sensory_memo_cell);
 
         let _modules = ModuleRegistry::new()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
@@ -1343,19 +1323,16 @@ mod tests {
             .unwrap()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *query_inbox_sink.borrow_mut() = Some(caps.query_inbox());
-                *query_memo_sink.borrow_mut() = Some(caps.memo());
                 QueryVectorStub
             })
             .unwrap()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *self_model_inbox_sink.borrow_mut() = Some(caps.self_model_inbox());
-                *self_model_memo_sink.borrow_mut() = Some(caps.memo());
                 SelfModelStub
             })
             .unwrap()
             .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
                 *sensory_detail_inbox_sink.borrow_mut() = Some(caps.sensory_detail_inbox());
-                *sensory_memo_sink.borrow_mut() = Some(caps.memo());
                 SensoryStub
             })
             .unwrap()
@@ -1369,9 +1346,6 @@ mod tests {
             query_inbox: query_inbox_cell.borrow_mut().take().unwrap(),
             self_model_inbox: self_model_inbox_cell.borrow_mut().take().unwrap(),
             sensory_detail_inbox: sensory_detail_inbox_cell.borrow_mut().take().unwrap(),
-            query_memo: query_memo_cell.borrow_mut().take().unwrap(),
-            self_model_memo: self_model_memo_cell.borrow_mut().take().unwrap(),
-            sensory_memo: sensory_memo_cell.borrow_mut().take().unwrap(),
         }
     }
 
@@ -1900,14 +1874,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn evidence_tools_publish_requests_without_polling_and_return_current_memos() {
+    async fn evidence_tools_publish_requests_without_polling() {
         let mut fixture = gate_tool_fixture().await;
-        fixture.query_memo.write("cached memory fact").await;
-        fixture
-            .self_model_memo
-            .write("cached self-model fact")
-            .await;
-        fixture.sensory_memo.write("cached sensory detail").await;
 
         let mut memory_requests = HashSet::new();
         let memory_output = fixture
@@ -1921,10 +1889,6 @@ mod tests {
             .await
             .unwrap();
         let memory_request = fixture.query_inbox.next_item().await.unwrap();
-        assert_eq!(
-            memory_output.latest_memo.as_deref(),
-            Some("cached memory fact")
-        );
         assert!(memory_output.requested);
         assert!(!memory_output.duplicate);
         assert_eq!(memory_request.sender.module, builtin::speak_gate());
@@ -1940,10 +1904,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            duplicate_memory_output.latest_memo.as_deref(),
-            Some("cached memory fact")
-        );
         assert!(!duplicate_memory_output.requested);
         assert!(duplicate_memory_output.duplicate);
         assert!(
@@ -1967,10 +1927,6 @@ mod tests {
             .await
             .unwrap();
         let self_model_request = fixture.self_model_inbox.next_item().await.unwrap();
-        assert_eq!(
-            self_model_output.latest_memo.as_deref(),
-            Some("cached self-model fact")
-        );
         assert!(self_model_output.requested);
         assert!(!self_model_output.duplicate);
         assert_eq!(self_model_request.sender.module, builtin::speak_gate());
@@ -1988,10 +1944,6 @@ mod tests {
             .await
             .unwrap();
         let sensory_request = fixture.sensory_detail_inbox.next_item().await.unwrap();
-        assert_eq!(
-            sensory_output.latest_memo.as_deref(),
-            Some("cached sensory detail")
-        );
         assert!(sensory_output.requested);
         assert!(!sensory_output.duplicate);
         assert_eq!(sensory_request.sender.module, builtin::speak_gate());

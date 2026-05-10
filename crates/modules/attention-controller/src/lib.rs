@@ -6,7 +6,8 @@ use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, BlackboardReader, CognitionLogReader, LlmAccess, Memo,
-    MemoUpdatedInbox, Module,
+    MemoUpdatedInbox, Module, SessionCompactionConfig, compact_session_if_needed,
+    push_unread_memo_logs,
 };
 use nuillu_types::{ModelTier, ModuleId};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -29,6 +30,13 @@ action in its world, not a chat-style response gated on a user request — keep 
 fully active so the agent can address peers, answer questions directed at it, and express
 in-world intent. Suppressing speak/speak-gate is suppressing the agent's voice.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+
+const COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX: &str =
+    "Compacted attention-controller session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the attention-controller module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
+decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
+allocation decisions. Do not invent facts. Return plain text only."#;
 
 tokio::task_local! {
     static CONTROLLER_DECISION_SCHEMA: Schema;
@@ -77,6 +85,8 @@ pub struct AttentionControllerModule {
     allocation_writer: AllocationWriter,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -99,6 +109,8 @@ impl AttentionControllerModule {
             allocation_writer,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -115,54 +127,42 @@ impl AttentionControllerModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        Self::activate_with(
-            &self.cognition_log,
-            &self.blackboard,
-            &self.allocation_reader,
-            &self.allocation_writer,
-            &self.memo,
-            &self.llm,
-            self.system_prompt(cx),
-        )
-        .await
+    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.activate_with(&system_prompt, cx.session_compaction_lutum())
+            .await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    #[allow(clippy::too_many_arguments)]
     async fn activate_with(
-        cognition_log_reader: &CognitionLogReader,
-        blackboard_reader: &BlackboardReader,
-        allocation_reader: &AllocationReader,
-        allocation_writer: &AllocationWriter,
-        memo: &Memo,
-        llm: &LlmAccess,
+        &mut self,
         system_prompt: &str,
+        compaction_lutum: &lutum::Lutum,
     ) -> Result<()> {
-        let cognition_log = cognition_log_reader
-            .read(|log| log.entries().to_vec())
-            .await;
-        let blackboard = blackboard_reader
+        let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
+        let blackboard = self
+            .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
             .await;
-        let current = allocation_reader.snapshot().await;
-        let controller_schema = allocation_reader.controller_schema_json().await;
+        let current = self.allocation_reader.snapshot().await;
+        let controller_schema = self.allocation_reader.controller_schema_json().await;
         let output_schema =
             Schema::try_from(controller_schema.clone()).context("controller schema is invalid")?;
-        let registered = allocation_reader
+        let registered = self
+            .allocation_reader
             .registered_module_ids()
             .await
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
 
-        let mut session = Session::new();
-        session.push_system(system_prompt);
-        session.push_user(
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_ephemeral_user(
             controller_input(
                 serde_json::to_value(&cognition_log).context("serialize cognition log")?,
                 blackboard,
@@ -174,22 +174,33 @@ impl AttentionControllerModule {
 
         let result = CONTROLLER_DECISION_SCHEMA
             .scope(output_schema, async {
-                session
-                    .structured_turn::<AllocationDecision>(&llm.lutum().await)
+                self.session
+                    .structured_turn::<AllocationDecision>(&self.llm.lutum().await)
                     .collect()
                     .await
             })
             .await
             .context("attention-controller structured turn failed")?;
+        let input_tokens = result.usage.input_tokens;
 
         let StructuredTurnOutcome::Structured(decision) = result.semantic else {
             anyhow::bail!("attention-controller structured turn refused");
         };
+        compact_session_if_needed(
+            &mut self.session,
+            input_tokens,
+            compaction_lutum,
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
 
         let next = apply_decision(current, &registered, decision);
 
-        memo.write(next.memo.clone()).await;
-        allocation_writer.set(next.allocation).await;
+        self.memo.write(next.memo.clone()).await;
+        self.allocation_writer.set(next.allocation).await;
         Ok(())
     }
 }

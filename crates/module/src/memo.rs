@@ -7,13 +7,13 @@ use crate::ports::Clock;
 use crate::runtime_events::RuntimeEventEmitter;
 use crate::{MemoUpdated, MemoUpdatedMailbox};
 
-/// Read-write handle for the activating module's own memo slot.
+/// Write handle for the activating module's own memo log.
 ///
 /// The owner identity is stamped at construction time by
 /// [`ModuleCapabilityFactory`](crate::ModuleCapabilityFactory); the module cannot
-/// change it. A module that does not hold a `Memo` has no memo slot
-/// allocated on the blackboard at all (slot creation is lazy and only
-/// `Memo::write` ever inserts one).
+/// change it. A module that does not hold a `Memo` has no memo log allocated
+/// on the blackboard at all (queue creation is lazy and only `Memo::write`
+/// ever inserts one).
 #[derive(Clone)]
 pub struct Memo {
     owner: ModuleInstanceId,
@@ -62,11 +62,5 @@ impl Memo {
         {
             tracing::trace!("memo update had no active subscribers");
         }
-    }
-
-    /// Read the owner module's own memo, or `None` if it has never been
-    /// written.
-    pub async fn read(&self) -> Option<String> {
-        self.blackboard.memo_for_instance(&self.owner).await
     }
 }

@@ -2227,6 +2227,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "lutum",
+ "nuillu-agent",
+ "nuillu-blackboard",
  "nuillu-module",
  "nuillu-types",
  "schemars",

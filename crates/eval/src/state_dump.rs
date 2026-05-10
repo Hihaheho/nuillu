@@ -62,7 +62,6 @@ pub struct FullAgentLastStateCaseDump {
 #[derive(Debug, Clone, PartialEq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct BlackboardLastStateDump {
-    pub memos: Vec<MemoDump>,
     pub memo_logs: Vec<MemoLogDump>,
     pub cognition_logs: Vec<CognitionLogDump>,
     pub agentic_deadlock: Option<AgenticDeadlockDump>,
@@ -70,14 +69,6 @@ pub struct BlackboardLastStateDump {
     pub allocation: Vec<AllocationModuleDump>,
     pub allocation_proposals: Vec<AllocationProposalDump>,
     pub replica_caps: Vec<ReplicaCapDump>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct MemoDump {
-    pub module: String,
-    pub replica: u8,
-    pub memo: DumpText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
@@ -216,11 +207,6 @@ mod tests {
                 failure: None,
             },
             blackboard: BlackboardLastStateDump {
-                memos: vec![MemoDump {
-                    module: "sensory".to_string(),
-                    replica: 0,
-                    memo: DumpText::new("memo\nwith newline"),
-                }],
                 memo_logs: vec![MemoLogDump {
                     module: "sensory".to_string(),
                     replica: 0,

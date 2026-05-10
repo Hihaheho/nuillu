@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, MemoryRequest,
-    MemoryRequestInbox, MemoryWriter, Module,
+    MemoryRequestInbox, MemoryWriter, Module, SessionCompactionConfig, compact_session_if_needed,
+    push_unread_memo_logs,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
@@ -21,6 +22,11 @@ concrete information likely to matter later."#;
 
 const NORMAL_REQUEST_DECAY_SECS: i64 = 86_400;
 const HIGH_REQUEST_DECAY_SECS: i64 = 604_800;
+const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, memory requests,
+inserted memory content, rejected candidates, deduplication decisions, and relevant cognition-log
+context future memory decisions need. Do not invent facts. Return plain text only."#;
 
 #[lutum::tool_input(name = "insert_memory", output = InsertMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -48,6 +54,8 @@ pub struct MemoryModule {
     blackboard: BlackboardReader,
     memory: MemoryWriter,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -68,6 +76,8 @@ impl MemoryModule {
             blackboard,
             memory,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -85,18 +95,17 @@ impl MemoryModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         requests: Vec<MemoryRequest>,
         cognition_updated: bool,
     ) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let snapshot = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "latest_memos": bb.memos(),
-                    "recent_memo_logs": bb.recent_memo_logs(),
                     "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
@@ -104,14 +113,18 @@ impl MemoryModule {
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_user(
             serde_json::json!({
-                "blackboard": snapshot,
-                "unread_memo_logs": unread_memo_logs,
                 "memory_requests": requests,
                 "cognition_updated": cognition_updated,
+            })
+            .to_string(),
+        );
+        self.session.push_ephemeral_user(
+            serde_json::json!({
+                "blackboard": snapshot,
                 "allocation": allocation,
                 "request_policy": {
                     "normal_request_default_decay_secs": NORMAL_REQUEST_DECAY_SECS,
@@ -124,7 +137,8 @@ impl MemoryModule {
         );
 
         for _ in 0..4 {
-            let outcome = session
+            let outcome = self
+                .session
                 .text_turn(&self.llm.lutum().await)
                 .tools::<MemoryTools>()
                 .available_tools([MemoryToolsSelector::InsertMemory])
@@ -133,8 +147,21 @@ impl MemoryModule {
                 .context("memory text turn failed")?;
 
             match outcome {
-                TextStepOutcomeWithTools::Finished(_) => return Ok(()),
+                TextStepOutcomeWithTools::Finished(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_MEMORY_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(());
+                }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
+                    let input_tokens = round.usage.input_tokens;
                     let mut results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
                         let MemoryToolsCall::InsertMemory(call) = call;
@@ -148,8 +175,18 @@ impl MemoryModule {
                         results.push(result);
                     }
                     round
-                        .commit(&mut session, results)
+                        .commit(&mut self.session, results)
                         .context("commit memory tool round")?;
+                    compact_session_if_needed(
+                        &mut self.session,
+                        input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_MEMORY_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
                 }
             }
         }

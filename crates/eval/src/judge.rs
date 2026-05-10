@@ -244,14 +244,9 @@ fn render_judge_input_section(
                 &request.artifact,
                 &[
                     (
-                        "last_state.blackboard.memos",
-                        &["last_state", "blackboard", "memos"],
-                    ),
-                    (
                         "last_state.blackboard.memo_logs",
                         &["last_state", "blackboard", "memo_logs"],
                     ),
-                    ("agent.memos", &["agent", "memos"]),
                     ("agent.memo_logs", &["agent", "memo_logs"]),
                 ],
             ),
@@ -374,7 +369,6 @@ fn agent_blackboard_observation(artifact: &CaseArtifact) -> Option<serde_json::V
     let agent = observation_path(artifact, &["agent"])?.as_object()?;
     let mut map = serde_json::Map::new();
     for key in [
-        "memos",
         "memo_logs",
         "cognition_logs",
         "allocation",

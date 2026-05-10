@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
-    Module, QueryInbox, QueryRequest, ports::FileSearchQuery,
+    Module, QueryInbox, QueryRequest, SessionCompactionConfig, compact_session_if_needed,
+    ports::FileSearchQuery, push_unread_memo_logs,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,11 @@ results. You must call search_files before finishing. The runtime memoizes only 
 returned by tools. Any final text is ignored; do not use a final answer as a data channel."#;
 
 const MAX_QUERY_ROUNDS: usize = 4;
+const COMPACTED_QUERY_AGENTIC_SESSION_PREFIX: &str = "Compacted query-agentic session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-agentic module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests,
+allocation guidance, file-search arguments, useful file hits, and failed searches future retrieval
+should not repeat. Do not invent facts. Return plain text only."#;
 
 #[lutum::tool_input(name = "search_files", output = SearchFilesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -66,6 +72,8 @@ pub struct QueryAgenticModule {
     files: FileSearcher,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -89,6 +97,8 @@ impl QueryAgenticModule {
             files,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -106,7 +116,7 @@ impl QueryAgenticModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn handle_queries(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         requests: Vec<QueryRequest>,
     ) -> Result<()> {
@@ -122,7 +132,7 @@ impl QueryAgenticModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_guidance(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate_guidance(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation
             .iter()
@@ -143,26 +153,32 @@ impl QueryAgenticModule {
     }
 
     async fn search_with_files(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
     ) -> Result<Vec<QueryFileHit>> {
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let snapshot = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
                     "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_user(
             serde_json::json!({
                 "questions": questions,
+            })
+            .to_string(),
+        );
+        self.session.push_ephemeral_user(
+            serde_json::json!({
                 "blackboard": snapshot,
                 "allocation": allocation,
             })
@@ -172,7 +188,8 @@ impl QueryAgenticModule {
         let mut all_hits = Vec::new();
         for _ in 0..MAX_QUERY_ROUNDS {
             let lutum = self.llm.lutum().await;
-            let turn = session
+            let turn = self
+                .session
                 .text_turn(&lutum)
                 .tools::<QueryAgenticTools>()
                 .available_tools([QueryAgenticToolsSelector::SearchFiles]);
@@ -187,8 +204,21 @@ impl QueryAgenticModule {
                 .context("query-agentic text turn failed")?;
 
             match outcome {
-                TextStepOutcomeWithTools::Finished(_) => return Ok(all_hits),
+                TextStepOutcomeWithTools::Finished(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(all_hits);
+                }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
+                    let input_tokens = round.usage.input_tokens;
                     let mut tool_results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
                         let QueryAgenticToolsCall::SearchFiles(call) = call;
@@ -203,8 +233,18 @@ impl QueryAgenticModule {
                         tool_results.push(result);
                     }
                     round
-                        .commit(&mut session, tool_results)
+                        .commit(&mut self.session, tool_results)
                         .context("commit query-agentic tool round")?;
+                    compact_session_if_needed(
+                        &mut self.session,
+                        input_tokens,
+                        cx.session_compaction_lutum(),
+                        self.session_compaction,
+                        Self::id(),
+                        COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
                 }
             }
         }

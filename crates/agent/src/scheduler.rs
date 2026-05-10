@@ -1133,8 +1133,12 @@ mod tests {
 
                 blackboard
                     .read(|bb| {
-                        let echo_memo = bb.memo(&echo_id()).expect("echo memo missing");
-                        assert_eq!(echo_memo, "echoed ping");
+                        assert!(
+                            bb.recent_memo_logs().iter().any(|record| {
+                                record.owner.module == echo_id() && record.content == "echoed ping"
+                            }),
+                            "echo memo log missing"
+                        );
                         assert_eq!(
                             bb.cognition_log().len(),
                             0,
@@ -1770,10 +1774,11 @@ mod tests {
                 .expect("scheduler returned err");
 
                 assert_eq!(attempts.get(), 3);
-                assert_eq!(
-                    blackboard.memo(&retry_id).await.as_deref(),
-                    Some("attempt 3 handled stable-batch")
-                );
+                let retry_logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(retry_logs.iter().any(|record| {
+                    record.owner.module == retry_id
+                        && record.content == "attempt 3 handled stable-batch"
+                }));
             })
             .await;
     }
@@ -1900,10 +1905,11 @@ mod tests {
                         assert_eq!(bb.cognition_log().len(), 0);
                     })
                     .await;
-                assert_eq!(
-                    blackboard.memo(&observer_id).await.as_deref(),
-                    Some("observed deadlock marker")
-                );
+                let observer_logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(observer_logs.iter().any(|record| {
+                    record.owner.module == observer_id
+                        && record.content == "observed deadlock marker"
+                }));
             })
             .await;
     }

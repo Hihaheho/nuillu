@@ -296,8 +296,6 @@ impl CognitionGateModule {
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "latest_memos": bb.memos(),
-                    "recent_memo_logs": bb.recent_memo_logs(),
                     "cognition_log": bb.cognition_log().entries(),
                     "memory_metadata": bb.memory_metadata(),
                     "time_division": self.time_division.as_prompt_json(),
@@ -762,7 +760,7 @@ mod tests {
         );
 
         let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains("latest_memos"));
+        assert!(!rendered.contains("recent_memo_logs"));
         assert!(!rendered.contains("\"allocation\""));
     }
 }

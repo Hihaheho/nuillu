@@ -298,14 +298,6 @@ modules = ["sensory", "query-vector"]
     let artifact = CaseArtifact::new("final utterance").with_observation(
         "agent",
         serde_json::json!({
-            "memos": {
-                "query-vector": [
-                    { "replica": 0, "memo": "second query memo" }
-                ],
-                "sensory": [
-                    { "replica": 0, "memo": "sensory memo" }
-                ]
-            },
             "memo_logs": {
                 "query-vector": [
                     {
@@ -351,8 +343,13 @@ fn render_judge_input_includes_only_selected_sections() {
     let artifact = CaseArtifact::new("retrieved file content only").with_observation(
         "agent",
         serde_json::json!({
-            "memos": {
-                "query-agentic": ["runtime metadata"]
+            "memo_logs": {
+                "query-agentic": [{
+                    "replica": 0,
+                    "index": 0,
+                    "written_at": "2026-05-08T00:00:00Z",
+                    "content": "runtime metadata"
+                }]
             },
             "memory_metadata": {
                 "mem-1": { "rank": "permanent" }

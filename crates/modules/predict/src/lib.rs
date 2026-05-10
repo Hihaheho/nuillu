@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module,
+    Memo, Module, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
 };
 
 mod batch;
@@ -17,6 +17,12 @@ Write the memo as free-form prose. For each useful prediction, preserve the subj
 state, validity horizon, and rationale, but do not encode the memo as JSON, YAML, a code block, or
 any fixed schema."#;
 
+const COMPACTED_PREDICT_SESSION_PREFIX: &str = "Compacted predict session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the predict module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve prior predictions, their subjects,
+validity horizons, rationales, memo-log facts, and cognition-log context needed for future
+prediction updates. Do not invent facts. Return plain text only."#;
+
 pub struct PredictModule {
     owner: nuillu_module::ModuleId,
     updates: CognitionLogUpdatedInbox,
@@ -25,6 +31,8 @@ pub struct PredictModule {
     blackboard: BlackboardReader,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -46,6 +54,8 @@ impl PredictModule {
             blackboard,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -62,22 +72,23 @@ impl PredictModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let context = self
             .blackboard
             .read(|bb| {
                 serde_json::json!({
-                    "memos": bb.memos(),
                     "memory_metadata": bb.memory_metadata(),
                 })
             })
             .await;
         let allocation = self.allocation.snapshot().await;
 
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_ephemeral_user(
             serde_json::json!({
                 "cognition_log": cognition_log,
                 "blackboard_context": context,
@@ -86,11 +97,22 @@ impl PredictModule {
             .to_string(),
         );
 
-        let result = session
+        let result = self
+            .session
             .text_turn(&self.llm.lutum().await)
             .collect()
             .await
             .context("predict text turn failed")?;
+        compact_session_if_needed(
+            &mut self.session,
+            result.usage.input_tokens,
+            cx.session_compaction_lutum(),
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_PREDICT_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
         let memo = result.assistant_text();
         if !memo.trim().is_empty() {
             self.memo.write(memo).await;

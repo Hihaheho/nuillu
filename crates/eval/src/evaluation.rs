@@ -567,10 +567,6 @@ fn render_module_output(module: EvalModule, artifact: &CaseArtifact) -> String {
             .join("\n\n");
     }
 
-    if let Some(memo) = latest_module_memo_value(module, artifact) {
-        return memo;
-    }
-
     format!("(no memo logs for module {})", module.as_str())
 }
 
@@ -608,43 +604,6 @@ fn render_memo_log_value(log: &serde_json::Value) -> String {
     format!("replica={replica} index={index} written_at={written_at}\n{content}")
 }
 
-fn latest_module_memo_value(module: EvalModule, artifact: &CaseArtifact) -> Option<String> {
-    let memo = observation_path_value(&artifact.observations, &["agent", "memos", module.as_str()])
-        .or_else(|| {
-            observation_path_value(
-                &artifact.observations,
-                &["last_state", "blackboard", "memos"],
-            )
-            .and_then(|memos| {
-                memos.as_array().and_then(|memos| {
-                    memos
-                        .iter()
-                        .find(|memo| {
-                            value_field_text(memo, "module").as_deref() == Some(module.as_str())
-                        })
-                        .and_then(|memo| memo.get("memo"))
-                })
-            })
-        })?;
-
-    match memo {
-        serde_json::Value::String(value) => Some(value.clone()),
-        serde_json::Value::Array(values) => Some(
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .get("memo")
-                        .map(json_value_text)
-                        .unwrap_or_else(|| json_value_text(value))
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        ),
-        other => Some(json_value_text(other)),
-    }
-}
-
 fn scoped_agent_observation(
     module: EvalModule,
     artifact: &CaseArtifact,
@@ -654,11 +613,6 @@ fn scoped_agent_observation(
     scoped.insert(
         "module".to_string(),
         serde_json::Value::String(module.as_str().to_string()),
-    );
-    insert_if_some(
-        &mut scoped,
-        "memos",
-        filter_object_entry(agent.get("memos"), module.as_str()),
     );
     insert_if_some(
         &mut scoped,
@@ -729,11 +683,6 @@ fn scoped_last_state_blackboard(
     module: EvalModule,
 ) -> serde_json::Value {
     let mut scoped = serde_json::Map::new();
-    insert_if_some(
-        &mut scoped,
-        "memos",
-        filter_array_by_field(blackboard.get("memos"), "module", module.as_str()),
-    );
     insert_if_some(
         &mut scoped,
         "memo_logs",

@@ -58,7 +58,7 @@ use crate::{
     state_dump::{
         AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
         CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
-        FullAgentLastStateDump, MemoDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
+        FullAgentLastStateDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
         MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
         render_full_agent_last_state_eure,
     },
@@ -773,7 +773,9 @@ async fn execute_module_case(
                             .await
                             .is_empty()
                     }
-                    _ => blackboard.memo(&shutdown_target_module).await.is_some(),
+                    _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
+                        .await
+                        .is_some(),
                 };
                 if events.stop_requested() || target_done {
                     break;
@@ -789,9 +791,7 @@ async fn execute_module_case(
         ModuleEvalTarget::AttentionSchema => {
             attention_schema_cognition_output(&env.blackboard).await
         }
-        _ => env
-            .blackboard
-            .memo(&target_module)
+        _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
             .await
             .unwrap_or_default(),
     };
@@ -821,6 +821,26 @@ async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
                 .flat_map(|record| record.entries.iter().map(|entry| entry.text.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n\n")
+        })
+        .await
+}
+
+async fn last_memo_log_content_for_module(
+    blackboard: &Blackboard,
+    module: &ModuleId,
+) -> Option<String> {
+    blackboard
+        .read(|bb| {
+            bb.recent_memo_logs()
+                .into_iter()
+                .filter(|record| &record.owner.module == module)
+                .max_by(|a, b| {
+                    a.written_at
+                        .cmp(&b.written_at)
+                        .then_with(|| a.owner.replica.cmp(&b.owner.replica))
+                        .then_with(|| a.index.cmp(&b.index))
+                })
+                .map(|record| record.content)
         })
         .await
 }
@@ -1590,9 +1610,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
         | EvalModule::Predict => ModelTier::Cheap,
-        EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => {
-            ModelTier::Premium
-        }
+        EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
         EvalModule::AttentionController => ModelTier::Default,
         EvalModule::AttentionSchema | EvalModule::SelfModel | EvalModule::Surprise => {
             ModelTier::Default
@@ -1675,7 +1693,6 @@ fn write_full_agent_last_state_eure(
 fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
     let cognition_log_set = bb.cognition_log_set();
     BlackboardLastStateDump {
-        memos: memo_dumps(bb),
         memo_logs: memo_log_dumps(bb),
         cognition_logs: cognition_log_set
             .logs()
@@ -1703,17 +1720,6 @@ fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
         allocation_proposals: allocation_proposal_dumps(bb),
         replica_caps: replica_cap_dumps(bb),
     }
-}
-
-fn memo_dumps(bb: &BlackboardInner) -> Vec<MemoDump> {
-    bb.memo_records()
-        .into_iter()
-        .map(|record| MemoDump {
-            module: record.owner.module.as_str().to_owned(),
-            replica: record.owner.replica.get(),
-            memo: DumpText::new(record.memo),
-        })
-        .collect()
 }
 
 fn memo_log_dumps(bb: &BlackboardInner) -> Vec<MemoLogDump> {
@@ -1847,7 +1853,6 @@ fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentObservation {
-    memos: BTreeMap<String, Vec<ReplicaMemoObservation>>,
     memo_logs: BTreeMap<String, Vec<MemoLogObservation>>,
     cognition_logs: Vec<CognitionLogObservation>,
     allocation: BTreeMap<String, AllocationModuleObservation>,
@@ -1860,7 +1865,6 @@ struct AgentObservation {
 impl AgentObservation {
     fn from_blackboard(bb: &BlackboardInner, utterances: Vec<RecordedUtterance>) -> Self {
         Self {
-            memos: memo_observations(bb),
             memo_logs: memo_log_observations(bb),
             cognition_logs: cognition_log_observations(bb),
             allocation: allocation_observation(bb.allocation()),
@@ -1877,12 +1881,6 @@ struct AllocationModuleObservation {
     activation_ratio: ActivationRatio,
     guidance: String,
     tier: ModelTier,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReplicaMemoObservation {
-    replica: u8,
-    memo: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1911,20 +1909,6 @@ struct ActiveModuleObservation {
     active_replicas: u8,
     activation_ratio: ActivationRatio,
     tier: ModelTier,
-}
-
-fn memo_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<ReplicaMemoObservation>> {
-    let mut memos = BTreeMap::<String, Vec<ReplicaMemoObservation>>::new();
-    for record in bb.memo_records() {
-        memos
-            .entry(record.owner.module.as_str().to_owned())
-            .or_default()
-            .push(ReplicaMemoObservation {
-                replica: record.owner.replica.get(),
-                memo: record.memo,
-            });
-    }
-    memos
 }
 
 fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogObservation>> {
@@ -2978,12 +2962,6 @@ limits {{
             .await;
         let actual = serde_json::to_value(observation).unwrap();
         let expected = serde_json::json!({
-            "memos": {
-                "query-vector": [{
-                    "replica": 0,
-                    "memo": "memo",
-                }],
-            },
             "memo_logs": {
                 "query-vector": [{
                     "replica": 0,
@@ -3135,6 +3113,8 @@ prompt = "What am I attending to?"
                         "append-attention-2",
                         second_entry,
                     ))
+                    .with_text_scenario(attention_schema_no_tool_scenario())
+                    .with_text_scenario(attention_schema_no_tool_scenario())
                     .with_text_scenario(attention_schema_no_tool_scenario());
                 let caps = test_caps_with_adapter(blackboard.clone(), adapter);
                 let modules = ModuleRegistry::new()

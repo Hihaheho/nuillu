@@ -15,7 +15,7 @@ use nuillu_blackboard::{
     Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, MemoLogRecord,
     ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
-use nuillu_types::{ModuleId, ModuleInstanceId};
+use nuillu_types::ModuleInstanceId;
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
@@ -39,10 +39,6 @@ impl BlackboardReader {
     /// duration of `f`; do not await inside it.
     pub async fn read<R>(&self, f: impl FnOnce(&BlackboardInner) -> R) -> R {
         self.blackboard.read(f).await
-    }
-
-    pub async fn latest_memos(&self) -> serde_json::Value {
-        self.blackboard.read(|bb| bb.memos()).await
     }
 
     pub async fn recent_memo_logs(&self) -> Vec<MemoLogRecord> {
@@ -72,10 +68,6 @@ impl BlackboardReader {
             }
         }
         records
-    }
-
-    pub async fn latest_memo_for_module(&self, module: &ModuleId) -> Option<String> {
-        self.blackboard.memo(module).await
     }
 }
 

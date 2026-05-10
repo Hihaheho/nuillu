@@ -3,22 +3,27 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module,
+    Memo, MemoryImportance, MemoryRequest, MemoryRequestMailbox, Module, SessionCompactionConfig,
+    compact_session_if_needed, push_unread_memo_logs,
 };
-use nuillu_types::builtin;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
 
 const SYSTEM_PROMPT: &str = r#"You are the surprise module.
-Detect unexpected cognition-log entries. If a predict memo is present, frame the assessment as
-divergence from pending predictions. If no predict memo is present, judge novelty against recent
+Detect unexpected cognition-log entries. If predict memo log entries are present, frame the
+assessment as divergence from pending predictions. If no predict memo log is present, judge novelty against recent
 cognition-log history. Do not generate forward predictions. Request memory only when the event is
 significant enough to preserve. Return only raw JSON for the structured object; do not wrap it in
 Markdown or code fences."#;
 
 const RECENT_COGNITION_LOG_LIMIT: usize = 12;
+const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
+log facts, significant events, memory preservation requests, and cognition-log context needed for
+future surprise checks. Do not invent facts. Return plain text only."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SurpriseAssessment {
@@ -53,6 +58,8 @@ pub struct SurpriseModule {
     memory_requests: MemoryRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
+    session: Session,
+    session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -77,6 +84,8 @@ impl SurpriseModule {
             memory_requests,
             memo,
             llm,
+            session: Session::new(),
+            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -93,7 +102,7 @@ impl SurpriseModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let recent_cognition_log = self
             .cognition_log
             .read(|log| {
@@ -102,38 +111,41 @@ impl SurpriseModule {
                 entries[start..].to_vec()
             })
             .await;
-        let (predict_memo, memos) = self
-            .blackboard
-            .read(|bb| {
-                (
-                    bb.memo(&builtin::predict()).map(ToOwned::to_owned),
-                    bb.memos().clone(),
-                )
-            })
-            .await;
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
         let allocation = self.allocation.snapshot().await;
 
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_ephemeral_system(system_prompt);
+        self.session.push_ephemeral_user(
             serde_json::json!({
                 "recent_cognition_log": recent_cognition_log,
-                "predict_memo": predict_memo,
-                "memos": memos,
                 "allocation": allocation,
             })
             .to_string(),
         );
 
-        let result = session
+        let result = self
+            .session
             .structured_turn::<SurpriseAssessment>(&self.llm.lutum().await)
             .collect()
             .await
             .context("surprise structured turn failed")?;
+        let input_tokens = result.usage.input_tokens;
 
         let StructuredTurnOutcome::Structured(assessment) = result.semantic else {
             anyhow::bail!("surprise structured turn refused");
         };
+        compact_session_if_needed(
+            &mut self.session,
+            input_tokens,
+            cx.session_compaction_lutum(),
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_SURPRISE_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
 
         if assessment.significant
             && let Some(request) = &assessment.memory_request
