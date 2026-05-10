@@ -26,3 +26,4 @@ logs/
 node_modules/
 dist/
 .tmp/
+*.local.*
