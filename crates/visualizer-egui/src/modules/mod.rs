@@ -12,12 +12,14 @@ pub mod speak;
 pub mod surprise;
 
 use std::collections::BTreeMap;
+use std::hash::Hash;
 
 use egui_hooks::UseHookExt as _;
 use nuillu_module::RuntimeEvent;
 
 use crate::{
-    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, text::wrapped_label,
+    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView,
+    text::{hard_wrap_long_segments, wrapped_label},
 };
 
 #[derive(Debug, Default)]
@@ -306,18 +308,18 @@ fn render_active_turn(ui: &mut egui::Ui, module: &ModuleState, turn: &LlmTurnSta
         .id_salt(id)
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for item in &turn.input {
-                render_input_item(ui, item);
+            for (index, item) in turn.input.iter().enumerate() {
+                render_input_item(ui, item, &turn.turn_id, index);
                 ui.add_space(6.0);
             }
-            for item in &turn.output {
-                render_output_item(ui, item);
+            for (index, item) in turn.output.iter().enumerate() {
+                render_output_item(ui, item, &turn.turn_id, index);
                 ui.add_space(6.0);
             }
         });
 }
 
-fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView) {
+fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView, turn_id: &str, index: usize) {
     egui::Frame::new()
         .fill(ui.visuals().extreme_bg_color)
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -335,11 +337,11 @@ fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView) {
                 }
             });
             ui.add_space(3.0);
-            wrapped_label(ui, &item.content);
+            render_input_item_content(ui, item, turn_id, index);
         });
 }
 
-fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState) {
+fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState, turn_id: &str, index: usize) {
     egui::Frame::new()
         .fill(ui.visuals().selection.bg_fill.linear_multiply(0.45))
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -357,8 +359,151 @@ fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState) {
                 }
             });
             ui.add_space(3.0);
-            wrapped_label(ui, &item.content);
+            render_output_item_content(ui, item, turn_id, index);
         });
+}
+
+fn render_input_item_content(
+    ui: &mut egui::Ui,
+    item: &LlmInputItemView,
+    turn_id: &str,
+    index: usize,
+) {
+    match item.kind.as_str() {
+        "tool_call" => {
+            if !render_json_block(
+                ui,
+                (
+                    "input-json",
+                    turn_id,
+                    index,
+                    item.kind.as_str(),
+                    item.source.as_deref(),
+                ),
+                "tool input JSON",
+                &item.content,
+            ) {
+                wrapped_label(ui, &item.content);
+            }
+        }
+        "tool_result" => {
+            if let Some((arguments, result)) = split_tool_result_content(&item.content) {
+                render_json_or_raw_tool_part(
+                    ui,
+                    (
+                        "input-tool-result-arguments",
+                        turn_id,
+                        index,
+                        item.source.as_deref(),
+                    ),
+                    "tool input JSON",
+                    "arguments",
+                    arguments,
+                );
+                ui.add_space(4.0);
+                render_json_or_raw_tool_part(
+                    ui,
+                    (
+                        "input-tool-result-output",
+                        turn_id,
+                        index,
+                        item.source.as_deref(),
+                    ),
+                    "tool output JSON",
+                    "result",
+                    result,
+                );
+            } else {
+                wrapped_label(ui, &item.content);
+            }
+        }
+        _ => wrapped_label(ui, &item.content),
+    }
+}
+
+fn render_output_item_content(
+    ui: &mut egui::Ui,
+    item: &LlmOutputItemState,
+    turn_id: &str,
+    index: usize,
+) {
+    let json_label = match item.kind.as_str() {
+        "structured" | "structured_ready" => Some("structured JSON"),
+        "tool_call_ready" => Some("tool input JSON"),
+        _ => None,
+    };
+    if let Some(label) = json_label
+        && render_json_block(
+            ui,
+            (
+                "output-json",
+                turn_id,
+                index,
+                item.kind.as_str(),
+                item.source.as_deref(),
+            ),
+            label,
+            &item.content,
+        )
+    {
+        return;
+    }
+    wrapped_label(ui, &item.content);
+}
+
+fn render_json_or_raw_tool_part(
+    ui: &mut egui::Ui,
+    id_salt: impl Hash,
+    json_label: &str,
+    raw_label: &str,
+    content: &str,
+) {
+    if render_json_block(ui, id_salt, json_label, content) {
+        return;
+    }
+    wrapped_label(ui, &format!("{raw_label}:\n{content}"));
+}
+
+fn render_json_block(ui: &mut egui::Ui, id_salt: impl Hash, label: &str, content: &str) -> bool {
+    let Some(json) = format_json_for_display(content) else {
+        return false;
+    };
+    egui::CollapsingHeader::new(format!("{label}: {}", json_preview(&json.compact)))
+        .default_open(false)
+        .id_salt(id_salt)
+        .show(ui, |ui| {
+            let display = hard_wrap_long_segments(&json.pretty, 120);
+            ui.add(egui::Label::new(egui::RichText::new(display).monospace()).wrap());
+        });
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonDisplay {
+    pretty: String,
+    compact: String,
+}
+
+fn format_json_for_display(content: &str) -> Option<JsonDisplay> {
+    let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let pretty = serde_json::to_string_pretty(&value).ok()?;
+    let compact = serde_json::to_string(&value).ok()?;
+    Some(JsonDisplay { pretty, compact })
+}
+
+fn json_preview(compact: &str) -> String {
+    const LIMIT: usize = 96;
+    if compact.chars().count() <= LIMIT {
+        return compact.to_string();
+    }
+    let mut preview: String = compact.chars().take(LIMIT).collect();
+    preview.push_str("...");
+    preview
+}
+
+fn split_tool_result_content(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix("arguments:\n")?;
+    rest.split_once("\nresult:\n")
 }
 
 fn turn_list_label(index: usize, turn: &LlmTurnState) -> String {
@@ -645,6 +790,34 @@ mod tests {
                 streaming: false,
                 source: None,
             }]
+        );
+    }
+
+    #[test]
+    fn json_display_prettifies_valid_json() {
+        let display = format_json_for_display("{\"answer\":true}").expect("valid json");
+
+        assert_eq!(
+            display,
+            JsonDisplay {
+                pretty: "{\n  \"answer\": true\n}".to_string(),
+                compact: "{\"answer\":true}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn json_display_rejects_invalid_json() {
+        assert_eq!(format_json_for_display("{\"answer\":"), None);
+    }
+
+    #[test]
+    fn tool_result_content_splits_arguments_and_result() {
+        let content = "arguments:\n{\"query\":\"koro\"}\nresult:\n{\"matches\":[]}";
+
+        assert_eq!(
+            split_tool_result_content(content),
+            Some(("{\"query\":\"koro\"}", "{\"matches\":[]}"))
         );
     }
 }
