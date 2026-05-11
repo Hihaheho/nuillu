@@ -360,6 +360,18 @@ impl eframe::App for VisualizerApp {
                         self.state.selected = Some(tab.id.clone());
                     }
                 }
+                let view_tab_id = self
+                    .state
+                    .selected
+                    .clone()
+                    .or_else(|| self.state.tabs.keys().next().cloned());
+                if let Some(tab_id) = view_tab_id {
+                    if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
+                        tab.view_menu(ui);
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("View"));
+                }
                 if self.start_suite_from_ui {
                     let label = if self.state.suite_start_requested {
                         "Eval started"
@@ -526,7 +538,6 @@ impl RuntimeTab {
             ui.heading(format!("{} {}", self.status.icon(), self.title));
             ui.label(format!("runtime events: {}", self.runtime_events.len()));
             ui.label(format!("modules: {}", self.modules.iter().count()));
-            self.view_menu(ui);
         });
 
         self.windows_ui(ui, commands);
