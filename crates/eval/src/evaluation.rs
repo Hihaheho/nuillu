@@ -70,6 +70,7 @@ pub struct SuiteRunReport {
     pub max_concurrent_llm_calls: Option<usize>,
     pub planned_case_count: usize,
     pub models: SuiteModelNames,
+    pub disabled_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

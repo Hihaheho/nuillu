@@ -422,6 +422,13 @@ impl AgentRuntimeControl {
             .await
     }
 
+    pub async fn activation_waiter(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.blackboard.activation_waiter(owner.clone()).await
+    }
+
     pub async fn record_module_batch_throttled(
         &self,
         owner: ModuleInstanceId,

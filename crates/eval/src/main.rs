@@ -3,9 +3,9 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use anyhow::Context as _;
 use clap::Parser;
 use nuillu_eval::{
-    LlmBackendConfig, ModelSet, ModelSetRole, ReasoningEffort, RunnerConfig, default_run_id,
-    gui::run_suite_with_visualizer, install_lutum_trace_subscriber, parse_model_set_file,
-    run_suite,
+    EvalModule, LlmBackendConfig, ModelSet, ModelSetRole, ReasoningEffort, RunnerConfig,
+    default_run_id, gui::run_suite_with_visualizer, install_lutum_trace_subscriber,
+    parse_model_set_file, run_suite,
 };
 use tokio::runtime::Builder;
 
@@ -83,6 +83,12 @@ struct Args {
     #[arg(long)]
     gui: bool,
 
+    /// Modules to drop from the full-agent wiring (repeatable). Useful for
+    /// isolating module-level effects, e.g. `--disable-module speak-gate`.
+    /// Required modules (attention-controller, sensory, speak) cannot be disabled.
+    #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
+    disable_module: Vec<EvalModule>,
+
     /// Optional case id/path substring patterns. When present, only matching cases run.
     #[arg(value_name = "PATTERN")]
     patterns: Vec<String>,
@@ -133,6 +139,7 @@ fn main() -> anyhow::Result<()> {
         fail_fast: args.fail_fast,
         max_concurrent_llm_calls: args.max_concurrent_llm_calls,
         case_patterns: args.patterns,
+        disabled_modules: args.disable_module,
     };
 
     if args.gui {

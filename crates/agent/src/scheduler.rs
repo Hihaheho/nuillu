@@ -186,6 +186,7 @@ enum ModuleState {
         module: AllocatedModule,
         next_batch_throttle: Option<NextBatchThrottle>,
     },
+    WaitingForActivation,
     CoolingDown,
     Awaiting,
     PendingBatch {
@@ -234,6 +235,12 @@ enum TaskMessage {
         batch: ModuleBatch,
         pending_kicks: Vec<Kick>,
         outcome: ActivationGateOutcome,
+    },
+    ActivationWaitReady {
+        index: usize,
+        module: AllocatedModule,
+        kick_inbox: KickInbox,
+        next_batch_throttle: Option<NextBatchThrottle>,
     },
 }
 
@@ -321,9 +328,32 @@ async fn refresh_active_and_schedule(
                 }
             }
             ModuleState::Stored { .. } => {
-                if let Some(kick_inbox) = &mut kick_inboxes[index] {
-                    notify_pending_and_ready(Vec::new(), kick_inbox);
-                }
+                runtime
+                    .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
+                    .await;
+                let ModuleState::Stored {
+                    module,
+                    next_batch_throttle,
+                } = std::mem::replace(&mut states[index], ModuleState::WaitingForActivation)
+                else {
+                    unreachable!("module state changed while scheduling activation wait");
+                };
+                let kick_inbox = kick_inboxes[index]
+                    .take()
+                    .expect("kick inbox available for inactive stored module");
+                let activation_waiter = runtime.activation_waiter(&owners[index]).await;
+                spawn_activation_wait(
+                    tasks,
+                    index,
+                    module,
+                    kick_inbox,
+                    next_batch_throttle,
+                    activation_waiter,
+                    parent,
+                    subscriber,
+                );
+            }
+            ModuleState::WaitingForActivation => {
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
                     .await;
@@ -661,6 +691,19 @@ async fn handle_task_message(
             }
             Ok(())
         }
+        TaskMessage::ActivationWaitReady {
+            index,
+            module,
+            kick_inbox,
+            next_batch_throttle,
+        } => {
+            kick_inboxes[index] = Some(kick_inbox);
+            states[index] = ModuleState::Stored {
+                module,
+                next_batch_throttle,
+            };
+            Ok(())
+        }
     }
 }
 
@@ -754,7 +797,7 @@ fn collect_dependency_flush_completions(
                 pending_kicks.push(kick);
                 completions.push(completion);
             }
-            ModuleState::Stored { .. } => {}
+            ModuleState::Stored { .. } | ModuleState::WaitingForActivation => {}
         }
     }
     completions
@@ -864,6 +907,51 @@ impl ActivationScheduling {
             Self::PendingActivationGate => ModuleState::PendingActivationGate,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_activation_wait(
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    index: usize,
+    module: AllocatedModule,
+    mut kick_inbox: KickInbox,
+    next_batch_throttle: Option<NextBatchThrottle>,
+    activation_waiter: Option<tokio::sync::oneshot::Receiver<()>>,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) {
+    tasks.push(spawn_local(
+        async move {
+            let mut activation = pin!(async move {
+                if let Some(waiter) = activation_waiter {
+                    let _ = waiter.await;
+                }
+            });
+            let mut kick_inbox_closed = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut activation => break,
+                    maybe_kick = kick_inbox.next(), if !kick_inbox_closed => {
+                        if let Some(kick) = maybe_kick {
+                            kick.notify_finish();
+                        } else {
+                            kick_inbox_closed = true;
+                        }
+                    }
+                }
+            }
+            notify_pending_and_ready(Vec::new(), &mut kick_inbox);
+            TaskMessage::ActivationWaitReady {
+                index,
+                module,
+                kick_inbox,
+                next_batch_throttle,
+            }
+        }
+        .instrument(parent.clone())
+        .with_subscriber(subscriber.clone()),
+    ));
 }
 
 fn spawn_next_batch(
@@ -3117,6 +3205,79 @@ mod tests {
 
     // Inactive replicas keep state and queued inbox messages, but the scheduler
     // does not start semantic work for them until allocation makes them active.
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn inactive_stored_module_runs_queued_work_after_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = echo_id();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let (done_tx, mut done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async {
+                    mailbox
+                        .publish(AttentionControlRequest::query("later"))
+                        .await
+                        .expect("inactive replica zero should queue the request");
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_oneshot_pending(
+                        &mut done_rx,
+                        "inactive module should not process queued work before activation",
+                    );
+
+                    let mut raised = ResourceAllocation::default();
+                    raised.set(module_id.clone(), ModuleConfig::default());
+                    raised.set_activation(module_id.clone(), ActivationRatio::ONE);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(raised))
+                        .await;
+
+                    tokio::time::timeout(Duration::from_millis(100), &mut done_rx)
+                        .await
+                        .expect("activation should wake the stored module")
+                        .expect("done sender dropped");
+                })
+                .await
+                .expect("scheduler returned err");
+
+                let owner = nuillu_types::ModuleInstanceId::new(module_id, ReplicaIndex::ZERO);
+                let memos = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(
+                    memos.iter().any(|record| {
+                        record.owner == owner && record.content == "echoed later"
+                    })
+                );
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn kick_silent_timeout_noops_kick_without_canceling_dependency_next_batch() {

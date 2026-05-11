@@ -146,7 +146,7 @@ pub struct ModuleCase {
     pub scoring: CaseScoring,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromEure)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub enum EvalModule {
     Sensory,

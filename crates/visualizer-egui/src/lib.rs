@@ -375,16 +375,7 @@ impl eframe::App for VisualizerApp {
                     });
                 }
                 if self.start_suite_from_ui {
-                    let label = if self.state.suite_start_requested {
-                        "Eval started"
-                    } else {
-                        "Start Eval"
-                    };
-                    if ui
-                        .add_enabled(!self.state.suite_start_requested, egui::Button::new(label))
-                        .clicked()
-                    {
-                        self.state.suite_start_requested = true;
+                    if ui.button("Start Activation").clicked() {
                         let _ = self.commands.send(VisualizerCommand::StartSuite);
                     }
                 }
@@ -424,7 +415,6 @@ impl eframe::App for VisualizerApp {
 pub struct VisualizerState {
     tabs: BTreeMap<VisualizerTabId, RuntimeTab>,
     selected: Option<VisualizerTabId>,
-    suite_start_requested: bool,
 }
 
 impl VisualizerState {

@@ -11,7 +11,7 @@ use nuillu_module::{
     memory_rank_counts, push_ephemeral_mind_context, push_formatted_cognition_log_batch,
     push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
-use nuillu_types::ModuleId;
+use nuillu_types::{ModuleId, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +26,10 @@ Output shape: a `memo` (free-form controller note for the shared memo surface) p
 array. The array lists modules to activate in descending priority order, each entry pairing a
 `module_id` (must be a registered module) with a `hint` — one concise sentence saying why that
 module needs activation now. Modules you omit receive zero activation; their typed mailboxes still
-flow because each module keeps a minimum replica. Position in the array maps to the host-configured
-activation table; positions beyond the table fall to zero, so prioritise tightly. Do not invent
-module ids and do not duplicate ids.
+flow through inactive replica-zero queues. The attention-controller itself is preserved at its
+current activation so the control plane cannot disable itself. Position in the array maps to the
+host-configured activation table; positions beyond the table fall to zero, so prioritise tightly.
+Do not invent module ids and do not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
@@ -254,13 +255,20 @@ fn apply_decision(
     registered: &std::collections::HashSet<ModuleId>,
     decision: AllocationDecision,
 ) -> AppliedDecision {
+    let controller_id = builtin::attention_controller();
+    let controller_activation = current.activation_for(&controller_id);
     let mut next = current;
     let table = next.activation_table().to_vec();
 
     // Controller's baseline: zero out every registered module. Entries listed
     // in `priority` will overwrite below; everything else stays at 0.0 so the
-    // module relies on its replicas-min floor only.
+    // module stays detached until new evidence or guidance makes it useful.
+    // Keep this controller alive once the host has activated it; otherwise one
+    // omitted self-entry would stop future allocation decisions.
     for id in registered {
+        if id == &controller_id {
+            continue;
+        }
         next.set_activation(id.clone(), ActivationRatio::ZERO);
         let mut config: ModuleConfig = next.for_module(id);
         config.guidance.clear();
@@ -281,6 +289,11 @@ fn apply_decision(
         config.guidance = entry.hint;
         next.set(id.clone(), config);
         next.set_activation(id, ratio);
+    }
+    if registered.contains(&controller_id)
+        && next.activation_for(&controller_id) < controller_activation
+    {
+        next.set_activation(controller_id, controller_activation);
     }
 
     AppliedDecision {
@@ -652,6 +665,61 @@ mod tests {
             ActivationRatio::ZERO
         );
         // Cognition-gate was registered but absent from priority — zero.
+        assert_eq!(
+            applied
+                .allocation
+                .activation_for(&builtin::cognition_gate()),
+            ActivationRatio::ZERO
+        );
+    }
+
+    #[test]
+    fn apply_decision_preserves_active_controller_when_omitted() {
+        let mut registered = std::collections::HashSet::new();
+        registered.insert(builtin::attention_controller());
+        registered.insert(builtin::sensory());
+        registered.insert(builtin::cognition_gate());
+
+        let mut current = ResourceAllocation::default();
+        current.set_activation_table(vec![ActivationRatio::ONE]);
+        current.set_activation(builtin::attention_controller(), ActivationRatio::ONE);
+        current.set(
+            builtin::attention_controller(),
+            ModuleConfig {
+                guidance: "continue controlling allocation".into(),
+            },
+        );
+        current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
+
+        let applied = apply_decision(
+            current,
+            &registered,
+            AllocationDecision {
+                memo: "checked".into(),
+                priority: vec![PriorityEntry {
+                    module_id: "sensory".into(),
+                    hint: "inspect queued input".into(),
+                }],
+            },
+        );
+
+        assert_eq!(
+            applied
+                .allocation
+                .activation_for(&builtin::attention_controller()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(
+            applied
+                .allocation
+                .for_module(&builtin::attention_controller())
+                .guidance,
+            "continue controlling allocation"
+        );
+        assert_eq!(
+            applied.allocation.activation_for(&builtin::sensory()),
+            ActivationRatio::ONE
+        );
         assert_eq!(
             applied
                 .allocation

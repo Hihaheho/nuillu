@@ -109,7 +109,17 @@ pub struct RunnerConfig {
     pub fail_fast: bool,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
+    pub disabled_modules: Vec<EvalModule>,
 }
+
+/// Modules that may never be disabled via `RunnerConfig::disabled_modules` —
+/// removing them breaks the basic observe → cognize → speak pipeline that the
+/// full-agent eval cases assume.
+pub const REQUIRED_FULL_AGENT_MODULES: &[EvalModule] = &[
+    EvalModule::AttentionController,
+    EvalModule::Sensory,
+    EvalModule::Speak,
+];
 
 pub struct RunnerHooks {
     pub visualizer: Option<VisualizerHook>,
@@ -800,6 +810,8 @@ pub enum RunnerError {
     TraceSubscriber { message: String },
     #[error("case patterns matched no eval cases: {patterns}")]
     NoCasesMatched { patterns: String },
+    #[error("cannot disable required module '{module}'")]
+    DisableRequiredModule { module: &'static str },
 }
 
 struct CaseExecution {
@@ -844,6 +856,7 @@ pub async fn run_suite_with_hooks(
     hooks: &mut RunnerHooks,
 ) -> Result<SuiteReport, RunnerError> {
     install_lutum_trace_subscriber()?;
+    validate_disabled_modules(&config.disabled_modules)?;
     let mut case_paths =
         discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
             path: config.cases_root.clone(),
@@ -962,6 +975,11 @@ fn suite_run_report(
             default: config.default_backend.model.clone(),
             premium: config.premium_backend.model.clone(),
         },
+        disabled_modules: config
+            .disabled_modules
+            .iter()
+            .map(|module| module.as_str().to_string())
+            .collect(),
     }
 }
 
@@ -971,6 +989,7 @@ pub async fn run_case_detailed(
     judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseRunOutput, RunnerError> {
     install_lutum_trace_subscriber()?;
+    validate_disabled_modules(&config.disabled_modules)?;
     let run_dir = config.output_root.join(&config.run_id);
     std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
         path: run_dir.clone(),
@@ -1334,14 +1353,20 @@ async fn execute_full_agent_case(
     reporter: &LiveReporter,
     hooks: &mut RunnerHooks,
 ) -> Result<CaseExecution> {
-    let case_modules = full_agent_case_modules(case);
+    let case_modules = full_agent_case_modules(case, &config.disabled_modules);
+    let gui_deferred_start = hooks.visualizer.is_some();
     let case_now = parse_case_now(case.now.as_deref())
         .map_err(anyhow::Error::msg)
         .context("parse full-agent case now")?;
+    let allocation = if gui_deferred_start {
+        full_agent_gui_initial_allocation(&case.limits, &case_modules)
+    } else {
+        full_agent_allocation(&case.limits, &case_modules)
+    };
     let env = build_eval_environment(
         output_dir,
         config,
-        full_agent_allocation(&case.limits, &case_modules),
+        allocation,
         case.limits.max_llm_calls,
         action_module_ids(&case_modules),
         Arc::new(NoopFileSearchProvider),
@@ -1400,33 +1425,16 @@ async fn execute_full_agent_case(
                 visualizer.as_deref(),
             )
             .await;
-            let now = clock.now();
-            for input in inputs {
-                let body = match input {
-                    FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
-                        direction,
-                        content: content.content,
-                        observed_at: now,
-                    },
-                    FullAgentInput::Seen {
-                        direction,
-                        appearance,
-                    } => SensoryInput::Seen {
-                        direction,
-                        appearance: appearance.content,
-                        observed_at: now,
-                    },
-                };
-                sensory
-                    .publish(body.clone())
-                    .await
-                    .expect("full-agent eval failed to publish SensoryInput");
-                if let Some(visualizer) = visualizer.as_ref() {
-                    let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
-                        tab_id: VisualizerTabId::new(case_id_for_idle.clone()),
-                        input: body,
-                    });
-                }
+            let mut started = !gui_deferred_start;
+            if started {
+                publish_full_agent_inputs(
+                    &case_id_for_idle,
+                    &inputs,
+                    &sensory,
+                    clock.as_ref(),
+                    visualizer.as_deref(),
+                )
+                .await;
             }
 
             let mut last_event_count = events.event_count();
@@ -1447,7 +1455,7 @@ async fn execute_full_agent_case(
                     .emit_if_changed(&allocation_blackboard)
                     .await;
                 if let Some(visualizer) = visualizer.as_deref_mut() {
-                    if handle_visualizer_commands(
+                    let command_outcome = handle_visualizer_commands(
                         &case_id_for_idle,
                         visualizer,
                         Some(&sensory),
@@ -1455,9 +1463,21 @@ async fn execute_full_agent_case(
                         memory.as_ref(),
                         clock.as_ref(),
                     )
-                    .await
-                    {
+                    .await;
+                    if command_outcome.shutdown {
                         break;
+                    }
+                    if command_outcome.start_requested && !started {
+                        activate_gui_start_modules(&allocation_blackboard).await;
+                        publish_full_agent_inputs(
+                            &case_id_for_idle,
+                            &inputs,
+                            &sensory,
+                            clock.as_ref(),
+                            Some(visualizer),
+                        )
+                        .await;
+                        started = true;
                     }
                 }
                 emit_visualizer_blackboard_snapshot(
@@ -1466,6 +1486,9 @@ async fn execute_full_agent_case(
                     visualizer.as_deref(),
                 )
                 .await;
+                if !started {
+                    continue;
+                }
                 let event_count = events.event_count();
                 if event_count == last_event_count {
                     idle_ticks = idle_ticks.saturating_add(1);
@@ -1669,6 +1692,7 @@ async fn execute_module_case(
                         clock.as_ref(),
                     )
                     .await
+                    .shutdown
                     {
                         break;
                     }
@@ -1784,6 +1808,63 @@ async fn emit_visualizer_blackboard_snapshot(
     });
 }
 
+async fn activate_gui_start_modules(blackboard: &Blackboard) {
+    let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+    let controller_id = builtin::attention_controller();
+    let mut controller_config = allocation.for_module(&controller_id);
+    controller_config.guidance =
+        "GUI start: process the sensory input and allocate the next active faculties.".to_string();
+    allocation.set(controller_id.clone(), controller_config);
+    allocation.set_activation(controller_id, ActivationRatio::ONE);
+
+    let sensory_id = builtin::sensory();
+    let mut sensory_config = allocation.for_module(&sensory_id);
+    sensory_config.guidance = "GUI start: normalize the queued sensory input.".to_string();
+    allocation.set(sensory_id.clone(), sensory_config);
+    allocation.set_activation(sensory_id, ActivationRatio::ONE);
+
+    blackboard
+        .apply(BlackboardCommand::SetAllocation(allocation))
+        .await;
+}
+
+async fn publish_full_agent_inputs(
+    case_id: &str,
+    inputs: &[FullAgentInput],
+    sensory: &SensoryInputMailbox,
+    clock: &dyn Clock,
+    visualizer: Option<&VisualizerHook>,
+) {
+    let now = clock.now();
+    for input in inputs {
+        let body = match input {
+            FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
+                direction: direction.clone(),
+                content: content.content.clone(),
+                observed_at: now,
+            },
+            FullAgentInput::Seen {
+                direction,
+                appearance,
+            } => SensoryInput::Seen {
+                direction: direction.clone(),
+                appearance: appearance.content.clone(),
+                observed_at: now,
+            },
+        };
+        sensory
+            .publish(body.clone())
+            .await
+            .expect("full-agent eval failed to publish SensoryInput");
+        if let Some(visualizer) = visualizer {
+            let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
+                tab_id: VisualizerTabId::new(case_id.to_string()),
+                input: body,
+            });
+        }
+    }
+}
+
 async fn handle_visualizer_commands(
     case_id: &str,
     visualizer: &mut VisualizerHook,
@@ -1791,12 +1872,15 @@ async fn handle_visualizer_commands(
     blackboard: &Blackboard,
     memory: &dyn MemoryStore,
     clock: &dyn Clock,
-) -> bool {
-    let mut shutdown = false;
+) -> VisualizerCommandOutcome {
+    let mut outcome = VisualizerCommandOutcome::default();
     while let Ok(command) = visualizer.commands.try_recv() {
         match command {
             VisualizerCommand::Shutdown => {
-                shutdown = true;
+                outcome.shutdown = true;
+            }
+            VisualizerCommand::StartSuite => {
+                outcome.start_requested = true;
             }
             VisualizerCommand::SendSensoryInput { tab_id, input } if tab_id.as_str() == case_id => {
                 let Some(sensory) = sensory else {
@@ -1860,7 +1944,13 @@ async fn handle_visualizer_commands(
             _ => {}
         }
     }
-    shutdown
+    outcome
+}
+
+#[derive(Debug, Default)]
+struct VisualizerCommandOutcome {
+    shutdown: bool,
+    start_requested: bool,
 }
 
 async fn emit_visualizer_memory_page(
@@ -2355,10 +2445,26 @@ async fn configured_reasoning_effort(
         .map(|value| value.0)
 }
 
-fn full_agent_case_modules(case: &FullAgentCase) -> Vec<EvalModule> {
-    case.modules
+fn full_agent_case_modules(case: &FullAgentCase, disabled: &[EvalModule]) -> Vec<EvalModule> {
+    let mut modules = case
+        .modules
         .clone()
-        .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec())
+        .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec());
+    if !disabled.is_empty() {
+        modules.retain(|module| !disabled.contains(module));
+    }
+    modules
+}
+
+fn validate_disabled_modules(disabled: &[EvalModule]) -> Result<(), RunnerError> {
+    for module in disabled {
+        if REQUIRED_FULL_AGENT_MODULES.contains(module) {
+            return Err(RunnerError::DisableRequiredModule {
+                module: module.as_str(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
@@ -2409,7 +2515,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
         EvalModule::Sensory => registry
-            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2423,7 +2529,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Gates the speak path; must re-fire fast as memos accumulate so
         // the cognition log is current by the time speak-gate considers it.
         EvalModule::CognitionGate => registry
-            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_cognition_gate::CognitionGateModule::new(
                     caps.memo_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2439,7 +2545,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
-            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_attention_controller::AttentionControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.attention_control_inbox(),
@@ -2455,7 +2561,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Periodic first-person attention narration; not on the critical
         // path for the speak loop.
         EvalModule::AttentionSchema => registry
-            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.memo_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2470,7 +2576,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // On-demand: fires on controller allocation guidance.
         EvalModule::SelfModel => registry
-            .register(1..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_self_model::SelfModelModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2484,7 +2590,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
-            .register(1..=1, Bpm::range(6.0, 15.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 15.0), linear_ratio_fn, |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
@@ -2498,7 +2604,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
-            .register(1..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2511,7 +2617,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
-            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_memory::MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2524,7 +2630,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
-            .register(1..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
                 nuillu_memory_compaction::MemoryCompactionModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2536,7 +2642,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
-            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -2550,7 +2656,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Cognition-log triggered; should be quick enough to flag
         // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
-            .register(1..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
                 nuillu_surprise::SurpriseModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -2571,7 +2677,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.attention_control_mailbox(),
-                    caps.memo(),
+                    caps.typed_memo::<nuillu_speak::SpeakGateMemo>(),
                     caps.llm_access(),
                 )
             })
@@ -2605,7 +2711,7 @@ fn full_agent_allocation(
             EvalModule::Sensory => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
-                0.0,
+                1.0,
                 ModelTier::Cheap,
                 "Queued sensory input is waiting; activate when the controller is ready to process external observations.",
             ),
@@ -2694,6 +2800,17 @@ fn full_agent_allocation(
                 "Idle until cognition-log updates are allowed through speak-gate.",
             ),
         }
+    }
+    allocation
+}
+
+fn full_agent_gui_initial_allocation(
+    limits: &crate::cases::EvalLimits,
+    modules: &[EvalModule],
+) -> ResourceAllocation {
+    let mut allocation = full_agent_allocation(limits, modules);
+    for module in modules {
+        allocation.set_activation(module.module_id(), ActivationRatio::ZERO);
     }
     allocation
 }
@@ -4137,6 +4254,7 @@ prompt = "Second?"
             fail_fast: false,
             max_concurrent_llm_calls: None,
             case_patterns: vec!["special-memory".to_string()],
+            disabled_modules: Vec::new(),
         };
 
         let tabs = visualizer_planned_tabs(&config).unwrap();
@@ -4322,6 +4440,7 @@ limits {{
             fail_fast: false,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),
+            disabled_modules: Vec::new(),
         };
 
         let report = run_suite(&config).await.unwrap();
@@ -4371,7 +4490,8 @@ limits {{
                     "cheap": "cheap-model",
                     "default": "default-model",
                     "premium": "premium-model",
-                }
+                },
+                "disabled_modules": [],
             })
         );
         for summary in &report.cases {
@@ -4735,6 +4855,42 @@ prompt = "What am I attending to?"
             .await;
     }
 
+    #[test]
+    fn full_agent_case_modules_filters_disabled() {
+        let case = FullAgentCase {
+            id: Some("x".to_string()),
+            description: None,
+            now: None,
+            modules: Some(DEFAULT_FULL_AGENT_MODULES.to_vec()),
+            inputs: Vec::new(),
+            participants: Vec::new(),
+            memories: Vec::new(),
+            memos: Vec::new(),
+            limits: crate::cases::EvalLimits {
+                max_llm_calls: None,
+            },
+            checks: Vec::new(),
+            modules_checks: Vec::new(),
+            scoring: Default::default(),
+        };
+        let modules = full_agent_case_modules(&case, &[EvalModule::SpeakGate]);
+        assert!(!modules.contains(&EvalModule::SpeakGate));
+        assert!(modules.contains(&EvalModule::Speak));
+        assert!(modules.contains(&EvalModule::AttentionController));
+    }
+
+    #[test]
+    fn validate_disabled_modules_rejects_required_modules() {
+        for required in REQUIRED_FULL_AGENT_MODULES {
+            let err = validate_disabled_modules(std::slice::from_ref(required)).unwrap_err();
+            assert!(matches!(
+                err,
+                RunnerError::DisableRequiredModule { module } if module == required.as_str()
+            ));
+        }
+        assert!(validate_disabled_modules(&[EvalModule::SpeakGate]).is_ok());
+    }
+
     #[tokio::test]
     async fn eval_registry_and_allocation_include_only_selected_modules() {
         let selected = [
@@ -4785,7 +4941,7 @@ prompt = "What am I attending to?"
     }
 
     #[test]
-    fn full_agent_allocation_starts_speech_path_inactive() {
+    fn full_agent_allocation_bootstraps_input_and_controller_only() {
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
@@ -4796,7 +4952,7 @@ prompt = "What am I attending to?"
 
         assert_eq!(
             allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ZERO
+            ActivationRatio::ONE
         );
         assert_eq!(allocation.tier_for(&builtin::sensory()), ModelTier::Cheap);
 
@@ -4845,5 +5001,29 @@ prompt = "What am I attending to?"
             assert_eq!(allocation.activation_for(&module), ActivationRatio::ZERO);
         }
         assert!(allocation.get(&builtin::query_agentic()).is_none());
+    }
+
+    #[tokio::test]
+    async fn full_agent_gui_initial_allocation_starts_every_module_detached() {
+        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
+        let allocation = full_agent_gui_initial_allocation(
+            &crate::cases::EvalLimits {
+                max_llm_calls: None,
+            },
+            &selected,
+        );
+        let blackboard = Blackboard::with_allocation(allocation);
+        let caps = test_caps(blackboard.clone());
+        let _allocated = eval_registry(&selected).build(&caps).await.unwrap();
+
+        blackboard
+            .read(|bb| {
+                for module in &selected {
+                    let id = module.module_id();
+                    assert_eq!(bb.allocation().activation_for(&id), ActivationRatio::ZERO);
+                    assert_eq!(bb.allocation().active_replicas(&id), 0);
+                }
+            })
+            .await;
     }
 }

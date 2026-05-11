@@ -11,7 +11,7 @@ use nuillu_module::{
     ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
     CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, Memo, Module, SceneReader,
-    SessionCompactionConfig, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
+    SessionCompactionConfig, TypedMemo, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
     compact_session_if_needed, format_faculty_system_prompt, memory_rank_counts,
     push_ephemeral_mind_context, push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
@@ -38,7 +38,15 @@ streaming that utterance tail right now. If there is no such assistant message a
 cognition-log and memo-log context, speak is not
 currently streaming.
 
-Use a strict readiness gate before setting should_speak=true:
+Return wants_to_speak and wait_for_evidence as separate decisions:
+- Set wants_to_speak=true when a user-visible utterance should eventually happen for the current
+  cognition-log situation.
+- Set wait_for_evidence=true only when wants_to_speak=true but essential evidence is still missing
+  from the cognition log.
+- Set wants_to_speak=false when no utterance is currently needed. In that case do not wait for
+  evidence merely because some information is absent.
+
+Use a strict readiness gate before setting wants_to_speak=true and wait_for_evidence=false:
 - The cognition log must contain the facts needed for the utterance, not only raw sensory
   observations, open questions, predictions, or instructions for another module.
 - query-vector/query-agentic retrieve evidence into memo logs; self-model writes self evidence
@@ -58,20 +66,21 @@ Use a strict readiness gate before setting should_speak=true:
   in-world or peer-directed exchange, do not convert it into external assistant advice unless that
   is explicitly asked for.
 - If responding now would require generic advice, unsupported diagnosis, or facts absent from
-  the cognition log, wait silently.
+  the cognition log, set wants_to_speak=true and wait_for_evidence=true.
 - If the speak memo already contains an utterance that addresses the current cognition-log request,
-  set should_speak=false unless a new cognition-log request or peer situation needs another utterance.
+  set wants_to_speak=false unless a new cognition-log request or peer situation needs another utterance.
 
 When a missing fact is needed for speech, call an evidence tool before waiting:
 - query_memory(question) for stable self/body/peer/world facts.
 - query_sensory_detail(question) for details from current sensory observations.
-If a tool result contains the needed fact but the cognition log does not, return should_speak=false with an
+If a tool result contains the needed fact but the cognition log does not, return wants_to_speak=true
+and wait_for_evidence=true with a
 cognition-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
 the source to consult, the concrete question to answer, and the exact fact that must become visible
 in the cognition log before speaking. After publishing an evidence request, wait silently; speak-gate will
 reconsider when a later cognition-log update arrives.
 
-When should_speak=true, you are only allowing the pending speak activation to run. Do not choose
+When wants_to_speak=true and wait_for_evidence=false, you are only allowing the pending speak activation to run. Do not choose
 an addressee or summarize speech content here; Speak will choose the target from the cognition log
 after this gate allows activation. Return only raw JSON for the structured decision; do not wrap it
 in Markdown or code fences."#;
@@ -101,6 +110,10 @@ collapsing them into a generic summary. Brevity matters, but never at the cost o
 load-bearing safety or peer-model fact that the cognition log makes available. Do not change the
 target or redirect the utterance to a different addressee. Do not invent diagnoses, generic
 advice, or facts that are not present in the cognition context.
+
+If this activation was allowed after waiting for missing evidence, the cognition log may still be
+incomplete. In that case, say only what the cognition log supports, make uncertainty explicit when
+needed, and do not fill gaps from hidden memo, tool, or module state.
 
 If partial_utterance is present, continue that utterance from exactly where it stopped; do not
 repeat, rewrite, or replace the already emitted partial text. Do not mention hidden state or
@@ -144,10 +157,28 @@ fn fallback_speech_target_schema() -> Schema {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct SpeakGateDecision {
-    should_speak: bool,
+    wants_to_speak: bool,
+    wait_for_evidence: bool,
     rationale: String,
     #[serde(default)]
     evidence_gaps: Vec<EvidenceGap>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpeakGateMemoKind {
+    WantsToSpeak,
+    WantsToSpeakMissingEvidence,
+    NoNeedToSpeak,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SpeakGateMemo {
+    pub kind: SpeakGateMemoKind,
+    pub rationale: String,
+    pub evidence_gaps: Vec<EvidenceGap>,
+    pub forced: bool,
+    pub latest_cognition_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -194,16 +225,18 @@ impl JsonSchema for SpeechTarget {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct EvidenceGap {
-    source: EvidenceGapSource,
-    question: String,
-    needed_fact: String,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceGap {
+    pub source: EvidenceGapSource,
+    pub question: String,
+    pub needed_fact: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
-enum EvidenceGapSource {
+pub enum EvidenceGapSource {
     Memory,
     File,
     SelfModel,
@@ -270,8 +303,8 @@ const MAX_GATE_TOOL_ROUNDS: usize = 4;
 const COMPACTED_SPEAK_GATE_SESSION_PREFIX: &str = "Compacted speak-gate session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the speak-gate module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve information that future speak-gate
-decisions need: cognition-log facts, prior allow/suppress decisions, evidence requests, evidence
-gaps, and tool results. Do not invent facts. Keep the summary concise, explicit, and faithful.
+decisions need: cognition-log facts, prior memo kinds, forced allows, suppressions, evidence
+requests, evidence gaps, and tool results. Do not invent facts. Keep the summary concise, explicit, and faithful.
 Return plain text only."#;
 
 pub type SpeakGateSessionCompactionConfig = SessionCompactionConfig;
@@ -288,7 +321,7 @@ fn apply_requested_evidence_guard(
     mut decision: SpeakGateDecision,
     requested_sources: &[EvidenceGapSource],
 ) -> SpeakGateDecision {
-    if !decision.should_speak || requested_sources.is_empty() {
+    if !decision.wants_to_speak || requested_sources.is_empty() {
         return decision;
     }
 
@@ -300,7 +333,7 @@ fn apply_requested_evidence_guard(
     sources.dedup();
     let sources = sources.join(", ");
     let original_rationale = decision.rationale.trim();
-    decision.should_speak = false;
+    decision.wait_for_evidence = true;
     decision.rationale = if original_rationale.is_empty() {
         format!("Waiting after requesting evidence from {sources}.")
     } else {
@@ -316,6 +349,73 @@ fn apply_requested_evidence_guard(
         ),
     });
     decision
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissingEvidenceState {
+    signature: MissingEvidenceSignature,
+    consecutive_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissingEvidenceSignature {
+    latest_cognition_index: Option<u64>,
+    evidence_gaps: Vec<NormalizedEvidenceGap>,
+}
+
+impl MissingEvidenceSignature {
+    fn new(latest_cognition_index: Option<u64>, evidence_gaps: &[EvidenceGap]) -> Self {
+        Self {
+            latest_cognition_index,
+            evidence_gaps: normalize_evidence_gaps_for_signature(evidence_gaps),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedEvidenceGap {
+    source: EvidenceGapSource,
+    question: String,
+    needed_fact: String,
+}
+
+fn normalize_signature_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_evidence_gaps_for_signature(gaps: &[EvidenceGap]) -> Vec<NormalizedEvidenceGap> {
+    let mut normalized = gaps
+        .iter()
+        .map(|gap| NormalizedEvidenceGap {
+            source: gap.source,
+            question: normalize_signature_text(&gap.question),
+            needed_fact: normalize_signature_text(&gap.needed_fact),
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn clean_evidence_gaps(gaps: Vec<EvidenceGap>) -> Vec<EvidenceGap> {
+    gaps.into_iter()
+        .map(|gap| EvidenceGap {
+            source: gap.source,
+            question: gap.question.trim().to_owned(),
+            needed_fact: gap.needed_fact.trim().to_owned(),
+        })
+        .collect()
+}
+
+fn memo_kind_from_decision(decision: &SpeakGateDecision) -> SpeakGateMemoKind {
+    if !decision.wants_to_speak {
+        return SpeakGateMemoKind::NoNeedToSpeak;
+    }
+    if decision.wait_for_evidence || !decision.evidence_gaps.is_empty() {
+        SpeakGateMemoKind::WantsToSpeakMissingEvidence
+    } else {
+        SpeakGateMemoKind::WantsToSpeak
+    }
 }
 
 fn readiness_gate_prompt(self_model_available: bool) -> String {
@@ -395,12 +495,13 @@ pub struct SpeakGateModule {
     cognition_log: CognitionLogReader,
     blackboard: BlackboardReader,
     attention_control: AttentionControlRequestMailbox,
-    memo: Memo,
+    memo: TypedMemo<SpeakGateMemo>,
     llm: LlmAccess,
     session: Session,
     session_compaction: SpeakGateSessionCompactionConfig,
     readiness_prompt: std::sync::OnceLock<String>,
     session_seeded: bool,
+    last_missing_evidence: Option<MissingEvidenceState>,
 }
 
 impl SpeakGateModule {
@@ -410,7 +511,7 @@ impl SpeakGateModule {
         cognition_log: CognitionLogReader,
         blackboard: BlackboardReader,
         attention_control: AttentionControlRequestMailbox,
-        memo: Memo,
+        memo: TypedMemo<SpeakGateMemo>,
         llm: LlmAccess,
     ) -> Self {
         Self {
@@ -426,6 +527,7 @@ impl SpeakGateModule {
             session_compaction: SpeakGateSessionCompactionConfig::default(),
             readiness_prompt: std::sync::OnceLock::new(),
             session_seeded: false,
+            last_missing_evidence: None,
         }
     }
 
@@ -456,6 +558,56 @@ impl SpeakGateModule {
         self.session_seeded = true;
     }
 
+    fn build_memo_from_decision(
+        &mut self,
+        decision: SpeakGateDecision,
+        latest_cognition_index: Option<u64>,
+        stuckness_seen: bool,
+    ) -> SpeakGateMemo {
+        let SpeakGateDecision {
+            wants_to_speak,
+            wait_for_evidence,
+            rationale,
+            evidence_gaps,
+        } = decision;
+        let decision = SpeakGateDecision {
+            wants_to_speak,
+            wait_for_evidence,
+            rationale: rationale.trim().to_owned(),
+            evidence_gaps: clean_evidence_gaps(evidence_gaps),
+        };
+        let kind = memo_kind_from_decision(&decision);
+        let forced = if kind == SpeakGateMemoKind::WantsToSpeakMissingEvidence {
+            let signature =
+                MissingEvidenceSignature::new(latest_cognition_index, &decision.evidence_gaps);
+            let consecutive_count = match &mut self.last_missing_evidence {
+                Some(state) if state.signature == signature => {
+                    state.consecutive_count = state.consecutive_count.saturating_add(1);
+                    state.consecutive_count
+                }
+                _ => {
+                    self.last_missing_evidence = Some(MissingEvidenceState {
+                        signature,
+                        consecutive_count: 1,
+                    });
+                    1
+                }
+            };
+            stuckness_seen && consecutive_count >= 2
+        } else {
+            self.last_missing_evidence = None;
+            false
+        };
+
+        SpeakGateMemo {
+            kind,
+            rationale: decision.rationale,
+            evidence_gaps: decision.evidence_gaps,
+            forced,
+            latest_cognition_index,
+        }
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
         &mut self,
@@ -470,13 +622,16 @@ impl SpeakGateModule {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let speak_owner = speak_owner();
-        let (rank_counts, stuckness, utterance_progress) = self
+        let (rank_counts, stuckness, utterance_progress, latest_cognition_index) = self
             .blackboard
             .read(|bb| {
                 (
                     memory_rank_counts(bb.memory_metadata()),
                     bb.agentic_deadlock_marker().cloned(),
                     bb.utterance_progress_for_instance(&speak_owner).cloned(),
+                    bb.unread_cognition_log_entries(None)
+                        .last()
+                        .map(|record| record.index),
                 )
             })
             .await;
@@ -498,9 +653,14 @@ impl SpeakGateModule {
         let decision = self
             .run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available)
             .await?;
+        let memo =
+            self.build_memo_from_decision(decision, latest_cognition_index, stuckness.is_some());
+        let vote = gate_vote_from_memo(&memo);
 
-        self.memo.write(render_speak_gate_memo(&decision)).await;
-        event.respond(gate_vote_from_decision(&decision));
+        self.memo
+            .write(memo.clone(), render_speak_gate_memo(&memo))
+            .await;
+        event.respond(vote);
         Ok(())
     }
 
@@ -685,29 +845,28 @@ impl SpeakGateModule {
     }
 }
 
-fn gate_vote_from_decision(decision: &SpeakGateDecision) -> ActivationGateVote {
-    if decision.should_speak {
-        ActivationGateVote::Allow
-    } else {
-        ActivationGateVote::Suppress
+fn gate_vote_from_memo(memo: &SpeakGateMemo) -> ActivationGateVote {
+    match memo.kind {
+        SpeakGateMemoKind::WantsToSpeak => ActivationGateVote::Allow,
+        SpeakGateMemoKind::WantsToSpeakMissingEvidence if memo.forced => ActivationGateVote::Allow,
+        SpeakGateMemoKind::WantsToSpeakMissingEvidence | SpeakGateMemoKind::NoNeedToSpeak => {
+            ActivationGateVote::Suppress
+        }
     }
 }
 
-fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
+fn render_speak_gate_memo(payload: &SpeakGateMemo) -> String {
     let mut memo = format!(
-        "Speak decision: {}\nRationale: {}",
-        if decision.should_speak {
-            "speak"
-        } else {
-            "wait silently"
-        },
-        decision.rationale.trim(),
+        "Speak decision: {}\nForced allow: {}\nRationale: {}",
+        payload.kind.as_memo_text(),
+        if payload.forced { "yes" } else { "no" },
+        payload.rationale.trim(),
     );
-    if decision.evidence_gaps.is_empty() {
+    if payload.evidence_gaps.is_empty() {
         memo.push_str("\nEvidence gaps: none");
     } else {
         memo.push_str("\nEvidence gaps:");
-        for gap in &decision.evidence_gaps {
+        for gap in &payload.evidence_gaps {
             memo.push_str("\n- Source: ");
             memo.push_str(gap.source.as_memo_text());
             memo.push_str("; question: ");
@@ -717,6 +876,16 @@ fn render_speak_gate_memo(decision: &SpeakGateDecision) -> String {
         }
     }
     memo
+}
+
+impl SpeakGateMemoKind {
+    fn as_memo_text(self) -> &'static str {
+        match self {
+            SpeakGateMemoKind::WantsToSpeak => "wants to speak",
+            SpeakGateMemoKind::WantsToSpeakMissingEvidence => "wants to speak but missing evidence",
+            SpeakGateMemoKind::NoNeedToSpeak => "no need to speak",
+        }
+    }
 }
 
 impl EvidenceGapSource {
@@ -1082,7 +1251,7 @@ impl Module for SpeakGateModule {
     }
 
     fn role_description() -> &'static str {
-        "Decides whether pending speak activations may run from cognition-log evidence. If needed query, sensory-detail, or self-model results have not been promoted by cognition-gate, speaking becomes a guess; request evidence or suppress. Records waiting/evidence-gap notes in its memo."
+        "Classifies pending speak activations as ready to speak, speech-worthy but missing evidence, or no speech needed. If the same missing-evidence state repeats after stuckness, it may force-allow Speak while recording the missing evidence in its typed memo."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1290,7 +1459,7 @@ mod tests {
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
                     caps.attention_control_mailbox(),
-                    caps.memo(),
+                    caps.typed_memo::<SpeakGateMemo>(),
                     caps.llm_access(),
                 ));
                 SpeakGateStub
@@ -1327,7 +1496,8 @@ mod tests {
             }),
             Ok(RawStructuredTurnEvent::StructuredOutputChunk {
                 json_delta: serde_json::json!({
-                    "should_speak": false,
+                    "wants_to_speak": false,
+                    "wait_for_evidence": false,
                     "rationale": rationale,
                     "evidence_gaps": [],
                 })
@@ -1501,7 +1671,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!decision.should_speak);
+        assert!(!decision.wants_to_speak);
+        assert!(!decision.wait_for_evidence);
         let items = fixture.gate.session.input().items();
         let ModelInputItem::Message { role, content } = &items[0] else {
             panic!("expected compacted system message");
@@ -1536,7 +1707,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!decision.should_speak);
+        assert!(!decision.wants_to_speak);
+        assert!(!decision.wait_for_evidence);
         let items = fixture.gate.session.input().items();
         let ModelInputItem::Message { role, content } = &items[0] else {
             panic!("expected original first history item");
@@ -1753,17 +1925,123 @@ mod tests {
         assert!(session.input().items().is_empty());
     }
 
+    fn speak_gate_decision(
+        wants_to_speak: bool,
+        wait_for_evidence: bool,
+        evidence_gaps: Vec<EvidenceGap>,
+    ) -> SpeakGateDecision {
+        SpeakGateDecision {
+            wants_to_speak,
+            wait_for_evidence,
+            rationale: "test rationale".into(),
+            evidence_gaps,
+        }
+    }
+
+    fn memory_gap() -> EvidenceGap {
+        EvidenceGap {
+            source: EvidenceGapSource::Memory,
+            question: " Which body fact? ".into(),
+            needed_fact: " frog body ".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_gate_decisions_normalize_to_three_memo_kinds() {
+        let mut fixture = gate_tool_fixture().await;
+
+        let ready = fixture.gate.build_memo_from_decision(
+            speak_gate_decision(true, false, Vec::new()),
+            Some(1),
+            false,
+        );
+        assert_eq!(ready.kind, SpeakGateMemoKind::WantsToSpeak);
+        assert_eq!(gate_vote_from_memo(&ready), ActivationGateVote::Allow);
+
+        let missing = fixture.gate.build_memo_from_decision(
+            speak_gate_decision(true, true, vec![memory_gap()]),
+            Some(1),
+            false,
+        );
+        assert_eq!(missing.kind, SpeakGateMemoKind::WantsToSpeakMissingEvidence);
+        assert_eq!(missing.evidence_gaps[0].question, "Which body fact?");
+        assert!(!missing.forced);
+        assert_eq!(gate_vote_from_memo(&missing), ActivationGateVote::Suppress);
+
+        let no_need = fixture.gate.build_memo_from_decision(
+            speak_gate_decision(false, true, vec![memory_gap()]),
+            Some(1),
+            true,
+        );
+        assert_eq!(no_need.kind, SpeakGateMemoKind::NoNeedToSpeak);
+        assert!(!no_need.forced);
+        assert_eq!(gate_vote_from_memo(&no_need), ActivationGateVote::Suppress);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_missing_evidence_with_stuckness_forces_allow() {
+        let mut fixture = gate_tool_fixture().await;
+
+        let first = fixture.gate.build_memo_from_decision(
+            speak_gate_decision(true, true, vec![memory_gap()]),
+            Some(3),
+            false,
+        );
+        assert_eq!(first.kind, SpeakGateMemoKind::WantsToSpeakMissingEvidence);
+        assert!(!first.forced);
+        assert_eq!(gate_vote_from_memo(&first), ActivationGateVote::Suppress);
+
+        let second = fixture.gate.build_memo_from_decision(
+            speak_gate_decision(true, true, vec![memory_gap()]),
+            Some(3),
+            true,
+        );
+        assert_eq!(second.kind, SpeakGateMemoKind::WantsToSpeakMissingEvidence);
+        assert!(second.forced);
+        assert_eq!(gate_vote_from_memo(&second), ActivationGateVote::Allow);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_gate_typed_memo_preserves_payload_and_plaintext() {
+        let fixture = gate_tool_fixture().await;
+        let payload = SpeakGateMemo {
+            kind: SpeakGateMemoKind::WantsToSpeak,
+            rationale: "ready".into(),
+            evidence_gaps: Vec::new(),
+            forced: false,
+            latest_cognition_index: Some(9),
+        };
+
+        fixture
+            .gate
+            .memo
+            .write(payload.clone(), render_speak_gate_memo(&payload))
+            .await;
+
+        let owner = ModuleInstanceId::new(builtin::speak_gate(), ReplicaIndex::ZERO);
+        let logs = fixture
+            .blackboard
+            .typed_memo_logs::<SpeakGateMemo>(&owner)
+            .await;
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].data(), &payload);
+        assert!(logs[0].content.contains("Speak decision: wants to speak"));
+        assert!(serde_json::from_str::<serde_json::Value>(&logs[0].content).is_err());
+    }
+
     #[test]
     fn requested_evidence_guard_turns_same_turn_speak_into_wait() {
         let decision = SpeakGateDecision {
-            should_speak: true,
+            wants_to_speak: true,
+            wait_for_evidence: false,
             rationale: "tool request is enough".into(),
             evidence_gaps: Vec::new(),
         };
 
         let guarded = apply_requested_evidence_guard(decision, &[EvidenceGapSource::Memory]);
 
-        assert!(!guarded.should_speak);
+        assert!(guarded.wants_to_speak);
+        assert!(guarded.wait_for_evidence);
         assert!(
             guarded
                 .rationale
@@ -1888,19 +2166,22 @@ mod tests {
 
     #[test]
     fn wait_decision_renders_evidence_gaps_in_free_form_memo() {
-        let decision = SpeakGateDecision {
-            should_speak: false,
+        let payload = SpeakGateMemo {
+            kind: SpeakGateMemoKind::WantsToSpeakMissingEvidence,
             rationale: "missing body fact".into(),
             evidence_gaps: vec![EvidenceGap {
                 source: EvidenceGapSource::Memory,
                 question: "What body should I report?".into(),
                 needed_fact: "frog body".into(),
             }],
+            forced: false,
+            latest_cognition_index: Some(7),
         };
 
-        let memo = render_speak_gate_memo(&decision);
+        let memo = render_speak_gate_memo(&payload);
 
-        assert!(memo.contains("Speak decision: wait silently"));
+        assert!(memo.contains("Speak decision: wants to speak but missing evidence"));
+        assert!(memo.contains("Forced allow: no"));
         assert!(memo.contains("Rationale: missing body fact"));
         assert!(memo.contains(
             "Source: memory; question: What body should I report?; needed fact: frog body"
@@ -1909,23 +2190,38 @@ mod tests {
     }
 
     #[test]
-    fn gate_vote_from_decision_allows_only_speak_decisions() {
-        let valid = SpeakGateDecision {
-            should_speak: true,
+    fn gate_vote_from_memo_allows_only_ready_or_forced_speak_decisions() {
+        let valid = SpeakGateMemo {
+            kind: SpeakGateMemoKind::WantsToSpeak,
             rationale: "ready".into(),
             evidence_gaps: Vec::new(),
+            forced: false,
+            latest_cognition_index: Some(1),
         };
 
-        assert_eq!(gate_vote_from_decision(&valid), ActivationGateVote::Allow);
+        assert_eq!(gate_vote_from_memo(&valid), ActivationGateVote::Allow);
 
-        let waiting = SpeakGateDecision {
-            should_speak: false,
-            ..valid
+        let waiting = SpeakGateMemo {
+            kind: SpeakGateMemoKind::WantsToSpeakMissingEvidence,
+            ..valid.clone()
+        };
+        assert_eq!(gate_vote_from_memo(&waiting), ActivationGateVote::Suppress);
+
+        let forced_waiting = SpeakGateMemo {
+            forced: true,
+            ..waiting.clone()
         };
         assert_eq!(
-            gate_vote_from_decision(&waiting),
-            ActivationGateVote::Suppress
+            gate_vote_from_memo(&forced_waiting),
+            ActivationGateVote::Allow
         );
+
+        let silent = SpeakGateMemo {
+            kind: SpeakGateMemoKind::NoNeedToSpeak,
+            forced: true,
+            ..valid
+        };
+        assert_eq!(gate_vote_from_memo(&silent), ActivationGateVote::Suppress);
     }
 
     #[tokio::test(flavor = "current_thread")]
