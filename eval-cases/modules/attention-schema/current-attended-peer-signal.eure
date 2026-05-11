@@ -5,8 +5,6 @@ prompt = "What are you attending to right now?"
 context = "The harness seeds the global memo surface. The attention-schema module should append a concise first-person cognition-log entry about the current peer signal, not hidden runtime state."
 
 limits {
-  max-ticks = 120
-  tick-ms = 500
   max-llm-calls = 8
 }
 

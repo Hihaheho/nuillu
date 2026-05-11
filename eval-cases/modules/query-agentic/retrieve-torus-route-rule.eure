@@ -5,8 +5,6 @@ prompt = "Why can an eastbound animal appear from the west?"
 context = "The query-agentic module should search the seeded file corpus. Static checks verify retrieval; the rubric judges generated search_files arguments and primary artifact.output only."
 
 limits {
-  max-ticks = 120
-  tick-ms = 500
   max-llm-calls = 8
 }
 

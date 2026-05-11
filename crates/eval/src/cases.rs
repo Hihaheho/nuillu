@@ -50,14 +50,6 @@ fn default_module_rubric_judge_inputs() -> Vec<RubricJudgeInput> {
     vec![RubricJudgeInput::Output, RubricJudgeInput::Observations]
 }
 
-fn default_tick_ms() -> u64 {
-    100
-}
-
-fn default_max_ticks() -> u64 {
-    40
-}
-
 fn default_max_llm_calls() -> Option<u64> {
     Some(10)
 }
@@ -377,10 +369,6 @@ impl FullAgentInput {
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct EvalLimits {
-    #[eure(default = "default_tick_ms")]
-    pub tick_ms: u64,
-    #[eure(default = "default_max_ticks")]
-    pub max_ticks: u64,
     #[eure(default = "default_max_llm_calls")]
     pub max_llm_calls: Option<u64>,
 }
@@ -388,8 +376,6 @@ pub struct EvalLimits {
 impl Default for EvalLimits {
     fn default() -> Self {
         Self {
-            tick_ms: default_tick_ms(),
-            max_ticks: default_max_ticks(),
             max_llm_calls: default_max_llm_calls(),
         }
     }
@@ -984,18 +970,6 @@ fn validate_common(
     limits: &EvalLimits,
     checks: &[Check],
 ) -> Result<(), CaseFileError> {
-    if limits.tick_ms == 0 {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "limits.tick-ms must be greater than zero".to_string(),
-        });
-    }
-    if limits.max_ticks == 0 {
-        return Err(CaseFileError::Validation {
-            path: path.to_path_buf(),
-            message: "limits.max-ticks must be greater than zero".to_string(),
-        });
-    }
     if matches!(limits.max_llm_calls, Some(0)) {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),

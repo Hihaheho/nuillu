@@ -5,8 +5,6 @@ prompt = "Can I make Koro calm down directly?"
 context = "The seeded memo names a current social goal and marks control over Koro as outside Nui's own action boundary."
 
 limits {
-  max-ticks = 120
-  tick-ms = 500
   max-llm-calls = 8
 }
 

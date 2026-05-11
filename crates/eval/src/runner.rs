@@ -78,6 +78,7 @@ use crate::{
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
+const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 256;
 
 #[derive(Debug, Clone)]
@@ -289,7 +290,7 @@ pub async fn run_suite_with_hooks(
             "max_concurrent_llm_calls": config.max_concurrent_llm_calls.map(NonZeroUsize::get),
         }),
         format!(
-            "eval suite start run={} cases={} output={}",
+            "🚀 eval suite start run={} cases={} output={}",
             config.run_id,
             case_paths.len(),
             run_dir.display()
@@ -323,6 +324,7 @@ pub async fn run_suite_with_hooks(
     let report = aggregate_suite(cases);
     let suite_path = run_dir.join("suite-report.json");
     write_json_file(&suite_path, &report)?;
+    eprintln!("\n════════════════════════════════════════════════════════════");
     reporter.emit(
         None,
         "suite_finished",
@@ -334,7 +336,7 @@ pub async fn run_suite_with_hooks(
             "mean_score": report.mean_score,
         }),
         format!(
-            "eval suite end run={} passed={} failed={} invalid={} mean_score={:.3}",
+            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3}",
             config.run_id,
             report.passed_cases,
             report.failed_cases,
@@ -446,6 +448,7 @@ async fn run_case_detailed_with_reporter(
         path: output_dir.clone(),
         source,
     })?;
+    eprintln!("\n────────────────────────────────────────────────────────────");
     reporter.emit(
         Some(&id),
         "case_started",
@@ -454,7 +457,7 @@ async fn run_case_detailed_with_reporter(
             "output_dir": output_dir.display().to_string(),
         }),
         format!(
-            "eval case start id={} path={} output={}",
+            "▶️  eval case start id={} path={} output={}",
             id,
             case_path.display(),
             output_dir.display()
@@ -641,9 +644,16 @@ fn emit_case_finished(
     summary: &CaseSummary,
     event_count: usize,
 ) -> Result<(), RunnerError> {
+    let status_icon = if summary.invalid {
+        "💥"
+    } else if summary.passed {
+        "✅"
+    } else {
+        "❌"
+    };
     let case_finished_message = if let Some(runtime_failure) = &summary.report.runtime_failure {
         format!(
-            "eval case end id={} passed={} invalid={} score={:.3} events={} failure={}",
+            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} events={} failure={}",
             summary.id,
             summary.passed,
             summary.invalid,
@@ -653,7 +663,7 @@ fn emit_case_finished(
         )
     } else {
         format!(
-            "eval case end id={} passed={} invalid={} score={:.3} events={}",
+            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} events={}",
             summary.id, summary.passed, summary.invalid, summary.score, event_count
         )
     };
@@ -969,7 +979,6 @@ async fn execute_full_agent_case(
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
-    let limits = case.limits.clone();
     let actions = env.actions.clone();
     let events = env.events.clone();
     let clock = env.clock.clone();
@@ -1029,15 +1038,18 @@ async fn execute_full_agent_case(
 
             let mut last_event_count = events.event_count();
             let mut idle_ticks = 0_u64;
-            let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, limits.tick_ms);
-            for tick in 0..limits.max_ticks {
+            let poll_ms = duration_millis_u64(EVAL_POLL_INTERVAL);
+            let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, poll_ms);
+            let mut tick: u64 = 0;
+            loop {
                 if actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW)
                     || events.stop_requested()
                 {
                     break;
                 }
                 tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+                tokio::time::sleep(EVAL_POLL_INTERVAL).await;
+                tick = tick.saturating_add(1);
                 let _ = allocation_reporter
                     .emit_if_changed(&allocation_blackboard)
                     .await;
@@ -1077,18 +1089,18 @@ async fn execute_full_agent_case(
                             Some(&case_id_for_idle),
                             "idle",
                             serde_json::json!({
-                                "tick": tick + 1,
+                                "tick": tick,
                                 "events": event_count,
                                 "idle_ticks": idle_ticks,
-                                "idle_for_ms": idle_ticks.saturating_mul(limits.tick_ms),
-                                "tick_ms": limits.tick_ms,
+                                "idle_for_ms": idle_ticks.saturating_mul(poll_ms),
+                                "tick_ms": poll_ms,
                                 "report_interval_ms": duration_millis_u64(IDLE_REPORT_INTERVAL),
                                 "active_modules": active_modules,
                             }),
                             format!(
-                                "eval idle case={} idle_for_ms={} events={} active=[{}]",
+                                "💤 eval idle case={} idle_for_ms={} events={} active=[{}]",
                                 case_id_for_idle,
-                                idle_ticks.saturating_mul(limits.tick_ms),
+                                idle_ticks.saturating_mul(poll_ms),
                                 event_count,
                                 active_summary
                             ),
@@ -1105,7 +1117,7 @@ async fn execute_full_agent_case(
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
     } else {
-        CaseArtifact::failed("no utterance before max-ticks")
+        CaseArtifact::failed("no utterance produced")
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
     let events = env.events.snapshot();
@@ -1182,7 +1194,6 @@ async fn execute_module_case(
     let run_target_module = target_module.clone();
     let modules = eval_registry(&case_modules).build(&env.caps).await?;
     let harness = env.caps.internal_harness_io();
-    let limits = case.limits.clone();
     let prompt = case.prompt.content.clone();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
@@ -1254,7 +1265,7 @@ async fn execute_module_case(
                 }
             }
 
-            for _ in 0..limits.max_ticks {
+            loop {
                 if let Some(visualizer) = visualizer.as_deref_mut() {
                     if handle_visualizer_commands(
                         &case_id_for_gui,
@@ -1289,7 +1300,7 @@ async fn execute_module_case(
                     break;
                 }
                 tokio::task::yield_now().await;
-                tokio::time::sleep(Duration::from_millis(limits.tick_ms)).await;
+                tokio::time::sleep(EVAL_POLL_INTERVAL).await;
             }
         },
     )
@@ -1307,7 +1318,7 @@ async fn execute_module_case(
         if env.events.stop_requested() {
             CaseArtifact::failed("stopped after max-llm-calls before target module produced output")
         } else {
-            CaseArtifact::failed("target module did not produce output before max-ticks")
+            CaseArtifact::failed("target module did not produce output")
         }
     } else {
         CaseArtifact::new(output)
@@ -3780,8 +3791,6 @@ id = "{id}"
 prompt = "Who are you?"
 
 limits {{
-  max-ticks = 1
-  tick-ms = 1
   max-llm-calls = 1
 }}
 "#
@@ -4190,8 +4199,6 @@ prompt = "What am I attending to?"
         ];
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
-                tick_ms: 500,
-                max_ticks: 1,
                 max_llm_calls: None,
             },
             &selected,
@@ -4237,8 +4244,6 @@ prompt = "What am I attending to?"
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
-                tick_ms: 500,
-                max_ticks: 1,
                 max_llm_calls: None,
             },
             &selected,

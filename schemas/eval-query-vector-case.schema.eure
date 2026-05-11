@@ -80,10 +80,6 @@ seconds-ago = `integer`
 seconds-ago.$optional = true
 
 @ $types.eval-limits
-tick-ms = `integer`
-tick-ms.$optional = true
-max-ticks = `integer`
-max-ticks.$optional = true
 max-llm-calls = `integer`
 max-llm-calls.$optional = true
 

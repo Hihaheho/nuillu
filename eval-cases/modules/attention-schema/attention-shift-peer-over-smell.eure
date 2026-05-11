@@ -5,8 +5,6 @@ prompt = "What has my attention now?"
 context = "The harness seeds an older preferred smell and a newer peer warning. The output should be a first-person cognition-log entry about the newer Koro food-boundary event as current attention."
 
 limits {
-  max-ticks = 120
-  tick-ms = 500
   max-llm-calls = 8
 }
 

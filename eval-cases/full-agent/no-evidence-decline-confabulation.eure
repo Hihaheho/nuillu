@@ -4,8 +4,6 @@ now = "2026-05-10T08:21:00+09:00"
 modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
-  max-ticks = 300
-  tick-ms = 500
   max-llm-calls = 22
 }
 
