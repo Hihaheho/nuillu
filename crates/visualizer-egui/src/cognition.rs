@@ -1,4 +1,4 @@
-use crate::{CognitionLogView, llm_chat::wrapped_label};
+use crate::{CognitionLogView, text::wrapped_label};
 
 pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
     egui::ScrollArea::vertical()

@@ -4,12 +4,32 @@ use std::sync::Arc;
 
 use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{ModelTier, ModuleInstanceId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::LutumTiers;
 use crate::rate_limit::{CapabilityKind, RateLimiter};
 use crate::runtime_events::RuntimeEventEmitter;
+
+/// Source of a Lutum request issued by a module-scoped runtime handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmRequestSource {
+    ModuleTurn,
+    SessionCompaction,
+}
+
+/// Per-request metadata attached to [`lutum::RequestExtensions`].
+///
+/// The module crate only stamps this metadata. External observers such as eval
+/// and visualizer hooks decide how to render or record it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmRequestMetadata {
+    pub owner: ModuleInstanceId,
+    pub tier: ModelTier,
+    pub source: LlmRequestSource,
+}
 
 /// Shared admission control for LLM turns.
 #[derive(Clone)]
@@ -132,7 +152,12 @@ impl LlmAccess {
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
         self.events.llm_accessed(self.owner.clone(), tier).await;
-        LlmLease::new(self.tiers.pick(tier), permit)
+        let lutum = self.tiers.pick(tier).with_extension(LlmRequestMetadata {
+            owner: self.owner.clone(),
+            tier,
+            source: LlmRequestSource::ModuleTurn,
+        });
+        LlmLease::new(lutum, permit)
     }
 }
 
@@ -142,7 +167,11 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
+    use lutum::{
+        FinishReason, Lutum, LutumHooksSet, MockLlmAdapter, MockTextScenario, ModelInput,
+        ModelInputHookContext, OnModelInput, RawTextTurnEvent, SharedPoolBudgetManager,
+        SharedPoolBudgetOptions, Usage,
+    };
     use nuillu_blackboard::{Blackboard, ResourceAllocation};
     use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
 
@@ -150,7 +179,7 @@ mod tests {
     use crate::rate_limit::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RateLimiter};
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
-    use super::{LlmAccess, LlmConcurrencyLimiter};
+    use super::{LlmAccess, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
 
     #[derive(Debug, Default)]
     struct RecordingSink {
@@ -162,6 +191,20 @@ mod tests {
         async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
             self.events.lock().expect("event lock poisoned").push(event);
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingModelInputHook {
+        seen: Arc<Mutex<Vec<Option<LlmRequestMetadata>>>>,
+    }
+
+    impl OnModelInput for RecordingModelInputHook {
+        async fn call(&self, cx: &ModelInputHookContext<'_>) {
+            self.seen
+                .lock()
+                .expect("metadata lock poisoned")
+                .push(cx.extensions().get::<LlmRequestMetadata>().cloned());
         }
     }
 
@@ -210,6 +253,70 @@ mod tests {
                     tier: ModelTier::Premium,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lutum_attaches_owner_metadata_to_request_extensions() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_model_override(builtin::cognition_gate(), ModelTier::Premium);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(
+            MockLlmAdapter::new().with_text_scenario(MockTextScenario::events(vec![
+                Ok(RawTextTurnEvent::Started {
+                    request_id: Some("req-metadata".into()),
+                    model: "mock".into(),
+                }),
+                Ok(RawTextTurnEvent::TextDelta { delta: "ok".into() }),
+                Ok(RawTextTurnEvent::Completed {
+                    request_id: Some("req-metadata".into()),
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage {
+                        total_tokens: 1,
+                        ..Usage::zero()
+                    },
+                }),
+            ])),
+        );
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::with_hooks(
+            adapter,
+            budget,
+            LutumHooksSet::new()
+                .with_on_model_input(RecordingModelInputHook { seen: seen.clone() }),
+        );
+        let tiers = crate::LutumTiers {
+            cheap: lutum.clone(),
+            default: lutum.clone(),
+            premium: lutum,
+        };
+        let sink = Arc::new(RecordingSink::default());
+        let events = RuntimeEventEmitter::new(sink);
+        let access = LlmAccess::new(
+            owner.clone(),
+            tiers,
+            blackboard,
+            events,
+            RateLimiter::disabled(),
+            LlmConcurrencyLimiter::new(None),
+        );
+
+        let lutum = access.lutum().await;
+        let _ = lutum
+            .text_turn(ModelInput::new().user("hello"))
+            .collect()
+            .await
+            .expect("mock text turn should complete");
+
+        assert_eq!(
+            seen.lock().expect("metadata lock poisoned").as_slice(),
+            &[Some(LlmRequestMetadata {
+                owner,
+                tier: ModelTier::Premium,
+                source: LlmRequestSource::ModuleTurn,
+            })]
         );
     }
 

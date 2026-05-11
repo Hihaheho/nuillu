@@ -1827,7 +1827,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
             &identity_memories,
-            &compaction_lutum,
+            compaction_lutum.lutum().clone(),
             clock.now(),
         );
         SpeakModule::activate(&mut module, &cx, &batch)

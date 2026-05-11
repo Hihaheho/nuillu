@@ -16,7 +16,7 @@ use nuillu_types::ModuleId;
 pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
-    session_compaction_lutum: &'a Lutum,
+    session_compaction_lutum: Lutum,
     now: DateTime<Utc>,
 }
 
@@ -24,7 +24,7 @@ impl<'a> ActivateCx<'a> {
     pub fn new(
         modules: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
-        session_compaction_lutum: &'a Lutum,
+        session_compaction_lutum: Lutum,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
@@ -48,7 +48,7 @@ impl<'a> ActivateCx<'a> {
 
     /// Cheap shared LLM handle for module-owned session compaction.
     pub fn session_compaction_lutum(&self) -> &Lutum {
-        self.session_compaction_lutum
+        &self.session_compaction_lutum
     }
 
     pub fn now(&self) -> DateTime<Utc> {

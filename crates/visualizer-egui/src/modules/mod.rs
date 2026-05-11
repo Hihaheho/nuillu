@@ -11,23 +11,19 @@ pub mod sensory;
 pub mod speak;
 pub mod surprise;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use egui_hooks::UseHookExt as _;
 use nuillu_module::RuntimeEvent;
 
 use crate::{
-    LlmTraceEvent,
-    llm_chat::{LlmChatItemKind, LlmChatMessage, LlmChatRole, LlmChatTranscript, wrapped_label},
+    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, text::wrapped_label,
 };
-
-const UNATTRIBUTED_LLM_OWNER: &str = "unattributed-llm";
 
 #[derive(Debug, Default)]
 pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
-    pending_llm_owners: VecDeque<String>,
-    span_to_owner: BTreeMap<String, String>,
+    turn_to_owner: BTreeMap<String, String>,
 }
 
 impl ModulesState {
@@ -46,14 +42,25 @@ pub struct ModuleState {
 
 #[derive(Debug, Clone)]
 pub struct LlmTurnState {
-    pub span_id: String,
-    pub kind: Option<String>,
+    pub turn_id: String,
+    pub operation: String,
+    pub source: LlmObservationSource,
+    pub tier: String,
     pub model: Option<String>,
     pub request_id: Option<String>,
     pub finish_reason: Option<String>,
-    pub input: LlmChatTranscript,
-    pub output: LlmChatTranscript,
+    pub usage: Option<LlmUsageView>,
+    pub input: Vec<LlmInputItemView>,
+    pub output: Vec<LlmOutputItemState>,
     pub status: ModuleSessionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmOutputItemState {
+    pub kind: String,
+    pub content: String,
+    pub streaming: bool,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,9 +76,7 @@ pub enum ModuleSessionStatus {
 pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
     match event {
         RuntimeEvent::LlmAccessed { owner, tier, .. } => {
-            let owner = owner.to_string();
-            state.pending_llm_owners.push_back(owner.clone());
-            let module = module_mut(state, owner);
+            let module = module_mut(state, owner.to_string());
             module.status = ModuleSessionStatus::Running;
             module.last_tier = Some(format!("{tier:?}"));
         }
@@ -88,115 +93,108 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
     }
 }
 
-pub fn apply_trace_event(state: &mut ModulesState, event: LlmTraceEvent) {
+pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEvent) {
     match event {
-        LlmTraceEvent::ModuleSpanOpened { span_id, owner } => {
-            state.span_to_owner.insert(span_id, owner);
-        }
-        LlmTraceEvent::SpanOpened {
-            span_id,
-            parent_span_id,
-            kind,
-            model,
+        LlmObservationEvent::ModelInput {
+            turn_id,
+            owner,
+            tier,
+            source,
+            operation,
+            items,
+            ..
         } => {
-            let owner = parent_span_id
-                .as_ref()
-                .and_then(|parent| state.span_to_owner.get(parent))
-                .cloned()
-                .or_else(|| state.pending_llm_owners.pop_front())
-                .unwrap_or_else(|| UNATTRIBUTED_LLM_OWNER.to_string());
-            state.span_to_owner.insert(span_id.clone(), owner.clone());
+            state.turn_to_owner.insert(turn_id.clone(), owner.clone());
             let module = module_mut(state, owner);
             module.status = ModuleSessionStatus::Running;
-            module.turns.push(LlmTurnState {
-                span_id,
-                kind,
-                model,
-                request_id: None,
-                finish_reason: None,
-                input: LlmChatTranscript::default(),
-                output: LlmChatTranscript::default(),
-                status: ModuleSessionStatus::Running,
-            });
+            module.last_tier = Some(tier.clone());
+            let turn = ensure_turn(module, turn_id, operation, source, tier);
+            turn.input = items;
+            turn.status = ModuleSessionStatus::Running;
         }
-        LlmTraceEvent::SpanRecorded {
-            span_id,
-            model,
+        LlmObservationEvent::StreamStarted {
+            turn_id,
+            owner,
+            tier,
+            source,
+            operation,
             request_id,
-            finish_reason,
+            model,
+            ..
         } => {
-            if let Some(turn) = turn_mut(state, &span_id) {
-                if model.is_some() {
-                    turn.model = model;
-                }
-                if request_id.is_some() {
-                    turn.request_id = request_id;
-                }
-                if finish_reason.is_some() {
-                    turn.finish_reason = finish_reason;
-                }
-            }
+            state.turn_to_owner.insert(turn_id.clone(), owner.clone());
+            let module = module_mut(state, owner);
+            module.status = ModuleSessionStatus::Running;
+            module.last_tier = Some(tier.clone());
+            let turn = ensure_turn(module, turn_id, operation, source, tier);
+            turn.model = Some(model);
+            turn.request_id = request_id;
+            turn.status = ModuleSessionStatus::Running;
         }
-        LlmTraceEvent::Input {
-            span_id,
-            transcript,
-        } => {
-            ensure_turn(state, &span_id).input = transcript;
-        }
-        LlmTraceEvent::OutputDelta {
-            span_id,
+        LlmObservationEvent::StreamDelta {
+            turn_id,
             kind,
             delta,
         } => {
-            let turn = ensure_turn(state, &span_id);
-            let index = turn
-                .output
-                .messages
-                .iter()
-                .rposition(|message| message.streaming)
-                .unwrap_or_else(|| {
-                    let index = turn.output.messages.len();
-                    turn.output.push(LlmChatMessage {
-                        role: LlmChatRole::Assistant,
-                        kind,
-                        content: String::new(),
-                        ephemeral: false,
-                        streaming: true,
-                        source: None,
-                    });
-                    index
-                });
-            turn.output.append_to_message(index, &delta);
-            turn.status = ModuleSessionStatus::Running;
-        }
-        LlmTraceEvent::OutputCompleted {
-            span_id,
-            transcript,
-        } => {
-            let turn = ensure_turn(state, &span_id);
-            turn.output = transcript;
-            turn.status = ModuleSessionStatus::Completed;
-            if let Some(owner) = state.span_to_owner.get(&span_id).cloned() {
-                module_mut(state, owner).status = ModuleSessionStatus::Completed;
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                append_output_delta(turn, kind, delta);
+                turn.status = ModuleSessionStatus::Running;
             }
         }
-        LlmTraceEvent::Error { span_id, message } => {
-            let turn = ensure_turn(state, &span_id);
-            turn.output.push(LlmChatMessage {
-                role: LlmChatRole::Assistant,
-                kind: LlmChatItemKind::Other("error".to_string()),
-                content: message,
-                ephemeral: false,
-                streaming: false,
-                source: None,
-            });
-            turn.status = ModuleSessionStatus::Failed;
+        LlmObservationEvent::ToolCallChunk {
+            turn_id,
+            id,
+            name,
+            arguments_json_delta,
+        } => {
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                append_output_delta(
+                    turn,
+                    "tool_call".to_string(),
+                    format!("{name}({id}) {arguments_json_delta}"),
+                );
+            }
         }
-        LlmTraceEvent::SpanClosed { span_id } => {
-            if let Some(turn) = turn_mut(state, &span_id)
-                && turn.status == ModuleSessionStatus::Running
-            {
+        LlmObservationEvent::ToolCallReady {
+            turn_id,
+            id,
+            name,
+            arguments_json,
+        } => {
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                turn.output.push(LlmOutputItemState {
+                    kind: "tool_call_ready".to_string(),
+                    content: arguments_json,
+                    streaming: false,
+                    source: Some(format!("{name}({id})")),
+                });
+            }
+        }
+        LlmObservationEvent::StructuredReady { turn_id, json } => {
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                apply_structured_ready(turn, json);
+            }
+        }
+        LlmObservationEvent::Completed {
+            turn_id,
+            request_id,
+            finish_reason,
+            usage,
+        } => {
+            let owner = state.turn_to_owner.get(&turn_id).cloned();
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                if request_id.is_some() {
+                    turn.request_id = request_id;
+                }
+                turn.finish_reason = Some(finish_reason);
+                turn.usage = Some(usage);
+                for row in &mut turn.output {
+                    row.streaming = false;
+                }
                 turn.status = ModuleSessionStatus::Completed;
+            }
+            if let Some(owner) = owner {
+                module_mut(state, owner).status = ModuleSessionStatus::Completed;
             }
         }
     }
@@ -240,7 +238,7 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
             if let Some(turn) = module
                 .turns
                 .iter()
-                .find(|turn| turn.span_id == next_turn_id)
+                .find(|turn| turn.turn_id == next_turn_id)
             {
                 render_active_turn(ui, module, turn);
             }
@@ -265,12 +263,12 @@ fn render_turn_list(
         .id_salt(format!("turn-list:{}", module.owner))
         .show(ui, |ui| {
             for (index, turn) in module.turns.iter().enumerate() {
-                let selected = turn.span_id == selected_turn_id;
+                let selected = turn.turn_id == selected_turn_id;
                 let response = ui
                     .selectable_label(selected, turn_list_label(index, turn))
-                    .on_hover_text(&turn.span_id);
+                    .on_hover_text(&turn.turn_id);
                 if response.clicked() {
-                    *next_turn_id = turn.span_id.clone();
+                    *next_turn_id = turn.turn_id.clone();
                 }
             }
         });
@@ -280,12 +278,12 @@ fn render_active_turn(ui: &mut egui::Ui, module: &ModuleState, turn: &LlmTurnSta
     ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} turn {}",
-            status_icon(turn.status),
-            turn.span_id
+            status_label(turn.status),
+            turn.turn_id
         ));
-        if let Some(kind) = &turn.kind {
-            ui.label(kind);
-        }
+        ui.label(&turn.operation);
+        ui.label(turn.source.label());
+        ui.label(&turn.tier);
         if let Some(model) = &turn.model {
             ui.label(model);
         }
@@ -295,22 +293,82 @@ fn render_active_turn(ui: &mut egui::Ui, module: &ModuleState, turn: &LlmTurnSta
         if let Some(finish_reason) = &turn.finish_reason {
             ui.label(format!("finish: {finish_reason}"));
         }
+        if let Some(usage) = &turn.usage {
+            ui.label(format!(
+                "tokens: {}/{}",
+                usage.input_tokens, usage.output_tokens
+            ));
+        }
     });
     ui.separator();
-    let transcript = merged_turn_transcript(turn);
-    let id = format!("active-turn:{}:{}", module.owner, turn.span_id);
-    crate::llm_chat::ui_with_id(ui, id, &transcript);
+    let id = format!("active-turn:{}:{}", module.owner, turn.turn_id);
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            for item in &turn.input {
+                render_input_item(ui, item);
+                ui.add_space(6.0);
+            }
+            for item in &turn.output {
+                render_output_item(ui, item);
+                ui.add_space(6.0);
+            }
+        });
+}
+
+fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView) {
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&item.role);
+                ui.label(&item.kind);
+                if item.ephemeral {
+                    ui.label("ephemeral");
+                }
+                if let Some(source) = &item.source {
+                    wrapped_label(ui, source);
+                }
+            });
+            ui.add_space(3.0);
+            wrapped_label(ui, &item.content);
+        });
+}
+
+fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState) {
+    egui::Frame::new()
+        .fill(ui.visuals().selection.bg_fill.linear_multiply(0.45))
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("assistant");
+                ui.label(&item.kind);
+                if item.streaming {
+                    ui.label("streaming");
+                }
+                if let Some(source) = &item.source {
+                    wrapped_label(ui, source);
+                }
+            });
+            ui.add_space(3.0);
+            wrapped_label(ui, &item.content);
+        });
 }
 
 fn turn_list_label(index: usize, turn: &LlmTurnState) -> String {
-    let kind = turn.kind.as_deref().unwrap_or("turn");
-    format!("{} {:02} {}", status_icon(turn.status), index + 1, kind)
-}
-
-fn merged_turn_transcript(turn: &LlmTurnState) -> LlmChatTranscript {
-    let mut transcript = turn.input.clone();
-    transcript.messages.extend(turn.output.messages.clone());
-    transcript
+    format!(
+        "{} {:02} {} {}",
+        status_label(turn.status),
+        index + 1,
+        turn.operation,
+        turn.source.label()
+    )
 }
 
 fn active_turn_id(module: &ModuleState) -> Option<String> {
@@ -320,7 +378,7 @@ fn active_turn_id(module: &ModuleState) -> Option<String> {
         .rev()
         .find(|turn| turn.status == ModuleSessionStatus::Running)
         .or_else(|| module.turns.last())
-        .map(|turn| turn.span_id.clone())
+        .map(|turn| turn.turn_id.clone())
 }
 
 fn selected_turn_id(module: &ModuleState, persisted: &str, default_turn_id: &str) -> String {
@@ -329,51 +387,96 @@ fn selected_turn_id(module: &ModuleState, persisted: &str, default_turn_id: &str
         .iter()
         .rev()
         .find(|turn| turn.status == ModuleSessionStatus::Running)
-        .map(|turn| turn.span_id.as_str());
+        .map(|turn| turn.turn_id.as_str());
     if let Some(running_turn_id) = running_turn_id
         && running_turn_id != persisted
     {
         return running_turn_id.to_string();
     }
-    if module.turns.iter().any(|turn| turn.span_id == persisted) {
+    if module.turns.iter().any(|turn| turn.turn_id == persisted) {
         persisted.to_string()
     } else {
         default_turn_id.to_string()
     }
 }
 
-fn ensure_turn<'a>(state: &'a mut ModulesState, span_id: &str) -> &'a mut LlmTurnState {
-    if turn_mut(state, span_id).is_none() {
-        let owner = state
-            .span_to_owner
-            .get(span_id)
-            .cloned()
-            .unwrap_or_else(|| UNATTRIBUTED_LLM_OWNER.to_string());
-        state
-            .span_to_owner
-            .insert(span_id.to_string(), owner.clone());
-        module_mut(state, owner).turns.push(LlmTurnState {
-            span_id: span_id.to_string(),
-            kind: None,
-            model: None,
-            request_id: None,
-            finish_reason: None,
-            input: LlmChatTranscript::default(),
-            output: LlmChatTranscript::default(),
-            status: ModuleSessionStatus::Running,
-        });
+fn ensure_turn<'a>(
+    module: &'a mut ModuleState,
+    turn_id: String,
+    operation: String,
+    source: LlmObservationSource,
+    tier: String,
+) -> &'a mut LlmTurnState {
+    if let Some(index) = module.turns.iter().position(|turn| turn.turn_id == turn_id) {
+        let turn = &mut module.turns[index];
+        turn.operation = operation;
+        turn.source = source;
+        turn.tier = tier;
+        return turn;
     }
-    turn_mut(state, span_id).expect("turn inserted")
+    module.turns.push(LlmTurnState {
+        turn_id,
+        operation,
+        source,
+        tier,
+        model: None,
+        request_id: None,
+        finish_reason: None,
+        usage: None,
+        input: Vec::new(),
+        output: Vec::new(),
+        status: ModuleSessionStatus::Running,
+    });
+    module.turns.last_mut().expect("turn inserted")
 }
 
-fn turn_mut<'a>(state: &'a mut ModulesState, span_id: &str) -> Option<&'a mut LlmTurnState> {
-    let owner = state.span_to_owner.get(span_id)?.clone();
+fn turn_mut<'a>(state: &'a mut ModulesState, turn_id: &str) -> Option<&'a mut LlmTurnState> {
+    let owner = state.turn_to_owner.get(turn_id)?.clone();
     state
         .modules
         .get_mut(&owner)?
         .turns
         .iter_mut()
-        .find(|turn| turn.span_id == span_id)
+        .find(|turn| turn.turn_id == turn_id)
+}
+
+fn append_output_delta(turn: &mut LlmTurnState, kind: String, delta: String) {
+    if let Some(row) = turn
+        .output
+        .iter_mut()
+        .rev()
+        .find(|row| row.streaming && row.kind == kind)
+    {
+        row.content.push_str(&delta);
+        return;
+    }
+    turn.output.push(LlmOutputItemState {
+        kind,
+        content: delta,
+        streaming: true,
+        source: None,
+    });
+}
+
+fn apply_structured_ready(turn: &mut LlmTurnState, json: String) {
+    if let Some(row) = turn
+        .output
+        .iter_mut()
+        .rev()
+        .find(|row| row.kind == "structured" || row.kind == "structured_ready")
+    {
+        row.kind = "structured_ready".to_string();
+        row.content = json;
+        row.streaming = false;
+        row.source = None;
+        return;
+    }
+    turn.output.push(LlmOutputItemState {
+        kind: "structured_ready".to_string(),
+        content: json,
+        streaming: false,
+        source: None,
+    });
 }
 
 fn module_mut(state: &mut ModulesState, owner: String) -> &mut ModuleState {
@@ -387,27 +490,27 @@ fn module_mut(state: &mut ModulesState, owner: String) -> &mut ModuleState {
 }
 
 fn module_title(module: &ModuleState) -> String {
-    format!("{} {}", status_icon(module.status), module.owner)
+    format!("{} {}", status_label(module.status), module.owner)
 }
 
-fn status_icon(status: ModuleSessionStatus) -> &'static str {
+fn status_label(status: ModuleSessionStatus) -> &'static str {
     match status {
-        ModuleSessionStatus::Idle => "⚪",
-        ModuleSessionStatus::Running => "🟢",
-        ModuleSessionStatus::Retrying => "⏱️",
-        ModuleSessionStatus::Completed => "✅",
-        ModuleSessionStatus::Failed => "❌",
+        ModuleSessionStatus::Idle => "idle",
+        ModuleSessionStatus::Running => "running",
+        ModuleSessionStatus::Retrying => "retrying",
+        ModuleSessionStatus::Completed => "done",
+        ModuleSessionStatus::Failed => "failed",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmTraceEvent, llm_chat::LlmChatRole};
+    use crate::{LlmObservationSource, LlmUsageView};
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
 
     #[test]
-    fn trace_events_update_module_stream_state() {
+    fn observation_events_update_module_stream_state() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         apply_runtime_event(
@@ -419,20 +522,30 @@ mod tests {
                 tier: nuillu_types::ModelTier::Default,
             },
         );
-        apply_trace_event(
+        apply_llm_observation(
             &mut state,
-            LlmTraceEvent::SpanOpened {
-                span_id: "1".to_string(),
-                parent_span_id: None,
-                kind: Some("text".to_string()),
-                model: None,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-1".to_string(),
+                owner: owner.to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: vec![LlmInputItemView {
+                    role: "user".to_string(),
+                    kind: "text".to_string(),
+                    content: "hello".to_string(),
+                    ephemeral: false,
+                    source: None,
+                }],
             },
         );
-        apply_trace_event(
+        apply_llm_observation(
             &mut state,
-            LlmTraceEvent::OutputDelta {
-                span_id: "1".to_string(),
-                kind: LlmChatItemKind::Text,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-1".to_string(),
+                kind: "text".to_string(),
                 delta: "world".to_string(),
             },
         );
@@ -441,37 +554,97 @@ mod tests {
             .modules
             .get(&owner.to_string())
             .expect("module exists");
-        assert_eq!(module.turns[0].output.messages[0].content, "world");
-        assert_eq!(
-            module.turns[0].output.messages[0].role,
-            LlmChatRole::Assistant
-        );
+        assert_eq!(module.turns[0].output[0].content, "world");
+        assert_eq!(module.turns[0].input[0].content, "hello");
         assert_eq!(module.status, ModuleSessionStatus::Running);
     }
 
     #[test]
-    fn trace_parent_span_maps_llm_turn_to_module_owner() {
+    fn completion_marks_turn_done_and_preserves_compaction_source() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO).to_string();
 
-        apply_trace_event(
+        apply_llm_observation(
             &mut state,
-            LlmTraceEvent::ModuleSpanOpened {
-                span_id: "activate-1".to_string(),
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-2".to_string(),
                 owner: owner.clone(),
+                module: "memory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::SessionCompaction,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
             },
         );
-        apply_trace_event(
+        apply_llm_observation(
             &mut state,
-            LlmTraceEvent::SpanOpened {
-                span_id: "turn-1".to_string(),
-                parent_span_id: Some("activate-1".to_string()),
-                kind: Some("text".to_string()),
-                model: None,
+            LlmObservationEvent::Completed {
+                turn_id: "turn-2".to_string(),
+                request_id: Some("req-2".to_string()),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsageView {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    total_tokens: 5,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
             },
         );
 
-        assert!(state.modules.contains_key(&owner));
-        assert!(!state.modules.contains_key(UNATTRIBUTED_LLM_OWNER));
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].source,
+            LlmObservationSource::SessionCompaction
+        );
+        assert_eq!(module.turns[0].status, ModuleSessionStatus::Completed);
+        assert_eq!(module.status, ModuleSessionStatus::Completed);
+    }
+
+    #[test]
+    fn structured_ready_replaces_streaming_structured_row() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO).to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-3".to_string(),
+                owner: owner.clone(),
+                module: "query-vector".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "structured_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-3".to_string(),
+                kind: "structured".to_string(),
+                delta: "{\"answer\":".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StructuredReady {
+                turn_id: "turn-3".to_string(),
+                json: "{\"answer\":true}".to_string(),
+            },
+        );
+
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].output,
+            vec![LlmOutputItemState {
+                kind: "structured_ready".to_string(),
+                content: "{\"answer\":true}".to_string(),
+                streaming: false,
+                source: None,
+            }]
+        );
     }
 }

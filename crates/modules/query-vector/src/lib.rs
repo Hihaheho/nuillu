@@ -729,7 +729,7 @@ mod tests {
         let cx = ActivateCx::new(
             &catalog,
             &identity_memories,
-            runtime.session_compaction_lutum(),
+            runtime.session_compaction_lutum().clone(),
             test_now(),
         );
         module.activate(&cx, &batch).await.expect("query activated");

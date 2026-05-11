@@ -1,10 +1,10 @@
 pub mod blackboard;
 pub mod chat;
 pub mod cognition;
-pub mod llm_chat;
 pub mod memories;
 pub mod memos;
 pub mod modules;
+pub mod text;
 pub mod window;
 
 pub use eframe;
@@ -17,8 +17,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use nuillu_module::{RuntimeEvent, SensoryInput};
 use serde::{Deserialize, Serialize};
-
-pub use llm_chat::{LlmChatItemKind, LlmChatMessage, LlmChatRole, LlmChatTranscript};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VisualizerTabId(pub String);
@@ -63,9 +61,9 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         event: RuntimeEvent,
     },
-    LlmTrace {
+    LlmObserved {
         tab_id: VisualizerTabId,
-        event: LlmTraceEvent,
+        event: LlmObservationEvent,
     },
     BlackboardSnapshot {
         tab_id: VisualizerTabId,
@@ -102,43 +100,91 @@ pub enum VisualizerCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LlmTraceEvent {
-    ModuleSpanOpened {
-        span_id: String,
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum LlmObservationEvent {
+    ModelInput {
+        turn_id: String,
         owner: String,
+        module: String,
+        replica: u8,
+        tier: String,
+        source: LlmObservationSource,
+        operation: String,
+        items: Vec<LlmInputItemView>,
     },
-    SpanOpened {
-        span_id: String,
-        parent_span_id: Option<String>,
-        kind: Option<String>,
-        model: Option<String>,
-    },
-    SpanRecorded {
-        span_id: String,
-        model: Option<String>,
+    StreamStarted {
+        turn_id: String,
+        owner: String,
+        module: String,
+        replica: u8,
+        tier: String,
+        source: LlmObservationSource,
+        operation: String,
         request_id: Option<String>,
-        finish_reason: Option<String>,
+        model: String,
     },
-    Input {
-        span_id: String,
-        transcript: LlmChatTranscript,
-    },
-    OutputDelta {
-        span_id: String,
-        kind: LlmChatItemKind,
+    StreamDelta {
+        turn_id: String,
+        kind: String,
         delta: String,
     },
-    OutputCompleted {
-        span_id: String,
-        transcript: LlmChatTranscript,
+    ToolCallChunk {
+        turn_id: String,
+        id: String,
+        name: String,
+        arguments_json_delta: String,
     },
-    Error {
-        span_id: String,
-        message: String,
+    ToolCallReady {
+        turn_id: String,
+        id: String,
+        name: String,
+        arguments_json: String,
     },
-    SpanClosed {
-        span_id: String,
+    StructuredReady {
+        turn_id: String,
+        json: String,
     },
+    Completed {
+        turn_id: String,
+        request_id: Option<String>,
+        finish_reason: String,
+        usage: LlmUsageView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmObservationSource {
+    ModuleTurn,
+    SessionCompaction,
+}
+
+impl LlmObservationSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ModuleTurn => "module",
+            Self::SessionCompaction => "compaction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmInputItemView {
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub ephemeral: bool,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmUsageView {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_micros_usd: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,8 +424,8 @@ impl VisualizerState {
                     tab.runtime_events.pop_front();
                 }
             }
-            VisualizerEvent::LlmTrace { tab_id, event } => {
-                modules::apply_trace_event(&mut self.tab_mut(tab_id).modules, event);
+            VisualizerEvent::LlmObserved { tab_id, event } => {
+                modules::apply_llm_observation(&mut self.tab_mut(tab_id).modules, event);
             }
             VisualizerEvent::BlackboardSnapshot { tab_id, snapshot } => {
                 self.tab_mut(tab_id).blackboard = snapshot;
@@ -518,7 +564,7 @@ impl RuntimeTab {
     fn logs_ui(&self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for log in &self.logs {
-                llm_chat::wrapped_label(ui, log);
+                text::wrapped_label(ui, log);
             }
         });
     }

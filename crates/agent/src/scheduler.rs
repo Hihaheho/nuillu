@@ -9,9 +9,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord};
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
-    ModuleBatch, ModuleDependencies, ModuleRunStatus, ports::Clock,
+    LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies, ModuleRunStatus,
+    ports::Clock,
 };
-use nuillu_types::{ModuleId, ModuleInstanceId};
+use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId};
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{Instant, sleep_until};
@@ -1068,10 +1069,18 @@ async fn activate_with_retries(
     batch: &ModuleBatch,
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
+    let module_owner = module.owner().clone();
     let cx = ActivateCx::new(
         catalog,
         identity_memories,
-        runtime.session_compaction_lutum(),
+        runtime
+            .session_compaction_lutum()
+            .clone()
+            .with_extension(LlmRequestMetadata {
+                owner: module_owner,
+                tier: ModelTier::Cheap,
+                source: LlmRequestSource::SessionCompaction,
+            }),
         runtime.clock().now(),
     );
     let mut retries = 0_u8;
@@ -1139,9 +1148,10 @@ mod tests {
     use nuillu_module::{
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
-        CognitionWriter, Memo, Module, ModuleDependencies, ModuleRegistry,
+        CognitionWriter, LlmRequestMetadata, LlmRequestSource, Memo, Module, ModuleDependencies,
+        ModuleRegistry,
     };
-    use nuillu_types::{MemoryContent, MemoryIndex, ModuleId, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaIndex, builtin};
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
@@ -1156,6 +1166,10 @@ mod tests {
 
     fn echo_id() -> ModuleId {
         ModuleId::new("echo").unwrap()
+    }
+
+    fn compaction_observer_id() -> ModuleId {
+        ModuleId::new("compaction-observer").unwrap()
     }
 
     fn request_question(request: &AttentionControlRequest) -> &str {
@@ -1204,6 +1218,44 @@ mod tests {
                 .await;
             if let Some(tx) = self.on_done.take() {
                 let _ = tx.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct CompactionMetadataObserver {
+        attention_control_inbox: AttentionControlRequestInbox,
+        on_seen: Option<oneshot::Sender<Option<LlmRequestMetadata>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for CompactionMetadataObserver {
+        type Batch = AttentionControlRequest;
+
+        fn id() -> &'static str {
+            "compaction-observer"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.attention_control_inbox.next_item().await?.body)
+        }
+
+        async fn activate(
+            &mut self,
+            cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(tx) = self.on_seen.take() {
+                let metadata = cx
+                    .session_compaction_lutum()
+                    .default_extensions()
+                    .get::<LlmRequestMetadata>()
+                    .cloned();
+                let _ = tx.send(metadata);
             }
             Ok(())
         }
@@ -2159,6 +2211,65 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_context_stamps_session_compaction_lutum_owner() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(compaction_observer_id(), ModuleConfig::default());
+                alloc.set_activation(compaction_observer_id(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (seen_tx, seen_rx) = oneshot::channel();
+                let seen_tx = Rc::new(RefCell::new(Some(seen_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let seen_tx = Rc::clone(&seen_tx);
+                            move |caps| CompactionMetadataObserver {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                on_seen: seen_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::query("ping"))
+                        .await
+                        .expect("attention request should route to observer");
+                    let metadata = seen_rx.await.expect("metadata observed");
+                    assert_eq!(
+                        metadata,
+                        Some(LlmRequestMetadata {
+                            owner: nuillu_types::ModuleInstanceId::new(
+                                compaction_observer_id(),
+                                ReplicaIndex::ZERO,
+                            ),
+                            tier: ModelTier::Cheap,
+                            source: LlmRequestSource::SessionCompaction,
+                        })
+                    );
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("scheduler returned err");
             })
             .await;
     }

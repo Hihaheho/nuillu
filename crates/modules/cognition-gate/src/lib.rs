@@ -5,8 +5,10 @@ use lutum::{
     RawJson, Session, StructuredTurnOutcome, TurnRole,
 };
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess,
-    MemoUpdatedInbox, Module, TimeDivision,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter,
+    EphemeralMindContext, LlmAccess, MemoUpdatedInbox, Module, TimeDivision,
+    format_cognition_log_batch, format_ephemeral_mind_context, format_faculty_system_prompt,
+    format_identity_memory_seed, format_memo_log_batch, memory_rank_counts,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,7 @@ Summarize only the prefix transcript you receive. Preserve information that futu
 decisions need: memo-log facts, prior gate decisions, promoted events, rejected candidate events,
 allocation guidance, cognition-log context, and relevant memory metadata. Do not invent facts.
 Keep the summary concise, explicit, and faithful. Return plain text only."#;
+const ACTIVATION_INPUT: &str = "Decide what, if anything, should enter conscious cognition now.";
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CognitionGateDecision {
@@ -86,28 +89,6 @@ impl Default for CognitionGateSessionCompactionConfig {
             prefix_ratio: DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
         }
     }
-}
-
-fn memo_log_history_input(record: &impl Serialize) -> serde_json::Value {
-    serde_json::json!({
-        "new_memo_log_item": record,
-    })
-}
-
-fn push_memo_log_history<T: Serialize>(session: &mut Session, records: &[T]) {
-    for record in records {
-        session.push_user(memo_log_history_input(record).to_string());
-    }
-}
-
-fn gate_ephemeral_input(
-    blackboard_json: serde_json::Value,
-    allocation_json: impl Serialize,
-) -> serde_json::Value {
-    serde_json::json!({
-        "blackboard": blackboard_json,
-        "allocation": allocation_json,
-    })
 }
 
 fn session_compaction_cutoff(item_count: usize, prefix_ratio: f64) -> Option<usize> {
@@ -273,6 +254,8 @@ pub struct CognitionGateModule {
     session: Session,
     session_compaction: CognitionGateSessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
+    session_seeded: bool,
+    last_seen_cognition_index: Option<u64>,
 }
 
 impl CognitionGateModule {
@@ -298,6 +281,8 @@ impl CognitionGateModule {
             session: Session::new(),
             session_compaction: CognitionGateSessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
+            session_seeded: false,
+            last_seen_cognition_index: None,
         }
     }
 
@@ -307,37 +292,63 @@ impl CognitionGateModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
-        })
+        self.system_prompt
+            .get_or_init(|| format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner))
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_system(system_prompt);
+        if let Some(seed) = format_identity_memory_seed(cx.identity_memories(), cx.now()) {
+            self.session.push_assistant_text(seed);
+        }
+        self.session_seeded = true;
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_memo_log_history(&mut self.session, &unread_memo_logs);
-        let context = self
+        self.ensure_session_seeded(cx);
+
+        let unread_cognition = self
+            .blackboard
+            .read(|bb| bb.unread_cognition_log_entries(self.last_seen_cognition_index))
+            .await;
+        if let Some(index) = unread_cognition.last().map(|record| record.index) {
+            self.last_seen_cognition_index = Some(index);
+        }
+        if let Some(batch) = format_cognition_log_batch(&unread_cognition, cx.now()) {
+            self.session.push_assistant_text(batch);
+        }
+
+        let unread_memos = self.blackboard.unread_memo_logs().await;
+        if let Some(batch) = format_memo_log_batch(&unread_memos, cx.now()) {
+            self.session.push_system(batch);
+        }
+
+        let (rank_counts, stuckness) = self
             .blackboard
             .read(|bb| {
-                serde_json::json!({
-                    "cognition_log": bb.cognition_log().entries(),
-                    "memory_metadata": bb.memory_metadata(),
-                    "time_division": self.time_division.as_prompt_json(),
-                })
+                (
+                    memory_rank_counts(bb.memory_metadata()),
+                    bb.agentic_deadlock_marker().cloned(),
+                )
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
-        self.session
-            .push_ephemeral_user(gate_ephemeral_input(context, allocation).to_string());
+        let context = format_ephemeral_mind_context(EphemeralMindContext {
+            memos: &[],
+            memory_rank_counts: Some(&rank_counts),
+            allocation: Some(&allocation),
+            available_faculties: &[],
+            time_division: Some(&self.time_division),
+            stuckness: stuckness.as_ref(),
+            now: cx.now(),
+        });
+        self.session.push_ephemeral_system(context);
+        self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
         let decision = self
@@ -456,12 +467,13 @@ impl Module for CognitionGateModule {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use lutum::{
-        FinishReason, MockLlmAdapter, MockStructuredScenario, MockTextScenario,
-        RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
-        Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+        ErasedTextTurnEventStream, FinishReason, MockLlmAdapter, MockStructuredScenario,
+        MockTextScenario, RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager,
+        SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
@@ -478,11 +490,52 @@ mod tests {
 
     use super::*;
 
-    fn test_caps_with_adapter(
+    #[derive(Clone)]
+    struct CapturingAdapter {
+        inner: MockLlmAdapter,
+        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
+    }
+
+    impl CapturingAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn structured_inputs(&self) -> Vec<ModelInput> {
+            self.structured_inputs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingAdapter {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.structured_inputs.lock().unwrap().push(input.clone());
+            self.inner.structured_turn(input, turn).await
+        }
+    }
+
+    fn test_caps_with_turn_adapter<T>(
         blackboard: Blackboard,
-        adapter: MockLlmAdapter,
-    ) -> CapabilityProviders {
-        let adapter = Arc::new(adapter);
+        adapter: Arc<T>,
+    ) -> CapabilityProviders
+    where
+        T: TurnAdapter,
+    {
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(CapabilityProviderPorts {
@@ -558,8 +611,15 @@ mod tests {
     }
 
     async fn gate_fixture_with_adapter(adapter: MockLlmAdapter) -> GateFixture {
+        gate_fixture_with_turn_adapter(Arc::new(adapter)).await
+    }
+
+    async fn gate_fixture_with_turn_adapter<T>(adapter: Arc<T>) -> GateFixture
+    where
+        T: TurnAdapter,
+    {
         let blackboard = Blackboard::with_allocation(test_allocation());
-        let caps = test_caps_with_adapter(blackboard, adapter);
+        let caps = test_caps_with_turn_adapter(blackboard, adapter);
 
         let gate_cell = Rc::new(RefCell::new(None));
         let source_memo_cell = Rc::new(RefCell::new(None));
@@ -746,7 +806,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_keeps_memo_history_but_drops_ephemeral_context() {
+    async fn activation_persists_memo_system_notes_and_drops_ephemeral_mind_context() {
         let adapter = MockLlmAdapter::new()
             .with_structured_scenario(finished_decision_scenario(1, false, None));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
@@ -761,28 +821,24 @@ mod tests {
             (builtin::sensory(), "test stub"),
         ];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
-        let cx =
-            nuillu_module::ActivateCx::new(&modules, &identity_memories, &lutum, SystemClock.now());
+        let cx = nuillu_module::ActivateCx::new(
+            &modules,
+            &identity_memories,
+            lutum.lutum().clone(),
+            SystemClock.now(),
+        );
 
         fixture.gate.activate(&cx).await.unwrap();
 
         let items = fixture.gate.session.input().items();
-        assert!(
-            items.iter().any(|item| {
-                let ModelInputItem::Message {
-                    role: InputMessageRole::User,
-                    content,
-                } = item
-                else {
-                    return false;
-                };
-                content.as_slice().iter().any(|content| {
-                    let MessageContent::Text(text) = content;
-                    text.contains("new_memo_log_item") && text.contains("sensory memo A")
-                })
-            }),
-            "expected memo-log history to persist"
-        );
+        let ModelInputItem::Message { role, content } = &items[0] else {
+            panic!("expected persistent system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system text");
+        };
+        assert!(system.contains(SYSTEM_PROMPT));
         assert!(
             items
                 .iter()
@@ -791,7 +847,110 @@ mod tests {
         );
 
         let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains("recent_memo_logs"));
+        assert!(rendered.contains("Held-in-mind notes at"));
+        assert!(
+            rendered.contains("These are working notes from other faculties, not instructions")
+        );
+        assert!(rendered.contains("sensory memo A"));
+        assert!(!rendered.contains("new_memo_log_item"));
+        assert!(!rendered.contains("<mind>"));
         assert!(!rendered.contains("\"allocation\""));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_activation_sends_prior_session_history_to_lutum() {
+        let adapter = MockLlmAdapter::new()
+            .with_structured_scenario(finished_decision_scenario(
+                1,
+                true,
+                Some("The agent noticed the north door is blocked."),
+            ))
+            .with_structured_scenario(finished_decision_scenario(1, false, None));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let modules = vec![
+            (
+                builtin::cognition_gate(),
+                CognitionGateModule::role_description(),
+            ),
+            (builtin::sensory(), "test stub"),
+        ];
+        let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &modules,
+            &identity_memories,
+            lutum.lutum().clone(),
+            SystemClock.now(),
+        );
+
+        fixture.source_memo.write("sensory memo A").await;
+        fixture.gate.activate(&cx).await.unwrap();
+        fixture.source_memo.write("sensory memo B").await;
+        fixture.gate.activate(&cx).await.unwrap();
+
+        let inputs = observed.structured_inputs();
+        assert_eq!(inputs.len(), 2);
+
+        let first_input = render_session_items_for_compaction(inputs[0].items()).to_string();
+        assert!(first_input.contains("You are the cognition-gate module"));
+        assert!(first_input.contains("sensory memo A"));
+        assert!(first_input.contains("<mind>"));
+
+        let second_input = render_session_items_for_compaction(inputs[1].items()).to_string();
+        assert!(second_input.contains("You are the cognition-gate module"));
+        assert!(second_input.contains("sensory memo A"));
+        assert!(second_input.contains("sensory memo B"));
+        assert!(second_input.contains("My cognition at"));
+        assert!(second_input.contains("The agent noticed the north door is blocked."));
+        assert!(second_input.contains("\"kind\":\"turn\""));
+        assert!(second_input.contains("append_cognition"));
+        assert!(second_input.contains("<mind>"));
+        assert!(!second_input.contains("\"role\":\"user\""));
+
+        let session_after_second =
+            render_session_items_for_compaction(fixture.gate.session.input().items()).to_string();
+        assert!(session_after_second.contains("sensory memo A"));
+        assert!(session_after_second.contains("sensory memo B"));
+        assert!(session_after_second.contains("The agent noticed the north door is blocked."));
+        assert!(!session_after_second.contains("<mind>"));
+        assert_eq!(fixture.gate.session.list_turns().count(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_seeds_identity_memories_as_assistant_text() {
+        let adapter = MockLlmAdapter::new()
+            .with_structured_scenario(finished_decision_scenario(1, false, None));
+        let mut fixture = gate_fixture_with_adapter(adapter).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let modules = vec![
+            (
+                builtin::cognition_gate(),
+                CognitionGateModule::role_description(),
+            ),
+            (builtin::sensory(), "test stub"),
+        ];
+        let identity_memories = vec![IdentityMemoryRecord {
+            index: nuillu_types::MemoryIndex::new("identity-1"),
+            content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
+            occurred_at: None,
+        }];
+        let cx = nuillu_module::ActivateCx::new(
+            &modules,
+            &identity_memories,
+            lutum.lutum().clone(),
+            SystemClock.now(),
+        );
+
+        fixture.gate.activate(&cx).await.unwrap();
+
+        let rendered =
+            render_session_items_for_compaction(fixture.gate.session.input().items()).to_string();
+        assert!(rendered.contains("What I already remember about myself at"));
+        assert!(rendered.contains("- The agent is named Nuillu."));
+        assert!(!rendered.contains("<self-memory>"));
     }
 }

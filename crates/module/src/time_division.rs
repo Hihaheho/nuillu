@@ -52,6 +52,14 @@ impl TimeDivision {
             .unwrap_or(&self.fallback_longest_tag)
     }
 
+    pub fn fallback_longest_tag(&self) -> &str {
+        &self.fallback_longest_tag
+    }
+
+    pub fn buckets(&self) -> &[TimeDivisionBucket] {
+        &self.buckets
+    }
+
     pub fn as_prompt_json(&self) -> serde_json::Value {
         serde_json::json!({
             "fallback_longest_tag": self.fallback_longest_tag,

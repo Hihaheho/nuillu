@@ -1,4 +1,4 @@
-use crate::{BlackboardSnapshot, llm_chat::wrapped_label};
+use crate::{BlackboardSnapshot, text::wrapped_label};
 
 pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
     egui::ScrollArea::vertical()

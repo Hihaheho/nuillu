@@ -6,8 +6,10 @@ use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    BlackboardReader, CognitionLogReader, EphemeralMindContext, LlmAccess, Memo, MemoUpdatedInbox,
+    Module, SessionCompactionConfig, compact_session_if_needed, format_cognition_log_batch,
+    format_ephemeral_mind_context, format_faculty_system_prompt, format_identity_memory_seed,
+    format_memo_log_batch, memory_rank_counts,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -101,6 +103,7 @@ pub struct AttentionControllerModule {
     session_compaction: SessionCompactionConfig,
     batching: batch::AttentionControlBatchConfig,
     system_prompt: std::sync::OnceLock<String>,
+    session_seeded: bool,
 }
 
 impl AttentionControllerModule {
@@ -128,6 +131,7 @@ impl AttentionControllerModule {
             session_compaction: SessionCompactionConfig::default(),
             batching: batch::AttentionControlBatchConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
+            session_seeded: false,
         }
     }
 
@@ -138,33 +142,48 @@ impl AttentionControllerModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
-        })
+        self.system_prompt
+            .get_or_init(|| format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner))
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session.push_system(system_prompt);
+        if let Some(seed) = format_identity_memory_seed(cx.identity_memories(), cx.now()) {
+            self.session.push_assistant_text(seed);
+        }
+        self.session_seeded = true;
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_with(
         &mut self,
-        system_prompt: &str,
+        cx: &nuillu_module::ActivateCx<'_>,
         compaction_lutum: &lutum::Lutum,
         requests: &[AttentionControlRequest],
     ) -> Result<()> {
-        let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
-        let blackboard = self
+        self.ensure_session_seeded(cx);
+
+        let unread_cognition = self.cognition_log.unread_events().await;
+        if let Some(batch) = format_cognition_log_batch(&unread_cognition, cx.now()) {
+            self.session.push_assistant_text(batch);
+        }
+
+        let unread_memos = self.blackboard.unread_memo_logs().await;
+        if let Some(batch) = format_memo_log_batch(&unread_memos, cx.now()) {
+            self.session.push_system(batch);
+        }
+
+        let (rank_counts, stuckness) = self
             .blackboard
             .read(|bb| {
-                serde_json::json!({
-                    "memory_metadata": bb.memory_metadata(),
-                })
+                (
+                    memory_rank_counts(bb.memory_metadata()),
+                    bb.agentic_deadlock_marker().cloned(),
+                )
             })
             .await;
         let current = self.allocation_reader.snapshot().await;
@@ -178,17 +197,18 @@ impl AttentionControllerModule {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
 
-        self.session.push_ephemeral_system(system_prompt);
-        self.session.push_ephemeral_user(
-            controller_input(
-                serde_json::to_value(&cognition_log).context("serialize cognition log")?,
-                serde_json::to_value(requests).context("serialize attention-control requests")?,
-                blackboard,
-                serde_json::to_value(&current).context("serialize current allocation")?,
-                controller_schema,
-            )
-            .to_string(),
-        );
+        let context = format_ephemeral_mind_context(EphemeralMindContext {
+            memos: &[],
+            memory_rank_counts: Some(&rank_counts),
+            allocation: Some(&current),
+            available_faculties: cx.modules(),
+            time_division: None,
+            stuckness: stuckness.as_ref(),
+            now: cx.now(),
+        });
+        self.session.push_ephemeral_system(context);
+        self.session
+            .push_ephemeral_developer(controller_request_input(requests));
 
         let lutum = self.llm.lutum().await;
         let result = CONTROLLER_DECISION_SCHEMA
@@ -287,20 +307,54 @@ fn fallback_allocation_decision_schema() -> Schema {
     .expect("fallback allocation decision schema must be a JSON object")
 }
 
-fn controller_input(
-    cognition_log: serde_json::Value,
-    attention_control_requests: serde_json::Value,
-    blackboard: serde_json::Value,
-    allocation: serde_json::Value,
-    controller_schema: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "cognition_log": cognition_log,
-        "attention_control_requests": attention_control_requests,
-        "blackboard": blackboard,
-        "allocation": allocation,
-        "controller_schema": controller_schema,
-    })
+fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
+    if requests.is_empty() {
+        return "No current attention-control requests.".to_owned();
+    }
+
+    let mut output = String::from("Current attention-control requests:");
+    for request in requests {
+        output.push('\n');
+        output.push_str("- ");
+        match request {
+            AttentionControlRequest::Query { question, reason } => {
+                output.push_str("Query: ");
+                output.push_str(question.trim());
+                push_optional_reason(&mut output, reason.as_deref());
+            }
+            AttentionControlRequest::SelfModel { question, reason } => {
+                output.push_str("Self-model: ");
+                output.push_str(question.trim());
+                push_optional_reason(&mut output, reason.as_deref());
+            }
+            AttentionControlRequest::Memory {
+                content,
+                importance,
+                reason,
+            } => {
+                output.push_str(match importance {
+                    nuillu_module::MemoryImportance::Normal => "Memory: ",
+                    nuillu_module::MemoryImportance::High => "High-priority memory: ",
+                });
+                output.push_str(content.trim());
+                push_optional_reason(&mut output, Some(reason));
+            }
+            AttentionControlRequest::SensoryDetail { question, reason } => {
+                output.push_str("Sensory detail: ");
+                output.push_str(question.trim());
+                push_optional_reason(&mut output, reason.as_deref());
+            }
+        }
+    }
+    output
+}
+
+fn push_optional_reason(output: &mut String, reason: Option<&str>) {
+    let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
+        return;
+    };
+    output.push_str(" Reason: ");
+    output.push_str(reason);
 }
 
 #[async_trait(?Send)]
@@ -324,13 +378,8 @@ impl Module for AttentionControllerModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.activate_with(
-            &system_prompt,
-            cx.session_compaction_lutum(),
-            &batch.requests,
-        )
-        .await
+        self.activate_with(cx, cx.session_compaction_lutum(), &batch.requests)
+            .await
     }
 }
 
@@ -338,8 +387,210 @@ impl Module for AttentionControllerModule {
 mod tests {
     use super::*;
 
-    use nuillu_blackboard::ResourceAllocation;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    use lutum::{
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockStructuredScenario,
+        RawStructuredTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter,
+        Usage,
+    };
+    use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
+    use nuillu_module::ports::{
+        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
+        NoopUtteranceSink, SystemClock,
+    };
+    use nuillu_module::{
+        CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
+        render_session_items_for_compaction,
+    };
     use nuillu_types::builtin;
+
+    #[derive(Clone)]
+    struct CapturingAdapter {
+        inner: MockLlmAdapter,
+        structured_inputs: Arc<Mutex<Vec<lutum::ModelInput>>>,
+    }
+
+    impl CapturingAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn structured_inputs(&self) -> Vec<lutum::ModelInput> {
+            self.structured_inputs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingAdapter {
+        async fn text_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.structured_inputs.lock().unwrap().push(input.clone());
+            self.inner.structured_turn(input, turn).await
+        }
+    }
+
+    fn test_caps_with_turn_adapter<T>(
+        blackboard: Blackboard,
+        adapter: Arc<T>,
+    ) -> CapabilityProviders
+    where
+        T: TurnAdapter,
+    {
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard,
+            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            primary_memory_store: Arc::new(NoopMemoryStore),
+            memory_replicas: Vec::new(),
+            file_search: Arc::new(NoopFileSearchProvider),
+            utterance_sink: Arc::new(NoopUtteranceSink),
+            clock: Arc::new(SystemClock),
+            tiers: LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        })
+    }
+
+    fn test_allocation() -> ResourceAllocation {
+        let mut allocation = ResourceAllocation::default();
+        for module in [builtin::attention_controller(), builtin::sensory()] {
+            allocation.set(module.clone(), ModuleConfig::default());
+            allocation.set_activation(module, ActivationRatio::ONE);
+        }
+        allocation.set_activation_table(vec![ActivationRatio::ONE]);
+        allocation
+    }
+
+    fn test_bpm() -> std::ops::RangeInclusive<Bpm> {
+        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)
+    }
+
+    macro_rules! noop_stub {
+        ($name:ident, $id:literal) => {
+            struct $name;
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = ();
+
+                fn id() -> &'static str {
+                    $id
+                }
+
+                fn role_description() -> &'static str {
+                    "test stub"
+                }
+
+                async fn next_batch(&mut self) -> Result<Self::Batch> {
+                    std::future::pending().await
+                }
+
+                async fn activate(
+                    &mut self,
+                    _cx: &nuillu_module::ActivateCx<'_>,
+                    _batch: &Self::Batch,
+                ) -> Result<()> {
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    noop_stub!(AttentionControllerStub, "attention-controller");
+    noop_stub!(SensoryStub, "sensory");
+
+    struct ControllerFixture {
+        controller: AttentionControllerModule,
+        source_memo: Memo,
+    }
+
+    async fn controller_fixture_with_turn_adapter<T>(adapter: Arc<T>) -> ControllerFixture
+    where
+        T: TurnAdapter,
+    {
+        let blackboard = Blackboard::with_allocation(test_allocation());
+        let caps = test_caps_with_turn_adapter(blackboard, adapter);
+
+        let controller_cell = Rc::new(RefCell::new(None));
+        let source_memo_cell = Rc::new(RefCell::new(None));
+
+        let controller_sink = Rc::clone(&controller_cell);
+        let source_memo_sink = Rc::clone(&source_memo_cell);
+
+        let _modules = ModuleRegistry::new()
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+                *controller_sink.borrow_mut() = Some(AttentionControllerModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.attention_control_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.allocation_writer(),
+                    caps.memo(),
+                    caps.llm_access(),
+                ));
+                AttentionControllerStub
+            })
+            .unwrap()
+            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+                *source_memo_sink.borrow_mut() = Some(caps.memo());
+                SensoryStub
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        ControllerFixture {
+            controller: controller_cell.borrow_mut().take().unwrap(),
+            source_memo: source_memo_cell.borrow_mut().take().unwrap(),
+        }
+    }
+
+    fn decision_scenario(input_tokens: u64, memo: &str) -> MockStructuredScenario {
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("attention-controller-finished".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk {
+                json_delta: serde_json::json!({
+                    "memo": memo,
+                    "priority": [],
+                })
+                .to_string(),
+            }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("attention-controller-finished".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens,
+                    ..Usage::zero()
+                },
+            }),
+        ])
+    }
 
     #[test]
     fn apply_decision_assigns_table_by_rank_and_zeroes_unlisted() {
@@ -410,44 +661,88 @@ mod tests {
     }
 
     #[test]
-    fn controller_input_includes_blackboard_memos_without_special_protocol() {
-        let input = controller_input(
-            serde_json::json!([]),
-            serde_json::json!([
-                {
-                    "kind": "query",
-                    "question": "which route is safe?",
-                    "reason": "speak-gate requested evidence"
-                }
-            ]),
-            serde_json::json!({
-                "memos": {
-                    "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
-                }
-            }),
-            serde_json::json!({}),
-            serde_json::json!({"schema": true}),
-        );
+    fn controller_request_input_keeps_requests_separate_from_blackboard_context() {
+        let input = controller_request_input(&[
+            AttentionControlRequest::query_with_reason(
+                "which route is safe?",
+                "speak-gate requested evidence",
+            ),
+            AttentionControlRequest::memory(
+                "Remember the north door is blocked.",
+                nuillu_module::MemoryImportance::High,
+                "direct safety constraint",
+            ),
+        ]);
 
         assert_eq!(
             input,
-            serde_json::json!({
-                "cognition_log": [],
-                "attention_control_requests": [
-                    {
-                        "kind": "query",
-                        "question": "which route is safe?",
-                        "reason": "speak-gate requested evidence"
-                    }
-                ],
-                "blackboard": {
-                    "memos": {
-                        "speak-gate": "{\"should_speak\":false,\"rationale\":\"waiting for attended route facts\"}"
-                    }
-                },
-                "allocation": {},
-                "controller_schema": {"schema": true},
-            })
+            "Current attention-control requests:\n- Query: which route is safe? Reason: speak-gate requested evidence\n- High-priority memory: Remember the north door is blocked. Reason: direct safety constraint"
+                .to_owned()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_activation_sends_prior_session_history_to_lutum() {
+        let adapter = MockLlmAdapter::new()
+            .with_structured_scenario(decision_scenario(1, "first controller note"))
+            .with_structured_scenario(decision_scenario(1, "second controller note"));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.controller.llm.lutum().await;
+        let modules = vec![
+            (
+                builtin::attention_controller(),
+                AttentionControllerModule::role_description(),
+            ),
+            (builtin::sensory(), "test stub"),
+        ];
+        let identity_memories = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &modules,
+            &identity_memories,
+            lutum.lutum().clone(),
+            SystemClock.now(),
+        );
+
+        fixture.source_memo.write("sensory memo A").await;
+        fixture
+            .controller
+            .activate_with(&cx, &lutum, &[])
+            .await
+            .unwrap();
+        fixture.source_memo.write("sensory memo B").await;
+        fixture
+            .controller
+            .activate_with(&cx, &lutum, &[])
+            .await
+            .unwrap();
+
+        let inputs = observed.structured_inputs();
+        assert_eq!(inputs.len(), 2);
+
+        let first_input = render_session_items_for_compaction(inputs[0].items()).to_string();
+        assert!(first_input.contains("You are the attention-controller module"));
+        assert!(first_input.contains("sensory memo A"));
+        assert!(first_input.contains("<mind>"));
+
+        let second_input = render_session_items_for_compaction(inputs[1].items()).to_string();
+        assert!(second_input.contains("You are the attention-controller module"));
+        assert!(second_input.contains("sensory memo A"));
+        assert!(second_input.contains("sensory memo B"));
+        assert!(second_input.contains("first controller note"));
+        assert!(second_input.contains("\"kind\":\"turn\""));
+        assert!(second_input.contains("<mind>"));
+        assert!(!second_input.contains("\"role\":\"user\""));
+
+        let session_after_second =
+            render_session_items_for_compaction(fixture.controller.session.input().items())
+                .to_string();
+        assert!(session_after_second.contains("sensory memo A"));
+        assert!(session_after_second.contains("sensory memo B"));
+        assert!(session_after_second.contains("first controller note"));
+        assert!(!session_after_second.contains("<mind>"));
+        assert_eq!(fixture.controller.session.list_turns().count(), 2);
     }
 }

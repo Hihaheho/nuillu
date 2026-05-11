@@ -18,25 +18,11 @@ pub fn format_system_prompt(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) -> String {
-    let mut peers = catalog
-        .iter()
-        .filter(|(id, _)| id != owner)
-        .map(|(id, role)| format!("- {}: {}", id, role))
-        .collect::<Vec<_>>();
-    peers.sort();
-
+    let peers = sorted_peer_lines(catalog, owner);
     let mut prompt = base.to_owned();
-    if !peers.is_empty() {
-        prompt.push_str("\n\nYou are part of a cognitive system. Other modules in this brain:\n");
-        prompt.push_str(&peers.join("\n"));
-        prompt.push('\n');
-    }
+    append_peer_section(&mut prompt, &peers);
     if !identity_memories.is_empty() {
-        if peers.is_empty() {
-            prompt.push_str("\n\n");
-        } else {
-            prompt.push('\n');
-        }
+        prompt.push_str(if peers.is_empty() { "\n\n" } else { "\n" });
         prompt.push_str("Identity memory loaded at agent startup:\n");
         for memory in identity_memories {
             prompt.push_str("- [");
@@ -51,6 +37,40 @@ pub fn format_system_prompt(
         }
     }
     prompt
+}
+
+/// Build the stable, cache-friendly system prompt for one faculty. This
+/// contains role and peer-structure context only; dynamic memory and
+/// blackboard state should be supplied through session seed or ephemeral
+/// activation context.
+pub fn format_faculty_system_prompt(
+    base: &str,
+    catalog: &[(ModuleId, &'static str)],
+    owner: &ModuleId,
+) -> String {
+    let peers = sorted_peer_lines(catalog, owner);
+    let mut prompt = base.to_owned();
+    append_peer_section(&mut prompt, &peers);
+    prompt
+}
+
+fn sorted_peer_lines(catalog: &[(ModuleId, &'static str)], owner: &ModuleId) -> Vec<String> {
+    let mut peers = catalog
+        .iter()
+        .filter(|(id, _)| id != owner)
+        .map(|(id, role)| format!("- {}: {}", id, role))
+        .collect::<Vec<_>>();
+    peers.sort();
+    peers
+}
+
+fn append_peer_section(prompt: &mut String, peers: &[String]) {
+    if peers.is_empty() {
+        return;
+    }
+    prompt.push_str("\n\nYou are part of a cognitive system. Other modules in this brain:\n");
+    prompt.push_str(&peers.join("\n"));
+    prompt.push('\n');
 }
 
 #[cfg(test)]

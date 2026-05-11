@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::{
-    MemoryPage, MemoryRecordView, VisualizerCommand, VisualizerTabId, llm_chat::wrapped_label,
+    MemoryPage, MemoryRecordView, VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 #[derive(Debug)]

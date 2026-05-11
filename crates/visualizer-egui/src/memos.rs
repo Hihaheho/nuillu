@@ -1,4 +1,4 @@
-use crate::{MemoView, llm_chat::wrapped_label};
+use crate::{MemoView, text::wrapped_label};
 
 pub fn ui(ui: &mut egui::Ui, memos: &[MemoView]) {
     egui::ScrollArea::vertical()

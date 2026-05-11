@@ -30,6 +30,7 @@ mod llm;
 mod memo;
 mod memory_caps;
 mod memory_render;
+mod mind_format;
 pub mod ports;
 mod prompt;
 mod rate_limit;
@@ -63,15 +64,20 @@ pub use channels::{
     SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
-pub use llm::{LlmAccess, LlmLease};
+pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};
 pub use memo::{Memo, TypedMemo};
 pub use memory_caps::{
     FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
 };
 pub use memory_render::render_memory_for_llm;
+pub use mind_format::{
+    EphemeralMindContext, MemoryRankCounts, format_cognition_log_batch,
+    format_ephemeral_mind_context, format_identity_memory_seed, format_memo_log_batch,
+    memory_rank_counts,
+};
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
-pub use prompt::format_system_prompt;
+pub use prompt::{format_faculty_system_prompt, format_system_prompt};
 pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
