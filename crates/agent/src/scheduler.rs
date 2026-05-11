@@ -6,14 +6,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord};
+use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord, ZeroReplicaWindowPolicy};
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies, ModuleRunStatus,
     ports::Clock,
 };
-use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId};
+use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{Instant, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
@@ -62,10 +63,14 @@ pub async fn run(
     let mut kick_inboxes: Vec<Option<KickInbox>> = Vec::with_capacity(owners.len());
     let mut kick_handles = Vec::with_capacity(owners.len());
     let mut target_indexes_by_role = HashMap::<ModuleId, Vec<usize>>::new();
+    let mut replica_zero_index_by_role = HashMap::<ModuleId, usize>::new();
     for (index, owner) in owners.iter().enumerate() {
         let (inbox, handle) = KickInbox::new();
         kick_inboxes.push(Some(inbox));
         kick_handles.push(handle);
+        if owner.replica == ReplicaIndex::ZERO {
+            replica_zero_index_by_role.insert(owner.module.clone(), index);
+        }
         target_indexes_by_role
             .entry(owner.module.clone())
             .or_default()
@@ -83,6 +88,10 @@ pub async fn run(
         })
         .collect::<Vec<_>>();
     let mut active = vec![false; states.len()];
+    let mut zero_windows = ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
+    let mut zero_window_wakers = std::iter::repeat_with(|| None)
+        .take(owners.len())
+        .collect::<Vec<_>>();
     let mut tasks: FuturesUnordered<JoinHandle<TaskMessage>> = FuturesUnordered::new();
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let parent = tracing::Span::current();
@@ -94,6 +103,8 @@ pub async fn run(
         &mut states,
         &mut tasks,
         &mut kick_inboxes,
+        &mut zero_window_wakers,
+        &mut zero_windows,
         config,
         &parent,
         &subscriber,
@@ -137,8 +148,11 @@ pub async fn run(
                             &mut states,
                             &mut tasks,
                             &mut kick_inboxes,
+                            &mut zero_window_wakers,
                             &kick_handles,
                             &dependency_targets,
+                            &replica_zero_index_by_role,
+                            &mut zero_windows,
                             config,
                             &parent,
                             &subscriber,
@@ -150,6 +164,8 @@ pub async fn run(
                             &mut states,
                             &mut tasks,
                             &mut kick_inboxes,
+                            &mut zero_window_wakers,
+                            &mut zero_windows,
                             config,
                             &parent,
                             &subscriber,
@@ -249,6 +265,125 @@ struct NextBatchThrottle {
     activation_threshold: ActivationRatio,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZeroReplicaPermit {
+    Open,
+    InFlight,
+}
+
+#[derive(Debug, Clone)]
+struct ZeroReplicaWindowState {
+    controller_activation_period: u32,
+    controller_activations: u32,
+    permit: Option<ZeroReplicaPermit>,
+}
+
+impl ZeroReplicaWindowState {
+    fn new(policy: ZeroReplicaWindowPolicy) -> Option<Self> {
+        Some(Self {
+            controller_activation_period: policy.controller_activation_period()?,
+            controller_activations: 0,
+            permit: None,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.controller_activations = 0;
+        self.permit = None;
+    }
+
+    fn record_zero_controller_activation(&mut self) -> bool {
+        if self.permit.is_some() {
+            return false;
+        }
+        self.controller_activations = self.controller_activations.saturating_add(1);
+        if self.controller_activations >= self.controller_activation_period {
+            self.controller_activations = 0;
+            self.permit = Some(ZeroReplicaPermit::Open);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ZeroReplicaWindows {
+    states: HashMap<ModuleId, ZeroReplicaWindowState>,
+}
+
+impl ZeroReplicaWindows {
+    fn new(policies: HashMap<ModuleId, ZeroReplicaWindowPolicy>) -> Self {
+        let states = policies
+            .into_iter()
+            .filter_map(|(module, policy)| {
+                ZeroReplicaWindowState::new(policy).map(|state| (module, state))
+            })
+            .collect();
+        Self { states }
+    }
+
+    fn allows(&self, owner: &ModuleInstanceId) -> bool {
+        owner.replica == ReplicaIndex::ZERO
+            && self
+                .states
+                .get(&owner.module)
+                .is_some_and(|state| state.permit.is_some())
+    }
+
+    fn mark_batch_accepted(&mut self, owner: &ModuleInstanceId) {
+        if owner.replica != ReplicaIndex::ZERO {
+            return;
+        }
+        if let Some(state) = self.states.get_mut(&owner.module)
+            && matches!(state.permit, Some(ZeroReplicaPermit::Open))
+        {
+            state.permit = Some(ZeroReplicaPermit::InFlight);
+        }
+    }
+
+    fn finish(&mut self, owner: &ModuleInstanceId) {
+        if owner.replica != ReplicaIndex::ZERO {
+            return;
+        }
+        if let Some(state) = self.states.get_mut(&owner.module)
+            && matches!(state.permit, Some(ZeroReplicaPermit::InFlight))
+        {
+            state.permit = None;
+        }
+    }
+
+    fn reset_allocation_active(&mut self, owners: &[ModuleInstanceId], active: &[bool]) {
+        for (owner, active) in owners.iter().zip(active.iter().copied()) {
+            if active && let Some(state) = self.states.get_mut(&owner.module) {
+                state.reset();
+            }
+        }
+    }
+
+    async fn record_controller_activation(
+        &mut self,
+        runtime: &AgentRuntimeControl,
+    ) -> Vec<ModuleId> {
+        let modules = self.states.keys().cloned().collect::<Vec<_>>();
+        let mut opened = Vec::new();
+        for module in modules {
+            let active_replicas = runtime.active_replicas(&module).await;
+            let Some(state) = self.states.get_mut(&module) else {
+                continue;
+            };
+            if active_replicas > 0 {
+                state.reset();
+                continue;
+            }
+            if state.record_zero_controller_activation() {
+                opened.push(module);
+            }
+        }
+        opened
+    }
+}
+
 #[derive(Clone)]
 struct DependencyTargets {
     dependencies: Arc<ModuleDependencies>,
@@ -276,12 +411,19 @@ async fn refresh_active_and_schedule(
     states: &mut [ModuleState],
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     kick_inboxes: &mut [Option<KickInbox>],
+    zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
+    zero_windows: &mut ZeroReplicaWindows,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
+    let mut allocation_active = vec![false; owners.len()];
     for (index, owner) in owners.iter().enumerate() {
-        active[index] = runtime.is_active(owner).await;
+        allocation_active[index] = runtime.is_active(owner).await;
+    }
+    zero_windows.reset_allocation_active(owners, &allocation_active);
+    for (index, owner) in owners.iter().enumerate() {
+        active[index] = allocation_active[index] || zero_windows.allows(owner);
     }
 
     for index in 0..states.len() {
@@ -342,6 +484,8 @@ async fn refresh_active_and_schedule(
                     .take()
                     .expect("kick inbox available for inactive stored module");
                 let activation_waiter = runtime.activation_waiter(&owners[index]).await;
+                let (zero_window_waker, zero_window_waiter) = oneshot::channel();
+                zero_window_wakers[index] = Some(zero_window_waker);
                 spawn_activation_wait(
                     tasks,
                     index,
@@ -349,6 +493,7 @@ async fn refresh_active_and_schedule(
                     kick_inbox,
                     next_batch_throttle,
                     activation_waiter,
+                    zero_window_waiter,
                     parent,
                     subscriber,
                 );
@@ -369,6 +514,7 @@ async fn refresh_active_and_schedule(
                     .await;
             }
             ModuleState::PendingBatch { .. } if active[index] => {
+                zero_windows.mark_batch_accepted(&owners[index]);
                 let ModuleState::PendingBatch {
                     module,
                     batch,
@@ -464,8 +610,11 @@ async fn handle_task_message(
     states: &mut [ModuleState],
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     kick_inboxes: &mut [Option<KickInbox>],
+    zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
+    replica_zero_index_by_role: &HashMap<ModuleId, usize>,
+    zero_windows: &mut ZeroReplicaWindows,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -494,7 +643,8 @@ async fn handle_task_message(
             result,
         } => match result {
             Ok((batch, pending_kicks)) => {
-                if runtime.is_active(&owners[index]).await {
+                if scheduling_active(runtime, zero_windows, &owners[index]).await {
+                    zero_windows.mark_batch_accepted(&owners[index]);
                     let scheduled = spawn_dependency_flush_or_activate(
                         runtime,
                         tasks,
@@ -554,7 +704,7 @@ async fn handle_task_message(
             mut pending_kicks,
         } => {
             pending_kicks.extend(kick_inbox.drain_ready());
-            if runtime.is_active(&owners[index]).await {
+            if scheduling_active(runtime, zero_windows, &owners[index]).await {
                 let scheduled = spawn_activation_gate_or_activate(
                     runtime,
                     tasks,
@@ -617,6 +767,15 @@ async fn handle_task_message(
                     module,
                     next_batch_throttle,
                 };
+                zero_windows.finish(&owners[index]);
+                if owners[index].module == builtin::attention_controller() {
+                    let opened = zero_windows.record_controller_activation(runtime).await;
+                    wake_zero_window_modules(
+                        opened,
+                        replica_zero_index_by_role,
+                        zero_window_wakers,
+                    );
+                }
                 Ok(())
             }
             Err(message) => {
@@ -647,7 +806,7 @@ async fn handle_task_message(
             outcome,
         } => {
             if outcome.allowed() {
-                if runtime.is_active(&owners[index]).await {
+                if scheduling_active(runtime, zero_windows, &owners[index]).await {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
@@ -684,6 +843,7 @@ async fn handle_task_message(
             } else {
                 notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                 kick_inboxes[index] = Some(kick_inbox);
+                zero_windows.finish(&owners[index]);
                 states[index] = ModuleState::Stored {
                     module,
                     next_batch_throttle: None,
@@ -697,6 +857,7 @@ async fn handle_task_message(
             kick_inbox,
             next_batch_throttle,
         } => {
+            zero_window_wakers[index] = None;
             kick_inboxes[index] = Some(kick_inbox);
             states[index] = ModuleState::Stored {
                 module,
@@ -711,6 +872,34 @@ fn notify_pending_and_ready(mut pending_kicks: Vec<Kick>, kick_inbox: &mut KickI
     pending_kicks.extend(kick_inbox.drain_ready());
     for kick in pending_kicks {
         kick.notify_finish();
+    }
+}
+
+async fn scheduling_active(
+    runtime: &AgentRuntimeControl,
+    zero_windows: &mut ZeroReplicaWindows,
+    owner: &ModuleInstanceId,
+) -> bool {
+    if runtime.is_active(owner).await {
+        zero_windows.reset_allocation_active(std::slice::from_ref(owner), &[true]);
+        true
+    } else {
+        zero_windows.allows(owner)
+    }
+}
+
+fn wake_zero_window_modules(
+    modules: Vec<ModuleId>,
+    replica_zero_index_by_role: &HashMap<ModuleId, usize>,
+    zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
+) {
+    for module in modules {
+        let Some(index) = replica_zero_index_by_role.get(&module).copied() else {
+            continue;
+        };
+        if let Some(waker) = zero_window_wakers[index].take() {
+            let _ = waker.send(());
+        }
     }
 }
 
@@ -917,6 +1106,7 @@ fn spawn_activation_wait(
     mut kick_inbox: KickInbox,
     next_batch_throttle: Option<NextBatchThrottle>,
     activation_waiter: Option<tokio::sync::oneshot::Receiver<()>>,
+    zero_window_waiter: tokio::sync::oneshot::Receiver<()>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -927,11 +1117,13 @@ fn spawn_activation_wait(
                     let _ = waiter.await;
                 }
             });
+            let mut zero_window = pin!(zero_window_waiter);
             let mut kick_inbox_closed = false;
             loop {
                 tokio::select! {
                     biased;
                     _ = &mut activation => break,
+                    _ = &mut zero_window => break,
                     maybe_kick = kick_inbox.next(), if !kick_inbox_closed => {
                         if let Some(kick) = maybe_kick {
                             kick.notify_finish();
@@ -1231,7 +1423,8 @@ mod tests {
     use async_trait::async_trait;
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, IdentityMemoryRecord, ModuleConfig,
-        ModuleRunStatus, ResourceAllocation, linear_ratio_fn,
+        ModulePolicy, ModuleRunStatus, ResourceAllocation, ZeroReplicaWindowPolicy,
+        linear_ratio_fn,
     };
     use nuillu_module::{
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
@@ -1239,7 +1432,9 @@ mod tests {
         CognitionWriter, LlmRequestMetadata, LlmRequestSource, Memo, Module, ModuleDependencies,
         ModuleRegistry,
     };
-    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaIndex, builtin};
+    use nuillu_types::{
+        MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
+    };
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
@@ -1310,6 +1505,86 @@ mod tests {
             Ok(())
         }
     }
+
+    struct ControllerTickModule {
+        attention_control_inbox: AttentionControlRequestInbox,
+        activations: Rc<Cell<u32>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ControllerTickModule {
+        type Batch = AttentionControlRequest;
+
+        fn id() -> &'static str {
+            "attention-controller"
+        }
+
+        fn role_description() -> &'static str {
+            "test attention controller"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.attention_control_inbox.next_item().await?.body)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.activations
+                .set(self.activations.get().saturating_add(1));
+            Ok(())
+        }
+    }
+
+    macro_rules! zero_window_target {
+        ($name:ident, $id:literal) => {
+            struct $name {
+                attention_control_inbox: AttentionControlRequestInbox,
+                activations: Rc<Cell<u32>>,
+                batches: Rc<RefCell<Vec<String>>>,
+            }
+
+            #[async_trait(?Send)]
+            impl Module for $name {
+                type Batch = AttentionControlRequest;
+
+                fn id() -> &'static str {
+                    $id
+                }
+
+                fn role_description() -> &'static str {
+                    "test zero-replica target"
+                }
+
+                async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+                    Ok(self.attention_control_inbox.next_item().await?.body)
+                }
+
+                async fn activate(
+                    &mut self,
+                    _cx: &nuillu_module::ActivateCx<'_>,
+                    batch: &Self::Batch,
+                ) -> anyhow::Result<()> {
+                    self.activations
+                        .set(self.activations.get().saturating_add(1));
+                    self.batches
+                        .borrow_mut()
+                        .push(request_question(batch).to_owned());
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    zero_window_target!(ZeroWindowTarget, "zero-window-target");
+    zero_window_target!(ZeroWindowTargetA, "zero-window-target-a");
+    zero_window_target!(ZeroWindowTargetB, "zero-window-target-b");
+    zero_window_target!(
+        HardDisabledZeroWindowTarget,
+        "hard-disabled-zero-window-target"
+    );
 
     struct CompactionMetadataObserver {
         attention_control_inbox: AttentionControlRequestInbox,
@@ -2238,6 +2513,41 @@ mod tests {
         );
     }
 
+    async fn wait_for_cell_count(cell: &Rc<Cell<u32>>, expected: u32) {
+        for _ in 0..100 {
+            if cell.get() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("expected count >= {expected}, got {}", cell.get());
+    }
+
+    fn set_activation(
+        allocation: &mut ResourceAllocation,
+        module: ModuleId,
+        ratio: ActivationRatio,
+    ) {
+        allocation.set(module.clone(), ModuleConfig::default());
+        allocation.set_activation(module, ratio);
+    }
+
+    fn fast_bpm() -> std::ops::RangeInclusive<Bpm> {
+        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)
+    }
+
+    fn test_policy(
+        replicas_range: std::ops::RangeInclusive<u8>,
+        rate_limit_range: std::ops::RangeInclusive<Bpm>,
+    ) -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end()).unwrap(),
+            rate_limit_range,
+            linear_ratio_fn,
+        )
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn typed_query_fanout_reaches_active_module() {
         let local = LocalSet::new();
@@ -2253,9 +2563,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| EchoModule {
@@ -2318,9 +2626,7 @@ mod tests {
                 let seen_tx = Rc::new(RefCell::new(Some(seen_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let seen_tx = Rc::clone(&seen_tx);
                             move |caps| CompactionMetadataObserver {
@@ -2358,6 +2664,486 @@ mod tests {
                 })
                 .await
                 .expect("scheduler returned err");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_runs_queued_work_after_default_controller_period() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id.clone(), ActivationRatio::ONE);
+                set_activation(&mut alloc, target_id.clone(), ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(test_policy(0..=1, fast_bpm()), {
+                        let target_activations = Rc::clone(&target_activations);
+                        let target_batches = Rc::clone(&target_batches);
+                        move |caps| ZeroWindowTarget {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&target_activations),
+                            batches: Rc::clone(&target_batches),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=2 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("tick-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(target_activations.get(), 0);
+                    }
+
+                    mailbox
+                        .publish(AttentionControlRequest::query("tick-3"))
+                        .await
+                        .expect("third controller tick should route");
+                    wait_for_cell_count(&controller_activations, 3).await;
+                    wait_for_cell_count(&target_activations, 1).await;
+
+                    assert_eq!(
+                        blackboard
+                            .read(|bb| bb.allocation().active_replicas(&target_id))
+                            .await,
+                        0
+                    );
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(target_batches.borrow().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_period_is_configurable_per_module() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_a_id = ModuleId::new(ZeroWindowTargetA::id()).unwrap();
+                let target_b_id = ModuleId::new(ZeroWindowTargetB::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
+                set_activation(&mut alloc, target_a_id, ActivationRatio::ZERO);
+                set_activation(&mut alloc, target_b_id, ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_a_activations = Rc::new(Cell::new(0_u32));
+                let target_b_activations = Rc::new(Cell::new(0_u32));
+                let target_a_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let target_b_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(
+                        {
+                            let mut policy = test_policy(0..=1, fast_bpm());
+                            policy.zero_replica_window =
+                                ZeroReplicaWindowPolicy::EveryControllerActivations(2);
+                            policy
+                        },
+                        {
+                            let target_a_activations = Rc::clone(&target_a_activations);
+                            let target_a_batches = Rc::clone(&target_a_batches);
+                            move |caps| ZeroWindowTargetA {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                activations: Rc::clone(&target_a_activations),
+                                batches: Rc::clone(&target_a_batches),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        {
+                            let mut policy = test_policy(0..=1, fast_bpm());
+                            policy.zero_replica_window =
+                                ZeroReplicaWindowPolicy::EveryControllerActivations(4);
+                            policy
+                        },
+                        {
+                            let target_b_activations = Rc::clone(&target_b_activations);
+                            let target_b_batches = Rc::clone(&target_b_batches);
+                            move |caps| ZeroWindowTargetB {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                activations: Rc::clone(&target_b_activations),
+                                batches: Rc::clone(&target_b_batches),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=2 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("period-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    wait_for_cell_count(&target_a_activations, 1).await;
+                    assert_eq!(target_b_activations.get(), 0);
+
+                    for i in 3..=4 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("period-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    wait_for_cell_count(&target_a_activations, 2).await;
+                    wait_for_cell_count(&target_b_activations, 1).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(target_a_batches.borrow().len(), 2);
+                assert_eq!(target_b_batches.borrow().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_counter_resets_when_module_becomes_active() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id.clone(), ActivationRatio::ONE);
+                set_activation(&mut alloc, target_id.clone(), ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(test_policy(0..=1, fast_bpm()), {
+                        let target_activations = Rc::clone(&target_activations);
+                        let target_batches = Rc::clone(&target_batches);
+                        move |caps| ZeroWindowTarget {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&target_activations),
+                            batches: Rc::clone(&target_batches),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=2 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("pre-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    assert_eq!(target_activations.get(), 0);
+
+                    let mut raised = ResourceAllocation::default();
+                    set_activation(&mut raised, controller_id.clone(), ActivationRatio::ONE);
+                    set_activation(&mut raised, target_id.clone(), ActivationRatio::ONE);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(raised))
+                        .await;
+                    wait_for_cell_count(&target_activations, 1).await;
+
+                    let mut lowered = ResourceAllocation::default();
+                    set_activation(&mut lowered, controller_id, ActivationRatio::ONE);
+                    set_activation(&mut lowered, target_id, ActivationRatio::ZERO);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(lowered))
+                        .await;
+                    let post_reset_baseline = target_activations.get();
+
+                    for i in 3..=4 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("post-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(target_activations.get(), post_reset_baseline);
+
+                    mailbox
+                        .publish(AttentionControlRequest::query("post-5"))
+                        .await
+                        .expect("third post-reset tick should route");
+                    wait_for_cell_count(&controller_activations, 5).await;
+                    wait_for_cell_count(&target_activations, post_reset_baseline + 1).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert!(target_batches.borrow().len() >= 2);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_is_one_shot_until_next_full_period() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
+                set_activation(&mut alloc, target_id, ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(
+                        {
+                            let mut policy = test_policy(0..=1, fast_bpm());
+                            policy.zero_replica_window =
+                                ZeroReplicaWindowPolicy::EveryControllerActivations(2);
+                            policy
+                        },
+                        {
+                            let target_activations = Rc::clone(&target_activations);
+                            let target_batches = Rc::clone(&target_batches);
+                            move |caps| ZeroWindowTarget {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                activations: Rc::clone(&target_activations),
+                                batches: Rc::clone(&target_batches),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=2 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("one-shot-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    wait_for_cell_count(&target_activations, 1).await;
+
+                    mailbox
+                        .publish(AttentionControlRequest::query("one-shot-3"))
+                        .await
+                        .expect("next queued message should not immediately re-open");
+                    wait_for_cell_count(&controller_activations, 3).await;
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(target_activations.get(), 1);
+
+                    mailbox
+                        .publish(AttentionControlRequest::query("one-shot-4"))
+                        .await
+                        .expect("second period tick should re-open");
+                    wait_for_cell_count(&controller_activations, 4).await;
+                    wait_for_cell_count(&target_activations, 2).await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(target_batches.borrow().len(), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_policy_can_disable_module() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
+                set_activation(&mut alloc, target_id, ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(
+                        {
+                            let mut policy = test_policy(0..=1, fast_bpm());
+                            policy.zero_replica_window = ZeroReplicaWindowPolicy::Disabled;
+                            policy
+                        },
+                        {
+                            let target_activations = Rc::clone(&target_activations);
+                            let target_batches = Rc::clone(&target_batches);
+                            move |caps| ZeroWindowTarget {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                activations: Rc::clone(&target_activations),
+                                batches: Rc::clone(&target_batches),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=4 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("disabled-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(target_activations.get(), 0);
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert!(target_batches.borrow().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn zero_replica_window_skips_hard_disabled_modules() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let controller_id = builtin::attention_controller();
+                let target_id = ModuleId::new(HardDisabledZeroWindowTarget::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
+                set_activation(&mut alloc, target_id, ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let controller_activations = Rc::new(Cell::new(0_u32));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register(test_policy(1..=1, fast_bpm()), {
+                        let controller_activations = Rc::clone(&controller_activations);
+                        move |caps| ControllerTickModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&controller_activations),
+                        }
+                    })
+                    .unwrap()
+                    .register(test_policy(0..=0, fast_bpm()), {
+                        let target_activations = Rc::clone(&target_activations);
+                        let target_batches = Rc::clone(&target_batches);
+                        move |caps| HardDisabledZeroWindowTarget {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&target_activations),
+                            batches: Rc::clone(&target_batches),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    for i in 1..=4 {
+                        mailbox
+                            .publish(AttentionControlRequest::query(format!("hard-{i}")))
+                            .await
+                            .expect("controller tick should route");
+                        wait_for_cell_count(&controller_activations, i).await;
+                    }
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_eq!(target_activations.get(), 0);
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert!(target_batches.borrow().is_empty());
             })
             .await;
     }
@@ -2409,9 +3195,7 @@ mod tests {
 
         let mut registry = ModuleRegistry::new()
             .register(
-                1..=1,
-                Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                linear_ratio_fn,
+                test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                 {
                     let activations = Rc::clone(&activations);
                     let target_tx = Rc::clone(&target_tx);
@@ -2428,9 +3212,10 @@ mod tests {
         if !primary_votes.borrow().is_empty() {
             registry = registry
                 .register(
-                    0..=u8::try_from(primary_votes.borrow().len()).unwrap(),
-                    Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                    linear_ratio_fn,
+                    test_policy(
+                        0..=u8::try_from(primary_votes.borrow().len()).unwrap(),
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                    ),
                     {
                         let primary_votes = Rc::clone(&primary_votes);
                         let primary_seen_tx = Rc::clone(&primary_seen_tx);
@@ -2447,9 +3232,10 @@ mod tests {
         if !secondary_votes.borrow().is_empty() {
             registry = registry
                 .register(
-                    0..=u8::try_from(secondary_votes.borrow().len()).unwrap(),
-                    Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                    linear_ratio_fn,
+                    test_policy(
+                        0..=u8::try_from(secondary_votes.borrow().len()).unwrap(),
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                    ),
                     {
                         let secondary_votes = Rc::clone(&secondary_votes);
                         let secondary_seen_tx = Rc::clone(&secondary_seen_tx);
@@ -2587,9 +3373,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let seen = Rc::clone(&seen);
                             let done_tx = Rc::clone(&done_tx);
@@ -2657,9 +3441,7 @@ mod tests {
                 // activation_ratio=1.0.
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(2000.0)..=Bpm::from_f64(2000.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(2000.0)..=Bpm::from_f64(2000.0)),
                         {
                             let batches = Rc::clone(&batches);
                             let first_tx = Rc::clone(&first_tx);
@@ -2737,9 +3519,7 @@ mod tests {
                 // should be ~120ms rather than a full 200ms.
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(300.0)..=Bpm::from_f64(300.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(300.0)..=Bpm::from_f64(300.0)),
                         {
                             let batches = Rc::clone(&batches);
                             let activation_delays = Rc::clone(&activation_delays);
@@ -2813,9 +3593,7 @@ mod tests {
                 // takes longer than that, no extra cooldown should be added.
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(500.0)..=Bpm::from_f64(500.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(500.0)..=Bpm::from_f64(500.0)),
                         {
                             let batches = Rc::clone(&batches);
                             let activation_delays = Rc::clone(&activation_delays);
@@ -2883,9 +3661,7 @@ mod tests {
                 // during cooldown and expects the second batch before deadline.
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(120.0)..=Bpm::from_f64(120.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(120.0)..=Bpm::from_f64(120.0)),
                         {
                             let batches = Rc::clone(&batches);
                             let first_tx = Rc::clone(&first_tx);
@@ -2957,9 +3733,7 @@ mod tests {
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| HangingBatchStub,
                     )
                     .unwrap()
@@ -3008,9 +3782,7 @@ mod tests {
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let entered_tx = Rc::clone(&entered_tx);
                             let release_rx = Rc::clone(&release_rx);
@@ -3058,9 +3830,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| CognitionGateStub {
@@ -3107,9 +3877,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let attempts = Rc::clone(&attempts);
                             let done_tx = Rc::clone(&done_tx);
@@ -3163,9 +3931,7 @@ mod tests {
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| AlwaysFailStub { batch_sent: false },
                     )
                     .unwrap()
@@ -3222,9 +3988,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| EchoModule {
@@ -3305,9 +4069,7 @@ mod tests {
 
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependency_activations = Rc::clone(&dependency_activations);
                             let dependency_release_rx = Rc::clone(&dependency_release_rx);
@@ -3321,9 +4083,7 @@ mod tests {
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
                             move |_| ImmediateDependentModule {
@@ -3378,30 +4138,22 @@ mod tests {
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyA,
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyB,
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyC,
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
@@ -3479,16 +4231,12 @@ mod tests {
                 let caps = test_caps(Blackboard::with_allocation(alloc));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyA,
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
                             on_done: None,
@@ -3586,9 +4334,7 @@ mod tests {
 
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependency_activations = Rc::clone(&dependency_activations);
                             let dependency_release_rx = Rc::clone(&dependency_release_rx);
@@ -3601,9 +4347,7 @@ mod tests {
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
@@ -3690,9 +4434,7 @@ mod tests {
 
                 let modules = ModuleRegistry::new()
                     .register(
-                        0..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let target_activated = Rc::clone(&target_activated);
                             move |_| GatedKickTargetModule {
@@ -3703,9 +4445,7 @@ mod tests {
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let gate_seen_tx = Rc::clone(&gate_seen_tx);
                             let gate_allow_rx = Rc::clone(&gate_allow_rx);
@@ -3718,9 +4458,7 @@ mod tests {
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
                             let dependent_collected_tx = Rc::clone(&dependent_collected_tx);
@@ -3793,9 +4531,7 @@ mod tests {
                 let caps = test_caps(Blackboard::default());
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let release_rx = Rc::clone(&release_rx);
                             move |_| FailingBatchModule {
@@ -3861,9 +4597,7 @@ mod tests {
                 let caps = test_caps(blackboard);
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| PendingDependencyModule {
                             release: None,
                             activations: Rc::new(Cell::new(0)),
@@ -3872,9 +4606,7 @@ mod tests {
                     )
                     .unwrap()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
                             on_done: None,
@@ -3975,9 +4707,7 @@ mod tests {
                 let caps = test_caps(Blackboard::with_allocation(alloc));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
                             on_done: None,
@@ -4045,9 +4775,7 @@ mod tests {
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let entered_tx = Rc::clone(&entered_tx);
                             let release_rx = Rc::clone(&release_rx);
@@ -4102,6 +4830,8 @@ mod tests {
                     target_indexes_by_role: Arc::new(HashMap::new()),
                 };
                 let mut followup_tasks = futures::stream::FuturesUnordered::new();
+                let mut zero_window_wakers = vec![None];
+                let mut zero_windows = super::ZeroReplicaWindows::new(HashMap::new());
                 let err = super::handle_task_message(
                     message,
                     &runtime,
@@ -4109,8 +4839,11 @@ mod tests {
                     &mut states,
                     &mut followup_tasks,
                     &mut kick_inboxes,
+                    &mut zero_window_wakers,
                     &[],
                     &dependency_targets,
+                    &HashMap::new(),
+                    &mut zero_windows,
                     test_config(),
                     &parent,
                     &subscriber,
@@ -4145,9 +4878,7 @@ mod tests {
                 let caps = test_caps(blackboard);
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| HangingBatchStub,
                     )
                     .unwrap()
@@ -4209,9 +4940,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                        linear_ratio_fn,
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
                             move |caps| DeadlockObserver {

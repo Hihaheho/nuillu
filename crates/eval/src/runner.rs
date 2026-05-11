@@ -31,7 +31,7 @@ use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    MemoryMetadata, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+    MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryQuery, MemoryStore,
@@ -2510,12 +2510,23 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         })
 }
 
+fn eval_policy(
+    replicas_range: std::ops::RangeInclusive<u8>,
+    rate_limit_range: std::ops::RangeInclusive<Bpm>,
+) -> ModulePolicy {
+    ModulePolicy::new(
+        ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end()).unwrap(),
+        rate_limit_range,
+        linear_ratio_fn,
+    )
+}
+
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
     match module {
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
         EvalModule::Sensory => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2529,7 +2540,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Gates the speak path; must re-fire fast as memos accumulate so
         // the cognition log is current by the time speak-gate considers it.
         EvalModule::CognitionGate => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_cognition_gate::CognitionGateModule::new(
                     caps.memo_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2545,7 +2556,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
-            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_attention_controller::AttentionControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.attention_control_inbox(),
@@ -2561,7 +2572,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Periodic first-person attention narration; not on the critical
         // path for the speak loop.
         EvalModule::AttentionSchema => registry
-            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.memo_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2576,7 +2587,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // On-demand: fires on controller allocation guidance.
         EvalModule::SelfModel => registry
-            .register(0..=1, Bpm::range(3.0, 6.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_self_model::SelfModelModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2590,7 +2601,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
-            .register(0..=1, Bpm::range(6.0, 15.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
                 nuillu_query_vector::QueryVectorModule::new(
                     caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
@@ -2604,7 +2615,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
-            .register(0..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
                 nuillu_query_agentic::QueryAgenticModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2617,7 +2628,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_memory::MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -2630,7 +2641,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
-            .register(0..=1, Bpm::range(2.0, 6.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
                 nuillu_memory_compaction::MemoryCompactionModule::new(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
@@ -2642,7 +2653,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -2656,7 +2667,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Cognition-log triggered; should be quick enough to flag
         // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_surprise::SurpriseModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -2671,7 +2682,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // On the critical path: must respond quickly to cognition-log
         // updates so it can decide to speak before the moment passes.
         EvalModule::SpeakGate => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_speak::SpeakGateModule::new(
                     caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
                     caps.cognition_log_reader(),
@@ -2685,7 +2696,7 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Reactive on cognition-log updates after speak-gate allows the
         // activation. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
-            .register(0..=1, Bpm::range(6.0, 18.0), linear_ratio_fn, |caps| {
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
                 nuillu_speak::SpeakModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -4732,9 +4743,7 @@ prompt = "What am I attending to?"
                 let caps = test_caps_with_adapter(blackboard.clone(), adapter);
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
-                        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
-                        linear_ratio_fn,
+                        eval_policy(1..=1, Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)),
                         |caps| {
                             nuillu_attention_schema::AttentionSchemaModule::new(
                                 caps.memo_updated_inbox(),

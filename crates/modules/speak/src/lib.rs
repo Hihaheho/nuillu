@@ -1393,8 +1393,12 @@ mod tests {
         }
     }
 
-    fn test_bpm() -> std::ops::RangeInclusive<nuillu_blackboard::Bpm> {
-        nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0)
+    fn test_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            nuillu_types::ReplicaCapRange::new(0, 0).unwrap(),
+            nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
+            nuillu_blackboard::linear_ratio_fn,
+        )
     }
 
     macro_rules! noop_stub {
@@ -1453,7 +1457,7 @@ mod tests {
         let attention_control_inbox_sink = Rc::clone(&attention_control_inbox_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 *gate_sink.borrow_mut() = Some(SpeakGateModule::new(
                     caps.activation_gate_for::<SpeakModule>(),
                     caps.cognition_log_reader(),
@@ -1465,7 +1469,7 @@ mod tests {
                 SpeakGateStub
             })
             .unwrap()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 *attention_control_inbox_sink.borrow_mut() = Some(caps.attention_control_inbox());
                 AttentionControllerStub
             })
@@ -1814,7 +1818,7 @@ mod tests {
         let module_sink = Rc::clone(&module_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 *module_sink.borrow_mut() = Some(SpeakModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),

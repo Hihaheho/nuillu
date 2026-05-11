@@ -672,9 +672,11 @@ mod tests {
     ) {
         let modules = ModuleRegistry::new()
             .register(
-                1..=1,
-                Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
-                linear_ratio_fn,
+                nuillu_blackboard::ModulePolicy::new(
+                    nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+                    Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                    linear_ratio_fn,
+                ),
                 |caps| {
                     QueryVectorModule::new(
                         caps.allocation_updated_inbox(),

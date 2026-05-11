@@ -191,9 +191,11 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(
-                1..=1,
-                Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
-                linear_ratio_fn,
+                nuillu_blackboard::ModulePolicy::new(
+                    nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+                    Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                    linear_ratio_fn,
+                ),
                 move |caps| RecordingAttentionController {
                     inner: AttentionControllerModule::new(
                         caps.memo_updated_inbox(),

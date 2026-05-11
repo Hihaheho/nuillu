@@ -387,13 +387,17 @@ mod tests {
         ])
     }
 
-    fn test_bpm() -> std::ops::RangeInclusive<Bpm> {
-        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)
+    fn test_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+            Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+            linear_ratio_fn,
+        )
     }
 
     async fn build_memory(caps: &CapabilityProviders) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
-            .register(1..=1, test_bpm(), linear_ratio_fn, |caps| {
+            .register(test_policy(), |caps| {
                 MemoryModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),

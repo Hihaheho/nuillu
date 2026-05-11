@@ -164,6 +164,7 @@ pub struct ModulePolicy {
     pub replicas_range: ReplicaCapRange,
     pub rate_limit_range: RangeInclusive<Bpm>,
     pub activation_ratio_fn: ActivationRatioFn,
+    pub zero_replica_window: ZeroReplicaWindowPolicy,
 }
 
 impl ModulePolicy {
@@ -176,6 +177,7 @@ impl ModulePolicy {
             replicas_range,
             rate_limit_range,
             activation_ratio_fn,
+            zero_replica_window: ZeroReplicaWindowPolicy::default(),
         }
     }
 
@@ -204,6 +206,35 @@ impl ModulePolicy {
     /// messages can queue until boot wiring or a later policy makes it active.
     pub fn max_active_replicas(&self) -> u8 {
         self.replicas_range.max.max(1)
+    }
+}
+
+/// Scheduler-owned low-activity recovery for roles with zero effective replicas.
+///
+/// This policy does not change [`ResourceAllocation`]. It only lets the agent
+/// scheduler briefly run replica 0 after the role has remained allocation-zero
+/// across a configured number of successful attention-controller activations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroReplicaWindowPolicy {
+    Disabled,
+    EveryControllerActivations(u32),
+}
+
+impl ZeroReplicaWindowPolicy {
+    pub const DEFAULT_CONTROLLER_ACTIVATIONS: u32 = 3;
+
+    pub fn controller_activation_period(self) -> Option<u32> {
+        match self {
+            Self::Disabled => None,
+            Self::EveryControllerActivations(0) => None,
+            Self::EveryControllerActivations(period) => Some(period),
+        }
+    }
+}
+
+impl Default for ZeroReplicaWindowPolicy {
+    fn default() -> Self {
+        Self::EveryControllerActivations(Self::DEFAULT_CONTROLLER_ACTIVATIONS)
     }
 }
 

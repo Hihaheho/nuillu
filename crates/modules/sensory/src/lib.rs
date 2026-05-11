@@ -637,8 +637,12 @@ mod tests {
         (blackboard, caps)
     }
 
-    fn test_bpm() -> std::ops::RangeInclusive<Bpm> {
-        Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)
+    fn test_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            nuillu_types::ReplicaCapRange::new(1, 1).unwrap(),
+            Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+            linear_ratio_fn,
+        )
     }
 
     async fn build_recording_sensory(
@@ -649,7 +653,7 @@ mod tests {
         session_history: Vec<String>,
     ) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
-            .register(1..=1, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 let mut inner = SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.allocation_updated_inbox(),

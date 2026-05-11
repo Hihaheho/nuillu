@@ -1,19 +1,16 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lutum::Lutum;
 use nuillu_blackboard::{
-    ActivationRatio, ActivationRatioFn, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm,
-    ModulePolicy, ModuleRunStatus,
+    ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
+    ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{
-    MemoryRank, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError, ReplicaIndex,
-};
+use nuillu_types::{MemoryRank, ModuleId, ModuleInstanceId, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
@@ -408,6 +405,30 @@ impl AgentRuntimeControl {
                 allocation
                     .cooldown_for(&owner.module)
                     .map(|interval| (interval, allocation.activation_for(&owner.module)))
+            })
+            .await
+    }
+
+    pub async fn active_replicas(&self, module: &ModuleId) -> u8 {
+        self.blackboard
+            .read(|bb| bb.allocation().active_replicas(module))
+            .await
+    }
+
+    pub async fn zero_replica_window_policies(&self) -> HashMap<ModuleId, ZeroReplicaWindowPolicy> {
+        self.blackboard
+            .read(|bb| {
+                bb.module_policies()
+                    .iter()
+                    .filter_map(|(module, policy)| {
+                        (policy.replicas_range.max > 0
+                            && policy
+                                .zero_replica_window
+                                .controller_activation_period()
+                                .is_some())
+                        .then_some((module.clone(), policy.zero_replica_window))
+                    })
+                    .collect()
             })
             .await
     }
@@ -862,14 +883,11 @@ impl ModuleRegistry {
         self
     }
 
-    /// Register a module type with its total active replica range, BPM tempo
-    /// range, and per-module activation-ratio mapping. The module's identity
+    /// Register a module type with its boot-time policy. The module's identity
     /// comes from [`Module::id`] / [`Module::role_description`].
     pub fn register<B>(
         mut self,
-        replicas_range: RangeInclusive<u8>,
-        rate_limit_range: RangeInclusive<Bpm>,
-        activation_ratio_fn: ActivationRatioFn,
+        policy: ModulePolicy,
         builder: B,
     ) -> Result<Self, ModuleRegistryError>
     where
@@ -884,8 +902,6 @@ impl ModuleRegistry {
         {
             return Err(ModuleRegistryError::DuplicateModule { module });
         }
-        let range = ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end())?;
-        let policy = ModulePolicy::new(range, rate_limit_range, activation_ratio_fn);
         self.registrations.push(ModuleRegistration {
             module,
             role_description,
@@ -1038,8 +1054,6 @@ impl Default for ModuleRegistry {
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleRegistryError {
     #[error(transparent)]
-    ReplicaCapRange(#[from] ReplicaCapRangeError),
-    #[error(transparent)]
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
@@ -1074,6 +1088,14 @@ mod tests {
         PortError, SystemClock,
     };
     use crate::test_support::{scoped, test_caps, test_caps_with_stores};
+
+    fn test_policy(replicas_range: std::ops::RangeInclusive<u8>) -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end()).unwrap(),
+            nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
+            nuillu_blackboard::linear_ratio_fn,
+        )
+    }
 
     #[derive(Clone, Default)]
     struct RecordingCognitionLogRepository {
@@ -1226,21 +1248,11 @@ mod tests {
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
-            .register(
-                0..=0,
-                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
-                nuillu_blackboard::linear_ratio_fn,
-                noop_builder,
-            )
+            .register(test_policy(0..=0), noop_builder)
             .unwrap();
 
         let err = registry
-            .register(
-                0..=0,
-                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
-                nuillu_blackboard::linear_ratio_fn,
-                noop_builder,
-            )
+            .register(test_policy(0..=0), noop_builder)
             .unwrap_err();
 
         let expected = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
@@ -1283,12 +1295,7 @@ mod tests {
         );
 
         let modules = ModuleRegistry::new()
-            .register(
-                0..=0,
-                nuillu_blackboard::Bpm::from_f64(60.0)..=nuillu_blackboard::Bpm::from_f64(60.0),
-                nuillu_blackboard::linear_ratio_fn,
-                noop_builder,
-            )
+            .register(test_policy(0..=0), noop_builder)
             .unwrap()
             .build(&caps)
             .await

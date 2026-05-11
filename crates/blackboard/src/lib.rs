@@ -26,8 +26,8 @@ mod state;
 
 pub use allocation::{
     ActivationRatio, ActivationRatioFn, AllocationLimits, Bpm, ModuleConfig, ModulePolicy,
-    RateLimitRatio, ReplicasRatio, ResourceAllocation, linear_ratio_fn, rate_only_ratio_fn,
-    replicas_only_ratio_fn,
+    RateLimitRatio, ReplicasRatio, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+    rate_only_ratio_fn, replicas_only_ratio_fn,
 };
 pub use cognition_log::{
     AgenticDeadlockMarker, CognitionLog, CognitionLogEntry, CognitionLogEntryRecord,

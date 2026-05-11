@@ -495,8 +495,12 @@ mod tests {
         allocation
     }
 
-    fn test_bpm() -> std::ops::RangeInclusive<Bpm> {
-        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)
+    fn test_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            nuillu_types::ReplicaCapRange::new(0, 0).unwrap(),
+            Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+            linear_ratio_fn,
+        )
     }
 
     macro_rules! noop_stub {
@@ -552,7 +556,7 @@ mod tests {
         let source_memo_sink = Rc::clone(&source_memo_cell);
 
         let _modules = ModuleRegistry::new()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 *controller_sink.borrow_mut() = Some(AttentionControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.attention_control_inbox(),
@@ -566,7 +570,7 @@ mod tests {
                 AttentionControllerStub
             })
             .unwrap()
-            .register(0..=0, test_bpm(), linear_ratio_fn, move |caps| {
+            .register(test_policy(), move |caps| {
                 *source_memo_sink.borrow_mut() = Some(caps.memo());
                 SensoryStub
             })
