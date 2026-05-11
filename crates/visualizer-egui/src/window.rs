@@ -93,6 +93,9 @@ impl<'a> PersistedWindow<'a> {
                 window = window.order(Order::Foreground);
             }
             let response = window.show(ui.ctx(), |ui| {
+                // egui keeps a resized window's requested size only when its
+                // contents consume that space.
+                ui.take_available_space();
                 ui.push_id(self.id, add_contents);
             });
 

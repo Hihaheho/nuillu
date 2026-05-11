@@ -379,8 +379,9 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
     }
 
     let mut next_turn_id = selected_turn_id.clone();
+    let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
     ui.horizontal(|ui| {
-        ui.set_min_height(320.0);
+        ui.set_min_height(body_height);
         ui.vertical(|ui| {
             ui.set_width(190.0);
             ui.strong("Turns");
@@ -410,6 +411,8 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
 pub fn window_title(module: &ModuleState) -> String {
     format!("Module - {}", module.owner)
 }
+
+const MODULE_BODY_MIN_HEIGHT: f32 = 160.0;
 
 fn render_turn_list(
     ui: &mut egui::Ui,
