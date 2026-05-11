@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{
-    AssistantInputItem, InputMessageRole, Lutum, MessageContent, ModelInput, ModelInputItem,
-    RawJson, Session, StructuredTurnOutcome, TurnRole,
-};
+use lutum::{Lutum, Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter,
-    EphemeralMindContext, LlmAccess, MemoUpdatedInbox, Module, TimeDivision,
-    format_cognition_log_batch, format_ephemeral_mind_context, format_faculty_system_prompt,
-    format_identity_memory_seed, format_memo_log_batch, memory_rank_counts,
+    EphemeralMindContext, LlmAccess, MemoUpdatedInbox, Module, SessionCompactionConfig,
+    TimeDivision, compact_session_if_needed, format_faculty_system_prompt, memory_rank_counts,
+    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,8 +58,6 @@ currently load-bearing, set append_cognition=false; silence is the default.
 
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
-const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
-const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the cognition-gate module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve information that future cognition-gate
@@ -76,171 +72,7 @@ pub struct CognitionGateDecision {
     pub cognition_text: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CognitionGateSessionCompactionConfig {
-    pub input_token_threshold: u64,
-    pub prefix_ratio: f64,
-}
-
-impl Default for CognitionGateSessionCompactionConfig {
-    fn default() -> Self {
-        Self {
-            input_token_threshold: DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD,
-            prefix_ratio: DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
-        }
-    }
-}
-
-fn session_compaction_cutoff(item_count: usize, prefix_ratio: f64) -> Option<usize> {
-    if item_count < 2 {
-        return None;
-    }
-    let ratio = if prefix_ratio.is_finite() {
-        prefix_ratio.clamp(f64::EPSILON, 1.0)
-    } else {
-        DEFAULT_SESSION_COMPACTION_PREFIX_RATIO
-    };
-    let cutoff = ((item_count as f64) * ratio).floor() as usize;
-    Some(cutoff.clamp(1, item_count.saturating_sub(1)))
-}
-
-fn input_message_role_text(role: InputMessageRole) -> &'static str {
-    match role {
-        InputMessageRole::System => "system",
-        InputMessageRole::Developer => "developer",
-        InputMessageRole::User => "user",
-    }
-}
-
-fn turn_role_text(role: TurnRole) -> &'static str {
-    match role {
-        TurnRole::System => "system",
-        TurnRole::Developer => "developer",
-        TurnRole::User => "user",
-        TurnRole::Assistant => "assistant",
-    }
-}
-
-fn raw_json_value(raw: &RawJson) -> serde_json::Value {
-    serde_json::from_str(raw.get()).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-}
-
-fn render_message_content_for_compaction(content: &MessageContent) -> serde_json::Value {
-    match content {
-        MessageContent::Text(text) => serde_json::json!({
-            "type": "text",
-            "text": text,
-        }),
-    }
-}
-
-fn render_assistant_input_for_compaction(item: &AssistantInputItem) -> serde_json::Value {
-    match item {
-        AssistantInputItem::Text(text) => serde_json::json!({
-            "type": "text",
-            "text": text,
-        }),
-        AssistantInputItem::Reasoning(text) => serde_json::json!({
-            "type": "reasoning",
-            "text": text,
-        }),
-        AssistantInputItem::Refusal(text) => serde_json::json!({
-            "type": "refusal",
-            "text": text,
-        }),
-    }
-}
-
-fn render_turn_item_for_compaction(item: &dyn lutum::ItemView) -> serde_json::Value {
-    if let Some(text) = item.as_text() {
-        return serde_json::json!({
-            "type": "text",
-            "text": text,
-        });
-    }
-    if let Some(text) = item.as_reasoning() {
-        return serde_json::json!({
-            "type": "reasoning",
-            "text": text,
-        });
-    }
-    if let Some(text) = item.as_refusal() {
-        return serde_json::json!({
-            "type": "refusal",
-            "text": text,
-        });
-    }
-    if let Some(call) = item.as_tool_call() {
-        return serde_json::json!({
-            "type": "tool_call",
-            "id": call.id.to_string(),
-            "name": call.name.to_string(),
-            "arguments": raw_json_value(call.arguments),
-        });
-    }
-    if let Some(result) = item.as_tool_result() {
-        return serde_json::json!({
-            "type": "tool_result",
-            "id": result.id.to_string(),
-            "name": result.name.to_string(),
-            "arguments": raw_json_value(result.arguments),
-            "result": raw_json_value(result.result),
-        });
-    }
-    serde_json::json!({
-        "type": "unknown",
-    })
-}
-
-fn render_session_item_for_compaction(index: usize, item: &ModelInputItem) -> serde_json::Value {
-    match item {
-        ModelInputItem::Message { role, content } => serde_json::json!({
-            "index": index,
-            "kind": "message",
-            "role": input_message_role_text(*role),
-            "content": content
-                .as_slice()
-                .iter()
-                .map(render_message_content_for_compaction)
-                .collect::<Vec<_>>(),
-        }),
-        ModelInputItem::Assistant(item) => serde_json::json!({
-            "index": index,
-            "kind": "assistant_input",
-            "item": render_assistant_input_for_compaction(item),
-        }),
-        ModelInputItem::ToolResult(result) => serde_json::json!({
-            "index": index,
-            "kind": "tool_result",
-            "id": result.id.to_string(),
-            "name": result.name.to_string(),
-            "arguments": raw_json_value(&result.arguments),
-            "result": raw_json_value(&result.result),
-        }),
-        ModelInputItem::Turn(turn) => {
-            let items = (0..turn.item_count())
-                .filter_map(|item_index| turn.item_at(item_index))
-                .map(render_turn_item_for_compaction)
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "index": index,
-                "kind": "turn",
-                "role": turn_role_text(turn.role()),
-                "items": items,
-            })
-        }
-    }
-}
-
-fn render_session_items_for_compaction(items: &[ModelInputItem]) -> serde_json::Value {
-    serde_json::Value::Array(
-        items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| render_session_item_for_compaction(index, item))
-            .collect(),
-    )
-}
+pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
 
 pub struct CognitionGateModule {
     owner: nuillu_types::ModuleId,
@@ -301,10 +133,12 @@ impl CognitionGateModule {
             return;
         }
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_system(system_prompt);
-        if let Some(seed) = format_identity_memory_seed(cx.identity_memories(), cx.now()) {
-            self.session.push_assistant_text(seed);
-        }
+        seed_persistent_faculty_session(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
         self.session_seeded = true;
     }
 
@@ -319,14 +153,10 @@ impl CognitionGateModule {
         if let Some(index) = unread_cognition.last().map(|record| record.index) {
             self.last_seen_cognition_index = Some(index);
         }
-        if let Some(batch) = format_cognition_log_batch(&unread_cognition, cx.now()) {
-            self.session.push_assistant_text(batch);
-        }
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
 
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        if let Some(batch) = format_memo_log_batch(&unread_memos, cx.now()) {
-            self.session.push_system(batch);
-        }
+        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
 
         let (rank_counts, stuckness) = self
             .blackboard
@@ -338,16 +168,18 @@ impl CognitionGateModule {
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        let context = format_ephemeral_mind_context(EphemeralMindContext {
-            memos: &[],
-            memory_rank_counts: Some(&rank_counts),
-            allocation: Some(&allocation),
-            available_faculties: &[],
-            time_division: Some(&self.time_division),
-            stuckness: stuckness.as_ref(),
-            now: cx.now(),
-        });
-        self.session.push_ephemeral_system(context);
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: Some(&self.time_division),
+                stuckness: stuckness.as_ref(),
+                now: cx.now(),
+            },
+        );
         self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
@@ -380,61 +212,17 @@ impl CognitionGateModule {
         let StructuredTurnOutcome::Structured(decision) = result.semantic else {
             anyhow::bail!("cognition-gate structured turn refused");
         };
-        self.compact_if_needed(input_tokens, compaction_lutum).await;
+        compact_session_if_needed(
+            &mut self.session,
+            input_tokens,
+            compaction_lutum,
+            self.session_compaction,
+            Self::id(),
+            COMPACTED_COGNITION_GATE_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
         Ok(decision)
-    }
-
-    async fn compact_if_needed(&mut self, input_tokens: u64, lutum: &Lutum) {
-        if input_tokens <= self.session_compaction.input_token_threshold {
-            return;
-        }
-        if let Err(error) = self.compact(lutum).await {
-            tracing::warn!(
-                input_tokens,
-                threshold = self.session_compaction.input_token_threshold,
-                error = ?error,
-                "cognition-gate session compaction failed"
-            );
-        }
-    }
-
-    async fn compact(&mut self, lutum: &Lutum) -> Result<()> {
-        let items = self.session.input().items();
-        let Some(cutoff) =
-            session_compaction_cutoff(items.len(), self.session_compaction.prefix_ratio)
-        else {
-            return Ok(());
-        };
-
-        let prefix = items[..cutoff].to_vec();
-        let suffix = items[cutoff..].to_vec();
-        let transcript =
-            serde_json::to_string_pretty(&render_session_items_for_compaction(&prefix))
-                .context("render cognition-gate session compaction transcript")?;
-
-        let mut summary_session = Session::new();
-        summary_session.push_system(SESSION_COMPACTION_PROMPT);
-        summary_session.push_user(transcript);
-        let summary = summary_session
-            .text_turn(lutum)
-            .collect()
-            .await
-            .context("summarize cognition-gate session prefix")?
-            .assistant_text();
-        let summary = summary.trim();
-        if summary.is_empty() {
-            tracing::warn!("cognition-gate session compaction produced an empty summary");
-            return Ok(());
-        }
-
-        let mut compacted_items = Vec::with_capacity(suffix.len().saturating_add(1));
-        compacted_items.push(ModelInputItem::text(
-            InputMessageRole::System,
-            format!("{COMPACTED_COGNITION_GATE_SESSION_PREFIX}\n{summary}"),
-        ));
-        compacted_items.extend(suffix);
-        self.session = Session::from_input(ModelInput::from_items(compacted_items));
-        Ok(())
     }
 }
 
@@ -471,9 +259,10 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, MockLlmAdapter, MockStructuredScenario,
-        MockTextScenario, RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager,
-        SharedPoolBudgetOptions, TurnAdapter, Usage,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, MessageContent, MockLlmAdapter,
+        MockStructuredScenario, MockTextScenario, ModelInput, ModelInputItem,
+        RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
+        TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
@@ -485,6 +274,7 @@ mod tests {
     };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
+        render_session_items_for_compaction, session_compaction_cutoff,
     };
     use nuillu_types::builtin;
 

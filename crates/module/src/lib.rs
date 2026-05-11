@@ -31,6 +31,7 @@ mod memo;
 mod memory_caps;
 mod memory_render;
 mod mind_format;
+mod mind_session;
 pub mod ports;
 mod prompt;
 mod rate_limit;
@@ -74,6 +75,10 @@ pub use mind_format::{
     EphemeralMindContext, MemoryRankCounts, format_cognition_log_batch,
     format_ephemeral_mind_context, format_identity_memory_seed, format_memo_log_batch,
     memory_rank_counts,
+};
+pub use mind_session::{
+    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;

@@ -7,9 +7,9 @@ use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     BlackboardReader, CognitionLogReader, EphemeralMindContext, LlmAccess, Memo, MemoUpdatedInbox,
-    Module, SessionCompactionConfig, compact_session_if_needed, format_cognition_log_batch,
-    format_ephemeral_mind_context, format_faculty_system_prompt, format_identity_memory_seed,
-    format_memo_log_batch, memory_rank_counts,
+    Module, SessionCompactionConfig, compact_session_if_needed, format_faculty_system_prompt,
+    memory_rank_counts, push_ephemeral_mind_context, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -151,10 +151,12 @@ impl AttentionControllerModule {
             return;
         }
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_system(system_prompt);
-        if let Some(seed) = format_identity_memory_seed(cx.identity_memories(), cx.now()) {
-            self.session.push_assistant_text(seed);
-        }
+        seed_persistent_faculty_session(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
         self.session_seeded = true;
     }
 
@@ -168,14 +170,10 @@ impl AttentionControllerModule {
         self.ensure_session_seeded(cx);
 
         let unread_cognition = self.cognition_log.unread_events().await;
-        if let Some(batch) = format_cognition_log_batch(&unread_cognition, cx.now()) {
-            self.session.push_assistant_text(batch);
-        }
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
 
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        if let Some(batch) = format_memo_log_batch(&unread_memos, cx.now()) {
-            self.session.push_system(batch);
-        }
+        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
 
         let (rank_counts, stuckness) = self
             .blackboard
@@ -197,16 +195,18 @@ impl AttentionControllerModule {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
 
-        let context = format_ephemeral_mind_context(EphemeralMindContext {
-            memos: &[],
-            memory_rank_counts: Some(&rank_counts),
-            allocation: Some(&current),
-            available_faculties: cx.modules(),
-            time_division: None,
-            stuckness: stuckness.as_ref(),
-            now: cx.now(),
-        });
-        self.session.push_ephemeral_system(context);
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: Some(&current),
+                available_faculties: cx.modules(),
+                time_division: None,
+                stuckness: stuckness.as_ref(),
+                now: cx.now(),
+            },
+        );
         self.session
             .push_ephemeral_developer(controller_request_input(requests));
 
