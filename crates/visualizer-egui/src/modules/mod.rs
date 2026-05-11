@@ -34,6 +34,10 @@ impl ModulesState {
     pub fn iter(&self) -> impl Iterator<Item = &ModuleState> {
         self.modules.values()
     }
+
+    pub fn get(&self, owner: &str) -> Option<&ModuleState> {
+        self.modules.get(owner)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -343,111 +347,11 @@ pub fn render_modules_overview(
     egui::ScrollArea::both()
         .id_salt("modules-overview")
         .show(ui, |ui| {
-            egui::Grid::new("modules-overview-grid")
-                .striped(true)
-                .num_columns(13)
-                .min_col_width(56.0)
-                .show(ui, |ui| {
-                    ui.strong("Owner");
-                    ui.strong("Module");
-                    ui.strong("Rep");
-                    ui.strong("Active");
-                    ui.strong("Runtime");
-                    ui.strong("LLM");
-                    ui.strong("Alloc");
-                    ui.strong("Replicas");
-                    ui.strong("Tier");
-                    ui.strong("BPM");
-                    ui.strong("Cooldown");
-                    ui.strong("Throttle");
-                    ui.strong("Latest LLM out");
-                    ui.end_row();
-
-                    for row in &rows {
-                        overview_cell(ui, &row.owner, None, &row.owner, &mut requested_owner);
-                        overview_cell(ui, &row.module, None, &row.owner, &mut requested_owner);
-                        overview_cell(
-                            ui,
-                            &row.replica.to_string(),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            if row.active { "yes" } else { "no" },
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            &row.runtime_status,
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(ui, &row.llm_status, None, &row.owner, &mut requested_owner);
-                        overview_cell(
-                            ui,
-                            &row.activation_ratio
-                                .map(|ratio| format!("{ratio:.2}"))
-                                .unwrap_or_else(|| "-".to_string()),
-                            row.guidance.as_deref(),
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            &row.active_replicas
-                                .map(|replicas| replicas.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            row.tier.as_deref().unwrap_or("-"),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            &row.bpm.map(format_bpm).unwrap_or_else(|| "-".to_string()),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            &row.cooldown_ms
-                                .map(format_millis)
-                                .unwrap_or_else(|| "-".to_string()),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        overview_cell(
-                            ui,
-                            row.throttle.as_deref().unwrap_or("-"),
-                            None,
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        let output = row.latest_llm_output.as_deref().unwrap_or("-");
-                        let output_preview = preview_text(output, 96);
-                        overview_cell(
-                            ui,
-                            &output_preview,
-                            row.latest_llm_output.as_deref(),
-                            &row.owner,
-                            &mut requested_owner,
-                        );
-                        ui.end_row();
-                    }
-                });
+            overview_header(ui);
+            ui.separator();
+            for (index, row) in rows.iter().enumerate() {
+                overview_row(ui, row, index, &mut requested_owner);
+            }
         });
 
     requested_owner
@@ -754,22 +658,145 @@ fn split_tool_result_content(content: &str) -> Option<(&str, &str)> {
     rest.split_once("\nresult:\n")
 }
 
-fn overview_cell(
+const OVERVIEW_ROW_HEIGHT: f32 = 22.0;
+const ACTIVE_COLUMN_WIDTH: f32 = 28.0;
+const MODULE_COLUMN_WIDTH: f32 = 130.0;
+const REPLICA_COLUMN_WIDTH: f32 = 30.0;
+const STATUS_COLUMN_WIDTH: f32 = 128.0;
+const LLM_COLUMN_WIDTH: f32 = 80.0;
+const ALLOCATION_COLUMN_WIDTH: f32 = 36.0;
+const TIER_COLUMN_WIDTH: f32 = 60.0;
+const BPM_COLUMN_WIDTH: f32 = 30.0;
+const COOLDOWN_COLUMN_WIDTH: f32 = 40.0;
+const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
+const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
+
+fn overview_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        overview_header_cell(ui, "", ACTIVE_COLUMN_WIDTH);
+        overview_header_cell(ui, "Module", MODULE_COLUMN_WIDTH);
+        overview_header_cell(ui, "Replica", REPLICA_COLUMN_WIDTH);
+        overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
+        overview_header_cell(ui, "BPM", BPM_COLUMN_WIDTH);
+        overview_header_cell(ui, "Cooldown", COOLDOWN_COLUMN_WIDTH);
+        overview_header_cell(ui, "Throttle", THROTTLE_COLUMN_WIDTH);
+        overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
+        overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
+        overview_header_cell(ui, "LLM", LLM_COLUMN_WIDTH);
+        overview_header_cell(ui, "Latest LLM out", LATEST_OUTPUT_COLUMN_WIDTH);
+    });
+}
+
+fn overview_row(
     ui: &mut egui::Ui,
-    text: &str,
-    hover: Option<&str>,
-    owner: &str,
+    row: &ModuleOverviewRow,
+    index: usize,
     requested_owner: &mut Option<String>,
 ) {
-    let mut response = ui.selectable_label(false, text);
+    let fill = (index % 2 == 1).then(|| ui.visuals().faint_bg_color);
+    let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            overview_checkbox_cell(ui, row.active);
+            overview_module_cell(ui, row, requested_owner);
+            overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
+            overview_label_cell(
+                ui,
+                &row.activation_ratio
+                    .map(|ratio| format!("{ratio:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                row.guidance.as_deref(),
+                ALLOCATION_COLUMN_WIDTH,
+            );
+            overview_label_cell(
+                ui,
+                &row.bpm.map(format_bpm).unwrap_or_else(|| "-".to_string()),
+                None,
+                BPM_COLUMN_WIDTH,
+            );
+            overview_label_cell(
+                ui,
+                &row.cooldown_ms
+                    .map(format_millis)
+                    .unwrap_or_else(|| "-".to_string()),
+                None,
+                COOLDOWN_COLUMN_WIDTH,
+            );
+            overview_label_cell(
+                ui,
+                row.throttle.as_deref().unwrap_or("-"),
+                None,
+                THROTTLE_COLUMN_WIDTH,
+            );
+            overview_label_cell(
+                ui,
+                row.tier.as_deref().unwrap_or("-"),
+                None,
+                TIER_COLUMN_WIDTH,
+            );
+            overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
+            overview_label_cell(ui, &row.llm_status, None, LLM_COLUMN_WIDTH);
+            let output = row.latest_llm_output.as_deref().unwrap_or("-");
+            let output_preview = tail_preview_text(output, 96);
+            overview_label_cell(
+                ui,
+                &output_preview,
+                row.latest_llm_output.as_deref(),
+                LATEST_OUTPUT_COLUMN_WIDTH,
+            );
+        });
+    });
+}
+
+fn overview_header_cell(ui: &mut egui::Ui, text: &str, width: f32) {
+    ui.add_sized(
+        [width, OVERVIEW_ROW_HEIGHT],
+        egui::Label::new(egui::RichText::new(text).strong())
+            .halign(egui::Align::Min)
+            .truncate(),
+    );
+}
+
+fn overview_checkbox_cell(ui: &mut egui::Ui, active: bool) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ACTIVE_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let mut active = active;
+            ui.add_enabled(false, egui::Checkbox::without_text(&mut active));
+        },
+    );
+}
+
+fn overview_module_cell(
+    ui: &mut egui::Ui,
+    row: &ModuleOverviewRow,
+    requested_owner: &mut Option<String>,
+) {
+    let mut response = ui.add_sized(
+        [MODULE_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
+        egui::Button::new(&row.module),
+    );
+    if row.owner != row.module {
+        response = response.on_hover_text(format!("open {}", row.owner));
+    }
+    if response.clicked() {
+        *requested_owner = Some(row.owner.clone());
+    }
+}
+
+fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width: f32) {
+    let response = ui.add_sized(
+        [width, OVERVIEW_ROW_HEIGHT],
+        egui::Label::new(text)
+            .truncate()
+            .show_tooltip_when_elided(true),
+    );
     if let Some(hover) = hover
         && !hover.is_empty()
         && hover != text
     {
-        response = response.on_hover_text(hover);
-    }
-    if response.clicked() {
-        *requested_owner = Some(owner.to_string());
+        response.on_hover_text(hover);
     }
 }
 
@@ -839,30 +866,39 @@ fn latest_llm_output(module: &ModuleState) -> Option<String> {
     Some(format!(
         "{}: {}",
         output.kind,
-        preview_text(&output.content, 160)
+        tail_preview_text(&output.content, 512)
     ))
 }
 
-fn preview_text(text: &str, max_chars: usize) -> String {
+fn replica_label(row: &ModuleOverviewRow) -> String {
+    let index = u16::from(row.replica) + 1;
+    row.active_replicas
+        .map(|total| format!("{index}/{total}"))
+        .unwrap_or_else(|| format!("{index}/-"))
+}
+
+fn tail_preview_text(text: &str, max_chars: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= max_chars {
         return normalized;
     }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
     let mut out = normalized
         .chars()
-        .take(max_chars.saturating_sub(3))
+        .rev()
+        .take(max_chars - 3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .collect::<String>();
-    out.push_str("...");
+    out.insert_str(0, "...");
     out
 }
 
 fn throttle_label(summary: &ThrottleSummary) -> String {
-    format!(
-        "{} {} {}",
-        summary.kind,
-        summary.detail,
-        format_millis(summary.delayed_ms)
-    )
+    format_millis(summary.delayed_ms)
 }
 
 fn format_bpm(bpm: f64) -> String {
@@ -1260,6 +1296,14 @@ mod tests {
     }
 
     #[test]
+    fn tail_preview_omits_prefix_and_keeps_latest_text() {
+        assert_eq!(
+            tail_preview_text("alpha beta gamma delta epsilon", 18),
+            "...a delta epsilon"
+        );
+    }
+
+    #[test]
     fn blackboard_snapshot_creates_module_rows_without_llm_turns() {
         let mut state = ModulesState::default();
         let snapshot = BlackboardSnapshot {
@@ -1397,10 +1441,32 @@ mod tests {
                 guidance: Some("inspect recent input".to_string()),
                 bpm: Some(12.5),
                 cooldown_ms: Some(4800),
-                throttle: Some("batch throttle next_batch 500ms".to_string()),
+                throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn replica_label_uses_one_based_index_and_active_total() {
+        let row = ModuleOverviewRow {
+            owner: "query-vector[1]".to_string(),
+            module: "query-vector".to_string(),
+            replica: 1,
+            active: true,
+            runtime_status: "Activating".to_string(),
+            llm_status: "running".to_string(),
+            activation_ratio: Some(1.0),
+            active_replicas: Some(2),
+            tier: Some("Default".to_string()),
+            guidance: None,
+            bpm: None,
+            cooldown_ms: None,
+            throttle: None,
+            latest_llm_output: None,
+        };
+
+        assert_eq!(replica_label(&row), "2/2");
     }
 
     #[test]

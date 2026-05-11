@@ -24,7 +24,7 @@ pub struct PersistedWindow<'a> {
     title: &'a str,
     default_pos: [f32; 2],
     default_size: [f32; 2],
-    open_requested: bool,
+    open_override: Option<bool>,
 }
 
 impl<'a> PersistedWindow<'a> {
@@ -34,7 +34,7 @@ impl<'a> PersistedWindow<'a> {
             title,
             default_pos: [24.0, 80.0],
             default_size: [520.0, 420.0],
-            open_requested: false,
+            open_override: None,
         }
     }
 
@@ -48,12 +48,20 @@ impl<'a> PersistedWindow<'a> {
         self
     }
 
-    pub fn open_requested(mut self, open_requested: bool) -> Self {
-        self.open_requested = open_requested;
+    pub fn open_requested(self, open_requested: bool) -> Self {
+        if open_requested {
+            self.open_override(Some(true))
+        } else {
+            self
+        }
+    }
+
+    pub fn open_override(mut self, open_override: Option<bool>) -> Self {
+        self.open_override = open_override;
         self
     }
 
-    pub fn show(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    pub fn show(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> bool {
         ui.push_id(self.id, |ui| {
             let state = ui.use_persisted_state(
                 || WindowState {
@@ -63,16 +71,16 @@ impl<'a> PersistedWindow<'a> {
                 },
                 (),
             );
-            let effective_state = if self.open_requested {
-                WindowState {
-                    open: true,
-                    ..*state
-                }
+            let effective_state = if let Some(open) = self.open_override {
+                WindowState { open, ..*state }
             } else {
                 *state
             };
             if !effective_state.open {
-                return;
+                if self.open_override.is_some() {
+                    state.set_next(effective_state);
+                }
+                return false;
             }
 
             let mut open = effective_state.open;
@@ -81,7 +89,7 @@ impl<'a> PersistedWindow<'a> {
                 .open(&mut open)
                 .default_pos(Pos2::new(effective_state.pos[0], effective_state.pos[1]))
                 .default_size(Vec2::new(effective_state.size[0], effective_state.size[1]));
-            if self.open_requested {
+            if self.open_override == Some(true) {
                 window = window.order(Order::Foreground);
             }
             let response = window.show(ui.ctx(), add_contents);
@@ -99,6 +107,8 @@ impl<'a> PersistedWindow<'a> {
                     ..effective_state
                 });
             }
-        });
+            open
+        })
+        .inner
     }
 }

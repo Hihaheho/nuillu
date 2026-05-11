@@ -82,6 +82,7 @@ pub enum VisualizerEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VisualizerCommand {
+    StartSuite,
     SendSensoryInput {
         tab_id: VisualizerTabId,
         input: ChatInput,
@@ -317,11 +318,13 @@ pub struct MemoryPage {
 pub struct VisualizerChannels {
     pub events: Receiver<VisualizerEvent>,
     pub commands: Sender<VisualizerCommand>,
+    pub start_suite_from_ui: bool,
 }
 
 pub struct VisualizerApp {
     events: Receiver<VisualizerEvent>,
     commands: Sender<VisualizerCommand>,
+    start_suite_from_ui: bool,
     state: VisualizerState,
 }
 
@@ -330,6 +333,7 @@ impl VisualizerApp {
         Self {
             events: channels.events,
             commands: channels.commands,
+            start_suite_from_ui: channels.start_suite_from_ui,
             state: VisualizerState::default(),
         }
     }
@@ -354,6 +358,20 @@ impl eframe::App for VisualizerApp {
                     let label = format!("{} {}", tab.status.icon(), tab.title);
                     if ui.selectable_label(selected, label).clicked() {
                         self.state.selected = Some(tab.id.clone());
+                    }
+                }
+                if self.start_suite_from_ui {
+                    let label = if self.state.suite_start_requested {
+                        "Eval started"
+                    } else {
+                        "Start Eval"
+                    };
+                    if ui
+                        .add_enabled(!self.state.suite_start_requested, egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.state.suite_start_requested = true;
+                        let _ = self.commands.send(VisualizerCommand::StartSuite);
                     }
                 }
                 if ui.button("Shutdown").clicked() {
@@ -392,6 +410,7 @@ impl eframe::App for VisualizerApp {
 pub struct VisualizerState {
     tabs: BTreeMap<VisualizerTabId, RuntimeTab>,
     selected: Option<VisualizerTabId>,
+    suite_start_requested: bool,
 }
 
 impl VisualizerState {
@@ -475,6 +494,14 @@ pub struct RuntimeTab {
     modules: modules::ModulesState,
     runtime_events: VecDeque<RuntimeEvent>,
     logs: VecDeque<String>,
+    window_open: BTreeMap<String, bool>,
+    window_requests: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ViewWindowSpec {
+    id: String,
+    title: String,
 }
 
 impl RuntimeTab {
@@ -489,6 +516,8 @@ impl RuntimeTab {
             modules: modules::ModulesState::default(),
             runtime_events: VecDeque::new(),
             logs: VecDeque::new(),
+            window_open: BTreeMap::new(),
+            window_requests: BTreeMap::new(),
         }
     }
 
@@ -497,79 +526,169 @@ impl RuntimeTab {
             ui.heading(format!("{} {}", self.status.icon(), self.title));
             ui.label(format!("runtime events: {}", self.runtime_events.len()));
             ui.label(format!("modules: {}", self.modules.iter().count()));
+            self.view_menu(ui);
         });
 
         self.windows_ui(ui, commands);
     }
 
-    fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerCommand>) {
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        let specs = self.window_specs();
+        ui.menu_button("View", |ui| {
+            for spec in specs {
+                let mut open = self.window_open.get(&spec.id).copied().unwrap_or(true);
+                if ui.checkbox(&mut open, &spec.title).changed() {
+                    self.window_requests.insert(spec.id, open);
+                }
+            }
+        });
+    }
+
+    fn window_specs(&self) -> Vec<ViewWindowSpec> {
         let base = self.id.as_str();
+        let mut specs = vec![
+            ViewWindowSpec {
+                id: format!("{base}:chat"),
+                title: format!("💬 Chat - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:blackboard"),
+                title: format!("🧾 Blackboard - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:memories"),
+                title: format!("🧠 Memory - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:memos"),
+                title: format!("📝 Memo - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:cognition"),
+                title: format!("🧩 Cognition Log - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:logs"),
+                title: format!("📜 Logs - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:modules"),
+                title: format!("Modules - {}", self.title),
+            },
+        ];
+        for module in self.modules.iter() {
+            specs.push(ViewWindowSpec {
+                id: format!("{base}:module:{}", module.owner),
+                title: modules::window_title(module),
+            });
+        }
+        specs
+    }
+
+    fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerCommand>) {
+        let base = self.id.as_str().to_string();
+        let mut window_requests = std::mem::take(&mut self.window_requests);
+
         let chat_id = format!("{base}:chat");
         let chat_title = format!("💬 Chat - {}", self.title);
-        window::PersistedWindow::new(&chat_id, &chat_title)
+        let open = window::PersistedWindow::new(&chat_id, &chat_title)
+            .open_override(window_requests.remove(&chat_id))
             .default_pos(24.0, 88.0)
             .default_size(520.0, 520.0)
             .show(ui, |ui| chat::ui(ui, &self.id, &mut self.chat, commands));
+        self.record_window_open(chat_id, open);
 
         let blackboard_id = format!("{base}:blackboard");
         let blackboard_title = format!("🧾 Blackboard - {}", self.title);
-        window::PersistedWindow::new(&blackboard_id, &blackboard_title)
+        let open = window::PersistedWindow::new(&blackboard_id, &blackboard_title)
+            .open_override(window_requests.remove(&blackboard_id))
             .default_pos(568.0, 88.0)
             .default_size(640.0, 520.0)
             .show(ui, |ui| blackboard::ui(ui, &self.blackboard));
+        self.record_window_open(blackboard_id, open);
 
         let memories_id = format!("{base}:memories");
         let memories_title = format!("🧠 Memory - {}", self.title);
-        window::PersistedWindow::new(&memories_id, &memories_title)
+        let open = window::PersistedWindow::new(&memories_id, &memories_title)
+            .open_override(window_requests.remove(&memories_id))
             .default_pos(96.0, 636.0)
             .default_size(720.0, 360.0)
             .show(ui, |ui| {
                 memories::ui(ui, &self.id, &mut self.memories, commands)
             });
+        self.record_window_open(memories_id, open);
 
         let memos_id = format!("{base}:memos");
         let memos_title = format!("📝 Memo - {}", self.title);
-        window::PersistedWindow::new(&memos_id, &memos_title)
+        let open = window::PersistedWindow::new(&memos_id, &memos_title)
+            .open_override(window_requests.remove(&memos_id))
             .default_pos(840.0, 636.0)
             .default_size(520.0, 360.0)
             .show(ui, |ui| memos::ui(ui, &self.blackboard.memos));
+        self.record_window_open(memos_id, open);
 
         let cognition_id = format!("{base}:cognition");
         let cognition_title = format!("🧩 Cognition Log - {}", self.title);
-        window::PersistedWindow::new(&cognition_id, &cognition_title)
+        let open = window::PersistedWindow::new(&cognition_id, &cognition_title)
+            .open_override(window_requests.remove(&cognition_id))
             .default_pos(1384.0, 636.0)
             .default_size(560.0, 360.0)
             .show(ui, |ui| cognition::ui(ui, &self.blackboard.cognition_logs));
+        self.record_window_open(cognition_id, open);
 
         let logs_id = format!("{base}:logs");
         let logs_title = format!("📜 Logs - {}", self.title);
-        window::PersistedWindow::new(&logs_id, &logs_title)
+        let open = window::PersistedWindow::new(&logs_id, &logs_title)
+            .open_override(window_requests.remove(&logs_id))
             .default_pos(24.0, 1020.0)
             .default_size(520.0, 360.0)
             .show(ui, |ui| self.logs_ui(ui));
+        self.record_window_open(logs_id, open);
 
         let modules_id = format!("{base}:modules");
         let modules_title = format!("Modules - {}", self.title);
         let mut requested_module = None;
-        window::PersistedWindow::new(&modules_id, &modules_title)
+        let open = window::PersistedWindow::new(&modules_id, &modules_title)
+            .open_override(window_requests.remove(&modules_id))
             .default_pos(568.0, 1020.0)
             .default_size(640.0, 360.0)
             .show(ui, |ui| {
                 requested_module =
                     modules::render_modules_overview(ui, &self.blackboard, &self.modules);
             });
+        self.record_window_open(modules_id, open);
 
-        for (index, module) in self.modules.iter().enumerate() {
-            let module_id = format!("{base}:module:{}", module.owner);
-            let module_title = modules::window_title(module);
+        let module_windows = self
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(index, module)| (index, module.owner.clone(), modules::window_title(module)))
+            .collect::<Vec<_>>();
+        for (index, owner, module_title) in module_windows {
+            let module_id = format!("{base}:module:{owner}");
             let x = 1232.0 + (index % 2) as f32 * 440.0;
             let y = 88.0 + (index / 2) as f32 * 380.0;
-            window::PersistedWindow::new(&module_id, &module_title)
-                .open_requested(requested_module.as_deref() == Some(module.owner.as_str()))
-                .default_pos(x, y)
-                .default_size(420.0, 360.0)
-                .show(ui, |ui| modules::render_module(ui, module));
+            let requested = if requested_module.as_deref() == Some(owner.as_str()) {
+                Some(true)
+            } else {
+                window_requests.remove(&module_id)
+            };
+            let open = {
+                let Some(module) = self.modules.get(&owner) else {
+                    continue;
+                };
+                window::PersistedWindow::new(&module_id, &module_title)
+                    .open_override(requested)
+                    .default_pos(x, y)
+                    .default_size(420.0, 360.0)
+                    .show(ui, |ui| modules::render_module(ui, module))
+            };
+            self.record_window_open(module_id, open);
         }
+    }
+
+    fn record_window_open(&mut self, id: String, open: bool) {
+        self.window_open.insert(id, open);
     }
 
     fn push_log(&mut self, message: String) {
@@ -640,5 +759,43 @@ mod tests {
         let tab = state.tabs().get(&tab_id).expect("tab exists");
         assert_eq!(tab.memories.query, "rust");
         assert_eq!(tab.memories.query_results[0].content, "learned rust");
+    }
+
+    #[test]
+    fn view_window_specs_include_overview_and_module_windows() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        state.apply(VisualizerEvent::LlmObserved {
+            tab_id: tab_id.clone(),
+            event: LlmObservationEvent::ModelInput {
+                turn_id: "turn-1".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        });
+
+        let specs = state
+            .tabs()
+            .get(&tab_id)
+            .expect("tab exists")
+            .window_specs();
+
+        assert!(
+            specs
+                .iter()
+                .any(|spec| { spec.id == "case-1:modules" && spec.title == "Modules - Case 1" })
+        );
+        assert!(specs.iter().any(|spec| {
+            spec.id == "case-1:module:sensory" && spec.title == "Module - sensory"
+        }));
     }
 }

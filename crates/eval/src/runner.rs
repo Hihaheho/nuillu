@@ -164,6 +164,7 @@ impl VisualizerHook {
     fn drain_cached_commands_until_shutdown(&mut self) {
         while let Ok(command) = self.commands.recv() {
             match command {
+                VisualizerCommand::StartSuite => {}
                 VisualizerCommand::Shutdown => break,
                 VisualizerCommand::ListMemories {
                     tab_id,

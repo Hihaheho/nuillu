@@ -14,6 +14,7 @@ fn main() -> eframe::Result<()> {
                 VisualizerChannels {
                     events: event_rx,
                     commands: command_tx,
+                    start_suite_from_ui: false,
                 },
             )))
         }),
