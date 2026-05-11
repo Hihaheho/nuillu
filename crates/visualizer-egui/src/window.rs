@@ -92,7 +92,9 @@ impl<'a> PersistedWindow<'a> {
             if self.open_override == Some(true) {
                 window = window.order(Order::Foreground);
             }
-            let response = window.show(ui.ctx(), add_contents);
+            let response = window.show(ui.ctx(), |ui| {
+                ui.push_id(self.id, add_contents);
+            });
 
             if let Some(response) = response {
                 let rect = response.response.rect;

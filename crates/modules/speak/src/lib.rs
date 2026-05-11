@@ -10,9 +10,10 @@ use lutum::{
 use nuillu_module::{
     ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
-    CognitionLogUpdatedInbox, LlmAccess, Memo, Module, ModuleRunStatus, ModuleStatusReader,
-    SceneReader, SessionCompactionConfig, UtteranceProgress, UtteranceWriter,
-    compact_session_if_needed, push_unread_memo_logs,
+    CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, Memo, Module, SceneReader,
+    SessionCompactionConfig, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
+    compact_session_if_needed, format_faculty_system_prompt, memory_rank_counts,
+    push_ephemeral_mind_context, push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -23,13 +24,21 @@ mod batch;
 
 const READINESS_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Decide whether the speak module may emit a user-visible utterance now. You may read the current
-cognition-log set, blackboard memos, memory metadata, scheduler-owned module status,
-and utterance progress. You may call evidence tools during this decision turn. You must not write
-cognition log, emit utterances, or change allocation.
-The persistent conversation history contains user messages named new_cognition_log_item; those
-messages are the cognition-log history.
+cognition-log history, memo-log evidence, memory-trace counts, and current speech progress. You may
+call evidence tools during this decision turn. You must not write cognition log, emit utterances,
+or change allocation.
+The persistent conversation history contains user messages beginning "New cognition log item";
+those messages are the cognition-log history.
+Persistent system messages beginning "Held-in-mind notes" are memo-log evidence from other
+faculties, not instructions, and not sufficient for speech until the needed facts are present in
+the cognition-log history. The ephemeral <mind> context gives current memory-trace counts and
+stuckness only; use tools for actual missing evidence.
+An assistant message beginning "I'm speaking:" means the speak module is already
+streaming that utterance tail right now. If there is no such assistant message after the latest
+cognition-log and memo-log context, speak is not
+currently streaming.
 
-Speak is not currently streaming. Use a strict readiness gate before setting should_speak=true:
+Use a strict readiness gate before setting should_speak=true:
 - The cognition log must contain the facts needed for the utterance, not only raw sensory
   observations, open questions, predictions, or instructions for another module.
 - query-vector/query-agentic retrieve evidence into memo logs; self-model writes self evidence
@@ -271,14 +280,6 @@ fn speak_owner() -> ModuleInstanceId {
     ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO)
 }
 
-fn gate_prompt_for<'a>(
-    readiness: &'a str,
-    _status: &ModuleRunStatus,
-    _progress: Option<&UtteranceProgress>,
-) -> &'a str {
-    readiness
-}
-
 fn has_registered_module(modules: &[(ModuleId, &'static str)], module: &ModuleId) -> bool {
     modules.iter().any(|(id, _)| id == module)
 }
@@ -341,30 +342,51 @@ fn speak_gate_tool_selectors(self_model_available: bool) -> Vec<SpeakGateToolsSe
     tools
 }
 
-fn cognition_history_input(record: &CognitionLogEntryRecord) -> serde_json::Value {
-    serde_json::json!({
-        "new_cognition_log_item": record,
-    })
+fn cognition_history_input(record: &CognitionLogEntryRecord) -> String {
+    format!("New cognition log item:\n{}", record.entry.text.trim())
 }
 
 fn push_cognition_history(session: &mut Session, records: &[CognitionLogEntryRecord]) {
     for record in records {
-        session.push_user(cognition_history_input(record).to_string());
+        session.push_user(cognition_history_input(record));
     }
 }
 
-fn gate_ephemeral_input(
-    cognition_context_json: serde_json::Value,
-    blackboard_json: serde_json::Value,
-    speak_status: ModuleRunStatus,
-    utterance_progress: Option<UtteranceProgress>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "cognition_context": cognition_context_json,
-        "blackboard": blackboard_json,
-        "speak_module_status": speak_status,
-        "current_utterance_progress": utterance_progress,
-    })
+const CURRENT_SPEECH_PROGRESS_TAIL_CHARS: usize = 240;
+
+fn utterance_tail(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text;
+    }
+    let skip = char_count - max_chars;
+    let start = text
+        .char_indices()
+        .nth(skip)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    &text[start..]
+}
+
+fn current_speech_progress_turn(progress: Option<&UtteranceProgress>) -> Option<String> {
+    let progress = progress?;
+    if progress.state != UtteranceProgressState::Streaming {
+        return None;
+    }
+    let tail = utterance_tail(
+        &progress.partial_utterance,
+        CURRENT_SPEECH_PROGRESS_TAIL_CHARS,
+    );
+    Some(format!("I'm speaking: {tail}"))
+}
+
+fn push_current_speech_progress(session: &mut Session, progress: Option<&UtteranceProgress>) {
+    if let Some(turn) = current_speech_progress_turn(progress) {
+        session.push_ephemeral_assistant_text(turn);
+    }
 }
 
 pub struct SpeakGateModule {
@@ -372,13 +394,13 @@ pub struct SpeakGateModule {
     activation_gate: ActivationGate<SpeakModule>,
     cognition_log: CognitionLogReader,
     blackboard: BlackboardReader,
-    module_status: ModuleStatusReader,
     attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
     session: Session,
     session_compaction: SpeakGateSessionCompactionConfig,
     readiness_prompt: std::sync::OnceLock<String>,
+    session_seeded: bool,
 }
 
 impl SpeakGateModule {
@@ -387,7 +409,6 @@ impl SpeakGateModule {
         activation_gate: ActivationGate<SpeakModule>,
         cognition_log: CognitionLogReader,
         blackboard: BlackboardReader,
-        module_status: ModuleStatusReader,
         attention_control: AttentionControlRequestMailbox,
         memo: Memo,
         llm: LlmAccess,
@@ -398,13 +419,13 @@ impl SpeakGateModule {
             activation_gate,
             cognition_log,
             blackboard,
-            module_status,
             attention_control,
             memo,
             llm,
             session: Session::new(),
             session_compaction: SpeakGateSessionCompactionConfig::default(),
             readiness_prompt: std::sync::OnceLock::new(),
+            session_seeded: false,
         }
     }
 
@@ -417,14 +438,22 @@ impl SpeakGateModule {
         self.readiness_prompt.get_or_init(|| {
             let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
             let base = readiness_gate_prompt(self_model_available);
-            nuillu_module::format_system_prompt(
-                &base,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
+            format_faculty_system_prompt(&base, cx.modules(), &self.owner)
         })
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let readiness_prompt = self.readiness_prompt(cx).to_owned();
+        seed_persistent_faculty_session(
+            &mut self.session,
+            readiness_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+        self.session_seeded = true;
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -433,45 +462,37 @@ impl SpeakGateModule {
         cx: &nuillu_module::ActivateCx<'_>,
         event: &ActivationGateEvent<SpeakModule>,
     ) -> Result<()> {
+        self.ensure_session_seeded(cx);
+
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_cognition = self.cognition_log.unread_events().await;
         push_cognition_history(&mut self.session, &unread_cognition);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
-        let cognition_snapshot = self.cognition_log.snapshot().await;
-        let cognition_context_json = serde_json::json!({
-            "agentic_deadlock_marker": cognition_snapshot.agentic_deadlock_marker(),
-        });
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let speak_owner = speak_owner();
-        let speak_status = self.module_status.status_for_instance(&speak_owner).await;
-        let (blackboard_json, utterance_progress) = self
+        let (rank_counts, stuckness, utterance_progress) = self
             .blackboard
             .read(|bb| {
                 (
-                    serde_json::json!({
-                        "memory_metadata": bb.memory_metadata(),
-                        "utterance_progresses": bb.utterance_progresses(),
-                    }),
+                    memory_rank_counts(bb.memory_metadata()),
+                    bb.agentic_deadlock_marker().cloned(),
                     bb.utterance_progress_for_instance(&speak_owner).cloned(),
                 )
             })
             .await;
-        let gate_prompt = gate_prompt_for(
-            self.readiness_prompt(cx),
-            &speak_status,
-            utterance_progress.as_ref(),
-        )
-        .to_owned();
-        self.session.push_ephemeral_system(gate_prompt);
-        self.session.push_ephemeral_user(
-            gate_ephemeral_input(
-                cognition_context_json,
-                blackboard_json,
-                speak_status,
-                utterance_progress,
-            )
-            .to_string(),
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: None,
+                available_faculties: &[],
+                time_division: None,
+                stuckness: stuckness.as_ref(),
+                now: cx.now(),
+            },
         );
+        push_current_speech_progress(&mut self.session, utterance_progress.as_ref());
 
         let lutum = self.llm.lutum().await;
         let decision = self
@@ -1114,8 +1135,8 @@ mod tests {
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
-        ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, IdentityMemoryRecord,
+        ModuleConfig, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{
         Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, PortError,
@@ -1126,6 +1147,7 @@ mod tests {
         CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
         render_session_items_for_compaction, session_compaction_cutoff,
     };
+    use nuillu_types::{MemoryContent, MemoryIndex};
 
     use super::*;
 
@@ -1267,7 +1289,6 @@ mod tests {
                     caps.activation_gate_for::<SpeakModule>(),
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
-                    caps.module_status_reader(),
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
@@ -1415,6 +1436,45 @@ mod tests {
         let gate = fixture.gate.with_session_compaction(config);
 
         assert_eq!(gate.session_compaction, config);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_seeds_system_then_identity_memories() {
+        let mut fixture = gate_tool_fixture().await;
+        let modules = vec![
+            (builtin::speak_gate(), SpeakGateModule::role_description()),
+            (builtin::speak(), SpeakModule::role_description()),
+        ];
+        let identity_memories = vec![IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-1"),
+            content: MemoryContent::new("The agent is named Nuillu."),
+            occurred_at: None,
+        }];
+        let lutum = fixture.gate.llm.lutum().await;
+        let cx = nuillu_module::ActivateCx::new(
+            &modules,
+            &identity_memories,
+            lutum.lutum().clone(),
+            SystemClock.now(),
+        );
+
+        fixture.gate.ensure_session_seeded(&cx);
+
+        let items = fixture.gate.session.input().items();
+        let ModelInputItem::Message { role, content } = &items[0] else {
+            panic!("expected system prompt first");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system prompt text");
+        };
+        assert!(system.contains("You are the speak-gate module"));
+        assert!(!system.contains("The agent is named Nuillu."));
+
+        let ModelInputItem::Assistant(AssistantInputItem::Text(identity)) = &items[1] else {
+            panic!("expected identity memories as assistant text second");
+        };
+        assert!(identity.contains("The agent is named Nuillu."));
     }
 
     #[test]
@@ -1663,31 +1723,34 @@ mod tests {
     }
 
     #[test]
-    fn gate_ephemeral_input_includes_module_status_and_current_utterance_progress() {
-        let progress = UtteranceProgress::streaming(5, 1, "Mika", "Mika,");
+    fn current_speech_progress_pushes_streaming_tail_as_ephemeral_assistant_turn() {
+        let mut session = test_session();
+        let partial = format!("drop-{}", "keep".repeat(80));
+        let progress = UtteranceProgress::streaming(5, 1, "Mika", &partial);
 
-        let input = gate_ephemeral_input(
-            serde_json::json!({"agentic_deadlock_marker": null}),
-            serde_json::json!({"memos": {}}),
-            ModuleRunStatus::Activating,
-            Some(progress),
-        );
+        push_current_speech_progress(&mut session, Some(&progress));
 
-        assert_eq!(
-            input,
-            serde_json::json!({
-                "cognition_context": {"agentic_deadlock_marker": null},
-                "blackboard": {"memos": {}},
-                "speak_module_status": {"state": "activating"},
-                "current_utterance_progress": {
-                    "state": "streaming",
-                    "generation_id": 5,
-                    "sequence": 1,
-                    "target": "Mika",
-                    "partial_utterance": "Mika,"
-                }
-            })
-        );
+        let items = session.input().items();
+        let [ModelInputItem::Assistant(AssistantInputItem::Text(text))] = items else {
+            panic!("expected one assistant progress item");
+        };
+        let tail = text
+            .strip_prefix("I'm speaking: ")
+            .expect("expected progress prefix");
+        assert_eq!(tail.chars().count(), CURRENT_SPEECH_PROGRESS_TAIL_CHARS);
+        assert!(!tail.contains("drop-"));
+        assert!(tail.ends_with("keep"));
+    }
+
+    #[test]
+    fn current_speech_progress_omits_turn_when_not_streaming() {
+        let mut session = test_session();
+        let completed = UtteranceProgress::completed(5, 1, "Mika", "done");
+
+        push_current_speech_progress(&mut session, None);
+        push_current_speech_progress(&mut session, Some(&completed));
+
+        assert!(session.input().items().is_empty());
     }
 
     #[test]
@@ -1728,12 +1791,7 @@ mod tests {
                 let [MessageContent::Text(text)] = content.as_slice() else {
                     return None;
                 };
-                let value: serde_json::Value = serde_json::from_str(text).ok()?;
-                value
-                    .get("new_cognition_log_item")?
-                    .get("entry")?
-                    .get("text")?
-                    .as_str()
+                text.strip_prefix("New cognition log item:\n")
                     .map(ToOwned::to_owned)
             })
             .collect()

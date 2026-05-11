@@ -392,12 +392,13 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
 
         ui.vertical(|ui| {
             ui.set_min_width((ui.available_width() - 8.0).max(260.0));
-            if let Some(turn) = module
+            if let Some((turn_index, turn)) = module
                 .turns
                 .iter()
-                .find(|turn| turn.turn_id == next_turn_id)
+                .enumerate()
+                .find(|(_, turn)| turn.turn_id == next_turn_id)
             {
-                render_active_turn(ui, module, turn);
+                render_active_turn(ui, module, turn_index, turn);
             }
         });
     });
@@ -421,17 +422,24 @@ fn render_turn_list(
         .show(ui, |ui| {
             for (index, turn) in module.turns.iter().enumerate() {
                 let selected = turn.turn_id == selected_turn_id;
-                let response = ui
-                    .selectable_label(selected, turn_list_label(index, turn))
-                    .on_hover_text(&turn.turn_id);
-                if response.clicked() {
-                    *next_turn_id = turn.turn_id.clone();
-                }
+                ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
+                    let response = ui
+                        .selectable_label(selected, turn_list_label(index, turn))
+                        .on_hover_text(&turn.turn_id);
+                    if response.clicked() {
+                        *next_turn_id = turn.turn_id.clone();
+                    }
+                });
             }
         });
 }
 
-fn render_active_turn(ui: &mut egui::Ui, module: &ModuleState, turn: &LlmTurnState) {
+fn render_active_turn(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    turn_index: usize,
+    turn: &LlmTurnState,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} turn {}",
@@ -458,23 +466,33 @@ fn render_active_turn(ui: &mut egui::Ui, module: &ModuleState, turn: &LlmTurnSta
         }
     });
     ui.separator();
-    let id = format!("active-turn:{}:{}", module.owner, turn.turn_id);
     egui::ScrollArea::vertical()
-        .id_salt(id)
+        .id_salt((
+            "active-turn",
+            module.owner.as_str(),
+            turn_index,
+            turn.turn_id.as_str(),
+        ))
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for (index, item) in turn.input.iter().enumerate() {
-                render_input_item(ui, item, &turn.turn_id, index);
+                render_input_item(ui, item, &turn.turn_id, turn_index, index);
                 ui.add_space(6.0);
             }
             for (index, item) in turn.output.iter().enumerate() {
-                render_output_item(ui, item, &turn.turn_id, index);
+                render_output_item(ui, item, &turn.turn_id, turn_index, index);
                 ui.add_space(6.0);
             }
         });
 }
 
-fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView, turn_id: &str, index: usize) {
+fn render_input_item(
+    ui: &mut egui::Ui,
+    item: &LlmInputItemView,
+    turn_id: &str,
+    turn_index: usize,
+    index: usize,
+) {
     egui::Frame::new()
         .fill(ui.visuals().extreme_bg_color)
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -492,11 +510,17 @@ fn render_input_item(ui: &mut egui::Ui, item: &LlmInputItemView, turn_id: &str, 
                 }
             });
             ui.add_space(3.0);
-            render_input_item_content(ui, item, turn_id, index);
+            render_input_item_content(ui, item, turn_id, turn_index, index);
         });
 }
 
-fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState, turn_id: &str, index: usize) {
+fn render_output_item(
+    ui: &mut egui::Ui,
+    item: &LlmOutputItemState,
+    turn_id: &str,
+    turn_index: usize,
+    index: usize,
+) {
     egui::Frame::new()
         .fill(ui.visuals().selection.bg_fill.linear_multiply(0.45))
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -514,7 +538,7 @@ fn render_output_item(ui: &mut egui::Ui, item: &LlmOutputItemState, turn_id: &st
                 }
             });
             ui.add_space(3.0);
-            render_output_item_content(ui, item, turn_id, index);
+            render_output_item_content(ui, item, turn_id, turn_index, index);
         });
 }
 
@@ -522,6 +546,7 @@ fn render_input_item_content(
     ui: &mut egui::Ui,
     item: &LlmInputItemView,
     turn_id: &str,
+    turn_index: usize,
     index: usize,
 ) {
     match item.kind.as_str() {
@@ -531,6 +556,7 @@ fn render_input_item_content(
                 (
                     "input-json",
                     turn_id,
+                    turn_index,
                     index,
                     item.kind.as_str(),
                     item.source.as_deref(),
@@ -548,6 +574,7 @@ fn render_input_item_content(
                     (
                         "input-tool-result-arguments",
                         turn_id,
+                        turn_index,
                         index,
                         item.source.as_deref(),
                     ),
@@ -561,6 +588,7 @@ fn render_input_item_content(
                     (
                         "input-tool-result-output",
                         turn_id,
+                        turn_index,
                         index,
                         item.source.as_deref(),
                     ),
@@ -580,6 +608,7 @@ fn render_output_item_content(
     ui: &mut egui::Ui,
     item: &LlmOutputItemState,
     turn_id: &str,
+    turn_index: usize,
     index: usize,
 ) {
     let json_label = match item.kind.as_str() {
@@ -593,6 +622,7 @@ fn render_output_item_content(
             (
                 "output-json",
                 turn_id,
+                turn_index,
                 index,
                 item.kind.as_str(),
                 item.source.as_deref(),

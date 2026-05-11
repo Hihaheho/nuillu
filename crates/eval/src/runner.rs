@@ -2543,7 +2543,6 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
                     caps.cognition_log_reader(),
                     caps.blackboard_reader(),
-                    caps.module_status_reader(),
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
