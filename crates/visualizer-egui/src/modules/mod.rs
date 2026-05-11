@@ -13,12 +13,14 @@ pub mod surprise;
 
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::time::Duration;
 
 use egui_hooks::UseHookExt as _;
 use nuillu_module::RuntimeEvent;
 
 use crate::{
-    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView,
+    AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
+    LlmObservationSource, LlmUsageView, ModuleStatusView,
     text::{hard_wrap_long_segments, wrapped_label},
 };
 
@@ -37,9 +39,20 @@ impl ModulesState {
 #[derive(Debug, Default)]
 pub struct ModuleState {
     pub owner: String,
+    pub module: String,
+    pub replica: u8,
     pub turns: Vec<LlmTurnState>,
     pub status: ModuleSessionStatus,
+    pub runtime_status: Option<String>,
     pub last_tier: Option<String>,
+    pub last_throttle: Option<ThrottleSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThrottleSummary {
+    pub kind: String,
+    pub detail: String,
+    pub delayed_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,19 +88,71 @@ pub enum ModuleSessionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleOverviewRow {
+    pub owner: String,
+    pub module: String,
+    pub replica: u8,
+    pub active: bool,
+    pub runtime_status: String,
+    pub llm_status: String,
+    pub activation_ratio: Option<f64>,
+    pub active_replicas: Option<u8>,
+    pub tier: Option<String>,
+    pub guidance: Option<String>,
+    pub bpm: Option<f64>,
+    pub cooldown_ms: Option<u64>,
+    pub throttle: Option<String>,
+    pub latest_llm_output: Option<String>,
+}
+
+pub fn apply_blackboard_snapshot(state: &mut ModulesState, snapshot: &BlackboardSnapshot) {
+    for status in &snapshot.module_statuses {
+        apply_module_status(state, status);
+    }
+    for allocation in &snapshot.allocation {
+        let owner = owner_for_replica(&allocation.module, 0);
+        let module = module_mut_with_metadata(state, owner, allocation.module.clone(), 0);
+        if module.runtime_status.is_none() {
+            module.runtime_status = Some("not reported".to_string());
+        }
+    }
+}
+
 pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
     match event {
         RuntimeEvent::LlmAccessed { owner, tier, .. } => {
-            let module = module_mut(state, owner.to_string());
+            let module = module_mut_for_owner(state, owner);
             module.status = ModuleSessionStatus::Running;
             module.last_tier = Some(format!("{tier:?}"));
         }
-        RuntimeEvent::RateLimitDelayed { owner, .. }
-        | RuntimeEvent::ModuleBatchThrottled { owner, .. } => {
-            module_mut(state, owner.to_string()).status = ModuleSessionStatus::Retrying;
+        RuntimeEvent::RateLimitDelayed {
+            owner,
+            capability,
+            delayed_for,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.status = ModuleSessionStatus::Retrying;
+            module.last_throttle = Some(ThrottleSummary {
+                kind: "rate limit".to_string(),
+                detail: format!("{capability:?}"),
+                delayed_ms: duration_millis(*delayed_for),
+            });
+        }
+        RuntimeEvent::ModuleBatchThrottled {
+            owner, delayed_for, ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.status = ModuleSessionStatus::Retrying;
+            module.last_throttle = Some(ThrottleSummary {
+                kind: "batch throttle".to_string(),
+                detail: "next_batch".to_string(),
+                delayed_ms: duration_millis(*delayed_for),
+            });
         }
         RuntimeEvent::MemoUpdated { owner, .. } => {
-            let module = module_mut(state, owner.to_string());
+            let module = module_mut_for_owner(state, owner);
             if module.status == ModuleSessionStatus::Running {
                 module.status = ModuleSessionStatus::Completed;
             }
@@ -100,6 +165,8 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
         LlmObservationEvent::ModelInput {
             turn_id,
             owner,
+            module,
+            replica,
             tier,
             source,
             operation,
@@ -107,16 +174,18 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             ..
         } => {
             state.turn_to_owner.insert(turn_id.clone(), owner.clone());
-            let module = module_mut(state, owner);
-            module.status = ModuleSessionStatus::Running;
-            module.last_tier = Some(tier.clone());
-            let turn = ensure_turn(module, turn_id, operation, source, tier);
+            let module_state = module_mut_with_metadata(state, owner, module, replica);
+            module_state.status = ModuleSessionStatus::Running;
+            module_state.last_tier = Some(tier.clone());
+            let turn = ensure_turn(module_state, turn_id, operation, source, tier);
             turn.input = items;
             turn.status = ModuleSessionStatus::Running;
         }
         LlmObservationEvent::StreamStarted {
             turn_id,
             owner,
+            module,
+            replica,
             tier,
             source,
             operation,
@@ -125,10 +194,10 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             ..
         } => {
             state.turn_to_owner.insert(turn_id.clone(), owner.clone());
-            let module = module_mut(state, owner);
-            module.status = ModuleSessionStatus::Running;
-            module.last_tier = Some(tier.clone());
-            let turn = ensure_turn(module, turn_id, operation, source, tier);
+            let module_state = module_mut_with_metadata(state, owner, module, replica);
+            module_state.status = ModuleSessionStatus::Running;
+            module_state.last_tier = Some(tier.clone());
+            let turn = ensure_turn(module_state, turn_id, operation, source, tier);
             turn.model = Some(model);
             turn.request_id = request_id;
             turn.status = ModuleSessionStatus::Running;
@@ -202,6 +271,188 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
     }
 }
 
+pub fn overview_rows(
+    state: &ModulesState,
+    snapshot: &BlackboardSnapshot,
+) -> Vec<ModuleOverviewRow> {
+    let mut rows = BTreeMap::<String, ModuleOverviewRow>::new();
+
+    for allocation in &snapshot.allocation {
+        upsert_overview_row(
+            &mut rows,
+            owner_for_replica(&allocation.module, 0),
+            &allocation.module,
+            0,
+        );
+    }
+    for status in &snapshot.module_statuses {
+        let row = upsert_overview_row(
+            &mut rows,
+            status.owner.clone(),
+            &status.module,
+            status.replica,
+        );
+        row.runtime_status = status.status.clone();
+    }
+    for module in state.iter() {
+        let module_name = module_name(module);
+        let row = upsert_overview_row(
+            &mut rows,
+            module.owner.clone(),
+            &module_name,
+            module.replica,
+        );
+        if let Some(runtime_status) = &module.runtime_status {
+            row.runtime_status = runtime_status.clone();
+        }
+        row.llm_status = status_label(module.status).to_string();
+        if row.tier.is_none() {
+            row.tier = module.last_tier.clone();
+        }
+        row.throttle = module.last_throttle.as_ref().map(throttle_label);
+        row.latest_llm_output = latest_llm_output(module);
+    }
+
+    let allocations = snapshot
+        .allocation
+        .iter()
+        .map(|allocation| (allocation.module.as_str(), allocation))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows.values_mut() {
+        if let Some(allocation) = allocations.get(row.module.as_str()) {
+            apply_allocation_to_row(row, allocation);
+        }
+    }
+
+    rows.into_values().collect()
+}
+
+pub fn render_modules_overview(
+    ui: &mut egui::Ui,
+    snapshot: &BlackboardSnapshot,
+    state: &ModulesState,
+) -> Option<String> {
+    let rows = overview_rows(state, snapshot);
+    let mut requested_owner = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.heading("Modules");
+        ui.label(format!("count: {}", rows.len()));
+    });
+    ui.separator();
+
+    egui::ScrollArea::both()
+        .id_salt("modules-overview")
+        .show(ui, |ui| {
+            egui::Grid::new("modules-overview-grid")
+                .striped(true)
+                .num_columns(13)
+                .min_col_width(56.0)
+                .show(ui, |ui| {
+                    ui.strong("Owner");
+                    ui.strong("Module");
+                    ui.strong("Rep");
+                    ui.strong("Active");
+                    ui.strong("Runtime");
+                    ui.strong("LLM");
+                    ui.strong("Alloc");
+                    ui.strong("Replicas");
+                    ui.strong("Tier");
+                    ui.strong("BPM");
+                    ui.strong("Cooldown");
+                    ui.strong("Throttle");
+                    ui.strong("Latest LLM out");
+                    ui.end_row();
+
+                    for row in &rows {
+                        overview_cell(ui, &row.owner, None, &row.owner, &mut requested_owner);
+                        overview_cell(ui, &row.module, None, &row.owner, &mut requested_owner);
+                        overview_cell(
+                            ui,
+                            &row.replica.to_string(),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            if row.active { "yes" } else { "no" },
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            &row.runtime_status,
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(ui, &row.llm_status, None, &row.owner, &mut requested_owner);
+                        overview_cell(
+                            ui,
+                            &row.activation_ratio
+                                .map(|ratio| format!("{ratio:.2}"))
+                                .unwrap_or_else(|| "-".to_string()),
+                            row.guidance.as_deref(),
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            &row.active_replicas
+                                .map(|replicas| replicas.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            row.tier.as_deref().unwrap_or("-"),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            &row.bpm.map(format_bpm).unwrap_or_else(|| "-".to_string()),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            &row.cooldown_ms
+                                .map(format_millis)
+                                .unwrap_or_else(|| "-".to_string()),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        overview_cell(
+                            ui,
+                            row.throttle.as_deref().unwrap_or("-"),
+                            None,
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        let output = row.latest_llm_output.as_deref().unwrap_or("-");
+                        let output_preview = preview_text(output, 96);
+                        overview_cell(
+                            ui,
+                            &output_preview,
+                            row.latest_llm_output.as_deref(),
+                            &row.owner,
+                            &mut requested_owner,
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+
+    requested_owner
+}
+
 pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
     ui.horizontal_wrapped(|ui| {
         ui.heading(module_title(module));
@@ -252,7 +503,7 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
 }
 
 pub fn window_title(module: &ModuleState) -> String {
-    module_title(module)
+    format!("Module - {}", module.owner)
 }
 
 fn render_turn_list(
@@ -503,6 +754,155 @@ fn split_tool_result_content(content: &str) -> Option<(&str, &str)> {
     rest.split_once("\nresult:\n")
 }
 
+fn overview_cell(
+    ui: &mut egui::Ui,
+    text: &str,
+    hover: Option<&str>,
+    owner: &str,
+    requested_owner: &mut Option<String>,
+) {
+    let mut response = ui.selectable_label(false, text);
+    if let Some(hover) = hover
+        && !hover.is_empty()
+        && hover != text
+    {
+        response = response.on_hover_text(hover);
+    }
+    if response.clicked() {
+        *requested_owner = Some(owner.to_string());
+    }
+}
+
+fn upsert_overview_row<'a>(
+    rows: &'a mut BTreeMap<String, ModuleOverviewRow>,
+    owner: String,
+    module: &str,
+    replica: u8,
+) -> &'a mut ModuleOverviewRow {
+    let row = rows
+        .entry(owner.clone())
+        .or_insert_with(|| ModuleOverviewRow {
+            owner,
+            module: module.to_string(),
+            replica,
+            active: false,
+            runtime_status: "not reported".to_string(),
+            llm_status: status_label(ModuleSessionStatus::Idle).to_string(),
+            activation_ratio: None,
+            active_replicas: None,
+            tier: None,
+            guidance: None,
+            bpm: None,
+            cooldown_ms: None,
+            throttle: None,
+            latest_llm_output: None,
+        });
+    if !module.is_empty() {
+        row.module = module.to_string();
+    }
+    row.replica = replica;
+    row
+}
+
+fn apply_allocation_to_row(row: &mut ModuleOverviewRow, allocation: &AllocationView) {
+    row.active = row.replica < allocation.active_replicas;
+    row.activation_ratio = Some(allocation.activation_ratio);
+    row.active_replicas = Some(allocation.active_replicas);
+    row.bpm = allocation.bpm;
+    row.cooldown_ms = allocation.cooldown_ms;
+    row.tier = Some(allocation.tier.clone());
+    row.guidance = (!allocation.guidance.is_empty()).then(|| allocation.guidance.clone());
+}
+
+fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
+    module_mut_with_metadata(
+        state,
+        status.owner.clone(),
+        status.module.clone(),
+        status.replica,
+    )
+    .runtime_status = Some(status.status.clone());
+}
+
+fn latest_llm_output(module: &ModuleState) -> Option<String> {
+    let turn = module
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.status == ModuleSessionStatus::Running)
+        .or_else(|| module.turns.last())?;
+    let output = turn
+        .output
+        .iter()
+        .rev()
+        .find(|item| !item.content.trim().is_empty())?;
+    Some(format!(
+        "{}: {}",
+        output.kind,
+        preview_text(&output.content, 160)
+    ))
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = normalized
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn throttle_label(summary: &ThrottleSummary) -> String {
+    format!(
+        "{} {} {}",
+        summary.kind,
+        summary.detail,
+        format_millis(summary.delayed_ms)
+    )
+}
+
+fn format_bpm(bpm: f64) -> String {
+    if bpm >= 100.0 {
+        format!("{bpm:.0}")
+    } else if bpm >= 10.0 {
+        format!("{bpm:.1}")
+    } else {
+        format!("{bpm:.2}")
+    }
+}
+
+fn format_millis(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn owner_for_replica(module: &str, replica: u8) -> String {
+    if replica == 0 {
+        module.to_string()
+    } else {
+        format!("{module}[{replica}]")
+    }
+}
+
+fn module_name(module: &ModuleState) -> String {
+    if !module.module.is_empty() {
+        module.module.clone()
+    } else {
+        infer_owner_parts(&module.owner).0
+    }
+}
+
 fn turn_list_label(index: usize, turn: &LlmTurnState) -> String {
     format!(
         "{} {:02} {} {}",
@@ -622,13 +1022,52 @@ fn apply_structured_ready(turn: &mut LlmTurnState, json: String) {
 }
 
 fn module_mut(state: &mut ModulesState, owner: String) -> &mut ModuleState {
-    state
+    let (module, replica) = infer_owner_parts(&owner);
+    module_mut_with_metadata(state, owner, module, replica)
+}
+
+fn module_mut_for_owner<'a>(
+    state: &'a mut ModulesState,
+    owner: &nuillu_types::ModuleInstanceId,
+) -> &'a mut ModuleState {
+    module_mut_with_metadata(
+        state,
+        owner.to_string(),
+        owner.module.as_str().to_string(),
+        owner.replica.get(),
+    )
+}
+
+fn module_mut_with_metadata(
+    state: &mut ModulesState,
+    owner: String,
+    module: String,
+    replica: u8,
+) -> &mut ModuleState {
+    let row = state
         .modules
         .entry(owner.clone())
         .or_insert_with(|| ModuleState {
             owner,
+            module: module.clone(),
+            replica,
             ..ModuleState::default()
-        })
+        });
+    if !module.is_empty() {
+        row.module = module;
+    }
+    row.replica = replica;
+    row
+}
+
+fn infer_owner_parts(owner: &str) -> (String, u8) {
+    if let Some((module, replica)) = owner.rsplit_once('[')
+        && let Some(replica) = replica.strip_suffix(']')
+        && let Ok(replica) = replica.parse::<u8>()
+    {
+        return (module.to_string(), replica);
+    }
+    (owner.to_string(), 0)
 }
 
 fn module_title(module: &ModuleState) -> String {
@@ -699,6 +1138,8 @@ mod tests {
         assert_eq!(module.turns[0].output[0].content, "world");
         assert_eq!(module.turns[0].input[0].content, "hello");
         assert_eq!(module.status, ModuleSessionStatus::Running);
+        assert_eq!(module.module, "sensory");
+        assert_eq!(module.replica, 0);
     }
 
     #[test]
@@ -816,5 +1257,164 @@ mod tests {
             split_tool_result_content(content),
             Some(("{\"query\":\"koro\"}", "{\"matches\":[]}"))
         );
+    }
+
+    #[test]
+    fn blackboard_snapshot_creates_module_rows_without_llm_turns() {
+        let mut state = ModulesState::default();
+        let snapshot = BlackboardSnapshot {
+            module_statuses: vec![ModuleStatusView {
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                status: "AwaitingBatch".to_string(),
+            }],
+            allocation: vec![AllocationView {
+                module: "surprise".to_string(),
+                activation_ratio: 0.25,
+                active_replicas: 1,
+                bpm: Some(9.0),
+                cooldown_ms: Some(6667),
+                tier: "Default".to_string(),
+                guidance: String::new(),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        apply_blackboard_snapshot(&mut state, &snapshot);
+
+        assert!(state.modules.contains_key("predict"));
+        assert!(state.modules.contains_key("surprise"));
+        assert_eq!(
+            state
+                .modules
+                .get("predict")
+                .and_then(|m| m.runtime_status.as_deref()),
+            Some("AwaitingBatch")
+        );
+        assert_eq!(
+            state.modules.get("surprise").map(|m| m.module.as_str()),
+            Some("surprise")
+        );
+    }
+
+    #[test]
+    fn runtime_events_record_throttle_summaries() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::RateLimitDelayed {
+                sequence: 1,
+                owner: owner.clone(),
+                capability: nuillu_module::CapabilityKind::LlmCall,
+                delayed_for: std::time::Duration::from_millis(25),
+            },
+        );
+
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(module.status, ModuleSessionStatus::Retrying);
+        assert_eq!(
+            module.last_throttle,
+            Some(ThrottleSummary {
+                kind: "rate limit".to_string(),
+                detail: "LlmCall".to_string(),
+                delayed_ms: 25,
+            })
+        );
+    }
+
+    #[test]
+    fn overview_rows_merge_allocation_status_throttle_and_latest_output() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-4".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Premium".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-4".to_string(),
+                kind: "text".to_string(),
+                delta: "filtered observation".to_string(),
+            },
+        );
+        state
+            .modules
+            .get_mut("sensory")
+            .expect("module exists")
+            .last_throttle = Some(ThrottleSummary {
+            kind: "batch throttle".to_string(),
+            detail: "next_batch".to_string(),
+            delayed_ms: 500,
+        });
+        let snapshot = BlackboardSnapshot {
+            module_statuses: vec![ModuleStatusView {
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                status: "Activating".to_string(),
+            }],
+            allocation: vec![AllocationView {
+                module: "sensory".to_string(),
+                activation_ratio: 0.75,
+                active_replicas: 1,
+                bpm: Some(12.5),
+                cooldown_ms: Some(4800),
+                tier: "Premium".to_string(),
+                guidance: "inspect recent input".to_string(),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        let rows = overview_rows(&state, &snapshot);
+
+        assert_eq!(
+            rows,
+            vec![ModuleOverviewRow {
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                active: true,
+                runtime_status: "Activating".to_string(),
+                llm_status: "running".to_string(),
+                activation_ratio: Some(0.75),
+                active_replicas: Some(1),
+                tier: Some("Premium".to_string()),
+                guidance: Some("inspect recent input".to_string()),
+                bpm: Some(12.5),
+                cooldown_ms: Some(4800),
+                throttle: Some("batch throttle next_batch 500ms".to_string()),
+                latest_llm_output: Some("text: filtered observation".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn module_window_title_is_stable_across_status_changes() {
+        let mut module = ModuleState {
+            owner: "sensory".to_string(),
+            module: "sensory".to_string(),
+            status: ModuleSessionStatus::Idle,
+            ..ModuleState::default()
+        };
+        let idle_title = window_title(&module);
+        module.status = ModuleSessionStatus::Running;
+
+        assert_eq!(idle_title, "Module - sensory");
+        assert_eq!(window_title(&module), idle_title);
     }
 }

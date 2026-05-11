@@ -2864,6 +2864,14 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
         allocation: allocation_module_dumps(bb.allocation())
             .into_iter()
             .map(|module| AllocationView {
+                bpm: ModuleId::new(module.module.clone())
+                    .ok()
+                    .and_then(|id| bb.allocation().cooldown_for(&id))
+                    .and_then(bpm_from_cooldown),
+                cooldown_ms: ModuleId::new(module.module.clone())
+                    .ok()
+                    .and_then(|id| bb.allocation().cooldown_for(&id))
+                    .map(duration_millis_u64),
                 module: module.module,
                 activation_ratio: module.activation_ratio,
                 active_replicas: module.active_replicas,
@@ -3321,6 +3329,11 @@ fn ticks_for_interval(interval: Duration, tick_ms: u64) -> u64 {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
+    let seconds = cooldown.as_secs_f64();
+    (seconds.is_finite() && seconds > 0.0).then_some(60.0 / seconds)
 }
 
 #[derive(Clone)]

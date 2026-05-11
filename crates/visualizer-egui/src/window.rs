@@ -1,4 +1,4 @@
-use egui::{Pos2, Vec2, Window};
+use egui::{Order, Pos2, Vec2, Window};
 use egui_hooks::UseHookExt as _;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,7 @@ pub struct PersistedWindow<'a> {
     title: &'a str,
     default_pos: [f32; 2],
     default_size: [f32; 2],
+    open_requested: bool,
 }
 
 impl<'a> PersistedWindow<'a> {
@@ -33,6 +34,7 @@ impl<'a> PersistedWindow<'a> {
             title,
             default_pos: [24.0, 80.0],
             default_size: [520.0, 420.0],
+            open_requested: false,
         }
     }
 
@@ -46,6 +48,11 @@ impl<'a> PersistedWindow<'a> {
         self
     }
 
+    pub fn open_requested(mut self, open_requested: bool) -> Self {
+        self.open_requested = open_requested;
+        self
+    }
+
     pub fn show(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         ui.push_id(self.id, |ui| {
             let state = ui.use_persisted_state(
@@ -56,17 +63,28 @@ impl<'a> PersistedWindow<'a> {
                 },
                 (),
             );
-            if !state.open {
+            let effective_state = if self.open_requested {
+                WindowState {
+                    open: true,
+                    ..*state
+                }
+            } else {
+                *state
+            };
+            if !effective_state.open {
                 return;
             }
 
-            let mut open = state.open;
-            let response = Window::new(self.title)
+            let mut open = effective_state.open;
+            let mut window = Window::new(self.title)
                 .id(egui::Id::new(self.id))
                 .open(&mut open)
-                .default_pos(Pos2::new(state.pos[0], state.pos[1]))
-                .default_size(Vec2::new(state.size[0], state.size[1]))
-                .show(ui.ctx(), add_contents);
+                .default_pos(Pos2::new(effective_state.pos[0], effective_state.pos[1]))
+                .default_size(Vec2::new(effective_state.size[0], effective_state.size[1]));
+            if self.open_requested {
+                window = window.order(Order::Foreground);
+            }
+            let response = window.show(ui.ctx(), add_contents);
 
             if let Some(response) = response {
                 let rect = response.response.rect;
@@ -76,7 +94,10 @@ impl<'a> PersistedWindow<'a> {
                     size: [rect.width(), rect.height()],
                 });
             } else {
-                state.set_next(WindowState { open, ..*state });
+                state.set_next(WindowState {
+                    open,
+                    ..effective_state
+                });
             }
         });
     }

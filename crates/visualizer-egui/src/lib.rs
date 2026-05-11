@@ -249,6 +249,10 @@ pub struct AllocationView {
     pub module: String,
     pub activation_ratio: f64,
     pub active_replicas: u8,
+    #[serde(default)]
+    pub bpm: Option<f64>,
+    #[serde(default)]
+    pub cooldown_ms: Option<u64>,
     pub tier: String,
     pub guidance: String,
 }
@@ -428,7 +432,9 @@ impl VisualizerState {
                 modules::apply_llm_observation(&mut self.tab_mut(tab_id).modules, event);
             }
             VisualizerEvent::BlackboardSnapshot { tab_id, snapshot } => {
-                self.tab_mut(tab_id).blackboard = snapshot;
+                let tab = self.tab_mut(tab_id);
+                modules::apply_blackboard_snapshot(&mut tab.modules, &snapshot);
+                tab.blackboard = snapshot;
             }
             VisualizerEvent::MemoryPage { tab_id, page } => {
                 let tab = self.tab_mut(tab_id);
@@ -542,12 +548,24 @@ impl RuntimeTab {
             .default_size(520.0, 360.0)
             .show(ui, |ui| self.logs_ui(ui));
 
+        let modules_id = format!("{base}:modules");
+        let modules_title = format!("Modules - {}", self.title);
+        let mut requested_module = None;
+        window::PersistedWindow::new(&modules_id, &modules_title)
+            .default_pos(568.0, 1020.0)
+            .default_size(640.0, 360.0)
+            .show(ui, |ui| {
+                requested_module =
+                    modules::render_modules_overview(ui, &self.blackboard, &self.modules);
+            });
+
         for (index, module) in self.modules.iter().enumerate() {
             let module_id = format!("{base}:module:{}", module.owner);
             let module_title = modules::window_title(module);
             let x = 1232.0 + (index % 2) as f32 * 440.0;
             let y = 88.0 + (index / 2) as f32 * 380.0;
             window::PersistedWindow::new(&module_id, &module_title)
+                .open_requested(requested_module.as_deref() == Some(module.owner.as_str()))
                 .default_pos(x, y)
                 .default_size(420.0, 360.0)
                 .show(ui, |ui| modules::render_module(ui, module));
