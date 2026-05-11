@@ -468,10 +468,17 @@ fn render_json_block(ui: &mut egui::Ui, id_salt: impl Hash, label: &str, content
     let Some(json) = format_json_for_display(content) else {
         return false;
     };
-    egui::CollapsingHeader::new(format!("{label}: {}", json_preview(&json.compact)))
-        .default_open(false)
-        .id_salt(id_salt)
-        .show(ui, |ui| {
+    let id = ui.make_persistent_id(("json-block", id_salt));
+    let header = format!("{label}: {}", json.compact);
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        .show_header(ui, |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(header).monospace())
+                    .truncate()
+                    .show_tooltip_when_elided(true),
+            )
+        })
+        .body(|ui| {
             let display = hard_wrap_long_segments(&json.pretty, 120);
             ui.add(egui::Label::new(egui::RichText::new(display).monospace()).wrap());
         });
@@ -489,16 +496,6 @@ fn format_json_for_display(content: &str) -> Option<JsonDisplay> {
     let pretty = serde_json::to_string_pretty(&value).ok()?;
     let compact = serde_json::to_string(&value).ok()?;
     Some(JsonDisplay { pretty, compact })
-}
-
-fn json_preview(compact: &str) -> String {
-    const LIMIT: usize = 96;
-    if compact.chars().count() <= LIMIT {
-        return compact.to_string();
-    }
-    let mut preview: String = compact.chars().take(LIMIT).collect();
-    preview.push_str("...");
-    preview
 }
 
 fn split_tool_result_content(content: &str) -> Option<(&str, &str)> {
