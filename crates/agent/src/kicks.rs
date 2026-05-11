@@ -16,6 +16,11 @@ pub(crate) struct Kick {
 }
 
 impl Kick {
+    pub(crate) fn new(sender: ModuleInstanceId) -> (Self, oneshot::Receiver<()>) {
+        let (completion, receiver) = oneshot::channel();
+        (Self { sender, completion }, receiver)
+    }
+
     pub(crate) fn notify_finish(self) {
         let _ = self.completion.send(());
     }
@@ -31,8 +36,8 @@ impl KickHandle {
     /// Send a kick to the target. The returned receiver resolves when the target completes or
     /// noops the kick. If the target is gone, the receiver resolves with `Err`.
     pub(crate) fn send(&self, sender: ModuleInstanceId) -> oneshot::Receiver<()> {
-        let (completion, receiver) = oneshot::channel();
-        let _ = self.sender.unbounded_send(Kick { sender, completion });
+        let (kick, receiver) = Kick::new(sender);
+        let _ = self.sender.unbounded_send(kick);
         receiver
     }
 }
