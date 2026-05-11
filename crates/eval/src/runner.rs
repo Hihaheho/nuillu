@@ -66,7 +66,10 @@ use crate::{
         FullAgentInput, ModuleCase, ModuleEvalTarget, discover_case_files, parse_case_file,
         parse_case_now, parse_memory_datetime,
     },
-    evaluation::{CaseReport, CaseSummary, SuiteReport, evaluate_case, normalize_text_block},
+    evaluation::{
+        CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, evaluate_case,
+        normalize_text_block,
+    },
     judge::{LlmRubricJudge, RubricJudge},
     model_set::ReasoningEffort,
     state_dump::{
@@ -848,6 +851,8 @@ pub async fn run_suite_with_hooks(
         })?;
     case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
     let run_dir = config.output_root.join(&config.run_id);
+    let planned_case_count = case_paths.len();
+    let run_report = suite_run_report(config, &run_dir, planned_case_count);
     std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
         path: run_dir.clone(),
         source,
@@ -900,7 +905,7 @@ pub async fn run_suite_with_hooks(
         }
     }
 
-    let report = aggregate_suite(cases);
+    let report = aggregate_suite(run_report, cases);
     let suite_path = run_dir.join("suite-report.json");
     write_json_file(&suite_path, &report)?;
     eprintln!("\n════════════════════════════════════════════════════════════");
@@ -936,6 +941,28 @@ fn backend_report(backend: &LlmBackendConfig) -> serde_json::Value {
         "reasoning_effort": backend.reasoning_effort,
         "use_responses_api": backend.use_responses_api,
     })
+}
+
+fn suite_run_report(
+    config: &RunnerConfig,
+    run_dir: &Path,
+    planned_case_count: usize,
+) -> SuiteRunReport {
+    SuiteRunReport {
+        run_id: config.run_id.clone(),
+        cases_root: config.cases_root.display().to_string(),
+        output_dir: run_dir.display().to_string(),
+        case_patterns: config.case_patterns.clone(),
+        fail_fast: config.fail_fast,
+        max_concurrent_llm_calls: config.max_concurrent_llm_calls.map(NonZeroUsize::get),
+        planned_case_count,
+        models: SuiteModelNames {
+            judge: config.judge_backend.model.clone(),
+            cheap: config.cheap_backend.model.clone(),
+            default: config.default_backend.model.clone(),
+            premium: config.premium_backend.model.clone(),
+        },
+    }
 }
 
 pub async fn run_case_detailed(
@@ -3740,7 +3767,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
     }
 }
 
-fn aggregate_suite(cases: Vec<CaseSummary>) -> SuiteReport {
+fn aggregate_suite(run: SuiteRunReport, cases: Vec<CaseSummary>) -> SuiteReport {
     let case_count = cases.len();
     let passed_cases = cases.iter().filter(|case| case.passed).count();
     let invalid_cases = cases.iter().filter(|case| case.invalid).count();
@@ -3752,6 +3779,7 @@ fn aggregate_suite(cases: Vec<CaseSummary>) -> SuiteReport {
     };
 
     SuiteReport {
+        run,
         case_count,
         passed_cases,
         failed_cases,
@@ -3855,10 +3883,14 @@ mod tests {
     }
 
     fn test_backend_config() -> LlmBackendConfig {
+        test_backend_config_with_model("gpt-oss:20b")
+    }
+
+    fn test_backend_config_with_model(model: &str) -> LlmBackendConfig {
         LlmBackendConfig {
             endpoint: "http://localhost:11434/v1".to_string(),
             token: "local".to_string(),
-            model: "gpt-oss:20b".to_string(),
+            model: model.to_string(),
             reasoning_effort: None,
             use_responses_api: false,
         }
@@ -4282,18 +4314,33 @@ limits {{
             cases_root: dir.path().join("eval-cases"),
             output_root: output_root.clone(),
             run_id: "runtime-failures".to_string(),
-            judge_backend: test_backend_config(),
-            cheap_backend: test_backend_config(),
-            default_backend: test_backend_config(),
-            premium_backend: test_backend_config(),
+            judge_backend: test_backend_config_with_model("judge-model"),
+            cheap_backend: test_backend_config_with_model("cheap-model"),
+            default_backend: test_backend_config_with_model("default-model"),
+            premium_backend: test_backend_config_with_model("premium-model"),
             model_dir: dir.path().join("missing-model"),
             fail_fast: false,
-            max_concurrent_llm_calls: None,
+            max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),
         };
 
         let report = run_suite(&config).await.unwrap();
 
+        let run_dir = output_root.join("runtime-failures");
+        assert_eq!(report.run.run_id, "runtime-failures");
+        assert_eq!(
+            report.run.cases_root,
+            config.cases_root.display().to_string()
+        );
+        assert_eq!(report.run.output_dir, run_dir.display().to_string());
+        assert_eq!(report.run.case_patterns, Vec::<String>::new());
+        assert!(!report.run.fail_fast);
+        assert_eq!(report.run.max_concurrent_llm_calls, Some(7));
+        assert_eq!(report.run.planned_case_count, 2);
+        assert_eq!(report.run.models.judge, "judge-model");
+        assert_eq!(report.run.models.cheap, "cheap-model");
+        assert_eq!(report.run.models.default, "default-model");
+        assert_eq!(report.run.models.premium, "premium-model");
         assert_eq!(report.case_count, 2);
         assert_eq!(report.passed_cases, 0);
         assert_eq!(report.invalid_cases, 2);
@@ -4305,8 +4352,28 @@ limits {{
                 && case.report.checks.is_empty()
         }));
 
-        let run_dir = output_root.join("runtime-failures");
         assert!(run_dir.join("suite-report.json").exists());
+        let suite_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_dir.join("suite-report.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            suite_json["run"],
+            serde_json::json!({
+                "run_id": "runtime-failures",
+                "cases_root": config.cases_root.display().to_string(),
+                "output_dir": run_dir.display().to_string(),
+                "case_patterns": [],
+                "fail_fast": false,
+                "max_concurrent_llm_calls": 7,
+                "planned_case_count": 2,
+                "models": {
+                    "judge": "judge-model",
+                    "cheap": "cheap-model",
+                    "default": "default-model",
+                    "premium": "premium-model",
+                }
+            })
+        );
         for summary in &report.cases {
             let output_dir = run_dir.join(sanitize_id(&summary.id));
             assert!(output_dir.join("report.json").exists());

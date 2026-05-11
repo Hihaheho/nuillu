@@ -24,7 +24,8 @@ pub use cases::{
 };
 pub use evaluation::{
     CaseEval, CaseObjective, CaseReport, CaseSummary, CheckOutcome, ModuleChecksReport,
-    ModuleRubricOutcome, SuiteReport, evaluate_case, normalize_text_block,
+    ModuleRubricOutcome, SuiteModelNames, SuiteReport, SuiteRunReport, evaluate_case,
+    normalize_text_block,
 };
 pub use judge::{
     JudgeOptions, LlmRubricJudge, RubricJudge, RubricJudgeError, RubricJudgeRequest,

@@ -61,7 +61,28 @@ pub struct CaseSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SuiteRunReport {
+    pub run_id: String,
+    pub cases_root: String,
+    pub output_dir: String,
+    pub case_patterns: Vec<String>,
+    pub fail_fast: bool,
+    pub max_concurrent_llm_calls: Option<usize>,
+    pub planned_case_count: usize,
+    pub models: SuiteModelNames,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuiteModelNames {
+    pub judge: String,
+    pub cheap: String,
+    pub default: String,
+    pub premium: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SuiteReport {
+    pub run: SuiteRunReport,
     pub case_count: usize,
     pub passed_cases: usize,
     pub failed_cases: usize,
