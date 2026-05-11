@@ -817,6 +817,25 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
     run_suite_with_hooks(config, &mut hooks).await
 }
 
+pub(crate) fn visualizer_planned_tabs(
+    config: &RunnerConfig,
+) -> Result<Vec<(VisualizerTabId, String)>, RunnerError> {
+    let mut case_paths =
+        discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
+            path: config.cases_root.clone(),
+            source,
+        })?;
+    case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    case_paths
+        .into_iter()
+        .map(|path| {
+            let case = parse_case_file(&path)?;
+            let id = case_id(&path, &case);
+            Ok((VisualizerTabId::new(id.clone()), id))
+        })
+        .collect()
+}
+
 pub async fn run_suite_with_hooks(
     config: &RunnerConfig,
     hooks: &mut RunnerHooks,
@@ -4052,6 +4071,48 @@ prompt = "Second?"
         let by_id = filter_case_paths(vec![first, second.clone()], &["special-memory".to_string()])
             .unwrap();
         assert_eq!(by_id, vec![second]);
+    }
+
+    #[test]
+    fn visualizer_planned_tabs_use_filtered_case_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(
+            case_dir.join("first-route.eure"),
+            r#"
+id = "module-query-vector-first-route"
+prompt = "First?"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            case_dir.join("second-memory.eure"),
+            r#"
+id = "module-query-vector-special-memory"
+prompt = "Second?"
+"#,
+        )
+        .unwrap();
+        let config = RunnerConfig {
+            cases_root: dir.path().join("eval-cases"),
+            output_root: dir.path().join("out"),
+            run_id: "run".to_string(),
+            judge_backend: test_backend_config(),
+            cheap_backend: test_backend_config(),
+            default_backend: test_backend_config(),
+            premium_backend: test_backend_config(),
+            model_dir: dir.path().join("models"),
+            fail_fast: false,
+            max_concurrent_llm_calls: None,
+            case_patterns: vec!["special-memory".to_string()],
+        };
+
+        let tabs = visualizer_planned_tabs(&config).unwrap();
+
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].0.as_str(), "module-query-vector-special-memory");
+        assert_eq!(tabs[0].1, "module-query-vector-special-memory");
     }
 
     #[test]

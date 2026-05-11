@@ -370,7 +370,9 @@ impl eframe::App for VisualizerApp {
                         tab.view_menu(ui);
                     }
                 } else {
-                    ui.add_enabled(false, egui::Button::new("View"));
+                    ui.menu_button("View", |ui| {
+                        ui.label("No runtime windows yet.");
+                    });
                 }
                 if self.start_suite_from_ui {
                     let label = if self.state.suite_start_requested {
@@ -429,9 +431,12 @@ impl VisualizerState {
     pub fn apply(&mut self, event: VisualizerEvent) {
         match event {
             VisualizerEvent::OpenTab { tab_id, title } => {
-                self.tabs
+                let tab = self
+                    .tabs
                     .entry(tab_id.clone())
-                    .or_insert_with(|| RuntimeTab::new(tab_id.clone(), title));
+                    .or_insert_with(|| RuntimeTab::new(tab_id.clone(), title.clone()));
+                tab.title = title;
+                tab.status = TabStatus::Running;
                 self.selected.get_or_insert(tab_id);
             }
             VisualizerEvent::SetTabStatus { tab_id, status } => {
@@ -770,6 +775,27 @@ mod tests {
         let tab = state.tabs().get(&tab_id).expect("tab exists");
         assert_eq!(tab.memories.query, "rust");
         assert_eq!(tab.memories.query_results[0].content, "learned rust");
+    }
+
+    #[test]
+    fn reducer_open_tab_marks_preopened_tab_running() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        state.apply(VisualizerEvent::SetTabStatus {
+            tab_id: tab_id.clone(),
+            status: TabStatus::Stopped,
+        });
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert_eq!(tab.status, TabStatus::Running);
     }
 
     #[test]

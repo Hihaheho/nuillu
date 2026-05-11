@@ -5,12 +5,25 @@ use anyhow::Context as _;
 use nuillu_visualizer_egui::{VisualizerApp, VisualizerChannels, VisualizerCommand, eframe};
 use tokio::runtime::Builder;
 
-use crate::{RunnerConfig, RunnerError, RunnerHooks, VisualizerHook, run_suite_with_hooks};
+use crate::{
+    RunnerConfig, RunnerError, RunnerHooks, VisualizerHook, run_suite_with_hooks,
+    runner::visualizer_planned_tabs,
+};
 
 pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, command_rx) = mpsc::channel();
     let shutdown_tx = command_tx.clone();
+    for (tab_id, title) in visualizer_planned_tabs(&config)? {
+        let _ = event_tx.send(nuillu_visualizer_egui::VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title,
+        });
+        let _ = event_tx.send(nuillu_visualizer_egui::VisualizerEvent::SetTabStatus {
+            tab_id,
+            status: nuillu_visualizer_egui::TabStatus::Stopped,
+        });
+    }
     let eval_thread = thread::spawn(move || -> Result<(), RunnerError> {
         if !wait_for_start_command(&command_rx) {
             return Ok(());
