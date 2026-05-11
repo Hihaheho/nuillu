@@ -440,6 +440,18 @@ fn render_active_turn(
     turn_index: usize,
     turn: &LlmTurnState,
 ) {
+    ui.push_id(
+        (
+            "active-turn",
+            module.owner.as_str(),
+            turn_index,
+            turn.turn_id.as_str(),
+        ),
+        |ui| render_active_turn_contents(ui, turn_index, turn),
+    );
+}
+
+fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmTurnState) {
     ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} turn {}",
@@ -467,22 +479,19 @@ fn render_active_turn(
     });
     ui.separator();
     egui::ScrollArea::vertical()
-        .id_salt((
-            "active-turn",
-            module.owner.as_str(),
-            turn_index,
-            turn.turn_id.as_str(),
-        ))
+        .id_salt("scroll-area")
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            for (index, item) in turn.input.iter().enumerate() {
-                render_input_item(ui, item, &turn.turn_id, turn_index, index);
-                ui.add_space(6.0);
-            }
-            for (index, item) in turn.output.iter().enumerate() {
-                render_output_item(ui, item, &turn.turn_id, turn_index, index);
-                ui.add_space(6.0);
-            }
+            ui.push_id("scroll-content", |ui| {
+                for (index, item) in turn.input.iter().enumerate() {
+                    render_input_item(ui, item, &turn.turn_id, turn_index, index);
+                    ui.add_space(6.0);
+                }
+                for (index, item) in turn.output.iter().enumerate() {
+                    render_output_item(ui, item, &turn.turn_id, turn_index, index);
+                    ui.add_space(6.0);
+                }
+            });
         });
 }
 
