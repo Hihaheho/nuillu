@@ -137,7 +137,6 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             ..
         } => {
             let module = module_mut_for_owner(state, owner);
-            module.status = ModuleSessionStatus::Retrying;
             module.last_throttle = Some(ThrottleSummary {
                 kind: "rate limit".to_string(),
                 detail: format!("{capability:?}"),
@@ -148,7 +147,6 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             owner, delayed_for, ..
         } => {
             let module = module_mut_for_owner(state, owner);
-            module.status = ModuleSessionStatus::Retrying;
             module.last_throttle = Some(ThrottleSummary {
                 kind: "batch throttle".to_string(),
                 detail: "next_batch".to_string(),
@@ -1385,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_events_record_throttle_summaries() {
+    fn runtime_events_record_throttle_summaries_without_changing_llm_status() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
 
@@ -1403,7 +1401,7 @@ mod tests {
             .modules
             .get(&owner.to_string())
             .expect("module exists");
-        assert_eq!(module.status, ModuleSessionStatus::Retrying);
+        assert_eq!(module.status, ModuleSessionStatus::Idle);
         assert_eq!(
             module.last_throttle,
             Some(ThrottleSummary {
