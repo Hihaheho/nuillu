@@ -6,7 +6,7 @@ modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", 
 limits {
   max-ticks = 300
   tick-ms = 500
-  max-llm-calls = 16
+  max-llm-calls = 22
 }
 
 participants = ["Pibi", "Koro"]

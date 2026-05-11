@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
@@ -729,11 +730,20 @@ impl AllocatedModule {
 pub struct AllocatedModules {
     runtime: AgentRuntimeControl,
     modules: Vec<AllocatedModule>,
+    dependencies: ModuleDependencies,
 }
 
 impl AllocatedModules {
-    fn new(runtime: AgentRuntimeControl, modules: Vec<AllocatedModule>) -> Self {
-        Self { runtime, modules }
+    fn new(
+        runtime: AgentRuntimeControl,
+        modules: Vec<AllocatedModule>,
+        dependencies: ModuleDependencies,
+    ) -> Self {
+        Self {
+            runtime,
+            modules,
+            dependencies,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -744,19 +754,55 @@ impl AllocatedModules {
         self.modules.is_empty()
     }
 
+    pub fn dependencies(&self) -> &ModuleDependencies {
+        &self.dependencies
+    }
+
     pub fn into_parts(self) -> (AgentRuntimeControl, Vec<AllocatedModule>) {
         (self.runtime, self.modules)
+    }
+
+    pub fn into_parts_with_dependencies(
+        self,
+    ) -> (
+        AgentRuntimeControl,
+        Vec<AllocatedModule>,
+        ModuleDependencies,
+    ) {
+        (self.runtime, self.modules, self.dependencies)
+    }
+}
+
+/// Per-module dependency map keyed by role, not replica.
+#[derive(Debug, Default, Clone)]
+pub struct ModuleDependencies {
+    deps_of: HashMap<ModuleId, Vec<ModuleId>>,
+    dependents_of: HashMap<ModuleId, Vec<ModuleId>>,
+}
+
+impl ModuleDependencies {
+    pub fn deps_of(&self, module: &ModuleId) -> &[ModuleId] {
+        self.deps_of.get(module).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn dependents_of(&self, module: &ModuleId) -> &[ModuleId] {
+        self.dependents_of
+            .get(module)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
 pub struct ModuleRegistry {
     registrations: Vec<ModuleRegistration>,
+    dependencies: Vec<(ModuleId, ModuleId)>,
 }
 
 impl fmt::Debug for ModuleRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleRegistry")
             .field("registrations", &self.registrations)
+            .field("dependencies", &self.dependencies)
             .finish()
     }
 }
@@ -798,7 +844,15 @@ impl ModuleRegistry {
     pub fn new() -> Self {
         Self {
             registrations: Vec::new(),
+            dependencies: Vec::new(),
         }
+    }
+
+    /// Declare that `dependent` should wait for active `dependency` replicas to flush before
+    /// activation. Both roles must be registered and the dependency graph must be acyclic.
+    pub fn depends_on(mut self, dependent: ModuleId, dependency: ModuleId) -> Self {
+        self.dependencies.push((dependent, dependency));
+        self
     }
 
     /// Register a module type with its total active replica range, BPM tempo
@@ -838,6 +892,8 @@ impl ModuleRegistry {
         &self,
         caps: &CapabilityProviders,
     ) -> Result<AllocatedModules, ModuleRegistryError> {
+        let dependencies = self.compile_dependencies()?;
+
         caps.apply_runtime_policy().await;
         caps.set_module_policies(
             self.registrations
@@ -871,8 +927,99 @@ impl ModuleRegistry {
                 modules.push(AllocatedModule::new(owner, (registration.builder)(scoped)));
             }
         }
-        Ok(AllocatedModules::new(caps.runtime_control(), modules))
+        Ok(AllocatedModules::new(
+            caps.runtime_control(),
+            modules,
+            dependencies,
+        ))
     }
+
+    fn compile_dependencies(&self) -> Result<ModuleDependencies, ModuleRegistryError> {
+        let registered = self
+            .registrations
+            .iter()
+            .map(|registration| &registration.module)
+            .collect::<HashSet<_>>();
+        let mut deps_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
+        let mut dependents_of = HashMap::<ModuleId, Vec<ModuleId>>::new();
+
+        for (dependent, dependency) in &self.dependencies {
+            if !registered.contains(dependent) {
+                return Err(ModuleRegistryError::UnknownDependent {
+                    dependent: dependent.clone(),
+                });
+            }
+            if !registered.contains(dependency) {
+                return Err(ModuleRegistryError::UnknownDependency {
+                    dependency: dependency.clone(),
+                });
+            }
+            if dependent == dependency {
+                return Err(ModuleRegistryError::DependencyCycle {
+                    cycle: vec![dependent.clone()],
+                });
+            }
+
+            let deps = deps_of.entry(dependent.clone()).or_default();
+            if !deps.contains(dependency) {
+                deps.push(dependency.clone());
+            }
+            let dependents = dependents_of.entry(dependency.clone()).or_default();
+            if !dependents.contains(dependent) {
+                dependents.push(dependent.clone());
+            }
+        }
+
+        let mut visiting = HashSet::<ModuleId>::new();
+        let mut visited = HashSet::<ModuleId>::new();
+        for module in registered {
+            if visited.contains(module) {
+                continue;
+            }
+            let mut stack = Vec::new();
+            dfs_check_dependencies(
+                module.clone(),
+                &deps_of,
+                &mut visiting,
+                &mut visited,
+                &mut stack,
+            )?;
+        }
+
+        Ok(ModuleDependencies {
+            deps_of,
+            dependents_of,
+        })
+    }
+}
+
+fn dfs_check_dependencies(
+    node: ModuleId,
+    deps_of: &HashMap<ModuleId, Vec<ModuleId>>,
+    visiting: &mut HashSet<ModuleId>,
+    visited: &mut HashSet<ModuleId>,
+    stack: &mut Vec<ModuleId>,
+) -> Result<(), ModuleRegistryError> {
+    if visited.contains(&node) {
+        return Ok(());
+    }
+    if !visiting.insert(node.clone()) {
+        let cycle_start = stack.iter().position(|module| module == &node).unwrap_or(0);
+        let mut cycle = stack[cycle_start..].to_vec();
+        cycle.push(node);
+        return Err(ModuleRegistryError::DependencyCycle { cycle });
+    }
+
+    stack.push(node.clone());
+    if let Some(deps) = deps_of.get(&node) {
+        for dep in deps {
+            dfs_check_dependencies(dep.clone(), deps_of, visiting, visited, stack)?;
+        }
+    }
+    stack.pop();
+    visiting.remove(&node);
+    visited.insert(node);
+    Ok(())
 }
 
 impl Default for ModuleRegistry {
@@ -891,6 +1038,15 @@ pub enum ModuleRegistryError {
     DuplicateModule { module: ModuleId },
     #[error("failed to load identity memories: {0}")]
     IdentityMemoryLoad(PortError),
+    #[error("dependent {dependent} declared in depends_on() but not registered")]
+    UnknownDependent { dependent: ModuleId },
+    #[error("dependency {dependency} declared in depends_on() but not registered")]
+    UnknownDependency { dependency: ModuleId },
+    #[error(
+        "module dependency cycle detected: {}",
+        cycle.iter().map(ModuleId::as_str).collect::<Vec<_>>().join(" -> ")
+    )]
+    DependencyCycle { cycle: Vec<ModuleId> },
 }
 
 #[cfg(test)]

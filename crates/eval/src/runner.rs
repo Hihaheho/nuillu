@@ -1955,7 +1955,36 @@ fn eval_registry(modules: &[EvalModule]) -> ModuleRegistry {
     for module in modules {
         registry = register_eval_module(registry, *module);
     }
-    registry
+    declare_eval_dependencies(registry, modules)
+}
+
+fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -> ModuleRegistry {
+    use nuillu_types::builtin;
+
+    let present = modules
+        .iter()
+        .copied()
+        .map(EvalModule::module_id)
+        .collect::<std::collections::HashSet<_>>();
+    let edges = [
+        (builtin::speak_gate(), builtin::cognition_gate()),
+        (builtin::self_model(), builtin::query_vector()),
+        (builtin::cognition_gate(), builtin::sensory()),
+        (builtin::cognition_gate(), builtin::query_vector()),
+        (builtin::cognition_gate(), builtin::query_agentic()),
+        (builtin::cognition_gate(), builtin::self_model()),
+        (builtin::cognition_gate(), builtin::surprise()),
+    ];
+
+    edges
+        .into_iter()
+        .fold(registry, |registry, (dependent, dependency)| {
+            if present.contains(&dependent) && present.contains(&dependency) {
+                registry.depends_on(dependent, dependency)
+            } else {
+                registry
+            }
+        })
 }
 
 fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {

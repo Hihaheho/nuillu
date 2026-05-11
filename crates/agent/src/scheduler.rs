@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
@@ -8,13 +9,18 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord};
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
-    ModuleBatch, ModuleRunStatus, ports::Clock,
+    ModuleBatch, ModuleDependencies, ModuleRunStatus, ports::Clock,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{Instant, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
+
+use crate::kicks::{Kick, KickHandle, KickInbox};
+
+/// Silent window before nooping pending dependency kicks when no natural wake arrives.
+const KICK_SILENT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentEventLoopConfig {
@@ -47,11 +53,29 @@ pub async fn run(
     config: AgentEventLoopConfig,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
-    let (runtime, modules) = modules.into_parts();
+    let (runtime, modules, dependencies) = modules.into_parts_with_dependencies();
     let owners = modules
         .iter()
         .map(|module| module.owner().clone())
         .collect::<Vec<_>>();
+    let mut kick_inboxes: Vec<Option<KickInbox>> = Vec::with_capacity(owners.len());
+    let mut kick_targets_by_role = HashMap::<ModuleId, Vec<KickTarget>>::new();
+    for owner in &owners {
+        let (inbox, handle) = KickInbox::new();
+        kick_inboxes.push(Some(inbox));
+        kick_targets_by_role
+            .entry(owner.module.clone())
+            .or_default()
+            .push(KickTarget {
+                owner: owner.clone(),
+                handle,
+            });
+    }
+    let deps_resolver = DepsResolver {
+        runtime: runtime.clone(),
+        dependencies: Arc::new(dependencies),
+        kick_targets_by_role: Arc::new(kick_targets_by_role),
+    };
     let mut states = modules
         .into_iter()
         .map(|module| ModuleState::Stored {
@@ -70,6 +94,8 @@ pub async fn run(
         &mut active,
         &mut states,
         &mut tasks,
+        &mut kick_inboxes,
+        &deps_resolver,
         config,
         &parent,
         &subscriber,
@@ -112,6 +138,7 @@ pub async fn run(
                             &owners,
                             &mut states,
                             &mut tasks,
+                            &mut kick_inboxes,
                             config,
                             &parent,
                             &subscriber,
@@ -122,6 +149,8 @@ pub async fn run(
                             &mut active,
                             &mut states,
                             &mut tasks,
+                            &mut kick_inboxes,
+                            &deps_resolver,
                             config,
                             &parent,
                             &subscriber,
@@ -164,6 +193,7 @@ enum ModuleState {
         module: AllocatedModule,
         batch: ModuleBatch,
         gate_approved: bool,
+        pending_kicks: Vec<Kick>,
     },
     PendingActivationGate,
     Activating,
@@ -173,23 +203,29 @@ enum TaskMessage {
     BatchCooldownExpired {
         index: usize,
         module: AllocatedModule,
+        kick_inbox: KickInbox,
         delayed_for: Duration,
     },
     NextBatch {
         index: usize,
         module: AllocatedModule,
-        result: Result<ModuleBatch, String>,
+        kick_inbox: KickInbox,
+        result: Result<(ModuleBatch, Vec<Kick>), String>,
     },
     Activate {
         index: usize,
         module: AllocatedModule,
+        kick_inbox: KickInbox,
+        pending_kicks: Vec<Kick>,
         activation_elapsed: Duration,
         result: Result<(), String>,
     },
     ActivationGate {
         index: usize,
         module: AllocatedModule,
+        kick_inbox: KickInbox,
         batch: ModuleBatch,
+        pending_kicks: Vec<Kick>,
         outcome: ActivationGateOutcome,
     },
 }
@@ -199,12 +235,45 @@ struct NextBatchThrottle {
     activation_threshold: ActivationRatio,
 }
 
+#[derive(Clone)]
+struct KickTarget {
+    owner: ModuleInstanceId,
+    handle: KickHandle,
+}
+
+#[derive(Clone)]
+struct DepsResolver {
+    runtime: AgentRuntimeControl,
+    dependencies: Arc<ModuleDependencies>,
+    kick_targets_by_role: Arc<HashMap<ModuleId, Vec<KickTarget>>>,
+}
+
+impl DepsResolver {
+    async fn resolve_active_now(&self, dependent: &ModuleId) -> Vec<KickHandle> {
+        let mut handles = Vec::new();
+        for dep_id in self.dependencies.deps_of(dependent) {
+            let Some(targets) = self.kick_targets_by_role.get(dep_id) else {
+                continue;
+            };
+            for target in targets {
+                if self.runtime.is_active(&target.owner).await {
+                    handles.push(target.handle.clone());
+                }
+            }
+        }
+        handles
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn refresh_active_and_schedule(
     runtime: &AgentRuntimeControl,
     owners: &[ModuleInstanceId],
     active: &mut [bool],
     states: &mut [ModuleState],
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    kick_inboxes: &mut [Option<KickInbox>],
+    deps_resolver: &DepsResolver,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -226,6 +295,9 @@ async fn refresh_active_and_schedule(
                 else {
                     unreachable!("module state changed while scheduling next batch");
                 };
+                let kick_inbox = kick_inboxes[index]
+                    .take()
+                    .expect("kick inbox available for stored module");
                 let now = runtime.clock().now();
                 if let Some(throttle) =
                     next_batch_throttle.filter(|throttle| throttle.not_before > now)
@@ -239,6 +311,7 @@ async fn refresh_active_and_schedule(
                             tasks,
                             index,
                             module,
+                            kick_inbox,
                             throttle.not_before,
                             runtime.clock(),
                             activation_increase,
@@ -246,13 +319,32 @@ async fn refresh_active_and_schedule(
                             subscriber,
                         );
                     } else {
-                        spawn_next_batch(tasks, index, module, parent, subscriber);
+                        spawn_next_batch(
+                            tasks,
+                            index,
+                            module,
+                            kick_inbox,
+                            deps_resolver.clone(),
+                            parent,
+                            subscriber,
+                        );
                     }
                 } else {
-                    spawn_next_batch(tasks, index, module, parent, subscriber);
+                    spawn_next_batch(
+                        tasks,
+                        index,
+                        module,
+                        kick_inbox,
+                        deps_resolver.clone(),
+                        parent,
+                        subscriber,
+                    );
                 }
             }
             ModuleState::Stored { .. } => {
+                if let Some(kick_inbox) = &mut kick_inboxes[index] {
+                    notify_pending_and_ready(Vec::new(), kick_inbox);
+                }
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
                     .await;
@@ -272,10 +364,14 @@ async fn refresh_active_and_schedule(
                     module,
                     batch,
                     gate_approved,
+                    pending_kicks,
                 } = std::mem::replace(&mut states[index], ModuleState::Activating)
                 else {
                     unreachable!("module state changed while scheduling activation");
                 };
+                let kick_inbox = kick_inboxes[index]
+                    .take()
+                    .expect("kick inbox available for pending-batch module");
                 if gate_approved {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
@@ -286,6 +382,8 @@ async fn refresh_active_and_schedule(
                         tasks,
                         index,
                         module,
+                        kick_inbox,
+                        pending_kicks,
                         batch,
                         config,
                         runtime.clone(),
@@ -301,6 +399,8 @@ async fn refresh_active_and_schedule(
                         index,
                         owners[index].clone(),
                         module,
+                        kick_inbox,
+                        pending_kicks,
                         batch,
                         config,
                         parent,
@@ -311,6 +411,9 @@ async fn refresh_active_and_schedule(
                 }
             }
             ModuleState::PendingBatch { .. } => {
+                if let Some(kick_inbox) = &mut kick_inboxes[index] {
+                    notify_pending_and_ready(Vec::new(), kick_inbox);
+                }
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
                     .await;
@@ -334,12 +437,14 @@ async fn refresh_active_and_schedule(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_task_message(
     message: TaskMessage,
     runtime: &AgentRuntimeControl,
     owners: &[ModuleInstanceId],
     states: &mut [ModuleState],
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    kick_inboxes: &mut [Option<KickInbox>],
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -348,11 +453,13 @@ async fn handle_task_message(
         TaskMessage::BatchCooldownExpired {
             index,
             module,
+            kick_inbox,
             delayed_for,
         } => {
             runtime
                 .record_module_batch_throttled(owners[index].clone(), delayed_for)
                 .await;
+            kick_inboxes[index] = Some(kick_inbox);
             states[index] = ModuleState::Stored {
                 module,
                 next_batch_throttle: None,
@@ -362,9 +469,10 @@ async fn handle_task_message(
         TaskMessage::NextBatch {
             index,
             module,
+            mut kick_inbox,
             result,
         } => match result {
-            Ok(batch) => {
+            Ok((batch, pending_kicks)) => {
                 if runtime.is_active(&owners[index]).await {
                     let scheduled = spawn_activation_gate_or_activate(
                         runtime,
@@ -372,6 +480,8 @@ async fn handle_task_message(
                         index,
                         owners[index].clone(),
                         module,
+                        kick_inbox,
+                        pending_kicks,
                         batch,
                         config,
                         parent,
@@ -383,15 +493,19 @@ async fn handle_task_message(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
                         .await;
+                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                    kick_inboxes[index] = Some(kick_inbox);
                     states[index] = ModuleState::PendingBatch {
                         module,
                         batch,
                         gate_approved: false,
+                        pending_kicks: Vec::new(),
                     };
                 }
                 Ok(())
             }
             Err(message) => {
+                notify_pending_and_ready(Vec::new(), &mut kick_inbox);
                 runtime
                     .record_module_status(
                         owners[index].clone(),
@@ -411,10 +525,14 @@ async fn handle_task_message(
         TaskMessage::Activate {
             index,
             module,
+            mut kick_inbox,
+            pending_kicks,
             activation_elapsed,
             result,
         } => match result {
             Ok(()) => {
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
                 let now = runtime.clock().now();
                 let next_batch_throttle = runtime
                     .module_batch_throttle_baseline(&owners[index])
@@ -439,6 +557,8 @@ async fn handle_task_message(
                 Ok(())
             }
             Err(message) => {
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
                 runtime
                     .record_module_status(
                         owners[index].clone(),
@@ -458,7 +578,9 @@ async fn handle_task_message(
         TaskMessage::ActivationGate {
             index,
             module,
+            mut kick_inbox,
             batch,
+            pending_kicks,
             outcome,
         } => {
             if outcome.allowed() {
@@ -473,6 +595,8 @@ async fn handle_task_message(
                         tasks,
                         index,
                         module,
+                        kick_inbox,
+                        pending_kicks,
                         batch,
                         config,
                         runtime.clone(),
@@ -485,13 +609,18 @@ async fn handle_task_message(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
                         .await;
+                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                    kick_inboxes[index] = Some(kick_inbox);
                     states[index] = ModuleState::PendingBatch {
                         module,
                         batch,
                         gate_approved: true,
+                        pending_kicks: Vec::new(),
                     };
                 }
             } else {
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
                 states[index] = ModuleState::Stored {
                     module,
                     next_batch_throttle: None,
@@ -502,12 +631,22 @@ async fn handle_task_message(
     }
 }
 
+fn notify_pending_and_ready(mut pending_kicks: Vec<Kick>, kick_inbox: &mut KickInbox) {
+    pending_kicks.extend(kick_inbox.drain_ready());
+    for kick in pending_kicks {
+        kick.notify_finish();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_activation_gate_or_activate(
     runtime: &AgentRuntimeControl,
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     owner: ModuleInstanceId,
     module: AllocatedModule,
+    kick_inbox: KickInbox,
+    pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
@@ -526,6 +665,8 @@ async fn spawn_activation_gate_or_activate(
             tasks,
             index,
             module,
+            kick_inbox,
+            pending_kicks,
             batch,
             config,
             runtime.clone(),
@@ -543,6 +684,8 @@ async fn spawn_activation_gate_or_activate(
             tasks,
             index,
             module,
+            kick_inbox,
+            pending_kicks,
             batch,
             gate_requests,
             parent,
@@ -570,18 +713,67 @@ fn spawn_next_batch(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     mut module: AllocatedModule,
+    mut kick_inbox: KickInbox,
+    deps_resolver: DepsResolver,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let result = module
-                .next_batch()
-                .await
-                .map_err(|error| format!("{error:#}"));
+            let (batch_result, mut pending_kicks) = {
+                let mut pending_kicks = Vec::new();
+                let mut kick_inbox_closed = false;
+                let mut next_batch = pin!(module.next_batch());
+
+                loop {
+                    let timeout_enabled = !pending_kicks.is_empty();
+                    tokio::select! {
+                        biased;
+                        result = &mut next_batch => break (result, pending_kicks),
+                        maybe_kick = kick_inbox.next(), if !kick_inbox_closed => {
+                            if let Some(kick) = maybe_kick {
+                                pending_kicks.push(kick);
+                            } else {
+                                kick_inbox_closed = true;
+                            }
+                        }
+                        _ = tokio::time::sleep(KICK_SILENT_TIMEOUT), if timeout_enabled => {
+                            for kick in pending_kicks.drain(..) {
+                                kick.notify_finish();
+                            }
+                        }
+                    }
+                }
+            };
+
+            let result = match batch_result {
+                Ok(batch) => {
+                    let dep_handles = deps_resolver
+                        .resolve_active_now(&module.owner().module)
+                        .await;
+                    let completions = dep_handles
+                        .into_iter()
+                        .map(|handle| handle.send(module.owner().clone()))
+                        .collect::<Vec<_>>();
+                    for completion in completions {
+                        let _ = completion.await;
+                    }
+                    pending_kicks.extend(kick_inbox.drain_ready());
+                    Ok((batch, pending_kicks))
+                }
+                Err(error) => {
+                    pending_kicks.extend(kick_inbox.drain_ready());
+                    for kick in pending_kicks {
+                        kick.notify_finish();
+                    }
+                    Err(format!("{error:#}"))
+                }
+            };
+
             TaskMessage::NextBatch {
                 index,
                 module,
+                kick_inbox,
                 result,
             }
         }
@@ -590,10 +782,12 @@ fn spawn_next_batch(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_batch_cooldown(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     module: AllocatedModule,
+    kick_inbox: KickInbox,
     deadline: DateTime<Utc>,
     clock: Arc<dyn Clock>,
     activation_increase: tokio::sync::oneshot::Receiver<()>,
@@ -611,6 +805,7 @@ fn spawn_batch_cooldown(
             TaskMessage::BatchCooldownExpired {
                 index,
                 module,
+                kick_inbox,
                 delayed_for,
             }
         }
@@ -619,10 +814,13 @@ fn spawn_batch_cooldown(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_activation_gate_wait(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     module: AllocatedModule,
+    kick_inbox: KickInbox,
+    pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
     requests: Vec<tokio::sync::oneshot::Receiver<ActivationGateVote>>,
     parent: &tracing::Span,
@@ -634,7 +832,9 @@ fn spawn_activation_gate_wait(
             TaskMessage::ActivationGate {
                 index,
                 module,
+                kick_inbox,
                 batch,
+                pending_kicks,
                 outcome,
             }
         }
@@ -643,10 +843,13 @@ fn spawn_activation_gate_wait(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_activate(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     module: AllocatedModule,
+    kick_inbox: KickInbox,
+    pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
     runtime: AgentRuntimeControl,
@@ -671,6 +874,8 @@ fn spawn_activate(
             TaskMessage::Activate {
                 index,
                 module,
+                kick_inbox,
+                pending_kicks,
                 activation_elapsed,
                 result,
             }
@@ -778,6 +983,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -1374,6 +1580,313 @@ mod tests {
         }
     }
 
+    struct PendingDependencyModule {
+        release: Option<oneshot::Receiver<()>>,
+        activations: Rc<Cell<u8>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for PendingDependencyModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "pending-dependency"
+        }
+
+        fn role_description() -> &'static str {
+            "test dependency"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.activations
+                .set(self.activations.get().saturating_add(1));
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct ImmediateDependentModule {
+        batch_sent: bool,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ImmediateDependentModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "immediate-dependent"
+        }
+
+        fn role_description() -> &'static str {
+            "test dependent"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct ReleasedDependentModule {
+        release: Option<oneshot::Receiver<()>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for ReleasedDependentModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "released-dependent"
+        }
+
+        fn role_description() -> &'static str {
+            "test dependent"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct GatedKickTargetModule {
+        batch_sent: bool,
+        activated: Rc<Cell<bool>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for GatedKickTargetModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "gated-kick-target"
+        }
+
+        fn role_description() -> &'static str {
+            "test gated dependency"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.activated.set(true);
+            Ok(())
+        }
+    }
+
+    struct BlockingAllowGateModule {
+        gate: ActivationGate<GatedKickTargetModule>,
+        seen: Option<oneshot::Sender<()>>,
+        allow: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingAllowGateModule {
+        type Batch = ActivationGateEvent<GatedKickTargetModule>;
+
+        fn id() -> &'static str {
+            "blocking-allow-gate"
+        }
+
+        fn role_description() -> &'static str {
+            "test blocking activation gate"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.gate.next_event().await?)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(seen) = self.seen.take() {
+                let _ = seen.send(());
+            }
+            if let Some(allow) = self.allow.take() {
+                let _ = allow.await;
+            }
+            batch.respond(ActivationGateVote::Allow);
+            Ok(())
+        }
+    }
+
+    struct GateKickDependentModule {
+        release: Option<oneshot::Receiver<()>>,
+        collected: Option<oneshot::Sender<()>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for GateKickDependentModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "gate-kick-dependent"
+        }
+
+        fn role_description() -> &'static str {
+            "test dependent"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+                if let Some(collected) = self.collected.take() {
+                    let _ = collected.send(());
+                }
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingBatchModule {
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailingBatchModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "failing-batch"
+        }
+
+        fn role_description() -> &'static str {
+            "test failing batch"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            anyhow::bail!("planned next_batch failure")
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            unreachable!("failing batch never activates")
+        }
+    }
+
+    struct FailingActivateAfterReleaseModule {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailingActivateAfterReleaseModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "failing-activate-after-release"
+        }
+
+        fn role_description() -> &'static str {
+            "test failing activation"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            anyhow::bail!("planned activation failure")
+        }
+    }
+
     async fn wait_for_status(
         blackboard: &Blackboard,
         owner: &nuillu_types::ModuleInstanceId,
@@ -1410,7 +1923,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
+                        0..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -1685,7 +2198,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
+                        0..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -2106,7 +2619,7 @@ mod tests {
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
+                        0..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -2156,7 +2669,7 @@ mod tests {
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
                     .register(
-                        1..=1,
+                        0..=1,
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
                         linear_ratio_fn,
                         {
@@ -2303,6 +2816,661 @@ mod tests {
 
     // Inactive replicas keep state and queued inbox messages, but the scheduler
     // does not start semantic work for them until allocation makes them active.
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn kick_silent_timeout_noops_kick_without_canceling_dependency_next_batch() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(PendingDependencyModule::id()).unwrap();
+                let dependent_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(dependency_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let dependency_activations = Rc::new(Cell::new(0_u8));
+                let observed_dependency_activations = Rc::clone(&dependency_activations);
+                let (dependency_release_tx, dependency_release_rx) = oneshot::channel();
+                let dependency_release_rx = Rc::new(RefCell::new(Some(dependency_release_rx)));
+                let (dependency_done_tx, dependency_done_rx) = oneshot::channel();
+                let dependency_done_tx = Rc::new(RefCell::new(Some(dependency_done_tx)));
+                let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
+                let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
+
+                let modules = ModuleRegistry::new()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let dependency_activations = Rc::clone(&dependency_activations);
+                            let dependency_release_rx = Rc::clone(&dependency_release_rx);
+                            let dependency_done_tx = Rc::clone(&dependency_done_tx);
+                            move |_| PendingDependencyModule {
+                                release: dependency_release_rx.borrow_mut().take(),
+                                activations: Rc::clone(&dependency_activations),
+                                on_done: dependency_done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let dependent_done_tx = Rc::clone(&dependent_done_tx);
+                            move |_| ImmediateDependentModule {
+                                batch_sent: false,
+                                on_done: dependent_done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id, dependency_id)
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async move {
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    let _ = dependent_done_rx.await;
+                    assert_eq!(observed_dependency_activations.get(), 0);
+                    let _ = dependency_release_tx.send(());
+                    let _ = dependency_done_rx.await;
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(dependency_activations.get(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn dependency_active_at_spawn_but_inactive_at_kick_send_is_skipped() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(PendingDependencyModule::id()).unwrap();
+                let dependent_id = ModuleId::new(ReleasedDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(dependency_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let dependency_activations = Rc::new(Cell::new(0_u8));
+                let (_dependency_release_tx, dependency_release_rx) = oneshot::channel();
+                let dependency_release_rx = Rc::new(RefCell::new(Some(dependency_release_rx)));
+                let (dependent_release_tx, dependent_release_rx) = oneshot::channel();
+                let dependent_release_rx = Rc::new(RefCell::new(Some(dependent_release_rx)));
+                let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
+                let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
+
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let dependency_activations = Rc::clone(&dependency_activations);
+                            let dependency_release_rx = Rc::clone(&dependency_release_rx);
+                            move |_| PendingDependencyModule {
+                                release: dependency_release_rx.borrow_mut().take(),
+                                activations: Rc::clone(&dependency_activations),
+                                on_done: None,
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let dependent_release_rx = Rc::clone(&dependent_release_rx);
+                            let dependent_done_tx = Rc::clone(&dependent_done_tx);
+                            move |_| ReleasedDependentModule {
+                                release: dependent_release_rx.borrow_mut().take(),
+                                on_done: dependent_done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id.clone(), dependency_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async move {
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    let mut lowered = ResourceAllocation::default();
+                    lowered.set(dependency_id, ModuleConfig::default());
+                    lowered.set_activation(
+                        ModuleId::new(PendingDependencyModule::id()).unwrap(),
+                        ActivationRatio::ZERO,
+                    );
+                    lowered.set(dependent_id, ModuleConfig::default());
+                    lowered.set_activation(
+                        ModuleId::new(ReleasedDependentModule::id()).unwrap(),
+                        ActivationRatio::ONE,
+                    );
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(lowered))
+                        .await;
+                    let _ = dependent_release_tx.send(());
+                    tokio::time::timeout(Duration::from_millis(100), dependent_done_rx)
+                        .await
+                        .expect("dependent should not wait for an inactive dependency")
+                        .expect("dependent activation sender dropped");
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(dependency_activations.get(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn gate_allow_after_target_inactive_noops_pending_dependency_kicks() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let target_id = ModuleId::new(GatedKickTargetModule::id()).unwrap();
+                let gate_id = ModuleId::new(BlockingAllowGateModule::id()).unwrap();
+                let dependent_id = ModuleId::new(GateKickDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(target_id.clone(), ModuleConfig::default());
+                alloc.set_activation(target_id.clone(), ActivationRatio::ONE);
+                alloc.set(gate_id.clone(), ModuleConfig::default());
+                alloc.set_activation(gate_id.clone(), ActivationRatio::ONE);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let target_activated = Rc::new(Cell::new(false));
+                let observed_target_activated = Rc::clone(&target_activated);
+                let (gate_seen_tx, gate_seen_rx) = oneshot::channel();
+                let gate_seen_tx = Rc::new(RefCell::new(Some(gate_seen_tx)));
+                let (gate_allow_tx, gate_allow_rx) = oneshot::channel();
+                let gate_allow_rx = Rc::new(RefCell::new(Some(gate_allow_rx)));
+                let (dependent_release_tx, dependent_release_rx) = oneshot::channel();
+                let dependent_release_rx = Rc::new(RefCell::new(Some(dependent_release_rx)));
+                let (dependent_collected_tx, dependent_collected_rx) = oneshot::channel();
+                let dependent_collected_tx = Rc::new(RefCell::new(Some(dependent_collected_tx)));
+                let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
+                let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
+
+                let modules = ModuleRegistry::new()
+                    .register(
+                        0..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let target_activated = Rc::clone(&target_activated);
+                            move |_| GatedKickTargetModule {
+                                batch_sent: false,
+                                activated: Rc::clone(&target_activated),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let gate_seen_tx = Rc::clone(&gate_seen_tx);
+                            let gate_allow_rx = Rc::clone(&gate_allow_rx);
+                            move |caps| BlockingAllowGateModule {
+                                gate: caps.activation_gate_for::<GatedKickTargetModule>(),
+                                seen: gate_seen_tx.borrow_mut().take(),
+                                allow: gate_allow_rx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let dependent_release_rx = Rc::clone(&dependent_release_rx);
+                            let dependent_collected_tx = Rc::clone(&dependent_collected_tx);
+                            let dependent_done_tx = Rc::clone(&dependent_done_tx);
+                            move |_| GateKickDependentModule {
+                                release: dependent_release_rx.borrow_mut().take(),
+                                collected: dependent_collected_tx.borrow_mut().take(),
+                                on_done: dependent_done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id.clone(), target_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async move {
+                    let _ = gate_seen_rx.await;
+                    let _ = dependent_release_tx.send(());
+                    let _ = dependent_collected_rx.await;
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+
+                    let mut lowered = ResourceAllocation::default();
+                    lowered.set(target_id, ModuleConfig::default());
+                    lowered.set_activation(
+                        ModuleId::new(GatedKickTargetModule::id()).unwrap(),
+                        ActivationRatio::ZERO,
+                    );
+                    lowered.set(gate_id, ModuleConfig::default());
+                    lowered.set_activation(
+                        ModuleId::new(BlockingAllowGateModule::id()).unwrap(),
+                        ActivationRatio::ONE,
+                    );
+                    lowered.set(dependent_id, ModuleConfig::default());
+                    lowered.set_activation(
+                        ModuleId::new(GateKickDependentModule::id()).unwrap(),
+                        ActivationRatio::ONE,
+                    );
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(lowered))
+                        .await;
+
+                    let _ = gate_allow_tx.send(());
+                    tokio::time::timeout(Duration::from_millis(100), dependent_done_rx)
+                        .await
+                        .expect("dependent kick should be nooped when the gate target is inactive")
+                        .expect("dependent activation sender dropped");
+                    assert!(!observed_target_activated.get());
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert!(!target_activated.get());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn next_batch_error_noops_pending_kicks_before_reporting_error() {
+        use futures::StreamExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let caps = test_caps(Blackboard::default());
+                let modules = ModuleRegistry::new()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let release_rx = Rc::clone(&release_rx);
+                            move |_| FailingBatchModule {
+                                release: release_rx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let module = modules.pop().unwrap();
+                let sender = module.owner().clone();
+                let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                let completion = kick_handle.send(sender);
+                let deps_resolver = super::DepsResolver {
+                    runtime,
+                    dependencies: Arc::new(dependencies),
+                    kick_targets_by_role: Arc::new(std::collections::HashMap::new()),
+                };
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+
+                super::spawn_next_batch(
+                    &mut tasks,
+                    0,
+                    module,
+                    kick_inbox,
+                    deps_resolver,
+                    &parent,
+                    &subscriber,
+                );
+                tokio::task::yield_now().await;
+                let _ = release_tx.send(());
+
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("next_batch task should finish")
+                    .expect("next_batch task should not panic");
+                match message {
+                    super::TaskMessage::NextBatch { result, .. } => {
+                        let error = match result {
+                            Ok(_) => panic!("next_batch should fail"),
+                            Err(error) => error,
+                        };
+                        assert!(error.contains("planned next_batch failure"));
+                    }
+                    _ => panic!("expected next_batch task message"),
+                }
+                completion
+                    .await
+                    .expect("pending kick should be completed on next_batch error");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn dependency_pull_drains_kicks_that_arrive_while_waiting_for_dependency() {
+        use futures::StreamExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(PendingDependencyModule::id()).unwrap();
+                let dependent_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(dependency_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let modules = ModuleRegistry::new()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        |_| PendingDependencyModule {
+                            release: None,
+                            activations: Rc::new(Cell::new(0)),
+                            on_done: None,
+                        },
+                    )
+                    .unwrap()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        |_| ImmediateDependentModule {
+                            batch_sent: false,
+                            on_done: None,
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id.clone(), dependency_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let dependent_index = modules
+                    .iter()
+                    .position(|module| module.owner().module == dependent_id)
+                    .unwrap();
+                let dependent = modules.remove(dependent_index);
+                let dependent_owner = dependent.owner().clone();
+                let dependency_owner = nuillu_types::ModuleInstanceId::new(
+                    dependency_id,
+                    nuillu_types::ReplicaIndex::ZERO,
+                );
+                let (dependent_kick_inbox, dependent_kick_handle) = crate::kicks::KickInbox::new();
+                let (mut dependency_kick_inbox, dependency_kick_handle) =
+                    crate::kicks::KickInbox::new();
+                let mut kick_targets = std::collections::HashMap::new();
+                kick_targets.insert(
+                    dependency_owner.module.clone(),
+                    vec![super::KickTarget {
+                        owner: dependency_owner.clone(),
+                        handle: dependency_kick_handle,
+                    }],
+                );
+                let deps_resolver = super::DepsResolver {
+                    runtime,
+                    dependencies: Arc::new(dependencies),
+                    kick_targets_by_role: Arc::new(kick_targets),
+                };
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+
+                super::spawn_next_batch(
+                    &mut tasks,
+                    0,
+                    dependent,
+                    dependent_kick_inbox,
+                    deps_resolver,
+                    &parent,
+                    &subscriber,
+                );
+                let dependency_kick = dependency_kick_inbox
+                    .next()
+                    .await
+                    .expect("dependent should kick its dependency");
+                let dependent_completion = dependent_kick_handle.send(dependency_owner);
+                dependency_kick.notify_finish();
+
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("next_batch task should finish")
+                    .expect("next_batch task should not panic");
+                match message {
+                    super::TaskMessage::NextBatch {
+                        result: Ok((_batch, pending_kicks)),
+                        ..
+                    } => {
+                        assert_eq!(pending_kicks.len(), 1);
+                        for kick in pending_kicks {
+                            kick.notify_finish();
+                        }
+                    }
+                    _ => panic!("expected successful next_batch with drained pending kick"),
+                }
+                dependent_completion
+                    .await
+                    .expect("kick arriving during dependency pull should be carried forward");
+                assert_eq!(dependent_owner.module, dependent_id);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_failure_noops_ready_kicks_before_reporting_error() {
+        use futures::StreamExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(FailingActivateAfterReleaseModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let entered_tx = Rc::new(RefCell::new(Some(entered_tx)));
+                let (release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        {
+                            let entered_tx = Rc::clone(&entered_tx);
+                            let release_rx = Rc::clone(&release_rx);
+                            move |_| FailingActivateAfterReleaseModule {
+                                entered: entered_tx.borrow_mut().take(),
+                                release: release_rx.borrow_mut().take(),
+                                batch_sent: false,
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, _) = modules.into_parts_with_dependencies();
+                let mut module = modules.pop().unwrap();
+                let owner = module.owner().clone();
+                let batch = module.next_batch().await.unwrap();
+                let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+
+                super::spawn_activate(
+                    &mut tasks,
+                    0,
+                    module,
+                    kick_inbox,
+                    Vec::new(),
+                    batch,
+                    test_config(),
+                    runtime.clone(),
+                    runtime.module_catalog(),
+                    runtime.identity_memories().await,
+                    &parent,
+                    &subscriber,
+                );
+                let _ = entered_rx.await;
+                let completion = kick_handle.send(owner.clone());
+                let _ = release_tx.send(());
+
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("activation task should finish")
+                    .expect("activation task should not panic");
+                let mut states = vec![super::ModuleState::Activating];
+                let mut kick_inboxes = Vec::new();
+                kick_inboxes.push(None);
+                let mut followup_tasks = futures::stream::FuturesUnordered::new();
+                let err = super::handle_task_message(
+                    message,
+                    &runtime,
+                    std::slice::from_ref(&owner),
+                    &mut states,
+                    &mut followup_tasks,
+                    &mut kick_inboxes,
+                    test_config(),
+                    &parent,
+                    &subscriber,
+                )
+                .await
+                .expect_err("activation failure should be reported");
+                assert!(matches!(
+                    err,
+                    SchedulerError::ModuleTaskFailed { phase: "activate", message, .. }
+                        if message.contains("planned activation failure")
+                ));
+                completion
+                    .await
+                    .expect("ready kick should be completed before activation error escapes");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn kick_silent_timeout_debounces_when_more_kicks_arrive() {
+        use futures::StreamExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(HangingBatchStub::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let modules = ModuleRegistry::new()
+                    .register(
+                        1..=1,
+                        Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
+                        linear_ratio_fn,
+                        |_| HangingBatchStub,
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let module = modules.pop().unwrap();
+                let owner = module.owner().clone();
+                let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                let deps_resolver = super::DepsResolver {
+                    runtime,
+                    dependencies: Arc::new(dependencies),
+                    kick_targets_by_role: Arc::new(std::collections::HashMap::new()),
+                };
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+
+                super::spawn_next_batch(
+                    &mut tasks,
+                    0,
+                    module,
+                    kick_inbox,
+                    deps_resolver,
+                    &parent,
+                    &subscriber,
+                );
+                let mut first = kick_handle.send(owner.clone());
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(500)).await;
+                let mut second = kick_handle.send(owner);
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_millis(600)).await;
+                tokio::task::yield_now().await;
+
+                assert!(matches!(
+                    first.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(matches!(
+                    second.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+
+                tokio::time::advance(Duration::from_millis(401)).await;
+                tokio::task::yield_now().await;
+                first.await.expect("first kick should be nooped");
+                second.await.expect("second kick should be nooped");
+
+                for task in tasks.iter() {
+                    task.abort();
+                }
+                while tasks.next().await.is_some() {}
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn idle_deadlock_records_marker_and_publishes_cognition_log_update() {

@@ -6,7 +6,7 @@ modules = ["sensory", "cognition-gate", "attention-controller", "self-model", "q
 limits {
   max-ticks = 300
   tick-ms = 500
-  max-llm-calls = 16
+  max-llm-calls = 22
 }
 
 participants = ["Koro"]

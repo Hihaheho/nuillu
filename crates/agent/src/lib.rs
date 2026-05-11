@@ -5,6 +5,7 @@
 //! input loops via typed inbox capabilities and perform side effects
 //! through other capabilities.
 
+mod kicks;
 pub mod scheduler;
 
 #[cfg(test)]

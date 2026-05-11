@@ -64,13 +64,21 @@ impl<T: Clone> Topic<T> {
         }
     }
 
-    fn subscribe(&self, owner: ModuleInstanceId) -> mpsc::UnboundedReceiver<Envelope<T>> {
+    fn subscribe(
+        &self,
+        owner: ModuleInstanceId,
+        exclude_self: bool,
+    ) -> mpsc::UnboundedReceiver<Envelope<T>> {
         let (sender, receiver) = mpsc::unbounded();
         self.inner
             .lock()
             .expect("Topic inner poisoned")
             .subscribers
-            .push(TopicSubscriber { owner, sender });
+            .push(TopicSubscriber {
+                owner,
+                sender,
+                exclude_self,
+            });
         receiver
     }
 }
@@ -92,6 +100,7 @@ impl<T: Clone> Default for TopicInner<T> {
 struct TopicSubscriber<T: Clone> {
     owner: ModuleInstanceId,
     sender: mpsc::UnboundedSender<Envelope<T>>,
+    exclude_self: bool,
 }
 
 /// Publish capability for one typed topic.
@@ -156,6 +165,9 @@ impl<T: Clone> TopicMailbox<T> {
                             .unwrap_or(false)
                             && subscriber.owner.replica == nuillu_types::ReplicaIndex::ZERO)
                 }) {
+                    if subscriber.exclude_self && subscriber.owner == envelope.sender {
+                        continue;
+                    }
                     if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
                         delivered += 1;
                     }
@@ -165,6 +177,9 @@ impl<T: Clone> TopicMailbox<T> {
                 let mut by_role = HashMap::<ModuleId, Vec<usize>>::new();
                 let mut fallback_by_role = HashMap::<ModuleId, usize>::new();
                 for (idx, subscriber) in inner.subscribers.iter().enumerate() {
+                    if subscriber.exclude_self && subscriber.owner == envelope.sender {
+                        continue;
+                    }
                     if allocation.is_replica_active(&subscriber.owner) {
                         by_role
                             .entry(subscriber.owner.module.clone())
@@ -214,7 +229,7 @@ impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
         Self {
             owner: owner.clone(),
-            receiver: topic.subscribe(owner.clone()),
+            receiver: topic.subscribe(owner, false),
             exclude_self: false,
         }
     }
@@ -222,7 +237,7 @@ impl<T: Clone> TopicInbox<T> {
     pub(crate) fn new_excluding_self(owner: ModuleInstanceId, topic: Topic<T>) -> Self {
         Self {
             owner: owner.clone(),
-            receiver: topic.subscribe(owner),
+            receiver: topic.subscribe(owner, true),
             exclude_self: true,
         }
     }

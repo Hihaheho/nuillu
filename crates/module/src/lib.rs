@@ -52,8 +52,8 @@ pub use allocation_writer::AllocationWriter;
 pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
     CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
-    InternalHarnessIo, ModuleCapabilityFactory, ModuleRegisterer, ModuleRegistry,
-    ModuleRegistryError,
+    InternalHarnessIo, ModuleCapabilityFactory, ModuleDependencies, ModuleRegisterer,
+    ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{
     AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AttentionControlRequest,
