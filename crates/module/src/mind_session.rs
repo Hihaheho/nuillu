@@ -51,7 +51,7 @@ mod tests {
     use nuillu_blackboard::{CognitionLogEntry, MemoLogRecord};
     use nuillu_types::{MemoryContent, MemoryIndex, ReplicaIndex, builtin};
 
-    use crate::render_session_items_for_compaction;
+    use lutum::{AssistantInputItem, InputMessageRole, MessageContent, ModelInputItem};
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap()
@@ -95,11 +95,33 @@ mod tests {
             now(),
         );
 
-        let rendered = render_session_items_for_compaction(session.input().items()).to_string();
-        assert!(rendered.contains("\"role\":\"system\""));
-        assert!(rendered.contains("SYSTEM"));
-        assert!(rendered.contains("What I already remember about myself"));
-        assert!(rendered.contains("My cognition at 2026-05-11T06:23:00Z"));
-        assert!(rendered.contains("Held-in-mind notes at 2026-05-11T06:23:00Z"));
+        let items = session.input().items();
+        let ModelInputItem::Message { role, content } = &items[0] else {
+            panic!("expected system message first");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system text");
+        };
+        assert_eq!(system, "SYSTEM");
+
+        let ModelInputItem::Assistant(AssistantInputItem::Text(identity)) = &items[1] else {
+            panic!("expected identity seed assistant text second");
+        };
+        assert!(identity.contains("What I already remember about myself"));
+
+        let ModelInputItem::Assistant(AssistantInputItem::Text(cognition)) = &items[2] else {
+            panic!("expected cognition batch assistant text third");
+        };
+        assert!(cognition.contains("My cognition at 2026-05-11T06:23:00Z"));
+
+        let ModelInputItem::Message { role, content } = &items[3] else {
+            panic!("expected memo batch system message fourth");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(memos)] = content.as_slice() else {
+            panic!("expected memo batch text");
+        };
+        assert!(memos.contains("Held-in-mind notes at 2026-05-11T06:23:00Z"));
     }
 }

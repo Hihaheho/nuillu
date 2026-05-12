@@ -76,17 +76,4 @@ impl CognitionLogSet {
     pub fn agentic_deadlock_marker(&self) -> Option<&AgenticDeadlockMarker> {
         self.agentic_deadlock_marker.as_ref()
     }
-
-    pub fn compact_json(&self) -> serde_json::Value {
-        if self.agentic_deadlock_marker.is_none() && self.logs.len() == 1 {
-            return serde_json::json!(self.logs[0].entries);
-        }
-        if let Some(marker) = &self.agentic_deadlock_marker {
-            return serde_json::json!({
-                "logs": self.logs,
-                "agentic_deadlock_marker": marker,
-            });
-        }
-        serde_json::json!(self.logs)
-    }
 }

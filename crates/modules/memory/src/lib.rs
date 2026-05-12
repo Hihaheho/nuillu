@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, MemoryWriter, Module, SessionCompactionConfig, compact_session_if_needed,
-    push_unread_memo_logs,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogEntryRecord,
+    CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, MemoryWriter, Module,
+    SessionCompactionConfig, compact_session_if_needed, memory_rank_counts,
+    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
@@ -57,6 +58,16 @@ pub struct MemoryModule {
     session: Session,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
+    last_seen_cognition_index: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryMetadataContext {
+    index: String,
+    rank: MemoryRank,
+    occurred_at: String,
+    decay_remaining_secs: i64,
+    access_count: u32,
 }
 
 impl MemoryModule {
@@ -79,6 +90,7 @@ impl MemoryModule {
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
+            last_seen_cognition_index: None,
         }
     }
 
@@ -94,6 +106,17 @@ impl MemoryModule {
         })
     }
 
+    async fn unread_cognition_log(&mut self) -> Vec<CognitionLogEntryRecord> {
+        let unread = self
+            .blackboard
+            .read(|bb| bb.unread_cognition_log_entries(self.last_seen_cognition_index))
+            .await;
+        if let Some(index) = unread.last().map(|record| record.index) {
+            self.last_seen_cognition_index = Some(index);
+        }
+        unread
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
         &mut self,
@@ -102,14 +125,27 @@ impl MemoryModule {
         cognition_updated: bool,
     ) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
-        let snapshot = self
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
+        let cognition_log = self.unread_cognition_log().await;
+        let (memory_metadata, rank_counts) = self
             .blackboard
             .read(|bb| {
-                serde_json::json!({
-                    "cognition_log": bb.cognition_log().entries(),
-                    "memory_metadata": bb.memory_metadata(),
-                })
+                let mut metadata = bb
+                    .memory_metadata()
+                    .values()
+                    .map(|item| MemoryMetadataContext {
+                        index: item.index.to_string(),
+                        rank: item.rank,
+                        occurred_at: item
+                            .occurred_at
+                            .map(|at| at.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        decay_remaining_secs: item.decay_remaining_secs,
+                        access_count: item.access_count,
+                    })
+                    .collect::<Vec<_>>();
+                metadata.sort_by(|left, right| left.index.cmp(&right.index));
+                (metadata, memory_rank_counts(bb.memory_metadata()))
             })
             .await;
         let allocation = self.allocation.snapshot().await;
@@ -117,26 +153,26 @@ impl MemoryModule {
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
-        self.session.push_user(
-            serde_json::json!({
-                "allocation_guidance": allocation_guidance,
-                "allocation_updated": allocation_updated,
-                "cognition_updated": cognition_updated,
-            })
-            .to_string(),
-        );
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "blackboard": snapshot,
-                "allocation": allocation,
-                "request_policy": {
-                    "normal_request_default_decay_secs": NORMAL_REQUEST_DECAY_SECS,
-                    "high_request_default_decay_secs": HIGH_REQUEST_DECAY_SECS,
-                    "explicit_requests_are_candidates": true,
-                    "deduplication_and_rejection_allowed": true,
-                },
-            })
-            .to_string(),
+        self.session.push_user(format_memory_activation_request(
+            &allocation_guidance,
+            allocation_updated,
+            cognition_updated,
+        ));
+        push_formatted_cognition_log_batch(&mut self.session, &cognition_log, cx.now());
+        if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
+            self.session.push_ephemeral_user(metadata_context);
+        }
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: None,
+                stuckness: None,
+                now: cx.now(),
+            },
         );
 
         for _ in 0..4 {
@@ -220,6 +256,39 @@ impl MemoryModule {
             index: index.to_string(),
         })
     }
+}
+
+fn format_memory_activation_request(
+    guidance: &str,
+    allocation_updated: bool,
+    cognition_updated: bool,
+) -> String {
+    format!(
+        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nCognition updated: {}\nNormal explicit request default decay: {} seconds.\nHigh-importance explicit request default decay: {} seconds.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed.",
+        if guidance.trim().is_empty() {
+            "none"
+        } else {
+            guidance.trim()
+        },
+        if allocation_updated { "yes" } else { "no" },
+        if cognition_updated { "yes" } else { "no" },
+        NORMAL_REQUEST_DECAY_SECS,
+        HIGH_REQUEST_DECAY_SECS,
+    )
+}
+
+fn format_memory_metadata_candidates(metadata: &[MemoryMetadataContext]) -> Option<String> {
+    if metadata.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Existing memory metadata for deduplication:");
+    for item in metadata {
+        out.push_str(&format!(
+            "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}",
+            item.index, item.rank, item.occurred_at, item.decay_remaining_secs, item.access_count
+        ));
+    }
+    Some(out)
 }
 
 #[async_trait(?Send)]

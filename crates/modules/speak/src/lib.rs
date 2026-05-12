@@ -618,20 +618,18 @@ impl SpeakGateModule {
 
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_cognition = self.cognition_log.unread_events().await;
+        let latest_cognition_index = unread_cognition.last().map(|record| record.index);
         push_cognition_history(&mut self.session, &unread_cognition);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let speak_owner = speak_owner();
-        let (rank_counts, stuckness, utterance_progress, latest_cognition_index) = self
+        let (rank_counts, stuckness, utterance_progress) = self
             .blackboard
             .read(|bb| {
                 (
                     memory_rank_counts(bb.memory_metadata()),
                     bb.agentic_deadlock_marker().cloned(),
                     bb.utterance_progress_for_instance(&speak_owner).cloned(),
-                    bb.unread_cognition_log_entries(None)
-                        .last()
-                        .map(|record| record.index),
                 )
             })
             .await;
@@ -933,29 +931,58 @@ fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> Strin
     )
 }
 
-fn generation_input(
-    cognition_log_json: serde_json::Value,
-    draft: &GenerationDraft,
-) -> serde_json::Value {
-    serde_json::json!({
-        "cognition_logs": cognition_log_json,
-        "speech_target": {
-            "target": draft.target.as_str(),
-        },
-    })
+fn format_generation_input(cognition_context: &str, draft: &GenerationDraft) -> String {
+    format!(
+        "Current cognition log:\n{}\n\nSpeech target: {}",
+        cognition_context.trim(),
+        draft.target.trim()
+    )
 }
 
 fn push_generation_context(
     session: &mut Session,
-    cognition_log_json: serde_json::Value,
+    cognition_context: &str,
     draft: &GenerationDraft,
     generation_prompt: &str,
 ) {
     session.push_system(generation_prompt);
-    session.push_user(generation_input(cognition_log_json, draft).to_string());
+    session.push_user(format_generation_input(cognition_context, draft));
     if !draft.accumulated.is_empty() {
         session.push_assistant_text(draft.accumulated.clone());
     }
+}
+
+fn finish_speech_cognition_context(lines: Vec<String>, idle_for_secs: Option<u64>) -> String {
+    let mut lines = lines;
+    if let Some(seconds) = idle_for_secs {
+        lines.push(format!("- I have been idle for {seconds} seconds."));
+    }
+    if lines.is_empty() {
+        "none".to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn format_abort_judge_input(cognition_context_at_start: &str, new_entries: &[String]) -> String {
+    let mut out = format!(
+        "Cognition log at the start of the current speech attempt:\n{}",
+        cognition_context_at_start.trim()
+    );
+    out.push_str("\n\nNew cognition entries since speech started:");
+    if new_entries.is_empty() {
+        out.push_str("\n- none");
+    } else {
+        for entry in new_entries
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+        {
+            out.push_str("\n- ");
+            out.push_str(entry);
+        }
+    }
+    out
 }
 
 enum GenerationStreamOutcome {
@@ -1043,42 +1070,57 @@ impl SpeakModule {
         batch: &batch::SpeakBatch,
     ) -> Result<()> {
         let _update_count = batch.updates.len();
-        let mut cognition_log_json = self.cognition_log.snapshot().await.compact_json();
-        let target = self.select_target(cx, &cognition_log_json).await?;
+        let mut cognition_context = self.speech_cognition_context().await;
+        let target = self.select_target(cx, &cognition_context).await?;
         let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), target);
 
         loop {
             self.record_streaming_progress(&draft).await;
             match self
-                .stream_generation(cx, cognition_log_json, &mut draft)
+                .stream_generation(cx, cognition_context.clone(), &mut draft)
                 .await?
             {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
-                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
+                    cognition_context = self.speech_cognition_context().await;
                 }
                 GenerationStreamOutcome::Aborted => {
-                    cognition_log_json = self.cognition_log.snapshot().await.compact_json();
-                    let new_target = self.select_target(cx, &cognition_log_json).await?;
+                    cognition_context = self.speech_cognition_context().await;
+                    let new_target = self.select_target(cx, &cognition_context).await?;
                     draft = GenerationDraft::new(self.utterance.next_generation_id(), new_target);
                 }
             }
         }
     }
 
+    async fn speech_cognition_context(&self) -> String {
+        let snapshot = self.cognition_log.snapshot().await;
+        let mut lines = Vec::new();
+        for record in snapshot.logs() {
+            for entry in &record.entries {
+                let text = entry.text.trim();
+                if !text.is_empty() {
+                    lines.push(format!("- {text}"));
+                }
+            }
+        }
+        let idle_for_secs = snapshot
+            .agentic_deadlock_marker()
+            .map(|marker| marker.idle_for.as_secs());
+        finish_speech_cognition_context(lines, idle_for_secs)
+    }
+
     async fn select_target(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        cognition_log_json: &serde_json::Value,
+        cognition_context: &str,
     ) -> Result<String> {
         let mut session = Session::new();
         session.push_system(self.target_prompt(cx));
-        session.push_user(
-            serde_json::json!({
-                "cognition_logs": cognition_log_json,
-            })
-            .to_string(),
-        );
+        session.push_user(format!(
+            "Current cognition log:\n{}",
+            cognition_context.trim()
+        ));
 
         let lutum = self.llm.lutum().await;
         let target_schema = self.scene.target_schema();
@@ -1105,16 +1147,16 @@ impl SpeakModule {
     async fn stream_generation(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        cognition_log_json: serde_json::Value,
+        cognition_context: String,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         let stream_started_at = cx.now();
-        let cognition_log_at_start_json = cognition_log_json.clone();
+        let cognition_context_at_start = cognition_context.clone();
 
         let mut session = Session::new();
         push_generation_context(
             &mut session,
-            cognition_log_json,
+            &cognition_context,
             draft,
             self.generation_prompt(cx),
         );
@@ -1178,7 +1220,7 @@ impl SpeakModule {
                     }
 
                     if self
-                        .judge_abort(cx, &cognition_log_at_start_json, &new_entries)
+                        .judge_abort(cx, &cognition_context_at_start, &new_entries)
                         .await?
                     {
                         return Ok(GenerationStreamOutcome::Aborted);
@@ -1205,18 +1247,15 @@ impl SpeakModule {
     async fn judge_abort(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        cognition_log_at_start_json: &serde_json::Value,
+        cognition_context_at_start: &str,
         new_entries: &[String],
     ) -> Result<bool> {
         let mut session = Session::new();
         session.push_system(self.abort_judge_prompt(cx));
-        session.push_user(
-            serde_json::json!({
-                "cognition_log_at_start": cognition_log_at_start_json,
-                "new_cognition_entries": new_entries,
-            })
-            .to_string(),
-        );
+        session.push_user(format_abort_judge_input(
+            cognition_context_at_start,
+            new_entries,
+        ));
 
         let lutum = self.llm.lutum().await;
         let result = session
@@ -1305,7 +1344,7 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, IdentityMemoryRecord,
-        ModuleConfig, ResourceAllocation, linear_ratio_fn,
+        ModuleConfig, ResourceAllocation,
     };
     use nuillu_module::ports::{
         Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, PortError,
@@ -1313,8 +1352,7 @@ mod tests {
     };
     use nuillu_module::{
         AttentionControlRequestInbox, CapabilityProviderPorts, CapabilityProviders,
-        CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant,
-        render_session_items_for_compaction, session_compaction_cutoff,
+        CognitionLogUpdated, LutumTiers, ModuleRegistry, Participant, session_compaction_cutoff,
     };
     use nuillu_types::{MemoryContent, MemoryIndex};
 
@@ -1688,10 +1726,24 @@ mod tests {
         assert!(summary.starts_with(COMPACTED_SPEAK_GATE_SESSION_PREFIX));
         assert!(summary.contains("old gate history summarized"));
 
-        let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains("history-0"));
-        assert!(rendered.contains("history-8"));
-        assert!(rendered.contains("history-9"));
+        let user_texts = items
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message {
+                    role: InputMessageRole::User,
+                    content,
+                } => {
+                    let [MessageContent::Text(text)] = content.as_slice() else {
+                        panic!("expected one text content item");
+                    };
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!user_texts.contains(&"history-0"));
+        assert!(user_texts.contains(&"history-8"));
+        assert!(user_texts.contains(&"history-9"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1723,9 +1775,15 @@ mod tests {
         };
         assert_eq!(text, "history-0");
 
-        let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains(COMPACTED_SPEAK_GATE_SESSION_PREFIX));
-        assert!(!rendered.contains("unexpected summary"));
+        assert!(!matches!(
+            &items[0],
+            ModelInputItem::Message { content, .. }
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.starts_with(COMPACTED_SPEAK_GATE_SESSION_PREFIX)
+                )
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1763,12 +1821,7 @@ mod tests {
         let draft = GenerationDraft::new(7, "Koro");
         let mut session = test_session();
 
-        push_generation_context(
-            &mut session,
-            serde_json::json!({"streams": []}),
-            &draft,
-            GENERATION_PROMPT,
-        );
+        push_generation_context(&mut session, "none", &draft, GENERATION_PROMPT);
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 7);
@@ -1791,10 +1844,10 @@ mod tests {
         let [MessageContent::Text(text)] = content.as_slice() else {
             panic!("expected one text content item");
         };
-        let json: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(json["speech_target"]["target"], "Koro");
-        assert!(json.get("allocation").is_none());
-        assert!(json.get("partial_utterance").is_none());
+        assert!(text.contains("Current cognition log:\nnone"));
+        assert!(text.contains("Speech target: Koro"));
+        assert!(!text.contains("allocation"));
+        assert!(!text.contains("partial_utterance"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2136,12 +2189,7 @@ mod tests {
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        push_generation_context(
-            &mut session,
-            serde_json::json!({"streams": []}),
-            &draft,
-            GENERATION_PROMPT,
-        );
+        push_generation_context(&mut session, "none", &draft, GENERATION_PROMPT);
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 11);

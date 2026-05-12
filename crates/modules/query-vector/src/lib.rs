@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
-    compact_session_if_needed, push_unread_memo_logs, render_memory_for_llm,
+    EphemeralMindContext, LlmAccess, Module, SessionCompactionConfig, TypedMemo,
+    VectorMemorySearcher, compact_session_if_needed, memory_rank_counts,
+    push_ephemeral_mind_context, push_formatted_memo_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -233,33 +234,31 @@ impl QueryVectorModule {
         questions: &[String],
     ) -> Result<QueryVectorRetrieval> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let prior_query_vector_searches = self.prior_query_vector_searches().await;
-        let snapshot = self
+        let rank_counts = self
             .blackboard
-            .read(|bb| {
-                serde_json::json!({
-                    "cognition_log": bb.cognition_log().entries(),
-                    "memory_metadata": bb.memory_metadata(),
-                })
-            })
+            .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
-        self.session.push_user(
-            serde_json::json!({
-                "questions": questions,
-            })
-            .to_string(),
-        );
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "blackboard": snapshot,
-                "allocation": allocation,
-                "prior_query_vector_searches": prior_query_vector_searches,
-            })
-            .to_string(),
+        self.session
+            .push_user(format_vector_memory_questions(questions));
+        if let Some(prior) = prior_query_vector_searches {
+            self.session.push_ephemeral_user(prior);
+        }
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: None,
+                stuckness: None,
+                now: cx.now(),
+            },
         );
 
         let lutum = self.llm.lutum().await;
@@ -356,30 +355,42 @@ impl QueryVectorModule {
         }
     }
 
-    async fn prior_query_vector_searches(&self) -> serde_json::Value {
+    async fn prior_query_vector_searches(&self) -> Option<String> {
         let records = self.memo.recent_logs().await;
-        serde_json::Value::Array(
-            records
-                .iter()
-                .map(|record| {
-                    let data = record.data();
-                    serde_json::json!({
-                        "index": record.index,
-                        "written_at": record.written_at,
-                        "requests": data.requests,
-                        "searches": data.searches.iter().map(|search| {
-                            serde_json::json!({
-                                "query": search.query,
-                                "limit": search.limit,
-                                "hit_indices": search.hit_indices,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "hit_indices": data.hits.iter().map(|hit| &hit.index).collect::<Vec<_>>(),
-                        "occurred_at": data.hits.iter().map(|hit| hit.occurred_at).collect::<Vec<_>>(),
-                    })
-                })
-                .collect(),
-        )
+        if records.is_empty() {
+            return None;
+        }
+        let mut out = String::from("Recent query-vector searches already attempted:");
+        for record in records {
+            let data = record.data();
+            out.push_str(&format!(
+                "\n- memo {} at {}",
+                record.index,
+                record.written_at.to_rfc3339()
+            ));
+            for request in &data.requests {
+                out.push_str(&format!("\n  request: {}", request.trim()));
+            }
+            for search in &data.searches {
+                let hit_indices = if search.hit_indices.is_empty() {
+                    "none".to_owned()
+                } else {
+                    search
+                        .hit_indices
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                out.push_str(&format!(
+                    "\n  search: {}; limit {}; hit indices: {}",
+                    search.query.trim(),
+                    search.limit,
+                    hit_indices
+                ));
+            }
+        }
+        Some(out)
     }
 
     async fn search_vector_memory(
@@ -452,6 +463,19 @@ fn bullet_lines<'a>(items: impl Iterator<Item = &'a str>) -> String {
         .map(|item| format!("- {item}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_vector_memory_questions(questions: &[String]) -> String {
+    let mut out = String::from("Vector-memory questions to investigate:");
+    for question in questions
+        .iter()
+        .map(|question| question.trim())
+        .filter(|q| !q.is_empty())
+    {
+        out.push_str("\n- ");
+        out.push_str(question);
+    }
+    out
 }
 
 #[async_trait(?Send)]

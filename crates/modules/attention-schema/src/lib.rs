@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    CognitionLogUpdatedInbox, CognitionWriter, EphemeralMindContext, LlmAccess, MemoUpdatedInbox,
+    Module, SessionCompactionConfig, compact_session_if_needed, push_ephemeral_mind_context,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -114,21 +115,27 @@ impl AttentionSchemaModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn update_model(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let unread_cognition_log = self.cognition_log.unread_events().await;
-        let cognition_log = self.cognition_log.snapshot().await;
         let allocation = self.allocation.snapshot().await;
 
         let prompt = self.model_prompt(cx).to_owned();
         self.session.push_ephemeral_system(prompt);
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "unread_cognition_log": unread_cognition_log,
-                "cognition_log": cognition_log,
-                "allocation": allocation,
-            })
-            .to_string(),
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition_log, cx.now());
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: None,
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: None,
+                stuckness: None,
+                now: cx.now(),
+            },
         );
+        self.session
+            .push_ephemeral_developer("Update the attention schema from the new notes above.");
 
         let lutum = self.llm.lutum().await;
         let outcome = self

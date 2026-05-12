@@ -210,10 +210,6 @@ impl ModuleStatusReader {
     pub async fn records(&self) -> Vec<ModuleRunStatusRecord> {
         self.blackboard.read(|bb| bb.module_status_records()).await
     }
-
-    pub async fn snapshot_json(&self) -> serde_json::Value {
-        self.blackboard.read(|bb| bb.module_statuses()).await
-    }
 }
 
 #[cfg(test)]
@@ -311,14 +307,6 @@ mod tests {
                 ))
                 .await,
             ModuleRunStatus::Inactive
-        );
-        assert_eq!(
-            reader.snapshot_json().await,
-            serde_json::json!({
-                "speak": {
-                    "state": "activating"
-                }
-            })
         );
     }
 

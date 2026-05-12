@@ -59,18 +59,6 @@ impl TimeDivision {
     pub fn buckets(&self) -> &[TimeDivisionBucket] {
         &self.buckets
     }
-
-    pub fn as_prompt_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "fallback_longest_tag": self.fallback_longest_tag,
-            "buckets": self.buckets.iter().map(|bucket| {
-                serde_json::json!({
-                    "tag": bucket.tag,
-                    "range_ms": bucket.range.as_millis(),
-                })
-            }).collect::<Vec<_>>(),
-        })
-    }
 }
 
 impl Default for TimeDivision {

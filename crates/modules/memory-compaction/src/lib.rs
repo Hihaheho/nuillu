@@ -63,6 +63,15 @@ pub struct MemoryCompactionModule {
     system_prompt: std::sync::OnceLock<String>,
 }
 
+#[derive(Clone, Debug)]
+struct MemoryMetadataContext {
+    index: String,
+    rank: MemoryRank,
+    occurred_at: String,
+    decay_remaining_secs: i64,
+    access_count: u32,
+}
+
 impl MemoryCompactionModule {
     pub fn new(
         allocation_updates: AllocationUpdatedInbox,
@@ -97,26 +106,42 @@ impl MemoryCompactionModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let snapshot = self
+        let memory_metadata = self
             .blackboard
             .read(|bb| {
-                serde_json::json!({
-                    "cognition_log": bb.cognition_log().entries(),
-                    "memory_metadata": bb.memory_metadata(),
-                })
+                let mut metadata = bb
+                    .memory_metadata()
+                    .values()
+                    .map(|item| MemoryMetadataContext {
+                        index: item.index.to_string(),
+                        rank: item.rank,
+                        occurred_at: item
+                            .occurred_at
+                            .map(|at| at.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        decay_remaining_secs: item.decay_remaining_secs,
+                        access_count: item.access_count,
+                    })
+                    .collect::<Vec<_>>();
+                metadata.sort_by(|left, right| left.index.cmp(&right.index));
+                metadata
             })
             .await;
         let allocation = self.allocation.snapshot().await;
+        let allocation_guidance = allocation
+            .iter()
+            .filter_map(|(id, config)| {
+                let guidance = config.guidance.trim();
+                (!guidance.is_empty()).then(|| (id.to_string(), guidance.to_owned()))
+            })
+            .collect::<Vec<_>>();
 
         let mut session = Session::new();
         session.push_system(self.system_prompt(cx));
-        session.push_user(
-            serde_json::json!({
-                "blackboard": snapshot,
-                "allocation": allocation,
-            })
-            .to_string(),
-        );
+        session.push_user(format_compaction_context(
+            &memory_metadata,
+            &allocation_guidance,
+        ));
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;
@@ -215,6 +240,37 @@ impl MemoryCompactionModule {
             merged_sources: source_count,
         })
     }
+}
+
+fn format_compaction_context(
+    memory_metadata: &[MemoryMetadataContext],
+    allocation_guidance: &[(String, String)],
+) -> String {
+    let mut out = String::from("Memory compaction context.");
+    out.push_str("\n\nMemory metadata candidates:");
+    if memory_metadata.is_empty() {
+        out.push_str("\n- none");
+    } else {
+        for item in memory_metadata {
+            out.push_str(&format!(
+                "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}",
+                item.index,
+                item.rank,
+                item.occurred_at,
+                item.decay_remaining_secs,
+                item.access_count
+            ));
+        }
+    }
+    out.push_str("\n\nCurrent compaction guidance:");
+    if allocation_guidance.is_empty() {
+        out.push_str("\n- none");
+    } else {
+        for (id, guidance) in allocation_guidance {
+            out.push_str(&format!("\n- {id}: {guidance}"));
+        }
+    }
+    out
 }
 
 #[async_trait(?Send)]

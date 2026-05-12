@@ -406,19 +406,16 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockStructuredScenario,
-        RawStructuredTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter,
-        Usage,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
+        MockLlmAdapter, MockStructuredScenario, ModelInputItem, RawStructuredTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
     use nuillu_module::ports::{
         Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
         NoopUtteranceSink, SystemClock,
     };
-    use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
-        render_session_items_for_compaction,
-    };
+    use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
 
     #[derive(Clone)]
@@ -794,27 +791,104 @@ mod tests {
         let inputs = observed.structured_inputs();
         assert_eq!(inputs.len(), 2);
 
-        let first_input = render_session_items_for_compaction(inputs[0].items()).to_string();
-        assert!(first_input.contains("You are the attention-controller module"));
-        assert!(first_input.contains("sensory memo A"));
-        assert!(first_input.contains("<mind>"));
+        let first_items = inputs[0].items();
+        let ModelInputItem::Message { role, content } = &first_items[0] else {
+            panic!("expected first input system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected first input system prompt text");
+        };
+        assert!(system.contains("You are the attention-controller module"));
 
-        let second_input = render_session_items_for_compaction(inputs[1].items()).to_string();
-        assert!(second_input.contains("You are the attention-controller module"));
-        assert!(second_input.contains("sensory memo A"));
-        assert!(second_input.contains("sensory memo B"));
-        assert!(second_input.contains("first controller note"));
-        assert!(second_input.contains("\"kind\":\"turn\""));
-        assert!(second_input.contains("<mind>"));
-        assert!(!second_input.contains("\"role\":\"user\""));
+        let ModelInputItem::Message { role, content } = &first_items[1] else {
+            panic!("expected first input memo-log note");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(memo_a)] = content.as_slice() else {
+            panic!("expected first input memo-log note text");
+        };
+        assert!(memo_a.contains("sensory memo A"));
+        assert!(first_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
 
-        let session_after_second =
-            render_session_items_for_compaction(fixture.controller.session.input().items())
-                .to_string();
-        assert!(session_after_second.contains("sensory memo A"));
-        assert!(session_after_second.contains("sensory memo B"));
-        assert!(session_after_second.contains("first controller note"));
-        assert!(!session_after_second.contains("<mind>"));
+        let second_items = inputs[1].items();
+        let ModelInputItem::Message { role, content } = &second_items[0] else {
+            panic!("expected second input system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected second input system prompt text");
+        };
+        assert!(system.contains("You are the attention-controller module"));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
+        )));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
+        )));
+        assert!(second_items.iter().any(|item| {
+            let ModelInputItem::Turn(turn) = item else {
+                return false;
+            };
+            (0..turn.item_count()).any(|index| {
+                turn.item_at(index)
+                    .and_then(|item| item.as_text())
+                    .is_some_and(|text| text.contains("first controller note"))
+            })
+        }));
+        assert!(
+            inputs[1]
+                .items()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::Turn(_)))
+        );
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
+        assert!(!second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                ..
+            }
+        )));
+
+        let session_after_second = fixture.controller.session.input().items();
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
+        )));
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
+        )));
+        assert!(session_after_second.iter().any(|item| {
+            let ModelInputItem::Turn(turn) = item else {
+                return false;
+            };
+            (0..turn.item_count()).any(|index| {
+                turn.item_at(index)
+                    .and_then(|item| item.as_text())
+                    .is_some_and(|text| text.contains("first controller note"))
+            })
+        }));
+        assert!(!session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
         assert_eq!(fixture.controller.session.list_turns().count(), 2);
     }
 }

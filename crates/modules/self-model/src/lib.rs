@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader, LlmAccess,
-    Memo, Module, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    Memo, Module, SessionCompactionConfig, compact_session_if_needed,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::builtin;
 
@@ -87,29 +88,24 @@ impl SelfModelModule {
             return Ok(());
         }
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
-        let cognition_context = self
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
+        let attention_schema_cognition = self
             .cognition_log
-            .snapshot()
+            .unread_events()
             .await
-            .logs()
-            .iter()
+            .into_iter()
             .filter(|record| record.source.module == builtin::attention_schema())
-            .cloned()
             .collect::<Vec<_>>();
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
-        self.session.push_user(
-            serde_json::json!({
-                "allocation_guidance": guidance,
-            })
-            .to_string(),
-        );
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "attention_schema_cognition_log": cognition_context,
-            })
-            .to_string(),
+        self.session.push_user(format!(
+            "Self-model guidance from attention-controller:\n{}",
+            guidance.trim()
+        ));
+        push_formatted_cognition_log_batch(
+            &mut self.session,
+            &attention_schema_cognition,
+            cx.now(),
         );
 
         let lutum = self.llm.lutum().await;

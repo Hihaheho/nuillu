@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module, SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
+    EphemeralMindContext, LlmAccess, Memo, Module, SessionCompactionConfig,
+    compact_session_if_needed, memory_rank_counts, push_ephemeral_mind_context,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 
 mod batch;
@@ -74,29 +76,32 @@ impl PredictModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let cognition_log = self.cognition_log.read(|log| log.entries().to_vec()).await;
+        let unread_cognition = self.cognition_log.unread_events().await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
-        let context = self
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
+        let rank_counts = self
             .blackboard
-            .read(|bb| {
-                serde_json::json!({
-                    "memory_metadata": bb.memory_metadata(),
-                })
-            })
+            .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "cognition_log": cognition_log,
-                "blackboard_context": context,
-                "allocation": allocation,
-            })
-            .to_string(),
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: Some(&rank_counts),
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: None,
+                stuckness: None,
+                now: cx.now(),
+            },
         );
+        self.session
+            .push_ephemeral_developer("Update forward predictions for the cognition above.");
 
         let lutum = self.llm.lutum().await;
         let result = self

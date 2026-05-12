@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, MemoryImportance, Module,
-    SessionCompactionConfig, compact_session_if_needed, push_unread_memo_logs,
+    CognitionLogReader, CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, Memo,
+    MemoryImportance, Module, SessionCompactionConfig, compact_session_if_needed,
+    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,6 @@ cognition-log history. Do not generate forward predictions. Request memory only 
 significant enough to preserve. Return only raw JSON for the structured object; do not wrap it in
 Markdown or code fences."#;
 
-const RECENT_COGNITION_LOG_LIMIT: usize = 12;
 const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
@@ -104,27 +104,28 @@ impl SurpriseModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let recent_cognition_log = self
-            .cognition_log
-            .read(|log| {
-                let entries = log.entries();
-                let start = entries.len().saturating_sub(RECENT_COGNITION_LOG_LIMIT);
-                entries[start..].to_vec()
-            })
-            .await;
+        let unread_cognition = self.cognition_log.unread_events().await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_unread_memo_logs(&mut self.session, &unread_memo_logs);
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let allocation = self.allocation.snapshot().await;
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
-        self.session.push_ephemeral_user(
-            serde_json::json!({
-                "recent_cognition_log": recent_cognition_log,
-                "allocation": allocation,
-            })
-            .to_string(),
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
+        push_ephemeral_mind_context(
+            &mut self.session,
+            EphemeralMindContext {
+                memos: &[],
+                memory_rank_counts: None,
+                allocation: Some(&allocation),
+                available_faculties: &[],
+                time_division: None,
+                stuckness: None,
+                now: cx.now(),
+            },
         );
+        self.session
+            .push_ephemeral_developer("Assess whether the new cognition is surprising.");
 
         let lutum = self.llm.lutum().await;
         let result = self

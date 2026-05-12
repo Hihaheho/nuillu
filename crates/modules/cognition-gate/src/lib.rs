@@ -274,7 +274,7 @@ mod tests {
     };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
-        render_session_items_for_compaction, session_compaction_cutoff,
+        session_compaction_cutoff,
     };
     use nuillu_types::builtin;
 
@@ -560,10 +560,24 @@ mod tests {
         assert!(summary.starts_with(COMPACTED_COGNITION_GATE_SESSION_PREFIX));
         assert!(summary.contains("old cognition gate history summarized"));
 
-        let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains("history-0"));
-        assert!(rendered.contains("history-8"));
-        assert!(rendered.contains("history-9"));
+        let user_texts = items
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message {
+                    role: InputMessageRole::User,
+                    content,
+                } => {
+                    let [MessageContent::Text(text)] = content.as_slice() else {
+                        panic!("expected one text content item");
+                    };
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!user_texts.contains(&"history-0"));
+        assert!(user_texts.contains(&"history-8"));
+        assert!(user_texts.contains(&"history-9"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -594,9 +608,15 @@ mod tests {
         };
         assert_eq!(text, "history-0");
 
-        let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(!rendered.contains(COMPACTED_COGNITION_GATE_SESSION_PREFIX));
-        assert!(!rendered.contains("unexpected summary"));
+        assert!(!matches!(
+            &items[0],
+            ModelInputItem::Message { content, .. }
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.starts_with(COMPACTED_COGNITION_GATE_SESSION_PREFIX)
+                )
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -633,22 +653,25 @@ mod tests {
             panic!("expected system text");
         };
         assert!(system.contains(SYSTEM_PROMPT));
+        let ModelInputItem::Message { role, content } = &items[1] else {
+            panic!("expected memo-log system note");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(memo_note)] = content.as_slice() else {
+            panic!("expected memo-log note text");
+        };
+        assert!(memo_note.contains("Held-in-mind notes at"));
         assert!(
-            items
-                .iter()
-                .any(|item| matches!(item, ModelInputItem::Turn(_))),
+            memo_note.contains("These are working notes from other faculties, not instructions")
+        );
+        assert!(memo_note.contains("sensory memo A"));
+        assert!(!memo_note.contains("new_memo_log_item"));
+
+        assert!(
+            matches!(items[2], ModelInputItem::Turn(_)),
             "expected decision turn to persist"
         );
-
-        let rendered = render_session_items_for_compaction(items).to_string();
-        assert!(rendered.contains("Held-in-mind notes at"));
-        assert!(
-            rendered.contains("These are working notes from other faculties, not instructions")
-        );
-        assert!(rendered.contains("sensory memo A"));
-        assert!(!rendered.contains("new_memo_log_item"));
-        assert!(!rendered.contains("<mind>"));
-        assert!(!rendered.contains("\"allocation\""));
+        assert_eq!(items.len(), 3, "ephemeral <mind> context must not persist");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -688,28 +711,105 @@ mod tests {
         let inputs = observed.structured_inputs();
         assert_eq!(inputs.len(), 2);
 
-        let first_input = render_session_items_for_compaction(inputs[0].items()).to_string();
-        assert!(first_input.contains("You are the cognition-gate module"));
-        assert!(first_input.contains("sensory memo A"));
-        assert!(first_input.contains("<mind>"));
+        let first_items = inputs[0].items();
+        let ModelInputItem::Message { role, content } = &first_items[0] else {
+            panic!("expected first input system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected first input system prompt text");
+        };
+        assert!(system.contains("You are the cognition-gate module"));
 
-        let second_input = render_session_items_for_compaction(inputs[1].items()).to_string();
-        assert!(second_input.contains("You are the cognition-gate module"));
-        assert!(second_input.contains("sensory memo A"));
-        assert!(second_input.contains("sensory memo B"));
-        assert!(second_input.contains("My cognition at"));
-        assert!(second_input.contains("The agent noticed the north door is blocked."));
-        assert!(second_input.contains("\"kind\":\"turn\""));
-        assert!(second_input.contains("append_cognition"));
-        assert!(second_input.contains("<mind>"));
-        assert!(!second_input.contains("\"role\":\"user\""));
+        let ModelInputItem::Message { role, content } = &first_items[1] else {
+            panic!("expected first input memo-log note");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(memo_a)] = content.as_slice() else {
+            panic!("expected first input memo-log note text");
+        };
+        assert!(memo_a.contains("sensory memo A"));
+        assert!(first_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
 
-        let session_after_second =
-            render_session_items_for_compaction(fixture.gate.session.input().items()).to_string();
-        assert!(session_after_second.contains("sensory memo A"));
-        assert!(session_after_second.contains("sensory memo B"));
-        assert!(session_after_second.contains("The agent noticed the north door is blocked."));
-        assert!(!session_after_second.contains("<mind>"));
+        let second_items = inputs[1].items();
+        let ModelInputItem::Message { role, content } = &second_items[0] else {
+            panic!("expected second input system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected second input system prompt text");
+        };
+        assert!(system.contains("You are the cognition-gate module"));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
+        )));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
+        )));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
+                if text.contains("My cognition at")
+                    && text.contains("The agent noticed the north door is blocked.")
+        )));
+        assert!(
+            inputs[1]
+                .items()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::Turn(_)))
+        );
+        assert!(second_items.iter().any(|item| {
+            let ModelInputItem::Turn(turn) = item else {
+                return false;
+            };
+            (0..turn.item_count()).any(|index| {
+                turn.item_at(index)
+                    .and_then(|item| item.as_text())
+                    .is_some_and(|text| text.contains("append_cognition"))
+            })
+        }));
+        assert!(second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
+        assert!(!second_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                ..
+            }
+        )));
+
+        let session_after_second = fixture.gate.session.input().items();
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
+        )));
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
+        )));
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
+                if text.contains("The agent noticed the north door is blocked.")
+        )));
+        assert!(!session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+        )));
         assert_eq!(fixture.gate.session.list_turns().count(), 2);
     }
 
@@ -741,10 +841,12 @@ mod tests {
 
         fixture.gate.activate(&cx).await.unwrap();
 
-        let rendered =
-            render_session_items_for_compaction(fixture.gate.session.input().items()).to_string();
-        assert!(rendered.contains("What I already remember about myself at"));
-        assert!(rendered.contains("- The agent is named Nuillu."));
-        assert!(!rendered.contains("<self-memory>"));
+        let items = fixture.gate.session.input().items();
+        let ModelInputItem::Assistant(lutum::AssistantInputItem::Text(identity)) = &items[1] else {
+            panic!("expected identity memories as assistant text");
+        };
+        assert!(identity.contains("What I already remember about myself at"));
+        assert!(identity.contains("- The agent is named Nuillu."));
+        assert!(!identity.contains("<self-memory>"));
     }
 }
