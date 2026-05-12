@@ -27,6 +27,7 @@ This document is the implementation source of truth. It describes the desired ar
 16. **Controller proposals with deterministic effective allocation** — Attention-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, computes active replicas from each module's boot-time cap range, then applies `RuntimePolicy` hard limits such as max total active replicas and max Premium replicas.
 17. **Registry-derived controller schema** — The attention-controller structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
 18. **Free-form memo logs** — `Memo` appends durable module-output log entries. Each entry is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Modules consume this surface through unread memo logs and keep any needed durable context in their own persistent `Session` plus compaction; there is no latest-memo snapshot read API. Structured output is reserved for runtime control decisions whose fields are read by code.
+19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and is reinforced by **reward**: the `reward` module updates policy value and reward-token count, and rank crosses tiers only as a derived consequence of value × tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. Creating new policy entries belongs to the `policy` module; updating value, rank, and reward tokens belongs to `reward`; retrieval belongs to `query-policy`. The retrieval module that surfaces memories is named `query-memory` (the role) rather than `query-vector` (the implementation); the underlying crate, tool ids, and `VectorMemorySearcher` capability keep their names for now and are renamed in a follow-up implementation pass.
 
 ---
 
@@ -43,10 +44,13 @@ crates/
     attention-controller/     # cognition log -> resource allocation
     attention-schema/         # memo logs/allocation/cognition log -> first-person attention cognition-log entries
     self-model/               # attention-schema cognition log + memo logs -> self-model memo logs
-    query-vector/             # blackboard/vector memory RAG -> query-vector memo logs
+    query-memory/             # blackboard/vector memory RAG -> query-memory memo logs (crate dir still query-vector/ in v1)
     query-agentic/            # blackboard/file search -> query-agentic memo logs
-    memory/                   # blackboard snapshot -> memory inserts
+    query-policy/             # blackboard/policy store search -> query-policy memo logs
+    memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
     memory-compaction/        # memory metadata/content -> merges
+    policy/                   # blackboard snapshot -> policy inserts (creates tentative policies only)
+    reward/                   # outcome memos + cognition log -> policy value/rank updates
     predict/                  # cognition log + blackboard -> forward prediction memo logs
     surprise/                 # cognition log divergence/novelty -> surprise memo logs
     speak/                    # attended state + memo logs -> user-visible utterances
@@ -342,7 +346,7 @@ Memos:
 - `Memo::write` replaces only the holder instance's memo.
 - `BlackboardInner` stores `HashMap<ModuleInstanceId, String>`.
 - Reader helpers provide exact-instance reads for capabilities and grouped module reads for prompts/eval.
-- Singleton serialization keeps the old shape: a module with one active memo appears as `"query-vector": "<memo>"`, not `"query-vector[0]"`.
+- Singleton serialization keeps the old shape: a module with one active memo appears as `"query-memory": "<memo>"`, not `"query-memory[0]"`.
 - Multi-replica serialization groups entries by module and includes `replica` only when there is more than one memo for that module.
 
 Cognition log:
@@ -533,11 +537,11 @@ Maintains a current self-description by integrating attention-schema cognition-l
 
 Stable self-knowledge belongs in memory and is surfaced through query-module memo logs; the self-model module is the dynamic integration layer over that knowledge, current attention, active task context, uncertainty, and recent module outputs. v1 should avoid granting broad direct memory search to self-model unless a later narrow self-knowledge capability is introduced; if `BlackboardReader` proves too wide for this role, introduce a narrower memo-log/context reader before implementation. Object/world models remain distributed through sensory, query, predict, and surprise memo logs in v1; add a dedicated `world-model` only if those fragments need one owner.
 
-### Query Vector
+### Query Memory
 
 Capabilities: `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `VectorMemorySearcher`, `Memo`, `LlmAccess`.
 
-Handles vector-memory/RAG retrieval only. Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results.
+Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration, and does not query the policy store. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible. The crate directory remains `crates/modules/query-vector/` in this revision; the rename of the crate, eval-case directory, tool id, and `VectorMemorySearcher` capability is a follow-up implementation pass.
 
 ### Query Agentic
 
@@ -556,6 +560,24 @@ Decides whether useful information should be preserved and inserts memory entrie
 Capabilities: `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryCompactor`, `LlmAccess`.
 
 Fetches related memory contents and merges redundant entries while accumulating remember tokens. Allocation updates wake it to consider compaction guidance.
+
+### Policy
+
+Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `PolicyWriter`, `LlmAccess`.
+
+Decides whether a successful or distinctive behavior pattern visible in recent cognition-log entries and module memo logs should be preserved as a tentative policy. Cognition-log updates and allocation guidance are wake paths. Candidates include speak completion memos, surprise-resolved sequences, and explicit controller policy-formation guidance. Only persists records the LLM chooses to write through `insert_policy`; all new policy entries start at `PolicyRank::Tentative` with `value = 0.0` and `reward_tokens = 0`. The module may reject, normalize, deduplicate, or merge candidates against existing policies. It does not modify existing policy `value`, `rank`, `reward_tokens`, or `decay` — those mutations belong to `reward`. It does not write memory, cognition-log entries, allocation, or memos.
+
+### Reward
+
+Capabilities: `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `PolicyValueUpdater`, `AttentionControlRequestMailbox`, `Memo`, `LlmAccess`.
+
+Assesses outcomes against recently active policies and updates policy `value` and `reward_tokens`; rank elevation/demotion is a derived store-level consequence of value crossing tier thresholds with sufficient reward-token count. Wakes on cognition-log updates and memo updates, notably surprise memos, speak completion memos, and `query-policy` memos that record which policies were retrieved in the window being judged. Reads the recent cognition-log window plus referenced policy retrievals, decides credit assignment with an LLM, and applies deltas through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta)`. Writes a free-form reward-assessment memo describing the credit decision so attention-controller can observe learning pressure. May publish `AttentionControlRequest::Policy` to ask the controller to raise `policy` activation when a novel pattern deserves formation. Cannot create new policy entries; cannot write memory, cognition-log entries, or allocation; cannot invent rank changes independent of value × token thresholds.
+
+### Query Policy
+
+Capabilities: `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `PolicySearcher`, `Memo`, `LlmAccess`.
+
+Retrieves applicable policies for the current situation. Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to surface policies relevant to a newly admitted situation. Output is appended to this replica's memo log and contains only retrieved policy content and applicability tags copied from search results; it does not synthesize advice, modify policy state, or describe itself. Retrieval is the credit-assignment substrate for `reward`: the memo entries record which policies were active in the window. Retrieval counts as access for diagnostic `usage_history` only — access does not elevate policy rank.
 
 ### Predict
 
@@ -609,7 +631,7 @@ Tool loops are written directly by each module so tool availability, round limit
 - the turn is part of a tool loop (`text_turn().tools::<T>().collect()`) — each round must complete before tool results can be committed,
 - the result is written directly to durable internal state such as free-form `Memo` text or a cognition-log entry — there is no consumer of partial output.
 
-cognition-gate, attention-controller, attention-schema, self-model, query-vector, query-agentic, memory, and memory-compaction use `.collect()` exclusively.
+cognition-gate, attention-controller, attention-schema, self-model, query-memory, query-agentic, query-policy, memory, memory-compaction, policy, and reward use `.collect()` exclusively.
 
 `.stream()` is appropriate only for the `speak` module's text generation step, where the response is user-facing and `UtteranceSink` can act on each chunk as it arrives. See Section 4 (Speak) for the full streaming + interruption pattern.
 
@@ -621,7 +643,8 @@ cognition-gate, attention-controller, attention-schema, self-model, query-vector
 
 `module::ports` defines adapter boundaries:
 
-- `MemoryStore`: replicated memory content plus adapter-owned search/indexing state. The primary store assigns `MemoryIndex` values; replica stores accept primary-assigned indexes. These storage replicas are persistence mirrors and are not module replicas.
+- `MemoryStore`: replicated memory content plus adapter-owned search/indexing state. The primary store assigns `MemoryIndex` values; replica stores accept primary-assigned indexes. These storage replicas are persistence mirrors and are not module replicas. The store also owns memory's access-based rank elevation: when a read path records access (`record_access: true`), the store updates the in-window access counter and, when the configured threshold for the current rank is reached, promotes the entry to the next rank, resets the decay timer to that rank's default, and zeroes the in-window counter. Modules do not see this mechanism beyond the resulting metadata. v1 thresholds (`ShortTerm → MidTerm` at ≥ 3 accesses, `MidTerm → LongTerm` at ≥ 5, `LongTerm → Permanent` at ≥ 8; `Permanent` has no runtime promotion, `Identity` is boot-only) live in `configs/memory-reinforcement.eure` and are tunable without spec changes.
+- `PolicyStore`: replicated policy content plus adapter-owned indexing state, parallel to `MemoryStore`. The primary store assigns `PolicyIndex` values; replica stores accept primary-assigned indexes. Methods include `insert(NewPolicy) -> PolicyIndex`, `put(IndexedPolicy)`, `get(&PolicyIndex)`, `list_by_rank(PolicyRank)`, `search(&PolicyQuery)`, `reinforce(&PolicyIndex, value_delta, reward_tokens_delta) -> PolicyRecord`, and `delete(&PolicyIndex)`. Decay is applied by the store. Rank changes are driven only by `reinforce()` — when value crosses a tier threshold with sufficient reward-token count — or by decay expiry; access never elevates policy rank. `Core` rank is boot-only / manually seeded in v1, parallel to `Identity` memory.
 - `FileSearchProvider`: read-only ripgrep-like file search with pattern, regex/literal mode, invert match, case sensitivity, context lines, and maximum match count.
 - `CognitionLogRepository`: append-only cognition log persistence with the emitting `ModuleInstanceId` / source owner.
 - `UtteranceSink`: append-only app-facing output persistence/notification for user-visible speech actions with the emitting `ModuleInstanceId`.
@@ -651,6 +674,8 @@ fallback-longest-tag = "before_24hour"
 
 Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` inserts new content into the primary store first, then mirrors the primary-assigned `MemoryIndex` to replica stores with indexed writes. `MemoryCompactor` uses store-level atomic compaction: primary `compact(new, sources)` must assign the merged `MemoryIndex` and atomically create the merged record while removing all source records; replica `put_compacted(indexed, sources)` must atomically mirror that replacement for the primary-assigned id. Memory metadata is mirrored once on the blackboard after primary success. Primary write/compaction failure fails the operation before metadata changes. Secondary failures are logged. Concrete adapters may be native-only; WASM builds use adapter alternatives.
 
+Policy content identity is owned by the primary `PolicyStore`, parallel to memory. `PolicyWriter` inserts new policies into the primary store first, then mirrors the primary-assigned `PolicyIndex` to replica stores with indexed writes; new entries start at `PolicyRank::Tentative` with `value = 0.0` and `reward_tokens = 0`. `PolicyValueUpdater::reinforce` is atomic at the primary store: the primary applies `(value_delta, reward_tokens_delta)`, checks tier-transition thresholds, and returns the updated `PolicyRecord` whose rank reflects any transition. Replicas accept the returned record by primary-assigned id. Policy metadata is mirrored once on the blackboard after primary success. Primary reinforce/insert failure fails the operation before metadata changes; secondary failures are logged.
+
 `UtteranceSink` is not a query response channel. It is an observable action log for host applications and eval harnesses. It exposes two notification surfaces:
 
 - `on_complete(utterance: Utterance)` — a complete, timestamped utterance. Every compliant sink must implement this.
@@ -666,7 +691,7 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query, memory, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query (memory, agentic, policy), memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
 Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
 
@@ -714,14 +739,22 @@ This keeps realistic artifacts observable without adding request/response correl
 | Attention schema models attention only | it receives memo, allocation, and cognition-log read/wake capabilities plus `CognitionWriter` and `LlmAccess`, not `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | attention-controller writes self-model guidance; self-model receives `AllocationUpdatedInbox` and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema cognition-log entries and current memo-log context |
-| Query vector is memory/RAG only | it receives `VectorMemorySearcher`, not file or self-model capabilities |
+| Query memory is memory/RAG only | it receives `VectorMemorySearcher`, not file, policy, or self-model capabilities |
 | Query agentic is file-search only | it receives `FileSearcher`, not memory or self-model capabilities |
+| Query policy is policy-retrieval only | it receives `PolicySearcher`, not memory, file, or self-model capabilities; its memo entries contain only retrieved policy content |
+| Memory rank elevation is store-internal | no module holds a memory rank-elevation capability; `MemoryStore` applies access-threshold promotions on read paths that set `record_access: true` |
+| Policy creation and policy update are separate roles | `policy` holds `PolicyWriter` but no mutation path on existing entries; `reward` holds `PolicyValueUpdater` but no insert path |
+| Reward does not write allocation | `reward` may bid only through `AttentionControlRequest::Policy`; only attention-controller holds `AllocationWriter` |
+| Policy rank changes derive from reward, not access | `PolicyValueUpdater::reinforce` is the only path to tier transitions outside decay expiry; `PolicySearcher` records hits in `usage_history` for diagnostics only |
+| Policies strengthen by reward, never by access | memories strengthen by access, never by reward; the two stores never share rank enums or strengthening rules |
+| `PolicySearcher` does not return demoted or expired policies | the store filters by current rank and decay before returning hits |
+| Policy / reward / query-policy ablations are wiring-only | boot wiring may include any subset; ablating `surprise` degrades reward to speak-completion only |
 | Results are durable via memo, not responses | module instances write their own `Memo`; channels are transient |
 | Modules cannot impersonate each other | owner-stamped capabilities construct envelope senders, memo owners, cognition log owners, and utterance owners |
 | No periodic activation | there is no `PeriodicInbox`, `PeriodicActivation`, `period`, `period_ms`, or scheduler tick path |
 | Modules with `cap_range.min = 0` are detachable by allocation | derived active replica count `0` fully disables all instances without killing loops |
 | Modules with `cap_range.min > 0` cannot be fully allocation-disabled | active replica derivation clamps requested replicas up to the registered minimum |
-| Query ablations are wiring-only | boot wiring may include query-vector, query-agentic, both, or neither |
+| Query ablations are wiring-only | boot wiring may include query-memory, query-agentic, query-policy, any subset, or none |
 | Predict and surprise are separate modules | separate crates and separate constructor capabilities |
 | Surprise has no forward-modeling responsibility | it receives no direct memo path from predict; predict output arrives through unread memo-log entries on `BlackboardReader` |
 | Predict and surprise ablations are wiring-only | boot wiring may include predict, surprise, both, or neither |

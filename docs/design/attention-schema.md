@@ -58,8 +58,30 @@ A memory is `(rank, content, decay, query_history, remember_tokens)`.
 - **decay**: remaining time to stay in the current rank
 
 Rank can rise through access or remember-token accumulation and fall when decay expires.
-Identity-ranked memories are startup identity facts: the agent loads all of them from the primary
-memory store before module activation and injects that stable snapshot into LLM system prompts.
+Access-based rank elevation is owned by `MemoryStore`, not by any module: reads that record
+access advance an in-window counter, and crossing a per-rank threshold promotes the entry and
+resets the decay timer. Identity-ranked memories are startup identity facts: the agent loads all of
+them from the primary memory store before module activation and injects that stable snapshot into
+LLM system prompts.
+
+### Policies
+
+A policy is `(rank, content, applicability, decay, usage_history, reward_tokens, value)`.
+
+- **rank**: tentative, provisional, established, habit, core
+- **content**: free-form prose describing the behavior ("When X, prefer Y because Z")
+- **applicability**: free-form situation/trigger description used by `query-policy` for retrieval
+- **decay**: remaining time before rank reduction if unrewarded
+- **usage history**: recent access log; diagnostic only — does NOT elevate rank
+- **reward tokens**: accumulated by `reward` when downstream signals credit the policy
+- **value**: scalar in `[-1, 1]` updated continuously by `reward`; `rank` crosses tiers as a derived
+  consequence of value × tokens
+
+Rank rises when `value` crosses a tier threshold with sufficient reward tokens, and falls when
+decay expires without re-reward. Core-ranked policies are loaded at startup like identity memories
+and injected into LLM system prompts. Policies strengthen by reward, never by access; memories
+strengthen by access, never by reward. The two stores never share rank enums or strengthening
+rules.
 
 ## Activations
 
@@ -81,7 +103,10 @@ Runtime Speak batch -> SpeakGate ActivationGate -> Speak activation
 SpeakGate -> AttentionControlRequest evidence bids -> AttentionController
 Surprise -> AttentionControlRequest::Memory -> AttentionController
 SpeakGate memo -> AttentionController -> allocation proposal
-CognitionLogUpdated -> Query/Memory/Predict/Surprise/AttentionSchema
+CognitionLogUpdated -> QueryMemory/QueryPolicy/Memory/Policy/Reward/Predict/Surprise/AttentionSchema
+Surprise memo / Speak memo / QueryPolicy memo -> Reward -> PolicyValueUpdater
+Reward -> AttentionControlRequest::Policy -> AttentionController
+QueryPolicy memo -> AttentionController / CognitionGate (memo-authoritative)
 ```
 
 Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<Speak>` holders such as SpeakGate. SpeakGate returns allow or suppress; when it suppresses, its decision and missing-evidence notes are durable only in its memo, and that memo update wakes the controller through the ordinary memo path. Speak writes a completion memo after a finished utterance.
@@ -95,10 +120,13 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | attention-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
-| query-vector | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `VectorMemorySearcher` |
+| query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `VectorMemorySearcher` |
 | query-agentic | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `FileSearcher` |
+| query-policy | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `PolicySearcher` |
 | memory | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
+| policy | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `PolicyWriter` |
+| reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `PolicyValueUpdater`, `AttentionControlRequestMailbox` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
 | speak-gate | ✓ | ✓ | — | ✓ | — | ✓ | `ActivationGate<SpeakModule>`, `ModuleStatusReader`, `AttentionControlRequestMailbox` |
@@ -117,6 +145,11 @@ Notable absences:
 - The attention controller wakes on memo updates; it reads the cognition log but is not woken by `CognitionLogUpdated`.
 - Only the attention controller can write resource allocation.
 - The memory module cannot increment remember tokens; that belongs to memory compaction.
+- The memory module cannot elevate memory rank; that belongs to `MemoryStore` on read-path access.
+- The policy module cannot mutate existing policies; value, rank, and reward-token changes belong to reward.
+- The reward module cannot create new policies; insertion belongs to the policy module.
+- Reward cannot write allocation; it may only bid through `AttentionControlRequest::Policy`.
+- Access does not strengthen policies; reward does not strengthen memories.
 - Predict does not write memory; preservation belongs to surprise requests and the memory module.
 - Surprise does not generate forward predictions; that belongs to predict.
 
@@ -167,21 +200,33 @@ Maintains a current self-description by integrating attention-schema cognition-l
 
 Stable self-knowledge belongs in memory and can be retrieved by query modules, but a live self-model is not just memory retrieval. The self-model module turns long-lived self facts, current attention, active task context, uncertainty, and recent module outputs into a current first-person state. In v1, object/world models remain distributed through sensory, query, predict, and surprise memo logs; a dedicated `world-model` can be added later if those fragments need a single owner.
 
-### Query Vector
+### Query Memory
 
-Handles vector-memory/RAG retrieval only. Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to retrieve memory relevant to the current cognitive surface. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers or describe itself.
+Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to retrieve memory relevant to the current cognitive surface. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers, describe itself, or query the policy store. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
 
 ### Query Agentic
 
 Handles read-only file-search retrieval only. Allocation updates wake it to act on controller guidance. Its memo contains only retrieved file content/snippets, copied from query results; it does not synthesize answers or describe itself.
 
+### Query Policy
+
+Retrieves applicable policies from the policy store. Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to surface policies relevant to a newly admitted situation. Its memo-log entries contain only retrieved policy content and applicability tags, copied from search results; it does not synthesize advice, modify policy state, or describe itself. The retrieval memos are the credit-assignment substrate for the reward module: they record which policies were active in the window being judged. Retrieval counts as access for diagnostic `usage_history` only — access does not elevate policy rank.
+
 ### Memory
 
-Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from attention-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision.
+Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from attention-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
 
 ### Memory Compaction
 
 Fetches related memory contents and merges redundant memories, accumulating remember tokens. Allocation updates wake it to consider compaction guidance.
+
+### Policy
+
+Preserves successful or distinctive behavior patterns as tentative policies. Cognition-log updates and allocation guidance are wake paths; candidates include speak completion memos, surprise-resolved sequences, and explicit controller policy-formation guidance. The module may reject, normalize, deduplicate, or merge candidates against existing policies, and only persists records through its own `insert_policy` tool decision. New entries start at `tentative` rank with `value = 0` and `reward_tokens = 0`. It does not mutate existing policy entries — value, rank, and reward-token changes belong to reward.
+
+### Reward
+
+Assesses outcomes against recently active policies and updates policy value and reward tokens. Cognition-log updates and memo updates (notably surprise memos, speak completion memos, and `query-policy` memos) are wake paths. It reads the recent cognition-log window plus referenced policy retrievals, decides credit assignment with an LLM, and applies value and token deltas through `PolicyValueUpdater::reinforce`. It writes a reward-assessment memo so the attention-controller can observe learning pressure, and may publish `AttentionControlRequest::Policy` to ask the controller to raise policy-module activation when a novel pattern deserves formation. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not create new policy entries, write memory, write cognition-log entries, or write allocation.
 
 ### Predict
 
@@ -236,11 +281,17 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - Cognition-log appenders cannot wake the controller directly; the controller wakes on memo updates.
 - The attention controller is not woken by cognition log updates.
 - Allocation activation ratios respect boot-time `cap_range.min/max`; modules with `cap_range.min = 0` are detachable by allocation.
-- Query-vector and query-agentic are independently detachable for ablation.
+- Query-memory and query-agentic are independently detachable for ablation.
 - Predict and surprise are independently detachable for ablation.
+- Memory and learning are distinct reinforcement substrates: memory rank elevation is store-internal and access-driven; policy rank elevation is reward-driven and runs only through `PolicyValueUpdater::reinforce`.
+- Policy creation (`policy` module) and policy update (`reward` module) are separate roles: `policy` cannot mutate existing entries, and `reward` cannot insert new ones.
+- Reward cannot write allocation; it may only bid through `AttentionControlRequest::Policy`.
+- `PolicySearcher` does not return demoted or expired policies.
+- Policy, reward, and query-policy are independently detachable for ablation.
 - Ablating the attention schema module should degrade attention-state modeling while task performance largely survives.
 - Ablating the self-model module should degrade self-report specifically while task performance largely survives.
 - Ablating sensory or speak should degrade end-to-end artifact evaluation while leaving lower-level query, attention-schema, and self-model module evaluations possible.
 - Ablating predict degrades surprise to cognition-log-history novelty detection.
+- Ablating surprise degrades reward to speak-completion only; learning continues but with a weaker credit signal.
 - Ablating surprise disables prediction-failure learning while leaving forward predictions available to other modules.
 - Ablating both predict and surprise removes the prediction loop entirely without affecting other modules.
