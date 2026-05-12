@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, EphemeralMindContext, LlmAccess, Memo, Module,
-    SensoryInput, SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed,
-    ports::Clock, push_ephemeral_mind_context,
+    AllocationReader, AllocationUpdatedInbox, LlmAccess, Memo, Module, SensoryInput,
+    SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed, ports::Clock,
 };
 use tokio::time::Instant;
 
@@ -202,21 +201,13 @@ impl SensoryModule {
             .map(|input| self.prepare_observation(now, input))
             .collect::<Vec<_>>();
         let allocation = self.allocation.snapshot().await;
+        let guidance = allocation.for_module(&self.owner).guidance;
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(format_sensory_batch(&observations));
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: None,
-                allocation: Some(&allocation),
-                available_faculties: cx.modules(),
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        if let Some(context) = format_sensory_guidance_context(&guidance) {
+            self.session.push_ephemeral_system(context);
+        }
 
         let lutum = self.llm.lutum().await;
         let result = self
@@ -292,18 +283,6 @@ impl SensoryModule {
         self.session.push_ephemeral_system(system_prompt);
         self.session
             .push_user(format_sensory_detail_request(&guidance, &self.observations));
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: None,
-                allocation: Some(&allocation),
-                available_faculties: cx.modules(),
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
 
         let lutum = self.llm.lutum().await;
         let result = self
@@ -518,6 +497,16 @@ fn format_sensory_batch(observations: &[PreparedSensoryObservation]) -> String {
         ));
     }
     out
+}
+
+fn format_sensory_guidance_context(guidance: &str) -> Option<String> {
+    let guidance = guidance.trim();
+    if guidance.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Sensory context for judging the new observations:\nCurrent sensory guidance: {guidance}"
+    ))
 }
 
 fn format_sensory_detail_request(guidance: &str, observations: &[String]) -> String {

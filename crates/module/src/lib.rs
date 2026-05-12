@@ -17,8 +17,8 @@
 //!   modules don't pick tiers themselves.
 
 pub use nuillu_blackboard::{
-    CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord, UtteranceProgress,
-    UtteranceProgressState,
+    AgenticDeadlockMarker, CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord,
+    ResourceAllocation, UtteranceProgress, UtteranceProgressState,
 };
 
 mod activation_gate;
@@ -72,12 +72,13 @@ pub use memory_caps::{
 };
 pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
-    EphemeralMindContext, MemoryRankCounts, format_cognition_log_batch,
-    format_ephemeral_mind_context, format_identity_memory_seed, format_memo_log_batch,
+    MemoryRankCounts, format_available_faculties, format_cognition_log_batch,
+    format_current_attention_guidance, format_identity_memory_seed, format_memo_log_batch,
+    format_memory_trace_inventory, format_stuckness, format_time_division_guidance,
     memory_rank_counts,
 };
 pub use mind_session::{
-    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
     seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;

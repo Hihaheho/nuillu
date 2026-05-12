@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, Memo,
-    MemoryImportance, Module, SessionCompactionConfig, compact_session_if_needed,
-    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, MemoryImportance, Module,
+    SessionCompactionConfig, compact_session_if_needed, format_current_attention_guidance,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,12 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's per
 Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
 log facts, significant events, memory preservation requests, and cognition-log context needed for
 future surprise checks. Do not invent facts. Return plain text only."#;
+
+fn format_surprise_context(allocation: &nuillu_module::ResourceAllocation) -> Option<String> {
+    format_current_attention_guidance(allocation).map(|attention| {
+        format!("Surprise context for assessing unexpected cognition:\n\n{attention}")
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SurpriseAssessment {
@@ -112,18 +118,9 @@ impl SurpriseModule {
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: None,
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        if let Some(context) = format_surprise_context(&allocation) {
+            self.session.push_ephemeral_system(context);
+        }
         self.session
             .push_ephemeral_developer("Assess whether the new cognition is surprising.");
 

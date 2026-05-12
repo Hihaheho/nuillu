@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogEntryRecord,
-    CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, MemoryWriter, Module,
-    SessionCompactionConfig, compact_session_if_needed, memory_rank_counts,
-    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    CognitionLogUpdatedInbox, LlmAccess, MemoryWriter, Module, SessionCompactionConfig,
+    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
+    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
@@ -28,6 +28,20 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persi
 Summarize only the prefix transcript you receive. Preserve memo-log facts, memory requests,
 inserted memory content, rejected candidates, deduplication decisions, and relevant cognition-log
 context future memory decisions need. Do not invent facts. Return plain text only."#;
+
+fn format_memory_decision_context(
+    rank_counts: &nuillu_module::MemoryRankCounts,
+    allocation: &nuillu_module::ResourceAllocation,
+) -> String {
+    let mut sections = vec!["Memory-write decision context:".to_owned()];
+    if let Some(section) = format_memory_trace_inventory(rank_counts) {
+        sections.push(section);
+    }
+    if let Some(section) = format_current_attention_guidance(allocation) {
+        sections.push(section);
+    }
+    sections.join("\n\n")
+}
 
 #[lutum::tool_input(name = "insert_memory", output = InsertMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -162,18 +176,8 @@ impl MemoryModule {
         if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
             self.session.push_ephemeral_user(metadata_context);
         }
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        self.session
+            .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
 
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;

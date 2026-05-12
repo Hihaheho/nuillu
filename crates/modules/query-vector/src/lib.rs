@@ -6,9 +6,9 @@ use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    EphemeralMindContext, LlmAccess, Module, SessionCompactionConfig, TypedMemo,
-    VectorMemorySearcher, compact_session_if_needed, memory_rank_counts,
-    push_ephemeral_mind_context, push_formatted_memo_log_batch, render_memory_for_llm,
+    LlmAccess, Module, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
+    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
+    memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -38,6 +38,20 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-vector module's
 Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, vector
 search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
 future retrieval should remember. Do not invent facts. Return plain text only."#;
+
+fn format_vector_memory_context(
+    rank_counts: &nuillu_module::MemoryRankCounts,
+    allocation: &nuillu_module::ResourceAllocation,
+) -> String {
+    let mut sections = vec!["Vector-memory retrieval context:".to_owned()];
+    if let Some(section) = format_memory_trace_inventory(rank_counts) {
+        sections.push(section);
+    }
+    if let Some(section) = format_current_attention_guidance(allocation) {
+        sections.push(section);
+    }
+    sections.join("\n\n")
+}
 
 #[lutum::tool_input(name = "search_vector_memory", output = SearchVectorMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -248,18 +262,8 @@ impl QueryVectorModule {
         if let Some(prior) = prior_query_vector_searches {
             self.session.push_ephemeral_user(prior);
         }
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        self.session
+            .push_ephemeral_system(format_vector_memory_context(&rank_counts, &allocation));
 
         let lutum = self.llm.lutum().await;
         let outcome = self

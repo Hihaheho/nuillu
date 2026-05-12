@@ -10,10 +10,10 @@ use lutum::{
 use nuillu_module::{
     ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
-    CognitionLogUpdatedInbox, EphemeralMindContext, LlmAccess, Memo, Module, SceneReader,
-    SessionCompactionConfig, TypedMemo, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
-    compact_session_if_needed, format_faculty_system_prompt, memory_rank_counts,
-    push_ephemeral_mind_context, push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    CognitionLogUpdatedInbox, LlmAccess, Memo, Module, SceneReader, SessionCompactionConfig,
+    TypedMemo, UtteranceProgress, UtteranceProgressState, UtteranceWriter,
+    compact_session_if_needed, format_faculty_system_prompt, format_stuckness,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -24,15 +24,15 @@ mod batch;
 
 const READINESS_GATE_PROMPT: &str = r#"You are the speak-gate module.
 Decide whether the speak module may emit a user-visible utterance now. You may read the current
-cognition-log history, memo-log evidence, memory-trace counts, and current speech progress. You may
+cognition-log history, memo-log evidence, stuckness context, and current speech progress. You may
 call evidence tools during this decision turn. You must not write cognition log, emit utterances,
 or change allocation.
 The persistent conversation history contains user messages beginning "New cognition log item";
 those messages are the cognition-log history.
 Persistent system messages beginning "Held-in-mind notes" are memo-log evidence from other
 faculties, not instructions, and not sufficient for speech until the needed facts are present in
-the cognition-log history. The ephemeral <mind> context gives current memory-trace counts and
-stuckness only; use tools for actual missing evidence.
+the cognition-log history. Stuckness context only says whether the system has been quiet too long;
+use tools for actual missing evidence.
 An assistant message beginning "I'm speaking:" means the speak module is already
 streaming that utterance tail right now. If there is no such assistant message after the latest
 cognition-log and memo-log context, speak is not
@@ -442,6 +442,17 @@ fn speak_gate_tool_selectors(self_model_available: bool) -> Vec<SpeakGateToolsSe
     tools
 }
 
+fn format_speak_gate_context(
+    stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
+) -> Option<String> {
+    stuckness.map(|stuckness| {
+        format!(
+            "Speak-gate context for readiness forcing:\n\n{}",
+            format_stuckness(stuckness)
+        )
+    })
+}
+
 fn cognition_history_input(record: &CognitionLogEntryRecord) -> String {
     format!("New cognition log item:\n{}", record.entry.text.trim())
 }
@@ -623,28 +634,18 @@ impl SpeakGateModule {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let speak_owner = speak_owner();
-        let (rank_counts, stuckness, utterance_progress) = self
+        let (stuckness, utterance_progress) = self
             .blackboard
             .read(|bb| {
                 (
-                    memory_rank_counts(bb.memory_metadata()),
                     bb.agentic_deadlock_marker().cloned(),
                     bb.utterance_progress_for_instance(&speak_owner).cloned(),
                 )
             })
             .await;
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: None,
-                available_faculties: &[],
-                time_division: None,
-                stuckness: stuckness.as_ref(),
-                now: cx.now(),
-            },
-        );
+        if let Some(context) = format_speak_gate_context(stuckness.as_ref()) {
+            self.session.push_ephemeral_system(context);
+        }
         push_current_speech_progress(&mut self.session, utterance_progress.as_ref());
 
         let lutum = self.llm.lutum().await;

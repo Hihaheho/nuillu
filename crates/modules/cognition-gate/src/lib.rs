@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Lutum, Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter,
-    EphemeralMindContext, LlmAccess, MemoUpdatedInbox, Module, SessionCompactionConfig,
-    TimeDivision, compact_session_if_needed, format_faculty_system_prompt, memory_rank_counts,
-    push_ephemeral_mind_context, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess,
+    MemoUpdatedInbox, Module, SessionCompactionConfig, TimeDivision, compact_session_if_needed,
+    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
+    format_stuckness, format_time_division_guidance, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
     seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
@@ -65,6 +66,28 @@ decisions need: memo-log facts, prior gate decisions, promoted events, rejected 
 allocation guidance, cognition-log context, and relevant memory metadata. Do not invent facts.
 Keep the summary concise, explicit, and faithful. Return plain text only."#;
 const ACTIVATION_INPUT: &str = "Decide what, if anything, should enter conscious cognition now.";
+
+fn format_cognition_gate_context(
+    rank_counts: &nuillu_module::MemoryRankCounts,
+    allocation: &nuillu_module::ResourceAllocation,
+    time_division: &TimeDivision,
+    stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
+) -> String {
+    let mut sections = vec![
+        "Cognition-gate context for deciding what should enter conscious cognition now:".to_owned(),
+    ];
+    if let Some(section) = format_memory_trace_inventory(rank_counts) {
+        sections.push(section);
+    }
+    if let Some(section) = format_current_attention_guidance(allocation) {
+        sections.push(section);
+    }
+    sections.push(format_time_division_guidance(time_division));
+    if let Some(stuckness) = stuckness {
+        sections.push(format_stuckness(stuckness));
+    }
+    sections.join("\n\n")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CognitionGateDecision {
@@ -168,18 +191,13 @@ impl CognitionGateModule {
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: Some(&self.time_division),
-                stuckness: stuckness.as_ref(),
-                now: cx.now(),
-            },
-        );
+        self.session
+            .push_ephemeral_system(format_cognition_gate_context(
+                &rank_counts,
+                &allocation,
+                &self.time_division,
+                stuckness.as_ref(),
+            ));
         self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
@@ -620,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_persists_memo_system_notes_and_drops_ephemeral_mind_context() {
+    async fn activation_persists_memo_system_notes_and_drops_ephemeral_decision_context() {
         let adapter = MockLlmAdapter::new()
             .with_structured_scenario(finished_decision_scenario(1, false, None));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
@@ -671,7 +689,11 @@ mod tests {
             matches!(items[2], ModelInputItem::Turn(_)),
             "expected decision turn to persist"
         );
-        assert_eq!(items.len(), 3, "ephemeral <mind> context must not persist");
+        assert_eq!(
+            items.len(),
+            3,
+            "ephemeral cognition-gate context must not persist"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -732,7 +754,11 @@ mod tests {
         assert!(first_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
+                )
         )));
 
         let second_items = inputs[1].items();
@@ -779,7 +805,11 @@ mod tests {
         assert!(second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
+                )
         )));
         assert!(!second_items.iter().any(|item| matches!(
             item,
@@ -808,7 +838,11 @@ mod tests {
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
+                )
         )));
         assert_eq!(fixture.gate.session.list_turns().count(), 2);
     }

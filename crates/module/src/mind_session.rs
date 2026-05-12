@@ -2,10 +2,7 @@ use chrono::{DateTime, Utc};
 use lutum::Session;
 use nuillu_blackboard::{CognitionLogEntryRecord, IdentityMemoryRecord, MemoLogRecord};
 
-use crate::{
-    EphemeralMindContext, format_cognition_log_batch, format_ephemeral_mind_context,
-    format_identity_memory_seed, format_memo_log_batch,
-};
+use crate::{format_cognition_log_batch, format_identity_memory_seed, format_memo_log_batch};
 
 pub fn seed_persistent_faculty_session(
     session: &mut Session,
@@ -37,10 +34,6 @@ pub fn push_formatted_memo_log_batch(
     if let Some(batch) = format_memo_log_batch(records, now) {
         session.push_system(batch);
     }
-}
-
-pub fn push_ephemeral_mind_context(session: &mut Session, context: EphemeralMindContext<'_>) {
-    session.push_ephemeral_system(format_ephemeral_mind_context(context));
 }
 
 #[cfg(test)]

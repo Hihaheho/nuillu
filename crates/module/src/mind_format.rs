@@ -12,16 +12,6 @@ use crate::TimeDivision;
 
 pub type MemoryRankCounts = BTreeMap<&'static str, usize>;
 
-pub struct EphemeralMindContext<'a> {
-    pub memos: &'a [MemoLogRecord],
-    pub memory_rank_counts: Option<&'a MemoryRankCounts>,
-    pub allocation: Option<&'a ResourceAllocation>,
-    pub available_faculties: &'a [(ModuleId, &'static str)],
-    pub time_division: Option<&'a TimeDivision>,
-    pub stuckness: Option<&'a AgenticDeadlockMarker>,
-    pub now: DateTime<Utc>,
-}
-
 pub fn memory_rank_counts(metadata: &HashMap<MemoryIndex, MemoryMetadata>) -> MemoryRankCounts {
     let mut counts = MemoryRankCounts::new();
     for meta in metadata.values() {
@@ -115,87 +105,22 @@ pub fn format_memo_log_batch(records: &[MemoLogRecord], now: DateTime<Utc>) -> O
     Some(output)
 }
 
-pub fn format_ephemeral_mind_context(context: EphemeralMindContext<'_>) -> String {
-    let mut out = String::from("<mind>");
-    push_held_in_mind(&mut out, context.memos, context.now);
-    if let Some(counts) = context.memory_rank_counts {
-        push_memory_traces(&mut out, counts);
-    }
-    if let Some(allocation) = context.allocation {
-        push_current_attention(&mut out, allocation);
-    }
-    push_available_faculties(&mut out, context.available_faculties);
-    if let Some(time_division) = context.time_division {
-        push_sense_of_time(&mut out, time_division);
-    }
-    if let Some(stuckness) = context.stuckness {
-        push_stuckness(&mut out, stuckness);
-    }
-    out.push_str("</mind>");
-    out
-}
-
-fn push_held_in_mind(out: &mut String, memos: &[MemoLogRecord], now: DateTime<Utc>) {
-    let mut grouped = BTreeMap::<&str, Vec<&MemoLogRecord>>::new();
-    for memo in memos.iter().filter(|memo| !memo.content.trim().is_empty()) {
-        grouped
-            .entry(memo.owner.module.as_str())
-            .or_default()
-            .push(memo);
-    }
-    if grouped.is_empty() {
-        return;
-    }
-
-    out.push_str("<held-in-mind>");
-    for (faculty, records) in grouped {
-        out.push('<');
-        out.push_str(faculty);
-        out.push('>');
-
-        let mut records = records;
-        records.sort_by(|a, b| {
-            a.written_at
-                .cmp(&b.written_at)
-                .then_with(|| a.index.cmp(&b.index))
-        });
-        for record in records {
-            let tag = age_xml_tag(record.written_at, now);
-            out.push('<');
-            out.push_str(&tag);
-            out.push('>');
-            push_xml_text(out, record.content.trim());
-            out.push_str("</");
-            out.push_str(&tag);
-            out.push('>');
-        }
-
-        out.push_str("</");
-        out.push_str(faculty);
-        out.push('>');
-    }
-    out.push_str("</held-in-mind>");
-}
-
-fn push_memory_traces(out: &mut String, counts: &MemoryRankCounts) {
+pub fn format_memory_trace_inventory(counts: &MemoryRankCounts) -> Option<String> {
     if counts.is_empty() {
-        return;
+        return None;
     }
 
-    out.push_str("<memory-traces>");
+    let mut out = String::from("Memory trace inventory:");
     for (rank, count) in counts {
-        out.push('<');
+        out.push_str("\n- ");
         out.push_str(rank);
-        out.push('>');
+        out.push_str(": ");
         out.push_str(&trace_count_text(*count));
-        out.push_str("</");
-        out.push_str(rank);
-        out.push('>');
     }
-    out.push_str("</memory-traces>");
+    Some(out)
 }
 
-fn push_current_attention(out: &mut String, allocation: &ResourceAllocation) {
+pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Option<String> {
     let mut entries = BTreeMap::<&str, (ActivationRatio, &str)>::new();
     for (id, config) in allocation.iter() {
         entries
@@ -215,7 +140,7 @@ fn push_current_attention(out: &mut String, allocation: &ResourceAllocation) {
         .filter(|(_, (ratio, guidance))| *ratio > ActivationRatio::ZERO || !guidance.is_empty())
         .collect::<Vec<_>>();
     if entries.is_empty() {
-        return;
+        return None;
     }
 
     entries.sort_by(|(left_id, (left_ratio, _)), (right_id, (right_ratio, _))| {
@@ -224,93 +149,68 @@ fn push_current_attention(out: &mut String, allocation: &ResourceAllocation) {
             .then_with(|| left_id.cmp(right_id))
     });
 
-    out.push_str("<current-attention>");
-    let mut current_section: Option<&'static str> = None;
+    let mut out = String::from("Current attention guidance:");
     for (id, (ratio, guidance)) in &entries {
-        let section = attention_strength_tag(*ratio);
-        if current_section != Some(section) {
-            if let Some(prev) = current_section {
-                out.push_str("</");
-                out.push_str(prev);
-                out.push('>');
-            }
-            out.push('<');
-            out.push_str(section);
-            out.push('>');
-            current_section = Some(section);
+        out.push_str("\n- ");
+        out.push_str(id);
+        out.push_str(" (");
+        out.push_str(attention_strength_label(*ratio));
+        out.push_str("): ");
+        if guidance.is_empty() {
+            out.push_str("active without specific guidance");
+        } else {
+            out.push_str(&single_line(guidance));
         }
-        out.push('<');
-        out.push_str(id);
-        out.push('>');
-        push_xml_text(
-            out,
-            if guidance.is_empty() {
-                "Active without specific guidance."
-            } else {
-                guidance
-            },
-        );
-        out.push_str("</");
-        out.push_str(id);
-        out.push('>');
     }
-    if let Some(prev) = current_section {
-        out.push_str("</");
-        out.push_str(prev);
-        out.push('>');
-    }
-    out.push_str("</current-attention>");
+    Some(out)
 }
 
-fn push_available_faculties(out: &mut String, faculties: &[(ModuleId, &'static str)]) {
+pub fn format_available_faculties(faculties: &[(ModuleId, &'static str)]) -> Option<String> {
     if faculties.is_empty() {
-        return;
+        return None;
     }
 
     let mut faculties = faculties.iter().collect::<Vec<_>>();
     faculties.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
-    out.push_str("<available-faculties>");
+    let mut out = String::from("Available faculties:");
     for (id, role) in faculties {
-        out.push('<');
+        out.push_str("\n- ");
         out.push_str(id.as_str());
-        out.push('>');
-        push_xml_text(out, role);
-        out.push_str("</");
-        out.push_str(id.as_str());
-        out.push('>');
+        out.push_str(": ");
+        out.push_str(&single_line(role));
     }
-    out.push_str("</available-faculties>");
+    Some(out)
 }
 
-fn push_sense_of_time(out: &mut String, time_division: &TimeDivision) {
-    out.push_str("<sense-of-time>");
-    out.push_str("Use these tags for past observations: ");
+pub fn format_time_division_guidance(time_division: &TimeDivision) -> String {
+    let mut out = String::from("Sense of time: use these tags for past observations: ");
     let mut first = true;
     for bucket in time_division.buckets() {
         if !first {
             out.push_str("; ");
         }
         first = false;
-        push_xml_text(out, &bucket.tag);
+        out.push_str(&single_line(&bucket.tag));
         out.push_str(" up to ");
         out.push_str(&duration_phrase(bucket.range));
     }
     if !first {
         out.push_str("; ");
     }
-    push_xml_text(out, time_division.fallback_longest_tag());
+    out.push_str(&single_line(time_division.fallback_longest_tag()));
     out.push_str(" after that.");
-    out.push_str("</sense-of-time>");
+    out
 }
 
-fn push_stuckness(out: &mut String, stuckness: &AgenticDeadlockMarker) {
-    out.push_str("<stuckness><quiet-too-long>I have been idle for ");
+pub fn format_stuckness(stuckness: &AgenticDeadlockMarker) -> String {
+    let mut out = String::from("Stuckness: I have been idle for ");
     out.push_str(&duration_phrase(stuckness.idle_for));
-    out.push_str(".</quiet-too-long></stuckness>");
+    out.push('.');
+    out
 }
 
-fn attention_strength_tag(ratio: ActivationRatio) -> &'static str {
+fn attention_strength_label(ratio: ActivationRatio) -> &'static str {
     if ratio.as_f64() >= 0.66 {
         "strong"
     } else if ratio > ActivationRatio::ZERO {
@@ -402,22 +302,6 @@ fn age_label(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-fn age_xml_tag(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    match classify_age(at, now) {
-        AgeBucket::Future => "future".to_owned(),
-        AgeBucket::JustNow => "just-now".to_owned(),
-        AgeBucket::OneMinute => "about-1-minute-ago".to_owned(),
-        AgeBucket::Minutes(m) => format!("about-{m}-minutes-ago"),
-        AgeBucket::OneHour => "about-1-hour-ago".to_owned(),
-        AgeBucket::HoursMinutes { hours, minutes: 0 } => format!("about-{hours}-hours-ago"),
-        AgeBucket::HoursMinutes { hours, minutes } => format!("about-{hours}h{minutes}m-ago"),
-        AgeBucket::Days(d) => format!("about-{d}-days-ago"),
-        AgeBucket::Months(m) => format!("about-{m}-months-ago"),
-        AgeBucket::OneYear => "about-one-year-ago".to_owned(),
-        AgeBucket::Years(y) => format!("about-{y}-years-ago"),
-    }
-}
-
 fn base_time(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -448,19 +332,6 @@ fn single_line(text: &str) -> String {
         out.push_str(word);
     }
     out
-}
-
-fn push_xml_text(out: &mut String, text: &str) {
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(ch),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -558,14 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_mind_xml_is_single_line_and_ordered_by_information_kind() {
-        let owner = nuillu_types::ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
-        let memos = vec![MemoLogRecord {
-            owner,
-            index: 0,
-            written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 21, 0).unwrap(),
-            content: "watch <door> & listen".into(),
-        }];
+    fn focused_context_formatters_return_plain_sections() {
         let mut allocation = ResourceAllocation::default();
         allocation.set(
             builtin::sensory(),
@@ -575,20 +439,17 @@ mod tests {
         );
         allocation.set_activation(builtin::sensory(), ActivationRatio::ONE);
 
-        let xml = format_ephemeral_mind_context(EphemeralMindContext {
-            memos: &memos,
-            memory_rank_counts: None,
-            allocation: Some(&allocation),
-            available_faculties: &[(builtin::sensory(), "observes the world")],
-            time_division: None,
-            stuckness: None,
-            now: now(),
-        });
-
         assert_eq!(
-            xml,
-            "<mind><held-in-mind><sensory><about-2-minutes-ago>watch &lt;door&gt; &amp; listen</about-2-minutes-ago></sensory></held-in-mind><current-attention><strong><sensory>keep watching</sensory></strong></current-attention><available-faculties><sensory>observes the world</sensory></available-faculties></mind>"
+            format_current_attention_guidance(&allocation),
+            Some("Current attention guidance:\n- sensory (strong): keep watching".to_owned())
         );
-        assert!(!xml.contains('\n'));
+        assert_eq!(
+            format_available_faculties(&[(builtin::sensory(), "observes the world")]),
+            Some("Available faculties:\n- sensory: observes the world".to_owned())
+        );
+        assert_eq!(
+            format_memory_trace_inventory(&BTreeMap::from([("short-term", 2)])),
+            Some("Memory trace inventory:\n- short-term: 2 traces".to_owned())
+        );
     }
 }

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, CognitionWriter, EphemeralMindContext, LlmAccess, MemoUpdatedInbox,
-    Module, SessionCompactionConfig, compact_session_if_needed, push_ephemeral_mind_context,
+    CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
+    SessionCompactionConfig, compact_session_if_needed, format_current_attention_guidance,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
@@ -36,6 +36,14 @@ Summarize only the prefix transcript you receive. Preserve memo-log facts, atten
 interpretations, prior appended first-person attention experiences, rejected candidates, allocation
 guidance, and cognition-log context needed for future attention updates. Do not invent facts.
 Return plain text only."#;
+
+fn format_attention_schema_context(
+    allocation: &nuillu_module::ResourceAllocation,
+) -> Option<String> {
+    format_current_attention_guidance(allocation).map(|attention| {
+        format!("Attention-schema context for updating the attention model:\n\n{attention}")
+    })
+}
 
 #[lutum::tool_input(
     name = "append_attention_experience",
@@ -122,18 +130,9 @@ impl AttentionSchemaModule {
         let prompt = self.model_prompt(cx).to_owned();
         self.session.push_ephemeral_system(prompt);
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition_log, cx.now());
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: None,
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        if let Some(context) = format_attention_schema_context(&allocation) {
+            self.session.push_ephemeral_system(context);
+        }
         self.session
             .push_ephemeral_developer("Update the attention schema from the new notes above.");
 

@@ -6,9 +6,10 @@ use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, EphemeralMindContext, LlmAccess, Memo, MemoUpdatedInbox,
-    Module, SessionCompactionConfig, compact_session_if_needed, format_faculty_system_prompt,
-    memory_rank_counts, push_ephemeral_mind_context, push_formatted_cognition_log_batch,
+    BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
+    SessionCompactionConfig, compact_session_if_needed, format_available_faculties,
+    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
+    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
     push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, builtin};
@@ -53,6 +54,30 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the attention-controller 
 Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
 decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
 allocation decisions. Do not invent facts. Return plain text only."#;
+
+fn format_attention_controller_context(
+    rank_counts: &nuillu_module::MemoryRankCounts,
+    current: &nuillu_module::ResourceAllocation,
+    modules: &[(ModuleId, &'static str)],
+    stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
+) -> String {
+    let mut sections = vec![
+        "Attention-controller context for assigning the next activation priorities:".to_owned(),
+    ];
+    if let Some(section) = format_memory_trace_inventory(rank_counts) {
+        sections.push(section);
+    }
+    if let Some(section) = format_current_attention_guidance(current) {
+        sections.push(section);
+    }
+    if let Some(section) = format_available_faculties(modules) {
+        sections.push(section);
+    }
+    if let Some(stuckness) = stuckness {
+        sections.push(format_stuckness(stuckness));
+    }
+    sections.join("\n\n")
+}
 
 tokio::task_local! {
     static CONTROLLER_DECISION_SCHEMA: Schema;
@@ -196,18 +221,13 @@ impl AttentionControllerModule {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
 
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&current),
-                available_faculties: cx.modules(),
-                time_division: None,
-                stuckness: stuckness.as_ref(),
-                now: cx.now(),
-            },
-        );
+        self.session
+            .push_ephemeral_system(format_attention_controller_context(
+                &rank_counts,
+                &current,
+                cx.modules(),
+                stuckness.as_ref(),
+            ));
         self.session
             .push_ephemeral_developer(controller_request_input(requests));
 
@@ -812,7 +832,11 @@ mod tests {
         assert!(first_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                )
         )));
 
         let second_items = inputs[1].items();
@@ -853,7 +877,11 @@ mod tests {
         assert!(second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                )
         )));
         assert!(!second_items.iter().any(|item| matches!(
             item,
@@ -887,7 +915,11 @@ mod tests {
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("<mind>"))
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)]
+                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                )
         )));
         assert_eq!(fixture.controller.session.list_turns().count(), 2);
     }

@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, EphemeralMindContext, FileSearcher,
-    LlmAccess, Memo, Module, SessionCompactionConfig, compact_session_if_needed,
-    memory_rank_counts, ports::FileSearchQuery, push_ephemeral_mind_context,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
+    Module, SessionCompactionConfig, compact_session_if_needed, ports::FileSearchQuery,
     push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
@@ -141,27 +140,10 @@ impl QueryAgenticModule {
     ) -> Result<Vec<QueryFileHit>> {
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        let rank_counts = self
-            .blackboard
-            .read(|bb| memory_rank_counts(bb.memory_metadata()))
-            .await;
-        let allocation = self.allocation.snapshot().await;
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session
             .push_user(format_file_search_questions(questions));
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
 
         let mut all_hits = Vec::new();
         for _ in 0..MAX_QUERY_ROUNDS {

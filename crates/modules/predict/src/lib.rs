@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    EphemeralMindContext, LlmAccess, Memo, Module, SessionCompactionConfig,
-    compact_session_if_needed, memory_rank_counts, push_ephemeral_mind_context,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
+    Memo, Module, SessionCompactionConfig, compact_session_if_needed,
+    format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 
@@ -24,6 +24,22 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the predict module's pers
 Summarize only the prefix transcript you receive. Preserve prior predictions, their subjects,
 validity horizons, rationales, memo-log facts, and cognition-log context needed for future
 prediction updates. Do not invent facts. Return plain text only."#;
+
+fn format_predict_context(
+    rank_counts: &nuillu_module::MemoryRankCounts,
+    allocation: &nuillu_module::ResourceAllocation,
+) -> String {
+    let mut sections = vec![
+        "Predict context for updating forward expectations from current cognition:".to_owned(),
+    ];
+    if let Some(section) = format_memory_trace_inventory(rank_counts) {
+        sections.push(section);
+    }
+    if let Some(section) = format_current_attention_guidance(allocation) {
+        sections.push(section);
+    }
+    sections.join("\n\n")
+}
 
 pub struct PredictModule {
     owner: nuillu_module::ModuleId,
@@ -88,18 +104,8 @@ impl PredictModule {
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
-        push_ephemeral_mind_context(
-            &mut self.session,
-            EphemeralMindContext {
-                memos: &[],
-                memory_rank_counts: Some(&rank_counts),
-                allocation: Some(&allocation),
-                available_faculties: &[],
-                time_division: None,
-                stuckness: None,
-                now: cx.now(),
-            },
-        );
+        self.session
+            .push_ephemeral_system(format_predict_context(&rank_counts, &allocation));
         self.session
             .push_ephemeral_developer("Update forward predictions for the cognition above.");
 
