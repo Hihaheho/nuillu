@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
 use nuillu_blackboard::Blackboard;
 use nuillu_module::ports::{
-    Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-    SystemClock,
+    Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
+    NoopUtteranceSink, SystemClock,
 };
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
@@ -58,6 +58,8 @@ fn test_caps_inner(
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock,

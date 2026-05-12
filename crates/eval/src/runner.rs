@@ -25,7 +25,10 @@ use lutum::{
 };
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
-use lutum_libsql_adapter::{EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig};
+use lutum_libsql_adapter::{
+    EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig, LibsqlPolicyStore,
+    LibsqlPolicyStoreConfig,
+};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
@@ -35,7 +38,8 @@ use nuillu_blackboard::{
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryQuery, MemoryStore,
-    NoopFileSearchProvider, PortError, SystemClock, Utterance, UtteranceDelta, UtteranceSink,
+    NoopFileSearchProvider, PolicyStore, PortError, SystemClock, Utterance, UtteranceDelta,
+    UtteranceSink,
 };
 use nuillu_module::{
     AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
@@ -2256,6 +2260,8 @@ async fn build_eval_environment(
         None => Arc::new(SystemClock),
     };
     let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
+    let policy_store: Arc<dyn PolicyStore> =
+        Arc::new(connect_policy_store(output_dir, config).await?);
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
@@ -2271,6 +2277,8 @@ async fn build_eval_environment(
             cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
             primary_memory_store: memory.clone(),
             memory_replicas: Vec::new(),
+            primary_policy_store: policy_store,
+            policy_replicas: Vec::new(),
             file_search,
             utterance_sink: utterances.clone(),
             clock: clock.clone(),
@@ -2317,6 +2325,23 @@ async fn connect_memory_store(
     )
     .await
     .context("connect libsql memory store")
+}
+
+async fn connect_policy_store(
+    output_dir: &Path,
+    config: &RunnerConfig,
+) -> Result<LibsqlPolicyStore> {
+    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
+        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
+    let dimensions = embedder.dimensions();
+    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let db_path = output_dir.join("policy.db");
+    LibsqlPolicyStore::connect(
+        LibsqlPolicyStoreConfig::local(db_path, dimensions).with_active_profile(profile),
+        Box::new(embedder),
+    )
+    .await
+    .context("connect libsql policy store")
 }
 
 fn module_file_search_provider(
@@ -2620,9 +2645,13 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::self_model(), builtin::query_vector()),
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_vector()),
+        (builtin::cognition_gate(), builtin::query_policy()),
         (builtin::cognition_gate(), builtin::query_agentic()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
+        (builtin::value_estimator(), builtin::query_policy()),
+        (builtin::reward(), builtin::value_estimator()),
+        (builtin::policy(), builtin::reward()),
     ];
 
     edges
@@ -2739,6 +2768,19 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                 )
             })
             .expect("eval module registration should be unique"),
+        EvalModule::QueryPolicy => registry
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
+                nuillu_query_policy::QueryPolicyModule::new(
+                    caps.allocation_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.policy_searcher(),
+                    caps.typed_memo::<nuillu_module::PolicyRetrievalMemo>(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
             .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
@@ -2773,6 +2815,50 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.memory_compactor(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::Policy => registry
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
+                nuillu_policy::PolicyModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.allocation_reader(),
+                    caps.policy_writer(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::ValueEstimator => registry
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
+                nuillu_value_estimator::ValueEstimatorModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.policy_window_reader(),
+                    caps.typed_memo::<nuillu_module::ValueEstimateMemo>(),
+                    caps.llm_access(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::Reward => registry
+            .register(eval_policy(0..=1, Bpm::range(3.0, 9.0)), |caps| {
+                nuillu_reward::RewardModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.memo_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.policy_window_reader(),
+                    caps.policy_value_updater(),
+                    caps.attention_control_mailbox(),
+                    caps.typed_memo::<nuillu_reward::RewardMemo>(),
                     caps.llm_access(),
                 )
             })
@@ -2887,6 +2973,13 @@ fn full_agent_allocation(
                 ModelTier::Cheap,
                 "Idle until memory retrieval is needed.",
             ),
+            EvalModule::QueryPolicy => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until policy retrieval is needed.",
+            ),
             EvalModule::QueryAgentic => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
@@ -2907,6 +3000,27 @@ fn full_agent_allocation(
                 0.0,
                 ModelTier::Cheap,
                 "Idle until compaction guidance arrives.",
+            ),
+            EvalModule::Policy => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Default,
+                "Idle until policy formation guidance or distinctive outcomes arrive.",
+            ),
+            EvalModule::ValueEstimator => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until query-policy retrieval windows need value estimates.",
+            ),
+            EvalModule::Reward => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Default,
+                "Idle until outcomes settle value-estimate windows.",
             ),
             EvalModule::Predict => set_allocation_module(
                 &mut allocation,
@@ -3020,14 +3134,18 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         EvalModule::Sensory
         | EvalModule::CognitionGate
         | EvalModule::QueryVector
+        | EvalModule::QueryPolicy
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
+        | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
         EvalModule::AttentionController => ModelTier::Default,
-        EvalModule::AttentionSchema | EvalModule::SelfModel | EvalModule::Surprise => {
-            ModelTier::Default
-        }
+        EvalModule::AttentionSchema
+        | EvalModule::SelfModel
+        | EvalModule::Policy
+        | EvalModule::Reward
+        | EvalModule::Surprise => ModelTier::Default,
     }
 }
 
@@ -4115,8 +4233,8 @@ mod tests {
     use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
     use nuillu_module::MemoUpdated;
     use nuillu_module::ports::{
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        SystemClock,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
+        NoopUtteranceSink, SystemClock,
     };
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
 
@@ -4296,6 +4414,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),

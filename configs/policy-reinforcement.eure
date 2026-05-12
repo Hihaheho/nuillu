@@ -1,0 +1,26 @@
+alpha = 0.2
+beta = 0.1
+confidence-gamma = 0.05
+confidence-scale = 0.5
+positive-token-min = 0.2
+
+external-weight = 1.0
+task-weight = 1.0
+social-weight = 1.0
+novelty-weight = 1.0
+cost-weight = 1.0
+risk-weight = 1.0
+
+provisional-token-min = 2
+provisional-value-min = 0.2
+established-token-min = 8
+established-value-min = 0.45
+established-confidence-min = 0.5
+habit-token-min = 16
+habit-value-min = 0.7
+habit-confidence-min = 0.7
+
+tentative-decay-secs = 86400
+provisional-decay-secs = 604800
+established-decay-secs = 2592000
+habit-decay-secs = 15552000

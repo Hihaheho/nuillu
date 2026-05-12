@@ -9,6 +9,7 @@ use lutum::Session;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, LlmAccess, Memo, Module, SensoryInput,
     SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed, ports::Clock,
+    seed_persistent_faculty_session,
 };
 use tokio::time::Instant;
 
@@ -74,6 +75,7 @@ pub struct SensoryModule {
     clock: Arc<dyn Clock>,
     llm: LlmAccess,
     session: Session,
+    session_seeded: bool,
     session_compaction: SessionCompactionConfig,
     burst: SensoryBurstConfig,
     system_prompt: std::sync::OnceLock<String>,
@@ -116,6 +118,7 @@ impl SensoryModule {
             clock,
             llm,
             session: Session::new(),
+            session_seeded: false,
             session_compaction: SessionCompactionConfig::default(),
             burst: SensoryBurstConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
@@ -133,26 +136,28 @@ impl SensoryModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
+            nuillu_module::format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
         })
     }
 
     fn detail_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.detail_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                DETAIL_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
+            nuillu_module::format_faculty_system_prompt(DETAIL_PROMPT, cx.modules(), &self.owner)
         })
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let system_prompt = self.system_prompt(cx).to_owned();
+        seed_persistent_faculty_session(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+        self.session_seeded = true;
     }
 
     fn format_age(now: DateTime<Utc>, observed_at: DateTime<Utc>) -> String {
@@ -200,10 +205,9 @@ impl SensoryModule {
             .cloned()
             .map(|input| self.prepare_observation(now, input))
             .collect::<Vec<_>>();
+        self.ensure_session_seeded(cx);
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation.for_module(&self.owner).guidance;
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(format_sensory_batch(&observations));
         if let Some(context) = format_sensory_guidance_context(&guidance) {
             self.session.push_ephemeral_system(context);
@@ -279,8 +283,9 @@ impl SensoryModule {
         if guidance.trim().is_empty() {
             return Ok(());
         }
-        let system_prompt = self.detail_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
+        self.ensure_session_seeded(cx);
+        let detail_prompt = self.detail_prompt(cx).to_owned();
+        self.session.push_ephemeral_developer(detail_prompt);
         self.session
             .push_user(format_sensory_detail_request(&guidance, &self.observations));
 
@@ -562,16 +567,16 @@ mod tests {
     use std::rc::Rc;
 
     use lutum::{
-        FinishReason, Lutum, MessageContent, MockLlmAdapter, MockTextScenario, ModelInputItem,
-        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+        FinishReason, InputMessageRole, Lutum, MessageContent, MockLlmAdapter, MockTextScenario,
+        ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
         linear_ratio_fn,
     };
     use nuillu_module::ports::{
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        SystemClock,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
+        NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{
         AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
@@ -666,6 +671,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
@@ -894,6 +901,16 @@ mod tests {
                     recorder.batches.borrow().as_slice(),
                     &[(1, false), (0, true)]
                 );
+                let sessions = recorder.session_inputs.borrow();
+                let first_session = sessions.first().expect("first sensory activation recorded");
+                let ModelInputItem::Message { role, content } = &first_session[0] else {
+                    panic!("expected sensory system prompt as first session item");
+                };
+                assert_eq!(role, &InputMessageRole::System);
+                let [MessageContent::Text(system)] = content.as_slice() else {
+                    panic!("expected sensory system prompt text");
+                };
+                assert!(system.contains("You are the sensory module"));
             })
             .await;
     }

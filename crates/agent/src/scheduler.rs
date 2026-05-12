@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use nuillu_blackboard::{ActivationRatio, IdentityMemoryRecord, ZeroReplicaWindowPolicy};
+use nuillu_blackboard::{
+    ActivationRatio, CorePolicyRecord, IdentityMemoryRecord, ZeroReplicaWindowPolicy,
+};
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies, ModuleRunStatus,
@@ -533,6 +535,7 @@ async fn refresh_active_and_schedule(
                         .await;
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
+                    let core_policies = runtime.core_policies().await;
                     spawn_activate(
                         tasks,
                         index,
@@ -544,6 +547,7 @@ async fn refresh_active_and_schedule(
                         runtime.clone(),
                         catalog,
                         identity_memories,
+                        core_policies,
                         parent,
                         subscriber,
                     );
@@ -813,6 +817,7 @@ async fn handle_task_message(
                     states[index] = ModuleState::Activating;
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
+                    let core_policies = runtime.core_policies().await;
                     spawn_activate(
                         tasks,
                         index,
@@ -824,6 +829,7 @@ async fn handle_task_message(
                         runtime.clone(),
                         catalog,
                         identity_memories,
+                        core_policies,
                         parent,
                         subscriber,
                     );
@@ -1048,6 +1054,7 @@ async fn spawn_activation_gate_or_activate(
             .await;
         let catalog = runtime.module_catalog();
         let identity_memories = runtime.identity_memories().await;
+        let core_policies = runtime.core_policies().await;
         spawn_activate(
             tasks,
             index,
@@ -1059,6 +1066,7 @@ async fn spawn_activation_gate_or_activate(
             runtime.clone(),
             catalog,
             identity_memories,
+            core_policies,
             parent,
             subscriber,
         );
@@ -1281,6 +1289,7 @@ fn spawn_activate(
     runtime: AgentRuntimeControl,
     catalog: Vec<(ModuleId, &'static str)>,
     identity_memories: Vec<IdentityMemoryRecord>,
+    core_policies: Vec<CorePolicyRecord>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -1292,6 +1301,7 @@ fn spawn_activate(
                 &runtime,
                 &catalog,
                 &identity_memories,
+                &core_policies,
                 &batch,
                 config.activate_retries,
             )
@@ -1346,6 +1356,7 @@ async fn activate_with_retries(
     runtime: &AgentRuntimeControl,
     catalog: &[(ModuleId, &'static str)],
     identity_memories: &[IdentityMemoryRecord],
+    core_policies: &[CorePolicyRecord],
     batch: &ModuleBatch,
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
@@ -1353,6 +1364,7 @@ async fn activate_with_retries(
     let cx = ActivateCx::new(
         catalog,
         identity_memories,
+        core_policies,
         runtime
             .session_compaction_lutum()
             .clone()
@@ -4810,6 +4822,7 @@ mod tests {
                     runtime.clone(),
                     runtime.module_catalog(),
                     runtime.identity_memories().await,
+                    runtime.core_policies().await,
                     &parent,
                     &subscriber,
                 );

@@ -121,8 +121,8 @@ mod tests {
     use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
     use nuillu_blackboard::{Blackboard, Bpm, linear_ratio_fn};
     use nuillu_module::ports::{
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        SystemClock,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
+        NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, MemoUpdated, Module,
@@ -173,6 +173,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),

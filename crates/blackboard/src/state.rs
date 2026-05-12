@@ -5,13 +5,13 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, builtin};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex, builtin};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
-    CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, IdentityMemoryRecord,
-    MemoryMetadata, ModulePolicy, ResourceAllocation,
+    CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, CorePolicyRecord,
+    IdentityMemoryRecord, MemoryMetadata, ModulePolicy, PolicyMetadata, ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -49,6 +49,8 @@ pub struct BlackboardInner {
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     identity_memories: Vec<IdentityMemoryRecord>,
+    policy_metadata: HashMap<PolicyIndex, PolicyMetadata>,
+    core_policies: Vec<CorePolicyRecord>,
     base_allocation: ResourceAllocation,
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
@@ -407,6 +409,8 @@ impl Default for BlackboardInner {
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
             identity_memories: Vec::new(),
+            policy_metadata: HashMap::new(),
+            core_policies: Vec::new(),
             base_allocation: ResourceAllocation::default(),
             allocation: ResourceAllocation::default(),
             allocation_proposals: HashMap::new(),
@@ -594,6 +598,14 @@ impl BlackboardInner {
         &self.identity_memories
     }
 
+    pub fn policy_metadata(&self) -> &HashMap<PolicyIndex, PolicyMetadata> {
+        &self.policy_metadata
+    }
+
+    pub fn core_policies(&self) -> &[CorePolicyRecord] {
+        &self.core_policies
+    }
+
     pub fn allocation(&self) -> &ResourceAllocation {
         &self.allocation
     }
@@ -679,6 +691,26 @@ impl BlackboardInner {
             }
             BlackboardCommand::SetIdentityMemories(records) => {
                 self.identity_memories = records;
+            }
+            BlackboardCommand::UpsertPolicyMetadata {
+                index,
+                rank_if_new,
+                decay_if_new_secs,
+                patch,
+            } => {
+                let entry = self
+                    .policy_metadata
+                    .entry(index.clone())
+                    .or_insert_with(|| {
+                        PolicyMetadata::new_at(index, rank_if_new, decay_if_new_secs)
+                    });
+                patch.apply(entry);
+            }
+            BlackboardCommand::RemovePolicyMetadata { index } => {
+                self.policy_metadata.remove(&index);
+            }
+            BlackboardCommand::SetCorePolicies(records) => {
+                self.core_policies = records;
             }
             BlackboardCommand::SetAllocation(alloc) => {
                 self.base_allocation = alloc;

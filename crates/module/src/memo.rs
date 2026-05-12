@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use nuillu_blackboard::{Blackboard, TypedMemoLogRecord};
+use nuillu_blackboard::{Blackboard, MemoLogRecord, TypedMemoLogRecord};
 use nuillu_types::ModuleInstanceId;
 
 use crate::ports::Clock;
@@ -54,8 +54,8 @@ impl Memo {
 
     /// Append a new plaintext owner memo item. Allocates the queue on first
     /// call.
-    pub async fn write(&self, memo: impl Into<String>) {
-        self.core.write_plain(memo.into()).await;
+    pub async fn write(&self, memo: impl Into<String>) -> MemoLogRecord {
+        self.core.write_plain(memo.into()).await
     }
 }
 
@@ -74,8 +74,8 @@ impl<T: 'static> TypedMemo<T> {
     }
 
     /// Append a new typed owner memo item plus its plaintext representation.
-    pub async fn write(&self, payload: T, memo: impl Into<String>) {
-        self.core.write_typed(payload, memo.into()).await;
+    pub async fn write(&self, payload: T, memo: impl Into<String>) -> MemoLogRecord {
+        self.core.write_typed(payload, memo.into()).await
     }
 
     /// Return retained typed memo entries for this owner.
@@ -101,22 +101,24 @@ impl MemoCore {
         }
     }
 
-    async fn write_plain(&self, memo: String) {
+    async fn write_plain(&self, memo: String) -> MemoLogRecord {
         let char_count = memo.chars().count();
         let record = self
             .blackboard
             .update_memo(self.owner.clone(), memo, self.clock.now())
             .await;
         self.publish_update(record.index, char_count).await;
+        record
     }
 
-    async fn write_typed<T: 'static>(&self, payload: T, memo: String) {
+    async fn write_typed<T: 'static>(&self, payload: T, memo: String) -> MemoLogRecord {
         let char_count = memo.chars().count();
         let record = self
             .blackboard
             .update_typed_memo(self.owner.clone(), memo, payload, self.clock.now())
             .await;
         self.publish_update(record.index, char_count).await;
+        record
     }
 
     async fn publish_update(&self, index: u64, char_count: usize) {

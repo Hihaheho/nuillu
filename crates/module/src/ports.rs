@@ -13,7 +13,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
-use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank, ModuleInstanceId};
+use nuillu_types::{
+    MemoryContent, MemoryIndex, MemoryRank, ModuleInstanceId, PolicyIndex, PolicyRank,
+    SignedUnitF32, UnitF32,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -64,6 +67,28 @@ pub trait MemoryStore {
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
 }
 
+/// Content-store for policy entries. Metadata (rank, value, confidence,
+/// reward-token counts, decay, diagnostic access) is mirrored on the
+/// blackboard; this trait owns durable trigger/behavior content and
+/// adapter-local trigger embedding/search state.
+#[async_trait(?Send)]
+pub trait PolicyStore {
+    async fn insert(&self, policy: NewPolicy) -> Result<PolicyIndex, PortError>;
+    async fn put(&self, policy: IndexedPolicy) -> Result<(), PortError>;
+    async fn get(&self, index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError>;
+    async fn list_by_rank(&self, rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError>;
+    async fn search(&self, q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError>;
+    async fn reinforce(
+        &self,
+        index: &PolicyIndex,
+        value_delta: f32,
+        reward_tokens_delta: u32,
+        expected_reward_delta: f32,
+        confidence_delta: f32,
+    ) -> Result<PolicyRecord, PortError>;
+    async fn delete(&self, index: &PolicyIndex) -> Result<(), PortError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct NewMemory {
     pub content: MemoryContent,
@@ -90,6 +115,56 @@ pub struct MemoryRecord {
 #[derive(Debug, Clone)]
 pub struct MemoryQuery {
     pub text: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPolicy {
+    pub trigger: String,
+    pub behavior: String,
+    pub rank: PolicyRank,
+    pub expected_reward: SignedUnitF32,
+    pub confidence: UnitF32,
+    pub value: SignedUnitF32,
+    pub reward_tokens: u32,
+    pub decay_remaining_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedPolicy {
+    pub index: PolicyIndex,
+    pub trigger: String,
+    pub behavior: String,
+    pub rank: PolicyRank,
+    pub expected_reward: SignedUnitF32,
+    pub confidence: UnitF32,
+    pub value: SignedUnitF32,
+    pub reward_tokens: u32,
+    pub decay_remaining_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyRecord {
+    pub index: PolicyIndex,
+    pub trigger: String,
+    pub behavior: String,
+    pub rank: PolicyRank,
+    pub expected_reward: SignedUnitF32,
+    pub confidence: UnitF32,
+    pub value: SignedUnitF32,
+    pub reward_tokens: u32,
+    pub decay_remaining_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicySearchHit {
+    pub policy: PolicyRecord,
+    pub similarity: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PolicyQuery {
+    pub trigger: String,
     pub limit: usize,
 }
 
@@ -218,6 +293,61 @@ impl MemoryStore for NoopMemoryStore {
     }
 
     async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+/// Policy store that accepts every write, returns empty reads, and assigns a
+/// unique synthetic [`PolicyIndex`] to each insert.
+#[derive(Debug, Default)]
+pub struct NoopPolicyStore;
+
+#[async_trait(?Send)]
+impl PolicyStore for NoopPolicyStore {
+    async fn insert(&self, _policy: NewPolicy) -> Result<PolicyIndex, PortError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(PolicyIndex::new(format!("noop-policy-{id}")))
+    }
+
+    async fn put(&self, _policy: IndexedPolicy) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn get(&self, _index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError> {
+        Ok(None)
+    }
+
+    async fn list_by_rank(&self, _rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn search(&self, _q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn reinforce(
+        &self,
+        index: &PolicyIndex,
+        value_delta: f32,
+        reward_tokens_delta: u32,
+        expected_reward_delta: f32,
+        confidence_delta: f32,
+    ) -> Result<PolicyRecord, PortError> {
+        Ok(PolicyRecord {
+            index: index.clone(),
+            trigger: String::new(),
+            behavior: String::new(),
+            rank: PolicyRank::Tentative,
+            expected_reward: SignedUnitF32::clamp(expected_reward_delta),
+            confidence: UnitF32::clamp(confidence_delta),
+            value: SignedUnitF32::clamp(value_delta),
+            reward_tokens: reward_tokens_delta,
+            decay_remaining_secs: 0,
+        })
+    }
+
+    async fn delete(&self, _index: &PolicyIndex) -> Result<(), PortError> {
         Ok(())
     }
 }

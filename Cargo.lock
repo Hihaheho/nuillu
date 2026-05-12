@@ -3347,14 +3347,18 @@ dependencies = [
  "nuillu-memory",
  "nuillu-memory-compaction",
  "nuillu-module",
+ "nuillu-policy",
  "nuillu-predict",
  "nuillu-query-agentic",
+ "nuillu-query-policy",
  "nuillu-query-vector",
+ "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
+ "nuillu-value-estimator",
  "nuillu-visualizer-protocol",
  "regex",
  "schemars",
@@ -3423,6 +3427,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-policy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lutum",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "nuillu-predict"
 version = "0.1.0"
 dependencies = [
@@ -3452,6 +3470,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-query-policy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nuillu-module",
+ "nuillu-types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-query-vector"
 version = "0.1.0"
 dependencies = [
@@ -3468,6 +3498,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuillu-reward"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "eure",
+ "lutum",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3545,6 +3591,17 @@ dependencies = [
  "schemars",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nuillu-value-estimator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nuillu-module",
+ "nuillu-types",
+ "tokio",
 ]
 
 [[package]]

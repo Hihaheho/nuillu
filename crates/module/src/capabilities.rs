@@ -10,13 +10,14 @@ use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{MemoryRank, ModuleId, ModuleInstanceId, ReplicaIndex};
+use nuillu_types::{MemoryRank, ModuleId, ModuleInstanceId, PolicyRank, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
 use crate::llm::LlmConcurrencyLimiter;
 use crate::ports::{
-    Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PortError, UtteranceSink,
+    Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PolicyStore, PortError,
+    UtteranceSink,
 };
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
@@ -29,9 +30,9 @@ use crate::{
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, FileSearcher, LlmAccess,
     LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryCompactor,
-    MemoryContentReader, MemoryWriter, Module, ModuleBatch, ModuleStatusReader, SensoryInput,
-    SensoryInputInbox, SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
-    VectorMemorySearcher,
+    MemoryContentReader, MemoryWriter, Module, ModuleBatch, ModuleStatusReader, PolicySearcher,
+    PolicyValueUpdater, PolicyWindowReader, PolicyWriter, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VectorMemorySearcher,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -55,6 +56,8 @@ struct CapabilityProvidersInner {
     cognition_log_port: Arc<dyn CognitionLogRepository>,
     primary_memory_store: Arc<dyn MemoryStore>,
     memory_replicas: Vec<Arc<dyn MemoryStore>>,
+    primary_policy_store: Arc<dyn PolicyStore>,
+    policy_replicas: Vec<Arc<dyn PolicyStore>>,
     file_search: Arc<dyn FileSearchProvider>,
     utterance_sink: Arc<dyn UtteranceSink>,
     clock: Arc<dyn Clock>,
@@ -74,6 +77,8 @@ pub struct CapabilityProviderPorts {
     pub cognition_log_port: Arc<dyn CognitionLogRepository>,
     pub primary_memory_store: Arc<dyn MemoryStore>,
     pub memory_replicas: Vec<Arc<dyn MemoryStore>>,
+    pub primary_policy_store: Arc<dyn PolicyStore>,
+    pub policy_replicas: Vec<Arc<dyn PolicyStore>>,
     pub file_search: Arc<dyn FileSearchProvider>,
     pub utterance_sink: Arc<dyn UtteranceSink>,
     pub clock: Arc<dyn Clock>,
@@ -120,6 +125,8 @@ impl CapabilityProviders {
             cognition_log_port,
             primary_memory_store,
             memory_replicas,
+            primary_policy_store,
+            policy_replicas,
             file_search,
             utterance_sink,
             clock,
@@ -171,6 +178,8 @@ impl CapabilityProviders {
                 cognition_log_port,
                 primary_memory_store,
                 memory_replicas,
+                primary_policy_store,
+                policy_replicas,
                 file_search,
                 utterance_sink,
                 clock,
@@ -226,6 +235,23 @@ impl CapabilityProviders {
         self.inner
             .blackboard
             .apply(BlackboardCommand::SetIdentityMemories(records))
+            .await;
+        Ok(())
+    }
+
+    pub(crate) async fn load_core_policies(&self) -> Result<(), PortError> {
+        let mut records = self
+            .inner
+            .primary_policy_store
+            .list_by_rank(PolicyRank::Core)
+            .await?
+            .into_iter()
+            .map(crate::policy_caps::core_policy_record)
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| a.index.as_str().cmp(b.index.as_str()));
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetCorePolicies(records))
             .await;
         Ok(())
     }
@@ -313,6 +339,35 @@ impl CapabilityProviders {
         )
     }
 
+    pub fn policy_writer(&self) -> PolicyWriter {
+        PolicyWriter::new(
+            self.inner.primary_policy_store.clone(),
+            self.inner.policy_replicas.clone(),
+            self.inner.blackboard.clone(),
+        )
+    }
+
+    pub fn policy_searcher(&self) -> PolicySearcher {
+        PolicySearcher::new(
+            self.inner.primary_policy_store.clone(),
+            self.inner.blackboard.clone(),
+            self.inner.clock.clone(),
+        )
+    }
+
+    pub fn policy_value_updater(&self) -> PolicyValueUpdater {
+        PolicyValueUpdater::new(
+            self.inner.primary_policy_store.clone(),
+            self.inner.policy_replicas.clone(),
+            self.inner.blackboard.clone(),
+            self.inner.clock.clone(),
+        )
+    }
+
+    pub fn policy_window_reader(&self) -> PolicyWindowReader {
+        PolicyWindowReader::new(self.inner.blackboard.clone())
+    }
+
     pub fn file_searcher(&self) -> FileSearcher {
         FileSearcher::new(self.inner.file_search.clone())
     }
@@ -381,6 +436,10 @@ impl AgentRuntimeControl {
         self.blackboard
             .read(|bb| bb.identity_memories().to_vec())
             .await
+    }
+
+    pub async fn core_policies(&self) -> Vec<nuillu_blackboard::CorePolicyRecord> {
+        self.blackboard.read(|bb| bb.core_policies().to_vec()).await
     }
 
     pub async fn record_module_status(&self, owner: ModuleInstanceId, status: ModuleRunStatus) {
@@ -678,6 +737,22 @@ impl ModuleCapabilityFactory {
         self.root.memory_compactor()
     }
 
+    pub fn policy_writer(&self) -> PolicyWriter {
+        self.root.policy_writer()
+    }
+
+    pub fn policy_searcher(&self) -> PolicySearcher {
+        self.root.policy_searcher()
+    }
+
+    pub fn policy_value_updater(&self) -> PolicyValueUpdater {
+        self.root.policy_value_updater()
+    }
+
+    pub fn policy_window_reader(&self) -> PolicyWindowReader {
+        self.root.policy_window_reader()
+    }
+
     pub fn file_searcher(&self) -> FileSearcher {
         self.root.file_searcher()
     }
@@ -928,6 +1003,9 @@ impl ModuleRegistry {
         caps.load_identity_memories()
             .await
             .map_err(ModuleRegistryError::IdentityMemoryLoad)?;
+        caps.load_core_policies()
+            .await
+            .map_err(ModuleRegistryError::CorePolicyLoad)?;
         // Install the post-boot module catalog before any module is constructed
         // so module constructors can read peers from `caps.module_catalog()`
         // synchronously when they assemble their system prompts.
@@ -1059,6 +1137,8 @@ pub enum ModuleRegistryError {
     DuplicateModule { module: ModuleId },
     #[error("failed to load identity memories: {0}")]
     IdentityMemoryLoad(PortError),
+    #[error("failed to load core policies: {0}")]
+    CorePolicyLoad(PortError),
     #[error("dependent {dependent} declared in depends_on() but not registered")]
     UnknownDependent { dependent: ModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
@@ -1084,8 +1164,8 @@ mod tests {
 
     use crate::ports::{
         CognitionLogRepository, FileSearchProvider, IndexedMemory, MemoryQuery, MemoryRecord,
-        MemoryStore, NewMemory, NoopFileSearchProvider, NoopMemoryStore, NoopUtteranceSink,
-        PortError, SystemClock,
+        MemoryStore, NewMemory, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
+        NoopUtteranceSink, PortError, SystemClock,
     };
     use crate::test_support::{scoped, test_caps, test_caps_with_stores};
 
@@ -1150,6 +1230,8 @@ mod tests {
             cognition_log_port,
             primary_memory_store: Arc::new(NoopMemoryStore) as Arc<dyn MemoryStore>,
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider) as Arc<dyn FileSearchProvider>,
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),

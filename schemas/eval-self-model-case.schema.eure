@@ -45,9 +45,13 @@ variants.attention-controller = { = "attention-controller", $variant => "literal
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
 variants.query-vector = { = "query-vector", $variant => "literal" }
+variants.query-policy = { = "query-policy", $variant => "literal" }
 variants.query-agentic = { = "query-agentic", $variant => "literal" }
 variants.memory = { = "memory", $variant => "literal" }
 variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
+variants.policy = { = "policy", $variant => "literal" }
+variants.value-estimator = { = "value-estimator", $variant => "literal" }
+variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
 variants.speak-gate = { = "speak-gate", $variant => "literal" }

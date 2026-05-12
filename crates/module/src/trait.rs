@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::Lutum;
-use nuillu_blackboard::IdentityMemoryRecord;
+use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
 use nuillu_types::ModuleId;
 
 /// Read-only context passed to `Module::activate` carrying agent-wide
@@ -16,6 +16,7 @@ use nuillu_types::ModuleId;
 pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
+    core_policies: &'a [CorePolicyRecord],
     session_compaction_lutum: Lutum,
     now: DateTime<Utc>,
 }
@@ -24,12 +25,14 @@ impl<'a> ActivateCx<'a> {
     pub fn new(
         modules: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
+        core_policies: &'a [CorePolicyRecord],
         session_compaction_lutum: Lutum,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
             modules,
             identity_memories,
+            core_policies,
             session_compaction_lutum,
             now,
         }
@@ -44,6 +47,10 @@ impl<'a> ActivateCx<'a> {
     /// store before modules are activated.
     pub fn identity_memories(&self) -> &[IdentityMemoryRecord] {
         self.identity_memories
+    }
+
+    pub fn core_policies(&self) -> &[CorePolicyRecord] {
+        self.core_policies
     }
 
     /// Cheap shared LLM handle for module-owned session compaction.

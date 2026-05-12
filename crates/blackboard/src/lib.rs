@@ -22,6 +22,7 @@ mod allocation;
 mod cognition_log;
 mod command;
 mod memory;
+mod policy;
 mod state;
 
 pub use allocation::{
@@ -35,6 +36,7 @@ pub use cognition_log::{
 };
 pub use command::BlackboardCommand;
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
+pub use policy::{CorePolicyRecord, PolicyMetaPatch, PolicyMetadata};
 pub use state::{
     Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord,
     TypedMemoLogRecord, UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,

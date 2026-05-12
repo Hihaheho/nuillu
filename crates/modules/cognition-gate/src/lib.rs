@@ -288,7 +288,7 @@ mod tests {
     };
     use nuillu_module::ports::{
         Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
-        NoopUtteranceSink, SystemClock,
+        NoopPolicyStore, NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
@@ -351,6 +351,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
@@ -656,6 +658,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
+            &[],
             lutum.lutum().clone(),
             SystemClock.now(),
         );
@@ -721,6 +724,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
+            &[],
             lutum.lutum().clone(),
             SystemClock.now(),
         );
@@ -869,6 +873,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
+            &[],
             lutum.lutum().clone(),
             SystemClock.now(),
         );

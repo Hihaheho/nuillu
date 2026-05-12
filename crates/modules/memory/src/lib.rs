@@ -115,6 +115,7 @@ impl MemoryModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.core_policies(),
                 cx.now(),
             )
         })
@@ -335,8 +336,8 @@ mod tests {
     };
     use nuillu_module::ports::{
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory,
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopUtteranceSink, PortError,
-        SystemClock,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopPolicyStore, NoopUtteranceSink,
+        PortError, SystemClock,
     };
     use nuillu_module::{
         AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated,
@@ -359,6 +360,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: primary,
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),

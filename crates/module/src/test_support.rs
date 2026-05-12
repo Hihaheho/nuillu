@@ -8,7 +8,7 @@ use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
 
 use crate::ports::{
     FileSearchProvider, MemoryStore, NoopCognitionLogRepository, NoopFileSearchProvider,
-    NoopMemoryStore, NoopUtteranceSink, SystemClock,
+    NoopMemoryStore, NoopPolicyStore, NoopUtteranceSink, SystemClock,
 };
 use crate::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
@@ -66,6 +66,8 @@ pub(crate) fn test_caps_with_stores_and_adapter(
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store,
             memory_replicas,
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search,
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),

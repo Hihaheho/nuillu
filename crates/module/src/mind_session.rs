@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use lutum::Session;
+use lutum::{InputMessageRole, ModelInputItem, Session};
 use nuillu_blackboard::{CognitionLogEntryRecord, IdentityMemoryRecord, MemoLogRecord};
 
 use crate::{format_cognition_log_batch, format_identity_memory_seed, format_memo_log_batch};
@@ -10,10 +10,14 @@ pub fn seed_persistent_faculty_session(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) {
-    session.push_system(system_prompt);
+    let mut seed_items = vec![ModelInputItem::text(
+        InputMessageRole::System,
+        system_prompt,
+    )];
     if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
-        session.push_assistant_text(seed);
+        seed_items.push(ModelInputItem::assistant_text(seed));
     }
+    session.input_mut().items_mut().splice(0..0, seed_items);
 }
 
 pub fn push_formatted_cognition_log_batch(
@@ -116,5 +120,32 @@ mod tests {
             panic!("expected memo batch text");
         };
         assert!(memos.contains("Held-in-mind notes at 2026-05-11T06:23:00Z"));
+    }
+
+    #[test]
+    fn persistent_faculty_seed_prepends_existing_history() {
+        let mut session = Session::new();
+        session.push_user("history before seed");
+
+        seed_persistent_faculty_session(&mut session, "SYSTEM", &[], now());
+
+        let items = session.input().items();
+        let ModelInputItem::Message { role, content } = &items[0] else {
+            panic!("expected prepended system message");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system text");
+        };
+        assert_eq!(system, "SYSTEM");
+
+        let ModelInputItem::Message { role, content } = &items[1] else {
+            panic!("expected existing history after system seed");
+        };
+        assert_eq!(role, &InputMessageRole::User);
+        let [MessageContent::Text(history)] = content.as_slice() else {
+            panic!("expected history text");
+        };
+        assert_eq!(history, "history before seed");
     }
 }

@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId};
+use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
 
 use crate::{
-    AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, IdentityMemoryRecord,
-    MemoryMetaPatch, ModulePolicy, ModuleRunStatus, ResourceAllocation, UtteranceProgress,
+    AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
+    IdentityMemoryRecord, MemoryMetaPatch, ModulePolicy, ModuleRunStatus, PolicyMetaPatch,
+    ResourceAllocation, UtteranceProgress,
 };
 
 /// Internal blackboard mutation. Constructed only by the agent's
@@ -47,6 +48,16 @@ pub enum BlackboardCommand {
         index: MemoryIndex,
     },
     SetIdentityMemories(Vec<IdentityMemoryRecord>),
+    UpsertPolicyMetadata {
+        index: PolicyIndex,
+        rank_if_new: PolicyRank,
+        decay_if_new_secs: i64,
+        patch: PolicyMetaPatch,
+    },
+    RemovePolicyMetadata {
+        index: PolicyIndex,
+    },
+    SetCorePolicies(Vec<CorePolicyRecord>),
     SetAllocation(ResourceAllocation),
     SetModulePolicies {
         policies: Vec<(ModuleId, ModulePolicy)>,

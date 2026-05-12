@@ -297,6 +297,11 @@ pub enum AttentionControlRequest {
         question: String,
         reason: Option<String>,
     },
+    Policy {
+        reason: String,
+        candidate_trigger: Option<String>,
+        candidate_behavior: Option<String>,
+    },
 }
 
 impl AttentionControlRequest {
@@ -354,6 +359,18 @@ impl AttentionControlRequest {
         Self::SensoryDetail {
             question: question.into(),
             reason: Some(reason.into()),
+        }
+    }
+
+    pub fn policy(
+        reason: impl Into<String>,
+        candidate_trigger: Option<String>,
+        candidate_behavior: Option<String>,
+    ) -> Self {
+        Self::Policy {
+            reason: reason.into(),
+            candidate_trigger,
+            candidate_behavior,
         }
     }
 }

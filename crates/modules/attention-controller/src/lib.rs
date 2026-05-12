@@ -377,6 +377,30 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
                 output.push_str(question.trim());
                 push_optional_reason(&mut output, reason.as_deref());
             }
+            AttentionControlRequest::Policy {
+                reason,
+                candidate_trigger,
+                candidate_behavior,
+            } => {
+                output.push_str("Policy formation: ");
+                output.push_str(reason.trim());
+                if let Some(trigger) = candidate_trigger
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    output.push_str(" Candidate trigger: ");
+                    output.push_str(trigger);
+                }
+                if let Some(behavior) = candidate_behavior
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    output.push_str(" Candidate behavior: ");
+                    output.push_str(behavior);
+                }
+            }
         }
     }
     output
@@ -433,7 +457,7 @@ mod tests {
     use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
     use nuillu_module::ports::{
         Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
-        NoopUtteranceSink, SystemClock,
+        NoopPolicyStore, NoopUtteranceSink, SystemClock,
     };
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
@@ -491,6 +515,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
@@ -791,6 +817,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
+            &[],
             lutum.lutum().clone(),
             SystemClock.now(),
         );

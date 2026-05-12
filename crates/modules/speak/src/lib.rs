@@ -1035,6 +1035,7 @@ impl SpeakModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.core_policies(),
                 cx.now(),
             )
         })
@@ -1047,6 +1048,7 @@ impl SpeakModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.core_policies(),
                 cx.now(),
             )
         })
@@ -1059,6 +1061,7 @@ impl SpeakModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.core_policies(),
                 cx.now(),
             )
         })
@@ -1348,8 +1351,8 @@ mod tests {
         ModuleConfig, ResourceAllocation,
     };
     use nuillu_module::ports::{
-        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, PortError,
-        SystemClock, Utterance, UtteranceSink,
+        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
+        NoopPolicyStore, PortError, SystemClock, Utterance, UtteranceSink,
     };
     use nuillu_module::{
         AttentionControlRequestInbox, CapabilityProviderPorts, CapabilityProviders,
@@ -1387,6 +1390,8 @@ mod tests {
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: Arc::new(NoopMemoryStore),
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink,
             clock: Arc::new(SystemClock),
@@ -1667,6 +1672,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
+            &[],
             lutum.lutum().clone(),
             SystemClock.now(),
         );
@@ -1912,6 +1918,7 @@ mod tests {
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
             &identity_memories,
+            &[],
             compaction_lutum.lutum().clone(),
             clock.now(),
         );

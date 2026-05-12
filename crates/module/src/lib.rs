@@ -32,6 +32,7 @@ mod memory_caps;
 mod memory_render;
 mod mind_format;
 mod mind_session;
+mod policy_caps;
 pub mod ports;
 mod prompt;
 mod rate_limit;
@@ -82,6 +83,11 @@ pub use mind_session::{
     seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;
+pub use policy_caps::{
+    ObservedReward, PolicyRetrievalHit, PolicyRetrievalMemo, PolicySearcher, PolicyValueUpdater,
+    PolicyWindowKey, PolicyWindowReader, PolicyWriter, TypedPolicyRetrievalWindow,
+    TypedValueEstimateWindow, ValueEstimateMemo, ValueEstimatePrediction,
+};
 pub use ports::Embedder;
 pub use prompt::{format_faculty_system_prompt, format_system_prompt};
 pub use rate_limit::{

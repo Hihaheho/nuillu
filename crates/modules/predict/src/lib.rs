@@ -85,6 +85,7 @@ impl PredictModule {
                 cx.modules(),
                 &self.owner,
                 cx.identity_memories(),
+                cx.core_policies(),
                 cx.now(),
             )
         })

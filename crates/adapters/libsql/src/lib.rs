@@ -11,14 +11,19 @@ use async_trait::async_trait;
 use libsql::{Connection, Transaction, params};
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::ports::{
-    IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, PortError,
+    IndexedMemory, IndexedPolicy, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NewPolicy,
+    PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore, PortError,
 };
-use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
+use nuillu_types::{
+    MemoryContent, MemoryIndex, MemoryRank, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const DEFAULT_MEMORY_TABLE: &str = "memories";
+const DEFAULT_POLICY_TABLE: &str = "policies";
 const PROFILE_REGISTRY_TABLE: &str = "memory_embedding_profiles";
+const POLICY_PROFILE_REGISTRY_TABLE: &str = "policy_embedding_profiles";
 const MAX_VECTOR_DIMS: usize = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,8 +94,40 @@ impl LibsqlMemoryStoreConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct LibsqlPolicyStoreConfig {
+    pub path: PathBuf,
+    pub table_name: String,
+    pub active_profile: EmbeddingProfile,
+}
+
+impl LibsqlPolicyStoreConfig {
+    pub fn local(path: impl Into<PathBuf>, vector_dims: usize) -> Self {
+        Self {
+            path: path.into(),
+            table_name: DEFAULT_POLICY_TABLE.to_owned(),
+            active_profile: EmbeddingProfile::default_for_dimensions(vector_dims),
+        }
+    }
+
+    pub fn with_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
+        self.active_profile = active_profile;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct LibsqlMemoryStore {
+    conn: Connection,
+    table_name: String,
+    active_profile: EmbeddingProfile,
+    profile_id: String,
+    embedding_table_name: String,
+    embedder: Arc<dyn Embedder>,
+}
+
+#[derive(Clone)]
+pub struct LibsqlPolicyStore {
     conn: Connection,
     table_name: String,
     active_profile: EmbeddingProfile,
@@ -609,6 +646,673 @@ impl LibsqlMemoryStore {
     }
 }
 
+impl LibsqlPolicyStore {
+    pub async fn connect(
+        config: LibsqlPolicyStoreConfig,
+        embedder: Box<dyn Embedder>,
+    ) -> Result<Self, PortError> {
+        let database = libsql::Builder::new_local(config.path)
+            .build()
+            .await
+            .map_err(map_libsql_error)?;
+        let conn = database.connect().map_err(map_libsql_error)?;
+        Self::from_connection(conn, config.table_name, config.active_profile, embedder).await
+    }
+
+    pub async fn from_connection(
+        conn: Connection,
+        table_name: impl Into<String>,
+        active_profile: EmbeddingProfile,
+        embedder: Box<dyn Embedder>,
+    ) -> Result<Self, PortError> {
+        let table_name = table_name.into();
+        validate_identifier("policy table name", &table_name)?;
+        active_profile.validate()?;
+
+        let embedder: Arc<dyn Embedder> = Arc::from(embedder);
+        let embedder_dims = embedder.dimensions();
+        if embedder_dims != active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "libSQL policy embedding dimension mismatch: profile={}, embedder={embedder_dims}",
+                active_profile.dimensions
+            )));
+        }
+
+        let profile_id = active_profile.profile_id();
+        let embedding_table_name = format!("{table_name}_trigger_embeddings_{profile_id}");
+        validate_identifier("policy embedding table name", &embedding_table_name)?;
+
+        let store = Self {
+            conn,
+            table_name,
+            active_profile,
+            profile_id,
+            embedding_table_name,
+            embedder,
+        };
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    pub fn active_profile(&self) -> &EmbeddingProfile {
+        &self.active_profile
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+
+    pub fn embedding_table_name(&self) -> &str {
+        &self.embedding_table_name
+    }
+
+    pub async fn backfill_active_profile(&self, limit: usize) -> Result<usize, PortError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let sql = format!(
+            r#"
+            SELECT p.id, p.trigger, p.updated_at_ms
+            FROM {policies} AS p
+            LEFT JOIN {embeddings} AS e ON e.policy_id = p.id
+            WHERE p.deleted_at_ms IS NULL
+              AND (
+                e.policy_id IS NULL
+                OR e.trigger_updated_at_ms != p.updated_at_ms
+              )
+            ORDER BY p.id ASC
+            LIMIT ?1
+            "#,
+            policies = self.table_name,
+            embeddings = self.embedding_table_name,
+        );
+
+        let mut rows = self
+            .conn
+            .query(&sql, [limit_to_i64(limit)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            pending.push(PendingPolicyEmbedding {
+                policy_id: row.get(0).map_err(map_libsql_error)?,
+                trigger: row.get(1).map_err(map_libsql_error)?,
+                trigger_updated_at_ms: row.get(2).map_err(map_libsql_error)?,
+            });
+        }
+
+        let mut written = 0;
+        for item in pending {
+            let embedding_json = self.embed_json(&item.trigger).await?;
+            self.upsert_embedding_conn(
+                item.policy_id,
+                &embedding_json,
+                now_ms(),
+                item.trigger_updated_at_ms,
+            )
+            .await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    async fn migrate(&self) -> Result<(), PortError> {
+        let policy_rank_idx = format!("{}_rank_live_idx", self.table_name);
+        validate_identifier("policy rank index name", &policy_rank_idx)?;
+
+        let ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {policies} (
+              id INTEGER PRIMARY KEY,
+              policy_index TEXT NOT NULL UNIQUE,
+              trigger TEXT NOT NULL,
+              behavior TEXT NOT NULL,
+              rank INTEGER NOT NULL,
+              expected_reward REAL NOT NULL,
+              confidence REAL NOT NULL,
+              value REAL NOT NULL,
+              reward_tokens INTEGER NOT NULL,
+              decay_remaining_secs INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              last_reinforced_at_ms INTEGER,
+              deleted_at_ms INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS {policy_rank_idx}
+            ON {policies}(rank)
+            WHERE deleted_at_ms IS NULL;
+
+            CREATE TABLE IF NOT EXISTS {profiles} (
+              profile_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              dimensions INTEGER NOT NULL,
+              table_name TEXT NOT NULL UNIQUE,
+              created_at_ms INTEGER NOT NULL
+            );
+            "#,
+            policies = self.table_name,
+            policy_rank_idx = policy_rank_idx,
+            profiles = POLICY_PROFILE_REGISTRY_TABLE,
+        );
+        self.conn
+            .execute_batch(&ddl)
+            .await
+            .map_err(map_libsql_error)?;
+
+        self.register_active_profile().await?;
+        self.create_active_embedding_table().await
+    }
+
+    async fn register_active_profile(&self) -> Result<(), PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT name, version, dimensions, table_name
+                    FROM {POLICY_PROFILE_REGISTRY_TABLE}
+                    WHERE profile_id = ?1
+                    LIMIT 1
+                    "#
+                ),
+                [self.profile_id.as_str()],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+
+        if let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let name: String = row.get(0).map_err(map_libsql_error)?;
+            let version: String = row.get(1).map_err(map_libsql_error)?;
+            let dimensions: i64 = row.get(2).map_err(map_libsql_error)?;
+            let table_name: String = row.get(3).map_err(map_libsql_error)?;
+            let expected_dimensions = self.active_profile.dimensions as i64;
+            if name != self.active_profile.name
+                || version != self.active_profile.version
+                || dimensions != expected_dimensions
+                || table_name != self.embedding_table_name
+            {
+                return Err(PortError::InvalidData(format!(
+                    "policy embedding profile registry conflict for {}",
+                    self.profile_id
+                )));
+            }
+            return Ok(());
+        }
+        drop(rows);
+
+        self.conn
+            .execute(
+                &format!(
+                    r#"
+                    INSERT INTO {POLICY_PROFILE_REGISTRY_TABLE} (
+                      profile_id,
+                      name,
+                      version,
+                      dimensions,
+                      table_name,
+                      created_at_ms
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#
+                ),
+                params![
+                    self.profile_id.as_str(),
+                    self.active_profile.name.as_str(),
+                    self.active_profile.version.as_str(),
+                    self.active_profile.dimensions as i64,
+                    self.embedding_table_name.as_str(),
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn create_active_embedding_table(&self) -> Result<(), PortError> {
+        let ddl = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {embeddings} (
+              policy_id INTEGER PRIMARY KEY,
+              trigger_embedding F32_BLOB({dimensions}) NOT NULL,
+              embedded_at_ms INTEGER NOT NULL,
+              trigger_updated_at_ms INTEGER NOT NULL,
+              FOREIGN KEY(policy_id) REFERENCES {policies}(id)
+            );
+            "#,
+            embeddings = self.embedding_table_name,
+            dimensions = self.active_profile.dimensions,
+            policies = self.table_name,
+        );
+        self.conn
+            .execute_batch(&ddl)
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn embed_json(&self, text: &str) -> Result<String, PortError> {
+        let embedding = self.embedder.embed(text).await?;
+        self.validate_embedding(&embedding)?;
+        serde_json::to_string(&embedding).map_err(|error| PortError::Backend(error.to_string()))
+    }
+
+    fn validate_embedding(&self, embedding: &[f32]) -> Result<(), PortError> {
+        if embedding.len() != self.active_profile.dimensions {
+            return Err(PortError::InvalidInput(format!(
+                "policy embedding dimension mismatch: expected {}, got {}",
+                self.active_profile.dimensions,
+                embedding.len()
+            )));
+        }
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return Err(PortError::InvalidData(
+                "policy embedding contains NaN or infinity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn upsert_policy_tx(
+        &self,
+        tx: &Transaction,
+        policy: IndexedPolicy,
+        now: i64,
+    ) -> Result<(i64, i64), PortError> {
+        let sql = format!(
+            r#"
+            INSERT INTO {policies} (
+              policy_index,
+              trigger,
+              behavior,
+              rank,
+              expected_reward,
+              confidence,
+              value,
+              reward_tokens,
+              decay_remaining_secs,
+              created_at_ms,
+              updated_at_ms,
+              last_reinforced_at_ms,
+              deleted_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL, NULL)
+            ON CONFLICT(policy_index) DO UPDATE SET
+              trigger = excluded.trigger,
+              behavior = excluded.behavior,
+              rank = excluded.rank,
+              expected_reward = excluded.expected_reward,
+              confidence = excluded.confidence,
+              value = excluded.value,
+              reward_tokens = excluded.reward_tokens,
+              decay_remaining_secs = excluded.decay_remaining_secs,
+              updated_at_ms = excluded.updated_at_ms,
+              deleted_at_ms = NULL
+            "#,
+            policies = self.table_name,
+        );
+        tx.execute(
+            &sql,
+            params![
+                policy.index.as_str(),
+                policy.trigger.as_str(),
+                policy.behavior.as_str(),
+                policy_rank_to_i64(policy.rank),
+                f64::from(policy.expected_reward.get()),
+                f64::from(policy.confidence.get()),
+                f64::from(policy.value.get()),
+                i64::from(policy.reward_tokens),
+                policy.decay_remaining_secs,
+                now,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+
+        self.policy_id_and_updated_at_tx(tx, &policy.index).await
+    }
+
+    async fn policy_id_and_updated_at_tx(
+        &self,
+        tx: &Transaction,
+        index: &PolicyIndex,
+    ) -> Result<(i64, i64), PortError> {
+        let sql = format!(
+            r#"
+            SELECT id, updated_at_ms
+            FROM {policies}
+            WHERE policy_index = ?1
+            LIMIT 1
+            "#,
+            policies = self.table_name,
+        );
+        let mut rows = tx
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        let Some(row) = rows.next().await.map_err(map_libsql_error)? else {
+            return Err(PortError::Backend(format!(
+                "policy row was not found after upsert: {}",
+                index.as_str()
+            )));
+        };
+        Ok((
+            row.get(0).map_err(map_libsql_error)?,
+            row.get(1).map_err(map_libsql_error)?,
+        ))
+    }
+
+    async fn upsert_embedding_tx(
+        &self,
+        tx: &Transaction,
+        policy_id: i64,
+        embedding_json: &str,
+        embedded_at_ms: i64,
+        trigger_updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let sql = self.upsert_embedding_sql();
+        tx.execute(
+            &sql,
+            params![
+                policy_id,
+                embedding_json,
+                embedded_at_ms,
+                trigger_updated_at_ms,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn upsert_embedding_conn(
+        &self,
+        policy_id: i64,
+        embedding_json: &str,
+        embedded_at_ms: i64,
+        trigger_updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let sql = self.upsert_embedding_sql();
+        self.conn
+            .execute(
+                &sql,
+                params![
+                    policy_id,
+                    embedding_json,
+                    embedded_at_ms,
+                    trigger_updated_at_ms,
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    fn upsert_embedding_sql(&self) -> String {
+        format!(
+            r#"
+            INSERT INTO {embeddings} (
+              policy_id,
+              trigger_embedding,
+              embedded_at_ms,
+              trigger_updated_at_ms
+            )
+            VALUES (?1, vector32(?2), ?3, ?4)
+            ON CONFLICT(policy_id) DO UPDATE SET
+              trigger_embedding = excluded.trigger_embedding,
+              embedded_at_ms = excluded.embedded_at_ms,
+              trigger_updated_at_ms = excluded.trigger_updated_at_ms
+            "#,
+            embeddings = self.embedding_table_name,
+        )
+    }
+
+    fn row_to_record(row: &libsql::Row) -> Result<PolicyRecord, PortError> {
+        let index: String = row.get(0).map_err(map_libsql_error)?;
+        let trigger: String = row.get(1).map_err(map_libsql_error)?;
+        let behavior: String = row.get(2).map_err(map_libsql_error)?;
+        let rank: i64 = row.get(3).map_err(map_libsql_error)?;
+        let expected_reward: f64 = row.get(4).map_err(map_libsql_error)?;
+        let confidence: f64 = row.get(5).map_err(map_libsql_error)?;
+        let value: f64 = row.get(6).map_err(map_libsql_error)?;
+        let reward_tokens: i64 = row.get(7).map_err(map_libsql_error)?;
+        let decay_remaining_secs: i64 = row.get(8).map_err(map_libsql_error)?;
+        Ok(PolicyRecord {
+            index: PolicyIndex::new(index),
+            trigger,
+            behavior,
+            rank: policy_rank_from_i64(rank)?,
+            expected_reward: signed_unit_from_f64("policy expected_reward", expected_reward)?,
+            confidence: unit_from_f64("policy confidence", confidence)?,
+            value: signed_unit_from_f64("policy value", value)?,
+            reward_tokens: u32::try_from(reward_tokens).map_err(|_| {
+                PortError::InvalidData(format!(
+                    "invalid policy reward token count: {reward_tokens}"
+                ))
+            })?,
+            decay_remaining_secs,
+        })
+    }
+
+    async fn put_indexed(&self, policy: IndexedPolicy) -> Result<(), PortError> {
+        let embedding_json = self.embed_json(&policy.trigger).await?;
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let (policy_id, updated_at_ms) = self.upsert_policy_tx(&tx, policy, now).await?;
+        self.upsert_embedding_tx(&tx, policy_id, &embedding_json, now, updated_at_ms)
+            .await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl PolicyStore for LibsqlPolicyStore {
+    async fn insert(&self, policy: NewPolicy) -> Result<PolicyIndex, PortError> {
+        let index = PolicyIndex::new(Uuid::now_v7().to_string());
+        self.put_indexed(IndexedPolicy {
+            index: index.clone(),
+            trigger: policy.trigger,
+            behavior: policy.behavior,
+            rank: policy.rank,
+            expected_reward: policy.expected_reward,
+            confidence: policy.confidence,
+            value: policy.value,
+            reward_tokens: policy.reward_tokens,
+            decay_remaining_secs: policy.decay_remaining_secs,
+        })
+        .await?;
+        Ok(index)
+    }
+
+    async fn put(&self, policy: IndexedPolicy) -> Result<(), PortError> {
+        self.put_indexed(policy).await
+    }
+
+    async fn get(&self, index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT policy_index, trigger, behavior, rank, expected_reward,
+                   confidence, value, reward_tokens, decay_remaining_secs
+            FROM {policies}
+            WHERE policy_index = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            policies = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Ok(Some(Self::row_to_record(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_by_rank(&self, rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT policy_index, trigger, behavior, rank, expected_reward,
+                   confidence, value, reward_tokens, decay_remaining_secs
+            FROM {policies}
+            WHERE rank = ?1
+              AND deleted_at_ms IS NULL
+            ORDER BY policy_index ASC
+            "#,
+            policies = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [policy_rank_to_i64(rank)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            out.push(Self::row_to_record(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn search(&self, q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError> {
+        if q.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let embedding_json = self.embed_json(&q.trigger).await?;
+        let sql = format!(
+            r#"
+            SELECT p.policy_index, p.trigger, p.behavior, p.rank,
+                   p.expected_reward, p.confidence, p.value,
+                   p.reward_tokens, p.decay_remaining_secs,
+                   vector_distance_cos(e.trigger_embedding, vector32(?1)) AS distance
+            FROM {policies} AS p
+            JOIN {embeddings} AS e ON e.policy_id = p.id
+            WHERE p.deleted_at_ms IS NULL
+              AND e.trigger_updated_at_ms = p.updated_at_ms
+            ORDER BY distance ASC,
+                     p.id ASC
+            LIMIT ?2
+            "#,
+            policies = self.table_name,
+            embeddings = self.embedding_table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let distance: f64 = row.get(9).map_err(map_libsql_error)?;
+            out.push(PolicySearchHit {
+                policy: Self::row_to_record(&row)?,
+                similarity: (1.0 - distance as f32).clamp(-1.0, 1.0),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn reinforce(
+        &self,
+        index: &PolicyIndex,
+        value_delta: f32,
+        reward_tokens_delta: u32,
+        expected_reward_delta: f32,
+        confidence_delta: f32,
+    ) -> Result<PolicyRecord, PortError> {
+        let now = now_ms();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let sql = format!(
+            r#"
+            SELECT policy_index, trigger, behavior, rank, expected_reward,
+                   confidence, value, reward_tokens, decay_remaining_secs
+            FROM {policies}
+            WHERE policy_index = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            policies = self.table_name,
+        );
+        let mut rows = tx
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        let Some(row) = rows.next().await.map_err(map_libsql_error)? else {
+            return Err(PortError::NotFound(index.as_str().to_owned()));
+        };
+        let mut record = Self::row_to_record(&row)?;
+        drop(rows);
+
+        record.expected_reward =
+            SignedUnitF32::clamp(record.expected_reward.get() + expected_reward_delta);
+        record.value = SignedUnitF32::clamp(record.value.get() + value_delta);
+        record.confidence = UnitF32::clamp(record.confidence.get() + confidence_delta);
+        record.reward_tokens = record.reward_tokens.saturating_add(reward_tokens_delta);
+        record.rank = rank_after_reinforcement(
+            record.rank,
+            record.value,
+            record.confidence,
+            record.reward_tokens,
+        );
+
+        let update = format!(
+            r#"
+            UPDATE {policies}
+            SET rank = ?2,
+                expected_reward = ?3,
+                confidence = ?4,
+                value = ?5,
+                reward_tokens = ?6,
+                updated_at_ms = ?7,
+                last_reinforced_at_ms = ?7
+            WHERE policy_index = ?1
+              AND deleted_at_ms IS NULL
+            "#,
+            policies = self.table_name,
+        );
+        tx.execute(
+            &update,
+            params![
+                record.index.as_str(),
+                policy_rank_to_i64(record.rank),
+                f64::from(record.expected_reward.get()),
+                f64::from(record.confidence.get()),
+                f64::from(record.value.get()),
+                i64::from(record.reward_tokens),
+                now,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(record)
+    }
+
+    async fn delete(&self, index: &PolicyIndex) -> Result<(), PortError> {
+        let now = now_ms();
+        let sql = format!(
+            r#"
+            UPDATE {policies}
+            SET deleted_at_ms = ?2,
+                updated_at_ms = ?2
+            WHERE policy_index = ?1
+            "#,
+            policies = self.table_name,
+        );
+        self.conn
+            .execute(&sql, params![index.as_str(), now])
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+}
+
 #[async_trait(?Send)]
 impl MemoryStore for LibsqlMemoryStore {
     async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError> {
@@ -797,6 +1501,13 @@ struct PendingEmbedding {
     content_updated_at_ms: i64,
 }
 
+#[derive(Debug)]
+struct PendingPolicyEmbedding {
+    policy_id: i64,
+    trigger: String,
+    trigger_updated_at_ms: i64,
+}
+
 fn validate_dimensions(label: &str, dimensions: usize) -> Result<(), PortError> {
     if dimensions == 0 {
         return Err(PortError::InvalidInput(format!(
@@ -859,6 +1570,66 @@ fn rank_from_i64(value: i64) -> Result<MemoryRank, PortError> {
         _ => Err(PortError::InvalidData(format!(
             "invalid memory rank: {value}"
         ))),
+    }
+}
+
+fn policy_rank_to_i64(rank: PolicyRank) -> i64 {
+    match rank {
+        PolicyRank::Tentative => 0,
+        PolicyRank::Provisional => 1,
+        PolicyRank::Established => 2,
+        PolicyRank::Habit => 3,
+        PolicyRank::Core => 4,
+    }
+}
+
+fn policy_rank_from_i64(value: i64) -> Result<PolicyRank, PortError> {
+    match value {
+        0 => Ok(PolicyRank::Tentative),
+        1 => Ok(PolicyRank::Provisional),
+        2 => Ok(PolicyRank::Established),
+        3 => Ok(PolicyRank::Habit),
+        4 => Ok(PolicyRank::Core),
+        _ => Err(PortError::InvalidData(format!(
+            "invalid policy rank: {value}"
+        ))),
+    }
+}
+
+fn signed_unit_from_f64(label: &str, value: f64) -> Result<SignedUnitF32, PortError> {
+    if !value.is_finite() {
+        return Err(PortError::InvalidData(format!("{label} is not finite")));
+    }
+    SignedUnitF32::new(value as f32)
+        .map_err(|error| PortError::InvalidData(format!("{label}: {error}")))
+}
+
+fn unit_from_f64(label: &str, value: f64) -> Result<UnitF32, PortError> {
+    if !value.is_finite() {
+        return Err(PortError::InvalidData(format!("{label} is not finite")));
+    }
+    UnitF32::new(value as f32).map_err(|error| PortError::InvalidData(format!("{label}: {error}")))
+}
+
+fn rank_after_reinforcement(
+    current: PolicyRank,
+    value: SignedUnitF32,
+    confidence: UnitF32,
+    reward_tokens: u32,
+) -> PolicyRank {
+    if matches!(current, PolicyRank::Core) {
+        return PolicyRank::Core;
+    }
+    let value = value.get();
+    let confidence = confidence.get();
+    if reward_tokens >= 16 && value >= 0.7 && confidence >= 0.7 {
+        PolicyRank::Habit
+    } else if reward_tokens >= 8 && value >= 0.45 && confidence >= 0.5 {
+        PolicyRank::Established
+    } else if reward_tokens >= 2 && value >= 0.2 {
+        PolicyRank::Provisional
+    } else {
+        PolicyRank::Tentative
     }
 }
 
@@ -1503,9 +2274,148 @@ mod tests {
         assert!(matches!(error, PortError::InvalidData(_)));
     }
 
+    #[tokio::test]
+    async fn policy_insert_then_get_roundtrips_payload_and_metadata() {
+        let store = policy_store().await;
+        let id = store
+            .insert(NewPolicy {
+                trigger: "alpha situation".into(),
+                behavior: "do the alpha behavior".into(),
+                rank: PolicyRank::Established,
+                expected_reward: SignedUnitF32::clamp(0.4),
+                confidence: UnitF32::clamp(0.6),
+                value: SignedUnitF32::clamp(0.5),
+                reward_tokens: 7,
+                decay_remaining_secs: 123,
+            })
+            .await
+            .unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.index, id);
+        assert_eq!(got.trigger, "alpha situation");
+        assert_eq!(got.behavior, "do the alpha behavior");
+        assert_eq!(got.rank, PolicyRank::Established);
+        assert_eq!(got.expected_reward.get(), 0.4);
+        assert_eq!(got.confidence.get(), 0.6);
+        assert_eq!(got.value.get(), 0.5);
+        assert_eq!(got.reward_tokens, 7);
+        assert_eq!(got.decay_remaining_secs, 123);
+    }
+
+    #[tokio::test]
+    async fn policy_search_uses_trigger_embedding_not_behavior_or_values() {
+        let store = policy_store().await;
+        let alpha = PolicyIndex::new("alpha-trigger");
+        store
+            .put(IndexedPolicy {
+                index: alpha.clone(),
+                trigger: "alpha".into(),
+                behavior: "plain behavior".into(),
+                rank: PolicyRank::Tentative,
+                expected_reward: SignedUnitF32::clamp(-1.0),
+                confidence: UnitF32::ZERO,
+                value: SignedUnitF32::clamp(-1.0),
+                reward_tokens: 0,
+                decay_remaining_secs: 60,
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedPolicy {
+                index: PolicyIndex::new("behavior-alpha-only"),
+                trigger: "beta".into(),
+                behavior: "alpha alpha alpha alpha alpha".into(),
+                rank: PolicyRank::Habit,
+                expected_reward: SignedUnitF32::clamp(1.0),
+                confidence: UnitF32::ONE,
+                value: SignedUnitF32::clamp(1.0),
+                reward_tokens: 99,
+                decay_remaining_secs: 60,
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&PolicyQuery {
+                trigger: "alpha".into(),
+                limit: 2,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].policy.index, alpha);
+    }
+
+    #[tokio::test]
+    async fn policy_reinforce_clamps_scalars_and_applies_rank_thresholds() {
+        let store = policy_store().await;
+        let id = PolicyIndex::new("reinforced");
+        store
+            .put(IndexedPolicy {
+                index: id.clone(),
+                trigger: "alpha".into(),
+                behavior: "do alpha".into(),
+                rank: PolicyRank::Tentative,
+                expected_reward: SignedUnitF32::clamp(0.9),
+                confidence: UnitF32::clamp(0.95),
+                value: SignedUnitF32::clamp(0.1),
+                reward_tokens: 15,
+                decay_remaining_secs: 60,
+            })
+            .await
+            .unwrap();
+
+        let record = store.reinforce(&id, 2.0, 1, 2.0, 2.0).await.unwrap();
+
+        assert_eq!(record.expected_reward.get(), 1.0);
+        assert_eq!(record.confidence.get(), 1.0);
+        assert_eq!(record.value.get(), 1.0);
+        assert_eq!(record.reward_tokens, 16);
+        assert_eq!(record.rank, PolicyRank::Habit);
+    }
+
+    #[tokio::test]
+    async fn policy_reinforce_negative_outcome_lowers_value_without_reward_token() {
+        let store = policy_store().await;
+        let id = PolicyIndex::new("negative");
+        store
+            .put(IndexedPolicy {
+                index: id.clone(),
+                trigger: "alpha".into(),
+                behavior: "do alpha".into(),
+                rank: PolicyRank::Provisional,
+                expected_reward: SignedUnitF32::clamp(0.2),
+                confidence: UnitF32::clamp(0.6),
+                value: SignedUnitF32::clamp(0.4),
+                reward_tokens: 3,
+                decay_remaining_secs: 60,
+            })
+            .await
+            .unwrap();
+
+        let record = store.reinforce(&id, -0.6, 0, -0.4, -0.1).await.unwrap();
+
+        assert!((record.value.get() - -0.2).abs() < f32::EPSILON * 2.0);
+        assert_eq!(record.expected_reward.get(), -0.2);
+        assert_eq!(record.confidence.get(), 0.5);
+        assert_eq!(record.reward_tokens, 3);
+        assert_eq!(record.rank, PolicyRank::Tentative);
+    }
+
     async fn store() -> LibsqlMemoryStore {
         LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(test_db_path(), 3),
+            TestEmbedder::new(3),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn policy_store() -> LibsqlPolicyStore {
+        LibsqlPolicyStore::connect(
+            LibsqlPolicyStoreConfig::local(test_db_path(), 3),
             TestEmbedder::new(3),
         )
         .await

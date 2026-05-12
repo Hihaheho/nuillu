@@ -9,6 +9,7 @@ use nuillu_module::{
     LlmAccess, Module, SessionCompactionConfig, TypedMemo, VectorMemorySearcher,
     compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
     memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -115,6 +116,7 @@ pub struct QueryVectorModule {
     memo: TypedMemo<QueryVectorMemo>,
     llm: LlmAccess,
     session: Session,
+    session_seeded: bool,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
@@ -141,6 +143,7 @@ impl QueryVectorModule {
             memo,
             llm,
             session: Session::new(),
+            session_seeded: false,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
@@ -148,14 +151,22 @@ impl QueryVectorModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
-                SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
-                cx.identity_memories(),
-                cx.now(),
-            )
+            nuillu_module::format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
         })
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let system_prompt = self.system_prompt(cx).to_owned();
+        seed_persistent_faculty_session(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+        self.session_seeded = true;
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -247,6 +258,7 @@ impl QueryVectorModule {
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
     ) -> Result<QueryVectorRetrieval> {
+        self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let prior_query_vector_searches = self.prior_query_vector_searches().await;
@@ -255,8 +267,6 @@ impl QueryVectorModule {
             .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
         self.session
             .push_user(format_vector_memory_questions(questions));
         if let Some(prior) = prior_query_vector_searches {
@@ -531,22 +541,63 @@ mod tests {
     use async_trait::async_trait;
     use chrono::TimeZone as _;
     use lutum::{
-        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
-        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
+        MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{
         IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory,
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopUtteranceSink, PortError,
-        SystemClock,
+        NoopCognitionLogRepository, NoopFileSearchProvider, NoopPolicyStore, NoopUtteranceSink,
+        PortError, SystemClock,
     };
     use nuillu_module::{
         ActivateCx, AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers,
         ModuleRegistry,
     };
     use nuillu_types::{MemoryContent, ModuleInstanceId, ReplicaIndex, builtin};
+
+    #[derive(Clone)]
+    struct CapturingAdapter {
+        inner: MockLlmAdapter,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
+    }
+
+    impl CapturingAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn text_inputs(&self) -> Vec<ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingAdapter {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MutableMemoryStore {
@@ -674,13 +725,23 @@ mod tests {
         store: Arc<MutableMemoryStore>,
         adapter: MockLlmAdapter,
     ) -> CapabilityProviders {
+        test_caps_with_turn_adapter(blackboard, store, Arc::new(adapter))
+    }
+
+    fn test_caps_with_turn_adapter<T: TurnAdapter + 'static>(
+        blackboard: Blackboard,
+        store: Arc<MutableMemoryStore>,
+        adapter: Arc<T>,
+    ) -> CapabilityProviders {
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-        let lutum = Lutum::new(Arc::new(adapter), budget);
+        let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
             primary_memory_store: store,
             memory_replicas: Vec::new(),
+            primary_policy_store: Arc::new(NoopPolicyStore),
+            policy_replicas: Vec::new(),
             file_search: Arc::new(NoopFileSearchProvider),
             utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
@@ -759,10 +820,54 @@ mod tests {
         let cx = ActivateCx::new(
             &catalog,
             &identity_memories,
+            &[],
             runtime.session_compaction_lutum().clone(),
             test_now(),
         );
         module.activate(&cx, &batch).await.expect("query activated");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn system_prompt_is_first_even_with_unread_memo_context() {
+        let blackboard = Blackboard::default();
+        let source = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        blackboard
+            .update_memo(source, "sensory memo before query".into(), test_now())
+            .await;
+        let store = Arc::new(MutableMemoryStore::default());
+        store.set_records(vec![memory_record(
+            "mem-1",
+            "Koro approaches from the left.",
+        )]);
+        let capture =
+            CapturingAdapter::new(MockLlmAdapter::new().with_text_scenario(tool_scenario("first")));
+        let observed = capture.clone();
+        let caps = test_caps_with_turn_adapter(blackboard.clone(), store, Arc::new(capture));
+        let (runtime, mut module) = build_query_vector(&caps).await;
+
+        activate_query_with_question(&blackboard, &caps, &runtime, &mut module, "food bowl clue")
+            .await;
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 1);
+        let items = inputs[0].items();
+        let ModelInputItem::Message { role, content } = &items[0] else {
+            panic!("expected first query-vector input item to be the system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system prompt text");
+        };
+        assert!(system.contains("You are the query-vector module"));
+
+        let ModelInputItem::Message { role, content } = &items[1] else {
+            panic!("expected unread memo context after system prompt");
+        };
+        assert_eq!(role, &InputMessageRole::System);
+        let [MessageContent::Text(memo_context)] = content.as_slice() else {
+            panic!("expected memo context text");
+        };
+        assert!(memo_context.contains("sensory memo before query"));
     }
 
     #[tokio::test(flavor = "current_thread")]
