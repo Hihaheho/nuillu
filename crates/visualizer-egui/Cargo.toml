@@ -7,8 +7,12 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "visualizer"
+name = "nuillu-visualizer-gui"
 path = "src/main.rs"
+
+[[bin]]
+name = "visualizer"
+path = "src/bin/visualizer.rs"
 
 [dependencies]
 chrono = { workspace = true }
@@ -17,6 +21,7 @@ egui = "0.34.2"
 egui_hooks = { version = "0.11.0", features = ["persistence"] }
 nuillu-module = { workspace = true }
 nuillu-types = { workspace = true }
+nuillu-visualizer-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

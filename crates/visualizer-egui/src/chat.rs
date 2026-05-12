@@ -4,8 +4,8 @@ use std::sync::mpsc::Sender;
 use nuillu_module::SensoryInput;
 
 use crate::{
-    ChatInput, ChatInputKind, UtteranceDeltaView, UtteranceView, VisualizerCommand,
-    VisualizerTabId, text::wrapped_label,
+    ChatInput, ChatInputKind, UtteranceDeltaView, UtteranceView, VisualizerClientMessage,
+    VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +145,7 @@ pub fn ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
     state: &mut ChatState,
-    commands: &Sender<VisualizerCommand>,
+    commands: &Sender<VisualizerClientMessage>,
 ) {
     chat_messages_ui(ui, &state.messages);
 
@@ -169,12 +169,14 @@ pub fn ui(
                 } else {
                     ChatInputKind::Heard
                 };
-                let _ = commands.send(VisualizerCommand::SendSensoryInput {
-                    tab_id: tab_id.clone(),
-                    input: ChatInput {
-                        kind,
-                        direction,
-                        content,
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::SendSensoryInput {
+                        tab_id: tab_id.clone(),
+                        input: ChatInput {
+                            kind,
+                            direction,
+                            content,
+                        },
                     },
                 });
                 state.draft.clear();

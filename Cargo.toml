@@ -9,7 +9,9 @@ members = [
     "crates/adapters/libsql",
     "crates/adapters/model2vec",
     "crates/modules/*",
-    "crates/eval", "crates/visualizer-egui",
+    "crates/eval",
+    "crates/visualizer-egui",
+    "crates/visualizer-protocol",
 ]
 
 [workspace.package]
@@ -76,3 +78,4 @@ nuillu-surprise = { path = "crates/modules/surprise" }
 nuillu-sensory = { path = "crates/modules/sensory" }
 nuillu-speak = { path = "crates/modules/speak" }
 nuillu-eval = { path = "crates/eval" }
+nuillu-visualizer-protocol = { path = "crates/visualizer-protocol" }

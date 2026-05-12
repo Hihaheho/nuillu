@@ -3355,7 +3355,7 @@ dependencies = [
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
- "nuillu-visualizer-egui",
+ "nuillu-visualizer-protocol",
  "regex",
  "schemars",
  "serde",
@@ -3557,8 +3557,20 @@ dependencies = [
  "egui_hooks",
  "nuillu-module",
  "nuillu-types",
+ "nuillu-visualizer-protocol",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "nuillu-visualizer-protocol"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nuillu-module",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

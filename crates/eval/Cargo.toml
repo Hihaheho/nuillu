@@ -39,7 +39,7 @@ nuillu-speak = { workspace = true }
 nuillu-cognition-gate = { workspace = true }
 nuillu-surprise = { workspace = true }
 nuillu-types = { workspace = true }
-nuillu-visualizer-egui = { path = "../visualizer-egui" }
+nuillu-visualizer-protocol = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

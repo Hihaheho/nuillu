@@ -31,7 +31,7 @@ use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
+    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_module::ports::{
     Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryQuery, MemoryStore,
@@ -39,19 +39,20 @@ use nuillu_module::ports::{
 };
 use nuillu_module::{
     AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
-    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, LlmRequestMetadata,
-    LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink,
-    RuntimePolicy, SensoryInput, SensoryInputMailbox,
+    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
+    LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
+    RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox,
 };
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
-use nuillu_visualizer_egui::{
+use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, ChatInputKind, CognitionEntryView, CognitionLogView,
     LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, MemoView,
     MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleStatusView, TabStatus,
-    UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerCommand, VisualizerEvent,
-    VisualizerTabId,
+    UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
+    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
+    VisualizerTabId, start_activation_action_id,
 };
 use regex::RegexBuilder;
 use serde::Serialize;
@@ -138,25 +139,66 @@ impl RunnerHooks {
 }
 
 pub struct VisualizerHook {
-    events: std::sync::mpsc::Sender<VisualizerEvent>,
-    commands: std::sync::mpsc::Receiver<VisualizerCommand>,
+    events: std::sync::mpsc::Sender<VisualizerServerMessage>,
+    commands: std::sync::mpsc::Receiver<VisualizerClientMessage>,
     memory_cache: BTreeMap<String, Vec<MemoryRecordView>>,
+    shutdown_requested: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct VisualizerEventSink {
+    events: std::sync::mpsc::Sender<VisualizerServerMessage>,
+}
+
+impl VisualizerEventSink {
+    fn new(events: std::sync::mpsc::Sender<VisualizerServerMessage>) -> Self {
+        Self { events }
+    }
+
+    fn send(&self, event: VisualizerEvent) {
+        let _ = self.events.send(VisualizerServerMessage::event(event));
+    }
 }
 
 impl VisualizerHook {
     pub fn new(
-        events: std::sync::mpsc::Sender<VisualizerEvent>,
-        commands: std::sync::mpsc::Receiver<VisualizerCommand>,
+        events: std::sync::mpsc::Sender<VisualizerServerMessage>,
+        commands: std::sync::mpsc::Receiver<VisualizerClientMessage>,
     ) -> Self {
         Self {
             events,
             commands,
             memory_cache: BTreeMap::new(),
+            shutdown_requested: false,
         }
     }
 
-    pub fn event_sender(&self) -> std::sync::mpsc::Sender<VisualizerEvent> {
-        self.events.clone()
+    pub fn event_sender(&self) -> VisualizerEventSink {
+        VisualizerEventSink::new(self.events.clone())
+    }
+
+    fn send_event(&self, event: VisualizerEvent) {
+        let _ = self.events.send(VisualizerServerMessage::event(event));
+    }
+
+    fn offer_action(&self, action: VisualizerAction) {
+        let _ = self
+            .events
+            .send(VisualizerServerMessage::OfferAction { action });
+    }
+
+    fn revoke_action(&self, action_id: String) {
+        let _ = self
+            .events
+            .send(VisualizerServerMessage::RevokeAction { action_id });
+    }
+
+    fn request_shutdown(&mut self) {
+        self.shutdown_requested = true;
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
     }
 
     fn set_memory_cache(&mut self, case_id: &str, records: Vec<MemoryRecordView>) {
@@ -175,19 +217,22 @@ impl VisualizerHook {
     }
 
     fn drain_cached_commands_until_shutdown(&mut self) {
-        while let Ok(command) = self.commands.recv() {
+        while let Ok(message) = self.commands.recv() {
+            let VisualizerClientMessage::Command { command } = message else {
+                continue;
+            };
             match command {
-                VisualizerCommand::StartSuite => {}
-                VisualizerCommand::Shutdown => break,
+                VisualizerCommand::Shutdown => {
+                    self.request_shutdown();
+                    break;
+                }
                 VisualizerCommand::ListMemories {
                     tab_id,
                     page,
                     per_page,
                 } => {
                     let page = self.cached_memory_page(tab_id.as_str(), page, per_page);
-                    let _ = self
-                        .events
-                        .send(VisualizerEvent::MemoryPage { tab_id, page });
+                    self.send_event(VisualizerEvent::MemoryPage { tab_id, page });
                 }
                 VisualizerCommand::QueryMemory {
                     tab_id,
@@ -205,14 +250,14 @@ impl VisualizerHook {
                         .take(limit)
                         .cloned()
                         .collect();
-                    let _ = self.events.send(VisualizerEvent::MemoryQueryResult {
+                    self.send_event(VisualizerEvent::MemoryQueryResult {
                         tab_id,
                         query,
                         records,
                     });
                 }
                 VisualizerCommand::SendSensoryInput { tab_id, .. } => {
-                    let _ = self.events.send(VisualizerEvent::Log {
+                    self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
                     });
@@ -229,13 +274,13 @@ struct VisualizerLlmObserver {
 
 struct VisualizerLlmObserverInner {
     case_id: String,
-    events: std::sync::mpsc::Sender<VisualizerEvent>,
+    events: VisualizerEventSink,
     next_turn: AtomicU64,
     extension_turns: Mutex<BTreeMap<usize, String>>,
 }
 
 impl VisualizerLlmObserver {
-    fn new(case_id: String, events: std::sync::mpsc::Sender<VisualizerEvent>) -> Self {
+    fn new(case_id: String, events: VisualizerEventSink) -> Self {
         Self {
             inner: Arc::new(VisualizerLlmObserverInner {
                 case_id,
@@ -282,7 +327,7 @@ impl VisualizerLlmObserver {
     }
 
     fn emit(&self, event: LlmObservationEvent) {
-        let _ = self.inner.events.send(VisualizerEvent::LlmObserved {
+        self.inner.events.send(VisualizerEvent::LlmObserved {
             tab_id: VisualizerTabId::new(self.inner.case_id.clone()),
             event,
         });
@@ -913,6 +958,13 @@ pub async fn run_suite_with_hooks(
             run_case_detailed_with_reporter(&path, config, Some(&judge), &reporter, hooks).await?;
         let failed = !output.summary.passed || output.summary.invalid;
         cases.push(output.summary);
+        if hooks
+            .visualizer
+            .as_ref()
+            .is_some_and(VisualizerHook::shutdown_requested)
+        {
+            break;
+        }
         if failed && config.fail_fast {
             break;
         }
@@ -942,6 +994,7 @@ pub async fn run_suite_with_hooks(
         ),
     )?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
+        eprintln!("eval suite finished; visualizer remains open until its window is closed");
         visualizer.drain_cached_commands_until_shutdown();
     }
     Ok(report)
@@ -1110,7 +1163,7 @@ async fn run_case_detailed_with_reporter(
         Ok(Ok(execution)) => execution,
         Ok(Err(error)) => {
             if let Some(visualizer) = hooks.visualizer.as_ref() {
-                let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+                visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.clone()),
                     status: TabStatus::Invalid,
                 });
@@ -1131,7 +1184,7 @@ async fn run_case_detailed_with_reporter(
         Err(payload) => {
             let message = format!("panic: {}", panic_payload_message(payload.as_ref()));
             if let Some(visualizer) = hooks.visualizer.as_ref() {
-                let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+                visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.clone()),
                     status: TabStatus::Invalid,
                 });
@@ -1311,7 +1364,7 @@ fn emit_visualizer_case_status(hooks: &RunnerHooks, summary: &CaseSummary) {
     } else {
         TabStatus::Failed
     };
-    let _ = visualizer.events.send(VisualizerEvent::SetTabStatus {
+    visualizer.send_event(VisualizerEvent::SetTabStatus {
         tab_id: VisualizerTabId::new(summary.id.clone()),
         status,
     });
@@ -1321,7 +1374,7 @@ fn emit_visualizer_open_tab(hooks: &RunnerHooks, id: &str) {
     let Some(visualizer) = hooks.visualizer.as_ref() else {
         return;
     };
-    let _ = visualizer.events.send(VisualizerEvent::OpenTab {
+    visualizer.send_event(VisualizerEvent::OpenTab {
         tab_id: VisualizerTabId::new(id.to_string()),
         title: id.to_string(),
     });
@@ -1392,6 +1445,9 @@ async fn execute_full_agent_case(
             25,
         )
         .await;
+        visualizer.offer_action(VisualizerAction::start_activation(VisualizerTabId::new(
+            case_id.to_string(),
+        )));
     }
 
     let host = env.caps.host_io();
@@ -1468,6 +1524,9 @@ async fn execute_full_agent_case(
                         break;
                     }
                     if command_outcome.start_requested && !started {
+                        visualizer.revoke_action(start_activation_action_id(
+                            &VisualizerTabId::new(case_id_for_idle.clone()),
+                        ));
                         activate_gui_start_modules(&allocation_blackboard).await;
                         publish_full_agent_inputs(
                             &case_id_for_idle,
@@ -1603,8 +1662,12 @@ async fn execute_module_case(
             25,
         )
         .await;
+        visualizer.offer_action(VisualizerAction::start_activation(VisualizerTabId::new(
+            case_id.to_string(),
+        )));
     }
 
+    let gui_deferred_start = hooks.visualizer.is_some();
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
     let run_target_module = target_module.clone();
@@ -1626,64 +1689,23 @@ async fn execute_module_case(
             activate_retries: 2,
         },
         async move {
-            match target {
-                ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
-                    let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-                    let mut config = allocation.for_module(&run_target_module);
-                    config.guidance = prompt.clone();
-                    allocation.set(run_target_module.clone(), config);
-                    blackboard
-                        .apply(BlackboardCommand::SetAllocation(allocation))
-                        .await;
-                    harness
-                        .allocation_updated_mailbox()
-                        .publish(AllocationUpdated)
-                        .await
-                        .expect("module eval failed to publish AllocationUpdated");
-                }
-                ModuleEvalTarget::AttentionSchema => {
-                    for record in &memo_seed_records {
-                        harness
-                            .memo_updated_mailbox()
-                            .publish(nuillu_module::MemoUpdated {
-                                owner: record.owner.clone(),
-                                index: record.index,
-                            })
-                            .await
-                            .expect("module eval failed to publish MemoUpdated");
-                    }
-                    if has_cognition_log_seed {
-                        harness
-                            .cognition_log_updated_mailbox()
-                            .publish(CognitionLogUpdated::EntryAppended {
-                                source: ModuleInstanceId::new(
-                                    builtin::cognition_gate(),
-                                    ReplicaIndex::ZERO,
-                                ),
-                            })
-                            .await
-                            .expect("module eval failed to publish CognitionLogUpdated");
-                    }
-                }
-                ModuleEvalTarget::SelfModel => {
-                    let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-                    let mut config = allocation.for_module(&run_target_module);
-                    config.guidance = prompt.clone();
-                    allocation.set(run_target_module.clone(), config);
-                    blackboard
-                        .apply(BlackboardCommand::SetAllocation(allocation))
-                        .await;
-                    harness
-                        .allocation_updated_mailbox()
-                        .publish(AllocationUpdated)
-                        .await
-                        .expect("module eval failed to publish AllocationUpdated");
-                }
+            let mut started = !gui_deferred_start;
+            if started {
+                activate_module_case_target(
+                    target,
+                    &blackboard,
+                    &harness,
+                    &prompt,
+                    &run_target_module,
+                    &memo_seed_records,
+                    has_cognition_log_seed,
+                )
+                .await;
             }
 
             loop {
                 if let Some(visualizer) = visualizer.as_deref_mut() {
-                    if handle_visualizer_commands(
+                    let command_outcome = handle_visualizer_commands(
                         &case_id_for_gui,
                         visualizer,
                         None,
@@ -1691,10 +1713,25 @@ async fn execute_module_case(
                         memory.as_ref(),
                         clock.as_ref(),
                     )
-                    .await
-                    .shutdown
-                    {
+                    .await;
+                    if command_outcome.shutdown {
                         break;
+                    }
+                    if command_outcome.start_requested && !started {
+                        visualizer.revoke_action(start_activation_action_id(
+                            &VisualizerTabId::new(case_id_for_gui.clone()),
+                        ));
+                        activate_module_case_target(
+                            target,
+                            &blackboard,
+                            &harness,
+                            &prompt,
+                            &run_target_module,
+                            &memo_seed_records,
+                            has_cognition_log_seed,
+                        )
+                        .await;
+                        started = true;
                     }
                 }
                 emit_visualizer_blackboard_snapshot(
@@ -1703,6 +1740,11 @@ async fn execute_module_case(
                     visualizer.as_deref(),
                 )
                 .await;
+                if !started {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(EVAL_POLL_INTERVAL).await;
+                    continue;
+                }
                 let target_done = match target {
                     ModuleEvalTarget::AttentionSchema => {
                         !attention_schema_cognition_output(&blackboard)
@@ -1759,6 +1801,71 @@ async fn execute_module_case(
     })
 }
 
+async fn activate_module_case_target(
+    target: ModuleEvalTarget,
+    blackboard: &Blackboard,
+    harness: &InternalHarnessIo,
+    prompt: &str,
+    run_target_module: &ModuleId,
+    memo_seed_records: &[MemoLogRecord],
+    has_cognition_log_seed: bool,
+) {
+    match target {
+        ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            harness
+                .allocation_updated_mailbox()
+                .publish(AllocationUpdated)
+                .await
+                .expect("module eval failed to publish AllocationUpdated");
+        }
+        ModuleEvalTarget::AttentionSchema => {
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+        }
+        ModuleEvalTarget::SelfModel => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            harness
+                .allocation_updated_mailbox()
+                .publish(AllocationUpdated)
+                .await
+                .expect("module eval failed to publish AllocationUpdated");
+        }
+    }
+}
+
 async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
     blackboard
         .read(|bb| {
@@ -1802,7 +1909,7 @@ async fn emit_visualizer_blackboard_snapshot(
         return;
     };
     let snapshot = blackboard.read(visualizer_blackboard_snapshot).await;
-    let _ = visualizer.events.send(VisualizerEvent::BlackboardSnapshot {
+    visualizer.send_event(VisualizerEvent::BlackboardSnapshot {
         tab_id: VisualizerTabId::new(case_id.to_string()),
         snapshot,
     });
@@ -1857,7 +1964,7 @@ async fn publish_full_agent_inputs(
             .await
             .expect("full-agent eval failed to publish SensoryInput");
         if let Some(visualizer) = visualizer {
-            let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
+            visualizer.send_event(VisualizerEvent::SensoryInput {
                 tab_id: VisualizerTabId::new(case_id.to_string()),
                 input: body,
             });
@@ -1874,17 +1981,36 @@ async fn handle_visualizer_commands(
     clock: &dyn Clock,
 ) -> VisualizerCommandOutcome {
     let mut outcome = VisualizerCommandOutcome::default();
-    while let Ok(command) = visualizer.commands.try_recv() {
+    let start_activation_id =
+        start_activation_action_id(&VisualizerTabId::new(case_id.to_string()));
+    loop {
+        let message = match visualizer.commands.try_recv() {
+            Ok(message) => message,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                visualizer.request_shutdown();
+                outcome.shutdown = true;
+                break;
+            }
+        };
+        let command = match message {
+            VisualizerClientMessage::Hello { .. } => continue,
+            VisualizerClientMessage::InvokeAction { action_id } => {
+                if action_id == start_activation_id {
+                    outcome.start_requested = true;
+                }
+                continue;
+            }
+            VisualizerClientMessage::Command { command } => command,
+        };
         match command {
             VisualizerCommand::Shutdown => {
+                visualizer.request_shutdown();
                 outcome.shutdown = true;
-            }
-            VisualizerCommand::StartSuite => {
-                outcome.start_requested = true;
             }
             VisualizerCommand::SendSensoryInput { tab_id, input } if tab_id.as_str() == case_id => {
                 let Some(sensory) = sensory else {
-                    let _ = visualizer.events.send(VisualizerEvent::Log {
+                    visualizer.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "this runtime does not accept sensory input".to_string(),
                     });
@@ -1904,7 +2030,7 @@ async fn handle_visualizer_commands(
                     },
                 };
                 let _ = sensory.publish(body.clone()).await;
-                let _ = visualizer.events.send(VisualizerEvent::SensoryInput {
+                visualizer.send_event(VisualizerEvent::SensoryInput {
                     tab_id,
                     input: body,
                 });
@@ -1922,7 +2048,7 @@ async fn handle_visualizer_commands(
                     .await
                     .map(|records| records.into_iter().map(memory_record_view).collect())
                     .unwrap_or_default();
-                let _ = visualizer.events.send(VisualizerEvent::MemoryQueryResult {
+                visualizer.send_event(VisualizerEvent::MemoryQueryResult {
                     tab_id,
                     query,
                     records,
@@ -1936,7 +2062,7 @@ async fn handle_visualizer_commands(
                 let all_records = list_all_visualizer_memories(blackboard, memory).await;
                 visualizer.set_memory_cache(case_id, all_records.clone());
                 let records = memory_page_from_records(&all_records, page, per_page);
-                let _ = visualizer.events.send(VisualizerEvent::MemoryPage {
+                visualizer.send_event(VisualizerEvent::MemoryPage {
                     tab_id,
                     page: records,
                 });
@@ -1964,7 +2090,7 @@ async fn emit_visualizer_memory_page(
     let records = list_all_visualizer_memories(blackboard, memory).await;
     visualizer.set_memory_cache(case_id, records.clone());
     let page = memory_page_from_records(&records, page, per_page);
-    let _ = visualizer.events.send(VisualizerEvent::MemoryPage {
+    visualizer.send_event(VisualizerEvent::MemoryPage {
         tab_id: VisualizerTabId::new(case_id.to_string()),
         page,
     });
@@ -2109,7 +2235,7 @@ async fn build_eval_environment(
     case_now: Option<DateTime<FixedOffset>>,
     case_id: &str,
     reporter: &LiveReporter,
-    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+    visualizer: Option<VisualizerEventSink>,
 ) -> Result<EvalEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
     let events = Arc::new(RecordingRuntimeEventSink::new(
@@ -3656,7 +3782,7 @@ struct RecordingUtteranceSink {
     reporter: LiveReporter,
     actions: Arc<ActionActivityTracker>,
     complete: Arc<Mutex<Vec<RecordedUtterance>>>,
-    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+    visualizer: Option<VisualizerEventSink>,
 }
 
 fn normalize_eval_utterance_text(text: String) -> String {
@@ -3683,7 +3809,7 @@ impl RecordingUtteranceSink {
         case_id: String,
         reporter: LiveReporter,
         actions: Arc<ActionActivityTracker>,
-        visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+        visualizer: Option<VisualizerEventSink>,
     ) -> Self {
         Self {
             case_id,
@@ -3743,7 +3869,7 @@ impl UtteranceSink for RecordingUtteranceSink {
             ),
         )?;
         if let Some(visualizer) = &self.visualizer {
-            let _ = visualizer.send(VisualizerEvent::UtteranceCompleted {
+            visualizer.send(VisualizerEvent::UtteranceCompleted {
                 tab_id: VisualizerTabId::new(self.case_id.clone()),
                 utterance: UtteranceView {
                     sender: recorded.sender,
@@ -3758,7 +3884,7 @@ impl UtteranceSink for RecordingUtteranceSink {
 
     async fn on_delta(&self, delta: UtteranceDelta) -> Result<(), PortError> {
         if let Some(visualizer) = &self.visualizer {
-            let _ = visualizer.send(VisualizerEvent::UtteranceDelta {
+            visualizer.send(VisualizerEvent::UtteranceDelta {
                 tab_id: VisualizerTabId::new(self.case_id.clone()),
                 utterance: UtteranceDeltaView {
                     sender: delta.sender.to_string(),
@@ -3780,7 +3906,7 @@ struct RecordingRuntimeEventSink {
     case_id: String,
     max_llm_calls: Option<u64>,
     reporter: LiveReporter,
-    visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+    visualizer: Option<VisualizerEventSink>,
 }
 
 impl RecordingRuntimeEventSink {
@@ -3788,7 +3914,7 @@ impl RecordingRuntimeEventSink {
         case_id: String,
         max_llm_calls: Option<u64>,
         reporter: LiveReporter,
-        visualizer: Option<std::sync::mpsc::Sender<VisualizerEvent>>,
+        visualizer: Option<VisualizerEventSink>,
     ) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
@@ -3875,7 +4001,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             live_message,
         )?;
         if let Some(visualizer) = &self.visualizer {
-            let _ = visualizer.send(VisualizerEvent::RuntimeEvent {
+            visualizer.send(VisualizerEvent::RuntimeEvent {
                 tab_id: VisualizerTabId::new(self.case_id.clone()),
                 event,
             });
@@ -4032,7 +4158,10 @@ mod tests {
 
         emit_visualizer_open_tab(&hooks, "case-1");
 
-        let event = event_rx.recv().expect("visualizer event");
+        let VisualizerServerMessage::Event { event } = event_rx.recv().expect("visualizer event")
+        else {
+            panic!("expected visualizer event");
+        };
         let VisualizerEvent::OpenTab { tab_id, title } = event else {
             panic!("expected open-tab event");
         };
@@ -4043,7 +4172,8 @@ mod tests {
     #[tokio::test]
     async fn visualizer_llm_observer_emits_hook_events() {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let observer = VisualizerLlmObserver::new("case-1".to_string(), event_tx);
+        let observer =
+            VisualizerLlmObserver::new("case-1".to_string(), VisualizerEventSink::new(event_tx));
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         let mut extensions = RequestExtensions::new();
         extensions.insert(LlmRequestMetadata {
@@ -4056,6 +4186,10 @@ mod tests {
 
         OnModelInput::call(&observer, &input_cx).await;
 
+        let event = match event_rx.recv().expect("model input event") {
+            VisualizerServerMessage::Event { event } => event,
+            _ => panic!("expected visualizer event"),
+        };
         let VisualizerEvent::LlmObserved {
             event:
                 LlmObservationEvent::ModelInput {
@@ -4065,7 +4199,7 @@ mod tests {
                     ..
                 },
             ..
-        } = event_rx.recv().expect("model input event")
+        } = event
         else {
             panic!("expected model input observation");
         };
@@ -4083,6 +4217,10 @@ mod tests {
 
         OnStreamEvent::call(&observer, &stream_cx).await;
 
+        let event = match event_rx.recv().expect("stream event") {
+            VisualizerServerMessage::Event { event } => event,
+            _ => panic!("expected visualizer event"),
+        };
         let VisualizerEvent::LlmObserved {
             event:
                 LlmObservationEvent::StreamDelta {
@@ -4091,7 +4229,7 @@ mod tests {
                     delta,
                 },
             ..
-        } = event_rx.recv().expect("stream event")
+        } = event
         else {
             panic!("expected stream delta observation");
         };
@@ -4116,16 +4254,25 @@ mod tests {
         );
 
         command_tx
-            .send(VisualizerCommand::QueryMemory {
-                tab_id: VisualizerTabId::new("case-1"),
-                query: "rust".to_string(),
-                limit: 10,
+            .send(VisualizerClientMessage::Command {
+                command: VisualizerCommand::QueryMemory {
+                    tab_id: VisualizerTabId::new("case-1"),
+                    query: "rust".to_string(),
+                    limit: 10,
+                },
             })
             .unwrap();
-        command_tx.send(VisualizerCommand::Shutdown).unwrap();
+        command_tx
+            .send(VisualizerClientMessage::Command {
+                command: VisualizerCommand::Shutdown,
+            })
+            .unwrap();
         hook.drain_cached_commands_until_shutdown();
 
-        let event = event_rx.recv().expect("memory query event");
+        let VisualizerServerMessage::Event { event } = event_rx.recv().expect("memory query event")
+        else {
+            panic!("expected visualizer event");
+        };
         let VisualizerEvent::MemoryQueryResult { records, .. } = event else {
             panic!("expected memory query result");
         };

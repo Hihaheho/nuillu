@@ -12,342 +12,53 @@ pub use egui;
 pub use egui_hooks;
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use chrono::{DateTime, Utc};
-use nuillu_module::{RuntimeEvent, SensoryInput};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct VisualizerTabId(pub String);
-
-impl VisualizerTabId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VisualizerEvent {
-    OpenTab {
-        tab_id: VisualizerTabId,
-        title: String,
-    },
-    SetTabStatus {
-        tab_id: VisualizerTabId,
-        status: TabStatus,
-    },
-    Log {
-        tab_id: VisualizerTabId,
-        message: String,
-    },
-    SensoryInput {
-        tab_id: VisualizerTabId,
-        input: SensoryInput,
-    },
-    UtteranceDelta {
-        tab_id: VisualizerTabId,
-        utterance: UtteranceDeltaView,
-    },
-    UtteranceCompleted {
-        tab_id: VisualizerTabId,
-        utterance: UtteranceView,
-    },
-    RuntimeEvent {
-        tab_id: VisualizerTabId,
-        event: RuntimeEvent,
-    },
-    LlmObserved {
-        tab_id: VisualizerTabId,
-        event: LlmObservationEvent,
-    },
-    BlackboardSnapshot {
-        tab_id: VisualizerTabId,
-        snapshot: BlackboardSnapshot,
-    },
-    MemoryPage {
-        tab_id: VisualizerTabId,
-        page: MemoryPage,
-    },
-    MemoryQueryResult {
-        tab_id: VisualizerTabId,
-        query: String,
-        records: Vec<MemoryRecordView>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VisualizerCommand {
-    StartSuite,
-    SendSensoryInput {
-        tab_id: VisualizerTabId,
-        input: ChatInput,
-    },
-    QueryMemory {
-        tab_id: VisualizerTabId,
-        query: String,
-        limit: usize,
-    },
-    ListMemories {
-        tab_id: VisualizerTabId,
-        page: usize,
-        per_page: usize,
-    },
-    Shutdown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum LlmObservationEvent {
-    ModelInput {
-        turn_id: String,
-        owner: String,
-        module: String,
-        replica: u8,
-        tier: String,
-        source: LlmObservationSource,
-        operation: String,
-        items: Vec<LlmInputItemView>,
-    },
-    StreamStarted {
-        turn_id: String,
-        owner: String,
-        module: String,
-        replica: u8,
-        tier: String,
-        source: LlmObservationSource,
-        operation: String,
-        request_id: Option<String>,
-        model: String,
-    },
-    StreamDelta {
-        turn_id: String,
-        kind: String,
-        delta: String,
-    },
-    ToolCallChunk {
-        turn_id: String,
-        id: String,
-        name: String,
-        arguments_json_delta: String,
-    },
-    ToolCallReady {
-        turn_id: String,
-        id: String,
-        name: String,
-        arguments_json: String,
-    },
-    StructuredReady {
-        turn_id: String,
-        json: String,
-    },
-    Completed {
-        turn_id: String,
-        request_id: Option<String>,
-        finish_reason: String,
-        usage: LlmUsageView,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmObservationSource {
-    ModuleTurn,
-    SessionCompaction,
-}
-
-impl LlmObservationSource {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ModuleTurn => "module",
-            Self::SessionCompaction => "compaction",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmInputItemView {
-    pub role: String,
-    pub kind: String,
-    pub content: String,
-    pub ephemeral: bool,
-    pub source: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmUsageView {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-    pub cost_micros_usd: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TabStatus {
-    Running,
-    Passed,
-    Failed,
-    Invalid,
-    Stopped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChatInputKind {
-    Heard,
-    Seen,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatInput {
-    pub kind: ChatInputKind,
-    pub direction: Option<String>,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UtteranceDeltaView {
-    pub sender: String,
-    pub target: String,
-    pub generation_id: u64,
-    pub sequence: u32,
-    pub delta: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UtteranceView {
-    pub sender: String,
-    pub target: String,
-    pub text: String,
-    pub emitted_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BlackboardSnapshot {
-    pub module_statuses: Vec<ModuleStatusView>,
-    pub allocation: Vec<AllocationView>,
-    pub memos: Vec<MemoView>,
-    pub cognition_logs: Vec<CognitionLogView>,
-    pub utterance_progresses: Vec<UtteranceProgressView>,
-    pub memory_metadata: Vec<MemoryMetadataView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleStatusView {
-    pub owner: String,
-    pub module: String,
-    pub replica: u8,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AllocationView {
-    pub module: String,
-    pub activation_ratio: f64,
-    pub active_replicas: u8,
-    #[serde(default)]
-    pub bpm: Option<f64>,
-    #[serde(default)]
-    pub cooldown_ms: Option<u64>,
-    pub tier: String,
-    pub guidance: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoView {
-    pub owner: String,
-    pub module: String,
-    pub replica: u8,
-    pub index: u64,
-    pub written_at: DateTime<Utc>,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CognitionLogView {
-    pub source: String,
-    pub entries: Vec<CognitionEntryView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CognitionEntryView {
-    pub at: DateTime<Utc>,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UtteranceProgressView {
-    pub owner: String,
-    pub target: String,
-    pub generation_id: u64,
-    pub sequence: u32,
-    pub state: String,
-    pub partial_utterance: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryMetadataView {
-    pub index: String,
-    pub rank: String,
-    pub occurred_at: Option<DateTime<Utc>>,
-    pub last_accessed: DateTime<Utc>,
-    pub access_count: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryRecordView {
-    pub index: String,
-    pub rank: String,
-    pub occurred_at: Option<DateTime<Utc>>,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemoryPage {
-    pub page: usize,
-    pub per_page: usize,
-    pub total: usize,
-    pub records: Vec<MemoryRecordView>,
-}
+use nuillu_module::RuntimeEvent;
+pub use nuillu_visualizer_protocol::*;
 
 pub struct VisualizerChannels {
-    pub events: Receiver<VisualizerEvent>,
-    pub commands: Sender<VisualizerCommand>,
-    pub start_suite_from_ui: bool,
+    pub server_messages: Receiver<VisualizerServerMessage>,
+    pub client_messages: Sender<VisualizerClientMessage>,
+    pub remote: bool,
 }
 
 pub struct VisualizerApp {
-    events: Receiver<VisualizerEvent>,
-    commands: Sender<VisualizerCommand>,
-    start_suite_from_ui: bool,
+    server_messages: Receiver<VisualizerServerMessage>,
+    client_messages: Sender<VisualizerClientMessage>,
+    remote: bool,
     state: VisualizerState,
 }
 
 impl VisualizerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
         Self {
-            events: channels.events,
-            commands: channels.commands,
-            start_suite_from_ui: channels.start_suite_from_ui,
+            server_messages: channels.server_messages,
+            client_messages: channels.client_messages,
+            remote: channels.remote,
             state: VisualizerState::default(),
         }
     }
 
-    fn drain_events(&mut self) {
-        while let Ok(event) = self.events.try_recv() {
-            self.state.apply(event);
+    fn drain_server_messages(&mut self) {
+        loop {
+            match self.server_messages.try_recv() {
+                Ok(message) => self.state.apply_server_message(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.remote {
+                        self.state.mark_disconnected();
+                    }
+                    break;
+                }
+            }
         }
     }
 }
 
 impl eframe::App for VisualizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        self.drain_server_messages();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
@@ -355,7 +66,7 @@ impl eframe::App for VisualizerApp {
             ui.horizontal_wrapped(|ui| {
                 for tab in self.state.tabs.values() {
                     let selected = self.state.selected.as_ref() == Some(&tab.id);
-                    let label = format!("{} {}", tab.status.icon(), tab.title);
+                    let label = format!("{} {}", tab_status_icon(tab.status), tab.title);
                     if ui.selectable_label(selected, label).clicked() {
                         self.state.selected = Some(tab.id.clone());
                     }
@@ -374,13 +85,22 @@ impl eframe::App for VisualizerApp {
                         ui.label("No runtime windows yet.");
                     });
                 }
-                if self.start_suite_from_ui {
-                    if ui.button("Start Activation").clicked() {
-                        let _ = self.commands.send(VisualizerCommand::StartSuite);
+                for action in self.state.visible_actions() {
+                    if ui.button(&action.label).clicked() {
+                        let _ = self
+                            .client_messages
+                            .send(VisualizerClientMessage::InvokeAction {
+                                action_id: action.id,
+                            });
                     }
                 }
+                if self.remote && self.state.disconnected {
+                    ui.colored_label(ui.visuals().error_fg_color, "Eval disconnected");
+                }
                 if ui.button("Shutdown").clicked() {
-                    let _ = self.commands.send(VisualizerCommand::Shutdown);
+                    let _ = self.client_messages.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::Shutdown,
+                    });
                 }
             });
         });
@@ -395,12 +115,16 @@ impl eframe::App for VisualizerApp {
                 self.state.selected = Some(tab_id.clone());
                 if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
                     ui.push_id(tab_id.as_str(), |ui| {
-                        tab.ui(ui, &self.commands);
+                        tab.ui(ui, &self.client_messages);
                     });
                 }
             } else {
                 ui.centered_and_justified(|ui| {
-                    ui.label("No runtime tabs yet.");
+                    if self.remote && self.state.disconnected {
+                        ui.label("Eval process disconnected.");
+                    } else {
+                        ui.label("No runtime tabs yet.");
+                    }
                 });
             }
         });
@@ -409,15 +133,49 @@ impl eframe::App for VisualizerApp {
     fn auto_save_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(1500)
     }
+
+    fn on_exit(&mut self) {
+        let _ = self.client_messages.send(VisualizerClientMessage::Command {
+            command: VisualizerCommand::Shutdown,
+        });
+    }
 }
 
 #[derive(Default)]
 pub struct VisualizerState {
     tabs: BTreeMap<VisualizerTabId, RuntimeTab>,
     selected: Option<VisualizerTabId>,
+    actions: BTreeMap<String, VisualizerAction>,
+    disconnected: bool,
 }
 
 impl VisualizerState {
+    pub fn apply_server_message(&mut self, message: VisualizerServerMessage) {
+        match message {
+            VisualizerServerMessage::Hello { .. } => {
+                self.disconnected = false;
+            }
+            VisualizerServerMessage::Event { event } => self.apply(event),
+            VisualizerServerMessage::OfferAction { action } => {
+                self.actions.insert(action.id.clone(), action);
+            }
+            VisualizerServerMessage::RevokeAction { action_id } => {
+                self.actions.remove(&action_id);
+            }
+        }
+    }
+
+    pub fn mark_disconnected(&mut self) {
+        if self.disconnected {
+            return;
+        }
+        self.disconnected = true;
+        self.actions.clear();
+        for tab in self.tabs.values_mut() {
+            tab.push_log("eval process disconnected".to_string());
+        }
+    }
+
     pub fn apply(&mut self, event: VisualizerEvent) {
         match event {
             VisualizerEvent::OpenTab { tab_id, title } => {
@@ -484,6 +242,17 @@ impl VisualizerState {
         &self.tabs
     }
 
+    pub fn visible_actions(&self) -> Vec<VisualizerAction> {
+        self.actions
+            .values()
+            .filter(|action| match &action.scope {
+                VisualizerActionScope::Global => true,
+                VisualizerActionScope::Tab { tab_id } => self.selected.as_ref() == Some(tab_id),
+            })
+            .cloned()
+            .collect()
+    }
+
     fn tab_mut(&mut self, tab_id: VisualizerTabId) -> &mut RuntimeTab {
         self.tabs
             .entry(tab_id.clone())
@@ -528,9 +297,9 @@ impl RuntimeTab {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerCommand>) {
+    fn ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
         ui.horizontal_wrapped(|ui| {
-            ui.heading(format!("{} {}", self.status.icon(), self.title));
+            ui.heading(format!("{} {}", tab_status_icon(self.status), self.title));
             ui.label(format!("runtime events: {}", self.runtime_events.len()));
             ui.label(format!("modules: {}", self.modules.iter().count()));
         });
@@ -591,7 +360,7 @@ impl RuntimeTab {
         specs
     }
 
-    fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerCommand>) {
+    fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
         let base = self.id.as_str().to_string();
         let mut window_requests = std::mem::take(&mut self.window_requests);
 
@@ -713,15 +482,13 @@ impl RuntimeTab {
     }
 }
 
-impl TabStatus {
-    fn icon(self) -> &'static str {
-        match self {
-            Self::Running => "🟢",
-            Self::Passed => "✅",
-            Self::Failed => "❌",
-            Self::Invalid => "⚠️",
-            Self::Stopped => "⚪",
-        }
+fn tab_status_icon(status: TabStatus) -> &'static str {
+    match status {
+        TabStatus::Running => "🟢",
+        TabStatus::Passed => "✅",
+        TabStatus::Failed => "❌",
+        TabStatus::Invalid => "⚠️",
+        TabStatus::Stopped => "⚪",
     }
 }
 
@@ -786,6 +553,42 @@ mod tests {
 
         let tab = state.tabs().get(&tab_id).expect("tab exists");
         assert_eq!(tab.status, TabStatus::Running);
+    }
+
+    #[test]
+    fn reducer_tracks_offered_actions_by_scope() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        state.apply_server_message(VisualizerServerMessage::OfferAction {
+            action: VisualizerAction::start_suite(),
+        });
+        state.apply_server_message(VisualizerServerMessage::OfferAction {
+            action: VisualizerAction::start_activation(tab_id.clone()),
+        });
+
+        let actions = state.visible_actions();
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.id == START_SUITE_ACTION_ID)
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.id == start_activation_action_id(&tab_id))
+        );
+
+        state.apply_server_message(VisualizerServerMessage::RevokeAction {
+            action_id: start_activation_action_id(&tab_id),
+        });
+        let actions = state.visible_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, START_SUITE_ACTION_ID);
     }
 
     #[test]
