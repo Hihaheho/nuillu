@@ -8,8 +8,42 @@ publish.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
-nuillu-eval = { workspace = true }
+eure = { workspace = true }
+eure-document = { workspace = true }
+lutum = { workspace = true }
+lutum-in-memory-adapter = { workspace = true }
+lutum-libsql-adapter = { workspace = true }
+lutum-model2vec-adapter = { workspace = true }
+lutum-openai = { workspace = true }
+lutum-trace = { workspace = true }
+nuillu-agent = { workspace = true }
+nuillu-attention-controller = { workspace = true }
+nuillu-attention-schema = { workspace = true }
+nuillu-blackboard = { workspace = true }
+nuillu-cognition-gate = { workspace = true }
+nuillu-homeostatic-controller = { workspace = true }
+nuillu-memory = { workspace = true }
+nuillu-module = { workspace = true }
+nuillu-openai-embedding-adapter = { workspace = true }
+nuillu-predict = { workspace = true }
+nuillu-query-agentic = { workspace = true }
+nuillu-reward = { workspace = true }
+nuillu-self-model = { workspace = true }
+nuillu-sensory = { workspace = true }
+nuillu-speak = { workspace = true }
+nuillu-surprise = { workspace = true }
+nuillu-types = { workspace = true }
+nuillu-vital = { workspace = true }
+nuillu-visualizer-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -9,7 +9,6 @@ pub mod cases;
 pub mod evaluation;
 pub mod gui;
 pub mod judge;
-pub mod live;
 pub mod model_set;
 pub mod runner;
 pub mod state_dump;
@@ -32,7 +31,6 @@ pub use judge::{
     JudgeOptions, LlmRubricJudge, RubricJudge, RubricJudgeError, RubricJudgeRequest,
     RubricJudgeVerdict, RubricJudgeVerdictCriterion, render_judge_input,
 };
-pub use live::{LiveServerConfig, run_live_with_visualizer};
 pub use model_set::{
     EmbeddingRole, ModelSet, ModelSetError, ModelSetFile, ModelSetRole, ReasoningEffort,
     parse_model_set_file,

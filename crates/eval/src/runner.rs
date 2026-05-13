@@ -218,17 +218,6 @@ impl VisualizerHook {
         self.shutdown_requested
     }
 
-    pub(crate) fn try_recv_command(&mut self) -> Option<VisualizerClientMessage> {
-        match self.commands.try_recv() {
-            Ok(message) => Some(message),
-            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.request_shutdown();
-                None
-            }
-        }
-    }
-
     fn set_memory_cache(&mut self, case_id: &str, records: Vec<MemoryRecordView>) {
         self.memory_cache.insert(case_id.to_string(), records);
     }
