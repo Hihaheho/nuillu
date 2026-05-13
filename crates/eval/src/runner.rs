@@ -3321,7 +3321,6 @@ fn register_eval_module(
                 |caps| {
                     nuillu_sensory::SensoryModule::new(
                         caps.sensory_input_inbox(),
-                        caps.allocation_updated_inbox(),
                         caps.allocation_reader(),
                         caps.memo(),
                         caps.clock(),

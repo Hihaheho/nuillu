@@ -127,7 +127,7 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 
 | Module | Read blackboard | Read cognition log | Read allocation | Memo | Clock | LLM | Special capabilities |
 |---|---|---|---|---|---|---|---|
-| sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox`, `AllocationUpdatedInbox` |
+| sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox` |
 | cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
 | attention-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
@@ -269,7 +269,7 @@ the cognition log, scheduler-owned module status, and utterance progress, so it 
 memo-only facts from attended facts. If speech is ready, it allows the activation. If speech should
 wait, it suppresses the activation and writes the wait decision and any missing-evidence notes to
 its memo log. It does not emit utterances, write cognition-log entries, change allocation, or write
-memory. It may call evidence tools that publish attention-control bids for memory, self-model, and sensory-detail lookup during its
+memory. It may call evidence tools that publish attention-control bids for memory and self-model lookup during its
 decision turn.
 
 ### Speak

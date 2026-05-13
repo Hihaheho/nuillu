@@ -294,10 +294,6 @@ pub enum AttentionControlRequest {
         importance: MemoryImportance,
         reason: String,
     },
-    SensoryDetail {
-        question: String,
-        reason: Option<String>,
-    },
     Policy {
         reason: String,
         candidate_trigger: Option<String>,
@@ -343,23 +339,6 @@ impl AttentionControlRequest {
             content: content.into(),
             importance,
             reason: reason.into(),
-        }
-    }
-
-    pub fn sensory_detail(question: impl Into<String>) -> Self {
-        Self::SensoryDetail {
-            question: question.into(),
-            reason: None,
-        }
-    }
-
-    pub fn sensory_detail_with_reason(
-        question: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::SensoryDetail {
-            question: question.into(),
-            reason: Some(reason.into()),
         }
     }
 

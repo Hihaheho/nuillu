@@ -3508,6 +3508,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "lutum",
+ "lutum-protocol",
  "nuillu-agent",
  "nuillu-blackboard",
  "nuillu-module",

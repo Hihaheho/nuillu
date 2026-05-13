@@ -97,7 +97,6 @@ fn register_server_module(
             registry.register_server(policy(1..=1, Bpm::range(3.0, 8.0)), |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.memo(),
                     caps.clock(),

@@ -66,7 +66,6 @@ Use a strict readiness gate before setting wants_to_speak=true and wait_for_evid
 
 When a missing fact is needed for speech, call an evidence tool before waiting:
 - query_memory(question) for stable self/body/peer/world facts.
-- query_sensory_detail(question) for details from current sensory observations.
 If a tool result contains the needed fact but the cognition log does not, return wants_to_speak=true
 and wait_for_evidence=true with a
 cognition-promotion evidence gap. If evidence is still unavailable, include evidence_gaps that name
@@ -123,7 +122,6 @@ pub enum EvidenceGapSource {
     Memory,
     File,
     SelfModel,
-    SensoryDetail,
     CognitionPromotion,
 }
 
@@ -133,7 +131,6 @@ impl EvidenceGapSource {
             EvidenceGapSource::Memory => "memory",
             EvidenceGapSource::File => "file",
             EvidenceGapSource::SelfModel => "self-model",
-            EvidenceGapSource::SensoryDetail => "sensory detail",
             EvidenceGapSource::CognitionPromotion => "cognition promotion",
         }
     }
@@ -163,23 +160,10 @@ struct QuerySelfModelOutput {
     duplicate: bool,
 }
 
-#[lutum::tool_input(name = "query_sensory_detail", output = QuerySensoryDetailOutput)]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-struct QuerySensoryDetailArgs {
-    question: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct QuerySensoryDetailOutput {
-    requested: bool,
-    duplicate: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 enum SpeakGateTools {
     QueryMemory(QueryMemoryArgs),
     QuerySelfModel(QuerySelfModelArgs),
-    QuerySensoryDetail(QuerySensoryDetailArgs),
 }
 
 const MAX_GATE_TOOL_ROUNDS: usize = 4;
@@ -304,9 +288,9 @@ fn memo_kind_from_decision(decision: &SpeakGateDecision) -> SpeakGateMemoKind {
 fn readiness_gate_prompt(self_model_available: bool) -> String {
     if self_model_available {
         READINESS_GATE_PROMPT.replace(
-            "- query_sensory_detail(question) for details from current sensory observations.",
+            "When a missing fact is needed for speech, call an evidence tool before waiting:\n- query_memory(question) for stable self/body/peer/world facts.",
             &format!(
-                "{READINESS_GATE_SELF_MODEL_TOOL_PROMPT}- query_sensory_detail(question) for details from current sensory observations."
+                "When a missing fact is needed for speech, call an evidence tool before waiting:\n- query_memory(question) for stable self/body/peer/world facts.\n{READINESS_GATE_SELF_MODEL_TOOL_PROMPT}"
             ),
         )
     } else {
@@ -315,10 +299,7 @@ fn readiness_gate_prompt(self_model_available: bool) -> String {
 }
 
 fn speak_gate_tool_selectors(self_model_available: bool) -> Vec<SpeakGateToolsSelector> {
-    let mut tools = vec![
-        SpeakGateToolsSelector::QueryMemory,
-        SpeakGateToolsSelector::QuerySensoryDetail,
-    ];
+    let mut tools = vec![SpeakGateToolsSelector::QueryMemory];
     if self_model_available {
         tools.push(SpeakGateToolsSelector::QuerySelfModel);
     }
@@ -566,7 +547,6 @@ impl SpeakGateModule {
     ) -> Result<SpeakGateDecision> {
         let mut memory_requests = HashSet::<String>::new();
         let mut self_model_requests = HashSet::<String>::new();
-        let mut sensory_detail_requests = HashSet::<String>::new();
         let mut requested_evidence_sources = Vec::<EvidenceGapSource>::new();
         let available_tools = speak_gate_tool_selectors(self_model_available);
 
@@ -621,23 +601,6 @@ impl SpeakGateModule {
                                 results.push(
                                     call.complete(output)
                                         .context("complete query_self_model tool call")?,
-                                );
-                            }
-                            SpeakGateToolsCall::QuerySensoryDetail(call) => {
-                                let output = self
-                                    .query_sensory_detail(
-                                        call.input.clone(),
-                                        &mut sensory_detail_requests,
-                                    )
-                                    .await
-                                    .context("run query_sensory_detail tool")?;
-                                if output.requested {
-                                    requested_evidence_sources
-                                        .push(EvidenceGapSource::SensoryDetail);
-                                }
-                                results.push(
-                                    call.complete(output)
-                                        .context("complete query_sensory_detail tool call")?,
                                 );
                             }
                         }
@@ -713,30 +676,6 @@ impl SpeakGateModule {
             duplicate,
         })
     }
-
-    async fn query_sensory_detail(
-        &self,
-        args: QuerySensoryDetailArgs,
-        requested_questions: &mut HashSet<String>,
-    ) -> Result<QuerySensoryDetailOutput> {
-        let question = args.question.trim().to_owned();
-        let duplicate = !requested_questions.insert(question.clone());
-        let requested = if duplicate {
-            false
-        } else {
-            self.attention_control
-                .publish(AttentionControlRequest::sensory_detail_with_reason(
-                    question,
-                    "speak-gate query_sensory_detail evidence tool",
-                ))
-                .await
-                .is_ok()
-        };
-        Ok(QuerySensoryDetailOutput {
-            requested,
-            duplicate,
-        })
-    }
 }
 
 fn gate_vote_from_memo(memo: &SpeakGateMemo) -> ActivationGateVote {
@@ -788,7 +727,6 @@ impl EvidenceGapSource {
             EvidenceGapSource::Memory => "memory",
             EvidenceGapSource::File => "file",
             EvidenceGapSource::SelfModel => "self-model",
-            EvidenceGapSource::SensoryDetail => "sensory detail",
             EvidenceGapSource::CognitionPromotion => "cognition promotion",
         }
     }
@@ -1397,29 +1335,6 @@ mod tests {
             AttentionControlRequest::self_model_with_reason(
                 "current role?",
                 "speak-gate query_self_model evidence tool"
-            )
-        );
-
-        let mut sensory_detail_requests = HashSet::new();
-        let sensory_output = fixture
-            .gate
-            .query_sensory_detail(
-                QuerySensoryDetailArgs {
-                    question: " what was just heard? ".into(),
-                },
-                &mut sensory_detail_requests,
-            )
-            .await
-            .unwrap();
-        let sensory_request = fixture.attention_control_inbox.next_item().await.unwrap();
-        assert!(sensory_output.requested);
-        assert!(!sensory_output.duplicate);
-        assert_eq!(sensory_request.sender.module, builtin::speak_gate());
-        assert_eq!(
-            sensory_request.body,
-            AttentionControlRequest::sensory_detail_with_reason(
-                "what was just heard?",
-                "speak-gate query_sensory_detail evidence tool"
             )
         );
     }

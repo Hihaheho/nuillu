@@ -5,36 +5,35 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::Session;
-use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, AmbientSensoryEntry, LlmAccess, Memo, Module,
-    SensoryInput, SensoryInputInbox, SensoryModality, SessionCompactionConfig,
-    compact_session_if_needed, ports::Clock, seed_persistent_faculty_session,
+use lutum::{
+    AssistantInputItem, InputMessageRole, ModelInput, ModelInputItem, Session,
+    TextStepOutcomeWithTools, ToolResult,
 };
+use nuillu_module::{
+    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
+    SensoryInputInbox, SensoryModality, SessionCompactionConfig, ports::Clock,
+    seed_persistent_faculty_session, session_compaction_cutoff,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 const SYSTEM_PROMPT: &str = r#"You are the sensory module.
 You receive batches of raw observations from the environment and decide whether anything is notable
 enough to write as sensory memo-log output. Use the deterministic salience features as guidance;
 repeated low-change stimuli should usually be ignored or summarized only when the summary is useful.
-If there is nothing notable, return an empty response. Otherwise return concise plain text only.
-Do not write JSON, YAML, Markdown code fences, headings, or implementation details. Do not write to
-the cognition log, memory, or emit utterances."#;
-
-const DETAIL_PROMPT: &str = r#"You are the sensory module answering a detailed sensory request.
-Use only retained sensory observations and prior sensory session context. If the observations do not
-contain the requested detail, say that the detail is unavailable. Do not infer hidden causes,
-intentions, or facts outside sensory observations. Return concise plain text only. Do not write
-JSON, YAML, Markdown code fences, headings, or implementation details."#;
+Use tools for every decision: call write_sensory_memo for durable sensory memo-log output, or
+ignore_observations when nothing should be written. Do not use final assistant text as an output
+channel. Do not write JSON, YAML, Markdown code fences, headings, or implementation details in memo
+text. Do not write to the cognition log, memory, or emit utterances."#;
 
 const COMPACTED_SENSORY_SESSION_PREFIX: &str = "Compacted sensory session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the sensory module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve observed sensory facts, source/direction
-details, relative timing, salience/habituation cues, notable sensory memo-log outputs, detail
-requests and answers, ignored/background context that may affect future salience, and uncertainty.
+details, relative timing, salience/habituation cues, memo-log outputs written through tools,
+ignored/background context that may affect future salience, and uncertainty.
 Do not invent facts. Return plain text only."#;
 
-const MAX_OBSERVATIONS: usize = 20;
 const DEFAULT_BURST_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_BURST_BUDGET: Duration = Duration::from_secs(1);
 const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
@@ -70,7 +69,6 @@ struct StimulusState {
 pub struct SensoryModule {
     owner: nuillu_types::ModuleId,
     inbox: SensoryInputInbox,
-    allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     memo: Memo,
     clock: Arc<dyn Clock>,
@@ -80,9 +78,35 @@ pub struct SensoryModule {
     session_compaction: SessionCompactionConfig,
     burst: SensoryBurstConfig,
     system_prompt: std::sync::OnceLock<String>,
-    detail_prompt: std::sync::OnceLock<String>,
-    observations: Vec<String>,
     stimuli: HashMap<String, StimulusState>,
+}
+
+#[lutum::tool_input(name = "write_sensory_memo", output = WriteSensoryMemoOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct WriteSensoryMemoArgs {
+    memo: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct WriteSensoryMemoOutput {
+    written: bool,
+}
+
+#[lutum::tool_input(name = "ignore_observations", output = IgnoreObservationsOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct IgnoreObservationsArgs {
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct IgnoreObservationsOutput {
+    ignored: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+enum SensoryTools {
+    WriteSensoryMemo(WriteSensoryMemoArgs),
+    IgnoreObservations(IgnoreObservationsArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +127,6 @@ impl Default for SensoryBurstConfig {
 impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
-        allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         memo: Memo,
         clock: Arc<dyn Clock>,
@@ -113,7 +136,6 @@ impl SensoryModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("sensory id is valid"),
             inbox,
-            allocation_updates,
             allocation,
             memo,
             clock,
@@ -123,8 +145,6 @@ impl SensoryModule {
             session_compaction: SessionCompactionConfig::default(),
             burst: SensoryBurstConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            detail_prompt: std::sync::OnceLock::new(),
-            observations: Vec::new(),
             stimuli: HashMap::new(),
         }
     }
@@ -138,12 +158,6 @@ impl SensoryModule {
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
             nuillu_module::format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
-        })
-    }
-
-    fn detail_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.detail_prompt.get_or_init(|| {
-            nuillu_module::format_faculty_system_prompt(DETAIL_PROMPT, cx.modules(), &self.owner)
         })
     }
 
@@ -209,34 +223,59 @@ impl SensoryModule {
         self.ensure_session_seeded(cx);
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation.for_module(&self.owner).guidance;
-        self.session.push_user(format_sensory_batch(&observations));
-        if let Some(context) = format_sensory_guidance_context(&guidance) {
-            self.session.push_ephemeral_system(context);
-        }
+        self.session
+            .push_user(format_sensory_batch(&observations, &guidance));
 
         let lutum = self.llm.lutum().await;
-        let result = self
+        let outcome = self
             .session
             .text_turn(&lutum)
+            .tools::<SensoryTools>()
+            .available_tools([
+                SensoryToolsSelector::WriteSensoryMemo,
+                SensoryToolsSelector::IgnoreObservations,
+            ])
+            .require_any_tool()
             .collect()
             .await
             .context("sensory text turn failed")?;
-        compact_session_if_needed(
-            &mut self.session,
-            result.usage.input_tokens,
-            cx.session_compaction_lutum(),
-            self.session_compaction,
-            Self::id(),
-            COMPACTED_SENSORY_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
 
-        let text = result.assistant_text();
-        let text = text.trim();
-        if !text.is_empty() {
-            self.remember_observation(text);
-            self.memo.write(text.to_owned()).await;
+        match outcome {
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let input_tokens = round.usage.input_tokens;
+                let mut results: Vec<ToolResult> = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    match call {
+                        SensoryToolsCall::WriteSensoryMemo(call) => {
+                            let output = self.write_sensory_memo(call.input.clone()).await;
+                            results.push(
+                                call.complete(output)
+                                    .context("complete write_sensory_memo tool call")?,
+                            );
+                        }
+                        SensoryToolsCall::IgnoreObservations(call) => {
+                            let output = self.ignore_observations(call.input.clone());
+                            results.push(
+                                call.complete(output)
+                                    .context("complete ignore_observations tool call")?,
+                            );
+                        }
+                    }
+                }
+                round
+                    .commit(&mut self.session, results)
+                    .context("commit sensory tool round")?;
+                self.compact_if_needed(input_tokens, cx.session_compaction_lutum())
+                    .await;
+            }
+            TextStepOutcomeWithTools::Finished(result) => {
+                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction_lutum())
+                    .await;
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction_lutum())
+                    .await;
+            }
         }
         Ok(())
     }
@@ -314,51 +353,6 @@ impl SensoryModule {
         }
     }
 
-    fn remember_observation(&mut self, text: &str) {
-        self.observations.push(text.to_owned());
-        if self.observations.len() > MAX_OBSERVATIONS {
-            self.observations.remove(0);
-        }
-    }
-
-    async fn handle_detail_guidance(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let allocation = self.allocation.snapshot().await;
-        let guidance = allocation.for_module(&self.owner).guidance;
-        if guidance.trim().is_empty() {
-            return Ok(());
-        }
-        self.ensure_session_seeded(cx);
-        let detail_prompt = self.detail_prompt(cx).to_owned();
-        self.session.push_ephemeral_developer(detail_prompt);
-        self.session
-            .push_user(format_sensory_detail_request(&guidance, &self.observations));
-
-        let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .text_turn(&lutum)
-            .collect()
-            .await
-            .context("sensory detail text turn failed")?;
-        compact_session_if_needed(
-            &mut self.session,
-            result.usage.input_tokens,
-            cx.session_compaction_lutum(),
-            self.session_compaction,
-            Self::id(),
-            COMPACTED_SENSORY_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
-
-        let text = result.assistant_text();
-        let text = text.trim();
-        if !text.is_empty() {
-            self.memo.write(text.to_owned()).await;
-        }
-        Ok(())
-    }
-
     fn salience_features(
         &mut self,
         modality: &str,
@@ -413,22 +407,43 @@ impl SensoryModule {
         }
     }
 
+    async fn write_sensory_memo(&self, args: WriteSensoryMemoArgs) -> WriteSensoryMemoOutput {
+        let memo = args.memo.trim();
+        let written = !memo.is_empty();
+        if written {
+            self.memo.write(memo.to_owned()).await;
+        }
+        WriteSensoryMemoOutput { written }
+    }
+
+    fn ignore_observations(&self, _args: IgnoreObservationsArgs) -> IgnoreObservationsOutput {
+        IgnoreObservationsOutput { ignored: true }
+    }
+
+    async fn compact_if_needed(&mut self, input_tokens: u64, lutum: &lutum::Lutum) {
+        if input_tokens <= self.session_compaction.input_token_threshold {
+            return;
+        }
+        if let Err(error) =
+            compact_sensory_session(&mut self.session, lutum, self.session_compaction).await
+        {
+            tracing::warn!(
+                module = Self::id(),
+                input_tokens,
+                threshold = self.session_compaction.input_token_threshold,
+                error = ?error,
+                "module session compaction failed"
+            );
+        }
+    }
+
     async fn next_batch(&mut self) -> Result<SensoryBatch> {
-        let mut batch = tokio::select! {
-            input = self.inbox.next_item() => SensoryBatch {
-                inputs: vec![input?.body],
-                allocation_updated: false,
-            },
-            update = self.allocation_updates.next_item() => {
-                let _ = update?;
-                SensoryBatch {
-                inputs: Vec::new(),
-                    allocation_updated: true,
-                }
-            }
+        let input = self.inbox.next_item().await?;
+        let mut batch = SensoryBatch {
+            inputs: vec![input.body],
         };
-        let ready = self.collect_ready_events_into_batch(&mut batch)?;
-        if !batch.inputs.is_empty() && ready.allocation_updates == 0 && !batch.allocation_updated {
+        self.collect_ready_events_into_batch(&mut batch)?;
+        if !batch.inputs.is_empty() {
             self.collect_sensory_burst(&mut batch).await?;
         }
         Ok(batch)
@@ -448,23 +463,11 @@ impl SensoryModule {
                 input = self.inbox.next_item() => {
                     batch.inputs.push(input?.body);
                     waited += std::cmp::min(started.elapsed(), wait_for);
-                    let ready = self.collect_ready_events_into_batch(batch)?;
-                    if ready.allocation_updates > 0 {
-                        break;
-                    }
-                }
-                update = self.allocation_updates.next_item() => {
-                    let _ = update?;
-                    batch.allocation_updated = true;
                     let _ = self.collect_ready_events_into_batch(batch)?;
-                    break;
                 }
                 _ = tokio::time::sleep(wait_for) => {
                     waited += wait_for;
                     let ready = self.collect_ready_events_into_batch(batch)?;
-                    if ready.allocation_updates > 0 {
-                        break;
-                    }
                     if ready.inputs == 0 {
                         break;
                     }
@@ -481,14 +484,8 @@ impl SensoryModule {
             .inputs
             .extend(ready_inputs.items.into_iter().map(|envelope| envelope.body));
 
-        let allocation_updates = self.allocation_updates.take_ready_items()?.items.len();
-        if allocation_updates > 0 {
-            batch.allocation_updated = true;
-        }
-
         Ok(ReadyCounts {
             inputs: input_count,
-            allocation_updates,
         })
     }
 }
@@ -496,13 +493,11 @@ impl SensoryModule {
 #[derive(Debug, Default)]
 pub struct SensoryBatch {
     inputs: Vec<SensoryInput>,
-    allocation_updated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReadyCounts {
     inputs: usize,
-    allocation_updates: usize,
 }
 
 fn plural(n: u64) -> &'static str {
@@ -514,77 +509,131 @@ fn is_user_directed_direction(direction: &str) -> bool {
     USER_DIRECTED_DIRECTIONS.contains(&direction.as_str())
 }
 
-fn format_sensory_batch(observations: &[PreparedSensoryObservation]) -> String {
+fn format_sensory_batch(observations: &[PreparedSensoryObservation], guidance: &str) -> String {
     let mut out = String::from("New sensory observations:");
     if observations.is_empty() {
         out.push_str("\n- none");
-        return out;
-    }
-    if observations.iter().any(|observation| observation.ambient) {
-        out.push_str(
-            "\nAmbient snapshot entries are enabled background rows only; omitted rows are not evidence that a condition disappeared.",
-        );
-    }
-    for observation in observations {
-        let mode = if observation.ambient {
-            "ambient"
-        } else {
-            "observed"
-        };
-        let direction = observation
-            .direction
-            .as_deref()
-            .map(|direction| format!(" from {direction}"))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "\n- {} {}{} observed {} ({}): {}",
-            mode,
-            observation.modality.as_str(),
-            direction,
-            observation.relative_age,
-            observation.observed_at.to_rfc3339(),
-            observation.content.trim()
-        ));
-        out.push_str(&format!(
-            "\n  salience: signature={}; repeated={}; repetition_count={}; seconds_since_previous={}; user_directed={}; novelty_score={:.2}; salience_score={:.2}",
-            observation.salience.signature,
-            if observation.salience.repeated { "yes" } else { "no" },
-            observation.salience.repetition_count,
-            observation
-                .salience
-                .seconds_since_previous
-                .map(|secs| secs.to_string())
-                .unwrap_or_else(|| "none".to_owned()),
-            if observation.salience.user_directed { "yes" } else { "no" },
-            observation.salience.novelty_score,
-            observation.salience.salience_score,
-        ));
-    }
-    out
-}
-
-fn format_sensory_guidance_context(guidance: &str) -> Option<String> {
-    let guidance = guidance.trim();
-    if guidance.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "Sensory context for judging the new observations:\nCurrent sensory guidance: {guidance}"
-    ))
-}
-
-fn format_sensory_detail_request(guidance: &str, observations: &[String]) -> String {
-    let mut out = format!("Sensory detail request:\n{}", guidance.trim());
-    out.push_str("\n\nRetained sensory observations:");
-    if observations.is_empty() {
-        out.push_str("\n- none");
     } else {
+        if observations.iter().any(|observation| observation.ambient) {
+            out.push_str(
+                "\nAmbient snapshot entries are enabled background rows only; omitted rows are not evidence that a condition disappeared.",
+            );
+        }
         for observation in observations {
-            out.push_str("\n- ");
-            out.push_str(observation.trim());
+            let mode = if observation.ambient {
+                "ambient"
+            } else {
+                "observed"
+            };
+            let direction = observation
+                .direction
+                .as_deref()
+                .map(|direction| format!(" from {direction}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n- {} {}{} observed {} ({}): {}",
+                mode,
+                observation.modality.as_str(),
+                direction,
+                observation.relative_age,
+                observation.observed_at.to_rfc3339(),
+                observation.content.trim()
+            ));
+            out.push_str(&format!(
+                "\n  salience: signature={}; repeated={}; repetition_count={}; seconds_since_previous={}; user_directed={}; novelty_score={:.2}; salience_score={:.2}",
+                observation.salience.signature,
+                if observation.salience.repeated { "yes" } else { "no" },
+                observation.salience.repetition_count,
+                observation
+                    .salience
+                    .seconds_since_previous
+                    .map(|secs| secs.to_string())
+                    .unwrap_or_else(|| "none".to_owned()),
+                if observation.salience.user_directed { "yes" } else { "no" },
+                observation.salience.novelty_score,
+                observation.salience.salience_score,
+            ));
         }
     }
+
+    out.push_str("\n\nCurrent sensory guidance: ");
+    let guidance = guidance.trim();
+    if guidance.is_empty() {
+        out.push_str("none");
+    } else {
+        out.push_str(guidance);
+    }
+    out.push_str("\n\nDecision: use write_sensory_memo only for useful durable sensory memo-log output; otherwise use ignore_observations.");
     out
+}
+
+async fn compact_sensory_session(
+    session: &mut Session,
+    lutum: &lutum::Lutum,
+    config: SessionCompactionConfig,
+) -> Result<()> {
+    let items = session.input().items();
+    let protected_prefix_len = sensory_session_protected_prefix_len(items);
+    let compactable_len = items.len().saturating_sub(protected_prefix_len);
+    let Some(relative_cutoff) = session_compaction_cutoff(compactable_len, config.prefix_ratio)
+    else {
+        return Ok(());
+    };
+    let cutoff = protected_prefix_len + relative_cutoff;
+
+    let protected_prefix = items[..protected_prefix_len].to_vec();
+    let prefix = items[protected_prefix_len..cutoff].to_vec();
+    let suffix = items[cutoff..].to_vec();
+
+    let mut summary_items = Vec::with_capacity(prefix.len().saturating_add(1));
+    summary_items.push(ModelInputItem::text(
+        InputMessageRole::System,
+        SESSION_COMPACTION_PROMPT,
+    ));
+    summary_items.extend(prefix);
+    let summary = lutum
+        .text_turn(ModelInput::from_items(summary_items))
+        .collect()
+        .await
+        .context("summarize sensory session prefix")?
+        .assistant_text();
+    let summary = summary.trim();
+    if summary.is_empty() {
+        tracing::warn!("sensory session compaction produced an empty summary");
+        return Ok(());
+    }
+
+    let mut compacted_items = Vec::with_capacity(
+        protected_prefix
+            .len()
+            .saturating_add(suffix.len())
+            .saturating_add(1),
+    );
+    compacted_items.extend(protected_prefix);
+    compacted_items.push(ModelInputItem::assistant_text(format!(
+        "{COMPACTED_SENSORY_SESSION_PREFIX}\n{summary}"
+    )));
+    compacted_items.extend(suffix);
+    *session = Session::from_input(ModelInput::from_items(compacted_items));
+    Ok(())
+}
+
+fn sensory_session_protected_prefix_len(items: &[ModelInputItem]) -> usize {
+    let mut len = match items.first() {
+        Some(ModelInputItem::Message {
+            role: InputMessageRole::System,
+            ..
+        }) => 1,
+        _ => 0,
+    };
+    if matches!(
+        items.get(len),
+        Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
+            if text.starts_with("What I already remember about myself")
+    ) {
+        len += 1;
+    }
+    len
 }
 
 #[async_trait(?Send)]
@@ -610,9 +659,6 @@ impl Module for SensoryModule {
     ) -> Result<()> {
         if !batch.inputs.is_empty() {
             self.handle_inputs(cx, &batch.inputs).await?;
-        }
-        if batch.allocation_updated {
-            self.handle_detail_guidance(cx).await?;
         }
         Ok(())
     }
@@ -648,7 +694,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct SensoryTestRecorder {
-        batches: Rc<RefCell<Vec<(usize, bool)>>>,
+        batches: Rc<RefCell<Vec<usize>>>,
         session_inputs: Rc<RefCell<Vec<Vec<ModelInputItem>>>>,
     }
 
@@ -678,10 +724,7 @@ mod tests {
             cx: &nuillu_module::ActivateCx<'_>,
             batch: &Self::Batch,
         ) -> Result<()> {
-            self.recorder
-                .batches
-                .borrow_mut()
-                .push((batch.inputs.len(), batch.allocation_updated));
+            self.recorder.batches.borrow_mut().push(batch.inputs.len());
             <SensoryModule as Module>::activate(&mut self.inner, cx, batch).await?;
             self.recorder
                 .session_inputs
@@ -689,6 +732,44 @@ mod tests {
                 .push(self.inner.session.input().items().to_vec());
             Ok(())
         }
+    }
+
+    fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
+        let mut usage = Usage::zero();
+        usage.input_tokens = input_tokens;
+        usage.total_tokens = input_tokens;
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("sensory-text".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-sensory".into(),
+                name: name.into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("sensory-text".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage,
+            }),
+        ])
+    }
+
+    fn write_memo_scenario(memo: &str, input_tokens: u64) -> MockTextScenario {
+        tool_scenario(
+            "write_sensory_memo",
+            serde_json::json!({ "memo": memo }).to_string(),
+            input_tokens,
+        )
+    }
+
+    fn ignore_scenario(reason: &str, input_tokens: u64) -> MockTextScenario {
+        tool_scenario(
+            "ignore_observations",
+            serde_json::json!({ "reason": reason }).to_string(),
+            input_tokens,
+        )
     }
 
     fn text_scenario(text: &str, input_tokens: u64) -> MockTextScenario {
@@ -754,7 +835,6 @@ mod tests {
             .register(test_policy(), move |caps| {
                 let mut inner = SensoryModule::new(
                     caps.sensory_input_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.memo(),
                     caps.clock(),
@@ -876,7 +956,7 @@ mod tests {
                 salience_score: 0.85,
             },
         }];
-        let text = format_sensory_batch(&observations);
+        let text = format_sensory_batch(&observations, "");
 
         assert!(text.contains("Ambient snapshot entries are enabled background rows only"));
         assert!(text.contains("ambient smell"));
@@ -890,7 +970,8 @@ mod tests {
             .run_until(async {
                 let mut adapter = MockLlmAdapter::new();
                 for _ in 0..10 {
-                    adapter = adapter.with_text_scenario(text_scenario("batched sensory note", 0));
+                    adapter =
+                        adapter.with_text_scenario(write_memo_scenario("batched sensory note", 0));
                 }
                 let (_blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
@@ -926,19 +1007,19 @@ mod tests {
                 })
                 .await;
 
-                assert_eq!(recorder.batches.borrow().as_slice(), &[(2, false)]);
+                assert_eq!(recorder.batches.borrow().as_slice(), &[2]);
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn input_and_detail_outputs_write_separate_plaintext_memo_logs() {
+    async fn memo_writes_come_from_tools_and_session_history_persists() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let adapter = MockLlmAdapter::new()
-                    .with_text_scenario(text_scenario("Koro is standing at the front.", 0))
-                    .with_text_scenario(text_scenario("Koro growled from the front.", 0));
+                    .with_text_scenario(write_memo_scenario("Koro is standing at the front.", 0))
+                    .with_text_scenario(write_memo_scenario("Koro growled from the front.", 0));
                 let (blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
                 let modules = build_recording_sensory(
@@ -960,18 +1041,10 @@ mod tests {
                         .await
                         .expect("sensory subscriber exists");
                     wait_for_memo_log_count(&blackboard, 1).await;
-                    let mut allocation = sensory_allocation();
-                    let mut config = allocation.for_module(&builtin::sensory());
-                    config.guidance = "What did the agent hear from Koro?".into();
-                    allocation.set(builtin::sensory(), config);
-                    blackboard
-                        .apply(BlackboardCommand::SetAllocation(allocation))
-                        .await;
-                    caps.internal_harness_io()
-                        .allocation_updated_mailbox()
-                        .publish(AllocationUpdated)
+                    sensory
+                        .publish(heard("Koro growled from the front."))
                         .await
-                        .expect("allocation update subscriber exists");
+                        .expect("sensory subscriber exists");
                     wait_for_memo_log_count(&blackboard, 2).await;
                 })
                 .await;
@@ -988,10 +1061,7 @@ mod tests {
                         "Koro growled from the front.",
                     ]
                 );
-                assert_eq!(
-                    recorder.batches.borrow().as_slice(),
-                    &[(1, false), (0, true)]
-                );
+                assert_eq!(recorder.batches.borrow().as_slice(), &[1, 1]);
                 let sessions = recorder.session_inputs.borrow();
                 let first_session = sessions.first().expect("first sensory activation recorded");
                 let ModelInputItem::Message { role, content } = &first_session[0] else {
@@ -1002,6 +1072,123 @@ mod tests {
                     panic!("expected sensory system prompt text");
                 };
                 assert!(system.contains("You are the sensory module"));
+                assert_eq!(
+                    count_message_role(first_session, InputMessageRole::System),
+                    1
+                );
+                assert_eq!(
+                    count_message_role(first_session, InputMessageRole::Developer),
+                    0
+                );
+
+                let second_session = sessions.get(1).expect("second sensory activation recorded");
+                assert!(
+                    second_session.iter().any(|item| {
+                        matches!(
+                            item,
+                            ModelInputItem::ToolResult(result)
+                                if result.name.as_str() == "write_sensory_memo"
+                                    && result.arguments.get().contains("Koro is standing")
+                        )
+                    }),
+                    "second sensory session should retain the first committed tool result"
+                );
+                assert_eq!(
+                    count_message_role(second_session, InputMessageRole::System),
+                    1
+                );
+                assert_eq!(
+                    count_message_role(second_session, InputMessageRole::Developer),
+                    0
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ignore_tool_does_not_write_memo() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(ignore_scenario("repeated background noise", 0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("fan hum continues"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    for _ in 0..50 {
+                        if !recorder.batches.borrow().is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(logs.is_empty());
+                assert_eq!(recorder.batches.borrow().as_slice(), &[1]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allocation_update_alone_does_not_wake_sensory() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new();
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+
+                run_modules(modules, async {
+                    let mut allocation = sensory_allocation();
+                    let mut config = allocation.for_module(&builtin::sensory());
+                    config.guidance = "keep watching the front".into();
+                    allocation.set(builtin::sensory(), config);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(allocation))
+                        .await;
+                    let _ = caps
+                        .internal_harness_io()
+                        .allocation_updated_mailbox()
+                        .publish(AllocationUpdated)
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(logs.is_empty());
+                assert!(recorder.batches.borrow().is_empty());
             })
             .await;
     }
@@ -1012,7 +1199,7 @@ mod tests {
         local
             .run_until(async {
                 let adapter = MockLlmAdapter::new()
-                    .with_text_scenario(text_scenario("Notable sensory change.", 2))
+                    .with_text_scenario(write_memo_scenario("Notable sensory change.", 2))
                     .with_text_scenario(text_scenario("old sensory history summarized", 0));
                 let (_blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
@@ -1040,7 +1227,11 @@ mod tests {
                     for _ in 0..50 {
                         if recorder.session_inputs.borrow().iter().any(|items| {
                             matches!(
-                                &items[0],
+                                &items[1],
+                                ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
+                                    if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
+                            ) || matches!(
+                                &items[1],
                                 ModelInputItem::Message { content, .. }
                                     if matches!(
                                         content.as_slice(),
@@ -1061,7 +1252,11 @@ mod tests {
                     .iter()
                     .find(|items| {
                         matches!(
-                            &items[0],
+                            &items[1],
+                            ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
+                                if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
+                        ) || matches!(
+                            &items[1],
                             ModelInputItem::Message { content, .. }
                                 if matches!(
                                     content.as_slice(),
@@ -1071,10 +1266,17 @@ mod tests {
                         )
                     })
                     .expect("expected a compacted sensory session");
-                let ModelInputItem::Message { content, .. } = &compacted[0] else {
-                    panic!("expected compacted summary message");
+                let ModelInputItem::Message { role, content } = &compacted[0] else {
+                    panic!("expected stable system prompt to remain first");
                 };
-                let [MessageContent::Text(summary)] = content.as_slice() else {
+                assert_eq!(role, &InputMessageRole::System);
+                let [MessageContent::Text(system)] = content.as_slice() else {
+                    panic!("expected system prompt text");
+                };
+                assert!(system.contains("You are the sensory module"));
+                let ModelInputItem::Assistant(lutum::AssistantInputItem::Text(summary)) =
+                    &compacted[1]
+                else {
                     panic!("expected compacted summary text");
                 };
                 assert!(summary.contains("old sensory history summarized"));
@@ -1097,5 +1299,17 @@ mod tests {
                 assert!(!user_texts.contains(&"history-0"));
             })
             .await;
+    }
+
+    fn count_message_role(items: &[ModelInputItem], expected: InputMessageRole) -> usize {
+        items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ModelInputItem::Message { role, .. } if role == &expected
+                )
+            })
+            .count()
     }
 }

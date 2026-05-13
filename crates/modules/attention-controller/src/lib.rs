@@ -392,11 +392,6 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
                 output.push_str(content.trim());
                 push_optional_reason(&mut output, Some(reason));
             }
-            AttentionControlRequest::SensoryDetail { question, reason } => {
-                output.push_str("Sensory detail: ");
-                output.push_str(question.trim());
-                push_optional_reason(&mut output, reason.as_deref());
-            }
             AttentionControlRequest::Policy {
                 reason,
                 candidate_trigger,
