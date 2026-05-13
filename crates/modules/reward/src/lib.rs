@@ -32,8 +32,8 @@ pub use estimation::{ValueEstimateMemo, ValueEstimatePrediction, ValueEstimatorM
 pub use policy::{PolicyCandidate, PolicyFormationDecision, PolicyModule, PolicyWriter};
 pub use query::{PolicyRetrievalHit, PolicyRetrievalMemo, PolicySearcher, QueryPolicyModule};
 pub use reward::{
-    NovelPolicyRequest, ObservedReward, PolicyCredit, PolicyValueUpdater, RewardAssessment,
-    RewardMemo, RewardModule,
+    NovelPolicyRequest, ObservedReward, PolicyCredit, PolicyRewardUpdate, PolicyValueUpdater,
+    RewardAssessment, RewardMemo, RewardModule,
 };
 
 // ---------------------------------------------------------------------------

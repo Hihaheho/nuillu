@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, params};
-pub use nuillu_module::ports::Embedder;
 use nuillu_memory::{IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory};
+pub use nuillu_module::ports::Embedder;
 use nuillu_module::ports::PortError;
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
@@ -1196,16 +1196,24 @@ impl PolicyStore for LibsqlPolicyStore {
             JOIN {embeddings} AS e ON e.policy_id = p.id
             WHERE p.deleted_at_ms IS NULL
               AND e.trigger_updated_at_ms = p.updated_at_ms
+              AND (p.rank = ?2 OR p.decay_remaining_secs > 0)
             ORDER BY distance ASC,
                      p.id ASC
-            LIMIT ?2
+            LIMIT ?3
             "#,
             policies = self.table_name,
             embeddings = self.embedding_table_name,
         );
         let mut rows = self
             .conn
-            .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
+            .query(
+                &sql,
+                params![
+                    embedding_json,
+                    policy_rank_to_i64(PolicyRank::Core),
+                    limit_to_i64(q.limit)
+                ],
+            )
             .await
             .map_err(map_libsql_error)?;
         let mut out = Vec::new();
@@ -2347,6 +2355,54 @@ mod tests {
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].policy.index, alpha);
+    }
+
+    #[tokio::test]
+    async fn policy_search_filters_expired_non_core_policies() {
+        let store = policy_store().await;
+        store
+            .put(IndexedPolicy {
+                index: PolicyIndex::new("expired"),
+                trigger: "alpha".into(),
+                behavior: "expired behavior".into(),
+                rank: PolicyRank::Established,
+                expected_reward: SignedUnitF32::ZERO,
+                confidence: UnitF32::ZERO,
+                value: SignedUnitF32::ZERO,
+                reward_tokens: 0,
+                decay_remaining_secs: 0,
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedPolicy {
+                index: PolicyIndex::new("core"),
+                trigger: "alpha".into(),
+                behavior: "core behavior".into(),
+                rank: PolicyRank::Core,
+                expected_reward: SignedUnitF32::ZERO,
+                confidence: UnitF32::ZERO,
+                value: SignedUnitF32::ZERO,
+                reward_tokens: 0,
+                decay_remaining_secs: 0,
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&PolicyQuery {
+                trigger: "alpha".into(),
+                limit: 8,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| hit.policy.index.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["core"]
+        );
     }
 
     #[tokio::test]

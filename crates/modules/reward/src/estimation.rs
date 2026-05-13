@@ -1,16 +1,35 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
     CognitionLogUpdatedInbox, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
+    format_current_attention_guidance,
 };
-use nuillu_types::PolicyIndex;
+use nuillu_types::{ModuleId, PolicyIndex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{PolicyWindowKey, PolicyWindowReader};
+use crate::{PolicyWindowKey, PolicyWindowReader, TypedPolicyRetrievalWindow};
+
+const SYSTEM_PROMPT: &str = r#"You are the value-estimator module.
+For each policy surfaced by query-policy, predict its expected reward in the current cognitive
+context. Return a prediction for every provided policy index. The prediction is a scalar in
+[-1, 1]. Do not mutate policy state, do not create policies, and do not invent policy indexes."#;
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ValueEstimationDecision {
+    pub predictions: Vec<ValueEstimationPrediction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ValueEstimationPrediction {
+    pub policy_index: PolicyIndex,
+    pub predicted_expected_reward: f32,
+    pub rationale: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValueEstimateMemo {
@@ -27,15 +46,17 @@ pub struct ValueEstimatePrediction {
 }
 
 pub struct ValueEstimatorModule {
+    owner: ModuleId,
     memo_updates: MemoUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     allocation_updates: AllocationUpdatedInbox,
-    _blackboard: BlackboardReader,
-    _cognition: CognitionLogReader,
-    _allocation: AllocationReader,
+    blackboard: BlackboardReader,
+    cognition: CognitionLogReader,
+    allocation: AllocationReader,
     windows: PolicyWindowReader,
     memo: TypedMemo<ValueEstimateMemo>,
-    _llm: LlmAccess,
+    llm: LlmAccess,
+    session: Session,
     processed: HashSet<PolicyWindowKey>,
 }
 
@@ -53,15 +74,17 @@ impl ValueEstimatorModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
+            owner: ModuleId::new(<Self as Module>::id()).expect("value-estimator id is valid"),
             memo_updates,
             cognition_updates,
             allocation_updates,
-            _blackboard: blackboard,
-            _cognition: cognition,
-            _allocation: allocation,
+            blackboard,
+            cognition,
+            allocation,
             windows,
             memo,
-            _llm: llm,
+            llm,
+            session: Session::new(),
             processed: HashSet::new(),
         }
     }
@@ -72,17 +95,7 @@ impl ValueEstimatorModule {
             if !self.processed.insert(window.key.clone()) {
                 continue;
             }
-            let predictions = window
-                .payload
-                .hits
-                .iter()
-                .map(|hit| ValueEstimatePrediction {
-                    policy_index: hit.policy_index.clone(),
-                    predicted_expected_reward: hit.expected_reward,
-                    confidence_hint: hit.confidence,
-                    rationale: "v1 baseline: use stored expected_reward for this context".into(),
-                })
-                .collect::<Vec<_>>();
+            let predictions = self.estimate_window(&window).await?;
             if predictions.is_empty() {
                 continue;
             }
@@ -95,6 +108,75 @@ impl ValueEstimatorModule {
         }
         Ok(())
     }
+
+    async fn estimate_window(
+        &mut self,
+        window: &TypedPolicyRetrievalWindow,
+    ) -> Result<Vec<ValueEstimatePrediction>> {
+        let cognition = self.cognition.snapshot().await;
+        let memos = self.blackboard.recent_memo_logs().await;
+        let allocation = self.allocation.snapshot().await;
+
+        self.session.push_ephemeral_system(SYSTEM_PROMPT);
+        if let Some(guidance) = format_current_attention_guidance(&allocation) {
+            self.session.push_ephemeral_system(guidance);
+        }
+        self.session.push_ephemeral_user(format!(
+            "Value-estimation request for {}:\nRetrieval window:\n{}\n\nRecent cognition:\n{}\n\nRecent memos:\n{}",
+            self.owner,
+            serde_json::to_string(&window.payload).unwrap_or_default(),
+            serde_json::to_string(&cognition).unwrap_or_default(),
+            serde_json::to_string(&memos).unwrap_or_default(),
+        ));
+
+        let lutum = self.llm.lutum().await;
+        let result = self
+            .session
+            .structured_turn::<ValueEstimationDecision>(&lutum)
+            .collect()
+            .await
+            .context("value-estimator structured turn failed")?;
+        let StructuredTurnOutcome::Structured(decision) = result.semantic else {
+            anyhow::bail!("value-estimator structured turn refused");
+        };
+
+        Ok(normalize_predictions(window, decision))
+    }
+}
+
+fn normalize_predictions(
+    window: &TypedPolicyRetrievalWindow,
+    decision: ValueEstimationDecision,
+) -> Vec<ValueEstimatePrediction> {
+    let mut by_index = decision
+        .predictions
+        .into_iter()
+        .map(|prediction| (prediction.policy_index.clone(), prediction))
+        .collect::<HashMap<_, _>>();
+
+    window
+        .payload
+        .hits
+        .iter()
+        .map(|hit| {
+            let Some(prediction) = by_index.remove(&hit.policy_index) else {
+                return ValueEstimatePrediction {
+                    policy_index: hit.policy_index.clone(),
+                    predicted_expected_reward: hit.expected_reward,
+                    confidence_hint: hit.confidence,
+                    rationale:
+                        "fallback: no value-estimator prediction returned, used stored expected_reward"
+                            .into(),
+                };
+            };
+            ValueEstimatePrediction {
+                policy_index: hit.policy_index.clone(),
+                predicted_expected_reward: prediction.predicted_expected_reward.clamp(-1.0, 1.0),
+                confidence_hint: hit.confidence,
+                rationale: prediction.rationale,
+            }
+        })
+        .collect()
 }
 
 fn render_value_estimate(memo: &ValueEstimateMemo) -> String {
@@ -148,5 +230,84 @@ impl Module for ValueEstimatorModule {
         _batch: &Self::Batch,
     ) -> Result<()> {
         ValueEstimatorModule::activate(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use nuillu_types::{PolicyRank, ReplicaIndex, builtin};
+
+    use super::*;
+    use crate::{PolicyRetrievalHit, PolicyRetrievalMemo};
+
+    #[test]
+    fn normalize_predictions_filters_unknowns_and_fills_missing_hits() {
+        let owner =
+            nuillu_types::ModuleInstanceId::new(builtin::query_policy(), ReplicaIndex::ZERO);
+        let window = TypedPolicyRetrievalWindow {
+            key: PolicyWindowKey {
+                owner: owner.clone(),
+                memo_index: 0,
+            },
+            written_at: Utc::now(),
+            plaintext: "policy plaintext".into(),
+            payload: PolicyRetrievalMemo {
+                request_context: "context".into(),
+                query_text: "alpha".into(),
+                hits: vec![
+                    PolicyRetrievalHit {
+                        policy_index: PolicyIndex::new("known"),
+                        similarity: 0.9,
+                        rank: PolicyRank::Tentative,
+                        trigger: "alpha".into(),
+                        behavior: "do alpha".into(),
+                        expected_reward: 0.25,
+                        confidence: 0.4,
+                        value: 0.1,
+                        reward_tokens: 0,
+                    },
+                    PolicyRetrievalHit {
+                        policy_index: PolicyIndex::new("missing"),
+                        similarity: 0.8,
+                        rank: PolicyRank::Tentative,
+                        trigger: "beta".into(),
+                        behavior: "do beta".into(),
+                        expected_reward: -0.2,
+                        confidence: 0.3,
+                        value: -0.1,
+                        reward_tokens: 0,
+                    },
+                ],
+            },
+        };
+        let decision = ValueEstimationDecision {
+            predictions: vec![
+                ValueEstimationPrediction {
+                    policy_index: PolicyIndex::new("known"),
+                    predicted_expected_reward: 4.0,
+                    rationale: "strong context".into(),
+                },
+                ValueEstimationPrediction {
+                    policy_index: PolicyIndex::new("unknown"),
+                    predicted_expected_reward: -1.0,
+                    rationale: "ignore".into(),
+                },
+            ],
+        };
+
+        let predictions = normalize_predictions(&window, decision);
+
+        assert_eq!(
+            predictions
+                .iter()
+                .map(|prediction| (
+                    prediction.policy_index.as_str(),
+                    prediction.predicted_expected_reward,
+                    prediction.confidence_hint
+                ))
+                .collect::<Vec<_>>(),
+            vec![("known", 1.0, 0.4), ("missing", -0.2, 0.3)]
+        );
     }
 }

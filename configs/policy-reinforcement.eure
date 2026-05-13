@@ -2,7 +2,7 @@ alpha = 0.2
 beta = 0.1
 confidence-gamma = 0.05
 confidence-scale = 0.5
-positive-token-min = 0.2
+settle-band = 0.2
 
 external-weight = 1.0
 task-weight = 1.0

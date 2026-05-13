@@ -3350,7 +3350,6 @@ dependencies = [
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
- "nuillu-policy",
  "nuillu-predict",
  "nuillu-query-agentic",
  "nuillu-reward",
@@ -3413,27 +3412,12 @@ dependencies = [
 ]
 
 [[package]]
-
 name = "nuillu-openai-embedding-adapter"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "nuillu-module",
  "reqwest 0.12.28",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "nuillu-policy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "nuillu-module",
- "nuillu-types",
- "schemars",
  "serde",
  "tokio",
 ]

@@ -68,6 +68,12 @@ impl PolicySearcher {
                 limit,
             })
             .await?;
+        let hits = hits
+            .into_iter()
+            .filter(|hit| {
+                hit.policy.rank == PolicyRank::Core || hit.policy.decay_remaining_secs > 0
+            })
+            .collect::<Vec<_>>();
         let now = self.clock.now();
         for hit in &hits {
             self.blackboard
@@ -235,5 +241,132 @@ impl Module for QueryPolicyModule {
         _batch: &Self::Batch,
     ) -> Result<()> {
         QueryPolicyModule::activate(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use nuillu_blackboard::Blackboard;
+    use nuillu_module::ports::{PortError, SystemClock};
+    use nuillu_types::{SignedUnitF32, UnitF32};
+
+    use super::*;
+    use crate::{IndexedPolicy, NewPolicy, PolicyRecord};
+
+    #[derive(Default)]
+    struct RecordingPolicyStore {
+        records: Mutex<Vec<PolicyRecord>>,
+    }
+
+    impl RecordingPolicyStore {
+        fn seed(&self, record: PolicyRecord) {
+            self.records
+                .lock()
+                .expect("policy store mutex poisoned")
+                .push(record);
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PolicyStore for RecordingPolicyStore {
+        async fn insert(&self, _policy: NewPolicy) -> Result<PolicyIndex, PortError> {
+            Ok(PolicyIndex::new("unused"))
+        }
+
+        async fn put(&self, _policy: IndexedPolicy) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn get(&self, _index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError> {
+            Ok(None)
+        }
+
+        async fn list_by_rank(&self, _rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn search(&self, _q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError> {
+            let mut records = self
+                .records
+                .lock()
+                .expect("policy store mutex poisoned")
+                .clone();
+            records.sort_by(|left, right| left.index.as_str().cmp(right.index.as_str()));
+            Ok(records
+                .into_iter()
+                .map(|policy| PolicySearchHit {
+                    policy,
+                    similarity: 1.0,
+                })
+                .collect())
+        }
+
+        async fn reinforce(
+            &self,
+            _index: &PolicyIndex,
+            _value_delta: f32,
+            _reward_tokens_delta: u32,
+            _expected_reward_delta: f32,
+            _confidence_delta: f32,
+        ) -> Result<PolicyRecord, PortError> {
+            Err(PortError::Backend("unused".into()))
+        }
+
+        async fn delete(&self, _index: &PolicyIndex) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn test_record(index: &str) -> PolicyRecord {
+        PolicyRecord {
+            index: PolicyIndex::new(index),
+            trigger: "alpha trigger".into(),
+            behavior: "alpha behavior".into(),
+            rank: PolicyRank::Tentative,
+            expected_reward: SignedUnitF32::ZERO,
+            confidence: UnitF32::ZERO,
+            value: SignedUnitF32::ZERO,
+            reward_tokens: 0,
+            decay_remaining_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_searcher_filters_expired_non_core_records() {
+        let blackboard = Blackboard::default();
+        let primary = Arc::new(RecordingPolicyStore::default());
+        primary.seed(PolicyRecord {
+            index: PolicyIndex::new("expired"),
+            decay_remaining_secs: 0,
+            ..test_record("expired")
+        });
+        primary.seed(PolicyRecord {
+            index: PolicyIndex::new("active"),
+            decay_remaining_secs: 60,
+            ..test_record("active")
+        });
+        primary.seed(PolicyRecord {
+            index: PolicyIndex::new("core"),
+            rank: PolicyRank::Core,
+            decay_remaining_secs: 0,
+            ..test_record("core")
+        });
+        let searcher = PolicySearcher::new(primary, blackboard.clone(), Arc::new(SystemClock));
+
+        let hits = searcher.search("alpha", 8).await.unwrap();
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.policy.index.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active", "core"]
+        );
+        let metadata = blackboard.read(|bb| bb.policy_metadata().clone()).await;
+        assert!(metadata.contains_key(&PolicyIndex::new("active")));
+        assert!(metadata.contains_key(&PolicyIndex::new("core")));
+        assert!(!metadata.contains_key(&PolicyIndex::new("expired")));
     }
 }

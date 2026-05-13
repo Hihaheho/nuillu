@@ -71,8 +71,22 @@ pub struct NovelPolicyRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RewardMemo {
     pub value_estimate_window: PolicyWindowKey,
+    pub observed_reward: ObservedReward,
     pub observed_scalar: f32,
-    pub updated_policy_indexes: Vec<PolicyIndex>,
+    pub updates: Vec<PolicyRewardUpdate>,
+    pub novel_policy_requested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyRewardUpdate {
+    pub policy_index: PolicyIndex,
+    pub credit: f32,
+    pub compared_expected_reward: f32,
+    pub td_error: f32,
+    pub value_delta: f32,
+    pub reward_tokens_delta: u32,
+    pub expected_reward_delta: f32,
+    pub confidence_delta: f32,
 }
 
 /// Atomically applies TD-style reinforcement deltas to the primary policy
@@ -160,7 +174,7 @@ struct ReinforcementConfig {
     beta: f32,
     confidence_gamma: f32,
     confidence_scale: f32,
-    positive_token_min: f32,
+    settle_band: f32,
     external_weight: f32,
     task_weight: f32,
     social_weight: f32,
@@ -202,7 +216,7 @@ struct ReinforcementConfigFile {
     beta: f64,
     confidence_gamma: f64,
     confidence_scale: f64,
-    positive_token_min: f64,
+    settle_band: f64,
     external_weight: f64,
     task_weight: f64,
     social_weight: f64,
@@ -229,7 +243,7 @@ impl ReinforcementConfigFile {
         validate_finite("beta", self.beta)?;
         validate_finite("confidence-gamma", self.confidence_gamma)?;
         validate_finite("confidence-scale", self.confidence_scale)?;
-        validate_finite("positive-token-min", self.positive_token_min)?;
+        validate_finite("settle-band", self.settle_band)?;
         validate_finite("external-weight", self.external_weight)?;
         validate_finite("task-weight", self.task_weight)?;
         validate_finite("social-weight", self.social_weight)?;
@@ -258,7 +272,7 @@ impl ReinforcementConfigFile {
             beta: self.beta as f32,
             confidence_gamma: self.confidence_gamma as f32,
             confidence_scale: self.confidence_scale as f32,
-            positive_token_min: self.positive_token_min as f32,
+            settle_band: self.settle_band as f32,
             external_weight: self.external_weight as f32,
             task_weight: self.task_weight as f32,
             social_weight: self.social_weight as f32,
@@ -387,7 +401,7 @@ impl RewardModule {
     ) -> Result<()> {
         let assessment = self.assess(&estimate, &retrieval).await?;
         let observed_scalar = self.config.observed_scalar(&assessment.observed_reward);
-        let mut updated = Vec::new();
+        let mut updates = Vec::new();
 
         for prediction in &estimate.predictions {
             let Some(credit) = assessment
@@ -401,23 +415,22 @@ impl RewardModule {
             if credit <= 0.0 {
                 continue;
             }
-            let Some(hit) = retrieval
+            if !retrieval
                 .hits
                 .iter()
-                .find(|hit| hit.policy_index == prediction.policy_index)
-            else {
+                .any(|hit| hit.policy_index == prediction.policy_index)
+            {
                 continue;
             };
             let td_error = observed_scalar - prediction.predicted_expected_reward;
             let expected_reward_delta = self.config.alpha * credit * td_error;
-            let value_delta = self.config.beta * credit * (observed_scalar - hit.value);
+            let value_delta = self.config.beta * credit * td_error.clamp(-1.0, 1.0);
             let confidence_delta = confidence_delta(
                 td_error.abs(),
                 self.config.confidence_gamma,
                 self.config.confidence_scale,
-            );
-            let reward_tokens_delta =
-                u32::from(credit > 0.0 && observed_scalar >= self.config.positive_token_min);
+            ) * credit;
+            let reward_tokens_delta = u32::from(td_error.abs() <= self.config.settle_band);
             self.updater
                 .reinforce(
                     &prediction.policy_index,
@@ -427,9 +440,19 @@ impl RewardModule {
                     confidence_delta,
                 )
                 .await?;
-            updated.push(prediction.policy_index.clone());
+            updates.push(PolicyRewardUpdate {
+                policy_index: prediction.policy_index.clone(),
+                credit,
+                compared_expected_reward: prediction.predicted_expected_reward,
+                td_error,
+                value_delta,
+                reward_tokens_delta,
+                expected_reward_delta,
+                confidence_delta,
+            });
         }
 
+        let novel_policy_requested = assessment.novel_policy_request.is_some();
         if let Some(request) = &assessment.novel_policy_request {
             let _ = self
                 .attention_control
@@ -443,8 +466,10 @@ impl RewardModule {
 
         let payload = RewardMemo {
             value_estimate_window: estimate_key,
+            observed_reward: assessment.observed_reward.clone(),
             observed_scalar,
-            updated_policy_indexes: updated,
+            updates,
+            novel_policy_requested,
         };
         let plaintext = render_reward_memo(&payload, &assessment);
         self.memo.write(payload, plaintext).await;
@@ -486,11 +511,7 @@ fn confidence_delta(abs_td_error: f32, gamma: f32, scale: f32) -> f32 {
     if scale <= 0.0 {
         return 0.0;
     }
-    if abs_td_error <= scale {
-        gamma * (1.0 - abs_td_error / scale)
-    } else {
-        -gamma * ((abs_td_error - scale) / scale).clamp(0.0, 1.0)
-    }
+    gamma * (1.0 - abs_td_error / scale).max(0.0)
 }
 
 fn validate_finite(name: &str, value: f64) -> Result<()> {
@@ -502,15 +523,11 @@ fn validate_finite(name: &str, value: f64) -> Result<()> {
 }
 
 fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> String {
-    format!(
-        "Reward assessment for {}#{}\nObserved scalar: {:.3}\nUpdated policies: {:?}\nObserved channels: external {:.3}, task {:.3}, social {:.3}, cost {:.3}, risk {:.3}, novelty {:.3}\nRationale: {}",
+    let mut output = format!(
+        "Reward assessment for {}#{}\nObserved scalar: {:.3}\nObserved channels: external {:.3}, task {:.3}, social {:.3}, cost {:.3}, risk {:.3}, novelty {:.3}\nRationale: {}",
         memo.value_estimate_window.owner,
         memo.value_estimate_window.memo_index,
         memo.observed_scalar,
-        memo.updated_policy_indexes
-            .iter()
-            .map(|index| index.as_str())
-            .collect::<Vec<_>>(),
         assessment.observed_reward.external,
         assessment.observed_reward.task,
         assessment.observed_reward.social,
@@ -518,7 +535,33 @@ fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> Strin
         assessment.observed_reward.risk,
         assessment.observed_reward.novelty,
         assessment.rationale.trim(),
-    )
+    );
+    if memo.updates.is_empty() {
+        output.push_str("\nPolicy updates: none");
+    } else {
+        output.push_str("\nPolicy updates:");
+        for update in &memo.updates {
+            output.push_str("\nPolicy [");
+            output.push_str(update.policy_index.as_str());
+            output.push_str(&format!(
+                "]: credit {:.3}; expected_reward {:.3}; td_error {:.3}; value_delta {:.3}; expected_reward_delta {:.3}; confidence_delta {:.3}; reward_tokens_delta {}",
+                update.credit,
+                update.compared_expected_reward,
+                update.td_error,
+                update.value_delta,
+                update.expected_reward_delta,
+                update.confidence_delta,
+                update.reward_tokens_delta,
+            ));
+        }
+    }
+    if let Some(request) = &assessment.novel_policy_request {
+        output.push_str("\nNovel policy request: ");
+        output.push_str(request.reason.trim());
+    } else {
+        output.push_str("\nNovel policy request: none");
+    }
+    output
 }
 
 #[async_trait(?Send)]
@@ -574,6 +617,7 @@ mod tests {
 
         assert_eq!(config.alpha, 0.2);
         assert_eq!(config.beta, 0.1);
+        assert_eq!(config.settle_band, 0.2);
         assert_eq!(
             config.observed_scalar(&ObservedReward {
                 external: 0.2,
@@ -585,5 +629,12 @@ mod tests {
             }),
             0.7
         );
+    }
+
+    #[test]
+    fn confidence_delta_rewards_accurate_predictions_only() {
+        assert_eq!(confidence_delta(0.0, 0.05, 0.5), 0.05);
+        assert_eq!(confidence_delta(0.5, 0.05, 0.5), 0.0);
+        assert_eq!(confidence_delta(1.0, 0.05, 0.5), 0.0);
     }
 }
