@@ -1,0 +1,81 @@
+id = "full-agent-surprise-on-prediction-violation"
+description = "Full-agent case: Demonstrates the steps[] schema. Step 1 feeds a typical scene and waits for predict to emit a forward prediction memo. Step 2 then injects a sensory input that violates the prediction and waits for surprise to emit its assessment, after which the case-level checks verify predict + surprise memos and that surprise-driven memory was preserved."
+now = "2026-05-10T08:21:00+09:00"
+modules = [
+  "sensory",
+  "cognition-gate",
+  "attention-controller",
+  "query-vector",
+  "memory",
+  "predict",
+  "surprise",
+  "speak-gate",
+  "speak",
+]
+
+limits {
+  max-llm-calls = 30
+}
+
+participants = ["Koro"]
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events."
+}
+
+@ memories[] {
+  rank = "permanent"
+  datetime = "2025-05-10"
+  content = "Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves."
+}
+
+@ steps[] {
+  description = "Baseline scene that matches Nui's prior model of Koro. Wait for predict to emit a forward prediction memo, then assert it landed in the agent observations."
+  wait-for.$variant: some.memo-from
+  wait-for.module = "predict"
+  wait-for.timeout-ms = 15000
+
+  @ inputs[] {
+    $variant: seen
+    direction = "simulation"
+    appearance = "Koro walks calmly toward his food bowl, sniffs it once, and lowers his head to eat."
+  }
+
+  @ checks[] {
+    $variant: json-pointer-contains
+    name = "predict-memo-present"
+    must-pass = true
+    pointer = "/observations/agent/memo_logs/predict/0/content"
+    contains = "Koro"
+  }
+}
+
+@ steps[] {
+  description = "Inject a sensory input that violates the prediction. Wait for surprise to emit its assessment memo."
+  wait-for.$variant: some.memo-from
+  wait-for.module = "surprise"
+  wait-for.timeout-ms = 15000
+
+  @ inputs[] {
+    $variant: seen
+    direction = "simulation"
+    appearance = "Koro suddenly snaps his head up from the bowl, bites the rim of the bowl, and starts growling toward the empty doorway."
+  }
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "surprise-memo-present"
+  must-pass = true
+  pointer = "/observations/agent/memo_logs/surprise/0/content"
+  contains = "surprise"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "memory-grew-from-surprise"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "Koro"
+}

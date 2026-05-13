@@ -75,6 +75,8 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
+    pub steps: Vec<EvalStep>,
+    #[eure(default)]
     pub participants: Vec<String>,
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
@@ -106,6 +108,31 @@ pub enum FullAgentInput {
         #[eure(default)]
         direction: Option<String>,
         appearance: Text,
+    },
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct EvalStep {
+    #[eure(default)]
+    pub description: Option<Text>,
+    pub inputs: Vec<FullAgentInput>,
+    #[eure(default)]
+    pub wait_for: Option<WaitFor>,
+    #[eure(default)]
+    pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(
+    crate = ::eure::document,
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case"
+)]
+pub enum WaitFor {
+    MemoFrom {
+        module: EvalModule,
+        timeout_ms: u64,
     },
 }
 
@@ -243,6 +270,17 @@ impl FullAgentCase {
             .clone()
             .unwrap_or_else(|| DEFAULT_FULL_AGENT_MODULES.to_vec())
     }
+
+    /// Inputs flattened across steps, or the legacy `inputs` list when
+    /// `steps` is empty. Used for places that need to summarize the entire
+    /// sensory feed of a case (e.g. judge prompt rendering).
+    pub fn flat_inputs(&self) -> Vec<&FullAgentInput> {
+        if !self.steps.is_empty() {
+            self.steps.iter().flat_map(|step| step.inputs.iter()).collect()
+        } else {
+            self.inputs.iter().collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,8 +385,8 @@ impl EvalCase {
     pub fn prompt_for_judge(&self) -> String {
         match self {
             Self::FullAgent(case) => case
-                .inputs
-                .iter()
+                .flat_inputs()
+                .into_iter()
                 .map(FullAgentInput::as_prompt_line)
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -793,27 +831,49 @@ fn is_full_agent_case_path(path: &Path) -> bool {
 }
 
 fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
-    if case.inputs.is_empty() {
+    if !case.inputs.is_empty() && !case.steps.is_empty() {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
-            message: "full-agent case must have at least one input".to_string(),
+            message: "full-agent case must use either `inputs` or `steps`, not both".to_string(),
+        });
+    }
+    if case.inputs.is_empty() && case.steps.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "full-agent case must have at least one input or one step".to_string(),
         });
     }
     for (index, input) in case.inputs.iter().enumerate() {
-        match input {
-            FullAgentInput::Heard { content, .. } if content.content.trim().is_empty() => {
+        validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
+    }
+    for (step_index, step) in case.steps.iter().enumerate() {
+        if step.inputs.is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("steps[{step_index}].inputs must not be empty"),
+            });
+        }
+        for (input_index, input) in step.inputs.iter().enumerate() {
+            validate_full_agent_input(
+                path,
+                &format!("steps[{step_index}].inputs[{input_index}]"),
+                input,
+            )?;
+        }
+        if let Some(wait_for) = &step.wait_for {
+            validate_wait_for(path, step_index, wait_for)?;
+        }
+        for check in &step.checks {
+            validate_check(path, check)?;
+            if !is_step_compatible_check(check) {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
-                    message: format!("inputs[{index}].content must not be empty"),
+                    message: format!(
+                        "steps[{step_index}].checks: {kind} cannot run mid-step (use the case-level checks instead)",
+                        kind = check.kind_name()
+                    ),
                 });
             }
-            FullAgentInput::Seen { appearance, .. } if appearance.content.trim().is_empty() => {
-                return Err(CaseFileError::Validation {
-                    path: path.to_path_buf(),
-                    message: format!("inputs[{index}].appearance must not be empty"),
-                });
-            }
-            _ => {}
         }
     }
     validate_modules(path, case.modules.as_deref())?;
@@ -825,6 +885,60 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
         &case.memos,
         &case.limits,
         &case.checks,
+    )
+}
+
+fn validate_full_agent_input(
+    path: &Path,
+    label: &str,
+    input: &FullAgentInput,
+) -> Result<(), CaseFileError> {
+    match input {
+        FullAgentInput::Heard { content, .. } if content.content.trim().is_empty() => {
+            Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}.content must not be empty"),
+            })
+        }
+        FullAgentInput::Seen { appearance, .. } if appearance.content.trim().is_empty() => {
+            Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}.appearance must not be empty"),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_wait_for(
+    path: &Path,
+    step_index: usize,
+    wait_for: &WaitFor,
+) -> Result<(), CaseFileError> {
+    match wait_for {
+        WaitFor::MemoFrom { timeout_ms, .. } => {
+            if *timeout_ms == 0 {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "steps[{step_index}].wait-for.timeout-ms must be greater than zero"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Mid-step checks can only consult agent observations (JSON pointers / text in
+/// the running artifact). Trace and rubric checks require a completed run.
+fn is_step_compatible_check(check: &Check) -> bool {
+    matches!(
+        check,
+        Check::JsonPointerEquals { .. }
+            | Check::JsonPointerContains { .. }
+            | Check::ArtifactTextContains { .. }
+            | Check::ArtifactTextExact { .. }
     )
 }
 
@@ -1209,6 +1323,170 @@ mod tests {
         let occurred_at = parse_memory_datetime("2025-05-10T08:21:00+09:00", None).unwrap();
 
         assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T23:21:00+00:00");
+    }
+
+    fn full_agent_case_with(
+        inputs: Vec<FullAgentInput>,
+        steps: Vec<EvalStep>,
+    ) -> FullAgentCase {
+        FullAgentCase {
+            id: Some("case".to_string()),
+            description: None,
+            now: None,
+            modules: None,
+            inputs,
+            steps,
+            participants: Vec::new(),
+            memories: Vec::new(),
+            memos: Vec::new(),
+            limits: EvalLimits::default(),
+            checks: Vec::new(),
+            modules_checks: Vec::new(),
+            scoring: CaseScoring::default(),
+        }
+    }
+
+    fn seen_input(appearance: &str) -> FullAgentInput {
+        FullAgentInput::Seen {
+            direction: None,
+            appearance: Text::plaintext(appearance),
+        }
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_both_inputs_and_steps() {
+        let case = full_agent_case_with(
+            vec![seen_input("input")],
+            vec![EvalStep {
+                description: None,
+                inputs: vec![seen_input("step")],
+                wait_for: None,
+                checks: Vec::new(),
+            }],
+        );
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("either `inputs` or `steps`"))
+        );
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_empty_step_inputs() {
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![EvalStep {
+                description: None,
+                inputs: Vec::new(),
+                wait_for: None,
+                checks: Vec::new(),
+            }],
+        );
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("steps[0].inputs must not be empty"))
+        );
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_zero_wait_timeout() {
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![EvalStep {
+                description: None,
+                inputs: vec![seen_input("step")],
+                wait_for: Some(WaitFor::MemoFrom {
+                    module: EvalModule::Predict,
+                    timeout_ms: 0,
+                }),
+                checks: Vec::new(),
+            }],
+        );
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("timeout-ms must be greater than zero"))
+        );
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_unsupported_step_check_kind() {
+        let trace_check = Check::TraceSpan {
+            common: CheckCommon::default(),
+            span_name: "x".to_string(),
+        };
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![EvalStep {
+                description: None,
+                inputs: vec![seen_input("step")],
+                wait_for: None,
+                checks: vec![trace_check],
+            }],
+        );
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("trace-span cannot run mid-step"))
+        );
+    }
+
+    #[test]
+    fn parses_surprise_on_prediction_violation_sample_case() {
+        let path =
+            Path::new("../../eval-cases/full-agent/surprise-on-prediction-violation.eure");
+        let case = parse_full_agent_case_file(path).expect("sample case should parse");
+        assert_eq!(case.steps.len(), 2);
+        assert!(case.inputs.is_empty());
+        assert!(matches!(
+            case.steps[0].wait_for,
+            Some(WaitFor::MemoFrom {
+                module: EvalModule::Predict,
+                ..
+            })
+        ));
+        assert!(matches!(
+            case.steps[1].wait_for,
+            Some(WaitFor::MemoFrom {
+                module: EvalModule::Surprise,
+                ..
+            })
+        ));
+        assert_eq!(case.steps[0].checks.len(), 1);
+    }
+
+    #[test]
+    fn validate_full_agent_case_accepts_steps_with_memo_from_wait() {
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![
+                EvalStep {
+                    description: Some(Text::plaintext("step 1")),
+                    inputs: vec![seen_input("baseline")],
+                    wait_for: Some(WaitFor::MemoFrom {
+                        module: EvalModule::Predict,
+                        timeout_ms: 5_000,
+                    }),
+                    checks: vec![Check::JsonPointerContains {
+                        common: CheckCommon::default(),
+                        pointer: "/observations/agent/memo_logs/predict/0/content".to_string(),
+                        contains: "predict".to_string(),
+                    }],
+                },
+                EvalStep {
+                    description: Some(Text::plaintext("step 2")),
+                    inputs: vec![seen_input("violation")],
+                    wait_for: Some(WaitFor::MemoFrom {
+                        module: EvalModule::Surprise,
+                        timeout_ms: 5_000,
+                    }),
+                    checks: Vec::new(),
+                },
+            ],
+        );
+
+        validate_full_agent_case(Path::new("case.eure"), &case).unwrap();
     }
 
     #[test]
