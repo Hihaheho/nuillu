@@ -1,320 +1,452 @@
 # Memory Ledger
 
 Date: 2026-05-13
-Scope: v2 durable memory storage, retrieval, extraction, and fact-update design.
+Scope: v2 durable memory organization, recall, linking, compaction, and dream-like balancing.
 
 This document describes desired architecture, not implementation progress. It extends
-`attention-schema.md` and `implementation-design.md` without changing the current v1
-runtime, module wiring, prompts, migrations, or public boot APIs.
+`attention-schema.md` and `implementation-design.md` without changing current module
+wiring, migrations, prompts, or public boot APIs.
 
 ---
 
 ## 0. Decisions
 
-1. **One canonical ledger, typed operation** - Episodes, facts, reflections, plans,
-   and procedures share one durable memory ledger. Retrieval, update, ranking, and
-   response behavior use typed projections over that ledger.
-2. **Text is canonical evidence** - Raw memory text is stored unchanged for the
-   version that produced it. Meaning is not embedded into canonical text with XML,
-   JSON snippets, or inline machine tags.
-3. **Meaning lives in sidecars** - Entities, aliases, mentions, tags, claims, links,
-   privacy flags, full-text index rows, and embeddings are stored as sidecar records
-   keyed to a memory version.
-4. **Claims are append-only** - Structured facts are inserted as `fact_claim` rows.
-   A mutable `current_fact` projection chooses the current claim for ordinary
-   response paths. Old claims are superseded, disputed, retracted, or archived; they
-   are not hard-overwritten.
-5. **`MemoryRank` is not memory type** - Existing memory ranks describe durability,
-   salience, and access reinforcement. They do not mean episode/fact/procedure, and
-   they do not imply truth. Logical kind and claim status are separate dimensions.
-6. **Capabilities remain the boundary** - Modules continue to interact through
-   memory capabilities such as `MemoryWriter`, `VectorMemorySearcher` or its future
-   broader search replacement, and `MemoryCompactor`. Modules must not receive raw
-   database handles or a new request/response mailbox protocol.
-7. **Blackboard stays a mirror** - Durable memory content, extraction sidecars, and
-   indexes live in the memory store adapter. The blackboard mirrors operational
-   metadata needed by modules, such as rank, decay, access counts, remember tokens,
-   and boot identity snapshots.
-8. **Embeddings are sensitive data** - Embeddings are useful for recall, but they
-   are not privacy neutral. They follow the same privacy, deletion, provider, and
-   retention policy as the text they encode, unless a stricter policy is configured.
+1. **Memory is not a fact table** - Nuillu does not model durable memory around
+   structured fact claims, current-fact projections, or source-authority records.
+   It stores remembered evidence and lets recall, links, rank, time, compaction,
+   and downstream interpretation shape behavior.
+2. **Canonical memory is short natural text** - A memory entry is a concise,
+   normalized natural-language memory, usually one to three sentences.
+3. **Memory text is effectively immutable** - Changed situations, corrections,
+   and edits create new memory entries and later links. They do not overwrite the
+   older remembered text.
+4. **No memory versions in v2** - The ledger does not require a separate
+   `memory_version` layer. If a memory must be revised, the revision is another
+   memory connected by links.
+5. **No stored current-truth hint** - Retrieval returns remembered material with
+   timestamps, rank, kind, concepts, tags, and links. It does not attach a
+   "current" decision.
+6. **No source authority field** - If source context matters, such as who said
+   something or where it was seen, that context belongs in the memory sentence
+   itself. The ledger does not treat `user`, `agent`, or `import` as truth
+   authorities.
+7. **Concepts and tags are sidecars** - Concepts support associative recall.
+   Operational tags support handling, compaction, search, and UI. Neither is
+   embedded into canonical text.
+8. **Direct links are compaction-owned** - Ingest extracts kind, concepts, and
+   operational tags. Memory-to-memory links are formed later by compaction and
+   rebalancing.
+9. **`MemoryRank` is not truth** - Existing memory ranks describe durability,
+   salience, access reinforcement, and boot identity weight. Rank does not mean a
+   memory is factual, current, or authoritative.
+10. **Hard delete is allowed** - User deletion can remove a memory and all attached
+    sidecars, search rows, embeddings, and links. Orphaned concepts become garbage
+    collection candidates.
 
 ---
 
 ## 1. Fit With The Current Runtime
 
-The cognitive surface does not change. Memory modules still observe cognition-log
-updates, memo-log context, and attention-controller guidance. Channel messages stay
-transient wake signals, and durable module output remains memo-authoritative.
+The module boundary stays capability-based. Modules do not receive raw database
+handles, arbitrary SQL access, or a new request/response protocol. Channel messages
+remain transient wake signals, and durable module output remains memo-authoritative.
 
-The existing roles map onto this design as follows:
-
-| Role | v2 memory-ledger responsibility |
+| Role | Memory-ledger responsibility |
 |---|---|
-| `memory` | Decides which cognitive evidence deserves durable preservation, then writes through the memory capability. The store performs canonical insert, extraction, indexing, and projection updates behind that capability. |
-| `query-memory` | Retrieves memory evidence and writes copied hits to its memo. It does not synthesize answers, decide truth, or bypass cognition-gate admission. Existing `query-vector` crate/tool names may remain until a follow-up rename. |
-| `memory-compaction` | Merges, summarizes, archives, or prunes redundant memory material through a compaction capability. It must preserve claim history and provenance links even when raw text or vectors are compacted. |
-| `attention-controller` | Sees memory pressure only through ordinary blackboard metadata and module memos. It does not gain direct fact-update or retrieval power. |
-| `self-model` | Integrates surfaced memory evidence into current first-person state. Stable self-knowledge comes from current identity-eligible memory/fact projections, not from superseded claims. |
+| `memory` | Preserves useful cognitive evidence as short normalized memory text. Ingest extracts only kind, concepts, and operational tags. |
+| `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. Existing `query-vector` names may remain until a rename pass. |
+| `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
+| `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
+| `vital` / `homeostatic-controller` | Drives sleep-like memory balancing by raising compaction or recombination allocation from homeostatic pressure. |
+| `attention-controller` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
+| `self-model` | Integrates retrieved identity and self-related memories into current self-description. Identity memories are high-rank memories, not current-fact rows. |
 
-This document does not introduce a new cognitive module. It refines the storage
-adapter and capability behavior below the existing module boundary.
+The store owns ledger consistency, search indexes, embeddings, access accounting,
+hard deletion, and link mutation. The blackboard remains a mirror of operational
+metadata such as rank, decay, access counts, remember tokens, and boot identity
+snapshots.
 
 ---
 
 ## 2. Canonical Model
 
-The ledger separates durable evidence from operational views.
+The ledger stores memory entries plus sidecars. The memory text is the durable
+evidence. Sidecars help recall and consolidation, but they do not replace the text.
 
-| Concept | Responsibility |
-|---|---|
-| `memory` | Logical durable record. Holds tenant/scope, origin, logical kind, creation time, and deletion marker. |
-| `memory_version` | Versioned text/evidence body. Holds raw text, summary, language, salience, confidence, observed/learned/valid time fields, privacy level, extraction payload, current marker, and supersession link. |
-| `entity` | Canonical entity identity within a tenant, such as a person, place, project, object, or organization. |
-| `entity_alias` | Locale-aware names and spelling variants that can resolve to an entity. |
-| `memory_mention` | Sidecar span linking a memory version to an entity, including mention text, optional character range, extraction method, and confidence. |
-| `tag` | Canonical topic, domain, or classifier label within a namespace. |
-| `memory_tag` | Sidecar assignment from a memory version to a tag, including source and confidence. |
-| `fact_claim` | Append-only structured claim extracted from or directly inserted with a memory version. |
-| `current_fact` | Mutable projection from `(tenant, subject, relation, scope)` to the claim currently used by ordinary response paths. |
-| `memory_link` | Explicit edge between memory versions, such as `supports`, `contradicts`, `supersedes`, `derived_from`, `same_entity`, `same_tag`, or `similar_to`. |
-| `memory_search` | Materialized search document combining current text, summary, resolved entity text, tag text, kind, status, and privacy filters. |
-| `memory_vec` | Vector sidecar for semantic candidate generation, keyed to the memory version and privacy/search metadata. |
+```text
+memory {
+  id
+  content
+  kind
+  rank
+  occurred_at
+  stored_at
+  deleted_at
+}
 
-`memory_version` is the unit indexed for retrieval because edits, summaries,
-archive transitions, and claim extraction all depend on a concrete text version.
-If canonical text changes, the system creates a new version and ties old and new
-versions with `supersedes` or `derived_from` links. Sidecar spans never need to
-survive text mutation; they stay attached to the version whose text they describe.
+concept {
+  id
+  canonical_label
+  normalized_label
+  loose_type?
+}
 
-Logical kind is an operational hint, not a hard store boundary:
+concept_alias {
+  concept_id
+  alias
+  normalized_alias
+}
 
-- `episode` records an event, observation, interaction, or autobiographical moment.
-- `fact` records a declarative memory item or imported knowledge record.
-- `reflection` records derived interpretation or consolidation.
-- `plan` records intended future work or commitments.
-- `procedure` records reusable know-how.
+memory_concept {
+  memory_id
+  concept_id
+  mention_text?
+  confidence
+}
 
-Facts can be derived from episodes, imported directly, or stated explicitly by a
-user. The store must preserve provenance either way.
+tag {
+  id
+  label
+  normalized_label
+  namespace
+}
 
----
+memory_tag {
+  memory_id
+  tag_id
+  confidence
+}
 
-## 3. Sidecar Extraction And Links
+memory_link {
+  from_memory_id
+  to_memory_id
+  relation
+  freeform_relation?
+  strength
+  confidence
+  updated_at
+}
 
-The write path stores raw text first, then derives sidecars. The extraction result
-is a candidate interpretation, not a trust boundary.
+memory_search {
+  memory_id
+  search_text
+  concept_text
+  tag_text
+}
 
-The minimum extraction payload for a v2-capable store is:
+memory_embedding {
+  memory_id
+  embedding_profile
+  embedding
+}
+```
 
-- `entities[]` with labels, types, aliases, privacy hints, and optional spans,
-- `tags[]` with namespaces, display labels, language, and confidence,
-- `claims[]` with subject, relation, object, update policy, confidence, valid time,
-  and source spans when available,
-- `time_expressions[]` that can populate observed, learned, valid-from, and
-  valid-to fields,
-- `privacy_flags[]` that can constrain retrieval, embedding, export, or retention.
+`occurred_at` is when the remembered event or state happened when known.
+`stored_at` is when Nuillu stored the memory. Both are exact timestamps. Prompt and
+display surfaces may round time through existing time-division behavior, but the
+ledger stores exact values.
 
-The extraction implementation may use schema-constrained LLM output, deterministic
-rules, manual edits, or imports. The canonical persistence format is normalized
-sidecar rows, not the LLM's raw JSON. The raw JSON may be retained in
-`extraction_json` for audit and replay if its privacy level permits.
+The initial loose memory kinds are:
 
-Human-facing edit surfaces may accept Obsidian-style `[[links]]`, but those links
-are UI syntax only. On save, they are resolved to entity/tag ids and optional display
-labels. Canonical memory text must not require those brackets to remain correct.
+```text
+episode
+statement
+reflection
+hypothesis
+dream
+procedure
+plan
+```
 
-XML-like tags are allowed only as temporary debug/export renderings. They are not
-canonical persistence because inline machine annotations make editing, span repair,
-privacy redaction, and re-extraction brittle.
+Kind is a weak retrieval and display hint. It is not a hard store boundary.
+For example, a `statement` can later support an `episode` summary, and a `dream`
+can remain useful as an association without becoming verified evidence.
 
-Embeddings are candidate generators. They can help retrieve multilingual,
-paraphrased, or weakly related material, but they do not decide truth. Any response
-that treats a fact as current must be grounded in `current_fact`, claim status,
-source/provenance, or explicit retrieved evidence.
+Concepts are loose symbolic nodes: people, places, objects, projects, topics, or
+recurring ideas. They may carry optional loose types such as `person`, `place`,
+`project`, `topic`, `object`, `self`, or `unknown`. These are hints, not a strict
+ontology. There are no reserved concept IDs, including `self`; special self meaning
+belongs in module prompts and self-model integration, not in the ledger schema.
 
----
+Concept deduplication is conservative. Exact normalized labels and explicit aliases
+can unify concepts. Ambiguous same-name concepts stay separate until later evidence
+or manual correction justifies merging.
 
-## 4. Retrieval
-
-Retrieval combines independent candidate sources before reranking:
-
-1. **Symbolic candidates** - Current facts, shared entities, shared tags, and
-   explicit `memory_link` edges.
-2. **Full-text candidates** - Keyword/phrase search over `memory_search.text`,
-   `summary`, `tag_text`, and `entity_text`.
-3. **Vector candidates** - Semantic nearest neighbors from `memory_vec`, filtered
-   by tenant, currentness, logical kind when requested, and privacy level.
-
-Candidate fusion should be deterministic, for example reciprocal-rank fusion or a
-weighted sum of normalized source ranks. Reranking then applies typed policy:
-
-- current memory versions outrank superseded or archived versions for ordinary
-  questions,
-- `current_fact` outranks old `fact_claim` rows for direct fact answers,
-- explicit history, provenance, conflict, or correction questions may include
-  superseded claims,
-- `MemoryRank` and access metadata affect salience and durability but do not make a
-  claim true,
-- recency is a signal, not truth; source trust, confidence, relation policy, and
-  corroboration can override it,
-- privacy filters apply before material is returned to a module or embedded for an
-  external provider.
-
-`query-memory` still writes only retrieved evidence into its memo. Speak remains
-downstream of cognition-gate and SpeakGate; it must not read hidden memory sidecars
-directly.
-
-Access-based rank elevation remains store-owned. A search path that records access
-patches the blackboard metadata after successful retrieval. Modules see the result
-as updated metadata, not as a separate rank-elevation capability.
-
----
-
-## 5. Changed Facts
-
-Changed facts are relation-policy problems, not memory-kind problems.
-
-`fact_claim` rows use one of these default update policies:
-
-| Policy | Use | Update behavior |
-|---|---|---|
-| `immutable` | Birth date, historical event occurrence, stable identity fact | Equivalent claims add support. Conflicting claims become disputed unless manually resolved. |
-| `exclusive` | Current city, current employer, current preference when phrased as singular | A winning new claim supersedes prior active claims for the same scoped relation and updates `current_fact`. |
-| `additive` | Skills, liked foods, known contacts, interests | Non-duplicate claims accumulate. Duplicates add support or aliases. |
-| `event` | Trips, meetings, tasks performed | Claims append as events and normally do not supersede each other. |
-
-When a user directly corrects an exclusive fact:
-
-1. Insert a new `fact_claim` with the new source version, confidence, valid time, and
-   transaction time.
-2. Mark the prior current claim as `superseded`, set `valid_to` when known, and link
-   it to the new claim.
-3. Replace the `current_fact` projection for the relation scope.
-4. Keep the old memory text, old claim, and provenance links for audit, explanation,
-   and temporal queries.
-
-Default conflict resolution orders evidence by:
-
-1. explicit user correction or direct user statement,
-2. trusted import or system source,
-3. agent inference from recent evidence,
-4. confidence/certainty,
-5. corroboration count,
-6. recency.
-
-This ordering is a default, not a global truth oracle. High-stakes domains should
-answer with "last confirmed" context or ask for confirmation even when a current
-projection exists.
+Tags are operational classification sidecars. They are not the main association
+graph. Initial uses include tags such as `dream`, `hypothesis`, `follow-up`, and
+`preference`, where a tag changes handling, compaction, search, or UI treatment.
 
 ---
 
-## 6. Compaction, Archiving, And Garbage Collection
+## 3. Ingest
 
-Compaction reduces operational weight without destroying provenance.
+Ingest keeps the first write simple.
 
-Allowed compaction outcomes:
+The memory module writes a short normalized memory sentence from cognition-log and
+memo-log evidence. The sentence should be readable by a human and a small LLM. If
+source context matters, it is part of the sentence:
 
-- create a summary/reflection memory version derived from source versions,
-- archive low-salience raw text while keeping summaries, claims, and links,
-- drop or regenerate vectors for archived, superseded, or low-value versions,
-- merge duplicate tags or aliases after exact normalization or reviewed near-dedupe,
-- remove search rows for material that is no longer retrievable under current
-  privacy and archive policy.
+```text
+Ryo said he no longer lives in Tokyo and recently moved to Kyoto.
+```
 
-Compaction must preserve:
+The sidecar extraction at ingest is limited to:
 
-- `fact_claim` history,
-- `current_fact` correctness,
-- `supersedes`, `supports`, `contradicts`, and `derived_from` links,
-- enough source metadata to explain why a current fact is believed,
-- `MemoryRank` and remember-token semantics for the resulting memory record.
+```text
+kind
+concepts
+operational tags
+```
 
-The safest garbage-collection order is vector sidecars first, then search rows for
-archived material, then raw text for low-salience episodes if a summary and claim
-provenance remain. `fact_claim` rows and supersession chains are the last data to
-delete and should normally be retained indefinitely unless privacy deletion requires
-removal.
+Ingest does not create direct memory-to-memory links. It also does not infer
+updates, corrections, contradictions, or truth. Those relationships require broader
+context and belong to compaction or rebalancing.
 
-Full-text indexes over external content must be kept synchronized by adapter-owned
-transactions or triggers. Any compaction or archive batch that mutates indexed text
-must either update the index in the same operation or schedule a verified rebuild.
+This keeps small LLM tasks understandable:
 
----
+- normalize a candidate into concise memory text,
+- classify its loose kind,
+- extract mentioned concepts,
+- add lightweight operational tags only when useful.
 
-## 7. Implementation Shape For A Future Pass
-
-The first implementation pass should keep the module-facing capability model intact
-and broaden store behavior behind it.
-
-Expected adapter changes:
-
-- extend the primary memory store schema from single-row content plus vector search
-  toward the ledger/projection model above,
-- expose a memory search API that can return typed hits with provenance, status,
-  privacy, rank, score breakdown, and optional current-fact metadata,
-- keep simple vector-only compatibility during migration so existing evals can run,
-- backfill existing v1 rows as active `memory_version` records with conservative
-  logical kind and no extracted claims until extraction replay runs,
-- load identity memories from identity-eligible current projections only, never from
-  superseded claims.
-
-Expected capability constraints:
-
-- no module receives raw SQL, table names, or arbitrary projection mutation methods,
-- no new mailbox carries durable memory answers,
-- no module can stamp another module as the source of a memory write,
-- claim projection updates happen inside the memory capability/store transaction,
-  not by ad-hoc module code.
-
-The exact Rust API names can be chosen in the implementation pass. The required
-semantic boundary is that modules request preservation, retrieval, or compaction;
-the store owns ledger consistency, extraction persistence, indexing, access
-accounting, and current-fact projection.
+The memory module may still reject, deduplicate, or normalize preservation
+candidates. It does not receive authority to overwrite older memory text or decide
+that one memory is now the current truth.
 
 ---
 
-## 8. Test Scenarios
+## 4. Links
 
-Design-level acceptance scenarios for the implementation pass:
+Memory-to-memory links are sidecars. They are separate from memory text and are
+mutable so later compaction can reshape associations without rewriting remembered
+evidence.
 
-1. **Episode ingest** - Ingest one user episode and verify the raw text, active
-   memory version, sidecar mentions, tags, search row, embedding row, and blackboard
-   metadata are created coherently.
-2. **Explicit correction** - Ingest a user correction for an exclusive relation and
-   verify the old claim is superseded, `valid_to` is set when possible, and
-   `current_fact` points to the new claim.
-3. **Hybrid retrieval** - Query for a memory that requires symbolic, full-text, and
-   vector candidates; verify fused results respect tenant, privacy, currentness,
-   status, and rank/salience filters.
-4. **Tag dedupe** - Insert exact duplicate tags after normalization and verify they
-   collapse to one canonical tag; route near duplicates through alias/manual or LLM
-   confirmation rather than automatic merge.
-5. **Compaction provenance** - Compact redundant memories and verify
-   `derived_from`/`supersedes` links, claim history, current projections, and
-   access-rank behavior remain correct.
-6. **Identity bootstrap** - Load startup identity memories from current
-   identity-eligible records and verify superseded identity claims are not injected
-   into module prompts as current facts.
-7. **Privacy filtering** - Mark a memory version or embedding as above the query's
-   allowed privacy level and verify it is excluded before module-visible retrieval
-   results are formed.
-8. **Temporal query** - Ask for what was believed at a prior valid or transaction
-   time and verify superseded claims can be returned only for that temporal request.
+Core relations:
+
+```text
+related
+supports
+contradicts
+updates
+corrects
+derived_from
+```
+
+The relation vocabulary is `core + freeform`. Core relations are preferred because
+they are searchable and testable. If compaction finds a useful relationship that
+does not fit the core set, it may store a freeform relation label alongside a core
+fallback such as `related`.
+
+Links are basically directed:
+
+- `A supports B` means A is remembered as supporting B.
+- `A contradicts B` means A conflicts with B.
+- `A updates B` means B may have been true at the time, but A remembers a later
+  state change.
+- `A corrects B` means B appears wrong or superseded by later remembered evidence.
+- `A derived_from B` means A was produced from B, as with compaction summaries.
+- `related` is treated as symmetric even if stored in one direction.
+
+`strength` and `confidence` can change over time. Text does not. Inferred
+`corrects` links are allowed, but should start with low confidence and become
+stronger only through repeated support, later compaction, or explicit remembered
+evidence.
+
+For example:
+
+```text
+M1: Ryo used to live in Tokyo.
+M2: Ryo said he recently moved to Kyoto.
+
+M2 updates M1
+```
+
+The link does not hide M1. It makes M1 and M2 easier to co-recall as a changed
+state. If M1 is recalled first, M2 can be fetched as related context; if M2 is
+recalled first, M1 can still interfere as an older memory.
 
 ---
 
-## 9. Invariants
+## 5. Retrieval
+
+The memory search API returns flat hits. It does not return bundles, current facts,
+or final answers.
+
+Seed candidates may come from:
+
+1. vector search,
+2. full-text search when available,
+3. concept matches,
+4. tag matches.
+
+`query-memory` may then explicitly fetch linked memories when useful. Link expansion
+is a tool action, not a hidden behavior of the store's ordinary search call.
+
+Returned memory evidence should include:
+
+```text
+content
+kind
+rank
+occurred_at
+stored_at
+matched concepts
+operational tags
+direct link metadata when fetched
+```
+
+No currentness hint is attached. The retrieval layer does not say "this is the
+current value" or "this old memory is outdated." It gives downstream modules enough
+remembered material to behave naturally: sometimes emphasizing newer information,
+sometimes surfacing uncertainty, and sometimes noticing an older conflicting memory.
+
+`query-memory` may summarize evidence and conflict structure in its memo, but it
+must not produce the user-facing answer or decide final truth. A valid evidence
+summary is:
+
+```text
+Memory evidence about Ryo's residence is mixed. One older memory says he lived in
+Tokyo. A later memory says he moved to Kyoto. The linked relation is an update,
+not a deletion of the older memory.
+```
+
+That summary is still retrieval evidence. Speak and self-model integration remain
+downstream of the normal cognition and memo surfaces.
+
+Access reinforcement applies only to direct search hits. Memories fetched only by
+explicit link expansion do not gain access reinforcement from that expansion alone.
+This prevents a linked cluster from strengthening itself merely because one member
+was recalled.
+
+---
+
+## 6. Compaction And Dreaming
+
+Memory balancing is homeostatic and sleep-like.
+
+NREM-like compaction is responsible for:
+
+- creating summary memories from related source memories,
+- adding `derived_from` links from summaries to sources,
+- creating or updating `updates`, `corrects`, `contradicts`, `supports`, and
+  `related` links,
+- adding operational tags when they help later handling,
+- preserving source memories unless hard deletion is requested.
+
+Compaction output is `summary + links`. It does not collapse the system into a
+single current fact. The source memories remain retrievable and can still interfere
+with later recall.
+
+Example compaction summary:
+
+```text
+Ryo's remembered residence changed from Tokyo to Kyoto across two memories.
+```
+
+This summary can link to both source memories using `derived_from`, and the later
+source memory can link to the older one using `updates`.
+
+REM-like recombination is different. `memory-recombination` produces associative
+dream or hypothesis material. These entries may be useful for planning, surprise,
+or later associations, but they are not verified evidence. They should use `dream`
+or `hypothesis` kind and operational tags when stored.
+
+Existing `vital` and `homeostatic-controller` roles drive this balancing through
+allocation. The memory ledger does not add a new memory tick API or a background SQL
+job that bypasses module capabilities.
+
+---
+
+## 7. Deletion And Garbage Collection
+
+This document does not define a privacy model. It only defines deletion behavior for
+the memory ledger.
+
+Hard deleting a memory removes:
+
+- the memory text,
+- concept mentions attached to the memory,
+- tag assignments attached to the memory,
+- links where the memory is either endpoint,
+- search rows,
+- embeddings.
+
+Concepts and tags are not automatically deleted just because one memory was
+removed. If a concept or tag becomes orphaned, it becomes a garbage collection
+candidate. Garbage collection must not infer that neighboring memories should be
+deleted merely because a linked memory was deleted.
+
+Compaction may archive or reduce operational weight in later implementation passes,
+but archive behavior is separate from hard deletion. Hard deletion is the user
+control path for removing remembered material and its sidecars.
+
+---
+
+## 8. Future Implementation Shape
+
+The first implementation pass should keep current module-facing capabilities intact.
+The exact Rust names can be chosen later, but the semantic boundaries are fixed:
+
+- modules request preservation, retrieval, linked-memory lookup, or compaction,
+- the store owns ledger consistency and indexing,
+- compaction owns direct memory-to-memory link formation,
+- blackboard mirrors metadata only,
+- query output remains memo-authoritative,
+- no module receives raw SQL or arbitrary table mutation power.
+
+The search API should remain flat by default. A separate linked-memory lookup tool
+can take memory ids and relation filters and return neighboring memories plus link
+metadata. This keeps ordinary search predictable while allowing `query-memory` to
+follow associations when its LLM session judges that useful.
+
+The current libSQL adapter can continue as a simple content plus vector search
+implementation until the ledger sidecars exist. This document does not require a
+specific SQLite extension or a full SQL migration shape.
+
+---
+
+## 9. Acceptance Scenarios
+
+Design-level scenarios for the implementation pass:
+
+1. **Simple ingest** - Ingest one short memory and verify content, kind, concepts,
+   operational tags, timestamps, search row, embedding row, and blackboard metadata
+   are coherent.
+2. **Changed situation** - Store a later changed-state memory and verify the older
+   memory text is not overwritten.
+3. **Compaction links** - Run compaction over older and newer related memories and
+   verify it creates `updates`, `corrects`, or `contradicts` links when appropriate.
+4. **Flat retrieval** - Ordinary search returns flat hits. Linked memories appear
+   only when `query-memory` explicitly fetches them.
+5. **Old memory remains searchable** - A memory linked by `updates` or `corrects`
+   is still searchable and retrievable.
+6. **Evidence summary boundary** - `query-memory` may summarize conflict evidence
+   in its memo, but does not produce the user-facing answer or final truth decision.
+7. **Compaction summary** - Compaction creates a summary memory and `derived_from`
+   links while preserving source memories.
+8. **Dream handling** - Dream or hypothesis memories are marked by kind/tag and are
+   not treated as verified evidence.
+9. **Access reinforcement** - Direct search hits record access; linked memories
+   fetched only by expansion do not gain access reinforcement.
+10. **Hard delete** - Deleting a memory removes its sidecars, links, search row, and
+    embedding while leaving unrelated memories intact.
+
+---
+
+## 10. Invariants
 
 | Invariant | Enforcement target |
 |---|---|
-| Memory storage is unified | One ledger stores all logical memory kinds; projections provide typed behavior. |
-| Memory rank is durability/salience only | Rank is separate from logical kind, claim status, and truth. |
-| Canonical text is not machine-annotated | Extraction writes sidecar rows and optional audit JSON. |
-| Facts are not hard-overwritten | New claims append; current projections move. |
-| Current response paths are current-first | Ordinary retrieval favors active versions and `current_fact`; history appears only when requested or needed for conflict explanation. |
-| Provenance survives compaction | Summary/archive operations preserve claim chains and memory links. |
+| Memory is not a fact table | No claim/current projection is required or exposed. |
+| Canonical text is effectively immutable | Revisions become new memories plus links. |
+| Ingest stays simple | Ingest extracts kind, concepts, and operational tags only. |
+| Direct links are compaction-owned | Ingest does not infer memory-to-memory corrections or contradictions. |
+| Currentness is not stored | Retrieval returns evidence and metadata, not current truth. |
+| Source is not authority | Any source context must live in natural memory text. |
+| Rank is durability/salience | `MemoryRank` does not imply truth, type, or currentness. |
+| Identity is high-rank memory | Identity-ranked memories are prompt seeds, not fact projections. |
+| Query output remains memo-authoritative | `query-memory` writes retrieval evidence and summaries to its memo. |
 | Capabilities remain the only module path | Modules hold memory capabilities, not raw database handles. |
-| Blackboard remains non-canonical | Blackboard mirrors metadata and boot snapshots; the memory store owns durable content and indexes. |
-| Query output remains memo-authoritative | Query-memory writes retrieved evidence to its memo and does not synthesize answers. |
-| Embeddings are treated as sensitive | Vector rows obey privacy, provider, deletion, and retention policy. |
+| Blackboard remains non-canonical | Durable content, links, search rows, and embeddings live in the store. |
+| Dream output is not verified evidence | `dream` and `hypothesis` entries require downstream interpretation. |
+| Hard delete removes attached sidecars | Memory deletion removes concept mentions, tag assignments, links, search rows, and embeddings for that memory. |
