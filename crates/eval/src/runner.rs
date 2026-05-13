@@ -31,6 +31,7 @@ use lutum_libsql_adapter::{
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
+use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
@@ -69,13 +70,13 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use crate::{
     artifact::CaseArtifact,
     cases::{
-        CaseFileError, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule, FullAgentCase,
-        FullAgentInput, ModuleCase, ModuleEvalTarget, discover_case_files, parse_case_file,
-        parse_case_now, parse_memory_datetime,
+        ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule,
+        EvalStep, FullAgentCase, FullAgentInput, ModuleCase, ModuleEvalTarget, WaitFor,
+        discover_case_files, parse_case_file, parse_case_now, parse_memory_datetime,
     },
     evaluation::{
-        CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, evaluate_case,
-        normalize_text_block,
+        CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, artifact_text,
+        evaluate_case, field_label, normalize_text_block, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     model_set::ReasoningEffort,
@@ -104,6 +105,14 @@ pub struct LlmBackendConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct EmbeddingBackendConfig {
+    pub endpoint: String,
+    pub token: String,
+    pub model: String,
+    pub dimensions: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub cases_root: PathBuf,
     pub output_root: PathBuf,
@@ -113,6 +122,7 @@ pub struct RunnerConfig {
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
     pub model_dir: PathBuf,
+    pub embedding_backend: Option<EmbeddingBackendConfig>,
     pub fail_fast: bool,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
@@ -1459,10 +1469,12 @@ async fn execute_full_agent_case(
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
+    let steps = case.steps.clone();
     let actions = env.actions.clone();
     let events = env.events.clone();
     let clock = env.clock.clone();
     let memory = env.memory.clone();
+    let utterances = env.utterances.clone();
     let allocation_blackboard = env.blackboard.clone();
     let mut allocation_reporter =
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
@@ -1478,6 +1490,10 @@ async fn execute_full_agent_case(
     .build(&env.caps)
     .await?;
     let mut visualizer = hooks.visualizer.as_mut();
+    let step_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let step_outcomes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let step_failure_for_loop = step_failure.clone();
+    let step_outcomes_for_loop = step_outcomes.clone();
 
     run_agent(
         modules,
@@ -1497,12 +1513,18 @@ async fn execute_full_agent_case(
             .await;
             let mut started = !gui_deferred_start;
             if started {
-                publish_full_agent_inputs(
+                run_input_phase(
                     &case_id_for_idle,
                     &inputs,
+                    &steps,
                     &sensory,
+                    &allocation_blackboard,
+                    utterances.as_ref(),
+                    events.as_ref(),
                     clock.as_ref(),
                     visualizer.as_deref(),
+                    &step_failure_for_loop,
+                    &step_outcomes_for_loop,
                 )
                 .await;
             }
@@ -1542,12 +1564,18 @@ async fn execute_full_agent_case(
                             &VisualizerTabId::new(case_id_for_idle.clone()),
                         ));
                         activate_gui_start_modules(&allocation_blackboard).await;
-                        publish_full_agent_inputs(
+                        run_input_phase(
                             &case_id_for_idle,
                             &inputs,
+                            &steps,
                             &sensory,
+                            &allocation_blackboard,
+                            utterances.as_ref(),
+                            events.as_ref(),
                             clock.as_ref(),
                             Some(visualizer),
+                            &step_failure_for_loop,
+                            &step_outcomes_for_loop,
                         )
                         .await;
                         started = true;
@@ -1601,7 +1629,21 @@ async fn execute_full_agent_case(
     )
     .await?;
 
-    let mut artifact = if let Some(utterance) = env.utterances.last_complete() {
+    let step_failure_message = step_failure
+        .lock()
+        .expect("step failure mutex poisoned")
+        .take();
+    let recorded_step_outcomes = step_outcomes
+        .lock()
+        .expect("step outcomes mutex poisoned")
+        .clone();
+    let mut artifact = if let Some(failure) = step_failure_message {
+        let mut artifact = CaseArtifact::failed(failure);
+        if let Some(utterance) = env.utterances.last_complete() {
+            artifact.output = utterance.text;
+        }
+        artifact
+    } else if let Some(utterance) = env.utterances.last_complete() {
         CaseArtifact::new(utterance.text)
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
@@ -1609,6 +1651,11 @@ async fn execute_full_agent_case(
         CaseArtifact::failed("no utterance produced")
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    if !recorded_step_outcomes.is_empty() {
+        artifact
+            .observations
+            .insert("steps".to_string(), serde_json::Value::Array(recorded_step_outcomes));
+    }
     let events = env.events.snapshot();
     let last_state = build_full_agent_last_state_dump(
         case_id,
@@ -1994,6 +2041,247 @@ async fn publish_full_agent_inputs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_input_phase(
+    case_id: &str,
+    inputs: &[FullAgentInput],
+    steps: &[EvalStep],
+    sensory: &SensoryInputMailbox,
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+    events: &RecordingRuntimeEventSink,
+    clock: &dyn Clock,
+    visualizer: Option<&VisualizerHook>,
+    step_failure: &Arc<Mutex<Option<String>>>,
+    step_outcomes: &Arc<Mutex<Vec<serde_json::Value>>>,
+) {
+    if steps.is_empty() {
+        publish_full_agent_inputs(case_id, inputs, sensory, clock, visualizer).await;
+        return;
+    }
+    for (index, step) in steps.iter().enumerate() {
+        publish_full_agent_inputs(case_id, &step.inputs, sensory, clock, visualizer).await;
+
+        let mut wait_outcome = WaitOutcome::Met;
+        if let Some(wait_for) = &step.wait_for {
+            wait_outcome = wait_for_condition(blackboard, events, wait_for).await;
+        }
+
+        let mut check_results: Vec<serde_json::Value> = Vec::new();
+        let mut must_pass_failure: Option<String> = None;
+        if matches!(wait_outcome, WaitOutcome::Met) && !step.checks.is_empty() {
+            let snapshot = build_step_snapshot(blackboard, utterances).await;
+            for check in &step.checks {
+                let (passed, diagnostic) = evaluate_step_check(check, &snapshot);
+                let common = check.common();
+                check_results.push(serde_json::json!({
+                    "name": check.display_name(),
+                    "kind": check.kind_name(),
+                    "passed": passed,
+                    "must_pass": common.must_pass,
+                    "diagnostic": diagnostic,
+                }));
+                if !passed && common.must_pass && must_pass_failure.is_none() {
+                    must_pass_failure = Some(format!(
+                        "step {index} must-pass check '{name}' failed: {diag}",
+                        name = check.display_name(),
+                        diag = diagnostic.clone().unwrap_or_else(|| "no diagnostic".to_string()),
+                    ));
+                }
+            }
+        }
+
+        let status = match (&wait_outcome, &must_pass_failure) {
+            (WaitOutcome::Timeout, _) => "timed-out",
+            (WaitOutcome::Stopped, _) => "stopped",
+            (_, Some(_)) => "check-failed",
+            _ => "ok",
+        };
+        let mut outcome = serde_json::Map::new();
+        outcome.insert("index".to_string(), serde_json::Value::from(index));
+        if let Some(description) = &step.description {
+            outcome.insert(
+                "description".to_string(),
+                serde_json::Value::String(description.content.clone()),
+            );
+        }
+        outcome.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        outcome.insert(
+            "checks".to_string(),
+            serde_json::Value::Array(check_results),
+        );
+        step_outcomes
+            .lock()
+            .expect("step outcomes mutex poisoned")
+            .push(serde_json::Value::Object(outcome));
+
+        match wait_outcome {
+            WaitOutcome::Met => {}
+            WaitOutcome::Timeout => {
+                let wait_label = wait_for_label(step.wait_for.as_ref());
+                let message = format!(
+                    "step {index} timed out waiting for {wait_label}",
+                );
+                step_failure
+                    .lock()
+                    .expect("step failure mutex poisoned")
+                    .get_or_insert(message);
+                events.request_stop("step-timeout");
+                return;
+            }
+            WaitOutcome::Stopped => return,
+        }
+
+        if let Some(message) = must_pass_failure {
+            step_failure
+                .lock()
+                .expect("step failure mutex poisoned")
+                .get_or_insert(message);
+            events.request_stop("step-check-failed");
+            return;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WaitOutcome {
+    Met,
+    Timeout,
+    Stopped,
+}
+
+async fn wait_for_condition(
+    blackboard: &Blackboard,
+    events: &RecordingRuntimeEventSink,
+    wait_for: &WaitFor,
+) -> WaitOutcome {
+    match wait_for {
+        WaitFor::MemoFrom { module, timeout_ms } => {
+            let target = module.module_id();
+            let baseline = memo_count_for_module(blackboard, &target).await;
+            let deadline = Duration::from_millis(*timeout_ms);
+            let start = Instant::now();
+            let poll = Duration::from_millis(50);
+            loop {
+                if events.stop_requested() {
+                    return WaitOutcome::Stopped;
+                }
+                let count = memo_count_for_module(blackboard, &target).await;
+                if count > baseline {
+                    return WaitOutcome::Met;
+                }
+                let elapsed = start.elapsed();
+                if elapsed >= deadline {
+                    return WaitOutcome::Timeout;
+                }
+                let remaining = deadline.saturating_sub(elapsed);
+                tokio::time::sleep(remaining.min(poll)).await;
+            }
+        }
+    }
+}
+
+fn wait_for_label(wait_for: Option<&WaitFor>) -> String {
+    match wait_for {
+        Some(WaitFor::MemoFrom { module, timeout_ms }) => format!(
+            "memo from module '{module}' within {timeout_ms}ms",
+            module = module.as_str(),
+        ),
+        None => "<no wait-for>".to_string(),
+    }
+}
+
+async fn memo_count_for_module(blackboard: &Blackboard, module: &ModuleId) -> usize {
+    blackboard
+        .read(|bb| {
+            bb.recent_memo_logs()
+                .into_iter()
+                .filter(|record| &record.owner.module == module)
+                .count()
+        })
+        .await
+}
+
+async fn build_step_snapshot(
+    blackboard: &Blackboard,
+    utterances: &RecordingUtteranceSink,
+) -> CaseArtifact {
+    let mut artifact = CaseArtifact::new(
+        utterances
+            .last_complete()
+            .map(|utterance| utterance.text)
+            .unwrap_or_default(),
+    );
+    add_observations(&mut artifact, blackboard, utterances).await;
+    artifact
+}
+
+fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<String>) {
+    match check {
+        Check::JsonPointerEquals {
+            pointer, expected, ..
+        } => {
+            let json = artifact.as_json();
+            let actual = pointer_text(&json, pointer);
+            let passed = actual.as_deref() == Some(expected.as_str());
+            let diagnostic = (!passed).then(|| match actual {
+                Some(actual) => format!(
+                    "expected JSON pointer {pointer:?} to equal {expected:?}, got {actual:?}"
+                ),
+                None => format!("JSON pointer {pointer:?} did not match artifact"),
+            });
+            (passed, diagnostic)
+        }
+        Check::JsonPointerContains {
+            pointer, contains, ..
+        } => {
+            let json = artifact.as_json();
+            let actual = pointer_text(&json, pointer);
+            let passed = actual
+                .as_deref()
+                .is_some_and(|text| text.contains(contains));
+            let diagnostic = (!passed).then(|| match actual {
+                Some(actual) => format!(
+                    "expected JSON pointer {pointer:?} to contain {contains:?}, got {actual:?}"
+                ),
+                None => format!("JSON pointer {pointer:?} did not match artifact"),
+            });
+            (passed, diagnostic)
+        }
+        Check::ArtifactTextContains {
+            field, contains, ..
+        } => {
+            let field = field.unwrap_or(ArtifactTextField::Output);
+            let text = artifact_text(artifact, field);
+            let passed = text.contains(contains);
+            let diagnostic = (!passed).then(|| {
+                format!(
+                    "expected {field_name} to contain {contains:?}",
+                    field_name = field_label(field),
+                )
+            });
+            (passed, diagnostic)
+        }
+        Check::ArtifactTextExact { field, exact, .. } => {
+            let field = field.unwrap_or(ArtifactTextField::Output);
+            let expected = normalize_text_block(&exact.content);
+            let text = normalize_text_block(artifact_text(artifact, field));
+            let passed = text == expected;
+            let diagnostic = (!passed).then(|| {
+                format!(
+                    "expected {field_name} to equal {expected:?}, got {text:?}",
+                    field_name = field_label(field),
+                )
+            });
+            (passed, diagnostic)
+        }
+        _ => (true, None),
+    }
+}
+
 async fn handle_visualizer_commands(
     case_id: &str,
     visualizer: &mut VisualizerHook,
@@ -2346,18 +2634,43 @@ fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
         .collect()
 }
 
+fn build_embedder(
+    config: &RunnerConfig,
+) -> Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
+    if let Some(embedding) = &config.embedding_backend {
+        let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
+            base_url: embedding.endpoint.clone(),
+            api_key: embedding.token.clone(),
+            model: embedding.model.clone(),
+            target_dimensions: embedding.dimensions,
+            request_timeout: None,
+        })
+        .with_context(|| {
+            format!(
+                "build openai embedder for model {} at {}",
+                embedding.model, embedding.endpoint
+            )
+        })?;
+        let profile = EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
+        Ok((Box::new(embedder), profile, embedding.dimensions))
+    } else {
+        let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
+            .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
+        let dimensions = embedder.dimensions();
+        let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+        Ok((Box::new(embedder), profile, dimensions))
+    }
+}
+
 async fn connect_memory_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlMemoryStore> {
-    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
-    let dimensions = embedder.dimensions();
-    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let (embedder, profile, dimensions) = build_embedder(config)?;
     let db_path = output_dir.join("memory.db");
     LibsqlMemoryStore::connect(
         LibsqlMemoryStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        Box::new(embedder),
+        embedder,
     )
     .await
     .context("connect libsql memory store")
@@ -2367,14 +2680,11 @@ async fn connect_policy_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlPolicyStore> {
-    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
-    let dimensions = embedder.dimensions();
-    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let (embedder, profile, dimensions) = build_embedder(config)?;
     let db_path = output_dir.join("policy.db");
     LibsqlPolicyStore::connect(
         LibsqlPolicyStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        Box::new(embedder),
+        embedder,
     )
     .await
     .context("connect libsql policy store")
@@ -4143,6 +4453,20 @@ impl RecordingRuntimeEventSink {
         self.stop.load(Ordering::Relaxed)
     }
 
+    fn request_stop(&self, reason: &str) {
+        if !self.stop.swap(true, Ordering::Relaxed) {
+            let _ = self.reporter.emit_port(
+                Some(&self.case_id),
+                "stop_requested",
+                serde_json::json!({ "reason": reason }),
+                format!(
+                    "eval stop requested case={} reason={}",
+                    self.case_id, reason
+                ),
+            );
+        }
+    }
+
     fn event_count(&self) -> usize {
         self.events
             .lock()
@@ -4609,6 +4933,7 @@ prompt = "Second?"
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
             model_dir: dir.path().join("models"),
+            embedding_backend: None,
             fail_fast: false,
             max_concurrent_llm_calls: None,
             case_patterns: vec!["special-memory".to_string()],
@@ -4795,6 +5120,7 @@ limits {{
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
             model_dir: dir.path().join("missing-model"),
+            embedding_backend: None,
             fail_fast: false,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),
@@ -5219,6 +5545,7 @@ prompt = "What am I attending to?"
             now: None,
             modules: Some(DEFAULT_FULL_AGENT_MODULES.to_vec()),
             inputs: Vec::new(),
+            steps: Vec::new(),
             participants: Vec::new(),
             memories: Vec::new(),
             memos: Vec::new(),

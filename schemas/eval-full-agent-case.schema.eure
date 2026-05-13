@@ -18,6 +18,10 @@ modules = [`$types.eval-module`]
 modules.$optional = true
 
 inputs = [`$types.full-agent-input`]
+inputs.$optional = true
+
+steps = [`$types.eval-step`]
+steps.$optional = true
 
 participants = [`text`]
 participants.$optional = true
@@ -79,6 +83,23 @@ variants.seen {
     $variant: text
     min-length = 1
   }
+}
+
+@ $types.eval-step
+description = `text`
+description.$optional = true
+inputs = [`$types.full-agent-input`]
+wait-for = `$types.wait-for`
+wait-for.$optional = true
+checks = [`$types.check`]
+checks.$optional = true
+
+@ $types.wait-for
+$variant: union
+
+variants.memo-from {
+  module = `$types.eval-module`
+  timeout-ms = `integer`
 }
 
 @ $types.memory-rank

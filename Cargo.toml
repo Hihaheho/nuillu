@@ -8,6 +8,7 @@ members = [
     "crates/adapters/in-memory",
     "crates/adapters/libsql",
     "crates/adapters/model2vec",
+    "crates/adapters/openai-embedding",
     "crates/modules/*",
     "crates/eval",
     "crates/visualizer-egui",
@@ -55,6 +56,7 @@ eure-document = "0.1.9"
 eure-fmt = "0.1.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # workspace-internal crates
 nuillu-types = { path = "crates/types" }
@@ -64,6 +66,7 @@ nuillu-agent = { path = "crates/agent" }
 lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
+nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }
 
 nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
 nuillu-attention-controller = { path = "crates/modules/attention-controller" }

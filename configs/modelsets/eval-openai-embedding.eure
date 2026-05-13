@@ -1,0 +1,40 @@
+name = "openai-embedding"
+
+embedding {
+  endpoint: https://api.openai.com/v1
+  token-env: OPENAI_API_KEY
+  model: text-embedding-3-small
+  dimensions = 512
+}
+
+judge {
+  endpoint: https://api.openai.com/v1
+  token-env: OPENAI_API_KEY
+  model: gpt-5.4-mini-2026-03-17
+  reasoning-effort = "medium"
+  use-responses-api = true
+}
+
+cheap {
+  endpoint: https://api.openai.com/v1
+  token-env: OPENAI_API_KEY
+  model: gpt-5.4-nano-2026-03-17
+  reasoning-effort = "low"
+  use-responses-api = true
+}
+
+default {
+  endpoint: https://api.openai.com/v1
+  token-env: OPENAI_API_KEY
+  model: gpt-5.4-nano-2026-03-17
+  reasoning-effort = "medium"
+  use-responses-api = true
+}
+
+premium {
+  endpoint: https://api.openai.com/v1
+  token-env: OPENAI_API_KEY
+  model: gpt-5.4-nano-2026-03-17
+  reasoning-effort = "medium"
+  use-responses-api = true
+}

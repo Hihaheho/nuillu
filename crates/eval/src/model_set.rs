@@ -28,6 +28,8 @@ pub struct ModelSet {
     pub default: Option<ModelSetRole>,
     #[eure(default)]
     pub premium: Option<ModelSetRole>,
+    #[eure(default)]
+    pub embedding: Option<EmbeddingRole>,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -80,6 +82,29 @@ impl ModelSetRole {
     }
 }
 
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct EmbeddingRole {
+    #[eure(default)]
+    pub endpoint: Option<String>,
+    #[eure(default)]
+    pub base_url: Option<String>,
+    #[eure(default)]
+    pub token: Option<String>,
+    #[eure(default)]
+    pub token_env: Option<String>,
+    #[eure(default)]
+    pub model: Option<String>,
+    #[eure(default)]
+    pub dimensions: Option<u32>,
+}
+
+impl EmbeddingRole {
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref().or(self.base_url.as_deref())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ModelSetError {
     #[error("failed to read model set {path}: {source}")]
@@ -115,7 +140,35 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
     validate_role(path, "judge", model_set.judge.as_ref())?;
     validate_role(path, "cheap", model_set.cheap.as_ref())?;
     validate_role(path, "default", model_set.default.as_ref())?;
-    validate_role(path, "premium", model_set.premium.as_ref())
+    validate_role(path, "premium", model_set.premium.as_ref())?;
+    validate_embedding_role(path, model_set.embedding.as_ref())
+}
+
+fn validate_embedding_role(
+    path: &Path,
+    role: Option<&EmbeddingRole>,
+) -> Result<(), ModelSetError> {
+    let Some(role) = role else {
+        return Ok(());
+    };
+    if role.endpoint.is_some() && role.base_url.is_some() {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: "embedding.endpoint and embedding.base-url cannot both be set".to_string(),
+        });
+    }
+    validate_optional_text(path, "embedding.endpoint", role.endpoint.as_deref())?;
+    validate_optional_text(path, "embedding.base-url", role.base_url.as_deref())?;
+    validate_optional_text(path, "embedding.token", role.token.as_deref())?;
+    validate_optional_text(path, "embedding.token-env", role.token_env.as_deref())?;
+    validate_optional_text(path, "embedding.model", role.model.as_deref())?;
+    if role.dimensions == Some(0) {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: "embedding.dimensions must be greater than zero when set".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_role(

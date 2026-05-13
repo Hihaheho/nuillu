@@ -543,21 +543,21 @@ fn build_outcome_with_rubric(
     }
 }
 
-fn artifact_text(artifact: &CaseArtifact, field: ArtifactTextField) -> &str {
+pub(crate) fn artifact_text(artifact: &CaseArtifact, field: ArtifactTextField) -> &str {
     match field {
         ArtifactTextField::Output => &artifact.output,
         ArtifactTextField::Failure => artifact.failure.as_deref().unwrap_or(""),
     }
 }
 
-fn field_label(field: ArtifactTextField) -> &'static str {
+pub(crate) fn field_label(field: ArtifactTextField) -> &'static str {
     match field {
         ArtifactTextField::Output => "output",
         ArtifactTextField::Failure => "failure",
     }
 }
 
-fn pointer_text(value: &serde_json::Value, pointer: &str) -> Option<String> {
+pub(crate) fn pointer_text(value: &serde_json::Value, pointer: &str) -> Option<String> {
     value.pointer(pointer).map(json_value_text)
 }
 
@@ -899,7 +899,7 @@ fn value_field_text(value: &serde_json::Value, field: &str) -> Option<String> {
     value.get(field).map(json_value_text)
 }
 
-fn json_value_text(value: &serde_json::Value) -> String {
+pub(crate) fn json_value_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
         other => {

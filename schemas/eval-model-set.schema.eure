@@ -17,6 +17,9 @@ default.$optional = true
 premium = `$types.model-role`
 premium.$optional = true
 
+embedding = `$types.embedding-role`
+embedding.$optional = true
+
 @ $types.reasoning-effort
 $variant: union
 variants.none = { = "none", $variant => "literal" }
@@ -41,3 +44,17 @@ reasoning-effort = `$types.reasoning-effort`
 reasoning-effort.$optional = true
 use-responses-api = `boolean`
 use-responses-api.$optional = true
+
+@ $types.embedding-role
+endpoint = `text`
+endpoint.$optional = true
+base-url = `text`
+base-url.$optional = true
+token = `text`
+token.$optional = true
+token-env = `text`
+token-env.$optional = true
+model = `text`
+model.$optional = true
+dimensions = `number`
+dimensions.$optional = true

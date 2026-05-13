@@ -3,15 +3,16 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use anyhow::Context as _;
 use clap::Parser;
 use nuillu_eval::{
-    EvalModule, LlmBackendConfig, ModelSet, ModelSetRole, ReasoningEffort, RunnerConfig,
-    default_run_id, gui::run_suite_with_visualizer, install_lutum_trace_subscriber,
-    parse_model_set_file, run_suite,
+    EmbeddingBackendConfig, EmbeddingRole, EvalModule, LlmBackendConfig, ModelSet, ModelSetRole,
+    ReasoningEffort, RunnerConfig, default_run_id, gui::run_suite_with_visualizer,
+    install_lutum_trace_subscriber, parse_model_set_file, run_suite,
 };
 use tokio::runtime::Builder;
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
 const DEFAULT_OPENAI_COMPAT_TOKEN: &str = "local";
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
+const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +128,7 @@ fn main() -> anyhow::Result<()> {
         args.premium_model.as_deref(),
         args.premium_reasoning_effort,
     )?;
+    let embedding_backend = resolve_embedding(model_set.as_ref().and_then(|m| m.embedding.as_ref()))?;
     let config = RunnerConfig {
         cases_root: args.cases,
         output_root: args.output,
@@ -136,6 +138,7 @@ fn main() -> anyhow::Result<()> {
         default_backend,
         premium_backend,
         model_dir: args.model_dir,
+        embedding_backend,
         fail_fast: args.fail_fast,
         max_concurrent_llm_calls: args.max_concurrent_llm_calls,
         case_patterns: args.patterns,
@@ -208,19 +211,32 @@ fn resolve_token(label: &str, role: Option<&ModelSetRole>) -> anyhow::Result<Str
     let Some(role) = role else {
         return Ok(DEFAULT_OPENAI_COMPAT_TOKEN.to_string());
     };
+    resolve_token_fields(
+        label,
+        role.token_env.as_deref(),
+        role.token.as_deref(),
+        Some(DEFAULT_OPENAI_COMPAT_TOKEN),
+    )
+}
 
-    if let Some(env_name) = role.token_env.as_deref() {
+fn resolve_token_fields(
+    label: &str,
+    token_env: Option<&str>,
+    token: Option<&str>,
+    default: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(env_name) = token_env {
         match std::env::var(env_name) {
-            Ok(token) if !token.trim().is_empty() => return Ok(token),
+            Ok(value) if !value.trim().is_empty() => return Ok(value),
             Ok(_) => {
-                if let Some(token) = role.token.as_ref() {
-                    return Ok(token.clone());
+                if let Some(value) = token {
+                    return Ok(value.to_string());
                 }
                 anyhow::bail!("{label}.token-env {env_name} is set but empty");
             }
             Err(source) => {
-                if let Some(token) = role.token.as_ref() {
-                    return Ok(token.clone());
+                if let Some(value) = token {
+                    return Ok(value.to_string());
                 }
                 return Err(source)
                     .with_context(|| format!("read {label}.token-env {env_name} from model set"));
@@ -228,10 +244,47 @@ fn resolve_token(label: &str, role: Option<&ModelSetRole>) -> anyhow::Result<Str
         }
     }
 
-    Ok(role
-        .token
+    if let Some(value) = token {
+        return Ok(value.to_string());
+    }
+    match default {
+        Some(value) => Ok(value.to_string()),
+        None => anyhow::bail!("{label}.token or {label}.token-env must be set"),
+    }
+}
+
+fn resolve_embedding(
+    role: Option<&EmbeddingRole>,
+) -> anyhow::Result<Option<EmbeddingBackendConfig>> {
+    let Some(role) = role else {
+        return Ok(None);
+    };
+    let endpoint = role
+        .endpoint()
+        .unwrap_or(DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
+        .to_string();
+    let token = resolve_token_fields(
+        "embedding",
+        role.token_env.as_deref(),
+        role.token.as_deref(),
+        None,
+    )?;
+    let model = role
+        .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_OPENAI_COMPAT_TOKEN.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("missing embedding.model in --model-set"))?;
+    let dimensions = role
+        .dimensions
+        .ok_or_else(|| anyhow::anyhow!("missing embedding.dimensions in --model-set"))?;
+    if dimensions == 0 {
+        anyhow::bail!("embedding.dimensions must be greater than zero");
+    }
+    Ok(Some(EmbeddingBackendConfig {
+        endpoint,
+        token,
+        model,
+        dimensions: dimensions as usize,
+    }))
 }
 
 fn role_ref(model_set: Option<&ModelSet>, role: ModelRole) -> Option<&ModelSetRole> {
