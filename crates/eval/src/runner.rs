@@ -31,6 +31,7 @@ use lutum_libsql_adapter::{
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
+use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
@@ -102,6 +103,14 @@ pub struct LlmBackendConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct EmbeddingBackendConfig {
+    pub endpoint: String,
+    pub token: String,
+    pub model: String,
+    pub dimensions: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub cases_root: PathBuf,
     pub output_root: PathBuf,
@@ -111,6 +120,7 @@ pub struct RunnerConfig {
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
     pub model_dir: PathBuf,
+    pub embedding_backend: Option<EmbeddingBackendConfig>,
     pub fail_fast: bool,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
@@ -2588,18 +2598,43 @@ fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
         .collect()
 }
 
+fn build_embedder(
+    config: &RunnerConfig,
+) -> Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
+    if let Some(embedding) = &config.embedding_backend {
+        let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
+            base_url: embedding.endpoint.clone(),
+            api_key: embedding.token.clone(),
+            model: embedding.model.clone(),
+            target_dimensions: embedding.dimensions,
+            request_timeout: None,
+        })
+        .with_context(|| {
+            format!(
+                "build openai embedder for model {} at {}",
+                embedding.model, embedding.endpoint
+            )
+        })?;
+        let profile = EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
+        Ok((Box::new(embedder), profile, embedding.dimensions))
+    } else {
+        let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
+            .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
+        let dimensions = embedder.dimensions();
+        let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+        Ok((Box::new(embedder), profile, dimensions))
+    }
+}
+
 async fn connect_memory_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlMemoryStore> {
-    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
-    let dimensions = embedder.dimensions();
-    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let (embedder, profile, dimensions) = build_embedder(config)?;
     let db_path = output_dir.join("memory.db");
     LibsqlMemoryStore::connect(
         LibsqlMemoryStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        Box::new(embedder),
+        embedder,
     )
     .await
     .context("connect libsql memory store")
@@ -2609,14 +2644,11 @@ async fn connect_policy_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlPolicyStore> {
-    let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-        .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
-    let dimensions = embedder.dimensions();
-    let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
+    let (embedder, profile, dimensions) = build_embedder(config)?;
     let db_path = output_dir.join("policy.db");
     LibsqlPolicyStore::connect(
         LibsqlPolicyStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        Box::new(embedder),
+        embedder,
     )
     .await
     .context("connect libsql policy store")
@@ -4821,6 +4853,7 @@ prompt = "Second?"
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
             model_dir: dir.path().join("models"),
+            embedding_backend: None,
             fail_fast: false,
             max_concurrent_llm_calls: None,
             case_patterns: vec!["special-memory".to_string()],
@@ -5007,6 +5040,7 @@ limits {{
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
             model_dir: dir.path().join("missing-model"),
+            embedding_backend: None,
             fail_fast: false,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),

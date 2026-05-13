@@ -31,6 +31,7 @@ nuillu-memory = { workspace = true }
 nuillu-memory-compaction = { workspace = true }
 nuillu-policy = { workspace = true }
 nuillu-module = { workspace = true }
+nuillu-openai-embedding-adapter = { workspace = true }
 nuillu-predict = { workspace = true }
 nuillu-query-agentic = { workspace = true }
 nuillu-query-policy = { workspace = true }
