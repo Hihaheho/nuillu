@@ -20,7 +20,7 @@ use nuillu_module::RuntimeEvent;
 
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
-    LlmObservationSource, LlmUsageView, ModuleStatusView,
+    LlmObservationSource, LlmUsageView, MemoView, ModuleStatusView, memos,
     text::{hard_wrap_long_segments, wrapped_label},
 };
 
@@ -366,54 +366,57 @@ pub fn render_modules_overview(
     actions
 }
 
-pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
+pub fn render_module(ui: &mut egui::Ui, module: &ModuleState, memos: &[MemoView]) {
+    let module_memos = module_memos(module, memos);
     ui.horizontal_wrapped(|ui| {
         ui.heading(module_title(module));
         if let Some(tier) = &module.last_tier {
             ui.label(format!("tier: {tier}"));
         }
+        ui.label(format!("memos: {}", module_memos.len()));
         ui.label(format!("turns: {}", module.turns.len()));
     });
     ui.separator();
 
-    let Some(default_turn_id) = active_turn_id(module) else {
-        ui.label("No LLM turns yet.");
-        return;
-    };
-    let persisted_turn_id =
-        ui.use_persisted_state(|| default_turn_id.clone(), module.owner.clone());
-    let selected_turn_id = selected_turn_id(module, persisted_turn_id.as_str(), &default_turn_id);
-    if selected_turn_id != persisted_turn_id.as_str() {
-        persisted_turn_id.set_next(selected_turn_id.clone());
+    let persisted_panel =
+        ui.use_persisted_state(|| MODULE_MEMOS_SELECTION.to_string(), module.owner.clone());
+    let selected_panel = selected_module_panel(module, persisted_panel.as_str());
+    if selected_panel != persisted_panel.as_str() {
+        persisted_panel.set_next(selected_panel.clone());
     }
 
-    let mut next_turn_id = selected_turn_id.clone();
+    let mut next_panel = selected_panel.clone();
     let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
     ui.horizontal(|ui| {
         ui.set_min_height(body_height);
         ui.vertical(|ui| {
             ui.set_width(190.0);
-            ui.strong("Turns");
+            ui.strong("Views");
             ui.separator();
-            render_turn_list(ui, module, &selected_turn_id, &mut next_turn_id);
+            render_module_selector(ui, module, &selected_panel, &mut next_panel);
         });
 
         ui.separator();
 
         ui.vertical(|ui| {
             ui.set_min_width((ui.available_width() - 8.0).max(260.0));
-            if let Some((turn_index, turn)) = module
-                .turns
-                .iter()
-                .enumerate()
-                .find(|(_, turn)| turn.turn_id == next_turn_id)
+            if next_panel == MODULE_MEMOS_SELECTION {
+                render_module_memos(ui, module, &module_memos);
+            } else if let Some(turn_id) = next_panel.strip_prefix(MODULE_TURN_SELECTION_PREFIX)
+                && let Some((turn_index, turn)) = module
+                    .turns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, turn)| turn.turn_id == turn_id)
             {
                 render_active_turn(ui, module, turn_index, turn);
+            } else {
+                render_module_memos(ui, module, &module_memos);
             }
         });
     });
-    if next_turn_id != selected_turn_id {
-        persisted_turn_id.set_next(next_turn_id);
+    if next_panel != selected_panel {
+        persisted_panel.set_next(next_panel);
     }
 }
 
@@ -422,26 +425,56 @@ pub fn window_title(module: &ModuleState) -> String {
 }
 
 const MODULE_BODY_MIN_HEIGHT: f32 = 160.0;
+const MODULE_MEMOS_SELECTION: &str = "memos";
+const MODULE_TURN_SELECTION_PREFIX: &str = "turn:";
 
-fn render_turn_list(
+fn render_module_selector(
     ui: &mut egui::Ui,
     module: &ModuleState,
-    selected_turn_id: &str,
-    next_turn_id: &mut String,
+    selected_panel: &str,
+    next_panel: &mut String,
 ) {
     egui::ScrollArea::vertical()
-        .id_salt(format!("turn-list:{}", module.owner))
+        .id_salt(format!("module-panel-list:{}", module.owner))
         .show(ui, |ui| {
+            if ui
+                .selectable_label(selected_panel == MODULE_MEMOS_SELECTION, "memos")
+                .clicked()
+            {
+                *next_panel = MODULE_MEMOS_SELECTION.to_string();
+            }
             for (index, turn) in module.turns.iter().enumerate() {
-                let selected = turn.turn_id == selected_turn_id;
+                let panel_id = turn_selection_id(&turn.turn_id);
+                let selected = panel_id == selected_panel;
                 ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
                     let response = ui
-                        .selectable_label(selected, turn_list_label(index, turn))
-                        .on_hover_text(&turn.turn_id);
+                        .selectable_label(selected, turn_selector_label(index))
+                        .on_hover_text(turn_selector_hover(turn));
                     if response.clicked() {
-                        *next_turn_id = turn.turn_id.clone();
+                        *next_panel = panel_id;
                     }
                 });
+            }
+        });
+}
+
+fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoView]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("memos");
+        ui.label(format!("module: {}", module_name(module)));
+        ui.label(format!("count: {}", memos.len()));
+    });
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt(("module-memos", module.owner.as_str()))
+        .show(ui, |ui| {
+            if memos.is_empty() {
+                ui.label("No memos yet.");
+                return;
+            }
+            for memo in memos {
+                memos::render_memo_card(ui, memo);
+                ui.add_space(6.0);
             }
         });
 }
@@ -1006,43 +1039,44 @@ fn module_name(module: &ModuleState) -> String {
     }
 }
 
-fn turn_list_label(index: usize, turn: &LlmTurnState) -> String {
-    format!(
-        "{} {:02} {} {}",
-        status_label(turn.status),
-        index + 1,
-        turn.operation,
-        turn.source.label()
-    )
+fn module_memos<'a>(module: &ModuleState, memos: &'a [MemoView]) -> Vec<&'a MemoView> {
+    let module_name = module_name(module);
+    memos
+        .iter()
+        .filter(|memo| memo.module == module_name)
+        .collect()
 }
 
-fn active_turn_id(module: &ModuleState) -> Option<String> {
-    module
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.status == ModuleSessionStatus::Running)
-        .or_else(|| module.turns.last())
-        .map(|turn| turn.turn_id.clone())
-}
-
-fn selected_turn_id(module: &ModuleState, persisted: &str, default_turn_id: &str) -> String {
-    let running_turn_id = module
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.status == ModuleSessionStatus::Running)
-        .map(|turn| turn.turn_id.as_str());
-    if let Some(running_turn_id) = running_turn_id
-        && running_turn_id != persisted
-    {
-        return running_turn_id.to_string();
+fn selected_module_panel(module: &ModuleState, persisted: &str) -> String {
+    if persisted == MODULE_MEMOS_SELECTION {
+        return MODULE_MEMOS_SELECTION.to_string();
     }
-    if module.turns.iter().any(|turn| turn.turn_id == persisted) {
+    let Some(turn_id) = persisted.strip_prefix(MODULE_TURN_SELECTION_PREFIX) else {
+        return MODULE_MEMOS_SELECTION.to_string();
+    };
+    if module.turns.iter().any(|turn| turn.turn_id == turn_id) {
         persisted.to_string()
     } else {
-        default_turn_id.to_string()
+        MODULE_MEMOS_SELECTION.to_string()
     }
+}
+
+fn turn_selection_id(turn_id: &str) -> String {
+    format!("{MODULE_TURN_SELECTION_PREFIX}{turn_id}")
+}
+
+fn turn_selector_label(index: usize) -> String {
+    format!("turn {}", index + 1)
+}
+
+fn turn_selector_hover(turn: &LlmTurnState) -> String {
+    format!(
+        "{} {} {} ({})",
+        status_label(turn.status),
+        turn.operation,
+        turn.source.label(),
+        turn.turn_id
+    )
 }
 
 fn ensure_turn<'a>(
@@ -1410,6 +1444,56 @@ mod tests {
     }
 
     #[test]
+    fn module_memos_filter_by_module_across_replicas() {
+        let module = ModuleState {
+            owner: "query-vector".to_string(),
+            module: "query-vector".to_string(),
+            replica: 0,
+            ..ModuleState::default()
+        };
+        let memos = vec![
+            memo_view("query-vector", "query-vector", 0, 0, "primary memo"),
+            memo_view("query-vector[1]", "query-vector", 1, 0, "replica memo"),
+            memo_view("sensory", "sensory", 0, 0, "other memo"),
+        ];
+
+        let owners = module_memos(&module, &memos)
+            .into_iter()
+            .map(|memo| memo.owner.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(owners, vec!["query-vector", "query-vector[1]"]);
+    }
+
+    #[test]
+    fn selected_module_panel_defaults_and_falls_back_to_memos() {
+        let module = ModuleState {
+            owner: "sensory".to_string(),
+            module: "sensory".to_string(),
+            turns: vec![LlmTurnState {
+                turn_id: "turn-1".to_string(),
+                operation: "text_turn".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                tier: "Default".to_string(),
+                model: None,
+                request_id: None,
+                finish_reason: None,
+                usage: None,
+                input: Vec::new(),
+                output: Vec::new(),
+                status: ModuleSessionStatus::Running,
+            }],
+            ..ModuleState::default()
+        };
+
+        assert_eq!(selected_module_panel(&module, ""), "memos");
+        assert_eq!(selected_module_panel(&module, "memos"), "memos");
+        assert_eq!(selected_module_panel(&module, "turn:turn-1"), "turn:turn-1");
+        assert_eq!(selected_module_panel(&module, "turn:missing"), "memos");
+        assert_eq!(selected_module_panel(&module, "turn-1"), "memos");
+    }
+
+    #[test]
     fn runtime_events_record_throttle_summaries_without_changing_llm_status() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
@@ -1551,5 +1635,18 @@ mod tests {
 
         assert_eq!(idle_title, "Module - sensory");
         assert_eq!(window_title(&module), idle_title);
+    }
+
+    fn memo_view(owner: &str, module: &str, replica: u8, index: u64, content: &str) -> MemoView {
+        MemoView {
+            owner: owner.to_string(),
+            module: module.to_string(),
+            replica,
+            index,
+            written_at: chrono::DateTime::parse_from_rfc3339("2026-05-13T00:00:00Z")
+                .expect("valid timestamp")
+                .with_timezone(&chrono::Utc),
+            content: content.to_string(),
+        }
     }
 }

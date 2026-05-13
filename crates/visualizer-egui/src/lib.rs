@@ -476,7 +476,9 @@ impl RuntimeTab {
                     .open_override(requested)
                     .default_pos(x, y)
                     .default_size(420.0, 360.0)
-                    .show(ui, |ui| modules::render_module(ui, module))
+                    .show(ui, |ui| {
+                        modules::render_module(ui, module, &self.blackboard.memos)
+                    })
             };
             self.record_window_open(module_id, open);
         }
