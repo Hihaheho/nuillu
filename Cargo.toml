@@ -11,6 +11,7 @@ members = [
     "crates/adapters/openai-embedding",
     "crates/modules/*",
     "crates/eval",
+    "crates/server",
     "crates/visualizer-egui",
     "crates/visualizer-protocol",
 ]

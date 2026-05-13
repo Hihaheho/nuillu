@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, LlmAccess, Memo, Module, SensoryInput,
-    SensoryInputInbox, SessionCompactionConfig, compact_session_if_needed, ports::Clock,
-    seed_persistent_faculty_session,
+    AllocationReader, AllocationUpdatedInbox, AmbientSensoryEntry, LlmAccess, Memo, Module,
+    SensoryInput, SensoryInputInbox, SensoryModality, SessionCompactionConfig,
+    compact_session_if_needed, ports::Clock, seed_persistent_faculty_session,
 };
 use tokio::time::Instant;
 
@@ -41,7 +41,8 @@ const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
 
 #[derive(Clone, Debug)]
 struct PreparedSensoryObservation {
-    kind: &'static str,
+    modality: SensoryModality,
+    ambient: bool,
     direction: Option<String>,
     content: String,
     observed_at: DateTime<Utc>,
@@ -203,7 +204,7 @@ impl SensoryModule {
         let observations = inputs
             .iter()
             .cloned()
-            .map(|input| self.prepare_observation(now, input))
+            .flat_map(|input| self.prepare_input_observations(now, input))
             .collect::<Vec<_>>();
         self.ensure_session_seeded(cx);
         let allocation = self.allocation.snapshot().await;
@@ -240,28 +241,71 @@ impl SensoryModule {
         Ok(())
     }
 
-    fn prepare_observation(
+    fn prepare_input_observations(
         &mut self,
         now: DateTime<Utc>,
         input: SensoryInput,
-    ) -> PreparedSensoryObservation {
-        let (kind, direction, raw_content, observed_at) = match &input {
-            SensoryInput::Heard {
+    ) -> Vec<PreparedSensoryObservation> {
+        match input {
+            SensoryInput::Observed {
+                modality,
                 direction,
                 content,
                 observed_at,
-            } => ("heard", direction.clone(), content.clone(), *observed_at),
-            SensoryInput::Seen {
+            } => vec![self.prepare_observation(
+                now,
+                modality,
+                false,
                 direction,
-                appearance,
+                content,
                 observed_at,
-            } => ("seen", direction.clone(), appearance.clone(), *observed_at),
-        };
+            )],
+            SensoryInput::AmbientSnapshot {
+                entries,
+                observed_at,
+            } => entries
+                .into_iter()
+                .map(|entry| self.prepare_ambient_observation(now, entry, observed_at))
+                .collect(),
+        }
+    }
+
+    fn prepare_ambient_observation(
+        &mut self,
+        now: DateTime<Utc>,
+        entry: AmbientSensoryEntry,
+        observed_at: DateTime<Utc>,
+    ) -> PreparedSensoryObservation {
+        self.prepare_observation(
+            now,
+            entry.modality,
+            true,
+            Some(format!("ambient:{}", entry.id)),
+            entry.content,
+            observed_at,
+        )
+    }
+
+    fn prepare_observation(
+        &mut self,
+        now: DateTime<Utc>,
+        modality: SensoryModality,
+        ambient: bool,
+        direction: Option<String>,
+        raw_content: String,
+        observed_at: DateTime<Utc>,
+    ) -> PreparedSensoryObservation {
         let relative_age = Self::format_age(now, observed_at);
-        let salience =
-            self.salience_features(kind, direction.as_deref(), &raw_content, observed_at);
+        let salience = self.salience_features(
+            modality.as_str(),
+            ambient,
+            direction.as_deref(),
+            &raw_content,
+            observed_at,
+        );
         PreparedSensoryObservation {
-            kind,
+            modality,
+            ambient,
             direction,
             content: raw_content,
             observed_at,
@@ -317,14 +361,16 @@ impl SensoryModule {
 
     fn salience_features(
         &mut self,
-        kind: &str,
+        modality: &str,
+        ambient: bool,
         direction: Option<&str>,
         content: &str,
         observed_at: DateTime<Utc>,
     ) -> SalienceFeatures {
         let signature = format!(
-            "{}:{}:{}",
-            kind,
+            "{}:{}:{}:{}",
+            if ambient { "ambient" } else { "observed" },
+            modality,
             direction.unwrap_or_default().to_ascii_lowercase(),
             content.trim().to_ascii_lowercase()
         );
@@ -474,14 +520,27 @@ fn format_sensory_batch(observations: &[PreparedSensoryObservation]) -> String {
         out.push_str("\n- none");
         return out;
     }
+    if observations.iter().any(|observation| observation.ambient) {
+        out.push_str(
+            "\nAmbient snapshot entries are enabled background rows only; omitted rows are not evidence that a condition disappeared.",
+        );
+    }
     for observation in observations {
+        let mode = if observation.ambient {
+            "ambient"
+        } else {
+            "observed"
+        };
+        let direction = observation
+            .direction
+            .as_deref()
+            .map(|direction| format!(" from {direction}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "\n- {} from {} observed {} ({}): {}",
-            observation.kind,
-            observation
-                .direction
-                .as_deref()
-                .unwrap_or("unknown direction"),
+            "\n- {} {}{} observed {} ({}): {}",
+            mode,
+            observation.modality.as_str(),
+            direction,
             observation.relative_age,
             observation.observed_at.to_rfc3339(),
             observation.content.trim()
@@ -574,10 +633,7 @@ mod tests {
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
         linear_ratio_fn,
     };
-    use nuillu_module::ports::{
-        NoopCognitionLogRepository,
-        SystemClock,
-    };
+    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
     };
@@ -739,7 +795,8 @@ mod tests {
     }
 
     fn heard(content: &str) -> SensoryInput {
-        SensoryInput::Heard {
+        SensoryInput::Observed {
+            modality: SensoryModality::Audition,
             direction: Some("front".to_string()),
             content: content.to_string(),
             observed_at: reference_now(),
@@ -784,6 +841,46 @@ mod tests {
         assert!(is_user_directed_direction("USER"));
         assert!(!is_user_directed_direction("ryo"));
         assert!(!is_user_directed_direction("left"));
+    }
+
+    #[test]
+    fn sensory_modality_round_trips_known_and_custom_strings() {
+        let known = serde_json::to_string(&SensoryModality::Audition).unwrap();
+        assert_eq!(known, "\"audition\"");
+        assert_eq!(
+            serde_json::from_str::<SensoryModality>("\"audio\"").unwrap(),
+            SensoryModality::Audition
+        );
+        assert_eq!(
+            serde_json::from_str::<SensoryModality>("\"thermal\"").unwrap(),
+            SensoryModality::Other("thermal".to_string())
+        );
+    }
+
+    #[test]
+    fn ambient_snapshot_format_marks_background_context() {
+        let observations = vec![PreparedSensoryObservation {
+            modality: SensoryModality::Smell,
+            ambient: true,
+            direction: Some("ambient:row-1".to_string()),
+            content: "wet stone smell".to_string(),
+            observed_at: reference_now(),
+            relative_age: "0 seconds ago".to_string(),
+            salience: SalienceFeatures {
+                signature: "ambient:smell:ambient:row-1:wet stone smell".to_string(),
+                repeated: false,
+                repetition_count: 1,
+                seconds_since_previous: None,
+                user_directed: false,
+                novelty_score: 0.85,
+                salience_score: 0.85,
+            },
+        }];
+        let text = format_sensory_batch(&observations);
+
+        assert!(text.contains("Ambient snapshot entries are enabled background rows only"));
+        assert!(text.contains("ambient smell"));
+        assert!(text.contains("wet stone smell"));
     }
 
     #[tokio::test(flavor = "current_thread")]

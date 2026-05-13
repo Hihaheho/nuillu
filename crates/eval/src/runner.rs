@@ -42,7 +42,7 @@ use nuillu_module::{
     AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
     LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
-    RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox,
+    RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_query_agentic::{
@@ -54,12 +54,12 @@ use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
 use nuillu_visualizer_protocol::{
-    AllocationView, BlackboardSnapshot, ChatInputKind, CognitionEntryView, CognitionLogView,
-    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, MemoView,
-    MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleStatusView, TabStatus,
-    UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
-    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
-    VisualizerTabId, start_activation_action_id,
+    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, LlmInputItemView,
+    LlmObservationEvent, LlmObservationSource, LlmUsageView, MemoView, MemoryMetadataView,
+    MemoryPage, MemoryRecordView, ModuleStatusView, TabStatus, UtteranceDeltaView,
+    UtteranceProgressView, UtteranceView, VisualizerAction, VisualizerClientMessage,
+    VisualizerCommand, VisualizerEvent, VisualizerServerMessage, VisualizerTabId,
+    start_activation_action_id,
 };
 use regex::RegexBuilder;
 use serde::Serialize;
@@ -193,7 +193,7 @@ impl VisualizerHook {
         VisualizerEventSink::new(self.events.clone())
     }
 
-    fn send_event(&self, event: VisualizerEvent) {
+    pub(crate) fn send_event(&self, event: VisualizerEvent) {
         let _ = self.events.send(VisualizerServerMessage::event(event));
     }
 
@@ -209,12 +209,23 @@ impl VisualizerHook {
             .send(VisualizerServerMessage::RevokeAction { action_id });
     }
 
-    fn request_shutdown(&mut self) {
+    pub(crate) fn request_shutdown(&mut self) {
         self.shutdown_requested = true;
     }
 
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
+    }
+
+    pub(crate) fn try_recv_command(&mut self) -> Option<VisualizerClientMessage> {
+        match self.commands.try_recv() {
+            Ok(message) => Some(message),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.request_shutdown();
+                None
+            }
+        }
     }
 
     fn set_memory_cache(&mut self, case_id: &str, records: Vec<MemoryRecordView>) {
@@ -273,6 +284,15 @@ impl VisualizerHook {
                     });
                 }
                 VisualizerCommand::SendSensoryInput { tab_id, .. } => {
+                    self.send_event(VisualizerEvent::Log {
+                        tab_id,
+                        message: "eval case is no longer running".to_string(),
+                    });
+                }
+                VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
+                | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
+                | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
+                | VisualizerCommand::SetModuleDisabled { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -1982,7 +2002,7 @@ async fn last_memo_log_content_for_module(
         .await
 }
 
-async fn emit_visualizer_blackboard_snapshot(
+pub(crate) async fn emit_visualizer_blackboard_snapshot(
     case_id: &str,
     blackboard: &Blackboard,
     visualizer: Option<&VisualizerHook>,
@@ -2027,7 +2047,8 @@ async fn publish_full_agent_inputs(
     let now = clock.now();
     for input in inputs {
         let body = match input {
-            FullAgentInput::Heard { direction, content } => SensoryInput::Heard {
+            FullAgentInput::Heard { direction, content } => SensoryInput::Observed {
+                modality: SensoryModality::Audition,
                 direction: direction.clone(),
                 content: content.content.clone(),
                 observed_at: now,
@@ -2035,9 +2056,20 @@ async fn publish_full_agent_inputs(
             FullAgentInput::Seen {
                 direction,
                 appearance,
-            } => SensoryInput::Seen {
+            } => SensoryInput::Observed {
+                modality: SensoryModality::Vision,
                 direction: direction.clone(),
-                appearance: appearance.content.clone(),
+                content: appearance.content.clone(),
+                observed_at: now,
+            },
+            FullAgentInput::Observed {
+                modality,
+                direction,
+                content,
+            } => SensoryInput::Observed {
+                modality: SensoryModality::parse(modality),
+                direction: direction.clone(),
+                content: content.content.clone(),
                 observed_at: now,
             },
         };
@@ -2340,17 +2372,11 @@ async fn handle_visualizer_commands(
                     continue;
                 };
                 let observed_at = clock.now();
-                let body = match input.kind {
-                    ChatInputKind::Heard => SensoryInput::Heard {
-                        direction: input.direction,
-                        content: input.content,
-                        observed_at,
-                    },
-                    ChatInputKind::Seen => SensoryInput::Seen {
-                        direction: input.direction,
-                        appearance: input.content,
-                        observed_at,
-                    },
+                let body = SensoryInput::Observed {
+                    modality: SensoryModality::parse(input.modality),
+                    direction: None,
+                    content: input.content,
+                    observed_at,
                 };
                 let _ = sensory.publish(body.clone()).await;
                 visualizer.send_event(VisualizerEvent::SensoryInput {
@@ -2390,6 +2416,36 @@ async fn handle_visualizer_commands(
                     page: records,
                 });
             }
+            VisualizerCommand::SetModuleDisabled {
+                tab_id,
+                module,
+                disabled,
+            } if tab_id.as_str() == case_id => match ModuleId::new(module.clone()) {
+                Ok(module_id) => {
+                    blackboard
+                        .apply(BlackboardCommand::SetModuleForcedDisabled {
+                            module: module_id,
+                            disabled,
+                        })
+                        .await;
+                }
+                Err(_) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id,
+                        message: format!("invalid module id: {module}"),
+                    });
+                }
+            },
+            VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
+            | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
+            | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
+                if tab_id.as_str() == case_id =>
+            {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id,
+                    message: "ambient sensory rows are only supported by nuillu-server".to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -2402,7 +2458,7 @@ struct VisualizerCommandOutcome {
     start_requested: bool,
 }
 
-async fn emit_visualizer_memory_page(
+pub(crate) async fn emit_visualizer_memory_page(
     case_id: &str,
     visualizer: &mut VisualizerHook,
     blackboard: &Blackboard,
@@ -2506,18 +2562,18 @@ fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
     }
 }
 
-struct EvalEnvironment {
-    blackboard: Blackboard,
-    caps: CapabilityProviders,
-    memory: Arc<dyn MemoryStore>,
-    memory_caps: MemoryCapabilities,
-    policy_caps: PolicyCapabilities,
-    utterances: Arc<RecordingUtteranceSink>,
-    actions: Arc<ActionActivityTracker>,
-    events: Arc<RecordingRuntimeEventSink>,
-    clock: Arc<dyn Clock>,
-    file_search: Arc<dyn FileSearchProvider>,
-    utterance_sink: Arc<dyn UtteranceSink>,
+pub(crate) struct EvalEnvironment {
+    pub(crate) blackboard: Blackboard,
+    pub(crate) caps: CapabilityProviders,
+    pub(crate) memory: Arc<dyn MemoryStore>,
+    pub(crate) memory_caps: MemoryCapabilities,
+    pub(crate) policy_caps: PolicyCapabilities,
+    pub(crate) utterances: Arc<RecordingUtteranceSink>,
+    pub(crate) actions: Arc<ActionActivityTracker>,
+    pub(crate) events: Arc<RecordingRuntimeEventSink>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) file_search: Arc<dyn FileSearchProvider>,
+    pub(crate) utterance_sink: Arc<dyn UtteranceSink>,
 }
 
 struct AnchoredRealtimeClock {
@@ -2552,7 +2608,7 @@ impl Clock for AnchoredRealtimeClock {
     }
 }
 
-async fn build_eval_environment(
+pub(crate) async fn build_eval_environment(
     output_dir: &Path,
     config: &RunnerConfig,
     allocation: ResourceAllocation,
@@ -2642,7 +2698,7 @@ async fn build_eval_environment(
     })
 }
 
-fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
+pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
     modules
         .iter()
         .copied()
@@ -2986,7 +3042,7 @@ fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalM
         .unwrap_or_else(|| vec![target.module()])
 }
 
-fn eval_registry(
+pub(crate) fn eval_registry(
     modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
@@ -3416,7 +3472,7 @@ fn register_eval_module(
     }
 }
 
-fn full_agent_allocation(
+pub(crate) fn full_agent_allocation(
     _limits: &crate::cases::EvalLimits,
     modules: &[EvalModule],
 ) -> ResourceAllocation {
@@ -3815,6 +3871,15 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 guidance: module.guidance.as_str().to_owned(),
             })
             .collect(),
+        forced_disabled_modules: {
+            let mut modules = bb
+                .forced_disabled_modules()
+                .iter()
+                .map(|module| module.as_str().to_owned())
+                .collect::<Vec<_>>();
+            modules.sort();
+            modules
+        },
         memos: bb
             .recent_memo_logs()
             .into_iter()
@@ -4273,10 +4338,12 @@ fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
 }
 
 #[derive(Clone)]
-struct LiveReporter {
+pub(crate) struct LiveReporter {
     run_id: String,
     path: PathBuf,
     file: Arc<Mutex<File>>,
+    log_prefix: String,
+    log_scope: String,
 }
 
 impl std::fmt::Debug for LiveReporter {
@@ -4284,12 +4351,23 @@ impl std::fmt::Debug for LiveReporter {
         f.debug_struct("LiveReporter")
             .field("run_id", &self.run_id)
             .field("path", &self.path)
+            .field("log_prefix", &self.log_prefix)
+            .field("log_scope", &self.log_scope)
             .finish_non_exhaustive()
     }
 }
 
 impl LiveReporter {
-    fn new(run_id: &str, run_dir: &Path) -> Result<Self, RunnerError> {
+    pub(crate) fn new(run_id: &str, run_dir: &Path) -> Result<Self, RunnerError> {
+        Self::new_with_log_context(run_id, run_dir, "eval", "case")
+    }
+
+    pub(crate) fn new_with_log_context(
+        run_id: &str,
+        run_dir: &Path,
+        log_prefix: &str,
+        log_scope: &str,
+    ) -> Result<Self, RunnerError> {
         let path = run_dir.join("events.jsonl");
         let file = OpenOptions::new()
             .create(true)
@@ -4300,7 +4378,17 @@ impl LiveReporter {
             run_id: run_id.to_string(),
             path: run_dir.join("events.jsonl"),
             file: Arc::new(Mutex::new(file)),
+            log_prefix: log_prefix.to_string(),
+            log_scope: log_scope.to_string(),
         })
+    }
+
+    fn log_prefix(&self) -> &str {
+        &self.log_prefix
+    }
+
+    fn log_scope(&self, value: &str) -> String {
+        format!("{}={value}", self.log_scope)
     }
 
     fn emit(
@@ -4325,7 +4413,9 @@ impl LiveReporter {
         live_message: String,
     ) -> Result<(), PortError> {
         self.emit_jsonl(case_id, kind, data, live_message)
-            .map_err(|error| PortError::Backend(format!("write live eval event: {error}")))
+            .map_err(|error| {
+                PortError::Backend(format!("write {} event: {error}", self.log_prefix))
+            })
     }
 
     fn emit_jsonl(
@@ -4362,7 +4452,7 @@ struct RecordedUtterance {
 }
 
 #[derive(Clone)]
-struct ActionActivityTracker {
+pub(crate) struct ActionActivityTracker {
     action_modules: Arc<HashSet<ModuleId>>,
     last_completed_at: Arc<Mutex<Option<Instant>>>,
 }
@@ -4413,7 +4503,7 @@ impl ActionActivityTracker {
 }
 
 #[derive(Clone)]
-struct RecordingUtteranceSink {
+pub(crate) struct RecordingUtteranceSink {
     case_id: String,
     reporter: LiveReporter,
     actions: Arc<ActionActivityTracker>,
@@ -4497,8 +4587,9 @@ impl UtteranceSink for RecordingUtteranceSink {
                 "emitted_at": recorded.emitted_at.clone(),
             }),
             format!(
-                "eval utterance case={} sender={} target={} chars={}",
-                self.case_id,
+                "{} utterance {} sender={} target={} chars={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
                 recorded.sender,
                 recorded.target,
                 recorded.text.chars().count()
@@ -4536,7 +4627,7 @@ impl UtteranceSink for RecordingUtteranceSink {
 }
 
 #[derive(Debug)]
-struct RecordingRuntimeEventSink {
+pub(crate) struct RecordingRuntimeEventSink {
     events: Mutex<Vec<RuntimeEvent>>,
     stop: AtomicBool,
     case_id: String,
@@ -4580,8 +4671,10 @@ impl RecordingRuntimeEventSink {
                 "stop_requested",
                 serde_json::json!({ "reason": reason }),
                 format!(
-                    "eval stop requested case={} reason={}",
-                    self.case_id, reason
+                    "{} stop requested {} reason={}",
+                    self.reporter.log_prefix(),
+                    self.reporter.log_scope(&self.case_id),
+                    reason
                 ),
             );
         }
@@ -4610,14 +4703,21 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::LlmAccessed {
                 call, owner, tier, ..
             } => format!(
-                "eval llm-accessed case={} call={} owner={} tier={:?}",
-                self.case_id, call, owner, tier
+                "{} llm-accessed {} call={} owner={} tier={:?}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                call,
+                owner,
+                tier
             ),
             RuntimeEvent::MemoUpdated {
                 owner, char_count, ..
             } => format!(
-                "eval memo-updated case={} owner={} chars={}",
-                self.case_id, owner, char_count
+                "{} memo-updated {} owner={} chars={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                char_count
             ),
             RuntimeEvent::RateLimitDelayed {
                 owner,
@@ -4625,8 +4725,9 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 delayed_for,
                 ..
             } => format!(
-                "eval rate-limit-delayed case={} owner={} capability={:?} delayed_ms={}",
-                self.case_id,
+                "{} rate-limit-delayed {} owner={} capability={:?} delayed_ms={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
                 owner,
                 capability,
                 delayed_for.as_millis()
@@ -4634,8 +4735,9 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleBatchThrottled {
                 owner, delayed_for, ..
             } => format!(
-                "eval module-batch-throttled case={} owner={} delayed_ms={}",
-                self.case_id,
+                "{} module-batch-throttled {} owner={} delayed_ms={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
                 owner,
                 delayed_for.as_millis()
             ),
@@ -4662,8 +4764,9 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 "stop_requested",
                 serde_json::json!({ "reason": "max-llm-calls" }),
                 format!(
-                    "eval stop requested case={} reason=max-llm-calls",
-                    self.case_id
+                    "{} stop requested {} reason=max-llm-calls",
+                    self.reporter.log_prefix(),
+                    self.reporter.log_scope(&self.case_id)
                 ),
             )?;
         }

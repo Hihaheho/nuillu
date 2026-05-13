@@ -168,6 +168,10 @@ pub enum VisualizerEvent {
         query: String,
         records: Vec<MemoryRecordView>,
     },
+    AmbientSensoryRows {
+        tab_id: VisualizerTabId,
+        rows: Vec<AmbientSensoryRowView>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +179,25 @@ pub enum VisualizerCommand {
     SendSensoryInput {
         tab_id: VisualizerTabId,
         input: ChatInput,
+    },
+    CreateAmbientSensoryRow {
+        tab_id: VisualizerTabId,
+        modality: String,
+        content: String,
+        disabled: bool,
+    },
+    UpdateAmbientSensoryRow {
+        tab_id: VisualizerTabId,
+        row: AmbientSensoryRowView,
+    },
+    RemoveAmbientSensoryRow {
+        tab_id: VisualizerTabId,
+        row_id: String,
+    },
+    SetModuleDisabled {
+        tab_id: VisualizerTabId,
+        module: String,
+        disabled: bool,
     },
     QueryMemory {
         tab_id: VisualizerTabId,
@@ -286,17 +309,18 @@ pub enum TabStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChatInputKind {
-    Heard,
-    Seen,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatInput {
-    pub kind: ChatInputKind,
-    pub direction: Option<String>,
+    pub modality: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbientSensoryRowView {
+    pub id: String,
+    pub modality: String,
+    pub content: String,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +344,8 @@ pub struct UtteranceView {
 pub struct BlackboardSnapshot {
     pub module_statuses: Vec<ModuleStatusView>,
     pub allocation: Vec<AllocationView>,
+    #[serde(default)]
+    pub forced_disabled_modules: Vec<String>,
     pub memos: Vec<MemoView>,
     pub cognition_logs: Vec<CognitionLogView>,
     pub utterance_progresses: Vec<UtteranceProgressView>,
@@ -608,6 +634,67 @@ mod tests {
         assert_eq!(action.id, start_activation_action_id(&tab_id));
         assert_eq!(action.scope, VisualizerActionScope::Tab { tab_id });
         assert_eq!(action.kind, VisualizerActionKind::StartActivation);
+    }
+
+    #[test]
+    fn ambient_rows_and_module_disable_commands_round_trip_through_json() {
+        let tab_id = VisualizerTabId::new("live");
+        let row = AmbientSensoryRowView {
+            id: "ambient-1".to_string(),
+            modality: "smell".to_string(),
+            content: "wet stone smell".to_string(),
+            disabled: false,
+        };
+        let message = VisualizerServerMessage::event(VisualizerEvent::AmbientSensoryRows {
+            tab_id: tab_id.clone(),
+            rows: vec![row.clone()],
+        });
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::AmbientSensoryRows { rows, .. },
+            } if rows == vec![row]
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::SetModuleDisabled {
+                tab_id,
+                module: "predict".to_string(),
+                disabled: true,
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SetModuleDisabled {
+                    module,
+                    disabled: true,
+                    ..
+                },
+            } if module == "predict"
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::SendSensoryInput {
+                tab_id: VisualizerTabId::new("live"),
+                input: ChatInput {
+                    modality: "touch".to_string(),
+                    content: "the tabletop feels cold".to_string(),
+                },
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SendSensoryInput { input, .. },
+            } if input.modality == "touch" && input.content == "the tabletop feels cold"
+        ));
     }
 
     #[test]

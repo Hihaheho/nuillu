@@ -98,6 +98,7 @@ pub struct ModuleOverviewRow {
     pub module: String,
     pub replica: u8,
     pub active: bool,
+    pub forced_disabled: bool,
     pub runtime_status: String,
     pub llm_status: String,
     pub activation_ratio: Option<f64>,
@@ -108,6 +109,12 @@ pub struct ModuleOverviewRow {
     pub cooldown_ms: Option<u64>,
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleOverviewAction {
+    OpenModule { owner: String },
+    SetDisabled { module: String, disabled: bool },
 }
 
 pub fn apply_blackboard_snapshot(state: &mut ModulesState, snapshot: &BlackboardSnapshot) {
@@ -324,6 +331,10 @@ pub fn overview_rows(
         if let Some(allocation) = allocations.get(row.module.as_str()) {
             apply_allocation_to_row(row, allocation);
         }
+        row.forced_disabled = snapshot
+            .forced_disabled_modules
+            .iter()
+            .any(|module| module == &row.module);
     }
 
     rows.into_values().collect()
@@ -333,9 +344,9 @@ pub fn render_modules_overview(
     ui: &mut egui::Ui,
     snapshot: &BlackboardSnapshot,
     state: &ModulesState,
-) -> Option<String> {
+) -> Vec<ModuleOverviewAction> {
     let rows = overview_rows(state, snapshot);
-    let mut requested_owner = None;
+    let mut actions = Vec::new();
     ui.horizontal_wrapped(|ui| {
         ui.heading("Modules");
         ui.label(format!("count: {}", rows.len()));
@@ -348,11 +359,11 @@ pub fn render_modules_overview(
             overview_header(ui);
             ui.separator();
             for (index, row) in rows.iter().enumerate() {
-                overview_row(ui, row, index, &mut requested_owner);
+                overview_row(ui, row, index, &mut actions);
             }
         });
 
-    requested_owner
+    actions
 }
 
 pub fn render_module(ui: &mut egui::Ui, module: &ModuleState) {
@@ -713,7 +724,7 @@ const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
 
 fn overview_header(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        overview_header_cell(ui, "", ACTIVE_COLUMN_WIDTH);
+        overview_header_cell(ui, "Enabled", ACTIVE_COLUMN_WIDTH);
         overview_header_cell(ui, "Module", MODULE_COLUMN_WIDTH);
         overview_header_cell(ui, "Replica", REPLICA_COLUMN_WIDTH);
         overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
@@ -731,14 +742,14 @@ fn overview_row(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
     index: usize,
-    requested_owner: &mut Option<String>,
+    actions: &mut Vec<ModuleOverviewAction>,
 ) {
     let fill = (index % 2 == 1).then(|| ui.visuals().faint_bg_color);
     let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            overview_checkbox_cell(ui, row.active);
-            overview_module_cell(ui, row, requested_owner);
+            overview_disable_cell(ui, row, actions);
+            overview_module_cell(ui, row, actions);
             overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
             overview_label_cell(
                 ui,
@@ -797,13 +808,26 @@ fn overview_header_cell(ui: &mut egui::Ui, text: &str, width: f32) {
     );
 }
 
-fn overview_checkbox_cell(ui: &mut egui::Ui, active: bool) {
+fn overview_disable_cell(
+    ui: &mut egui::Ui,
+    row: &ModuleOverviewRow,
+    actions: &mut Vec<ModuleOverviewAction>,
+) {
     ui.allocate_ui_with_layout(
         egui::vec2(ACTIVE_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            let mut active = active;
-            ui.add_enabled(false, egui::Checkbox::without_text(&mut active));
+            let mut enabled = !row.forced_disabled;
+            if ui
+                .add(egui::Checkbox::without_text(&mut enabled))
+                .on_hover_text("Allow this module to use allocated replicas")
+                .changed()
+            {
+                actions.push(ModuleOverviewAction::SetDisabled {
+                    module: row.module.clone(),
+                    disabled: !enabled,
+                });
+            }
         },
     );
 }
@@ -811,7 +835,7 @@ fn overview_checkbox_cell(ui: &mut egui::Ui, active: bool) {
 fn overview_module_cell(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
-    requested_owner: &mut Option<String>,
+    actions: &mut Vec<ModuleOverviewAction>,
 ) {
     let mut response = ui.add_sized(
         [MODULE_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
@@ -821,7 +845,9 @@ fn overview_module_cell(
         response = response.on_hover_text(format!("open {}", row.owner));
     }
     if response.clicked() {
-        *requested_owner = Some(row.owner.clone());
+        actions.push(ModuleOverviewAction::OpenModule {
+            owner: row.owner.clone(),
+        });
     }
 }
 
@@ -853,6 +879,7 @@ fn upsert_overview_row<'a>(
             module: module.to_string(),
             replica,
             active: false,
+            forced_disabled: false,
             runtime_status: "not reported".to_string(),
             llm_status: status_label(ModuleSessionStatus::Idle).to_string(),
             activation_ratio: None,
@@ -1473,6 +1500,7 @@ mod tests {
                 module: "sensory".to_string(),
                 replica: 0,
                 active: true,
+                forced_disabled: false,
                 runtime_status: "Activating".to_string(),
                 llm_status: "running".to_string(),
                 activation_ratio: Some(0.75),
@@ -1494,6 +1522,7 @@ mod tests {
             module: "query-vector".to_string(),
             replica: 1,
             active: true,
+            forced_disabled: false,
             runtime_status: "Activating".to_string(),
             llm_status: "running".to_string(),
             activation_ratio: Some(1.0),

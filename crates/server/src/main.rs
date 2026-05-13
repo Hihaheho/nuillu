@@ -3,11 +3,10 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use anyhow::Context as _;
 use clap::Parser;
 use nuillu_eval::{
-    EmbeddingBackendConfig, EmbeddingRole, EvalModule, LlmBackendConfig, ModelSet, ModelSetRole,
-    ReasoningEffort, RunnerConfig, default_run_id, gui::run_suite_with_visualizer,
-    install_lutum_trace_subscriber, parse_model_set_file, run_suite,
+    EmbeddingBackendConfig, EmbeddingRole, EvalModule, LiveServerConfig, LlmBackendConfig,
+    ModelSet, ModelSetRole, ReasoningEffort, RunnerConfig, default_run_id,
+    install_lutum_trace_subscriber, parse_model_set_file, run_live_with_visualizer,
 };
-use tokio::runtime::Builder;
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
 const DEFAULT_OPENAI_COMPAT_TOKEN: &str = "local";
@@ -16,29 +15,21 @@ const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "nuillu-eval",
-    about = "Run data-driven nuillu eval cases against real agent/module wiring"
+    name = "nuillu-server",
+    about = "Run a live nuillu agent with the visualizer GUI"
 )]
 struct Args {
-    /// Eure case file or directory to load recursively.
-    #[arg(long, default_value = "eval-cases")]
-    cases: PathBuf,
+    /// Persistent live runtime state directory.
+    #[arg(long, default_value = ".tmp/server")]
+    state: PathBuf,
 
-    /// Root directory for JSON eval outputs.
-    #[arg(long, default_value = ".tmp/eval")]
-    output: PathBuf,
-
-    /// Run id used as the output subdirectory name.
+    /// Run id used for live event logs.
     #[arg(long)]
     run_id: Option<String>,
 
     /// Model set Eure file with per-role backend config.
     #[arg(long)]
     model_set: Option<PathBuf>,
-
-    /// Rubric judge model override.
-    #[arg(long)]
-    judge_model: Option<String>,
 
     /// Optional cheap-tier model override.
     #[arg(long)]
@@ -51,10 +42,6 @@ struct Args {
     /// Optional premium-tier model override.
     #[arg(long)]
     premium_model: Option<String>,
-
-    /// Optional judge reasoning effort override.
-    #[arg(long, value_enum)]
-    judge_reasoning_effort: Option<ReasoningEffort>,
 
     /// Optional cheap-tier reasoning effort override.
     #[arg(long, value_enum)]
@@ -72,44 +59,27 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MODEL_DIR)]
     model_dir: PathBuf,
 
-    /// Stop the suite after the first failed or invalid case.
-    #[arg(long)]
-    fail_fast: bool,
-
     /// Maximum concurrent agent LLM calls. Defaults to unlimited.
-    #[arg(long, env = "NUILLU_EVAL_MAX_CONCURRENT_LLM_CALLS")]
+    #[arg(long, env = "NUILLU_SERVER_MAX_CONCURRENT_LLM_CALLS")]
     max_concurrent_llm_calls: Option<NonZeroUsize>,
 
-    /// Run the reusable egui visualizer while the eval suite executes.
-    #[arg(long)]
-    gui: bool,
-
-    /// Modules to drop from the full-agent wiring (repeatable). Useful for
-    /// isolating module-level effects, e.g. `--disable-module speak-gate`.
-    /// Required modules (attention-controller, sensory, speak) cannot be disabled.
+    /// Modules to force-disable at startup.
     #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
     disable_module: Vec<EvalModule>,
 
-    /// Optional case id/path substring patterns. When present, only matching cases run.
-    #[arg(value_name = "PATTERN")]
-    patterns: Vec<String>,
+    /// Participants currently available to the speak module as targets.
+    #[arg(long = "participant", value_name = "NAME")]
+    participants: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
     install_lutum_trace_subscriber()?;
     let args = Args::parse();
-    let run_id = args.run_id.unwrap_or_else(default_run_id);
     let model_set = args
         .model_set
         .as_deref()
         .map(parse_model_set_file)
         .transpose()?;
-    let judge_backend = resolve_backend(
-        "judge",
-        role_ref(model_set.as_ref(), ModelRole::Judge),
-        args.judge_model.as_deref(),
-        args.judge_reasoning_effort,
-    )?;
     let cheap_backend = resolve_backend(
         "cheap",
         role_ref(model_set.as_ref(), ModelRole::Cheap),
@@ -130,45 +100,37 @@ fn main() -> anyhow::Result<()> {
     )?;
     let embedding_backend =
         resolve_embedding(model_set.as_ref().and_then(|m| m.embedding.as_ref()))?;
-    let config = RunnerConfig {
-        cases_root: args.cases,
-        output_root: args.output,
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| format!("server-{}", default_run_id()));
+
+    let runner = RunnerConfig {
+        cases_root: PathBuf::from("eval-cases"),
+        output_root: args.state.clone(),
         run_id,
-        judge_backend,
+        judge_backend: default_backend.clone(),
         cheap_backend,
         default_backend,
         premium_backend,
         model_dir: args.model_dir,
         embedding_backend,
-        fail_fast: args.fail_fast,
+        fail_fast: false,
         max_concurrent_llm_calls: args.max_concurrent_llm_calls,
-        case_patterns: args.patterns,
-        disabled_modules: args.disable_module,
+        case_patterns: Vec::new(),
+        disabled_modules: Vec::new(),
     };
 
-    if args.gui {
-        return run_suite_with_visualizer(config);
-    }
-
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build eval tokio runtime")?;
-    let report = runtime.block_on(run_suite(&config))?;
-    println!(
-        "cases={} passed={} failed={} invalid={} output={}",
-        report.case_count,
-        report.passed_cases,
-        report.failed_cases,
-        report.invalid_cases,
-        config.output_root.join(&config.run_id).display()
-    );
-    Ok(())
+    run_live_with_visualizer(LiveServerConfig {
+        runner,
+        state_dir: args.state,
+        disabled_modules: args.disable_module,
+        participants: args.participants,
+    })
+    .context("run nuillu live server")
 }
 
 #[derive(Clone, Copy)]
 enum ModelRole {
-    Judge,
     Cheap,
     Default,
     Premium,
@@ -291,7 +253,6 @@ fn resolve_embedding(
 fn role_ref(model_set: Option<&ModelSet>, role: ModelRole) -> Option<&ModelSetRole> {
     let model_set = model_set?;
     match role {
-        ModelRole::Judge => model_set.judge.as_ref(),
         ModelRole::Cheap => model_set.cheap.as_ref(),
         ModelRole::Default => model_set.default.as_ref(),
         ModelRole::Premium => model_set.premium.as_ref(),

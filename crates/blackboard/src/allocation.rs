@@ -403,6 +403,13 @@ impl ResourceAllocation {
         self
     }
 
+    pub fn force_disable_modules(mut self, disabled: &HashSet<ModuleId>) -> Self {
+        for id in disabled {
+            self.active_replicas.insert(id.clone(), 0);
+        }
+        self
+    }
+
     fn enforce_total_active_limit(&mut self, max_active: u8) {
         let mut active_modules = self
             .allocation_module_ids()

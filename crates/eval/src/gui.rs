@@ -124,7 +124,7 @@ fn wait_for_start_suite(port: &VisualizerServerPort, child: &mut Child) -> anyho
     }
 }
 
-fn accept_visualizer_connection(
+pub(crate) fn accept_visualizer_connection(
     listener: &TcpListener,
     child: &mut Child,
 ) -> anyhow::Result<TcpStream> {
@@ -145,7 +145,7 @@ fn accept_visualizer_connection(
     }
 }
 
-fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
+pub(crate) fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
     let mut command = visualizer_gui_command(host)?;
     command
         .stdin(Stdio::null())
@@ -229,14 +229,18 @@ fn workspace_root() -> &'static Path {
         .expect("eval crate should be two levels below workspace root")
 }
 
-fn wait_for_visualizer_exit(mut child: Child) {
+pub(crate) fn wait_for_visualizer_exit(child: Child) {
+    wait_for_visualizer_exit_with_context(child, "eval finished");
+}
+
+pub(crate) fn wait_for_visualizer_exit_with_context(mut child: Child, context: &str) {
     match child.try_wait() {
         Ok(Some(_)) => return,
         Ok(None) => {
-            eprintln!("eval finished; visualizer remains open until its window is closed");
+            eprintln!("{context}; visualizer remains open until its window is closed");
         }
         Err(error) => {
-            eprintln!("failed to poll visualizer process after eval finished: {error}");
+            eprintln!("failed to poll visualizer process after {context}: {error}");
             return;
         }
     }

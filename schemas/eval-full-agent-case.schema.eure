@@ -85,6 +85,19 @@ variants.seen {
   }
 }
 
+variants.observed {
+  modality {
+    $variant: text
+    min-length = 1
+  }
+  direction = `text`
+  direction.$optional = true
+  content {
+    $variant: text
+    min-length = 1
+  }
+}
+
 @ $types.eval-step
 description = `text`
 description.$optional = true

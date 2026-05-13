@@ -68,6 +68,10 @@ pub enum BlackboardCommand {
     },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),
+    SetModuleForcedDisabled {
+        module: ModuleId,
+        disabled: bool,
+    },
     RecordAllocationProposal {
         controller: ModuleInstanceId,
         proposal: ResourceAllocation,

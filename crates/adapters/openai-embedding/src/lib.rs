@@ -130,7 +130,9 @@ impl Embedder for OpenAiEmbedder {
         }
 
         let body: EmbeddingsResponse = response.json().await.map_err(|error| {
-            PortError::InvalidData(format!("failed to decode openai embedding response: {error}"))
+            PortError::InvalidData(format!(
+                "failed to decode openai embedding response: {error}"
+            ))
         })?;
 
         let raw = body.data.into_iter().next().ok_or_else(|| {

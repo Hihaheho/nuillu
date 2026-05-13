@@ -144,10 +144,7 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
     validate_embedding_role(path, model_set.embedding.as_ref())
 }
 
-fn validate_embedding_role(
-    path: &Path,
-    role: Option<&EmbeddingRole>,
-) -> Result<(), ModelSetError> {
+fn validate_embedding_role(path: &Path, role: Option<&EmbeddingRole>) -> Result<(), ModelSetError> {
     let Some(role) = role else {
         return Ok(());
     };

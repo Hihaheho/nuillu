@@ -57,12 +57,12 @@ pub use capabilities::{
     ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{
-    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AttentionControlRequest,
-    AttentionControlRequestInbox, AttentionControlRequestMailbox, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope, MemoUpdated, MemoUpdatedInbox,
-    MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError, VitalUpdated, VitalUpdatedInbox,
-    VitalUpdatedMailbox,
+    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AmbientSensoryEntry,
+    AttentionControlRequest, AttentionControlRequestInbox, AttentionControlRequestMailbox,
+    CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope,
+    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput,
+    SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox, TopicMailbox,
+    TopicRecvError, VitalUpdated, VitalUpdatedInbox, VitalUpdatedMailbox,
 };
 pub use cognition::CognitionWriter;
 pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};

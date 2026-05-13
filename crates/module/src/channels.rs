@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -6,8 +7,8 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use nuillu_blackboard::Blackboard;
 use nuillu_types::{ModuleId, ModuleInstanceId};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::rate_limit::{CapabilityKind, RateLimiter, TopicKind};
 use crate::runtime_events::RuntimeEventEmitter;
@@ -405,22 +406,114 @@ pub type VitalUpdatedInbox = TopicInbox<VitalUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;
 pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SensoryModality {
+    Vision,
+    Audition,
+    Smell,
+    Taste,
+    Touch,
+    Proprioception,
+    Interoception,
+    Other(String),
+}
+
+impl SensoryModality {
+    pub fn parse(value: impl AsRef<str>) -> Self {
+        let value = value.as_ref().trim();
+        match normalize_modality(value).as_str() {
+            "vision" | "visual" | "seen" | "sight" => Self::Vision,
+            "audition" | "audio" | "heard" | "hearing" | "sound" => Self::Audition,
+            "smell" | "olfaction" | "scent" => Self::Smell,
+            "taste" | "gustation" => Self::Taste,
+            "touch" | "tactile" => Self::Touch,
+            "proprioception" | "proprioceptive" => Self::Proprioception,
+            "interoception" | "interoceptive" => Self::Interoception,
+            "" => Self::Other("other".to_string()),
+            normalized => Self::Other(normalized.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Vision => "vision",
+            Self::Audition => "audition",
+            Self::Smell => "smell",
+            Self::Taste => "taste",
+            Self::Touch => "touch",
+            Self::Proprioception => "proprioception",
+            Self::Interoception => "interoception",
+            Self::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl Serialize for SensoryModality {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensoryModality {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::parse)
+    }
+}
+
+impl JsonSchema for SensoryModality {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        "SensoryModality".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        Schema::try_from(serde_json::json!({
+            "type": "string",
+            "description": "Sensory category/modality such as vision, audition, smell, taste, touch, proprioception, interoception, or a custom modality string."
+        }))
+        .expect("sensory modality schema must be a JSON object")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AmbientSensoryEntry {
+    pub id: String,
+    pub modality: SensoryModality,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SensoryInput {
-    Heard {
+    Observed {
+        modality: SensoryModality,
         direction: Option<String>,
         content: String,
         observed_at: DateTime<Utc>,
     },
-    Seen {
-        direction: Option<String>,
-        appearance: String,
+    AmbientSnapshot {
+        entries: Vec<AmbientSensoryEntry>,
         observed_at: DateTime<Utc>,
     },
 }
 
 pub type SensoryInputMailbox = TopicMailbox<SensoryInput>;
 pub type SensoryInputInbox = TopicInbox<SensoryInput>;
+
+fn normalize_modality(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
 
 #[cfg(test)]
 mod tests {
@@ -437,6 +530,37 @@ mod tests {
 
     fn ticker_id() -> ModuleId {
         ModuleId::new("ticker").unwrap()
+    }
+
+    #[test]
+    fn multimodal_sensory_input_round_trips_as_strings() {
+        let input = SensoryInput::AmbientSnapshot {
+            entries: vec![AmbientSensoryEntry {
+                id: "ambient-1".to_string(),
+                modality: SensoryModality::Other("thermal".to_string()),
+                content: "warm air near the door".to_string(),
+            }],
+            observed_at: DateTime::parse_from_rfc3339("2026-05-13T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        let json = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "ambient_snapshot",
+                "entries": [
+                    {
+                        "id": "ambient-1",
+                        "modality": "thermal",
+                        "content": "warm air near the door",
+                    }
+                ],
+                "observed_at": "2026-05-13T00:00:00Z",
+            })
+        );
+        assert_eq!(serde_json::from_value::<SensoryInput>(json).unwrap(), input);
     }
 
     #[tokio::test]

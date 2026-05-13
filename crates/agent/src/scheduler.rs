@@ -134,16 +134,13 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = shutdown.as_mut() => {
-                for handle in tasks.iter() {
-                    handle.abort();
-                }
-                while tasks.next().await.is_some() {}
+                abort_tasks(&mut tasks).await;
                 return Ok(());
             },
             joined = tasks.next(), if !tasks.is_empty() => {
                 match joined {
                     Some(Ok(message)) => {
-                        handle_task_message(
+                        if let Err(error) = handle_task_message(
                             message,
                             &runtime,
                             &owners,
@@ -158,7 +155,10 @@ pub async fn run(
                             config,
                             &parent,
                             &subscriber,
-                        ).await?;
+                        ).await {
+                            abort_tasks(&mut tasks).await;
+                            return Err(error);
+                        }
                         refresh_active_and_schedule(
                             &runtime,
                             &owners,
@@ -177,6 +177,7 @@ pub async fn run(
                     Some(Err(e)) => {
                         let message = e.to_string();
                         tracing::error!(error = ?e, "module task panicked");
+                        abort_tasks(&mut tasks).await;
                         return Err(SchedulerError::ModuleTaskPanicked { message });
                     }
                     None => {}
@@ -197,6 +198,13 @@ pub async fn run(
             }
         }
     }
+}
+
+async fn abort_tasks(tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>) {
+    for handle in tasks.iter() {
+        handle.abort();
+    }
+    while tasks.next().await.is_some() {}
 }
 
 enum ModuleState {

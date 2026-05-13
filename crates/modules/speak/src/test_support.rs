@@ -10,9 +10,7 @@ use lutum::{
     SharedPoolBudgetOptions, Usage,
 };
 use nuillu_blackboard::{ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation};
-use nuillu_module::ports::{
-    NoopCognitionLogRepository, PortError, SystemClock,
-};
+use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
 use nuillu_module::{
     AttentionControlRequestInbox, CapabilityProviderPorts, CapabilityProviders, LutumTiers, Module,
     ModuleRegistry,

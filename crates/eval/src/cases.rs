@@ -109,6 +109,12 @@ pub enum FullAgentInput {
         direction: Option<String>,
         appearance: Text,
     },
+    Observed {
+        modality: String,
+        #[eure(default)]
+        direction: Option<String>,
+        content: Text,
+    },
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -418,18 +424,38 @@ impl FullAgentInput {
     pub fn as_prompt_line(&self) -> String {
         match self {
             Self::Heard { direction, content } => {
-                let direction = direction.as_deref().unwrap_or("unknown");
-                format!("heard[{direction}]: {}", content.content)
+                format!("heard{}: {}", direction_suffix(direction), content.content)
             }
             Self::Seen {
                 direction,
                 appearance,
             } => {
-                let direction = direction.as_deref().unwrap_or("unknown");
-                format!("seen[{direction}]: {}", appearance.content)
+                format!(
+                    "seen{}: {}",
+                    direction_suffix(direction),
+                    appearance.content
+                )
+            }
+            Self::Observed {
+                modality,
+                direction,
+                content,
+            } => {
+                format!(
+                    "observed:{modality}{}: {}",
+                    direction_suffix(direction),
+                    content.content
+                )
             }
         }
     }
+}
+
+fn direction_suffix(direction: &Option<String>) -> String {
+    direction
+        .as_deref()
+        .map(|direction| format!("[{direction}]"))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -916,6 +942,18 @@ fn validate_full_agent_input(
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.appearance must not be empty"),
+            })
+        }
+        FullAgentInput::Observed { modality, .. } if modality.trim().is_empty() => {
+            Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}.modality must not be empty"),
+            })
+        }
+        FullAgentInput::Observed { content, .. } if content.content.trim().is_empty() => {
+            Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}.content must not be empty"),
             })
         }
         _ => Ok(()),

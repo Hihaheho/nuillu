@@ -4,9 +4,14 @@ use std::sync::mpsc::Sender;
 use nuillu_module::SensoryInput;
 
 use crate::{
-    ChatInput, ChatInputKind, UtteranceDeltaView, UtteranceView, VisualizerClientMessage,
+    AmbientSensoryRowView, ChatInput, UtteranceDeltaView, UtteranceView, VisualizerClientMessage,
     VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
+
+const FIELD_HEIGHT: f32 = 24.0;
+const MODALITY_FIELD_WIDTH: f32 = 120.0;
+const AMBIENT_INPUT_WIDTH: f32 = 360.0;
+const ONE_SHOT_INPUT_MIN_WIDTH: f32 = 320.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatRole {
@@ -49,41 +54,50 @@ struct UtteranceKey {
     generation_id: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ChatState {
     messages: Vec<ChatMessage>,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
-    draft: String,
-    direction: String,
-    seen: bool,
+    ambient_rows: Vec<AmbientSensoryRowView>,
+    one_shot_modality: String,
+    one_shot_draft: String,
+}
+
+impl Default for ChatState {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            streaming_utterances: BTreeMap::new(),
+            ambient_rows: Vec::new(),
+            one_shot_modality: "audition".to_string(),
+            one_shot_draft: String::new(),
+        }
+    }
 }
 
 impl ChatState {
+    pub fn set_ambient_rows(&mut self, rows: Vec<AmbientSensoryRowView>) {
+        self.ambient_rows = rows;
+    }
+
     pub fn push_sensory_input(&mut self, input: SensoryInput) {
         let (source, content) = match input {
-            SensoryInput::Heard {
-                direction,
+            SensoryInput::Observed {
+                modality,
                 content,
                 observed_at,
-            } => (
-                format!(
-                    "heard {} at {}",
-                    direction.as_deref().unwrap_or("unknown"),
-                    observed_at
-                ),
-                content,
-            ),
-            SensoryInput::Seen {
-                direction,
-                appearance,
+                ..
+            } => (format!("{} at {}", modality.as_str(), observed_at), content),
+            SensoryInput::AmbientSnapshot {
+                entries,
                 observed_at,
             } => (
-                format!(
-                    "seen {} at {}",
-                    direction.as_deref().unwrap_or("unknown"),
-                    observed_at
-                ),
-                appearance,
+                format!("ambient snapshot at {observed_at}"),
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{}: {}", entry.modality.as_str(), entry.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             ),
         };
         let mut message = ChatMessage::new(ChatRole::User, content);
@@ -150,38 +164,147 @@ pub fn ui(
     chat_messages_ui(ui, &state.messages);
 
     ui.separator();
+    ambient_table_ui(ui, tab_id, state, commands);
+    ui.separator();
+    one_shot_ui(ui, tab_id, state, commands);
+}
+
+fn ambient_table_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut ChatState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
     ui.horizontal(|ui| {
-        ui.checkbox(&mut state.seen, "Seen");
-        ui.label("Direction");
-        ui.text_edit_singleline(&mut state.direction);
-    });
-    ui.horizontal(|ui| {
-        let response = ui.text_edit_singleline(&mut state.draft);
-        let send = ui.button("Send").clicked()
-            || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-        if send {
-            let content = state.draft.trim().to_owned();
-            if !content.is_empty() {
-                let direction =
-                    (!state.direction.trim().is_empty()).then(|| state.direction.trim().to_owned());
-                let kind = if state.seen {
-                    ChatInputKind::Seen
-                } else {
-                    ChatInputKind::Heard
-                };
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::SendSensoryInput {
-                        tab_id: tab_id.clone(),
-                        input: ChatInput {
-                            kind,
-                            direction,
-                            content,
-                        },
-                    },
-                });
-                state.draft.clear();
-            }
+        ui.strong("Ambient");
+        if ui.button("Add row").clicked() {
+            let _ = commands.send(VisualizerClientMessage::Command {
+                command: VisualizerCommand::CreateAmbientSensoryRow {
+                    tab_id: tab_id.clone(),
+                    modality: "vision".to_string(),
+                    content: String::new(),
+                    disabled: false,
+                },
+            });
         }
+    });
+    egui::ScrollArea::horizontal()
+        .id_salt("ambient-sensory-table-scroll")
+        .show(ui, |ui| {
+            egui::Grid::new("ambient-sensory-table")
+                .striped(true)
+                .num_columns(4)
+                .show(ui, |ui| {
+                    ui.strong("Enabled");
+                    ui.strong("Category");
+                    ui.strong("Input");
+                    ui.end_row();
+
+                    let mut index = 0;
+                    while index < state.ambient_rows.len() {
+                        let row_id = state.ambient_rows[index].id.clone();
+                        let mut send_update = false;
+
+                        let mut enabled = !state.ambient_rows[index].disabled;
+                        if ui
+                            .add_sized(
+                                [56.0, FIELD_HEIGHT],
+                                egui::Checkbox::without_text(&mut enabled),
+                            )
+                            .on_hover_text("Include this row in ambient snapshots")
+                            .changed()
+                        {
+                            state.ambient_rows[index].disabled = !enabled;
+                            send_update = true;
+                        }
+
+                        let category_response = ui.add_sized(
+                            [MODALITY_FIELD_WIDTH, FIELD_HEIGHT],
+                            egui::TextEdit::singleline(&mut state.ambient_rows[index].modality)
+                                .desired_width(MODALITY_FIELD_WIDTH),
+                        );
+                        if category_response.lost_focus() {
+                            send_update = true;
+                        }
+
+                        let input_response = ui.add_sized(
+                            [AMBIENT_INPUT_WIDTH, FIELD_HEIGHT],
+                            egui::TextEdit::singleline(&mut state.ambient_rows[index].content)
+                                .desired_width(AMBIENT_INPUT_WIDTH),
+                        );
+                        if input_response.lost_focus() {
+                            send_update = true;
+                        }
+
+                        if ui
+                            .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Delete"))
+                            .clicked()
+                        {
+                            let _ = commands.send(VisualizerClientMessage::Command {
+                                command: VisualizerCommand::RemoveAmbientSensoryRow {
+                                    tab_id: tab_id.clone(),
+                                    row_id,
+                                },
+                            });
+                            state.ambient_rows.remove(index);
+                            ui.end_row();
+                            continue;
+                        } else if send_update {
+                            let _ = commands.send(VisualizerClientMessage::Command {
+                                command: VisualizerCommand::UpdateAmbientSensoryRow {
+                                    tab_id: tab_id.clone(),
+                                    row: state.ambient_rows[index].clone(),
+                                },
+                            });
+                        }
+                        ui.end_row();
+                        index += 1;
+                    }
+                });
+        });
+}
+
+fn one_shot_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut ChatState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    ui.vertical(|ui| {
+        ui.strong("One shot");
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [MODALITY_FIELD_WIDTH, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut state.one_shot_modality)
+                    .desired_width(MODALITY_FIELD_WIDTH),
+            );
+            let input_width = (ui.available_width() - 72.0).max(ONE_SHOT_INPUT_MIN_WIDTH);
+            let response = ui.add_sized(
+                [input_width, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut state.one_shot_draft).desired_width(input_width),
+            );
+            let send = ui
+                .add_sized([56.0, FIELD_HEIGHT], egui::Button::new("Send"))
+                .clicked()
+                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if send {
+                let content = state.one_shot_draft.trim().to_owned();
+                if !content.is_empty() {
+                    let modality = if state.one_shot_modality.trim().is_empty() {
+                        "audition".to_string()
+                    } else {
+                        state.one_shot_modality.trim().to_owned()
+                    };
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::SendSensoryInput {
+                            tab_id: tab_id.clone(),
+                            input: ChatInput { modality, content },
+                        },
+                    });
+                    state.one_shot_draft.clear();
+                }
+            }
+        });
     });
 }
 

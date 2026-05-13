@@ -235,6 +235,9 @@ impl VisualizerState {
                 tab.memories.query = query;
                 tab.memories.query_results = records;
             }
+            VisualizerEvent::AmbientSensoryRows { tab_id, rows } => {
+                self.tab_mut(tab_id).chat.set_ambient_rows(rows);
+            }
         }
     }
 
@@ -423,15 +426,32 @@ impl RuntimeTab {
         let modules_id = format!("{base}:modules");
         let modules_title = format!("Modules - {}", self.title);
         let mut requested_module = None;
+        let mut module_commands = Vec::new();
         let open = window::PersistedWindow::new(&modules_id, &modules_title)
             .open_override(window_requests.remove(&modules_id))
             .default_pos(568.0, 1020.0)
             .default_size(640.0, 360.0)
             .show(ui, |ui| {
-                requested_module =
+                module_commands =
                     modules::render_modules_overview(ui, &self.blackboard, &self.modules);
             });
         self.record_window_open(modules_id, open);
+        for action in module_commands {
+            match action {
+                modules::ModuleOverviewAction::OpenModule { owner } => {
+                    requested_module = Some(owner);
+                }
+                modules::ModuleOverviewAction::SetDisabled { module, disabled } => {
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::SetModuleDisabled {
+                            tab_id: self.id.clone(),
+                            module,
+                            disabled,
+                        },
+                    });
+                }
+            }
+        }
 
         let module_windows = self
             .modules

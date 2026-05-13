@@ -286,10 +286,7 @@ mod tests {
         ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
         linear_ratio_fn,
     };
-    use nuillu_module::ports::{
-        Clock, NoopCognitionLogRepository,
-        SystemClock,
-    };
+    use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
         session_compaction_cutoff,

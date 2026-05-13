@@ -57,6 +57,7 @@ pub struct BlackboardInner {
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
     allocation_caps: HashMap<ModuleInstanceId, ResourceAllocation>,
+    forced_disabled_modules: HashSet<ModuleId>,
     module_policies: HashMap<ModuleId, ModulePolicy>,
     allocation_limits: AllocationLimits,
 }
@@ -419,6 +420,7 @@ impl Default for BlackboardInner {
             allocation: ResourceAllocation::default(),
             allocation_proposals: HashMap::new(),
             allocation_caps: HashMap::new(),
+            forced_disabled_modules: HashSet::new(),
             module_policies: HashMap::new(),
             allocation_limits: AllocationLimits::default(),
         }
@@ -631,6 +633,10 @@ impl BlackboardInner {
         &self.allocation_caps
     }
 
+    pub fn forced_disabled_modules(&self) -> &HashSet<ModuleId> {
+        &self.forced_disabled_modules
+    }
+
     pub fn module_policies(&self) -> &HashMap<ModuleId, ModulePolicy> {
         &self.module_policies
     }
@@ -745,6 +751,14 @@ impl BlackboardInner {
             BlackboardCommand::SetMemoRetentionPerOwner(retained) => {
                 self.memo_retained_per_owner = retained.max(1);
                 self.truncate_memos_to_retention();
+            }
+            BlackboardCommand::SetModuleForcedDisabled { module, disabled } => {
+                if disabled {
+                    self.forced_disabled_modules.insert(module);
+                } else {
+                    self.forced_disabled_modules.remove(&module);
+                }
+                self.recompute_effective_allocation();
             }
             BlackboardCommand::RecordAllocationProposal {
                 controller,
@@ -890,7 +904,8 @@ impl BlackboardInner {
 
         self.allocation = effective
             .derived(&self.module_policies)
-            .limited(self.allocation_limits);
+            .limited(self.allocation_limits)
+            .force_disable_modules(&self.forced_disabled_modules);
     }
 
     fn active_allocation_maps<'a>(
@@ -1173,6 +1188,61 @@ mod tests {
             "attention-controller: query cheaply\nattention-controller[1]: query deeply"
         );
         assert_eq!(effective.active_replicas(&builtin::speak()), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_disabled_module_overrides_derived_active_replicas() {
+        let mut base = ResourceAllocation::default();
+        base.set_activation(builtin::sensory(), crate::ActivationRatio::ONE);
+        let bb = Blackboard::with_allocation(base);
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![(
+                builtin::sensory(),
+                test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+            )],
+        })
+        .await;
+
+        assert_eq!(
+            bb.read(|bb| bb.allocation().active_replicas(&builtin::sensory()))
+                .await,
+            1
+        );
+
+        bb.apply(BlackboardCommand::SetModuleForcedDisabled {
+            module: builtin::sensory(),
+            disabled: true,
+        })
+        .await;
+
+        let disabled = bb
+            .read(|bb| {
+                (
+                    bb.allocation().active_replicas(&builtin::sensory()),
+                    bb.allocation().activation_for(&builtin::sensory()),
+                    bb.forced_disabled_modules().contains(&builtin::sensory()),
+                )
+            })
+            .await;
+        assert_eq!(disabled.0, 0);
+        assert_eq!(disabled.1, crate::ActivationRatio::ONE);
+        assert!(disabled.2);
+
+        bb.apply(BlackboardCommand::SetModuleForcedDisabled {
+            module: builtin::sensory(),
+            disabled: false,
+        })
+        .await;
+
+        let reenabled = bb
+            .read(|bb| {
+                (
+                    bb.allocation().active_replicas(&builtin::sensory()),
+                    bb.forced_disabled_modules().contains(&builtin::sensory()),
+                )
+            })
+            .await;
+        assert_eq!(reenabled, (1, false));
     }
 
     #[tokio::test]

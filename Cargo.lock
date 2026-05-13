@@ -3520,6 +3520,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nuillu-eval",
+]
+
+[[package]]
 name = "nuillu-speak"
 version = "0.1.0"
 dependencies = [
