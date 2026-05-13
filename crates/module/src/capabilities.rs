@@ -10,7 +10,7 @@ use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
+use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
@@ -195,6 +195,13 @@ impl CapabilityProviders {
         self.inner
             .blackboard
             .apply(BlackboardCommand::SetModulePolicies { policies })
+            .await;
+    }
+
+    pub(crate) async fn set_module_replica_capacities(&self, capacities: Vec<(ModuleId, u8)>) {
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetModuleReplicaCapacities { capacities })
             .await;
     }
 
@@ -388,6 +395,10 @@ impl AgentRuntimeControl {
         self.blackboard.activation_waiter(owner.clone()).await
     }
 
+    pub async fn allocation_change_waiter(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.blackboard.allocation_change_waiter().await
+    }
+
     pub async fn record_module_batch_throttled(
         &self,
         owner: ModuleInstanceId,
@@ -438,6 +449,13 @@ impl HostIo {
         TopicMailbox::new(
             self.owner.clone(),
             self.root.inner.sensory_input_topic.clone(),
+        )
+    }
+
+    pub fn allocation_updated_mailbox(&self) -> AllocationUpdatedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.allocation_updates.clone(),
         )
     }
 }
@@ -781,6 +799,7 @@ struct ModuleRegistration {
     module: ModuleId,
     role_description: &'static str,
     policy: ModulePolicy,
+    replica_capacity: u8,
     builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
 }
 
@@ -790,6 +809,7 @@ impl fmt::Debug for ModuleRegistration {
             .field("module", &self.module)
             .field("role_description", &self.role_description)
             .field("policy", &self.policy)
+            .field("replica_capacity", &self.replica_capacity)
             .finish_non_exhaustive()
     }
 }
@@ -844,10 +864,54 @@ impl ModuleRegistry {
         {
             return Err(ModuleRegistryError::DuplicateModule { module });
         }
+        let replica_capacity = policy.max_active_replicas();
         self.registrations.push(ModuleRegistration {
             module,
             role_description,
             policy,
+            replica_capacity,
+            builder: Box::new(move |caps| Box::new(builder(caps))),
+        });
+        Ok(self)
+    }
+
+    pub fn register_with_replica_capacity<B>(
+        mut self,
+        policy: ModulePolicy,
+        replica_capacity: u8,
+        builder: B,
+    ) -> Result<Self, ModuleRegistryError>
+    where
+        B: ModuleRegisterer + 'static,
+    {
+        let module = ModuleId::new(<B::Module as Module>::id())?;
+        let role_description = <B::Module as Module>::role_description();
+        if self
+            .registrations
+            .iter()
+            .any(|registration| registration.module == module)
+        {
+            return Err(ModuleRegistryError::DuplicateModule { module });
+        }
+        if replica_capacity > ReplicaCapRange::V1_MAX {
+            return Err(ModuleRegistryError::ReplicaCapacityAboveV1Max {
+                module,
+                capacity: replica_capacity,
+            });
+        }
+        let policy_capacity = policy.max_active_replicas();
+        if replica_capacity < policy_capacity {
+            return Err(ModuleRegistryError::ReplicaCapacityBelowPolicyMax {
+                module,
+                capacity: replica_capacity,
+                policy_capacity,
+            });
+        }
+        self.registrations.push(ModuleRegistration {
+            module,
+            role_description,
+            policy,
+            replica_capacity,
             builder: Box::new(move |caps| Box::new(builder(caps))),
         });
         Ok(self)
@@ -867,6 +931,13 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
+        caps.set_module_replica_capacities(
+            self.registrations
+                .iter()
+                .map(|registration| (registration.module.clone(), registration.replica_capacity))
+                .collect(),
+        )
+        .await;
         // Install the post-boot module catalog before any module is constructed
         // so module constructors can read peers from `caps.module_catalog()`
         // synchronously when they assemble their system prompts.
@@ -881,7 +952,7 @@ impl ModuleRegistry {
         for registration in &self.registrations {
             // Build every possible replica up to the registered max, with a
             // replica-0 floor so inactive modules can retain queued messages.
-            let total_replicas = registration.policy.max_active_replicas();
+            let total_replicas = registration.replica_capacity;
             for replica in 0..total_replicas {
                 let owner =
                     ModuleInstanceId::new(registration.module.clone(), ReplicaIndex::new(replica));
@@ -996,6 +1067,16 @@ pub enum ModuleRegistryError {
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
+    #[error("module {module} replica capacity {capacity} exceeds v1 limit")]
+    ReplicaCapacityAboveV1Max { module: ModuleId, capacity: u8 },
+    #[error(
+        "module {module} replica capacity {capacity} is below policy capacity {policy_capacity}"
+    )]
+    ReplicaCapacityBelowPolicyMax {
+        module: ModuleId,
+        capacity: u8,
+        policy_capacity: u8,
+    },
     #[error("dependent {dependent} declared in depends_on() but not registered")]
     UnknownDependent { dependent: ModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
@@ -1136,6 +1217,35 @@ mod tests {
             err,
             ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn register_with_replica_capacity_builds_hard_cap_but_keeps_soft_policy() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let allocated = ModuleRegistry::new()
+            .register_with_replica_capacity(test_policy(0..=1), 2, noop_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        assert_eq!(allocated.len(), 2);
+        let module = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
+        let (soft_max, capacity) = blackboard
+            .read(|bb| {
+                (
+                    bb.module_policies()
+                        .get(&module)
+                        .unwrap()
+                        .replicas_range
+                        .max,
+                    bb.module_replica_capacity(&module).unwrap(),
+                )
+            })
+            .await;
+        assert_eq!(soft_max, 1);
+        assert_eq!(capacity, 2);
     }
 
     #[tokio::test]

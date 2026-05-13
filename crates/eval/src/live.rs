@@ -10,9 +10,9 @@ use nuillu_module::{
 use nuillu_query_agentic::NoopFileSearchProvider;
 use nuillu_types::{MemoryRank, ModuleId};
 use nuillu_visualizer_protocol::{
-    AmbientSensoryRowView, MemoryRecordView, TabStatus, VisualizerClientMessage, VisualizerCommand,
-    VisualizerEvent, VisualizerServerMessage, VisualizerServerPort, VisualizerTabId,
-    memory_page_from_records,
+    AmbientSensoryRowView, MemoryRecordView, ModuleSettingsView, TabStatus,
+    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
+    VisualizerServerPort, VisualizerTabId, memory_page_from_records,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{runtime::Builder, task::LocalSet};
@@ -24,9 +24,9 @@ use crate::{
         accept_visualizer_connection, spawn_visualizer_gui, wait_for_visualizer_exit_with_context,
     },
     runner::{
-        LiveReporter, action_module_ids, build_eval_environment,
-        emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page, eval_registry,
-        full_agent_allocation,
+        LiveReporter, ReplicaHardCap, action_module_ids, apply_visualizer_module_settings,
+        build_eval_environment, emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page,
+        eval_registry, full_agent_allocation,
     },
 };
 
@@ -108,6 +108,8 @@ pub fn run_live_with_visualizer(config: LiveServerConfig) -> anyhow::Result<()> 
 async fn run_live(config: LiveServerConfig, visualizer: &mut VisualizerHook) -> anyhow::Result<()> {
     let tab_id = VisualizerTabId::new(LIVE_TAB_ID.to_string());
     let mut ambient = AmbientRows::load(config.state_dir.join("ambient-sensory.json"))?;
+    let mut module_settings =
+        LiveModuleSettings::load(config.state_dir.join("module-settings.json"))?;
     visualizer.send_event(VisualizerEvent::AmbientSensoryRows {
         tab_id: tab_id.clone(),
         rows: ambient.rows.clone(),
@@ -158,6 +160,7 @@ async fn run_live(config: LiveServerConfig, visualizer: &mut VisualizerHook) -> 
     .await;
 
     let sensory = env.caps.host_io().sensory_input_mailbox();
+    let allocation_updates = env.caps.host_io().allocation_updated_mailbox();
     let mut restart_count = 0_u64;
     loop {
         let allocated = eval_registry(
@@ -166,9 +169,18 @@ async fn run_live(config: LiveServerConfig, visualizer: &mut VisualizerHook) -> 
             &env.policy_caps,
             &env.file_search,
             &env.utterance_sink,
+            ReplicaHardCap::V1Max,
         )
         .build(&env.caps)
         .await?;
+        apply_persisted_module_settings(
+            &module_settings,
+            visualizer,
+            &tab_id,
+            &env.blackboard,
+            &allocation_updates,
+        )
+        .await;
 
         let result = run_agent(
             allocated,
@@ -176,7 +188,15 @@ async fn run_live(config: LiveServerConfig, visualizer: &mut VisualizerHook) -> 
                 idle_threshold: Duration::from_secs(1),
                 activate_retries: 2,
             },
-            drive_live_until_shutdown(visualizer, &tab_id, &mut ambient, &sensory, &env),
+            drive_live_until_shutdown(
+                visualizer,
+                &tab_id,
+                &mut ambient,
+                &mut module_settings,
+                &sensory,
+                &allocation_updates,
+                &env,
+            ),
         )
         .await;
 
@@ -221,7 +241,9 @@ async fn drive_live_until_shutdown(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     ambient: &mut AmbientRows,
+    module_settings: &mut LiveModuleSettings,
     sensory: &SensoryInputMailbox,
+    allocation_updates: &nuillu_module::AllocationUpdatedMailbox,
     env: &crate::runner::EvalEnvironment,
 ) {
     publish_ambient_snapshot(ambient, sensory, visualizer, tab_id, env.clock.as_ref()).await;
@@ -230,8 +252,17 @@ async fn drive_live_until_shutdown(
             break;
         }
         while let Some(message) = visualizer.try_recv_command() {
-            if handle_live_visualizer_message(message, visualizer, tab_id, ambient, sensory, env)
-                .await
+            if handle_live_visualizer_message(
+                message,
+                visualizer,
+                tab_id,
+                ambient,
+                module_settings,
+                sensory,
+                allocation_updates,
+                env,
+            )
+            .await
             {
                 break;
             }
@@ -249,7 +280,9 @@ async fn handle_live_visualizer_message(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     ambient: &mut AmbientRows,
+    module_settings: &mut LiveModuleSettings,
     sensory: &SensoryInputMailbox,
+    allocation_updates: &nuillu_module::AllocationUpdatedMailbox,
     env: &crate::runner::EvalEnvironment,
 ) -> bool {
     let command = match message {
@@ -326,6 +359,29 @@ async fn handle_live_visualizer_message(
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id: tab_id.clone(),
                         message: format!("invalid module id: {module}"),
+                    });
+                }
+            }
+            false
+        }
+        VisualizerCommand::SetModuleSettings {
+            tab_id: command_tab,
+            settings,
+        } if command_tab == *tab_id => {
+            if apply_visualizer_module_settings(
+                tab_id,
+                visualizer,
+                &env.blackboard,
+                allocation_updates,
+                settings.clone(),
+            )
+            .await
+            {
+                module_settings.upsert(settings);
+                if let Err(error) = module_settings.save() {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to save module settings: {error}"),
                     });
                 }
             }
@@ -417,6 +473,79 @@ async fn publish_ambient_snapshot(
         tab_id: tab_id.clone(),
         input: body,
     });
+}
+
+async fn apply_persisted_module_settings(
+    settings: &LiveModuleSettings,
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    blackboard: &nuillu_blackboard::Blackboard,
+    allocation_updates: &nuillu_module::AllocationUpdatedMailbox,
+) {
+    for setting in settings.iter() {
+        apply_visualizer_module_settings(
+            tab_id,
+            visualizer,
+            blackboard,
+            allocation_updates,
+            setting.clone(),
+        )
+        .await;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModuleSettingsFile {
+    modules: Vec<ModuleSettingsView>,
+}
+
+#[derive(Debug)]
+struct LiveModuleSettings {
+    path: PathBuf,
+    modules: std::collections::BTreeMap<String, ModuleSettingsView>,
+}
+
+impl LiveModuleSettings {
+    fn load(path: PathBuf) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Ok(Self {
+                path,
+                modules: std::collections::BTreeMap::new(),
+            });
+        }
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read module settings from {}", path.display()))?;
+        let file: ModuleSettingsFile = serde_json::from_str(&text)
+            .with_context(|| format!("parse module settings from {}", path.display()))?;
+        Ok(Self {
+            path,
+            modules: file
+                .modules
+                .into_iter()
+                .map(|settings| (settings.module.clone(), settings))
+                .collect(),
+        })
+    }
+
+    fn save(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create module settings dir {}", parent.display()))?;
+        }
+        let text = serde_json::to_string_pretty(&ModuleSettingsFile {
+            modules: self.modules.values().cloned().collect(),
+        })?;
+        fs::write(&self.path, text)
+            .with_context(|| format!("write module settings to {}", self.path.display()))
+    }
+
+    fn upsert(&mut self, settings: ModuleSettingsView) {
+        self.modules.insert(settings.module.clone(), settings);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ModuleSettingsView> {
+        self.modules.values()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

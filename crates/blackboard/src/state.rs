@@ -31,6 +31,7 @@ pub struct Blackboard {
     inner: Arc<RwLock<BlackboardInner>>,
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
+    allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
     module_catalog: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
 }
 
@@ -59,6 +60,7 @@ pub struct BlackboardInner {
     allocation_caps: HashMap<ModuleInstanceId, ResourceAllocation>,
     forced_disabled_modules: HashSet<ModuleId>,
     module_policies: HashMap<ModuleId, ModulePolicy>,
+    module_replica_capacities: HashMap<ModuleId, u8>,
     allocation_limits: AllocationLimits,
 }
 
@@ -231,6 +233,7 @@ impl Blackboard {
             inner: Arc::new(RwLock::new(BlackboardInner::default())),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
+            allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
             module_catalog: Arc::new(OnceLock::new()),
         }
     }
@@ -245,6 +248,7 @@ impl Blackboard {
             inner: Arc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
+            allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
             module_catalog: Arc::new(OnceLock::new()),
         }
     }
@@ -277,9 +281,14 @@ impl Blackboard {
     /// Apply one command under the blackboard write lock.
     pub async fn apply(&self, cmd: BlackboardCommand) {
         let mut guard = self.inner.write().await;
+        let before = guard.allocation.clone();
         guard.apply(cmd);
+        let allocation_changed = before != guard.allocation;
         self.notify_active_waiters(&guard.allocation);
         self.notify_activation_increase_waiters(&guard.allocation);
+        if allocation_changed {
+            self.notify_allocation_change_waiters();
+        }
     }
 
     pub async fn update_memo(
@@ -360,6 +369,17 @@ impl Blackboard {
         Some(receiver)
     }
 
+    pub async fn allocation_change_waiter(&self) -> oneshot::Receiver<()> {
+        let mut waiters = self
+            .allocation_change_waiters
+            .lock()
+            .expect("allocation change waiters poisoned");
+        waiters.retain(|sender| !sender.is_closed());
+        let (sender, receiver) = oneshot::channel();
+        waiters.push(sender);
+        receiver
+    }
+
     fn notify_active_waiters(&self, allocation: &ResourceAllocation) {
         let mut waiters = self
             .activation_waiters
@@ -390,6 +410,16 @@ impl Blackboard {
             }
         }
         *waiters = pending;
+    }
+
+    fn notify_allocation_change_waiters(&self) {
+        let mut waiters = self
+            .allocation_change_waiters
+            .lock()
+            .expect("allocation change waiters poisoned");
+        for waiter in waiters.drain(..) {
+            let _ = waiter.send(());
+        }
     }
 }
 
@@ -422,6 +452,7 @@ impl Default for BlackboardInner {
             allocation_caps: HashMap::new(),
             forced_disabled_modules: HashSet::new(),
             module_policies: HashMap::new(),
+            module_replica_capacities: HashMap::new(),
             allocation_limits: AllocationLimits::default(),
         }
     }
@@ -641,6 +672,17 @@ impl BlackboardInner {
         &self.module_policies
     }
 
+    pub fn module_replica_capacity(&self, module: &ModuleId) -> Option<u8> {
+        self.module_replica_capacities
+            .get(module)
+            .copied()
+            .or_else(|| {
+                self.module_policies
+                    .get(module)
+                    .map(ModulePolicy::max_active_replicas)
+            })
+    }
+
     pub fn allocation_limits(&self) -> AllocationLimits {
         self.allocation_limits
     }
@@ -740,9 +782,18 @@ impl BlackboardInner {
             }
             BlackboardCommand::SetModulePolicies { policies } => {
                 for (module, policy) in policies {
+                    self.module_replica_capacities
+                        .entry(module.clone())
+                        .or_insert_with(|| policy.max_active_replicas());
                     self.module_policies.insert(module, policy);
                 }
                 self.recompute_effective_allocation();
+            }
+            BlackboardCommand::SetModuleReplicaCapacities { capacities } => {
+                for (module, capacity) in capacities {
+                    self.module_replica_capacities
+                        .insert(module, capacity.max(1));
+                }
             }
             BlackboardCommand::SetAllocationLimits(limits) => {
                 self.allocation_limits = limits;
@@ -1453,6 +1504,41 @@ mod tests {
             .await;
 
         assert!(waiter.is_none());
+    }
+
+    #[tokio::test]
+    async fn allocation_change_waiter_fires_when_policy_changes_derived_cooldown() {
+        let module = builtin::query_vector();
+        let mut base = ResourceAllocation::default();
+        base.set(module.clone(), crate::ModuleConfig::default());
+        base.set_activation(module.clone(), crate::ActivationRatio::ONE);
+        let bb = Blackboard::with_allocation(base);
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![(
+                module.clone(),
+                crate::ModulePolicy::new(
+                    ReplicaCapRange::new(0, 1).unwrap(),
+                    crate::Bpm::from_f64(1.0)..=crate::Bpm::from_f64(1.0),
+                    crate::linear_ratio_fn,
+                ),
+            )],
+        })
+        .await;
+
+        let waiter = bb.allocation_change_waiter().await;
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![(
+                module,
+                crate::ModulePolicy::new(
+                    ReplicaCapRange::new(0, 1).unwrap(),
+                    crate::Bpm::from_f64(60.0)..=crate::Bpm::from_f64(60.0),
+                    crate::linear_ratio_fn,
+                ),
+            )],
+        })
+        .await;
+
+        assert_eq!(waiter.await, Ok(()));
     }
 
     fn test_policy(range: ReplicaCapRange) -> crate::ModulePolicy {

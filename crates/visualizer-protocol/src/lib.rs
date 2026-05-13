@@ -199,6 +199,10 @@ pub enum VisualizerCommand {
         module: String,
         disabled: bool,
     },
+    SetModuleSettings {
+        tab_id: VisualizerTabId,
+        settings: ModuleSettingsView,
+    },
     QueryMemory {
         tab_id: VisualizerTabId,
         query: String,
@@ -345,6 +349,8 @@ pub struct BlackboardSnapshot {
     pub module_statuses: Vec<ModuleStatusView>,
     pub allocation: Vec<AllocationView>,
     #[serde(default)]
+    pub module_policies: Vec<ModulePolicyView>,
+    #[serde(default)]
     pub forced_disabled_modules: Vec<String>,
     pub memos: Vec<MemoView>,
     pub cognition_logs: Vec<CognitionLogView>,
@@ -371,6 +377,34 @@ pub struct AllocationView {
     pub cooldown_ms: Option<u64>,
     pub tier: String,
     pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModulePolicyView {
+    pub module: String,
+    pub replica_min: u8,
+    pub replica_max: u8,
+    pub replica_capacity: u8,
+    pub bpm_min: f64,
+    pub bpm_max: f64,
+    pub zero_replica_window: ZeroReplicaWindowView,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModuleSettingsView {
+    pub module: String,
+    pub replica_min: u8,
+    pub replica_max: u8,
+    pub bpm_min: f64,
+    pub bpm_max: f64,
+    pub zero_replica_window: ZeroReplicaWindowView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ZeroReplicaWindowView {
+    Disabled,
+    EveryControllerActivations { period: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_rows_and_module_disable_commands_round_trip_through_json() {
+    fn ambient_rows_and_module_commands_round_trip_through_json() {
         let tab_id = VisualizerTabId::new("live");
         let row = AmbientSensoryRowView {
             id: "ambient-1".to_string(),
@@ -694,6 +728,40 @@ mod tests {
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::SendSensoryInput { input, .. },
             } if input.modality == "touch" && input.content == "the tabletop feels cold"
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::SetModuleSettings {
+                tab_id: VisualizerTabId::new("live"),
+                settings: ModuleSettingsView {
+                    module: "predict".to_string(),
+                    replica_min: 0,
+                    replica_max: 2,
+                    bpm_min: 3.0,
+                    bpm_max: 12.0,
+                    zero_replica_window: ZeroReplicaWindowView::EveryControllerActivations {
+                        period: 4,
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SetModuleSettings {
+                    settings:
+                        ModuleSettingsView {
+                            module,
+                            replica_max: 2,
+                            zero_replica_window:
+                                ZeroReplicaWindowView::EveryControllerActivations { period: 4 },
+                            ..
+                        },
+                    ..
+                },
+            } if module == "predict"
         ));
     }
 

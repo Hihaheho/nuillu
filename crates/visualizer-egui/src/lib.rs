@@ -450,6 +450,14 @@ impl RuntimeTab {
                         },
                     });
                 }
+                modules::ModuleOverviewAction::SetModuleSettings { settings } => {
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::SetModuleSettings {
+                            tab_id: self.id.clone(),
+                            settings,
+                        },
+                    });
+                }
             }
         }
 

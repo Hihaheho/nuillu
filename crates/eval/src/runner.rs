@@ -34,12 +34,13 @@ use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
+    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation,
+    ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
 use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryRecord, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
-    AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
+    AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
     LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality,
@@ -56,10 +57,10 @@ use nuillu_types::{
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, LlmInputItemView,
     LlmObservationEvent, LlmObservationSource, LlmUsageView, MemoView, MemoryMetadataView,
-    MemoryPage, MemoryRecordView, ModuleStatusView, TabStatus, UtteranceDeltaView,
-    UtteranceProgressView, UtteranceView, VisualizerAction, VisualizerClientMessage,
-    VisualizerCommand, VisualizerEvent, VisualizerServerMessage, VisualizerTabId,
-    start_activation_action_id,
+    MemoryPage, MemoryRecordView, ModulePolicyView, ModuleSettingsView, ModuleStatusView,
+    TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
+    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
+    VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
 };
 use regex::RegexBuilder;
 use serde::Serialize;
@@ -292,7 +293,8 @@ impl VisualizerHook {
                 VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
-                | VisualizerCommand::SetModuleDisabled { tab_id, .. } => {
+                | VisualizerCommand::SetModuleDisabled { tab_id, .. }
+                | VisualizerCommand::SetModuleSettings { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -1494,6 +1496,7 @@ async fn execute_full_agent_case(
 
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
+    let allocation_updates = host.allocation_updated_mailbox();
     let inputs = case.inputs.clone();
     let steps = case.steps.clone();
     let actions = env.actions.clone();
@@ -1512,6 +1515,11 @@ async fn execute_full_agent_case(
         &env.policy_caps,
         &env.file_search,
         &env.utterance_sink,
+        if gui_deferred_start {
+            ReplicaHardCap::V1Max
+        } else {
+            ReplicaHardCap::PolicyMax
+        },
     )
     .build(&env.caps)
     .await?;
@@ -1578,6 +1586,7 @@ async fn execute_full_agent_case(
                         visualizer,
                         Some(&sensory),
                         &allocation_blackboard,
+                        &allocation_updates,
                         memory.as_ref(),
                         clock.as_ref(),
                     )
@@ -1771,10 +1780,16 @@ async fn execute_module_case(
         &env.policy_caps,
         &env.file_search,
         &env.utterance_sink,
+        if gui_deferred_start {
+            ReplicaHardCap::V1Max
+        } else {
+            ReplicaHardCap::PolicyMax
+        },
     )
     .build(&env.caps)
     .await?;
     let harness = env.caps.internal_harness_io();
+    let allocation_updates = env.caps.host_io().allocation_updated_mailbox();
     let prompt = case.prompt.content.clone();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
@@ -1812,6 +1827,7 @@ async fn execute_module_case(
                         visualizer,
                         None,
                         &blackboard,
+                        &allocation_updates,
                         memory.as_ref(),
                         clock.as_ref(),
                     )
@@ -2332,6 +2348,7 @@ async fn handle_visualizer_commands(
     visualizer: &mut VisualizerHook,
     sensory: Option<&SensoryInputMailbox>,
     blackboard: &Blackboard,
+    allocation_updates: &AllocationUpdatedMailbox,
     memory: &dyn MemoryStore,
     clock: &dyn Clock,
 ) -> VisualizerCommandOutcome {
@@ -2436,6 +2453,18 @@ async fn handle_visualizer_commands(
                     });
                 }
             },
+            VisualizerCommand::SetModuleSettings { tab_id, settings }
+                if tab_id.as_str() == case_id =>
+            {
+                apply_visualizer_module_settings(
+                    &tab_id,
+                    visualizer,
+                    blackboard,
+                    allocation_updates,
+                    settings,
+                )
+                .await;
+            }
             VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
@@ -2456,6 +2485,106 @@ async fn handle_visualizer_commands(
 struct VisualizerCommandOutcome {
     shutdown: bool,
     start_requested: bool,
+}
+
+pub(crate) async fn apply_visualizer_module_settings(
+    tab_id: &VisualizerTabId,
+    visualizer: &VisualizerHook,
+    blackboard: &Blackboard,
+    allocation_updates: &AllocationUpdatedMailbox,
+    settings: ModuleSettingsView,
+) -> bool {
+    let update = match build_module_policy_update(blackboard, &settings).await {
+        Ok(update) => update,
+        Err(message) => {
+            visualizer.send_event(VisualizerEvent::Log {
+                tab_id: tab_id.clone(),
+                message,
+            });
+            return false;
+        }
+    };
+
+    let before = blackboard.read(|bb| bb.allocation().clone()).await;
+    blackboard
+        .apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![update],
+        })
+        .await;
+    let after = blackboard.read(|bb| bb.allocation().clone()).await;
+    if before != after && allocation_updates.publish(AllocationUpdated).await.is_err() {
+        tracing::trace!("visualizer module settings allocation update had no active subscribers");
+    }
+    true
+}
+
+async fn build_module_policy_update(
+    blackboard: &Blackboard,
+    settings: &ModuleSettingsView,
+) -> Result<(ModuleId, ModulePolicy), String> {
+    let module = ModuleId::new(settings.module.clone())
+        .map_err(|_| format!("invalid module id: {}", settings.module))?;
+    if settings.replica_min > settings.replica_max {
+        return Err(format!(
+            "{} replica min {} exceeds max {}",
+            settings.module, settings.replica_min, settings.replica_max
+        ));
+    }
+    if !settings.bpm_min.is_finite()
+        || !settings.bpm_max.is_finite()
+        || settings.bpm_min <= 0.0
+        || settings.bpm_max <= 0.0
+    {
+        return Err(format!(
+            "{} BPM range must be positive and finite",
+            settings.module
+        ));
+    }
+    if settings.bpm_min > settings.bpm_max {
+        return Err(format!(
+            "{} BPM min {} exceeds max {}",
+            settings.module, settings.bpm_min, settings.bpm_max
+        ));
+    }
+
+    let (policy, capacity) = blackboard
+        .read(|bb| {
+            let policy = bb.module_policies().get(&module).cloned();
+            let capacity = bb.module_replica_capacity(&module);
+            (policy, capacity)
+        })
+        .await;
+    let Some(mut policy) = policy else {
+        return Err(format!(
+            "module settings target is not registered: {}",
+            settings.module
+        ));
+    };
+    let capacity = capacity.unwrap_or_else(|| policy.max_active_replicas());
+    if settings.replica_max > capacity {
+        return Err(format!(
+            "{} replica max {} exceeds hard cap {}",
+            settings.module, settings.replica_max, capacity
+        ));
+    }
+
+    policy.replicas_range = ReplicaCapRange::new(settings.replica_min, settings.replica_max)
+        .map_err(|error| format!("{} invalid replica range: {error}", settings.module))?;
+    policy.rate_limit_range = Bpm::range(settings.bpm_min, settings.bpm_max);
+    policy.zero_replica_window = match settings.zero_replica_window {
+        ZeroReplicaWindowView::Disabled => ZeroReplicaWindowPolicy::Disabled,
+        ZeroReplicaWindowView::EveryControllerActivations { period } => {
+            if period == 0 {
+                return Err(format!(
+                    "{} zero-window period must be greater than zero",
+                    settings.module
+                ));
+            }
+            ZeroReplicaWindowPolicy::EveryControllerActivations(period)
+        }
+    };
+
+    Ok((module, policy))
 }
 
 pub(crate) async fn emit_visualizer_memory_page(
@@ -3048,6 +3177,7 @@ pub(crate) fn eval_registry(
     policy_caps: &PolicyCapabilities,
     file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
+    replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
     for module in modules {
@@ -3059,9 +3189,45 @@ pub(crate) fn eval_registry(
             policy_caps,
             file_search,
             utterance_sink,
+            replica_hard_cap,
         );
     }
     declare_eval_dependencies(registry, modules)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicaHardCap {
+    PolicyMax,
+    V1Max,
+}
+
+trait EvalRegistryExt {
+    fn register_eval<B>(
+        self,
+        policy: ModulePolicy,
+        replica_hard_cap: ReplicaHardCap,
+        builder: B,
+    ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
+    where
+        B: nuillu_module::ModuleRegisterer + 'static;
+}
+
+impl EvalRegistryExt for ModuleRegistry {
+    fn register_eval<B>(
+        self,
+        policy: ModulePolicy,
+        replica_hard_cap: ReplicaHardCap,
+        builder: B,
+    ) -> Result<ModuleRegistry, nuillu_module::ModuleRegistryError>
+    where
+        B: nuillu_module::ModuleRegisterer + 'static,
+    {
+        let replica_capacity = match replica_hard_cap {
+            ReplicaHardCap::PolicyMax => policy.max_active_replicas(),
+            ReplicaHardCap::V1Max => ReplicaCapRange::V1_MAX,
+        };
+        self.register_with_replica_capacity(policy, replica_capacity, builder)
+    }
 }
 
 fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -> ModuleRegistry {
@@ -3154,320 +3320,401 @@ fn register_eval_module(
     policy_caps: &PolicyCapabilities,
     file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
+    replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
     match module {
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
         EvalModule::Sensory => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_sensory::SensoryModule::new(
-                    caps.sensory_input_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.memo(),
-                    caps.clock(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_sensory::SensoryModule::new(
+                        caps.sensory_input_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.memo(),
+                        caps.clock(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // Gates the speak path; must re-fire fast as memos accumulate so
         // the cognition log is current by the time speak-gate considers it.
         EvalModule::CognitionGate => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_cognition_gate::CognitionGateModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.cognition_writer(),
-                    caps.time_division(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_cognition_gate::CognitionGateModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        caps.cognition_writer(),
+                        caps.time_division(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // Expensive (premium tier in default model-set), heavy reasoning.
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), {
-                let voluntary = voluntary_modules(all_modules);
-                move |caps| {
-                    nuillu_attention_controller::AttentionControllerModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.attention_control_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.allocation_writer(voluntary.clone(), Vec::new()),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let voluntary = voluntary_modules(all_modules);
+                    move |caps| {
+                        nuillu_attention_controller::AttentionControllerModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.attention_control_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.allocation_reader(),
+                            caps.allocation_writer(voluntary.clone(), Vec::new()),
+                            caps.memo(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         // Periodic first-person attention narration; not on the critical
         // path for the speak loop.
         EvalModule::AttentionSchema => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_attention_schema::AttentionSchemaModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.cognition_log_reader(),
-                    caps.cognition_writer(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_attention_schema::AttentionSchemaModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        caps.cognition_log_reader(),
+                        caps.cognition_writer(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // On-demand: fires on controller allocation guidance.
         EvalModule::SelfModel => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_self_model::SelfModelModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_self_model::SelfModelModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
-                let memory_caps = memory_caps.clone();
-                move |caps| {
-                    nuillu_memory::QueryVectorModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        memory_caps.searcher(),
-                        caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
+                replica_hard_cap,
+                {
+                    let memory_caps = memory_caps.clone();
+                    move |caps| {
+                        nuillu_memory::QueryVectorModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            memory_caps.searcher(),
+                            caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::QueryPolicy => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
-                let policy_caps = policy_caps.clone();
-                move |caps| {
-                    nuillu_reward::QueryPolicyModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        policy_caps.searcher(),
-                        caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
+                replica_hard_cap,
+                {
+                    let policy_caps = policy_caps.clone();
+                    move |caps| {
+                        nuillu_reward::QueryPolicyModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            policy_caps.searcher(),
+                            caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
-                let file_search = file_search.clone();
-                move |caps| {
-                    nuillu_query_agentic::QueryAgenticModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        FileSearcher::new(file_search.clone()),
-                        caps.memo(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let file_search = file_search.clone();
+                    move |caps| {
+                        nuillu_query_agentic::QueryAgenticModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            FileSearcher::new(file_search.clone()),
+                            caps.memo(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), {
-                let memory_caps = memory_caps.clone();
-                move |caps| {
-                    nuillu_memory::MemoryModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        memory_caps.writer(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                {
+                    let memory_caps = memory_caps.clone();
+                    move |caps| {
+                        nuillu_memory::MemoryModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            memory_caps.writer(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
-                let memory_caps = memory_caps.clone();
-                move |caps| {
-                    nuillu_memory::MemoryCompactionModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        memory_caps.compactor(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let memory_caps = memory_caps.clone();
+                    move |caps| {
+                        nuillu_memory::MemoryCompactionModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            memory_caps.compactor(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::MemoryRecombination => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
-                let memory_caps = memory_caps.clone();
-                move |caps| {
-                    nuillu_memory::MemoryRecombinationModule::new(
-                        caps.allocation_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        memory_caps.searcher(),
-                        caps.cognition_writer(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let memory_caps = memory_caps.clone();
+                    move |caps| {
+                        nuillu_memory::MemoryRecombinationModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            memory_caps.searcher(),
+                            caps.cognition_writer(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Vital => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
-                nuillu_vital::VitalModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.vital_writer(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_vital::VitalModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.vital_writer(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::HomeostaticController => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 20.0)), |caps| {
-                nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                    caps.vital_updated_inbox(),
-                    caps.vital_reader(),
-                    caps.allocation_writer(
-                        homeostatic_drive_modules(),
-                        homeostatic_capped_modules(),
-                    ),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 20.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_homeostatic_controller::HomeostaticControllerModule::new(
+                        caps.vital_updated_inbox(),
+                        caps.vital_reader(),
+                        caps.allocation_writer(
+                            homeostatic_drive_modules(),
+                            homeostatic_capped_modules(),
+                        ),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Policy => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
-                let policy_caps = policy_caps.clone();
-                move |caps| {
-                    nuillu_reward::PolicyModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.allocation_reader(),
-                        policy_caps.writer(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let policy_caps = policy_caps.clone();
+                    move |caps| {
+                        nuillu_reward::PolicyModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.allocation_reader(),
+                            policy_caps.writer(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::ValueEstimator => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
-                let policy_caps = policy_caps.clone();
-                move |caps| {
-                    nuillu_reward::ValueEstimatorModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        policy_caps.window_reader(),
-                        caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
+                replica_hard_cap,
+                {
+                    let policy_caps = policy_caps.clone();
+                    move |caps| {
+                        nuillu_reward::ValueEstimatorModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.allocation_reader(),
+                            policy_caps.window_reader(),
+                            caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         EvalModule::Reward => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 9.0)), {
-                let policy_caps = policy_caps.clone();
-                move |caps| {
-                    nuillu_reward::RewardModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.memo_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        policy_caps.window_reader(),
-                        policy_caps.value_updater(),
-                        caps.attention_control_mailbox(),
-                        caps.typed_memo::<nuillu_reward::RewardMemo>(),
-                        caps.llm_access(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 9.0)),
+                replica_hard_cap,
+                {
+                    let policy_caps = policy_caps.clone();
+                    move |caps| {
+                        nuillu_reward::RewardModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.memo_updated_inbox(),
+                            caps.allocation_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.allocation_reader(),
+                            policy_caps.window_reader(),
+                            policy_caps.value_updater(),
+                            caps.attention_control_mailbox(),
+                            caps.typed_memo::<nuillu_reward::RewardMemo>(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_predict::PredictModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_predict::PredictModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; should be quick enough to flag
         // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_surprise::SurpriseModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.attention_control_mailbox(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_surprise::SurpriseModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.attention_control_mailbox(),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // On the critical path: must respond quickly to cognition-log
         // updates so it can decide to speak before the moment passes.
         EvalModule::SpeakGate => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_speak::SpeakGateModule::new(
-                    caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
-                    caps.cognition_log_reader(),
-                    caps.blackboard_reader(),
-                    caps.attention_control_mailbox(),
-                    caps.typed_memo::<nuillu_speak::SpeakGateMemo>(),
-                    caps.llm_access(),
-                )
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                |caps| {
+                    nuillu_speak::SpeakGateModule::new(
+                        caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
+                        caps.cognition_log_reader(),
+                        caps.blackboard_reader(),
+                        caps.attention_control_mailbox(),
+                        caps.typed_memo::<nuillu_speak::SpeakGateMemo>(),
+                        caps.llm_access(),
+                    )
+                },
+            )
             .expect("eval module registration should be unique"),
         // Reactive on cognition-log updates after speak-gate allows the
         // activation. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), {
-                let utterance_sink = utterance_sink.clone();
-                move |caps| {
-                    nuillu_speak::SpeakModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        UtteranceWriter::new(
-                            caps.owner().clone(),
-                            caps.blackboard(),
-                            utterance_sink.clone(),
-                            caps.clock(),
-                        ),
-                        caps.llm_access(),
-                        caps.scene_reader(),
-                    )
-                }
-            })
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                replica_hard_cap,
+                {
+                    let utterance_sink = utterance_sink.clone();
+                    move |caps| {
+                        nuillu_speak::SpeakModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.memo(),
+                            UtteranceWriter::new(
+                                caps.owner().clone(),
+                                caps.blackboard(),
+                                utterance_sink.clone(),
+                                caps.clock(),
+                            ),
+                            caps.llm_access(),
+                            caps.scene_reader(),
+                        )
+                    }
+                },
+            )
             .expect("eval module registration should be unique"),
     }
 }
@@ -3871,6 +4118,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 guidance: module.guidance.as_str().to_owned(),
             })
             .collect(),
+        module_policies: module_policy_views(bb),
         forced_disabled_modules: {
             let mut modules = bb
                 .forced_disabled_modules()
@@ -3920,6 +4168,35 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             })
             .collect(),
         memory_metadata,
+    }
+}
+
+fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
+    let mut policies = bb
+        .module_policies()
+        .iter()
+        .map(|(module, policy)| ModulePolicyView {
+            module: module.as_str().to_owned(),
+            replica_min: policy.replicas_range.min,
+            replica_max: policy.replicas_range.max,
+            replica_capacity: bb
+                .module_replica_capacity(module)
+                .unwrap_or_else(|| policy.max_active_replicas()),
+            bpm_min: policy.rate_limit_range.start().as_f64(),
+            bpm_max: policy.rate_limit_range.end().as_f64(),
+            zero_replica_window: zero_replica_window_view(policy.zero_replica_window),
+        })
+        .collect::<Vec<_>>();
+    policies.sort_by(|left, right| left.module.cmp(&right.module));
+    policies
+}
+
+fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaWindowView {
+    match policy {
+        ZeroReplicaWindowPolicy::Disabled => ZeroReplicaWindowView::Disabled,
+        ZeroReplicaWindowPolicy::EveryControllerActivations(period) => {
+            ZeroReplicaWindowView::EveryControllerActivations { period }
+        }
     }
 }
 
@@ -5836,6 +6113,7 @@ prompt = "What am I attending to?"
             &policy_caps,
             &file_search,
             &utterance_sink,
+            ReplicaHardCap::PolicyMax,
         )
         .build(&caps)
         .await
@@ -5980,6 +6258,7 @@ prompt = "What am I attending to?"
             &policy_caps,
             &file_search,
             &utterance_sink,
+            ReplicaHardCap::PolicyMax,
         )
         .build(&caps)
         .await

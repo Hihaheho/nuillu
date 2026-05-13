@@ -66,6 +66,9 @@ pub enum BlackboardCommand {
     SetModulePolicies {
         policies: Vec<(ModuleId, ModulePolicy)>,
     },
+    SetModuleReplicaCapacities {
+        capacities: Vec<(ModuleId, u8)>,
+    },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),
     SetModuleForcedDisabled {

@@ -20,7 +20,8 @@ use nuillu_module::RuntimeEvent;
 
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
-    LlmObservationSource, LlmUsageView, MemoView, ModuleStatusView, memos,
+    LlmObservationSource, LlmUsageView, MemoView, ModulePolicyView, ModuleSettingsView,
+    ModuleStatusView, ZeroReplicaWindowView, memos,
     text::{hard_wrap_long_segments, wrapped_label},
 };
 
@@ -107,14 +108,22 @@ pub struct ModuleOverviewRow {
     pub guidance: Option<String>,
     pub bpm: Option<f64>,
     pub cooldown_ms: Option<u64>,
+    pub policy: Option<ModulePolicyView>,
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModuleOverviewAction {
     OpenModule { owner: String },
     SetDisabled { module: String, disabled: bool },
+    SetModuleSettings { settings: ModuleSettingsView },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct OpenModuleConfig {
+    module: String,
+    anchor: egui::Pos2,
 }
 
 pub fn apply_blackboard_snapshot(state: &mut ModulesState, snapshot: &BlackboardSnapshot) {
@@ -327,15 +336,24 @@ pub fn overview_rows(
         .iter()
         .map(|allocation| (allocation.module.as_str(), allocation))
         .collect::<BTreeMap<_, _>>();
+    let policies = snapshot
+        .module_policies
+        .iter()
+        .map(|policy| (policy.module.as_str(), policy))
+        .collect::<BTreeMap<_, _>>();
     for row in rows.values_mut() {
         if let Some(allocation) = allocations.get(row.module.as_str()) {
             apply_allocation_to_row(row, allocation);
+        }
+        if let Some(policy) = policies.get(row.module.as_str()) {
+            row.policy = Some((*policy).clone());
         }
         row.forced_disabled = snapshot
             .forced_disabled_modules
             .iter()
             .any(|module| module == &row.module);
     }
+    rows.retain(|_, row| overview_row_visible(row));
 
     rows.into_values().collect()
 }
@@ -347,6 +365,10 @@ pub fn render_modules_overview(
 ) -> Vec<ModuleOverviewAction> {
     let rows = overview_rows(state, snapshot);
     let mut actions = Vec::new();
+    let open_config_id = ui.make_persistent_id("module-config-popup");
+    let mut open_config = ui
+        .ctx()
+        .data(|data| data.get_temp::<OpenModuleConfig>(open_config_id));
     ui.horizontal_wrapped(|ui| {
         ui.heading("Modules");
         ui.label(format!("count: {}", rows.len()));
@@ -359,9 +381,18 @@ pub fn render_modules_overview(
             overview_header(ui);
             ui.separator();
             for (index, row) in rows.iter().enumerate() {
-                overview_row(ui, row, index, &mut actions);
+                overview_row(ui, row, index, &mut actions, &mut open_config);
             }
         });
+
+    render_open_config_popup(ui, snapshot, &mut open_config, &mut actions);
+    if let Some(open_config) = open_config {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(open_config_id, open_config));
+    } else {
+        ui.ctx()
+            .data_mut(|data| data.remove::<OpenModuleConfig>(open_config_id));
+    }
 
     actions
 }
@@ -744,6 +775,7 @@ fn split_tool_result_content(content: &str) -> Option<(&str, &str)> {
 
 const OVERVIEW_ROW_HEIGHT: f32 = 22.0;
 const ACTIVE_COLUMN_WIDTH: f32 = 28.0;
+const CONFIG_COLUMN_WIDTH: f32 = 54.0;
 const MODULE_COLUMN_WIDTH: f32 = 130.0;
 const REPLICA_COLUMN_WIDTH: f32 = 30.0;
 const STATUS_COLUMN_WIDTH: f32 = 128.0;
@@ -754,10 +786,14 @@ const BPM_COLUMN_WIDTH: f32 = 30.0;
 const COOLDOWN_COLUMN_WIDTH: f32 = 40.0;
 const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
+const CONFIG_POPUP_WIDTH: f32 = 310.0;
+const CONFIG_POPUP_ESTIMATED_HEIGHT: f32 = 160.0;
+const CONFIG_POPUP_GAP: f32 = 6.0;
 
 fn overview_header(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         overview_header_cell(ui, "Enabled", ACTIVE_COLUMN_WIDTH);
+        overview_header_cell(ui, "Configs", CONFIG_COLUMN_WIDTH);
         overview_header_cell(ui, "Module", MODULE_COLUMN_WIDTH);
         overview_header_cell(ui, "Replica", REPLICA_COLUMN_WIDTH);
         overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
@@ -776,12 +812,14 @@ fn overview_row(
     row: &ModuleOverviewRow,
     index: usize,
     actions: &mut Vec<ModuleOverviewAction>,
+    open_config: &mut Option<OpenModuleConfig>,
 ) {
     let fill = (index % 2 == 1).then(|| ui.visuals().faint_bg_color);
     let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
             overview_disable_cell(ui, row, actions);
+            overview_config_cell(ui, row, open_config);
             overview_module_cell(ui, row, actions);
             overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
             overview_label_cell(
@@ -865,6 +903,202 @@ fn overview_disable_cell(
     );
 }
 
+fn overview_config_cell(
+    ui: &mut egui::Ui,
+    row: &ModuleOverviewRow,
+    open_config: &mut Option<OpenModuleConfig>,
+) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(CONFIG_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let Some(policy) = &row.policy else {
+                ui.label("-");
+                return;
+            };
+            let response = ui.add_sized(
+                [CONFIG_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
+                egui::Button::new("Edit"),
+            );
+            let anchor = response.rect.right_top();
+            let clicked = response.clicked();
+            response.on_hover_text(format!("edit {}", policy.module));
+            if clicked {
+                if open_config
+                    .as_ref()
+                    .is_some_and(|open| open.module == policy.module)
+                {
+                    *open_config = None;
+                } else {
+                    *open_config = Some(OpenModuleConfig {
+                        module: policy.module.clone(),
+                        anchor,
+                    });
+                }
+            }
+        },
+    );
+}
+
+fn render_open_config_popup(
+    ui: &mut egui::Ui,
+    snapshot: &BlackboardSnapshot,
+    open_config: &mut Option<OpenModuleConfig>,
+    actions: &mut Vec<ModuleOverviewAction>,
+) {
+    let Some(open) = open_config.clone() else {
+        return;
+    };
+    let Some(policy) = snapshot
+        .module_policies
+        .iter()
+        .find(|policy| policy.module == open.module)
+        .cloned()
+    else {
+        *open_config = None;
+        return;
+    };
+
+    let mut close = false;
+    let popup_pos = clamped_config_popup_pos(ui.ctx(), open.anchor);
+    egui::Area::new(egui::Id::new((
+        "module-config-popup",
+        policy.module.as_str(),
+    )))
+    .order(egui::Order::Foreground)
+    .fixed_pos(popup_pos)
+    .show(ui.ctx(), |ui| {
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            ui.set_min_width(CONFIG_POPUP_WIDTH);
+            ui.set_max_width(CONFIG_POPUP_WIDTH);
+            ui.horizontal(|ui| {
+                ui.strong("Configs");
+                ui.label(&policy.module);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("x").on_hover_text("close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+            render_config_editor(ui, &policy, actions);
+        });
+    });
+    if close {
+        *open_config = None;
+    }
+}
+
+fn clamped_config_popup_pos(ctx: &egui::Context, anchor: egui::Pos2) -> egui::Pos2 {
+    let bounds = ctx.content_rect();
+    let mut pos = anchor + egui::vec2(CONFIG_POPUP_GAP, 0.0);
+    if pos.x + CONFIG_POPUP_WIDTH > bounds.right() {
+        pos.x = (anchor.x - CONFIG_POPUP_WIDTH - CONFIG_POPUP_GAP).max(bounds.left());
+    }
+    if pos.y + CONFIG_POPUP_ESTIMATED_HEIGHT > bounds.bottom() {
+        pos.y = (bounds.bottom() - CONFIG_POPUP_ESTIMATED_HEIGHT).max(bounds.top());
+    }
+    pos.y = pos.y.max(bounds.top());
+    pos
+}
+
+fn render_config_editor(
+    ui: &mut egui::Ui,
+    policy: &ModulePolicyView,
+    actions: &mut Vec<ModuleOverviewAction>,
+) {
+    let mut settings = ModuleSettingsView {
+        module: policy.module.clone(),
+        replica_min: policy.replica_min,
+        replica_max: policy.replica_max,
+        bpm_min: policy.bpm_min,
+        bpm_max: policy.bpm_max,
+        zero_replica_window: policy.zero_replica_window,
+    };
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.label("Replicas");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut settings.replica_min)
+                    .range(0..=policy.replica_capacity)
+                    .speed(1.0),
+            )
+            .changed();
+        ui.label("to");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut settings.replica_max)
+                    .range(0..=policy.replica_capacity)
+                    .speed(1.0),
+            )
+            .changed();
+        ui.label(format!("cap {}", policy.replica_capacity));
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("BPM");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut settings.bpm_min)
+                    .range(0.001..=100_000.0)
+                    .speed(0.25),
+            )
+            .changed();
+        ui.label("to");
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut settings.bpm_max)
+                    .range(0.001..=100_000.0)
+                    .speed(0.25),
+            )
+            .changed();
+    });
+
+    let mut zero_enabled = matches!(
+        settings.zero_replica_window,
+        ZeroReplicaWindowView::EveryControllerActivations { .. }
+    );
+    let mut zero_period = match settings.zero_replica_window {
+        ZeroReplicaWindowView::Disabled => 3,
+        ZeroReplicaWindowView::EveryControllerActivations { period } => period.max(1),
+    };
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(&mut zero_enabled, "Zero window").changed();
+        ui.add_enabled_ui(zero_enabled, |ui| {
+            ui.label("period");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut zero_period)
+                        .range(1..=10_000)
+                        .speed(1.0),
+                )
+                .changed();
+        });
+    });
+
+    settings.replica_min = settings.replica_min.min(policy.replica_capacity);
+    settings.replica_max = settings.replica_max.min(policy.replica_capacity);
+    if settings.replica_min > settings.replica_max {
+        settings.replica_max = settings.replica_min;
+    }
+    if settings.bpm_min > settings.bpm_max {
+        settings.bpm_max = settings.bpm_min;
+    }
+    settings.zero_replica_window = if zero_enabled {
+        ZeroReplicaWindowView::EveryControllerActivations {
+            period: zero_period.max(1),
+        }
+    } else {
+        ZeroReplicaWindowView::Disabled
+    };
+
+    if changed {
+        actions.push(ModuleOverviewAction::SetModuleSettings { settings });
+    }
+}
+
 fn overview_module_cell(
     ui: &mut egui::Ui,
     row: &ModuleOverviewRow,
@@ -921,6 +1155,7 @@ fn upsert_overview_row<'a>(
             guidance: None,
             bpm: None,
             cooldown_ms: None,
+            policy: None,
             throttle: None,
             latest_llm_output: None,
         });
@@ -939,6 +1174,21 @@ fn apply_allocation_to_row(row: &mut ModuleOverviewRow, allocation: &AllocationV
     row.cooldown_ms = allocation.cooldown_ms;
     row.tier = Some(allocation.tier.clone());
     row.guidance = (!allocation.guidance.is_empty()).then(|| allocation.guidance.clone());
+}
+
+fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
+    if row.replica == 0 {
+        return true;
+    }
+    if let Some(policy) = &row.policy
+        && row.replica < policy.replica_max
+    {
+        return true;
+    }
+    row.llm_status != status_label(ModuleSessionStatus::Idle)
+        || row.latest_llm_output.is_some()
+        || row.throttle.is_some()
+        || !matches!(row.runtime_status.as_str(), "Inactive" | "not reported")
 }
 
 fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
@@ -1444,6 +1694,53 @@ mod tests {
     }
 
     #[test]
+    fn overview_rows_hide_capacity_only_inactive_replicas() {
+        let state = ModulesState::default();
+        let snapshot = BlackboardSnapshot {
+            module_statuses: vec![
+                ModuleStatusView {
+                    owner: "sensory".to_string(),
+                    module: "sensory".to_string(),
+                    replica: 0,
+                    status: "AwaitingBatch".to_string(),
+                },
+                ModuleStatusView {
+                    owner: "sensory[1]".to_string(),
+                    module: "sensory".to_string(),
+                    replica: 1,
+                    status: "Inactive".to_string(),
+                },
+            ],
+            allocation: vec![AllocationView {
+                module: "sensory".to_string(),
+                activation_ratio: 1.0,
+                active_replicas: 1,
+                bpm: Some(18.0),
+                cooldown_ms: Some(3333),
+                tier: "Cheap".to_string(),
+                guidance: String::new(),
+            }],
+            module_policies: vec![ModulePolicyView {
+                module: "sensory".to_string(),
+                replica_min: 0,
+                replica_max: 1,
+                replica_capacity: 2,
+                bpm_min: 6.0,
+                bpm_max: 18.0,
+                zero_replica_window: ZeroReplicaWindowView::EveryControllerActivations {
+                    period: 3,
+                },
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        let rows = overview_rows(&state, &snapshot);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].owner, "sensory");
+    }
+
+    #[test]
     fn module_memos_filter_by_module_across_replicas() {
         let module = ModuleState {
             owner: "query-vector".to_string(),
@@ -1593,6 +1890,7 @@ mod tests {
                 guidance: Some("inspect recent input".to_string()),
                 bpm: Some(12.5),
                 cooldown_ms: Some(4800),
+                policy: None,
                 throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
             }]
@@ -1615,6 +1913,7 @@ mod tests {
             guidance: None,
             bpm: None,
             cooldown_ms: None,
+            policy: None,
             throttle: None,
             latest_llm_output: None,
         };

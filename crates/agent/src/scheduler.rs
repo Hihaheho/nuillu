@@ -4,7 +4,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use nuillu_blackboard::{
     ActivationRatio, CorePolicyRecord, IdentityMemoryRecord, ZeroReplicaWindowPolicy,
@@ -232,6 +232,7 @@ enum TaskMessage {
         module: AllocatedModule,
         kick_inbox: KickInbox,
         delayed_for: Duration,
+        next_batch_throttle: Option<NextBatchThrottle>,
     },
     NextBatch {
         index: usize,
@@ -270,7 +271,9 @@ enum TaskMessage {
     },
 }
 
+#[derive(Debug, Clone)]
 struct NextBatchThrottle {
+    baseline: DateTime<Utc>,
     not_before: DateTime<Utc>,
     activation_threshold: ActivationRatio,
 }
@@ -333,6 +336,20 @@ impl ZeroReplicaWindows {
         Self { states }
     }
 
+    fn sync(&mut self, policies: HashMap<ModuleId, ZeroReplicaWindowPolicy>) {
+        self.states
+            .retain(|module, _| policies.contains_key(module));
+        for (module, policy) in policies {
+            if let Some(period) = policy.controller_activation_period() {
+                if let Some(state) = self.states.get_mut(&module) {
+                    state.controller_activation_period = period;
+                } else if let Some(state) = ZeroReplicaWindowState::new(policy) {
+                    self.states.insert(module, state);
+                }
+            }
+        }
+    }
+
     fn allows(&self, owner: &ModuleInstanceId) -> bool {
         owner.replica == ReplicaIndex::ZERO
             && self
@@ -375,6 +392,7 @@ impl ZeroReplicaWindows {
         &mut self,
         runtime: &AgentRuntimeControl,
     ) -> Vec<ModuleId> {
+        self.sync(runtime.zero_replica_window_policies().await);
         let modules = self.states.keys().cloned().collect::<Vec<_>>();
         let mut opened = Vec::new();
         for module in modules {
@@ -427,6 +445,7 @@ async fn refresh_active_and_schedule(
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
+    zero_windows.sync(runtime.zero_replica_window_policies().await);
     let mut allocation_active = vec![false; owners.len()];
     for (index, owner) in owners.iter().enumerate() {
         allocation_active[index] = runtime.is_active(owner).await;
@@ -454,21 +473,24 @@ async fn refresh_active_and_schedule(
                     .expect("kick inbox available for stored module");
                 let now = runtime.clock().now();
                 if let Some(throttle) =
-                    next_batch_throttle.filter(|throttle| throttle.not_before > now)
+                    current_next_batch_throttle(runtime, &owners[index], next_batch_throttle, now)
+                        .await
                 {
                     if let Some(activation_increase) = runtime
                         .activation_increase_waiter(&owners[index], throttle.activation_threshold)
                         .await
                     {
                         states[index] = ModuleState::CoolingDown;
+                        let allocation_change = runtime.allocation_change_waiter().await;
                         spawn_batch_cooldown(
                             tasks,
                             index,
                             module,
                             kick_inbox,
-                            throttle.not_before,
+                            throttle,
                             runtime.clock(),
                             activation_increase,
+                            allocation_change,
                             parent,
                             subscriber,
                         );
@@ -614,6 +636,22 @@ async fn refresh_active_and_schedule(
     }
 }
 
+async fn current_next_batch_throttle(
+    runtime: &AgentRuntimeControl,
+    owner: &ModuleInstanceId,
+    throttle: Option<NextBatchThrottle>,
+    now: DateTime<Utc>,
+) -> Option<NextBatchThrottle> {
+    let throttle = throttle?;
+    let (interval, activation_threshold) = runtime.module_batch_throttle_baseline(owner).await?;
+    let not_before = throttle.baseline + ChronoDuration::from_std(interval).ok()?;
+    (not_before > now).then_some(NextBatchThrottle {
+        baseline: throttle.baseline,
+        not_before,
+        activation_threshold,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_task_message(
     message: TaskMessage,
@@ -637,6 +675,7 @@ async fn handle_task_message(
             module,
             kick_inbox,
             delayed_for,
+            next_batch_throttle,
         } => {
             runtime
                 .record_module_batch_throttled(owners[index].clone(), delayed_for)
@@ -644,7 +683,7 @@ async fn handle_task_message(
             kick_inboxes[index] = Some(kick_inbox);
             states[index] = ModuleState::Stored {
                 module,
-                next_batch_throttle: None,
+                next_batch_throttle,
             };
             Ok(())
         }
@@ -770,6 +809,9 @@ async fn handle_task_message(
                             chrono::Duration::from_std(remaining)
                                 .ok()
                                 .map(|d| NextBatchThrottle {
+                                    baseline: now
+                                        - ChronoDuration::from_std(activation_elapsed)
+                                            .unwrap_or_default(),
                                     not_before: now + d,
                                     activation_threshold,
                                 })
@@ -1230,18 +1272,24 @@ fn spawn_batch_cooldown(
     index: usize,
     module: AllocatedModule,
     kick_inbox: KickInbox,
-    deadline: DateTime<Utc>,
+    throttle: NextBatchThrottle,
     clock: Arc<dyn Clock>,
     activation_increase: tokio::sync::oneshot::Receiver<()>,
+    allocation_change: tokio::sync::oneshot::Receiver<()>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
             let started = clock.now();
+            let deadline = throttle.not_before;
+            let mut next_batch_throttle = None;
             tokio::select! {
-                _ = clock.sleep_until(deadline) => {}
-                _ = activation_increase => {}
+                _ = clock.sleep_until(deadline) => {},
+                _ = activation_increase => {},
+                _ = allocation_change => {
+                    next_batch_throttle = Some(throttle);
+                },
             }
             let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
             TaskMessage::BatchCooldownExpired {
@@ -1249,6 +1297,7 @@ fn spawn_batch_cooldown(
                 module,
                 kick_inbox,
                 delayed_for,
+                next_batch_throttle,
             }
         }
         .instrument(parent.clone())
