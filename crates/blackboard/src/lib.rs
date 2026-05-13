@@ -24,6 +24,7 @@ mod command;
 mod memory;
 mod policy;
 mod state;
+mod vital;
 
 pub use allocation::{
     ActivationRatio, ActivationRatioFn, AllocationLimits, Bpm, ModuleConfig, ModulePolicy,
@@ -41,3 +42,4 @@ pub use state::{
     Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord,
     TypedMemoLogRecord, UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
 };
+pub use vital::{VitalMode, VitalPatch, VitalState};

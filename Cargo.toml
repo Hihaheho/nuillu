@@ -74,6 +74,8 @@ nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
 nuillu-query-agentic = { path = "crates/modules/query-agentic" }
 nuillu-memory = { path = "crates/modules/memory" }
+nuillu-vital = { path = "crates/modules/vital" }
+nuillu-homeostatic-controller = { path = "crates/modules/homeostatic-controller" }
 nuillu-reward = { path = "crates/modules/reward" }
 nuillu-predict = { path = "crates/modules/predict" }
 nuillu-surprise = { path = "crates/modules/surprise" }

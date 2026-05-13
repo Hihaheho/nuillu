@@ -41,6 +41,7 @@ mod session_compaction;
 mod tiers;
 mod time_division;
 mod r#trait;
+mod vital;
 
 #[cfg(test)]
 mod test_support;
@@ -60,7 +61,8 @@ pub use channels::{
     AttentionControlRequestInbox, AttentionControlRequestMailbox, CognitionLogUpdated,
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope, MemoUpdated, MemoUpdatedInbox,
     MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError,
+    SensoryInputMailbox, TopicInbox, TopicMailbox, TopicRecvError, VitalUpdated, VitalUpdatedInbox,
+    VitalUpdatedMailbox,
 };
 pub use cognition::CognitionWriter;
 pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};
@@ -83,7 +85,9 @@ pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
-pub use readers::{AllocationReader, BlackboardReader, CognitionLogReader, ModuleStatusReader};
+pub use readers::{
+    AllocationReader, BlackboardReader, CognitionLogReader, ModuleStatusReader, VitalReader,
+};
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
 pub use session_compaction::{
@@ -93,3 +97,4 @@ pub use session_compaction::{
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
+pub use vital::VitalWriter;

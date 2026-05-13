@@ -21,7 +21,10 @@ Inspect the current cognitive workspace and decide whether to preserve short, us
 Use the current cognition log plus unread/recent module memo logs as candidate evidence. Allocation
 guidance from attention-controller may contain explicit preservation candidates from other modules,
 but those candidates are not write commands. You may reject, normalize, merge, and deduplicate
-observations and guidance. Use insert_memory only for concrete information likely to matter later."#;
+observations and guidance. Use insert_memory only for concrete information likely to matter later.
+Entries beginning "Internal dream simulation, not a verified fact:" are associative internal
+simulations, not evidence. Do not store them as factual memories; preserve them only when explicitly
+framed as hypotheses or associations."#;
 
 const NORMAL_REQUEST_DECAY_SECS: i64 = 86_400;
 const HIGH_REQUEST_DECAY_SECS: i64 = 604_800;

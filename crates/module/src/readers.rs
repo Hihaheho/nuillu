@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use nuillu_blackboard::{
     Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, MemoLogRecord,
-    ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
+    ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation, VitalState,
 };
 use nuillu_types::ModuleInstanceId;
 
@@ -145,8 +145,13 @@ impl AllocationReader {
             .await
     }
 
-    pub async fn controller_schema_json(&self) -> serde_json::Value {
-        let ids = self.registered_module_ids().await;
+    pub async fn controller_schema_json(
+        &self,
+        allowed_modules: &[nuillu_types::ModuleId],
+    ) -> serde_json::Value {
+        let mut ids = allowed_modules.to_vec();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids.dedup();
         let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
 
         let priority_items = if module_ids.is_empty() {
@@ -183,6 +188,25 @@ impl AllocationReader {
             },
             "required": ["memo", "priority"],
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct VitalReader {
+    blackboard: Blackboard,
+}
+
+impl VitalReader {
+    pub(crate) fn new(blackboard: Blackboard) -> Self {
+        Self { blackboard }
+    }
+
+    pub async fn snapshot(&self) -> VitalState {
+        self.blackboard.read(|bb| bb.vital().clone()).await
+    }
+
+    pub async fn read<R>(&self, f: impl FnOnce(&VitalState) -> R) -> R {
+        self.blackboard.read(|bb| f(bb.vital())).await
     }
 }
 
@@ -231,7 +255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_schema_enumerates_registered_modules_with_cap_ranges() {
+    async fn controller_schema_enumerates_allowed_modules() {
         let blackboard = Blackboard::default();
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
@@ -249,7 +273,9 @@ mod tests {
             .await;
         let reader = AllocationReader::new(blackboard);
 
-        let schema = reader.controller_schema_json().await;
+        let schema = reader
+            .controller_schema_json(&[builtin::query_vector()])
+            .await;
         assert_eq!(
             schema,
             serde_json::json!({
@@ -267,7 +293,7 @@ mod tests {
                             "additionalProperties": false,
                             "properties": {
                                 "module_id": {
-                                    "enum": ["query-vector", "speak"],
+                                    "enum": ["query-vector"],
                                 },
                                 "hint": {
                                     "type": "string",

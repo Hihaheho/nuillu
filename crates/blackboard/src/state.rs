@@ -5,13 +5,14 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
-use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex, builtin};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, PolicyIndex};
 use tokio::sync::{RwLock, oneshot};
 
 use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
     CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, CorePolicyRecord,
     IdentityMemoryRecord, MemoryMetadata, ModulePolicy, PolicyMetadata, ResourceAllocation,
+    VitalState,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -46,6 +47,7 @@ pub struct BlackboardInner {
     cognition_logs: HashMap<ModuleInstanceId, CognitionLog>,
     cognition_entry_log: Vec<CognitionLogEntryRecord>,
     cognition_next_index: u64,
+    vital: VitalState,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     identity_memories: Vec<IdentityMemoryRecord>,
@@ -54,6 +56,7 @@ pub struct BlackboardInner {
     base_allocation: ResourceAllocation,
     allocation: ResourceAllocation,
     allocation_proposals: HashMap<ModuleInstanceId, ResourceAllocation>,
+    allocation_caps: HashMap<ModuleInstanceId, ResourceAllocation>,
     module_policies: HashMap<ModuleId, ModulePolicy>,
     allocation_limits: AllocationLimits,
 }
@@ -406,6 +409,7 @@ impl Default for BlackboardInner {
             cognition_logs: HashMap::new(),
             cognition_entry_log: Vec::new(),
             cognition_next_index: 0,
+            vital: VitalState::default(),
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
             identity_memories: Vec::new(),
@@ -414,6 +418,7 @@ impl Default for BlackboardInner {
             base_allocation: ResourceAllocation::default(),
             allocation: ResourceAllocation::default(),
             allocation_proposals: HashMap::new(),
+            allocation_caps: HashMap::new(),
             module_policies: HashMap::new(),
             allocation_limits: AllocationLimits::default(),
         }
@@ -606,6 +611,10 @@ impl BlackboardInner {
         &self.core_policies
     }
 
+    pub fn vital(&self) -> &VitalState {
+        &self.vital
+    }
+
     pub fn allocation(&self) -> &ResourceAllocation {
         &self.allocation
     }
@@ -616,6 +625,10 @@ impl BlackboardInner {
 
     pub fn allocation_proposals(&self) -> &HashMap<ModuleInstanceId, ResourceAllocation> {
         &self.allocation_proposals
+    }
+
+    pub fn allocation_caps(&self) -> &HashMap<ModuleInstanceId, ResourceAllocation> {
+        &self.allocation_caps
     }
 
     pub fn module_policies(&self) -> &HashMap<ModuleId, ModulePolicy> {
@@ -660,6 +673,9 @@ impl BlackboardInner {
                 });
                 self.cognition_next_index = self.cognition_next_index.saturating_add(1);
                 self.cognition_logs.entry(source).or_default().append(entry);
+            }
+            BlackboardCommand::UpdateVital { patch, now } => {
+                self.vital.apply_patch(patch, now);
             }
             BlackboardCommand::RecordAgenticDeadlockMarker(marker) => {
                 self.agentic_deadlock_marker = Some(marker);
@@ -737,6 +753,10 @@ impl BlackboardInner {
                 self.allocation_proposals.insert(controller, proposal);
                 self.recompute_effective_allocation();
             }
+            BlackboardCommand::RecordAllocationCap { controller, cap } => {
+                self.allocation_caps.insert(controller, cap);
+                self.recompute_effective_allocation();
+            }
         }
     }
 
@@ -775,27 +795,20 @@ impl BlackboardInner {
     }
 
     fn recompute_effective_allocation(&mut self) {
-        let active_controller_replicas = self
-            .allocation
-            .active_replicas(&builtin::attention_controller());
-        let mut active_proposals = self
-            .allocation_proposals
-            .iter()
-            .filter(|(owner, _)| {
-                owner.module == builtin::attention_controller()
-                    && owner.replica.get() < active_controller_replicas
-            })
-            .collect::<Vec<_>>();
-        active_proposals.sort_by_key(|(owner, _)| owner.replica);
-
-        if active_proposals.is_empty() {
-            self.allocation = self
-                .base_allocation
-                .clone()
-                .derived(&self.module_policies)
-                .limited(self.allocation_limits);
-            return;
-        }
+        let mut active_proposals = self.active_allocation_maps(&self.allocation_proposals);
+        active_proposals.sort_by(|(left, _), (right, _)| {
+            left.module
+                .as_str()
+                .cmp(right.module.as_str())
+                .then_with(|| left.replica.cmp(&right.replica))
+        });
+        let mut active_caps = self.active_allocation_maps(&self.allocation_caps);
+        active_caps.sort_by(|(left, _), (right, _)| {
+            left.module
+                .as_str()
+                .cmp(right.module.as_str())
+                .then_with(|| left.replica.cmp(&right.replica))
+        });
 
         let module_ids: HashSet<ModuleId> = self
             .module_policies
@@ -816,24 +829,41 @@ impl BlackboardInner {
             effective.set_model_override(id.clone(), tier);
         }
         for id in module_ids {
-            let count = active_proposals.len() as u32;
-            let activation_sum = active_proposals
+            let module_proposals = active_proposals
+                .iter()
+                .filter(|(_, proposal)| proposal.has_module_opinion(&id))
+                .collect::<Vec<_>>();
+            if module_proposals.is_empty() {
+                effective.set(id.clone(), self.base_allocation.for_module(&id));
+                effective.set_activation(id.clone(), self.base_allocation.activation_for(&id));
+                continue;
+            }
+
+            let count = module_proposals.len() as u32;
+            let activation_sum = module_proposals
                 .iter()
                 .map(|(_, proposal)| {
-                    let ratio = if proposal.get(&id).is_some() {
+                    if proposal.has_activation(&id) {
                         proposal.activation_for(&id)
                     } else {
                         self.base_allocation.activation_for(&id)
-                    };
-                    u32::from(ratio.raw())
+                    }
                 })
+                .map(|ratio| u32::from(ratio.raw()))
                 .sum::<u32>();
-            let guidance =
-                combine_guidance(active_proposals.iter().filter_map(|(owner, proposal)| {
+
+            let guidance = if module_proposals
+                .iter()
+                .any(|(_, proposal)| proposal.get(&id).is_some())
+            {
+                combine_guidance(module_proposals.iter().filter_map(|(owner, proposal)| {
                     proposal
                         .get(&id)
                         .map(|cfg| (owner.to_string(), cfg.guidance.trim().to_owned()))
-                }));
+                }))
+            } else {
+                self.base_allocation.for_module(&id).guidance
+            };
 
             effective.set(id.clone(), crate::ModuleConfig { guidance });
             effective.set_activation(
@@ -842,9 +872,34 @@ impl BlackboardInner {
             );
         }
 
+        let capped_ids = effective
+            .iter_activation()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in capped_ids {
+            let cap = active_caps
+                .iter()
+                .filter(|(_, cap)| cap.has_activation(&id))
+                .map(|(_, cap)| cap.activation_for(&id))
+                .min();
+            if let Some(cap) = cap {
+                let current = effective.activation_for(&id);
+                effective.set_activation(id, current.min(cap));
+            }
+        }
+
         self.allocation = effective
             .derived(&self.module_policies)
             .limited(self.allocation_limits);
+    }
+
+    fn active_allocation_maps<'a>(
+        &self,
+        maps: &'a HashMap<ModuleInstanceId, ResourceAllocation>,
+    ) -> Vec<(&'a ModuleInstanceId, &'a ResourceAllocation)> {
+        maps.iter()
+            .filter(|(owner, _)| self.allocation.is_replica_active(owner))
+            .collect()
     }
 }
 
@@ -1208,6 +1263,79 @@ mod tests {
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
         assert!(effective.get(&unknown).is_none());
+    }
+
+    #[tokio::test]
+    async fn allocation_caps_clamp_active_drive_without_disabling_replica() {
+        let mut base = ResourceAllocation::default();
+        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(
+            builtin::homeostatic_controller(),
+            crate::ActivationRatio::ONE,
+        );
+        base.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
+
+        let bb = Blackboard::with_allocation(base);
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![
+                (
+                    builtin::attention_controller(),
+                    test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+                ),
+                (
+                    builtin::homeostatic_controller(),
+                    test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+                ),
+                (
+                    builtin::speak(),
+                    test_policy(ReplicaCapRange::new(0, 1).unwrap()),
+                ),
+            ],
+        })
+        .await;
+
+        let mut drive = ResourceAllocation::default();
+        drive.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
+        bb.apply(BlackboardCommand::RecordAllocationProposal {
+            controller: ModuleInstanceId::new(builtin::attention_controller(), ReplicaIndex::ZERO),
+            proposal: drive,
+        })
+        .await;
+
+        let mut cap = ResourceAllocation::default();
+        cap.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.15));
+        bb.apply(BlackboardCommand::RecordAllocationCap {
+            controller: ModuleInstanceId::new(
+                builtin::homeostatic_controller(),
+                ReplicaIndex::ZERO,
+            ),
+            cap,
+        })
+        .await;
+
+        let effective = bb.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            effective.activation_for(&builtin::speak()),
+            crate::ActivationRatio::from_f64(0.15)
+        );
+        assert_eq!(effective.active_replicas(&builtin::speak()), 1);
+
+        let mut wake_cap = ResourceAllocation::default();
+        wake_cap.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
+        bb.apply(BlackboardCommand::RecordAllocationCap {
+            controller: ModuleInstanceId::new(
+                builtin::homeostatic_controller(),
+                ReplicaIndex::ZERO,
+            ),
+            cap: wake_cap,
+        })
+        .await;
+
+        let effective = bb.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            effective.activation_for(&builtin::speak()),
+            crate::ActivationRatio::ONE
+        );
     }
 
     #[tokio::test]

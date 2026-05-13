@@ -340,6 +340,10 @@ fn cognition_history_input(record: &CognitionLogEntryRecord) -> String {
     format!("New cognition log item:\n{}", record.entry.text.trim())
 }
 
+fn speech_eligible_cognition(record: &CognitionLogEntryRecord) -> bool {
+    record.source.module != builtin::memory_recombination()
+}
+
 fn push_cognition_history(session: &mut Session, records: &[CognitionLogEntryRecord]) {
     for record in records {
         session.push_user(cognition_history_input(record));
@@ -516,8 +520,12 @@ impl SpeakGateModule {
 
         let self_model_available = has_registered_module(cx.modules(), &builtin::self_model());
         let unread_cognition = self.cognition_log.unread_events().await;
-        let latest_cognition_index = unread_cognition.last().map(|record| record.index);
-        push_cognition_history(&mut self.session, &unread_cognition);
+        let speech_cognition = unread_cognition
+            .into_iter()
+            .filter(speech_eligible_cognition)
+            .collect::<Vec<_>>();
+        let latest_cognition_index = speech_cognition.last().map(|record| record.index);
+        push_cognition_history(&mut self.session, &speech_cognition);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let speak_owner = speak_owner();

@@ -10,6 +10,7 @@ use nuillu_module::{
 };
 
 use crate::utterance::UtteranceWriter;
+use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -330,6 +331,9 @@ impl SpeakModule {
         let snapshot = self.cognition_log.snapshot().await;
         let mut lines = Vec::new();
         for record in snapshot.logs() {
+            if record.source.module == builtin::memory_recombination() {
+                continue;
+            }
             for entry in &record.entries {
                 let text = entry.text.trim();
                 if !text.is_empty() {
@@ -471,6 +475,7 @@ impl SpeakModule {
         snapshot
             .logs()
             .iter()
+            .filter(|record| record.source.module != builtin::memory_recombination())
             .flat_map(|record| record.entries.iter())
             .filter(|entry| entry.at > threshold)
             .map(|entry| entry.text.clone())

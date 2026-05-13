@@ -4,6 +4,7 @@
 //! ([`MemoryWriter`], [`MemoryCompactor`], [`VectorMemorySearcher`],
 //! [`MemoryContentReader`]), and the three modules that operate on memory:
 //! [`MemoryModule`] (writes), [`MemoryCompactionModule`] (merges), and
+//! [`MemoryRecombinationModule`] (dream-like recombination), and
 //! [`QueryVectorModule`] (vector-search retrieval).
 //!
 //! Hosts build a [`MemoryCapabilities`] provider once at boot to bundle the
@@ -22,6 +23,7 @@ use nuillu_types::MemoryRank;
 
 mod memory;
 mod query;
+mod recombination;
 mod store;
 
 pub use memory::{
@@ -34,6 +36,10 @@ pub use query::{
     QueryVectorBatch, QueryVectorMemo, QueryVectorMemoHit, QueryVectorMemoSearch,
     QueryVectorMemoryHit, QueryVectorModule, QueryVectorTools, QueryVectorToolsCall,
     QueryVectorToolsSelector, SearchVectorMemoryArgs, SearchVectorMemoryOutput,
+};
+pub use recombination::{
+    AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
+    RecombinationTools, RecombinationToolsCall, RecombinationToolsSelector,
 };
 pub use store::{
     IndexedMemory, MemoryCompactor, MemoryContentReader, MemoryQuery, MemoryRecord, MemoryStore,

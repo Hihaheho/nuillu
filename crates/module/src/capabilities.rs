@@ -27,7 +27,8 @@ use crate::{
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, LlmAccess, LutumTiers,
     Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, Module, ModuleBatch,
     ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision,
-    TopicInbox, TopicMailbox, TypedMemo,
+    TopicInbox, TopicMailbox, TypedMemo, VitalReader, VitalUpdated, VitalUpdatedInbox,
+    VitalUpdatedMailbox, VitalWriter,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -45,6 +46,7 @@ struct CapabilityProvidersInner {
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
+    vital_updates: Topic<VitalUpdated>,
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
     activation_gates: ActivationGateHub,
@@ -133,6 +135,13 @@ impl CapabilityProviders {
                     blackboard.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::AllocationUpdated,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                vital_updates: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::VitalUpdated,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -461,6 +470,10 @@ impl InternalHarnessIo {
         )
     }
 
+    pub fn vital_updated_mailbox(&self) -> VitalUpdatedMailbox {
+        TopicMailbox::new(self.owner.clone(), self.root.inner.vital_updates.clone())
+    }
+
     pub fn memo_updated_mailbox(&self) -> MemoUpdatedMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone())
     }
@@ -508,6 +521,10 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.allocation_updates.clone(),
         )
+    }
+
+    pub fn vital_updated_inbox(&self) -> VitalUpdatedInbox {
+        TopicInbox::new_excluding_self(self.owner.clone(), self.root.inner.vital_updates.clone())
     }
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
@@ -593,6 +610,10 @@ impl ModuleCapabilityFactory {
         self.root.allocation_reader()
     }
 
+    pub fn vital_reader(&self) -> VitalReader {
+        VitalReader::new(self.root.inner.blackboard.clone())
+    }
+
     pub fn module_status_reader(&self) -> ModuleStatusReader {
         self.root.module_status_reader()
     }
@@ -610,7 +631,11 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn allocation_writer(&self) -> AllocationWriter {
+    pub fn allocation_writer(
+        &self,
+        allowed_drive_modules: Vec<ModuleId>,
+        allowed_cap_modules: Vec<ModuleId>,
+    ) -> AllocationWriter {
         AllocationWriter::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
@@ -618,6 +643,17 @@ impl ModuleCapabilityFactory {
                 self.owner.clone(),
                 self.root.inner.allocation_updates.clone(),
             ),
+            allowed_drive_modules,
+            allowed_cap_modules,
+        )
+    }
+
+    pub fn vital_writer(&self) -> VitalWriter {
+        VitalWriter::new(
+            self.owner.clone(),
+            self.root.inner.blackboard.clone(),
+            VitalUpdatedMailbox::new(self.owner.clone(), self.root.inner.vital_updates.clone()),
+            self.root.inner.clock.clone(),
         )
     }
 
@@ -1109,8 +1145,8 @@ mod tests {
         let controller = scoped(&caps, builtin::attention_controller(), 0);
         let _w1 = cognition_gate.cognition_writer();
         let _w2 = cognition_gate.cognition_writer();
-        let _a1 = controller.allocation_writer();
-        let _a2 = controller.allocation_writer();
+        let _a1 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
+        let _a2 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
     }
 
     #[tokio::test]
@@ -1290,7 +1326,7 @@ mod tests {
         let caps = test_caps(blackboard);
         let controller = scoped(&caps, builtin::attention_controller(), 0);
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
-        let writer = controller.allocation_writer();
+        let writer = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
         let mut inbox = cognition_gate.allocation_updated_inbox();
 
         let mut proposal = ResourceAllocation::default();
@@ -1339,5 +1375,4 @@ mod tests {
         assert_eq!(event.sender.module, builtin::speak());
         assert_eq!(event.body.owner.module, builtin::speak());
     }
-
 }

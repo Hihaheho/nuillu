@@ -120,10 +120,7 @@ mod tests {
     use async_trait::async_trait;
     use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
     use nuillu_blackboard::{Blackboard, Bpm, linear_ratio_fn};
-    use nuillu_module::ports::{
-        NoopCognitionLogRepository,
-        SystemClock,
-    };
+    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, MemoUpdated, Module,
         ModuleRegistry,
@@ -199,7 +196,10 @@ mod tests {
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
                         caps.allocation_reader(),
-                        caps.allocation_writer(),
+                        caps.allocation_writer(
+                            vec![nuillu_types::builtin::attention_controller()],
+                            Vec::new(),
+                        ),
                         caps.memo(),
                         caps.llm_access(),
                     )

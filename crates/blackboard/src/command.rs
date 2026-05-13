@@ -4,7 +4,7 @@ use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIn
 use crate::{
     AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
     IdentityMemoryRecord, MemoryMetaPatch, ModulePolicy, ModuleRunStatus, PolicyMetaPatch,
-    ResourceAllocation, UtteranceProgress,
+    ResourceAllocation, UtteranceProgress, VitalPatch,
 };
 
 /// Internal blackboard mutation. Constructed only by the agent's
@@ -34,6 +34,10 @@ pub enum BlackboardCommand {
     AppendCognitionLog {
         source: ModuleInstanceId,
         entry: CognitionLogEntry,
+    },
+    UpdateVital {
+        patch: VitalPatch,
+        now: DateTime<Utc>,
     },
     RecordAgenticDeadlockMarker(AgenticDeadlockMarker),
     UpsertMemoryMetadata {
@@ -67,5 +71,9 @@ pub enum BlackboardCommand {
     RecordAllocationProposal {
         controller: ModuleInstanceId,
         proposal: ResourceAllocation,
+    },
+    RecordAllocationCap {
+        controller: ModuleInstanceId,
+        cap: ResourceAllocation,
     },
 }

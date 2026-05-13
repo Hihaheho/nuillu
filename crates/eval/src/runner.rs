@@ -31,7 +31,6 @@ use lutum_libsql_adapter::{
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
-use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
@@ -39,17 +38,18 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryRecord, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
-use nuillu_reward::{PolicyCapabilities, PolicyStore};
-use nuillu_query_agentic::{
-    FileSearchHit, FileSearchProvider, FileSearchQuery, FileSearcher, NoopFileSearchProvider,
-};
-use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_module::{
     AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
     LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox,
 };
+use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
+use nuillu_query_agentic::{
+    FileSearchHit, FileSearchProvider, FileSearchQuery, FileSearcher, NoopFileSearchProvider,
+};
+use nuillu_reward::{PolicyCapabilities, PolicyStore};
+use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
@@ -1448,7 +1448,13 @@ async fn execute_full_agent_case(
     env.caps
         .scene()
         .set(case.participants.iter().map(Participant::new));
-    seed_memories(&env.memory_caps, env.clock.as_ref(), case_now, &case.memories).await?;
+    seed_memories(
+        &env.memory_caps,
+        env.clock.as_ref(),
+        case_now,
+        &case.memories,
+    )
+    .await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
@@ -1652,9 +1658,10 @@ async fn execute_full_agent_case(
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
     if !recorded_step_outcomes.is_empty() {
-        artifact
-            .observations
-            .insert("steps".to_string(), serde_json::Value::Array(recorded_step_outcomes));
+        artifact.observations.insert(
+            "steps".to_string(),
+            serde_json::Value::Array(recorded_step_outcomes),
+        );
     }
     let events = env.events.snapshot();
     let last_state = build_full_agent_last_state_dump(
@@ -1709,7 +1716,13 @@ async fn execute_module_case(
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
-    seed_memories(&env.memory_caps, env.clock.as_ref(), case_now, &case.memories).await?;
+    seed_memories(
+        &env.memory_caps,
+        env.clock.as_ref(),
+        case_now,
+        &case.memories,
+    )
+    .await?;
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -2085,7 +2098,9 @@ async fn run_input_phase(
                     must_pass_failure = Some(format!(
                         "step {index} must-pass check '{name}' failed: {diag}",
                         name = check.display_name(),
-                        diag = diagnostic.clone().unwrap_or_else(|| "no diagnostic".to_string()),
+                        diag = diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "no diagnostic".to_string()),
                     ));
                 }
             }
@@ -2122,9 +2137,7 @@ async fn run_input_phase(
             WaitOutcome::Met => {}
             WaitOutcome::Timeout => {
                 let wait_label = wait_for_label(step.wait_for.as_ref());
-                let message = format!(
-                    "step {index} timed out waiting for {wait_label}",
-                );
+                let message = format!("step {index} timed out waiting for {wait_label}",);
                 step_failure
                     .lock()
                     .expect("step failure mutex poisoned")
@@ -2594,8 +2607,12 @@ async fn build_eval_environment(
         },
     });
 
-    let memory_caps =
-        MemoryCapabilities::new(blackboard.clone(), clock.clone(), memory.clone(), Vec::new());
+    let memory_caps = MemoryCapabilities::new(
+        blackboard.clone(),
+        clock.clone(),
+        memory.clone(),
+        Vec::new(),
+    );
     memory_caps
         .bootstrap_identity_memories()
         .await
@@ -2634,9 +2651,7 @@ fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
         .collect()
 }
 
-fn build_embedder(
-    config: &RunnerConfig,
-) -> Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
+fn build_embedder(config: &RunnerConfig) -> Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
     if let Some(embedding) = &config.embedding_backend {
         let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
             base_url: embedding.endpoint.clone(),
@@ -2651,7 +2666,8 @@ fn build_embedder(
                 embedding.model, embedding.endpoint
             )
         })?;
-        let profile = EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
+        let profile =
+            EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
         Ok((Box::new(embedder), profile, embedding.dimensions))
     } else {
         let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
@@ -2982,6 +2998,7 @@ fn eval_registry(
         registry = register_eval_module(
             registry,
             *module,
+            modules,
             memory_caps,
             policy_caps,
             file_search,
@@ -3011,6 +3028,10 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::value_estimator(), builtin::query_policy()),
         (builtin::reward(), builtin::value_estimator()),
         (builtin::policy(), builtin::reward()),
+        (
+            builtin::memory_recombination(),
+            builtin::memory_compaction(),
+        ),
     ];
 
     edges
@@ -3022,6 +3043,40 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
                 registry
             }
         })
+}
+
+fn hidden_from_attention_modules() -> Vec<ModuleId> {
+    vec![
+        nuillu_types::builtin::vital(),
+        nuillu_types::builtin::homeostatic_controller(),
+        nuillu_types::builtin::memory_compaction(),
+        nuillu_types::builtin::memory_recombination(),
+    ]
+}
+
+fn homeostatic_drive_modules() -> Vec<ModuleId> {
+    vec![
+        nuillu_types::builtin::memory_compaction(),
+        nuillu_types::builtin::memory_recombination(),
+    ]
+}
+
+fn homeostatic_capped_modules() -> Vec<ModuleId> {
+    vec![
+        nuillu_types::builtin::speak_gate(),
+        nuillu_types::builtin::speak(),
+    ]
+}
+
+fn voluntary_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
+    let hidden = hidden_from_attention_modules()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    modules
+        .iter()
+        .map(|module| module.module_id())
+        .filter(|id| !hidden.contains(id))
+        .collect()
 }
 
 fn eval_policy(
@@ -3038,6 +3093,7 @@ fn eval_policy(
 fn register_eval_module(
     registry: ModuleRegistry,
     module: EvalModule,
+    all_modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
     file_search: &Arc<dyn FileSearchProvider>,
@@ -3077,17 +3133,20 @@ fn register_eval_module(
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
         EvalModule::AttentionController => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_attention_controller::AttentionControllerModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.attention_control_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.allocation_writer(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(3.0, 6.0)), {
+                let voluntary = voluntary_modules(all_modules);
+                move |caps| {
+                    nuillu_attention_controller::AttentionControllerModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.attention_control_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.allocation_writer(voluntary.clone(), Vec::new()),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         // Periodic first-person attention narration; not on the critical
@@ -3198,6 +3257,43 @@ fn register_eval_module(
                         caps.llm_access(),
                     )
                 }
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::MemoryRecombination => registry
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
+                let memory_caps = memory_caps.clone();
+                move |caps| {
+                    nuillu_memory::MemoryRecombinationModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.searcher(),
+                        caps.cognition_writer(),
+                        caps.llm_access(),
+                    )
+                }
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::Vital => registry
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
+                nuillu_vital::VitalModule::new(
+                    caps.cognition_log_updated_inbox(),
+                    caps.allocation_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.vital_writer(),
+                )
+            })
+            .expect("eval module registration should be unique"),
+        EvalModule::HomeostaticController => registry
+            .register(eval_policy(0..=1, Bpm::range(6.0, 20.0)), |caps| {
+                nuillu_homeostatic_controller::HomeostaticControllerModule::new(
+                    caps.vital_updated_inbox(),
+                    caps.vital_reader(),
+                    caps.allocation_writer(
+                        homeostatic_drive_modules(),
+                        homeostatic_capped_modules(),
+                    ),
+                )
             })
             .expect("eval module registration should be unique"),
         EvalModule::Policy => registry
@@ -3399,6 +3495,27 @@ fn full_agent_allocation(
                 ModelTier::Cheap,
                 "Idle until compaction guidance arrives.",
             ),
+            EvalModule::MemoryRecombination => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until REM-like recombination guidance arrives.",
+            ),
+            EvalModule::Vital => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Cheap,
+                "Continuously update homeostatic vital state from cognition volume and memory traces.",
+            ),
+            EvalModule::HomeostaticController => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                1.0,
+                ModelTier::Cheap,
+                "Autonomically drive sleep-like memory modules and cap action modules from vital state.",
+            ),
             EvalModule::Policy => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
@@ -3535,6 +3652,9 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::QueryPolicy
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
+        | EvalModule::MemoryRecombination
+        | EvalModule::Vital
+        | EvalModule::HomeostaticController
         | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
@@ -5648,7 +5768,7 @@ prompt = "What am I attending to?"
     }
 
     #[test]
-    fn full_agent_allocation_bootstraps_input_and_controller_only() {
+    fn full_agent_allocation_bootstraps_input_and_autonomic_controllers() {
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
@@ -5682,6 +5802,20 @@ prompt = "What am I attending to?"
         );
 
         assert_eq!(
+            allocation.activation_for(&builtin::vital()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(allocation.tier_for(&builtin::vital()), ModelTier::Cheap);
+        assert_eq!(
+            allocation.activation_for(&builtin::homeostatic_controller()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(
+            allocation.tier_for(&builtin::homeostatic_controller()),
+            ModelTier::Cheap
+        );
+
+        assert_eq!(
             allocation.activation_for(&builtin::speak_gate()),
             ActivationRatio::ZERO
         );
@@ -5702,6 +5836,7 @@ prompt = "What am I attending to?"
             builtin::query_vector(),
             builtin::memory(),
             builtin::memory_compaction(),
+            builtin::memory_recombination(),
             builtin::predict(),
             builtin::surprise(),
         ] {

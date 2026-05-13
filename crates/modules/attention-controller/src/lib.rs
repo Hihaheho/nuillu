@@ -79,6 +79,18 @@ fn format_attention_controller_context(
     sections.join("\n\n")
 }
 
+fn visible_modules(
+    modules: &[(ModuleId, &'static str)],
+    allowed: &[ModuleId],
+) -> Vec<(ModuleId, &'static str)> {
+    let allowed = allowed.iter().collect::<std::collections::HashSet<_>>();
+    modules
+        .iter()
+        .filter(|(id, _)| allowed.contains(id))
+        .cloned()
+        .collect()
+}
+
 tokio::task_local! {
     static CONTROLLER_DECISION_SCHEMA: Schema;
 }
@@ -168,8 +180,11 @@ impl AttentionControllerModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt
-            .get_or_init(|| format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner))
+        self.system_prompt.get_or_init(|| {
+            let visible_modules =
+                visible_modules(cx.modules(), self.allocation_writer.allowed_drive_modules());
+            format_faculty_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
+        })
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
@@ -211,21 +226,26 @@ impl AttentionControllerModule {
             })
             .await;
         let current = self.allocation_reader.snapshot().await;
-        let controller_schema = self.allocation_reader.controller_schema_json().await;
+        let allowed_modules = self.allocation_writer.allowed_drive_modules().to_vec();
+        let controller_schema = self
+            .allocation_reader
+            .controller_schema_json(&allowed_modules)
+            .await;
         let output_schema =
             Schema::try_from(controller_schema.clone()).context("controller schema is invalid")?;
-        let registered = self
-            .allocation_reader
-            .registered_module_ids()
-            .await
-            .into_iter()
+        let registered = allowed_modules
+            .iter()
+            .cloned()
             .collect::<std::collections::HashSet<_>>();
+        let mut visible_current = current.clone();
+        visible_current.retain_modules(&registered);
+        let visible_modules = visible_modules(cx.modules(), &allowed_modules);
 
         self.session
             .push_ephemeral_system(format_attention_controller_context(
                 &rank_counts,
-                &current,
-                cx.modules(),
+                &visible_current,
+                &visible_modules,
                 stuckness.as_ref(),
             ));
         self.session
@@ -455,10 +475,7 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
-    use nuillu_module::ports::{
-        Clock, NoopCognitionLogRepository,
-        SystemClock,
-    };
+    use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
 
@@ -600,7 +617,10 @@ mod tests {
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
-                    caps.allocation_writer(),
+                    caps.allocation_writer(
+                        vec![builtin::attention_controller(), builtin::sensory()],
+                        Vec::new(),
+                    ),
                     caps.memo(),
                     caps.llm_access(),
                 ));

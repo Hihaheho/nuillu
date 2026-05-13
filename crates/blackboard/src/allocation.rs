@@ -303,6 +303,14 @@ impl ResourceAllocation {
         self.per_module.get(id)
     }
 
+    pub fn has_activation(&self, id: &ModuleId) -> bool {
+        self.activation.contains_key(id)
+    }
+
+    pub fn has_module_opinion(&self, id: &ModuleId) -> bool {
+        self.per_module.contains_key(id) || self.activation.contains_key(id)
+    }
+
     pub fn activation_for(&self, id: &ModuleId) -> ActivationRatio {
         self.activation.get(id).copied().unwrap_or_default()
     }
@@ -336,6 +344,14 @@ impl ResourceAllocation {
 
     pub fn iter_activation(&self) -> impl Iterator<Item = (&ModuleId, ActivationRatio)> {
         self.activation.iter().map(|(id, r)| (id, *r))
+    }
+
+    pub fn retain_modules(&mut self, allowed: &std::collections::HashSet<ModuleId>) {
+        self.per_module.retain(|id, _| allowed.contains(id));
+        self.activation.retain(|id, _| allowed.contains(id));
+        self.model_override.retain(|id, _| allowed.contains(id));
+        self.cooldown.retain(|id, _| allowed.contains(id));
+        self.active_replicas.retain(|id, _| allowed.contains(id));
     }
 
     /// Host-set lookup table. Index = priority position; positions beyond the

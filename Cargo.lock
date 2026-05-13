@@ -3347,6 +3347,7 @@ dependencies = [
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-cognition-gate",
+ "nuillu-homeostatic-controller",
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
@@ -3359,6 +3360,7 @@ dependencies = [
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
+ "nuillu-vital",
  "regex",
  "schemars",
  "serde",
@@ -3368,6 +3370,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nuillu-homeostatic-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3572,6 +3588,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nuillu-vital"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "tokio",
 ]
 
 [[package]]

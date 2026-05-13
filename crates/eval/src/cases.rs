@@ -130,10 +130,7 @@ pub struct EvalStep {
     rename_all_fields = "kebab-case"
 )]
 pub enum WaitFor {
-    MemoFrom {
-        module: EvalModule,
-        timeout_ms: u64,
-    },
+    MemoFrom { module: EvalModule, timeout_ms: u64 },
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -186,6 +183,9 @@ pub enum EvalModule {
     QueryAgentic,
     Memory,
     MemoryCompaction,
+    MemoryRecombination,
+    Vital,
+    HomeostaticController,
     Policy,
     ValueEstimator,
     Reward,
@@ -205,6 +205,9 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::QueryPolicy,
     EvalModule::Memory,
     EvalModule::MemoryCompaction,
+    EvalModule::MemoryRecombination,
+    EvalModule::Vital,
+    EvalModule::HomeostaticController,
     EvalModule::ValueEstimator,
     EvalModule::Reward,
     EvalModule::Policy,
@@ -227,6 +230,9 @@ impl EvalModule {
             Self::QueryAgentic => "query-agentic",
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
+            Self::MemoryRecombination => "memory-recombination",
+            Self::Vital => "vital",
+            Self::HomeostaticController => "homeostatic-controller",
             Self::Policy => "policy",
             Self::ValueEstimator => "value-estimator",
             Self::Reward => "reward",
@@ -249,6 +255,9 @@ impl EvalModule {
             Self::QueryAgentic => builtin::query_agentic(),
             Self::Memory => builtin::memory(),
             Self::MemoryCompaction => builtin::memory_compaction(),
+            Self::MemoryRecombination => builtin::memory_recombination(),
+            Self::Vital => builtin::vital(),
+            Self::HomeostaticController => builtin::homeostatic_controller(),
             Self::Policy => builtin::policy(),
             Self::ValueEstimator => builtin::value_estimator(),
             Self::Reward => builtin::reward(),
@@ -276,7 +285,10 @@ impl FullAgentCase {
     /// sensory feed of a case (e.g. judge prompt rendering).
     pub fn flat_inputs(&self) -> Vec<&FullAgentInput> {
         if !self.steps.is_empty() {
-            self.steps.iter().flat_map(|step| step.inputs.iter()).collect()
+            self.steps
+                .iter()
+                .flat_map(|step| step.inputs.iter())
+                .collect()
         } else {
             self.inputs.iter().collect()
         }
@@ -1325,10 +1337,7 @@ mod tests {
         assert_eq!(occurred_at.to_rfc3339(), "2025-05-09T23:21:00+00:00");
     }
 
-    fn full_agent_case_with(
-        inputs: Vec<FullAgentInput>,
-        steps: Vec<EvalStep>,
-    ) -> FullAgentCase {
+    fn full_agent_case_with(inputs: Vec<FullAgentInput>, steps: Vec<EvalStep>) -> FullAgentCase {
         FullAgentCase {
             id: Some("case".to_string()),
             description: None,
@@ -1434,8 +1443,7 @@ mod tests {
 
     #[test]
     fn parses_surprise_on_prediction_violation_sample_case() {
-        let path =
-            Path::new("../../eval-cases/full-agent/surprise-on-prediction-violation.eure");
+        let path = Path::new("../../eval-cases/full-agent/surprise-on-prediction-violation.eure");
         let case = parse_full_agent_case_file(path).expect("sample case should parse");
         assert_eq!(case.steps.len(), 2);
         assert!(case.inputs.is_empty());
