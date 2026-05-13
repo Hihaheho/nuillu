@@ -10,29 +10,24 @@ use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{MemoryRank, ModuleId, ModuleInstanceId, PolicyRank, ReplicaIndex};
+use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
 use crate::llm::LlmConcurrencyLimiter;
-use crate::ports::{
-    Clock, CognitionLogRepository, FileSearchProvider, MemoryStore, PolicyStore, PortError,
-    UtteranceSink,
-};
+use crate::ports::{Clock, CognitionLogRepository};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::scene::{SceneReader, SceneRegistry};
 use crate::r#trait::ErasedModule;
-use crate::utterance::UtteranceWriter;
 use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
     AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, FileSearcher, LlmAccess,
-    LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryCompactor,
-    MemoryContentReader, MemoryWriter, Module, ModuleBatch, ModuleStatusReader, PolicySearcher,
-    PolicyValueUpdater, PolicyWindowReader, PolicyWriter, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VectorMemorySearcher,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, LlmAccess, LutumTiers,
+    Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, Module, ModuleBatch,
+    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision,
+    TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -54,12 +49,6 @@ struct CapabilityProvidersInner {
     sensory_input_topic: Topic<SensoryInput>,
     activation_gates: ActivationGateHub,
     cognition_log_port: Arc<dyn CognitionLogRepository>,
-    primary_memory_store: Arc<dyn MemoryStore>,
-    memory_replicas: Vec<Arc<dyn MemoryStore>>,
-    primary_policy_store: Arc<dyn PolicyStore>,
-    policy_replicas: Vec<Arc<dyn PolicyStore>>,
-    file_search: Arc<dyn FileSearchProvider>,
-    utterance_sink: Arc<dyn UtteranceSink>,
     clock: Arc<dyn Clock>,
     time_division: TimeDivision,
     tiers: LutumTiers,
@@ -75,12 +64,6 @@ struct CapabilityProvidersInner {
 pub struct CapabilityProviderPorts {
     pub blackboard: Blackboard,
     pub cognition_log_port: Arc<dyn CognitionLogRepository>,
-    pub primary_memory_store: Arc<dyn MemoryStore>,
-    pub memory_replicas: Vec<Arc<dyn MemoryStore>>,
-    pub primary_policy_store: Arc<dyn PolicyStore>,
-    pub policy_replicas: Vec<Arc<dyn PolicyStore>>,
-    pub file_search: Arc<dyn FileSearchProvider>,
-    pub utterance_sink: Arc<dyn UtteranceSink>,
     pub clock: Arc<dyn Clock>,
     pub tiers: LutumTiers,
 }
@@ -123,12 +106,6 @@ impl CapabilityProviders {
         let CapabilityProviderPorts {
             blackboard,
             cognition_log_port,
-            primary_memory_store,
-            memory_replicas,
-            primary_policy_store,
-            policy_replicas,
-            file_search,
-            utterance_sink,
             clock,
             tiers,
         } = ports;
@@ -176,12 +153,6 @@ impl CapabilityProviders {
                 activation_gates: ActivationGateHub::new(blackboard.clone()),
                 blackboard,
                 cognition_log_port,
-                primary_memory_store,
-                memory_replicas,
-                primary_policy_store,
-                policy_replicas,
-                file_search,
-                utterance_sink,
                 clock,
                 time_division: TimeDivision::default(),
                 tiers,
@@ -216,44 +187,6 @@ impl CapabilityProviders {
             .blackboard
             .apply(BlackboardCommand::SetModulePolicies { policies })
             .await;
-    }
-
-    pub(crate) async fn load_identity_memories(&self) -> Result<(), PortError> {
-        let mut records = self
-            .inner
-            .primary_memory_store
-            .list_by_rank(MemoryRank::Identity)
-            .await?
-            .into_iter()
-            .map(|record| nuillu_blackboard::IdentityMemoryRecord {
-                index: record.index,
-                content: record.content,
-                occurred_at: record.occurred_at,
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| a.index.as_str().cmp(b.index.as_str()));
-        self.inner
-            .blackboard
-            .apply(BlackboardCommand::SetIdentityMemories(records))
-            .await;
-        Ok(())
-    }
-
-    pub(crate) async fn load_core_policies(&self) -> Result<(), PortError> {
-        let mut records = self
-            .inner
-            .primary_policy_store
-            .list_by_rank(PolicyRank::Core)
-            .await?
-            .into_iter()
-            .map(crate::policy_caps::core_policy_record)
-            .collect::<Vec<_>>();
-        records.sort_by(|a, b| a.index.as_str().cmp(b.index.as_str()));
-        self.inner
-            .blackboard
-            .apply(BlackboardCommand::SetCorePolicies(records))
-            .await;
-        Ok(())
     }
 
     pub(crate) fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
@@ -307,69 +240,6 @@ impl CapabilityProviders {
 
     pub fn module_status_reader(&self) -> ModuleStatusReader {
         ModuleStatusReader::new(self.inner.blackboard.clone())
-    }
-
-    pub fn vector_memory_searcher(&self) -> VectorMemorySearcher {
-        VectorMemorySearcher::new(
-            self.inner.primary_memory_store.clone(),
-            self.inner.blackboard.clone(),
-            self.inner.clock.clone(),
-        )
-    }
-
-    pub fn memory_content_reader(&self) -> MemoryContentReader {
-        MemoryContentReader::new(self.inner.primary_memory_store.clone())
-    }
-
-    pub fn memory_writer(&self) -> MemoryWriter {
-        MemoryWriter::new(
-            self.inner.primary_memory_store.clone(),
-            self.inner.memory_replicas.clone(),
-            self.inner.blackboard.clone(),
-            self.inner.clock.clone(),
-        )
-    }
-
-    pub fn memory_compactor(&self) -> MemoryCompactor {
-        MemoryCompactor::new(
-            self.inner.primary_memory_store.clone(),
-            self.inner.memory_replicas.clone(),
-            self.inner.blackboard.clone(),
-            self.inner.clock.clone(),
-        )
-    }
-
-    pub fn policy_writer(&self) -> PolicyWriter {
-        PolicyWriter::new(
-            self.inner.primary_policy_store.clone(),
-            self.inner.policy_replicas.clone(),
-            self.inner.blackboard.clone(),
-        )
-    }
-
-    pub fn policy_searcher(&self) -> PolicySearcher {
-        PolicySearcher::new(
-            self.inner.primary_policy_store.clone(),
-            self.inner.blackboard.clone(),
-            self.inner.clock.clone(),
-        )
-    }
-
-    pub fn policy_value_updater(&self) -> PolicyValueUpdater {
-        PolicyValueUpdater::new(
-            self.inner.primary_policy_store.clone(),
-            self.inner.policy_replicas.clone(),
-            self.inner.blackboard.clone(),
-            self.inner.clock.clone(),
-        )
-    }
-
-    pub fn policy_window_reader(&self) -> PolicyWindowReader {
-        PolicyWindowReader::new(self.inner.blackboard.clone())
-    }
-
-    pub fn file_searcher(&self) -> FileSearcher {
-        FileSearcher::new(self.inner.file_search.clone())
     }
 
     pub fn clock(&self) -> Arc<dyn Clock> {
@@ -709,6 +579,12 @@ impl ModuleCapabilityFactory {
         self.root.blackboard_reader()
     }
 
+    /// Raw [`Blackboard`] handle. Domain crates use this to build their own
+    /// owner-stamped capability handles outside of `nuillu-module`.
+    pub fn blackboard(&self) -> Blackboard {
+        self.root.inner.blackboard.clone()
+    }
+
     pub fn cognition_log_reader(&self) -> CognitionLogReader {
         self.root.cognition_log_reader()
     }
@@ -719,42 +595,6 @@ impl ModuleCapabilityFactory {
 
     pub fn module_status_reader(&self) -> ModuleStatusReader {
         self.root.module_status_reader()
-    }
-
-    pub fn vector_memory_searcher(&self) -> VectorMemorySearcher {
-        self.root.vector_memory_searcher()
-    }
-
-    pub fn memory_content_reader(&self) -> MemoryContentReader {
-        self.root.memory_content_reader()
-    }
-
-    pub fn memory_writer(&self) -> MemoryWriter {
-        self.root.memory_writer()
-    }
-
-    pub fn memory_compactor(&self) -> MemoryCompactor {
-        self.root.memory_compactor()
-    }
-
-    pub fn policy_writer(&self) -> PolicyWriter {
-        self.root.policy_writer()
-    }
-
-    pub fn policy_searcher(&self) -> PolicySearcher {
-        self.root.policy_searcher()
-    }
-
-    pub fn policy_value_updater(&self) -> PolicyValueUpdater {
-        self.root.policy_value_updater()
-    }
-
-    pub fn policy_window_reader(&self) -> PolicyWindowReader {
-        self.root.policy_window_reader()
-    }
-
-    pub fn file_searcher(&self) -> FileSearcher {
-        self.root.file_searcher()
     }
 
     pub fn cognition_writer(&self) -> CognitionWriter {
@@ -778,15 +618,6 @@ impl ModuleCapabilityFactory {
                 self.owner.clone(),
                 self.root.inner.allocation_updates.clone(),
             ),
-        )
-    }
-
-    pub fn utterance_writer(&self) -> UtteranceWriter {
-        UtteranceWriter::new(
-            self.owner.clone(),
-            self.root.inner.blackboard.clone(),
-            self.root.inner.utterance_sink.clone(),
-            self.root.inner.clock.clone(),
         )
     }
 
@@ -1000,12 +831,6 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
-        caps.load_identity_memories()
-            .await
-            .map_err(ModuleRegistryError::IdentityMemoryLoad)?;
-        caps.load_core_policies()
-            .await
-            .map_err(ModuleRegistryError::CorePolicyLoad)?;
         // Install the post-boot module catalog before any module is constructed
         // so module constructors can read peers from `caps.module_catalog()`
         // synchronously when they assemble their system prompts.
@@ -1135,10 +960,6 @@ pub enum ModuleRegistryError {
     ModuleId(#[from] nuillu_types::ModuleIdParseError),
     #[error("module {module} is already registered")]
     DuplicateModule { module: ModuleId },
-    #[error("failed to load identity memories: {0}")]
-    IdentityMemoryLoad(PortError),
-    #[error("failed to load core policies: {0}")]
-    CorePolicyLoad(PortError),
     #[error("dependent {dependent} declared in depends_on() but not registered")]
     UnknownDependent { dependent: ModuleId },
     #[error("dependency {dependency} declared in depends_on() but not registered")]
@@ -1158,16 +979,12 @@ mod tests {
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
-        ResourceAllocation, UtteranceProgress,
+        ResourceAllocation,
     };
-    use nuillu_types::{MemoryContent, MemoryIndex, ReplicaCapRange, builtin};
+    use nuillu_types::{ReplicaCapRange, builtin};
 
-    use crate::ports::{
-        CognitionLogRepository, FileSearchProvider, IndexedMemory, MemoryQuery, MemoryRecord,
-        MemoryStore, NewMemory, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
-        NoopUtteranceSink, PortError, SystemClock,
-    };
-    use crate::test_support::{scoped, test_caps, test_caps_with_stores};
+    use crate::ports::{CognitionLogRepository, PortError, SystemClock};
+    use crate::test_support::{scoped, test_caps};
 
     fn test_policy(replicas_range: std::ops::RangeInclusive<u8>) -> ModulePolicy {
         ModulePolicy::new(
@@ -1228,12 +1045,6 @@ mod tests {
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port,
-            primary_memory_store: Arc::new(NoopMemoryStore) as Arc<dyn MemoryStore>,
-            memory_replicas: Vec::new(),
-            primary_policy_store: Arc::new(NoopPolicyStore),
-            policy_replicas: Vec::new(),
-            file_search: Arc::new(NoopFileSearchProvider) as Arc<dyn FileSearchProvider>,
-            utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
@@ -1274,59 +1085,6 @@ mod tests {
         NoopModule
     }
 
-    #[derive(Clone)]
-    struct StaticMemoryStore {
-        records: Vec<MemoryRecord>,
-    }
-
-    #[async_trait(?Send)]
-    impl MemoryStore for StaticMemoryStore {
-        async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
-            Ok(MemoryIndex::new("unused"))
-        }
-
-        async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
-            Ok(())
-        }
-
-        async fn compact(
-            &self,
-            _mem: NewMemory,
-            _sources: &[MemoryIndex],
-        ) -> Result<MemoryIndex, PortError> {
-            Ok(MemoryIndex::new("unused"))
-        }
-
-        async fn put_compacted(
-            &self,
-            _mem: IndexedMemory,
-            _sources: &[MemoryIndex],
-        ) -> Result<(), PortError> {
-            Ok(())
-        }
-
-        async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
-            Ok(None)
-        }
-
-        async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
-            Ok(self
-                .records
-                .iter()
-                .filter(|record| record.rank == rank)
-                .cloned()
-                .collect())
-        }
-
-        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
-            Ok(Vec::new())
-        }
-
-        async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn register_rejects_duplicate_module_ids() {
         let registry = ModuleRegistry::new()
@@ -1342,56 +1100,6 @@ mod tests {
             err,
             ModuleRegistryError::DuplicateModule { module } if module == expected
         ));
-    }
-
-    #[tokio::test]
-    async fn registry_build_loads_sorted_identity_memory_snapshot() {
-        let blackboard = Blackboard::default();
-        let store = StaticMemoryStore {
-            records: vec![
-                MemoryRecord {
-                    index: MemoryIndex::new("identity-b"),
-                    content: MemoryContent::new("second"),
-                    rank: MemoryRank::Identity,
-                    occurred_at: None,
-                },
-                MemoryRecord {
-                    index: MemoryIndex::new("other"),
-                    content: MemoryContent::new("ordinary"),
-                    rank: MemoryRank::Permanent,
-                    occurred_at: None,
-                },
-                MemoryRecord {
-                    index: MemoryIndex::new("identity-a"),
-                    content: MemoryContent::new("first"),
-                    rank: MemoryRank::Identity,
-                    occurred_at: None,
-                },
-            ],
-        };
-        let caps = test_caps_with_stores(
-            blackboard.clone(),
-            Arc::new(store),
-            Vec::new(),
-            Arc::new(crate::ports::NoopFileSearchProvider),
-        );
-
-        let modules = ModuleRegistry::new()
-            .register(test_policy(0..=0), noop_builder)
-            .unwrap()
-            .build(&caps)
-            .await
-            .unwrap();
-
-        assert_eq!(modules.len(), 1);
-        let snapshot = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
-        assert_eq!(
-            snapshot
-                .iter()
-                .map(|record| (record.index.as_str(), record.content.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("identity-a", "first"), ("identity-b", "second")]
-        );
     }
 
     #[tokio::test]
@@ -1632,23 +1340,4 @@ mod tests {
         assert_eq!(event.body.owner.module, builtin::speak());
     }
 
-    #[tokio::test]
-    async fn utterance_writer_owner_stamps_stream_progress() {
-        let blackboard = Blackboard::default();
-        let caps = test_caps(blackboard.clone());
-        let speak = scoped(&caps, builtin::speak(), 0);
-
-        speak
-            .utterance_writer()
-            .record_progress(UtteranceProgress::streaming(7, 2, "Koro", "Koro, wait"))
-            .await;
-
-        let records = blackboard.read(|bb| bb.utterance_progress_records()).await;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].owner.module, builtin::speak());
-        assert_eq!(
-            records[0].progress,
-            UtteranceProgress::streaming(7, 2, "Koro", "Koro, wait")
-        );
-    }
 }

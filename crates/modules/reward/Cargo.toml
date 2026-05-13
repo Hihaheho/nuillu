@@ -9,14 +9,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+nuillu-blackboard = { workspace = true }
 nuillu-module = { workspace = true }
 nuillu-types = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 eure = { workspace = true }
+futures = { workspace = true }
 lutum = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

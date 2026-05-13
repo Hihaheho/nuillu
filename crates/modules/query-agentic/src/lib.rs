@@ -2,15 +2,18 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, FileSearcher, LlmAccess, Memo,
-    Module, SessionCompactionConfig, compact_session_if_needed, ports::FileSearchQuery,
-    push_formatted_memo_log_batch,
+    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
+    SessionCompactionConfig, compact_session_if_needed, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+mod file_search;
 pub use batch::NextBatch as QueryAgenticBatch;
+pub use file_search::{
+    FileSearchHit, FileSearchProvider, FileSearchQuery, FileSearcher, NoopFileSearchProvider,
+};
 
 const SYSTEM_PROMPT: &str = r#"You are the query-agentic module.
 Choose read-only file searches only. Use the search_files tool for file and text lookup.

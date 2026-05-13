@@ -1,14 +1,19 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
+use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
+use nuillu_module::ports::PortError;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, PolicyWriter, format_current_attention_guidance,
-    push_formatted_memo_log_batch,
+    LlmAccess, Module, format_current_attention_guidance, push_formatted_memo_log_batch,
 };
-use nuillu_types::ModuleId;
+use nuillu_types::{ModuleId, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::{IndexedPolicy, NewPolicy, PolicyStore, fanout_policy_put};
 
 const SYSTEM_PROMPT: &str = r#"You are the policy module.
 Preserve successful or distinctive behavior patterns as new tentative policies.
@@ -25,6 +30,77 @@ pub struct PolicyCandidate {
     pub trigger: String,
     pub behavior: String,
     pub reason: String,
+}
+
+/// Inserts new tentative policies, mirrors metadata onto the blackboard, and
+/// fans out indexed writes to replica stores.
+#[derive(Clone)]
+pub struct PolicyWriter {
+    primary_store: Arc<dyn PolicyStore>,
+    replicas: Vec<Arc<dyn PolicyStore>>,
+    blackboard: Blackboard,
+}
+
+impl PolicyWriter {
+    pub(crate) fn new(
+        primary_store: Arc<dyn PolicyStore>,
+        replicas: Vec<Arc<dyn PolicyStore>>,
+        blackboard: Blackboard,
+    ) -> Self {
+        Self {
+            primary_store,
+            replicas,
+            blackboard,
+        }
+    }
+
+    pub async fn insert(
+        &self,
+        trigger: String,
+        behavior: String,
+        decay_secs: i64,
+    ) -> Result<PolicyIndex, PortError> {
+        let new = NewPolicy {
+            trigger: trigger.clone(),
+            behavior: behavior.clone(),
+            rank: PolicyRank::Tentative,
+            expected_reward: SignedUnitF32::ZERO,
+            confidence: UnitF32::ZERO,
+            value: SignedUnitF32::ZERO,
+            reward_tokens: 0,
+            decay_remaining_secs: decay_secs,
+        };
+        let index = self.primary_store.insert(new).await?;
+        let indexed = IndexedPolicy {
+            index: index.clone(),
+            trigger,
+            behavior,
+            rank: PolicyRank::Tentative,
+            expected_reward: SignedUnitF32::ZERO,
+            confidence: UnitF32::ZERO,
+            value: SignedUnitF32::ZERO,
+            reward_tokens: 0,
+            decay_remaining_secs: decay_secs,
+        };
+        fanout_policy_put(&self.replicas, indexed).await;
+        self.blackboard
+            .apply(BlackboardCommand::UpsertPolicyMetadata {
+                index: index.clone(),
+                rank_if_new: PolicyRank::Tentative,
+                decay_if_new_secs: decay_secs,
+                patch: PolicyMetaPatch {
+                    rank: Some(PolicyRank::Tentative),
+                    expected_reward: Some(SignedUnitF32::ZERO),
+                    confidence: Some(UnitF32::ZERO),
+                    value: Some(SignedUnitF32::ZERO),
+                    reward_tokens: Some(0),
+                    decay_remaining_secs: Some(decay_secs),
+                    ..Default::default()
+                },
+            })
+            .await;
+        Ok(index)
+    }
 }
 
 pub struct PolicyModule {
@@ -59,9 +135,9 @@ impl PolicyModule {
         }
     }
 
-    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+    async fn activate(&mut self, _cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let memos = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &memos, cx.now());
+        push_formatted_memo_log_batch(&mut self.session, &memos, _cx.now());
         let allocation = self.allocation.snapshot().await;
         self.session.push_ephemeral_system(SYSTEM_PROMPT);
         if let Some(guidance) = format_current_attention_guidance(&allocation) {

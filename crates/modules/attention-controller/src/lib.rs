@@ -456,8 +456,8 @@ mod tests {
     };
     use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
     use nuillu_module::ports::{
-        Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore,
-        NoopPolicyStore, NoopUtteranceSink, SystemClock,
+        Clock, NoopCognitionLogRepository,
+        SystemClock,
     };
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
@@ -513,12 +513,6 @@ mod tests {
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            primary_memory_store: Arc::new(NoopMemoryStore),
-            memory_replicas: Vec::new(),
-            primary_policy_store: Arc::new(NoopPolicyStore),
-            policy_replicas: Vec::new(),
-            file_search: Arc::new(NoopFileSearchProvider),
-            utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),

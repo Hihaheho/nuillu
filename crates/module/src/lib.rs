@@ -28,11 +28,9 @@ mod channels;
 mod cognition;
 mod llm;
 mod memo;
-mod memory_caps;
 mod memory_render;
 mod mind_format;
 mod mind_session;
-mod policy_caps;
 pub mod ports;
 mod prompt;
 mod rate_limit;
@@ -43,7 +41,6 @@ mod session_compaction;
 mod tiers;
 mod time_division;
 mod r#trait;
-mod utterance;
 
 #[cfg(test)]
 mod test_support;
@@ -68,9 +65,6 @@ pub use channels::{
 pub use cognition::CognitionWriter;
 pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};
 pub use memo::{Memo, TypedMemo};
-pub use memory_caps::{
-    FileSearcher, MemoryCompactor, MemoryContentReader, MemoryWriter, VectorMemorySearcher,
-};
 pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
     MemoryRankCounts, format_available_faculties, format_cognition_log_batch,
@@ -83,11 +77,6 @@ pub use mind_session::{
     seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;
-pub use policy_caps::{
-    ObservedReward, PolicyRetrievalHit, PolicyRetrievalMemo, PolicySearcher, PolicyValueUpdater,
-    PolicyWindowKey, PolicyWindowReader, PolicyWriter, TypedPolicyRetrievalWindow,
-    TypedValueEstimateWindow, ValueEstimateMemo, ValueEstimatePrediction,
-};
 pub use ports::Embedder;
 pub use prompt::{format_faculty_system_prompt, format_system_prompt};
 pub use rate_limit::{
@@ -104,4 +93,3 @@ pub use session_compaction::{
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
-pub use utterance::UtteranceWriter;

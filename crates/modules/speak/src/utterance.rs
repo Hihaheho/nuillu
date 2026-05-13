@@ -1,11 +1,61 @@
+//! `UtteranceSink` port + the `UtteranceWriter` capability handle.
+//!
+//! Only the speak module emits user-visible utterances, so the trait and the
+//! owner-stamped writer that wraps it live in this crate. Adapters provide
+//! concrete implementations of `UtteranceSink` and the host injects them into
+//! the speak registration closure.
+
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, UtteranceProgress};
+use nuillu_module::ports::{Clock, PortError};
 use nuillu_types::ModuleInstanceId;
 
-use crate::ports::{Clock, Utterance, UtteranceDelta, UtteranceSink};
+/// A single user-visible utterance emitted by the speak module.
+pub struct Utterance {
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub text: String,
+    pub emitted_at: DateTime<Utc>,
+}
+
+/// A streaming chunk emitted while a user-visible utterance is being generated.
+///
+/// A generation may be interrupted and resumed. Resumed chunks keep the same
+/// `generation_id` and continue the `sequence`; sinks should append them to
+/// the chunks they already accepted instead of discarding partial text.
+pub struct UtteranceDelta {
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub delta: String,
+}
+
+/// Append-only sink for utterances. Adapters provide concrete implementations.
+#[async_trait(?Send)]
+pub trait UtteranceSink {
+    async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError>;
+
+    async fn on_delta(&self, _delta: UtteranceDelta) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+/// Utterance sink that drops every event.
+#[derive(Debug, Default)]
+pub struct NoopUtteranceSink;
+
+#[async_trait(?Send)]
+impl UtteranceSink for NoopUtteranceSink {
+    async fn on_complete(&self, _utterance: Utterance) -> Result<(), PortError> {
+        Ok(())
+    }
+}
 
 fn normalized_target(target: impl Into<String>) -> Option<String> {
     let target = target.into().trim().to_owned();
@@ -26,7 +76,7 @@ pub struct UtteranceWriter {
 }
 
 impl UtteranceWriter {
-    pub(crate) fn new(
+    pub fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         sink: Arc<dyn UtteranceSink>,

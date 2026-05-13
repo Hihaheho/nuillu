@@ -6,8 +6,10 @@ use futures::StreamExt;
 use lutum::{Session, StructuredTurnOutcome, TextTurnEvent};
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
-    SceneReader, UtteranceProgress, UtteranceWriter,
+    SceneReader, UtteranceProgress,
 };
+
+use crate::utterance::UtteranceWriter;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -617,14 +619,15 @@ mod tests {
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let sink = Arc::new(CapturingUtteranceSink {
+        let sink: Arc<dyn crate::utterance::UtteranceSink> = Arc::new(CapturingUtteranceSink {
             completed: Rc::clone(&completed),
             done: RefCell::new(Some(done_tx)),
         });
-        let caps = test_caps_with_adapter_and_sink(blackboard.clone(), adapter, sink);
+        let caps = test_caps_with_adapter(blackboard.clone(), adapter);
         caps.scene().set([Participant::new("Koro")]);
         let module_cell = Rc::new(RefCell::new(None));
         let module_sink = Rc::clone(&module_cell);
+        let utterance_sink_for_closure = sink.clone();
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
@@ -632,7 +635,12 @@ mod tests {
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
                     caps.memo(),
-                    caps.utterance_writer(),
+                    UtteranceWriter::new(
+                        caps.owner().clone(),
+                        caps.blackboard(),
+                        utterance_sink_for_closure.clone(),
+                        caps.clock(),
+                    ),
                     caps.llm_access(),
                     caps.scene_reader(),
                 ));

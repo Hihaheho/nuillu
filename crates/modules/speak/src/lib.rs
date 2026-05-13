@@ -1,5 +1,6 @@
 mod gate;
 mod speak;
+mod utterance;
 
 #[cfg(test)]
 mod test_support;
@@ -9,3 +10,4 @@ pub use gate::{
     SpeakGateSessionCompactionConfig,
 };
 pub use speak::SpeakModule;
+pub use utterance::{NoopUtteranceSink, Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};

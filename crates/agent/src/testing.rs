@@ -6,10 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
 use nuillu_blackboard::Blackboard;
-use nuillu_module::ports::{
-    Clock, NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
-    NoopUtteranceSink, SystemClock,
-};
+use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, LutumTiers, RuntimePolicy,
@@ -56,12 +53,6 @@ fn test_caps_inner(
         ports: CapabilityProviderPorts {
             blackboard,
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            primary_memory_store: Arc::new(NoopMemoryStore),
-            memory_replicas: Vec::new(),
-            primary_policy_store: Arc::new(NoopPolicyStore),
-            policy_replicas: Vec::new(),
-            file_search: Arc::new(NoopFileSearchProvider),
-            utterance_sink: Arc::new(NoopUtteranceSink),
             clock,
             tiers: LutumTiers {
                 cheap: lutum.clone(),
