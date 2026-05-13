@@ -69,13 +69,8 @@ nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
 nuillu-attention-controller = { path = "crates/modules/attention-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
-nuillu-query-vector = { path = "crates/modules/query-vector" }
-nuillu-query-policy = { path = "crates/modules/query-policy" }
 nuillu-query-agentic = { path = "crates/modules/query-agentic" }
 nuillu-memory = { path = "crates/modules/memory" }
-nuillu-memory-compaction = { path = "crates/modules/memory-compaction" }
-nuillu-policy = { path = "crates/modules/policy" }
-nuillu-value-estimator = { path = "crates/modules/value-estimator" }
 nuillu-reward = { path = "crates/modules/reward" }
 nuillu-predict = { path = "crates/modules/predict" }
 nuillu-surprise = { path = "crates/modules/surprise" }

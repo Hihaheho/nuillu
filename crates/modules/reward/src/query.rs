@@ -1,10 +1,96 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
+use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, PolicyRetrievalHit, PolicyRetrievalMemo, PolicySearcher, TypedMemo,
+    LlmAccess, Module, TypedMemo,
 };
-use nuillu_types::ModuleId;
+use nuillu_types::{ModuleId, PolicyIndex, PolicyRank};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{PolicyQuery, PolicySearchHit, PolicyStore};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyRetrievalMemo {
+    pub request_context: String,
+    pub query_text: String,
+    pub hits: Vec<PolicyRetrievalHit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyRetrievalHit {
+    pub policy_index: PolicyIndex,
+    pub similarity: f32,
+    pub rank: PolicyRank,
+    pub trigger: String,
+    pub behavior: String,
+    pub expected_reward: f32,
+    pub confidence: f32,
+    pub value: f32,
+    pub reward_tokens: u32,
+}
+
+/// Trigger-similarity search over the primary policy store with diagnostic
+/// access metadata mirrored to the blackboard.
+#[derive(Clone)]
+pub struct PolicySearcher {
+    primary_store: Arc<dyn PolicyStore>,
+    blackboard: Blackboard,
+    clock: Arc<dyn Clock>,
+}
+
+impl PolicySearcher {
+    pub(crate) fn new(
+        primary_store: Arc<dyn PolicyStore>,
+        blackboard: Blackboard,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            primary_store,
+            blackboard,
+            clock,
+        }
+    }
+
+    pub async fn search(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<PolicySearchHit>, PortError> {
+        let hits = self
+            .primary_store
+            .search(&PolicyQuery {
+                trigger: trigger.to_owned(),
+                limit,
+            })
+            .await?;
+        let now = self.clock.now();
+        for hit in &hits {
+            self.blackboard
+                .apply(BlackboardCommand::UpsertPolicyMetadata {
+                    index: hit.policy.index.clone(),
+                    rank_if_new: hit.policy.rank,
+                    decay_if_new_secs: hit.policy.decay_remaining_secs,
+                    patch: PolicyMetaPatch {
+                        rank: Some(hit.policy.rank),
+                        expected_reward: Some(hit.policy.expected_reward),
+                        confidence: Some(hit.policy.confidence),
+                        value: Some(hit.policy.value),
+                        reward_tokens: Some(hit.policy.reward_tokens),
+                        decay_remaining_secs: Some(hit.policy.decay_remaining_secs),
+                        record_access_at: Some(now),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        Ok(hits)
+    }
+}
 
 pub struct QueryPolicyModule {
     owner: ModuleId,

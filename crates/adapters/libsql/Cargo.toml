@@ -9,7 +9,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+nuillu-memory = { workspace = true }
 nuillu-module = { workspace = true }
+nuillu-reward = { workspace = true }
 nuillu-types = { workspace = true }
 
 async-trait = { workspace = true }

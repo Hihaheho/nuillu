@@ -10,9 +10,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, params};
 pub use nuillu_module::ports::Embedder;
-use nuillu_module::ports::{
-    IndexedMemory, IndexedPolicy, MemoryQuery, MemoryRecord, MemoryStore, NewMemory, NewPolicy,
-    PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore, PortError,
+use nuillu_memory::{IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory};
+use nuillu_module::ports::PortError;
+use nuillu_reward::{
+    IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
 use nuillu_types::{
     MemoryContent, MemoryIndex, MemoryRank, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32,

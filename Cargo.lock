@@ -2911,7 +2911,9 @@ dependencies = [
  "async-trait",
  "chrono",
  "libsql",
+ "nuillu-memory",
  "nuillu-module",
+ "nuillu-reward",
  "nuillu-types",
  "serde_json",
  "sha2",
@@ -3345,20 +3347,15 @@ dependencies = [
  "nuillu-blackboard",
  "nuillu-cognition-gate",
  "nuillu-memory",
- "nuillu-memory-compaction",
  "nuillu-module",
- "nuillu-policy",
  "nuillu-predict",
  "nuillu-query-agentic",
- "nuillu-query-policy",
- "nuillu-query-vector",
  "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
- "nuillu-value-estimator",
  "nuillu-visualizer-protocol",
  "regex",
  "schemars",
@@ -3377,6 +3374,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
+ "futures",
  "lutum",
  "lutum-protocol",
  "nuillu-agent",
@@ -3387,22 +3386,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nuillu-memory-compaction"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "lutum-protocol",
- "nuillu-module",
- "nuillu-types",
- "schemars",
- "serde",
- "serde_json",
  "tracing",
 ]
 
@@ -3424,20 +3407,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "nuillu-policy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "nuillu-module",
- "nuillu-types",
- "schemars",
- "serde",
- "tokio",
 ]
 
 [[package]]
@@ -3470,26 +3439,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-query-policy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "nuillu-module",
- "nuillu-types",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nuillu-query-vector"
+name = "nuillu-reward"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "eure",
+ "futures",
  "lutum",
- "lutum-protocol",
  "nuillu-blackboard",
  "nuillu-module",
  "nuillu-types",
@@ -3498,22 +3456,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "nuillu-reward"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "eure",
- "lutum",
- "nuillu-module",
- "nuillu-types",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -3591,17 +3533,6 @@ dependencies = [
  "schemars",
  "serde",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "nuillu-value-estimator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "nuillu-module",
- "nuillu-types",
- "tokio",
 ]
 
 [[package]]

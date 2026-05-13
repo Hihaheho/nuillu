@@ -11,8 +11,7 @@ use lutum::{
 };
 use nuillu_blackboard::{ActivationRatio, Blackboard, ModuleConfig, ResourceAllocation};
 use nuillu_module::ports::{
-    NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
-    PortError, SystemClock, Utterance, UtteranceSink,
+    NoopCognitionLogRepository, PortError, SystemClock,
 };
 use nuillu_module::{
     AttentionControlRequestInbox, CapabilityProviderPorts, CapabilityProviders, LutumTiers, Module,
@@ -20,6 +19,7 @@ use nuillu_module::{
 };
 use nuillu_types::builtin;
 
+use crate::utterance::{Utterance, UtteranceSink};
 use crate::{SpeakGateMemo, SpeakGateModule, SpeakModule};
 
 pub(crate) fn test_session() -> Session {
@@ -30,30 +30,12 @@ pub(crate) fn test_caps_with_adapter(
     blackboard: Blackboard,
     adapter: MockLlmAdapter,
 ) -> CapabilityProviders {
-    test_caps_with_adapter_and_sink(
-        blackboard,
-        adapter,
-        Arc::new(nuillu_module::ports::NoopUtteranceSink),
-    )
-}
-
-pub(crate) fn test_caps_with_adapter_and_sink(
-    blackboard: Blackboard,
-    adapter: MockLlmAdapter,
-    utterance_sink: Arc<dyn UtteranceSink>,
-) -> CapabilityProviders {
     let adapter = Arc::new(adapter);
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
     let lutum = Lutum::new(adapter, budget);
     CapabilityProviders::new(CapabilityProviderPorts {
         blackboard,
         cognition_log_port: Arc::new(NoopCognitionLogRepository),
-        primary_memory_store: Arc::new(NoopMemoryStore),
-        memory_replicas: Vec::new(),
-        primary_policy_store: Arc::new(NoopPolicyStore),
-        policy_replicas: Vec::new(),
-        file_search: Arc::new(NoopFileSearchProvider),
-        utterance_sink,
         clock: Arc::new(SystemClock),
         tiers: LutumTiers {
             cheap: lutum.clone(),

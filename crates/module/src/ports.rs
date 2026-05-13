@@ -5,18 +5,20 @@
 //! capability handles that wrap them.
 //!
 //! All async traits use `?Send` so the agent can run on a single-threaded
-//! runtime (current-thread tokio / wasm32) without requiring `Send`
-//! bounds.
+//! runtime (current-thread tokio / wasm32) without requiring `Send` bounds.
+//!
+//! Domain-specific ports live in their owning crates:
+//! `MemoryStore` (and the memory capabilities) in `nuillu-memory`,
+//! `PolicyStore` (and policy capabilities) in `nuillu-reward`,
+//! `FileSearchProvider` in `nuillu-query-agentic`, and
+//! `UtteranceSink` in `nuillu-speak`.
 //!
 //! [`CapabilityProviders`]: crate::CapabilityProviders
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
-use nuillu_types::{
-    MemoryContent, MemoryIndex, MemoryRank, ModuleInstanceId, PolicyIndex, PolicyRank,
-    SignedUnitF32, UnitF32,
-};
+use nuillu_types::ModuleInstanceId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,159 +38,6 @@ pub enum PortError {
 pub trait Embedder {
     fn dimensions(&self) -> usize;
     async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError>;
-}
-
-/// Content-store for memory entries. Metadata (rank, decay, access counts)
-/// is mirrored on the blackboard; this trait owns durable content and any
-/// adapter-local search/indexing state.
-///
-/// Primary stores assign [`MemoryIndex`] values through [`insert`](Self::insert).
-/// Replica stores receive primary-assigned ids through [`put`](Self::put).
-/// Compaction is also store-atomic: [`compact`](Self::compact) and
-/// [`put_compacted`](Self::put_compacted) must create the merged record and
-/// remove all sources as one backend operation.
-#[async_trait(?Send)]
-pub trait MemoryStore {
-    async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError>;
-    async fn put(&self, mem: IndexedMemory) -> Result<(), PortError>;
-    async fn compact(
-        &self,
-        mem: NewMemory,
-        sources: &[MemoryIndex],
-    ) -> Result<MemoryIndex, PortError>;
-    async fn put_compacted(
-        &self,
-        mem: IndexedMemory,
-        sources: &[MemoryIndex],
-    ) -> Result<(), PortError>;
-    async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError>;
-    async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError>;
-    async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError>;
-    async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
-}
-
-/// Content-store for policy entries. Metadata (rank, value, confidence,
-/// reward-token counts, decay, diagnostic access) is mirrored on the
-/// blackboard; this trait owns durable trigger/behavior content and
-/// adapter-local trigger embedding/search state.
-#[async_trait(?Send)]
-pub trait PolicyStore {
-    async fn insert(&self, policy: NewPolicy) -> Result<PolicyIndex, PortError>;
-    async fn put(&self, policy: IndexedPolicy) -> Result<(), PortError>;
-    async fn get(&self, index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError>;
-    async fn list_by_rank(&self, rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError>;
-    async fn search(&self, q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError>;
-    async fn reinforce(
-        &self,
-        index: &PolicyIndex,
-        value_delta: f32,
-        reward_tokens_delta: u32,
-        expected_reward_delta: f32,
-        confidence_delta: f32,
-    ) -> Result<PolicyRecord, PortError>;
-    async fn delete(&self, index: &PolicyIndex) -> Result<(), PortError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct NewMemory {
-    pub content: MemoryContent,
-    pub rank: MemoryRank,
-    pub occurred_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexedMemory {
-    pub index: MemoryIndex,
-    pub content: MemoryContent,
-    pub rank: MemoryRank,
-    pub occurred_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MemoryRecord {
-    pub index: MemoryIndex,
-    pub content: MemoryContent,
-    pub rank: MemoryRank,
-    pub occurred_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MemoryQuery {
-    pub text: String,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct NewPolicy {
-    pub trigger: String,
-    pub behavior: String,
-    pub rank: PolicyRank,
-    pub expected_reward: SignedUnitF32,
-    pub confidence: UnitF32,
-    pub value: SignedUnitF32,
-    pub reward_tokens: u32,
-    pub decay_remaining_secs: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexedPolicy {
-    pub index: PolicyIndex,
-    pub trigger: String,
-    pub behavior: String,
-    pub rank: PolicyRank,
-    pub expected_reward: SignedUnitF32,
-    pub confidence: UnitF32,
-    pub value: SignedUnitF32,
-    pub reward_tokens: u32,
-    pub decay_remaining_secs: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PolicyRecord {
-    pub index: PolicyIndex,
-    pub trigger: String,
-    pub behavior: String,
-    pub rank: PolicyRank,
-    pub expected_reward: SignedUnitF32,
-    pub confidence: UnitF32,
-    pub value: SignedUnitF32,
-    pub reward_tokens: u32,
-    pub decay_remaining_secs: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PolicySearchHit {
-    pub policy: PolicyRecord,
-    pub similarity: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct PolicyQuery {
-    pub trigger: String,
-    pub limit: usize,
-}
-
-/// Read-only grep-like search over application files.
-#[async_trait(?Send)]
-pub trait FileSearchProvider {
-    async fn search(&self, query: &FileSearchQuery) -> Result<Vec<FileSearchHit>, PortError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSearchQuery {
-    pub pattern: String,
-    pub regex: bool,
-    pub invert_match: bool,
-    pub case_sensitive: bool,
-    pub context: usize,
-    pub max_matches: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSearchHit {
-    pub path: String,
-    pub line: usize,
-    pub snippet: String,
 }
 
 /// Append-only persistence for the cognition log.
@@ -238,128 +87,12 @@ impl Clock for SystemClock {
     async fn sleep_until(&self, deadline: DateTime<Utc>) {
         let remaining = deadline - Utc::now();
         let Ok(duration) = remaining.to_std() else {
-            return; // deadline already past or non-positive
+            return;
         };
         if duration.is_zero() {
             return;
         }
         tokio::time::sleep(duration).await;
-    }
-}
-
-/// Memory store that accepts every write, returns empty reads, and assigns
-/// a unique synthetic [`MemoryIndex`] to each insert.
-#[derive(Debug, Default)]
-pub struct NoopMemoryStore;
-
-#[async_trait(?Send)]
-impl MemoryStore for NoopMemoryStore {
-    async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(MemoryIndex::new(format!("noop-memory-{id}")))
-    }
-
-    async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
-        Ok(())
-    }
-
-    async fn compact(
-        &self,
-        mem: NewMemory,
-        _sources: &[MemoryIndex],
-    ) -> Result<MemoryIndex, PortError> {
-        self.insert(mem).await
-    }
-
-    async fn put_compacted(
-        &self,
-        _mem: IndexedMemory,
-        _sources: &[MemoryIndex],
-    ) -> Result<(), PortError> {
-        Ok(())
-    }
-
-    async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
-        Ok(None)
-    }
-
-    async fn list_by_rank(&self, _rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
-        Ok(())
-    }
-}
-
-/// Policy store that accepts every write, returns empty reads, and assigns a
-/// unique synthetic [`PolicyIndex`] to each insert.
-#[derive(Debug, Default)]
-pub struct NoopPolicyStore;
-
-#[async_trait(?Send)]
-impl PolicyStore for NoopPolicyStore {
-    async fn insert(&self, _policy: NewPolicy) -> Result<PolicyIndex, PortError> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(PolicyIndex::new(format!("noop-policy-{id}")))
-    }
-
-    async fn put(&self, _policy: IndexedPolicy) -> Result<(), PortError> {
-        Ok(())
-    }
-
-    async fn get(&self, _index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError> {
-        Ok(None)
-    }
-
-    async fn list_by_rank(&self, _rank: PolicyRank) -> Result<Vec<PolicyRecord>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn search(&self, _q: &PolicyQuery) -> Result<Vec<PolicySearchHit>, PortError> {
-        Ok(Vec::new())
-    }
-
-    async fn reinforce(
-        &self,
-        index: &PolicyIndex,
-        value_delta: f32,
-        reward_tokens_delta: u32,
-        expected_reward_delta: f32,
-        confidence_delta: f32,
-    ) -> Result<PolicyRecord, PortError> {
-        Ok(PolicyRecord {
-            index: index.clone(),
-            trigger: String::new(),
-            behavior: String::new(),
-            rank: PolicyRank::Tentative,
-            expected_reward: SignedUnitF32::clamp(expected_reward_delta),
-            confidence: UnitF32::clamp(confidence_delta),
-            value: SignedUnitF32::clamp(value_delta),
-            reward_tokens: reward_tokens_delta,
-            decay_remaining_secs: 0,
-        })
-    }
-
-    async fn delete(&self, _index: &PolicyIndex) -> Result<(), PortError> {
-        Ok(())
-    }
-}
-
-/// File search provider that returns no hits.
-#[derive(Debug, Default)]
-pub struct NoopFileSearchProvider;
-
-#[async_trait(?Send)]
-impl FileSearchProvider for NoopFileSearchProvider {
-    async fn search(&self, _query: &FileSearchQuery) -> Result<Vec<FileSearchHit>, PortError> {
-        Ok(Vec::new())
     }
 }
 
@@ -383,47 +116,5 @@ impl CognitionLogRepository for NoopCognitionLogRepository {
         _from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError> {
         Ok(Vec::new())
-    }
-}
-
-/// Utterance sink that drops every event.
-#[derive(Debug, Default)]
-pub struct NoopUtteranceSink;
-
-#[async_trait(?Send)]
-impl UtteranceSink for NoopUtteranceSink {
-    async fn on_complete(&self, _utterance: Utterance) -> Result<(), PortError> {
-        Ok(())
-    }
-}
-
-/// A single user-visible utterance emitted by the speak module.
-pub struct Utterance {
-    pub sender: ModuleInstanceId,
-    pub target: String,
-    pub text: String,
-    pub emitted_at: DateTime<Utc>,
-}
-
-/// A streaming chunk emitted while a user-visible utterance is being generated.
-///
-/// A generation may be interrupted and resumed. Resumed chunks keep the same
-/// `generation_id` and continue the `sequence`; sinks should append them to the
-/// chunks they already accepted instead of discarding partial text.
-pub struct UtteranceDelta {
-    pub sender: ModuleInstanceId,
-    pub target: String,
-    pub generation_id: u64,
-    pub sequence: u32,
-    pub delta: String,
-}
-
-/// Append-only sink for utterances. Adapters provide concrete implementations.
-#[async_trait(?Send)]
-pub trait UtteranceSink {
-    async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError>;
-
-    async fn on_delta(&self, _delta: UtteranceDelta) -> Result<(), PortError> {
-        Ok(())
     }
 }

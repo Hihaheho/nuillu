@@ -36,11 +36,13 @@ use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
 };
-use nuillu_module::ports::{
-    Clock, Embedder, FileSearchHit, FileSearchProvider, FileSearchQuery, MemoryQuery, MemoryStore,
-    NoopFileSearchProvider, PolicyStore, PortError, SystemClock, Utterance, UtteranceDelta,
-    UtteranceSink,
+use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryRecord, MemoryStore};
+use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
+use nuillu_reward::{PolicyCapabilities, PolicyStore};
+use nuillu_query_agentic::{
+    FileSearchHit, FileSearchProvider, FileSearchQuery, FileSearcher, NoopFileSearchProvider,
 };
+use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_module::{
     AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
@@ -1436,7 +1438,7 @@ async fn execute_full_agent_case(
     env.caps
         .scene()
         .set(case.participants.iter().map(Participant::new));
-    seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
+    seed_memories(&env.memory_caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
@@ -1466,7 +1468,15 @@ async fn execute_full_agent_case(
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
     let live_reporter = reporter.clone();
     let case_id_for_idle = case_id.to_string();
-    let modules = eval_registry(&case_modules).build(&env.caps).await?;
+    let modules = eval_registry(
+        &case_modules,
+        &env.memory_caps,
+        &env.policy_caps,
+        &env.file_search,
+        &env.utterance_sink,
+    )
+    .build(&env.caps)
+    .await?;
     let mut visualizer = hooks.visualizer.as_mut();
 
     run_agent(
@@ -1652,7 +1662,7 @@ async fn execute_module_case(
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
-    seed_memories(&env.caps, env.clock.as_ref(), case_now, &case.memories).await?;
+    seed_memories(&env.memory_caps, env.clock.as_ref(), case_now, &case.memories).await?;
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -1675,7 +1685,15 @@ async fn execute_module_case(
     let target_module = module_id_for_target(target);
     let shutdown_target_module = target_module.clone();
     let run_target_module = target_module.clone();
-    let modules = eval_registry(&case_modules).build(&env.caps).await?;
+    let modules = eval_registry(
+        &case_modules,
+        &env.memory_caps,
+        &env.policy_caps,
+        &env.file_search,
+        &env.utterance_sink,
+    )
+    .build(&env.caps)
+    .await?;
     let harness = env.caps.internal_harness_io();
     let prompt = case.prompt.content.clone();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
@@ -2178,7 +2196,7 @@ fn memory_page_from_records(
     }
 }
 
-fn memory_record_view(record: nuillu_module::ports::MemoryRecord) -> MemoryRecordView {
+fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
     MemoryRecordView {
         index: record.index.as_str().to_owned(),
         rank: memory_rank_name(record.rank).to_owned(),
@@ -2191,10 +2209,14 @@ struct EvalEnvironment {
     blackboard: Blackboard,
     caps: CapabilityProviders,
     memory: Arc<dyn MemoryStore>,
+    memory_caps: MemoryCapabilities,
+    policy_caps: PolicyCapabilities,
     utterances: Arc<RecordingUtteranceSink>,
     actions: Arc<ActionActivityTracker>,
     events: Arc<RecordingRuntimeEventSink>,
     clock: Arc<dyn Clock>,
+    file_search: Arc<dyn FileSearchProvider>,
+    utterance_sink: Arc<dyn UtteranceSink>,
 }
 
 struct AnchoredRealtimeClock {
@@ -2275,12 +2297,6 @@ async fn build_eval_environment(
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
             cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
-            primary_memory_store: memory.clone(),
-            memory_replicas: Vec::new(),
-            primary_policy_store: policy_store,
-            policy_replicas: Vec::new(),
-            file_search,
-            utterance_sink: utterances.clone(),
             clock: clock.clone(),
             tiers,
         },
@@ -2290,14 +2306,34 @@ async fn build_eval_environment(
         },
     });
 
+    let memory_caps =
+        MemoryCapabilities::new(blackboard.clone(), clock.clone(), memory.clone(), Vec::new());
+    memory_caps
+        .bootstrap_identity_memories()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to load identity memories: {err}"))?;
+
+    let policy_caps =
+        PolicyCapabilities::new(blackboard.clone(), clock.clone(), policy_store, Vec::new());
+    policy_caps
+        .bootstrap_core_policies()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to load core policies: {err}"))?;
+
+    let utterance_sink: Arc<dyn UtteranceSink> = utterances.clone();
+
     Ok(EvalEnvironment {
         blackboard,
         caps,
         memory,
+        memory_caps,
+        policy_caps,
         utterances,
         actions,
         events,
         clock,
+        file_search,
+        utterance_sink,
     })
 }
 
@@ -2437,12 +2473,12 @@ impl FileSearchProvider for SeededFileSearchProvider {
 }
 
 async fn seed_memories(
-    caps: &CapabilityProviders,
+    memory_caps: &MemoryCapabilities,
     clock: &dyn Clock,
     case_now: Option<DateTime<FixedOffset>>,
     memories: &[crate::cases::MemorySeed],
 ) -> Result<()> {
-    let writer = caps.memory_writer();
+    let writer = memory_caps.writer();
     for memory in memories {
         let occurred_at = memory_seed_occurred_at(clock, case_now, memory)?;
         writer
@@ -2624,10 +2660,23 @@ fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalM
         .unwrap_or_else(|| vec![target.module()])
 }
 
-fn eval_registry(modules: &[EvalModule]) -> ModuleRegistry {
+fn eval_registry(
+    modules: &[EvalModule],
+    memory_caps: &MemoryCapabilities,
+    policy_caps: &PolicyCapabilities,
+    file_search: &Arc<dyn FileSearchProvider>,
+    utterance_sink: &Arc<dyn UtteranceSink>,
+) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
     for module in modules {
-        registry = register_eval_module(registry, *module);
+        registry = register_eval_module(
+            registry,
+            *module,
+            memory_caps,
+            policy_caps,
+            file_search,
+            utterance_sink,
+        );
     }
     declare_eval_dependencies(registry, modules)
 }
@@ -2676,7 +2725,14 @@ fn eval_policy(
     )
 }
 
-fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleRegistry {
+fn register_eval_module(
+    registry: ModuleRegistry,
+    module: EvalModule,
+    memory_caps: &MemoryCapabilities,
+    policy_caps: &PolicyCapabilities,
+    file_search: &Arc<dyn FileSearchProvider>,
+    utterance_sink: &Arc<dyn UtteranceSink>,
+) -> ModuleRegistry {
     match module {
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
@@ -2756,111 +2812,135 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
         EvalModule::QueryVector => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
-                nuillu_query_vector::QueryVectorModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.vector_memory_searcher(),
-                    caps.typed_memo::<nuillu_query_vector::QueryVectorMemo>(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
+                let memory_caps = memory_caps.clone();
+                move |caps| {
+                    nuillu_memory::QueryVectorModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.searcher(),
+                        caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         EvalModule::QueryPolicy => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
-                nuillu_query_policy::QueryPolicyModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.policy_searcher(),
-                    caps.typed_memo::<nuillu_module::PolicyRetrievalMemo>(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
+                let policy_caps = policy_caps.clone();
+                move |caps| {
+                    nuillu_reward::QueryPolicyModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        policy_caps.searcher(),
+                        caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         // File search is heavier and not on the speak critical path.
         EvalModule::QueryAgentic => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
-                nuillu_query_agentic::QueryAgenticModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.file_searcher(),
-                    caps.memo(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
+                let file_search = file_search.clone();
+                move |caps| {
+                    nuillu_query_agentic::QueryAgenticModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        FileSearcher::new(file_search.clone()),
+                        caps.memo(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_memory::MemoryModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_writer(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), {
+                let memory_caps = memory_caps.clone();
+                move |caps| {
+                    nuillu_memory::MemoryModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.writer(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         // Rare; runs on allocation guidance only.
         EvalModule::MemoryCompaction => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
-                nuillu_memory_compaction::MemoryCompactionModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.memory_compactor(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
+                let memory_caps = memory_caps.clone();
+                move |caps| {
+                    nuillu_memory::MemoryCompactionModule::new(
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.compactor(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         EvalModule::Policy => registry
-            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), |caps| {
-                nuillu_policy::PolicyModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.policy_writer(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(2.0, 6.0)), {
+                let policy_caps = policy_caps.clone();
+                move |caps| {
+                    nuillu_reward::PolicyModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        policy_caps.writer(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         EvalModule::ValueEstimator => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), |caps| {
-                nuillu_value_estimator::ValueEstimatorModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.policy_window_reader(),
-                    caps.typed_memo::<nuillu_module::ValueEstimateMemo>(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(6.0, 15.0)), {
+                let policy_caps = policy_caps.clone();
+                move |caps| {
+                    nuillu_reward::ValueEstimatorModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        policy_caps.window_reader(),
+                        caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         EvalModule::Reward => registry
-            .register(eval_policy(0..=1, Bpm::range(3.0, 9.0)), |caps| {
-                nuillu_reward::RewardModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.policy_window_reader(),
-                    caps.policy_value_updater(),
-                    caps.attention_control_mailbox(),
-                    caps.typed_memo::<nuillu_reward::RewardMemo>(),
-                    caps.llm_access(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(3.0, 9.0)), {
+                let policy_caps = policy_caps.clone();
+                move |caps| {
+                    nuillu_reward::RewardModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.memo_updated_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        policy_caps.window_reader(),
+                        policy_caps.value_updater(),
+                        caps.attention_control_mailbox(),
+                        caps.typed_memo::<nuillu_reward::RewardMemo>(),
+                        caps.llm_access(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
         // Cognition-log triggered; not on speak critical path.
@@ -2908,15 +2988,23 @@ fn register_eval_module(registry: ModuleRegistry, module: EvalModule) -> ModuleR
         // Reactive on cognition-log updates after speak-gate allows the
         // activation. Match speak-gate so the pair stays in sync.
         EvalModule::Speak => registry
-            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), |caps| {
-                nuillu_speak::SpeakModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    caps.utterance_writer(),
-                    caps.llm_access(),
-                    caps.scene_reader(),
-                )
+            .register(eval_policy(0..=1, Bpm::range(6.0, 18.0)), {
+                let utterance_sink = utterance_sink.clone();
+                move |caps| {
+                    nuillu_speak::SpeakModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        UtteranceWriter::new(
+                            caps.owner().clone(),
+                            caps.blackboard(),
+                            utterance_sink.clone(),
+                            caps.clock(),
+                        ),
+                        caps.llm_access(),
+                        caps.scene_reader(),
+                    )
+                }
             })
             .expect("eval module registration should be unique"),
     }
@@ -4231,11 +4319,9 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
+    use nuillu_memory::NoopMemoryStore;
     use nuillu_module::MemoUpdated;
-    use nuillu_module::ports::{
-        NoopCognitionLogRepository, NoopFileSearchProvider, NoopMemoryStore, NoopPolicyStore,
-        NoopUtteranceSink, SystemClock,
-    };
+    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
@@ -4412,12 +4498,6 @@ mod tests {
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            primary_memory_store: Arc::new(NoopMemoryStore),
-            memory_replicas: Vec::new(),
-            primary_policy_store: Arc::new(NoopPolicyStore),
-            policy_replicas: Vec::new(),
-            file_search: Arc::new(NoopFileSearchProvider),
-            utterance_sink: Arc::new(NoopUtteranceSink),
             clock: Arc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
@@ -5185,7 +5265,31 @@ prompt = "What am I attending to?"
 
         let blackboard = Blackboard::with_allocation(allocation);
         let caps = test_caps(blackboard.clone());
-        let allocated = eval_registry(&selected).build(&caps).await.unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let memory_caps = MemoryCapabilities::new(
+            blackboard.clone(),
+            clock.clone(),
+            Arc::new(NoopMemoryStore),
+            Vec::new(),
+        );
+        let policy_caps = PolicyCapabilities::new(
+            blackboard.clone(),
+            clock,
+            Arc::new(nuillu_reward::NoopPolicyStore),
+            Vec::new(),
+        );
+        let file_search: Arc<dyn FileSearchProvider> = Arc::new(NoopFileSearchProvider);
+        let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
+        let allocated = eval_registry(
+            &selected,
+            &memory_caps,
+            &policy_caps,
+            &file_search,
+            &utterance_sink,
+        )
+        .build(&caps)
+        .await
+        .unwrap();
         assert_eq!(allocated.len(), selected.len());
 
         let (replica_caps, allocation_modules) = blackboard
@@ -5290,7 +5394,31 @@ prompt = "What am I attending to?"
         );
         let blackboard = Blackboard::with_allocation(allocation);
         let caps = test_caps(blackboard.clone());
-        let _allocated = eval_registry(&selected).build(&caps).await.unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let memory_caps = MemoryCapabilities::new(
+            blackboard.clone(),
+            clock.clone(),
+            Arc::new(NoopMemoryStore),
+            Vec::new(),
+        );
+        let policy_caps = PolicyCapabilities::new(
+            blackboard.clone(),
+            clock,
+            Arc::new(nuillu_reward::NoopPolicyStore),
+            Vec::new(),
+        );
+        let file_search: Arc<dyn FileSearchProvider> = Arc::new(NoopFileSearchProvider);
+        let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
+        let _allocated = eval_registry(
+            &selected,
+            &memory_caps,
+            &policy_caps,
+            &file_search,
+            &utterance_sink,
+        )
+        .build(&caps)
+        .await
+        .unwrap();
 
         blackboard
             .read(|bb| {

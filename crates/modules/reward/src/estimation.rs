@@ -4,9 +4,27 @@ use anyhow::Result;
 use async_trait::async_trait;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, LlmAccess, MemoUpdatedInbox, Module, PolicyWindowKey,
-    PolicyWindowReader, TypedMemo, ValueEstimateMemo, ValueEstimatePrediction,
+    CognitionLogUpdatedInbox, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
 };
+use nuillu_types::PolicyIndex;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{PolicyWindowKey, PolicyWindowReader};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ValueEstimateMemo {
+    pub retrieval_window: PolicyWindowKey,
+    pub predictions: Vec<ValueEstimatePrediction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ValueEstimatePrediction {
+    pub policy_index: PolicyIndex,
+    pub predicted_expected_reward: f32,
+    pub confidence_hint: f32,
+    pub rationale: String,
+}
 
 pub struct ValueEstimatorModule {
     memo_updates: MemoUpdatedInbox,
