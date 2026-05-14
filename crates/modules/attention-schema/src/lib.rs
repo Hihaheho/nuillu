@@ -4,8 +4,9 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
     CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, compact_session_if_needed, format_current_attention_guidance,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_current_attention_guidance, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -154,6 +155,7 @@ impl AttentionSchemaModule {
                     result.usage.input_tokens,
                     cx.session_compaction_lutum(),
                     self.session_compaction,
+                    SessionCompactionProtectedPrefix::None,
                     Self::id(),
                     COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
@@ -167,6 +169,7 @@ impl AttentionSchemaModule {
                     result.usage.input_tokens,
                     cx.session_compaction_lutum(),
                     self.session_compaction,
+                    SessionCompactionProtectedPrefix::None,
                     Self::id(),
                     COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
@@ -198,6 +201,7 @@ impl AttentionSchemaModule {
             input_tokens,
             cx.session_compaction_lutum(),
             self.session_compaction,
+            SessionCompactionProtectedPrefix::None,
             Self::id(),
             COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,

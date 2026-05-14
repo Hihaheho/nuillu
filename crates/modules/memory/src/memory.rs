@@ -4,8 +4,9 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogEntryRecord,
     CognitionLogUpdatedInbox, LlmAccess, Module, SessionCompactionConfig,
-    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
-    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
+    format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -203,6 +204,7 @@ impl MemoryModule {
                         result.usage.input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -216,6 +218,7 @@ impl MemoryModule {
                         result.usage.input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -245,6 +248,7 @@ impl MemoryModule {
                         input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,

@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Memo, Module,
-    SessionCompactionConfig, compact_session_if_needed, push_formatted_memo_log_batch,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -174,6 +175,7 @@ impl QueryAgenticModule {
                         result.usage.input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -187,6 +189,7 @@ impl QueryAgenticModule {
                         result.usage.input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -217,6 +220,7 @@ impl QueryAgenticModule {
                         input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::None,
                         Self::id(),
                         COMPACTED_QUERY_AGENTIC_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,

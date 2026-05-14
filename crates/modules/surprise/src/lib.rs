@@ -4,8 +4,9 @@ use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
     CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, MemoryImportance, Module,
-    SessionCompactionConfig, compact_session_if_needed, format_current_attention_guidance,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_current_attention_guidance, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,7 @@ impl SurpriseModule {
             input_tokens,
             cx.session_compaction_lutum(),
             self.session_compaction,
+            SessionCompactionProtectedPrefix::None,
             Self::id(),
             COMPACTED_SURPRISE_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,

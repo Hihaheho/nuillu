@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader, LlmAccess,
-    Memo, Module, SessionCompactionConfig, compact_session_if_needed,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_session_if_needed, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::builtin;
 
@@ -121,6 +121,7 @@ impl SelfModelModule {
             result.usage.input_tokens,
             cx.session_compaction_lutum(),
             self.session_compaction,
+            SessionCompactionProtectedPrefix::None,
             Self::id(),
             COMPACTED_SELF_MODEL_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,

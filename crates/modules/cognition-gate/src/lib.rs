@@ -3,11 +3,11 @@ use async_trait::async_trait;
 use lutum::{Lutum, Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess,
-    MemoUpdatedInbox, Module, SessionCompactionConfig, TimeDivision, compact_session_if_needed,
-    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
-    format_stuckness, format_time_division_guidance, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    MemoUpdatedInbox, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    TimeDivision, compact_session_if_needed, format_current_attention_guidance,
+    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
+    format_time_division_guidance, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,7 @@ impl CognitionGateModule {
             input_tokens,
             compaction_lutum,
             self.session_compaction,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
             COMPACTED_COGNITION_GATE_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,
@@ -276,11 +277,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use lutum::{
-        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, InputMessageRole, MessageContent, MockLlmAdapter,
-        MockStructuredScenario, MockTextScenario, ModelInput, ModelInputItem,
-        RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
-        TurnAdapter, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
+        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
+        MessageContent, MockLlmAdapter, MockStructuredScenario, MockTextScenario, ModelInput,
+        ModelInputItem, RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager,
+        SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
@@ -561,12 +562,8 @@ mod tests {
 
         assert!(!decision.append_cognition);
         let items = fixture.gate.session.input().items();
-        let ModelInputItem::Message { role, content } = &items[0] else {
-            panic!("expected compacted system message");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(summary)] = content.as_slice() else {
-            panic!("expected compacted summary text");
+        let ModelInputItem::Assistant(AssistantInputItem::Text(summary)) = &items[0] else {
+            panic!("expected compacted assistant message");
         };
         assert!(summary.starts_with(COMPACTED_COGNITION_GATE_SESSION_PREFIX));
         assert!(summary.contains("old cognition gate history summarized"));

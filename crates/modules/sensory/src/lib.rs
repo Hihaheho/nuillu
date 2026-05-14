@@ -5,14 +5,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{
-    AssistantInputItem, InputMessageRole, ModelInput, ModelInputItem, Session,
-    TextStepOutcomeWithTools, ToolResult,
-};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
-    SensoryInputInbox, SensoryModality, SessionCompactionConfig, ports::Clock,
-    seed_persistent_faculty_session, session_compaction_cutoff,
+    SensoryInputInbox, SensoryModality, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_session_if_needed, ports::Clock, seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -424,17 +421,17 @@ impl SensoryModule {
         if input_tokens <= self.session_compaction.input_token_threshold {
             return;
         }
-        if let Err(error) =
-            compact_sensory_session(&mut self.session, lutum, self.session_compaction).await
-        {
-            tracing::warn!(
-                module = Self::id(),
-                input_tokens,
-                threshold = self.session_compaction.input_token_threshold,
-                error = ?error,
-                "module session compaction failed"
-            );
-        }
+        compact_session_if_needed(
+            &mut self.session,
+            input_tokens,
+            lutum,
+            self.session_compaction,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+            Self::id(),
+            COMPACTED_SENSORY_SESSION_PREFIX,
+            SESSION_COMPACTION_PROMPT,
+        )
+        .await;
     }
 
     async fn next_batch(&mut self) -> Result<SensoryBatch> {
@@ -565,75 +562,6 @@ fn format_sensory_batch(observations: &[PreparedSensoryObservation], guidance: &
     }
     out.push_str("\n\nDecision: use write_sensory_memo only for useful durable sensory memo-log output; otherwise use ignore_observations.");
     out
-}
-
-async fn compact_sensory_session(
-    session: &mut Session,
-    lutum: &lutum::Lutum,
-    config: SessionCompactionConfig,
-) -> Result<()> {
-    let items = session.input().items();
-    let protected_prefix_len = sensory_session_protected_prefix_len(items);
-    let compactable_len = items.len().saturating_sub(protected_prefix_len);
-    let Some(relative_cutoff) = session_compaction_cutoff(compactable_len, config.prefix_ratio)
-    else {
-        return Ok(());
-    };
-    let cutoff = protected_prefix_len + relative_cutoff;
-
-    let protected_prefix = items[..protected_prefix_len].to_vec();
-    let prefix = items[protected_prefix_len..cutoff].to_vec();
-    let suffix = items[cutoff..].to_vec();
-
-    let mut summary_items = Vec::with_capacity(prefix.len().saturating_add(1));
-    summary_items.push(ModelInputItem::text(
-        InputMessageRole::System,
-        SESSION_COMPACTION_PROMPT,
-    ));
-    summary_items.extend(prefix);
-    let summary = lutum
-        .text_turn(ModelInput::from_items(summary_items))
-        .collect()
-        .await
-        .context("summarize sensory session prefix")?
-        .assistant_text();
-    let summary = summary.trim();
-    if summary.is_empty() {
-        tracing::warn!("sensory session compaction produced an empty summary");
-        return Ok(());
-    }
-
-    let mut compacted_items = Vec::with_capacity(
-        protected_prefix
-            .len()
-            .saturating_add(suffix.len())
-            .saturating_add(1),
-    );
-    compacted_items.extend(protected_prefix);
-    compacted_items.push(ModelInputItem::assistant_text(format!(
-        "{COMPACTED_SENSORY_SESSION_PREFIX}\n{summary}"
-    )));
-    compacted_items.extend(suffix);
-    *session = Session::from_input(ModelInput::from_items(compacted_items));
-    Ok(())
-}
-
-fn sensory_session_protected_prefix_len(items: &[ModelInputItem]) -> usize {
-    let mut len = match items.first() {
-        Some(ModelInputItem::Message {
-            role: InputMessageRole::System,
-            ..
-        }) => 1,
-        _ => 0,
-    };
-    if matches!(
-        items.get(len),
-        Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
-            if text.starts_with("What I already remember about myself")
-    ) {
-        len += 1;
-    }
-    len
 }
 
 #[async_trait(?Send)]
@@ -1230,14 +1158,6 @@ mod tests {
                                 &items[1],
                                 ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
                                     if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
-                            ) || matches!(
-                                &items[1],
-                                ModelInputItem::Message { content, .. }
-                                    if matches!(
-                                        content.as_slice(),
-                                        [MessageContent::Text(text)]
-                                            if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
-                                    )
                             )
                         }) {
                             break;
@@ -1255,14 +1175,6 @@ mod tests {
                             &items[1],
                             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
                                 if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
-                        ) || matches!(
-                            &items[1],
-                            ModelInputItem::Message { content, .. }
-                                if matches!(
-                                    content.as_slice(),
-                                    [MessageContent::Text(text)]
-                                        if text.starts_with(COMPACTED_SENSORY_SESSION_PREFIX)
-                                )
                         )
                     })
                     .expect("expected a compacted sensory session");

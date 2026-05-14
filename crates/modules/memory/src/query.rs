@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, SessionCompactionConfig, TypedMemo, compact_session_if_needed,
-    format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
-    push_formatted_memo_log_batch, render_memory_for_llm, seed_persistent_faculty_session,
+    LlmAccess, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
+    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
+    memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -290,6 +291,7 @@ impl QueryVectorModule {
                     result.usage.input_tokens,
                     cx.session_compaction_lutum(),
                     self.session_compaction,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                     Self::id(),
                     COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
@@ -303,6 +305,7 @@ impl QueryVectorModule {
                     result.usage.input_tokens,
                     cx.session_compaction_lutum(),
                     self.session_compaction,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                     Self::id(),
                     COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
@@ -318,6 +321,7 @@ impl QueryVectorModule {
                         input_tokens,
                         cx.session_compaction_lutum(),
                         self.session_compaction,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
                         COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -354,6 +358,7 @@ impl QueryVectorModule {
                     input_tokens,
                     cx.session_compaction_lutum(),
                     self.session_compaction,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                     Self::id(),
                     COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,

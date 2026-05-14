@@ -6,9 +6,10 @@ use lutum::{Lutum, Session, StructuredStepOutcomeWithTools, StructuredTurnOutcom
 use nuillu_module::{
     ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
-    LlmAccess, Module, SessionCompactionConfig, TypedMemo, UtteranceProgress,
-    UtteranceProgressState, compact_session_if_needed, format_faculty_system_prompt,
-    format_stuckness, push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    LlmAccess, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
+    UtteranceProgress, UtteranceProgressState, compact_session_if_needed,
+    format_faculty_system_prompt, format_stuckness, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::JsonSchema;
@@ -622,6 +623,7 @@ impl SpeakGateModule {
             input_tokens,
             lutum,
             self.session_compaction,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
             COMPACTED_SPEAK_GATE_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,
@@ -859,12 +861,8 @@ mod tests {
         assert!(!decision.wants_to_speak);
         assert!(!decision.wait_for_evidence);
         let items = fixture.gate.session.input().items();
-        let ModelInputItem::Message { role, content } = &items[0] else {
-            panic!("expected compacted system message");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(summary)] = content.as_slice() else {
-            panic!("expected compacted summary text");
+        let ModelInputItem::Assistant(AssistantInputItem::Text(summary)) = &items[0] else {
+            panic!("expected compacted assistant message");
         };
         assert!(summary.starts_with(COMPACTED_SPEAK_GATE_SESSION_PREFIX));
         assert!(summary.contains("old gate history summarized"));
@@ -949,12 +947,8 @@ mod tests {
 
         assert_eq!(decision.rationale, "tool result committed");
         let items = fixture.gate.session.input().items();
-        let ModelInputItem::Message { role, content } = &items[0] else {
-            panic!("expected compacted system message");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(summary)] = content.as_slice() else {
-            panic!("expected compacted summary text");
+        let ModelInputItem::Assistant(AssistantInputItem::Text(summary)) = &items[0] else {
+            panic!("expected compacted assistant message");
         };
         assert!(summary.contains("tool round history summarized"));
     }

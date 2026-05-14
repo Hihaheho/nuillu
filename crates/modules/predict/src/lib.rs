@@ -3,9 +3,9 @@ use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module, SessionCompactionConfig, compact_session_if_needed,
-    format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
+    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 
 mod batch;
@@ -122,6 +122,7 @@ impl PredictModule {
             result.usage.input_tokens,
             cx.session_compaction_lutum(),
             self.session_compaction,
+            SessionCompactionProtectedPrefix::None,
             Self::id(),
             COMPACTED_PREDICT_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,

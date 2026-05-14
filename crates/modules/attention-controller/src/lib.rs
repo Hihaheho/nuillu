@@ -7,10 +7,11 @@ use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, compact_session_if_needed, format_available_faculties,
-    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
-    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_available_faculties, format_current_attention_guidance, format_faculty_system_prompt,
+    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, builtin};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -271,6 +272,7 @@ impl AttentionControllerModule {
             input_tokens,
             compaction_lutum,
             self.session_compaction,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
             COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,
