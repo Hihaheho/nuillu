@@ -563,6 +563,9 @@ async fn refresh_active_and_schedule(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
+                    runtime
+                        .record_module_batch_ready(owners[index].clone(), &batch)
+                        .await;
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
                     let core_policies = runtime.core_policies().await;
@@ -864,6 +867,9 @@ async fn handle_task_message(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
+                    runtime
+                        .record_module_batch_ready(owners[index].clone(), &batch)
+                        .await;
                     states[index] = ModuleState::Activating;
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
@@ -1100,7 +1106,10 @@ async fn spawn_activation_gate_or_activate(
         .await;
     if gate_requests.is_empty() {
         runtime
-            .record_module_status(owner, ModuleRunStatus::Activating)
+            .record_module_status(owner.clone(), ModuleRunStatus::Activating)
+            .await;
+        runtime
+            .record_module_batch_ready(owner.clone(), &batch)
             .await;
         let catalog = runtime.module_catalog();
         let identity_memories = runtime.identity_memories().await;

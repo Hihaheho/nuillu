@@ -257,6 +257,18 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
                 owner,
                 delayed_for.as_millis()
             ),
+            RuntimeEvent::ModuleBatchReady {
+                owner,
+                batch_type,
+                batch_debug,
+                ..
+            } => eprintln!(
+                "nuillu-server module-batch-ready tab={} owner={} type={} chars={}",
+                self.tab_id,
+                owner,
+                batch_type,
+                batch_debug.chars().count()
+            ),
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),

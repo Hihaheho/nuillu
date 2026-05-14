@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::PortError;
 use crate::rate_limit::CapabilityKind;
+use crate::r#trait::ModuleBatch;
+
+const MAX_BATCH_DEBUG_CHARS: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -33,6 +36,12 @@ pub enum RuntimeEvent {
         sequence: u64,
         owner: ModuleInstanceId,
         delayed_for: Duration,
+    },
+    ModuleBatchReady {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        batch_type: String,
+        batch_debug: String,
     },
 }
 
@@ -115,10 +124,34 @@ impl RuntimeEventEmitter {
         .await;
     }
 
+    pub(crate) async fn module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
+        let batch_type = batch.type_name().to_string();
+        let batch_debug = truncated_debug(batch.debug());
+        self.emit(|sequence| RuntimeEvent::ModuleBatchReady {
+            sequence,
+            owner,
+            batch_type,
+            batch_debug,
+        })
+        .await;
+    }
+
     async fn emit(&self, build: impl FnOnce(u64) -> RuntimeEvent) {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sink.on_event(build(sequence)).await {
             tracing::warn!(?error, "runtime event sink failed");
         }
     }
+}
+
+fn truncated_debug(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len().min(MAX_BATCH_DEBUG_CHARS));
+    for (index, ch) in debug.chars().enumerate() {
+        if index == MAX_BATCH_DEBUG_CHARS {
+            out.push_str("\n... [truncated]");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }

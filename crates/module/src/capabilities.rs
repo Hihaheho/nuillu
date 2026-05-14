@@ -409,6 +409,10 @@ impl AgentRuntimeControl {
             .await;
     }
 
+    pub async fn record_module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
+        self.runtime_events.module_batch_ready(owner, batch).await;
+    }
+
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
         self.blackboard
             .apply(BlackboardCommand::RecordAgenticDeadlockMarker(

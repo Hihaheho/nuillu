@@ -51,6 +51,7 @@ pub struct ModuleState {
     pub runtime_status: Option<String>,
     pub last_tier: Option<String>,
     pub last_throttle: Option<ThrottleSummary>,
+    pub latest_batch: Option<ModuleBatchDebugState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,12 @@ pub struct ThrottleSummary {
     pub kind: String,
     pub detail: String,
     pub delayed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBatchDebugState {
+    pub batch_type: String,
+    pub debug: String,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,7 @@ pub struct LlmTurnState {
     pub request_id: Option<String>,
     pub finish_reason: Option<String>,
     pub usage: Option<LlmUsageView>,
+    pub batch: Option<ModuleBatchDebugState>,
     pub input: Vec<LlmInputItemView>,
     pub output: Vec<LlmOutputItemState>,
     pub status: ModuleSessionStatus,
@@ -175,6 +183,18 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 module.status = ModuleSessionStatus::Completed;
             }
         }
+        RuntimeEvent::ModuleBatchReady {
+            owner,
+            batch_type,
+            batch_debug,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.latest_batch = Some(ModuleBatchDebugState {
+                batch_type: batch_type.clone(),
+                debug: batch_debug.clone(),
+            });
+        }
     }
 }
 
@@ -195,7 +215,8 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
-            let turn = ensure_turn(module_state, turn_id, operation, source, tier);
+            let batch = module_state.latest_batch.clone();
+            let turn = ensure_turn(module_state, turn_id, operation, source, tier, batch);
             turn.input = items;
             turn.status = ModuleSessionStatus::Running;
         }
@@ -215,7 +236,8 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
-            let turn = ensure_turn(module_state, turn_id, operation, source, tier);
+            let batch = module_state.latest_batch.clone();
+            let turn = ensure_turn(module_state, turn_id, operation, source, tier, batch);
             turn.model = Some(model);
             turn.request_id = request_id;
             turn.status = ModuleSessionStatus::Running;
@@ -559,6 +581,10 @@ fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmT
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.push_id("scroll-content", |ui| {
+                if let Some(batch) = &turn.batch {
+                    render_batch_item(ui, batch, &turn.turn_id, turn_index);
+                    ui.add_space(6.0);
+                }
                 for (index, item) in turn.input.iter().enumerate() {
                     render_input_item(ui, item, &turn.turn_id, turn_index, index);
                     ui.add_space(6.0);
@@ -567,6 +593,30 @@ fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmT
                     render_output_item(ui, item, &turn.turn_id, turn_index, index);
                     ui.add_space(6.0);
                 }
+            });
+        });
+}
+
+fn render_batch_item(
+    ui: &mut egui::Ui,
+    batch: &ModuleBatchDebugState,
+    turn_id: &str,
+    turn_index: usize,
+) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("batch");
+                wrapped_label(ui, &batch.batch_type);
+            });
+            ui.add_space(3.0);
+            let display = hard_wrap_long_segments(&batch.debug, 120);
+            ui.push_id(("batch-debug", turn_id, turn_index), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(display).monospace()).wrap());
             });
         });
 }
@@ -1335,12 +1385,16 @@ fn ensure_turn<'a>(
     operation: String,
     source: LlmObservationSource,
     tier: String,
+    batch: Option<ModuleBatchDebugState>,
 ) -> &'a mut LlmTurnState {
     if let Some(index) = module.turns.iter().position(|turn| turn.turn_id == turn_id) {
         let turn = &mut module.turns[index];
         turn.operation = operation;
         turn.source = source;
         turn.tier = tier;
+        if turn.batch.is_none() {
+            turn.batch = batch;
+        }
         return turn;
     }
     module.turns.push(LlmTurnState {
@@ -1352,6 +1406,7 @@ fn ensure_turn<'a>(
         request_id: None,
         finish_reason: None,
         usage: None,
+        batch,
         input: Vec::new(),
         output: Vec::new(),
         status: ModuleSessionStatus::Running,
@@ -1574,6 +1629,47 @@ mod tests {
     }
 
     #[test]
+    fn module_batch_ready_is_copied_to_new_turns() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleBatchReady {
+                sequence: 0,
+                owner: owner.clone(),
+                batch_type: "nuillu_sensory::SensoryBatch".to_string(),
+                batch_debug: "SensoryBatch { inputs: [], allocation_updated: true }".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-batch".to_string(),
+                owner: owner.to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(
+            module.turns[0].batch,
+            Some(ModuleBatchDebugState {
+                batch_type: "nuillu_sensory::SensoryBatch".to_string(),
+                debug: "SensoryBatch { inputs: [], allocation_updated: true }".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn structured_ready_replaces_streaming_structured_row() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO).to_string();
@@ -1776,6 +1872,7 @@ mod tests {
                 request_id: None,
                 finish_reason: None,
                 usage: None,
+                batch: None,
                 input: Vec::new(),
                 output: Vec::new(),
                 status: ModuleSessionStatus::Running,

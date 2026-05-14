@@ -4963,6 +4963,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::MemoUpdated { .. } => false,
             RuntimeEvent::RateLimitDelayed { .. } => false,
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
+            RuntimeEvent::ModuleBatchReady { .. } => false,
         };
         let live_message = match &event {
             RuntimeEvent::LlmAccessed {
@@ -5005,6 +5006,19 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.reporter.log_scope(&self.case_id),
                 owner,
                 delayed_for.as_millis()
+            ),
+            RuntimeEvent::ModuleBatchReady {
+                owner,
+                batch_type,
+                batch_debug,
+                ..
+            } => format!(
+                "{} module-batch-ready {} owner={} type={} chars={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                batch_type,
+                batch_debug.chars().count()
             ),
         };
         self.events

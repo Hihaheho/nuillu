@@ -1,4 +1,5 @@
 use std::any::{Any, TypeId};
+use std::fmt::Debug;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow};
@@ -76,7 +77,7 @@ impl<'a> ActivateCx<'a> {
 /// state (e.g. `Rc`-bearing `lutum::Session`).
 #[async_trait(?Send)]
 pub trait Module {
-    type Batch: 'static;
+    type Batch: Debug + 'static;
 
     /// Stable kebab-case identifier for this module type.
     fn id() -> &'static str
@@ -95,12 +96,17 @@ pub trait Module {
 
 pub struct ModuleBatch {
     inner: Rc<dyn Any>,
+    type_name: &'static str,
+    debug: String,
 }
 
 impl ModuleBatch {
-    pub(crate) fn new<T: 'static>(inner: T) -> Self {
+    pub(crate) fn new<T: Debug + 'static>(inner: T) -> Self {
+        let debug = format!("{inner:?}");
         Self {
             inner: Rc::new(inner),
+            type_name: std::any::type_name::<T>(),
+            debug,
         }
     }
 
@@ -115,12 +121,22 @@ impl ModuleBatch {
     pub(crate) fn as_any(&self) -> &dyn Any {
         self.inner.as_ref()
     }
+
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    pub fn debug(&self) -> &str {
+        &self.debug
+    }
 }
 
 impl Clone for ModuleBatch {
     fn clone(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),
+            type_name: self.type_name,
+            debug: self.debug.clone(),
         }
     }
 }
