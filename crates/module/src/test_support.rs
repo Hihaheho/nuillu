@@ -1,5 +1,6 @@
 //! Test fixtures shared by `#[cfg(test)] mod tests` blocks in this crate.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
@@ -34,8 +35,8 @@ pub(crate) fn test_caps_with_adapter(
     CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard,
-            cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            clock: Arc::new(SystemClock),
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
+            clock: Rc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use nuillu_blackboard::{Blackboard, BlackboardCommand, VitalPatch};
 use nuillu_types::ModuleInstanceId;
@@ -10,7 +10,7 @@ pub struct VitalWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
     updates: VitalUpdatedMailbox,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl VitalWriter {
@@ -18,7 +18,7 @@ impl VitalWriter {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: VitalUpdatedMailbox,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             owner,

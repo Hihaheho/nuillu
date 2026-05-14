@@ -16,7 +16,7 @@
 //!
 //! [`ModuleRegistry::build`]: nuillu_module::ModuleRegistry::build
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use nuillu_blackboard::{Blackboard, BlackboardCommand};
 use nuillu_module::ports::{Clock, PortError};
@@ -69,18 +69,18 @@ pub use store::{
 /// handles on demand and seeds boot-time identity memories.
 #[derive(Clone)]
 pub struct MemoryCapabilities {
-    primary_store: Arc<dyn MemoryStore>,
-    replicas: Vec<Arc<dyn MemoryStore>>,
+    primary_store: Rc<dyn MemoryStore>,
+    replicas: Vec<Rc<dyn MemoryStore>>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl MemoryCapabilities {
     pub fn new(
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
-        primary_store: Arc<dyn MemoryStore>,
-        replicas: Vec<Arc<dyn MemoryStore>>,
+        clock: Rc<dyn Clock>,
+        primary_store: Rc<dyn MemoryStore>,
+        replicas: Vec<Rc<dyn MemoryStore>>,
     ) -> Self {
         Self {
             primary_store,
@@ -90,7 +90,7 @@ impl MemoryCapabilities {
         }
     }
 
-    pub fn primary_store(&self) -> &Arc<dyn MemoryStore> {
+    pub fn primary_store(&self) -> &Rc<dyn MemoryStore> {
         &self.primary_store
     }
 

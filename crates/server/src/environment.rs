@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -37,11 +38,11 @@ use super::llm_observer::VisualizerLlmObserver;
 pub(super) struct ServerEnvironment {
     pub(super) blackboard: Blackboard,
     pub(super) caps: CapabilityProviders,
-    pub(super) memory: Arc<dyn MemoryStore>,
+    pub(super) memory: Rc<dyn MemoryStore>,
     pub(super) memory_caps: MemoryCapabilities,
     pub(super) policy_caps: PolicyCapabilities,
-    pub(super) clock: Arc<dyn Clock>,
-    pub(super) utterance_sink: Arc<dyn UtteranceSink>,
+    pub(super) clock: Rc<dyn Clock>,
+    pub(super) utterance_sink: Rc<dyn UtteranceSink>,
 }
 
 pub(super) async fn build_server_environment(
@@ -50,22 +51,22 @@ pub(super) async fn build_server_environment(
     visualizer: VisualizerEventSink,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
-    let event_sink = Arc::new(ServerRuntimeEventSink::new(
+    let event_sink = Rc::new(ServerRuntimeEventSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer.clone(),
     ));
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
-    let utterance_sink = Arc::new(ServerUtteranceSink::new(
+    let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer,
     ));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(config).await?);
-    let policy_store: Arc<dyn PolicyStore> = Arc::new(connect_policy_store(config).await?);
+    let clock: Rc<dyn Clock> = Rc::new(SystemClock);
+    let memory: Rc<dyn MemoryStore> = Rc::new(connect_memory_store(config).await?);
+    let policy_store: Rc<dyn PolicyStore> = Rc::new(connect_policy_store(config).await?);
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
+            cognition_log_port: Rc::new(InMemoryCognitionLogRepository::new()),
             clock: clock.clone(),
             tiers: build_tiers(
                 &config.cheap_backend,

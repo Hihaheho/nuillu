@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -69,7 +69,7 @@ pub struct SensoryModule {
     inbox: SensoryInputInbox,
     allocation: AllocationReader,
     memo: Memo,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
     llm: LlmAccess,
     session: Session,
     session_seeded: bool,
@@ -127,7 +127,7 @@ impl SensoryModule {
         inbox: SensoryInputInbox,
         allocation: AllocationReader,
         memo: Memo,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
         llm: LlmAccess,
     ) -> Self {
         Self {
@@ -596,6 +596,7 @@ mod tests {
 
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use lutum::{
         FinishReason, InputMessageRole, Lutum, MessageContent, MockLlmAdapter, MockTextScenario,
@@ -741,8 +742,8 @@ mod tests {
         let caps = CapabilityProviders::new(CapabilityProviderConfig {
             ports: CapabilityProviderPorts {
                 blackboard: blackboard.clone(),
-                cognition_log_port: Arc::new(NoopCognitionLogRepository),
-                clock: Arc::new(SystemClock),
+                cognition_log_port: Rc::new(NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
                 tiers: LutumTiers {
                     cheap: lutum.clone(),
                     default: lutum.clone(),

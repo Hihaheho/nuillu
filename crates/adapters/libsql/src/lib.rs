@@ -588,6 +588,7 @@ impl LibsqlMemoryStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_memory_tx(
         &self,
         tx: &Transaction,
@@ -2697,7 +2698,7 @@ mod tests {
     }
 
     impl TestEmbedder {
-        fn new(dims: usize) -> Box<dyn Embedder> {
+        fn boxed(dims: usize) -> Box<dyn Embedder> {
             Box::new(Self { dims })
         }
     }
@@ -2756,7 +2757,7 @@ mod tests {
     async fn connect_rejects_dimension_mismatch() {
         let result = LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(test_db_path(), 2),
-            TestEmbedder::new(3),
+            TestEmbedder::boxed(3),
         )
         .await;
 
@@ -2949,7 +2950,7 @@ mod tests {
 
         let store = LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(path, 3),
-            TestEmbedder::new(3),
+            TestEmbedder::boxed(3),
         )
         .await
         .unwrap();
@@ -3495,7 +3496,7 @@ mod tests {
 
         let result = LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(path, profile.dimensions).with_active_profile(profile),
-            TestEmbedder::new(3),
+            TestEmbedder::boxed(3),
         )
         .await;
 
@@ -3721,7 +3722,7 @@ mod tests {
     async fn store() -> LibsqlMemoryStore {
         LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(test_db_path(), 3),
-            TestEmbedder::new(3),
+            TestEmbedder::boxed(3),
         )
         .await
         .unwrap()
@@ -3762,7 +3763,7 @@ mod tests {
     async fn policy_store() -> LibsqlPolicyStore {
         LibsqlPolicyStore::connect(
             LibsqlPolicyStoreConfig::local(test_db_path(), 3),
-            TestEmbedder::new(3),
+            TestEmbedder::boxed(3),
         )
         .await
         .unwrap()
@@ -3772,7 +3773,7 @@ mod tests {
         let dims = profile.dimensions;
         LibsqlMemoryStore::connect(
             LibsqlMemoryStoreConfig::local(path, dims).with_active_profile(profile),
-            TestEmbedder::new(dims),
+            TestEmbedder::boxed(dims),
         )
         .await
         .unwrap()

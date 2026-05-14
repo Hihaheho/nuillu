@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -38,16 +38,16 @@ pub struct PolicyRetrievalHit {
 /// access metadata mirrored to the blackboard.
 #[derive(Clone)]
 pub struct PolicySearcher {
-    primary_store: Arc<dyn PolicyStore>,
+    primary_store: Rc<dyn PolicyStore>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl PolicySearcher {
     pub(crate) fn new(
-        primary_store: Arc<dyn PolicyStore>,
+        primary_store: Rc<dyn PolicyStore>,
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
@@ -246,7 +246,7 @@ impl Module for QueryPolicyModule {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use nuillu_blackboard::Blackboard;
@@ -337,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn policy_searcher_filters_expired_non_core_records() {
         let blackboard = Blackboard::default();
-        let primary = Arc::new(RecordingPolicyStore::default());
+        let primary = Rc::new(RecordingPolicyStore::default());
         primary.seed(PolicyRecord {
             index: PolicyIndex::new("expired"),
             decay_remaining_secs: 0,
@@ -354,7 +354,7 @@ mod tests {
             decay_remaining_secs: 0,
             ..test_record("core")
         });
-        let searcher = PolicySearcher::new(primary, blackboard.clone(), Arc::new(SystemClock));
+        let searcher = PolicySearcher::new(primary, blackboard.clone(), Rc::new(SystemClock));
 
         let hits = searcher.search("alpha", 8).await.unwrap();
 

@@ -163,6 +163,7 @@ impl LlmAccess {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -222,7 +223,7 @@ mod tests {
             default: lutum.clone(),
             premium: lutum,
         };
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
         let access = LlmAccess::new(
             owner.clone(),
@@ -292,7 +293,7 @@ mod tests {
             default: lutum.clone(),
             premium: lutum,
         };
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink);
         let access = LlmAccess::new(
             owner.clone(),
@@ -332,7 +333,7 @@ mod tests {
             default: lutum.clone(),
             premium: lutum,
         };
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
         let limiter = RateLimiter::new(
             RateLimitPolicy::for_module(
@@ -395,7 +396,7 @@ mod tests {
             default: lutum.clone(),
             premium: lutum,
         };
-        let sink = Arc::new(RecordingSink::default());
+        let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink);
         let access = LlmAccess::new(
             owner,

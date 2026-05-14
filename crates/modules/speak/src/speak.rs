@@ -563,7 +563,6 @@ impl SpeakModule {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
 
     use lutum::{
         AssistantInputItem, InputMessageRole, MessageContent, MockLlmAdapter, ModelInputItem,
@@ -624,7 +623,7 @@ mod tests {
         let blackboard = Blackboard::with_allocation(allocation);
         let completed = Rc::new(RefCell::new(Vec::new()));
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let sink: Arc<dyn crate::utterance::UtteranceSink> = Arc::new(CapturingUtteranceSink {
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
             completed: Rc::clone(&completed),
             done: RefCell::new(Some(done_tx)),
         });

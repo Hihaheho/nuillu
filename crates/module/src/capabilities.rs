@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use lutum::Lutum;
@@ -38,7 +37,7 @@ use crate::{
 /// [`ModuleCapabilityFactory`] so they cannot choose another owner.
 #[derive(Clone)]
 pub struct CapabilityProviders {
-    inner: Arc<CapabilityProvidersInner>,
+    inner: Rc<CapabilityProvidersInner>,
 }
 
 struct CapabilityProvidersInner {
@@ -50,8 +49,8 @@ struct CapabilityProvidersInner {
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
     activation_gates: ActivationGateHub,
-    cognition_log_port: Arc<dyn CognitionLogRepository>,
-    clock: Arc<dyn Clock>,
+    cognition_log_port: Rc<dyn CognitionLogRepository>,
+    clock: Rc<dyn Clock>,
     time_division: TimeDivision,
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
@@ -65,22 +64,22 @@ struct CapabilityProvidersInner {
 #[derive(Clone)]
 pub struct CapabilityProviderPorts {
     pub blackboard: Blackboard,
-    pub cognition_log_port: Arc<dyn CognitionLogRepository>,
-    pub clock: Arc<dyn Clock>,
+    pub cognition_log_port: Rc<dyn CognitionLogRepository>,
+    pub clock: Rc<dyn Clock>,
     pub tiers: LutumTiers,
 }
 
 /// Runtime policy and observation hooks layered on top of the boot ports.
 #[derive(Clone)]
 pub struct CapabilityProviderRuntime {
-    pub event_sink: Arc<dyn RuntimeEventSink>,
+    pub event_sink: Rc<dyn RuntimeEventSink>,
     pub policy: RuntimePolicy,
 }
 
 impl Default for CapabilityProviderRuntime {
     fn default() -> Self {
         Self {
-            event_sink: Arc::new(NoopRuntimeEventSink),
+            event_sink: Rc::new(NoopRuntimeEventSink),
             policy: RuntimePolicy::default(),
         }
     }
@@ -116,7 +115,7 @@ impl CapabilityProviders {
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         let llm_concurrency_limiter = LlmConcurrencyLimiter::new(policy.max_concurrent_llm_calls);
         Self {
-            inner: Arc::new(CapabilityProvidersInner {
+            inner: Rc::new(CapabilityProvidersInner {
                 attention_control_requests: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::RoleLoadBalanced,
@@ -259,7 +258,7 @@ impl CapabilityProviders {
         ModuleStatusReader::new(self.inner.blackboard.clone())
     }
 
-    pub fn clock(&self) -> Arc<dyn Clock> {
+    pub fn clock(&self) -> Rc<dyn Clock> {
         self.inner.clock.clone()
     }
 
@@ -292,7 +291,7 @@ impl CapabilityProviders {
 pub struct AgentRuntimeControl {
     blackboard: Blackboard,
     cognition_log_updates: CognitionLogUpdatedMailbox,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
     session_compaction_lutum: Lutum,
     session_compaction_policy: SessionCompactionPolicy,
     runtime_events: RuntimeEventEmitter,
@@ -306,7 +305,7 @@ impl AgentRuntimeControl {
             .await
     }
 
-    pub fn clock(&self) -> Arc<dyn Clock> {
+    pub fn clock(&self) -> Rc<dyn Clock> {
         self.clock.clone()
     }
 
@@ -695,7 +694,7 @@ impl ModuleCapabilityFactory {
         SceneReader::new(self.root.inner.scene.clone())
     }
 
-    pub fn clock(&self) -> Arc<dyn Clock> {
+    pub fn clock(&self) -> Rc<dyn Clock> {
         self.root.clock()
     }
 
@@ -1108,6 +1107,8 @@ pub enum ModuleRegistryError {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
@@ -1170,7 +1171,7 @@ mod tests {
 
     fn test_caps_with_cognition_repo(
         blackboard: Blackboard,
-        cognition_log_port: Arc<dyn CognitionLogRepository>,
+        cognition_log_port: Rc<dyn CognitionLogRepository>,
     ) -> CapabilityProviders {
         let adapter = Arc::new(lutum::MockLlmAdapter::new());
         let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
@@ -1178,7 +1179,7 @@ mod tests {
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
             cognition_log_port,
-            clock: Arc::new(SystemClock),
+            clock: Rc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
@@ -1279,7 +1280,7 @@ mod tests {
     async fn cognition_writer_appends_persists_publishes_and_owner_stamps() {
         let blackboard = Blackboard::default();
         let repo = RecordingCognitionLogRepository::default();
-        let caps = test_caps_with_cognition_repo(blackboard.clone(), Arc::new(repo.clone()));
+        let caps = test_caps_with_cognition_repo(blackboard.clone(), Rc::new(repo.clone()));
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 1);
         let subscriber = scoped(&caps, builtin::predict(), 0);
         let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::new(1));

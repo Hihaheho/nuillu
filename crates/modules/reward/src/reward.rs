@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -93,18 +93,18 @@ pub struct PolicyRewardUpdate {
 /// store and mirrors metadata onto the blackboard.
 #[derive(Clone)]
 pub struct PolicyValueUpdater {
-    primary_store: Arc<dyn PolicyStore>,
-    replicas: Vec<Arc<dyn PolicyStore>>,
+    primary_store: Rc<dyn PolicyStore>,
+    replicas: Vec<Rc<dyn PolicyStore>>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl PolicyValueUpdater {
     pub(crate) fn new(
-        primary_store: Arc<dyn PolicyStore>,
-        replicas: Vec<Arc<dyn PolicyStore>>,
+        primary_store: Rc<dyn PolicyStore>,
+        replicas: Vec<Rc<dyn PolicyStore>>,
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,

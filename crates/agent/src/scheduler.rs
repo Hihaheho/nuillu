@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1282,7 +1283,7 @@ fn spawn_batch_cooldown(
     module: AllocatedModule,
     kick_inbox: KickInbox,
     throttle: NextBatchThrottle,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
     activation_increase: tokio::sync::oneshot::Receiver<()>,
     allocation_change: tokio::sync::oneshot::Receiver<()>,
     parent: &tracing::Span,

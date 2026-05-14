@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -28,7 +29,7 @@ const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
 /// without taking the async lock.
 #[derive(Debug, Clone)]
 pub struct Blackboard {
-    inner: Arc<RwLock<BlackboardInner>>,
+    inner: Rc<RwLock<BlackboardInner>>,
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
@@ -230,7 +231,7 @@ impl std::fmt::Debug for ActivationIncreaseWaiter {
 impl Blackboard {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(BlackboardInner::default())),
+            inner: Rc::new(RwLock::new(BlackboardInner::default())),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
@@ -245,7 +246,7 @@ impl Blackboard {
         };
         inner.recompute_effective_allocation();
         Self {
-            inner: Arc::new(RwLock::new(inner)),
+            inner: Rc::new(RwLock::new(inner)),
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),

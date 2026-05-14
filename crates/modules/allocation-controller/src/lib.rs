@@ -147,6 +147,7 @@ pub struct AllocationControllerModule {
 }
 
 impl AllocationControllerModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         updates: MemoUpdatedInbox,
         requests: AttentionControlRequestInbox,
@@ -528,8 +529,8 @@ mod tests {
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
-            cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            clock: Arc::new(SystemClock),
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
+            clock: Rc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),

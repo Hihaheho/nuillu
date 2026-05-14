@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -90,14 +90,14 @@ impl<M: Module> ActivationGate<M> {
 
 #[derive(Clone)]
 pub(crate) struct ActivationGateHub {
-    inner: Arc<Mutex<ActivationGateHubInner>>,
+    inner: Rc<Mutex<ActivationGateHubInner>>,
     blackboard: Blackboard,
 }
 
 impl ActivationGateHub {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ActivationGateHubInner::default())),
+            inner: Rc::new(Mutex::new(ActivationGateHubInner::default())),
             blackboard,
         }
     }

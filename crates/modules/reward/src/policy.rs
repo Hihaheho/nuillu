@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -36,15 +36,15 @@ pub struct PolicyCandidate {
 /// fans out indexed writes to replica stores.
 #[derive(Clone)]
 pub struct PolicyWriter {
-    primary_store: Arc<dyn PolicyStore>,
-    replicas: Vec<Arc<dyn PolicyStore>>,
+    primary_store: Rc<dyn PolicyStore>,
+    replicas: Vec<Rc<dyn PolicyStore>>,
     blackboard: Blackboard,
 }
 
 impl PolicyWriter {
     pub(crate) fn new(
-        primary_store: Arc<dyn PolicyStore>,
-        replicas: Vec<Arc<dyn PolicyStore>>,
+        primary_store: Rc<dyn PolicyStore>,
+        replicas: Vec<Rc<dyn PolicyStore>>,
         blackboard: Blackboard,
     ) -> Self {
         Self {

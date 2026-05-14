@@ -111,6 +111,7 @@ pub fn session_compaction_cutoff(item_count: usize, prefix_ratio: f64) -> Option
     Some(cutoff.clamp(1, item_count.saturating_sub(1)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_session_if_needed(
     session: &mut Session,
     input_tokens: u64,

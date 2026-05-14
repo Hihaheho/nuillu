@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -62,13 +63,13 @@ impl RuntimeEventSink for NoopRuntimeEventSink {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeEventEmitter {
-    sink: Arc<dyn RuntimeEventSink>,
+    sink: Rc<dyn RuntimeEventSink>,
     next_sequence: Arc<AtomicU64>,
     next_llm_call: Arc<AtomicU64>,
 }
 
 impl RuntimeEventEmitter {
-    pub(crate) fn new(sink: Arc<dyn RuntimeEventSink>) -> Self {
+    pub(crate) fn new(sink: Rc<dyn RuntimeEventSink>) -> Self {
         Self {
             sink,
             next_sequence: Arc::new(AtomicU64::new(0)),

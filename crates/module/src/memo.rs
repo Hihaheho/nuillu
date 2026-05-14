@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use nuillu_blackboard::{Blackboard, MemoLogRecord, TypedMemoLogRecord};
 use nuillu_types::ModuleInstanceId;
@@ -35,7 +35,7 @@ struct MemoCore {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
     updates: MemoUpdatedMailbox,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
     events: RuntimeEventEmitter,
 }
 
@@ -44,7 +44,7 @@ impl Memo {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
@@ -64,7 +64,7 @@ impl<T: 'static> TypedMemo<T> {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
@@ -89,7 +89,7 @@ impl MemoCore {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {

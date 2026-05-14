@@ -1390,14 +1390,14 @@ fn turn_usage_tokens(usage: &LlmUsageView) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
 
-fn ensure_turn<'a>(
-    module: &'a mut ModuleState,
+fn ensure_turn(
+    module: &mut ModuleState,
     turn_id: String,
     operation: String,
     source: LlmObservationSource,
     tier: String,
     batch: Option<ModuleBatchDebugState>,
-) -> &'a mut LlmTurnState {
+) -> &mut LlmTurnState {
     if let Some(index) = module.turns.iter().position(|turn| turn.turn_id == turn_id) {
         let turn = &mut module.turns[index];
         turn.operation = operation;

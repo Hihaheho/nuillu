@@ -13,7 +13,7 @@
 //!
 //! [`ModuleRegistry::build`]: nuillu_module::ModuleRegistry::build
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -293,7 +293,7 @@ impl PolicyWindowReader {
     }
 }
 
-pub(crate) async fn fanout_policy_put(replicas: &[Arc<dyn PolicyStore>], indexed: IndexedPolicy) {
+pub(crate) async fn fanout_policy_put(replicas: &[Rc<dyn PolicyStore>], indexed: IndexedPolicy) {
     let replica_writes = replicas.iter().enumerate().map(|(replica, store)| {
         let indexed = indexed.clone();
         async move {
@@ -320,18 +320,18 @@ pub(crate) fn core_policy_record(record: PolicyRecord) -> CorePolicyRecord {
 /// handles on demand and seeds boot-time core policies.
 #[derive(Clone)]
 pub struct PolicyCapabilities {
-    primary_store: Arc<dyn PolicyStore>,
-    replicas: Vec<Arc<dyn PolicyStore>>,
+    primary_store: Rc<dyn PolicyStore>,
+    replicas: Vec<Rc<dyn PolicyStore>>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl PolicyCapabilities {
     pub fn new(
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
-        primary_store: Arc<dyn PolicyStore>,
-        replicas: Vec<Arc<dyn PolicyStore>>,
+        clock: Rc<dyn Clock>,
+        primary_store: Rc<dyn PolicyStore>,
+        replicas: Vec<Rc<dyn PolicyStore>>,
     ) -> Self {
         Self {
             primary_store,

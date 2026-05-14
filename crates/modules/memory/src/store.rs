@@ -5,7 +5,7 @@
 //! one of the capability wrappers below, all of which thread blackboard
 //! metadata updates alongside the storage calls.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -366,16 +366,16 @@ impl MemoryStore for NoopMemoryStore {
 /// Vector search over the primary memory store + automatic access patching.
 #[derive(Clone)]
 pub struct VectorMemorySearcher {
-    primary_store: Arc<dyn MemoryStore>,
+    primary_store: Rc<dyn MemoryStore>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl VectorMemorySearcher {
     pub fn new(
-        primary_store: Arc<dyn MemoryStore>,
+        primary_store: Rc<dyn MemoryStore>,
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
@@ -413,11 +413,11 @@ impl VectorMemorySearcher {
 /// Content lookup by memory index without implying vector search.
 #[derive(Clone)]
 pub struct MemoryContentReader {
-    primary_store: Arc<dyn MemoryStore>,
+    primary_store: Rc<dyn MemoryStore>,
 }
 
 impl MemoryContentReader {
-    pub fn new(primary_store: Arc<dyn MemoryStore>) -> Self {
+    pub fn new(primary_store: Rc<dyn MemoryStore>) -> Self {
         Self { primary_store }
     }
 
@@ -436,18 +436,18 @@ impl MemoryContentReader {
 /// Insert a new memory entry. Mirrors metadata onto the blackboard.
 #[derive(Clone)]
 pub struct MemoryWriter {
-    primary_store: Arc<dyn MemoryStore>,
-    replicas: Vec<Arc<dyn MemoryStore>>,
+    primary_store: Rc<dyn MemoryStore>,
+    replicas: Vec<Rc<dyn MemoryStore>>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl MemoryWriter {
     pub fn new(
-        primary_store: Arc<dyn MemoryStore>,
-        replicas: Vec<Arc<dyn MemoryStore>>,
+        primary_store: Rc<dyn MemoryStore>,
+        replicas: Vec<Rc<dyn MemoryStore>>,
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
@@ -527,18 +527,18 @@ impl MemoryWriter {
 /// per design it accumulates `remember_tokens` when merging.
 #[derive(Clone)]
 pub struct MemoryCompactor {
-    primary_store: Arc<dyn MemoryStore>,
-    replicas: Vec<Arc<dyn MemoryStore>>,
+    primary_store: Rc<dyn MemoryStore>,
+    replicas: Vec<Rc<dyn MemoryStore>>,
     blackboard: Blackboard,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl MemoryCompactor {
     pub fn new(
-        primary_store: Arc<dyn MemoryStore>,
-        replicas: Vec<Arc<dyn MemoryStore>>,
+        primary_store: Rc<dyn MemoryStore>,
+        replicas: Vec<Rc<dyn MemoryStore>>,
         blackboard: Blackboard,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
@@ -653,16 +653,16 @@ impl MemoryCompactor {
 /// Non-destructive writer for memory-to-memory associations.
 #[derive(Clone)]
 pub struct MemoryAssociator {
-    primary_store: Arc<dyn MemoryStore>,
-    replicas: Vec<Arc<dyn MemoryStore>>,
-    clock: Arc<dyn Clock>,
+    primary_store: Rc<dyn MemoryStore>,
+    replicas: Vec<Rc<dyn MemoryStore>>,
+    clock: Rc<dyn Clock>,
 }
 
 impl MemoryAssociator {
     pub fn new(
-        primary_store: Arc<dyn MemoryStore>,
-        replicas: Vec<Arc<dyn MemoryStore>>,
-        clock: Arc<dyn Clock>,
+        primary_store: Rc<dyn MemoryStore>,
+        replicas: Vec<Rc<dyn MemoryStore>>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             primary_store,
@@ -693,15 +693,15 @@ impl MemoryAssociator {
 /// Hard-delete a memory entry and remove the blackboard metadata mirror.
 #[derive(Clone)]
 pub struct MemoryDeleter {
-    primary_store: Arc<dyn MemoryStore>,
-    replicas: Vec<Arc<dyn MemoryStore>>,
+    primary_store: Rc<dyn MemoryStore>,
+    replicas: Vec<Rc<dyn MemoryStore>>,
     blackboard: Blackboard,
 }
 
 impl MemoryDeleter {
     pub fn new(
-        primary_store: Arc<dyn MemoryStore>,
-        replicas: Vec<Arc<dyn MemoryStore>>,
+        primary_store: Rc<dyn MemoryStore>,
+        replicas: Vec<Rc<dyn MemoryStore>>,
         blackboard: Blackboard,
     ) -> Self {
         Self {
@@ -864,11 +864,11 @@ mod tests {
         let now = record.stored_at;
         let blackboard = Blackboard::new();
         let searcher = VectorMemorySearcher::new(
-            Arc::new(StaticMemoryStore {
+            Rc::new(StaticMemoryStore {
                 record: record.clone(),
             }),
             blackboard.clone(),
-            Arc::new(FixedClock(now)),
+            Rc::new(FixedClock(now)),
         );
 
         let hits = searcher.search("alpha", 1).await.unwrap();
@@ -886,7 +886,7 @@ mod tests {
     async fn linked_lookup_does_not_record_access() {
         let record = test_record();
         let blackboard = Blackboard::new();
-        let reader = MemoryContentReader::new(Arc::new(StaticMemoryStore {
+        let reader = MemoryContentReader::new(Rc::new(StaticMemoryStore {
             record: record.clone(),
         }));
 

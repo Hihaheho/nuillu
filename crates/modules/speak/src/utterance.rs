@@ -7,7 +7,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -70,8 +69,8 @@ fn normalized_target(target: impl Into<String>) -> Option<String> {
 pub struct UtteranceWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
-    sink: Arc<dyn UtteranceSink>,
-    clock: Arc<dyn Clock>,
+    sink: Rc<dyn UtteranceSink>,
+    clock: Rc<dyn Clock>,
     next_generation: Rc<Cell<u64>>,
 }
 
@@ -79,8 +78,8 @@ impl UtteranceWriter {
     pub fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
-        sink: Arc<dyn UtteranceSink>,
-        clock: Arc<dyn Clock>,
+        sink: Rc<dyn UtteranceSink>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             owner,

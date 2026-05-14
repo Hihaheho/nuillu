@@ -63,6 +63,7 @@ pub(super) async fn drive_server_until_shutdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_visualizer_message(
     message: VisualizerClientMessage,
     visualizer: &mut VisualizerHook,

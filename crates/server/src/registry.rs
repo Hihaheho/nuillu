@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use nuillu_blackboard::{
     ActivationRatio, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
@@ -15,7 +15,7 @@ pub(super) fn server_registry(
     modules: &[RuntimeModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    utterance_sink: &Arc<dyn UtteranceSink>,
+    utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
     for module in modules {
@@ -87,7 +87,7 @@ fn register_server_module(
     all_modules: &[RuntimeModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    utterance_sink: &Arc<dyn UtteranceSink>,
+    utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
     match module {
         RuntimeModule::Sensory => {

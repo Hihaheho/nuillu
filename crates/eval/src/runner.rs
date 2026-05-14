@@ -6,6 +6,7 @@ use std::{
     num::NonZeroUsize,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -2460,14 +2461,14 @@ fn memory_page_from_records(
 pub(crate) struct EvalEnvironment {
     pub(crate) blackboard: Blackboard,
     pub(crate) caps: CapabilityProviders,
-    pub(crate) memory: Arc<dyn MemoryStore>,
+    pub(crate) memory: Rc<dyn MemoryStore>,
     pub(crate) memory_caps: MemoryCapabilities,
     pub(crate) policy_caps: PolicyCapabilities,
-    pub(crate) utterances: Arc<RecordingUtteranceSink>,
-    pub(crate) actions: Arc<ActionActivityTracker>,
-    pub(crate) events: Arc<RecordingRuntimeEventSink>,
-    pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) utterance_sink: Arc<dyn UtteranceSink>,
+    pub(crate) utterances: Rc<RecordingUtteranceSink>,
+    pub(crate) actions: Rc<ActionActivityTracker>,
+    pub(crate) events: Rc<RecordingRuntimeEventSink>,
+    pub(crate) clock: Rc<dyn Clock>,
+    pub(crate) utterance_sink: Rc<dyn UtteranceSink>,
 }
 
 struct AnchoredRealtimeClock {
@@ -2502,6 +2503,7 @@ impl Clock for AnchoredRealtimeClock {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_eval_environment(
     output_dir: &Path,
     config: &RunnerConfig,
@@ -2514,26 +2516,26 @@ pub(crate) async fn build_eval_environment(
     visualizer: Option<VisualizerEventSink>,
 ) -> Result<EvalEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
-    let events = Arc::new(RecordingRuntimeEventSink::new(
+    let events = Rc::new(RecordingRuntimeEventSink::new(
         case_id.to_string(),
         max_llm_calls,
         reporter.clone(),
         visualizer.clone(),
     ));
-    let actions = Arc::new(ActionActivityTracker::new(action_modules));
-    let utterances = Arc::new(RecordingUtteranceSink::new(
+    let actions = Rc::new(ActionActivityTracker::new(action_modules));
+    let utterances = Rc::new(RecordingUtteranceSink::new(
         case_id.to_string(),
         reporter.clone(),
         actions.clone(),
         visualizer.clone(),
     ));
-    let clock: Arc<dyn Clock> = match case_now {
-        Some(now) => Arc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
-        None => Arc::new(SystemClock),
+    let clock: Rc<dyn Clock> = match case_now {
+        Some(now) => Rc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
+        None => Rc::new(SystemClock),
     };
-    let memory: Arc<dyn MemoryStore> = Arc::new(connect_memory_store(output_dir, config).await?);
-    let policy_store: Arc<dyn PolicyStore> =
-        Arc::new(connect_policy_store(output_dir, config).await?);
+    let memory: Rc<dyn MemoryStore> = Rc::new(connect_memory_store(output_dir, config).await?);
+    let policy_store: Rc<dyn PolicyStore> =
+        Rc::new(connect_policy_store(output_dir, config).await?);
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
@@ -2556,7 +2558,7 @@ pub(crate) async fn build_eval_environment(
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
+            cognition_log_port: Rc::new(InMemoryCognitionLogRepository::new()),
             clock: clock.clone(),
             tiers,
         },
@@ -2584,7 +2586,7 @@ pub(crate) async fn build_eval_environment(
         .await
         .map_err(|err| anyhow::anyhow!("failed to load core policies: {err}"))?;
 
-    let utterance_sink: Arc<dyn UtteranceSink> = utterances.clone();
+    let utterance_sink: Rc<dyn UtteranceSink> = utterances.clone();
 
     Ok(EvalEnvironment {
         blackboard,
@@ -2760,7 +2762,7 @@ pub(crate) fn eval_registry(
     modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    utterance_sink: &Arc<dyn UtteranceSink>,
+    utterance_sink: &Rc<dyn UtteranceSink>,
     replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
@@ -2904,7 +2906,7 @@ fn register_eval_module(
     all_modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    utterance_sink: &Arc<dyn UtteranceSink>,
+    utterance_sink: &Rc<dyn UtteranceSink>,
     replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
     match module {
@@ -4180,7 +4182,7 @@ impl ActionActivityTracker {
 pub(crate) struct RecordingUtteranceSink {
     case_id: String,
     reporter: LiveReporter,
-    actions: Arc<ActionActivityTracker>,
+    actions: Rc<ActionActivityTracker>,
     complete: Arc<Mutex<Vec<RecordedUtterance>>>,
     visualizer: Option<VisualizerEventSink>,
 }
@@ -4208,7 +4210,7 @@ impl RecordingUtteranceSink {
     fn new(
         case_id: String,
         reporter: LiveReporter,
-        actions: Arc<ActionActivityTracker>,
+        actions: Rc<ActionActivityTracker>,
         visualizer: Option<VisualizerEventSink>,
     ) -> Self {
         Self {
@@ -4658,8 +4660,8 @@ mod tests {
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(CapabilityProviderPorts {
             blackboard,
-            cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            clock: Arc::new(SystemClock),
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
+            clock: Rc::new(SystemClock),
             tiers: LutumTiers {
                 cheap: lutum.clone(),
                 default: lutum.clone(),
@@ -4820,7 +4822,7 @@ id = "module-query-vector-special-memory"
     async fn recording_utterance_sink_returns_last_complete() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let actions = Arc::new(ActionActivityTracker::new(vec![builtin::speak()]));
+        let actions = Rc::new(ActionActivityTracker::new(vec![builtin::speak()]));
         let sink =
             RecordingUtteranceSink::new("test-case".to_string(), reporter, actions.clone(), None);
         let emitted_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
@@ -5437,20 +5439,20 @@ prompt = "What am I attending to?"
 
         let blackboard = Blackboard::with_allocation(allocation);
         let caps = test_caps(blackboard.clone());
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let clock: Rc<dyn Clock> = Rc::new(SystemClock);
         let memory_caps = MemoryCapabilities::new(
             blackboard.clone(),
             clock.clone(),
-            Arc::new(NoopMemoryStore),
+            Rc::new(NoopMemoryStore),
             Vec::new(),
         );
         let policy_caps = PolicyCapabilities::new(
             blackboard.clone(),
             clock,
-            Arc::new(nuillu_reward::NoopPolicyStore),
+            Rc::new(nuillu_reward::NoopPolicyStore),
             Vec::new(),
         );
-        let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
+        let utterance_sink: Rc<dyn UtteranceSink> = Rc::new(nuillu_speak::NoopUtteranceSink);
         let allocated = eval_registry(
             &selected,
             &memory_caps,
@@ -5580,20 +5582,20 @@ prompt = "What am I attending to?"
         );
         let blackboard = Blackboard::with_allocation(allocation);
         let caps = test_caps(blackboard.clone());
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let clock: Rc<dyn Clock> = Rc::new(SystemClock);
         let memory_caps = MemoryCapabilities::new(
             blackboard.clone(),
             clock.clone(),
-            Arc::new(NoopMemoryStore),
+            Rc::new(NoopMemoryStore),
             Vec::new(),
         );
         let policy_caps = PolicyCapabilities::new(
             blackboard.clone(),
             clock,
-            Arc::new(nuillu_reward::NoopPolicyStore),
+            Rc::new(nuillu_reward::NoopPolicyStore),
             Vec::new(),
         );
-        let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
+        let utterance_sink: Rc<dyn UtteranceSink> = Rc::new(nuillu_speak::NoopUtteranceSink);
         let _allocated = eval_registry(
             &selected,
             &memory_caps,

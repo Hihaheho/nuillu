@@ -286,7 +286,6 @@ impl MemoryAssociationModule {
 
         let mut links = sources
             .iter()
-            .cloned()
             .map(|source| AssociationLinkArgs {
                 from_index: record.index.to_string(),
                 to_index: source.to_string(),

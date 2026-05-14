@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use nuillu_blackboard::{Blackboard, BlackboardCommand, CognitionLogEntry};
 use nuillu_types::ModuleInstanceId;
@@ -13,18 +13,18 @@ use crate::{CognitionLogUpdated, CognitionLogUpdatedMailbox};
 pub struct CognitionWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
-    cognition_log_port: Arc<dyn CognitionLogRepository>,
+    cognition_log_port: Rc<dyn CognitionLogRepository>,
     updates: CognitionLogUpdatedMailbox,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 }
 
 impl CognitionWriter {
     pub(crate) fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
-        cognition_log_port: Arc<dyn CognitionLogRepository>,
+        cognition_log_port: Rc<dyn CognitionLogRepository>,
         updates: CognitionLogUpdatedMailbox,
-        clock: Arc<dyn Clock>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             owner,

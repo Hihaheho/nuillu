@@ -1,5 +1,6 @@
 //! Test fixtures shared by `#[cfg(test)] mod tests` blocks in this crate.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
     test_caps_inner(
         blackboard,
         RuntimePolicy::default(),
-        Arc::new(InstantSleepClock),
+        Rc::new(InstantSleepClock),
     )
 }
 
@@ -38,20 +39,20 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
 /// test specifically asserts that cooldown deadlines block long enough to
 /// coalesce subsequent work.
 pub(crate) fn test_caps_with_real_clock(blackboard: Blackboard) -> CapabilityProviders {
-    test_caps_inner(blackboard, RuntimePolicy::default(), Arc::new(SystemClock))
+    test_caps_inner(blackboard, RuntimePolicy::default(), Rc::new(SystemClock))
 }
 
 pub(crate) fn test_caps_with_policy(
     blackboard: Blackboard,
     policy: RuntimePolicy,
 ) -> CapabilityProviders {
-    test_caps_inner(blackboard, policy, Arc::new(InstantSleepClock))
+    test_caps_inner(blackboard, policy, Rc::new(InstantSleepClock))
 }
 
 fn test_caps_inner(
     blackboard: Blackboard,
     policy: RuntimePolicy,
-    clock: Arc<dyn Clock>,
+    clock: Rc<dyn Clock>,
 ) -> CapabilityProviders {
     let adapter = Arc::new(MockLlmAdapter::new());
     let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
@@ -59,7 +60,7 @@ fn test_caps_inner(
     CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard,
-            cognition_log_port: Arc::new(NoopCognitionLogRepository),
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
             clock,
             tiers: LutumTiers {
                 cheap: lutum.clone(),
