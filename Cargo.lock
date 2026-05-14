@@ -3347,6 +3347,7 @@ dependencies = [
  "nuillu-blackboard",
  "nuillu-cognition-gate",
  "nuillu-homeostatic-controller",
+ "nuillu-interoception",
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
@@ -3359,7 +3360,6 @@ dependencies = [
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
- "nuillu-vital",
  "schemars",
  "serde",
  "serde_json",
@@ -3382,6 +3382,23 @@ dependencies = [
  "nuillu-types",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nuillu-interoception"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "lutum",
+ "nuillu-blackboard",
+ "nuillu-module",
+ "nuillu-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3524,6 +3541,7 @@ dependencies = [
  "nuillu-blackboard",
  "nuillu-cognition-gate",
  "nuillu-homeostatic-controller",
+ "nuillu-interoception",
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
@@ -3535,7 +3553,6 @@ dependencies = [
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
- "nuillu-vital",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3613,19 +3630,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "nuillu-vital"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "nuillu-blackboard",
- "nuillu-module",
- "nuillu-types",
- "tokio",
 ]
 
 [[package]]

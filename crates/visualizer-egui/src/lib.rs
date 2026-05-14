@@ -570,6 +570,9 @@ mod tests {
                 stored_at: chrono::Utc::now(),
                 concepts: Vec::new(),
                 tags: Vec::new(),
+                affect_arousal: 0.0,
+                valence: 0.0,
+                emotion: String::new(),
                 content: "learned rust".to_string(),
             }],
         });

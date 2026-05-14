@@ -12,8 +12,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use nuillu_blackboard::{
-    Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, MemoLogRecord,
-    ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation, VitalState,
+    Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, InteroceptiveState,
+    MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
 use nuillu_types::ModuleInstanceId;
 
@@ -193,21 +193,21 @@ impl AllocationReader {
 }
 
 #[derive(Clone)]
-pub struct VitalReader {
+pub struct InteroceptiveReader {
     blackboard: Blackboard,
 }
 
-impl VitalReader {
+impl InteroceptiveReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
         Self { blackboard }
     }
 
-    pub async fn snapshot(&self) -> VitalState {
-        self.blackboard.read(|bb| bb.vital().clone()).await
+    pub async fn snapshot(&self) -> InteroceptiveState {
+        self.blackboard.read(|bb| bb.interoception().clone()).await
     }
 
-    pub async fn read<R>(&self, f: impl FnOnce(&VitalState) -> R) -> R {
-        self.blackboard.read(|bb| f(bb.vital())).await
+    pub async fn read<R>(&self, f: impl FnOnce(&InteroceptiveState) -> R) -> R {
+        self.blackboard.read(|bb| f(bb.interoception())).await
     }
 }
 

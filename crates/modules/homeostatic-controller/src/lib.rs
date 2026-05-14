@@ -3,8 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nuillu_blackboard::{ActivationRatio, ModuleConfig, ResourceAllocation, VitalState};
-use nuillu_module::{AllocationWriter, Module, VitalReader, VitalUpdatedInbox};
+use nuillu_blackboard::{ActivationRatio, InteroceptiveState, ModuleConfig, ResourceAllocation};
+use nuillu_module::{AllocationWriter, InteroceptiveReader, InteroceptiveUpdatedInbox, Module};
 use nuillu_types::{ModuleId, builtin};
 
 const PERIODIC_WAKEUP: Duration = Duration::from_secs(1);
@@ -24,8 +24,8 @@ enum HomeostaticPhase {
 }
 
 pub struct HomeostaticControllerModule {
-    vital_updates: VitalUpdatedInbox,
-    vital: VitalReader,
+    interoception_updates: InteroceptiveUpdatedInbox,
+    interoception: InteroceptiveReader,
     allocation: AllocationWriter,
     phase: HomeostaticPhase,
     last_phase_entered_at: Option<DateTime<Utc>>,
@@ -33,13 +33,13 @@ pub struct HomeostaticControllerModule {
 
 impl HomeostaticControllerModule {
     pub fn new(
-        vital_updates: VitalUpdatedInbox,
-        vital: VitalReader,
+        interoception_updates: InteroceptiveUpdatedInbox,
+        interoception: InteroceptiveReader,
         allocation: AllocationWriter,
     ) -> Self {
         Self {
-            vital_updates,
-            vital,
+            interoception_updates,
+            interoception,
             allocation,
             phase: HomeostaticPhase::Wake,
             last_phase_entered_at: None,
@@ -47,9 +47,9 @@ impl HomeostaticControllerModule {
     }
 
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        let vital = self.vital.snapshot().await;
+        let interoception = self.interoception.snapshot().await;
         let entered_at = self.last_phase_entered_at.unwrap_or_else(|| cx.now());
-        let next = next_phase(self.phase, entered_at, cx.now(), &vital);
+        let next = next_phase(self.phase, entered_at, cx.now(), &interoception);
         let should_emit = self.last_phase_entered_at.is_none() || next != self.phase;
         if next != self.phase {
             tracing::info!(from = ?self.phase, to = ?next, "homeostatic phase transition");
@@ -73,12 +73,12 @@ impl HomeostaticControllerModule {
 
     async fn next_batch(&mut self) -> Result<()> {
         tokio::select! {
-            update = self.vital_updates.next_item() => {
+            update = self.interoception_updates.next_item() => {
                 let _ = update?;
             }
             _ = tokio::time::sleep(PERIODIC_WAKEUP) => {}
         }
-        let _ = self.vital_updates.take_ready_items()?;
+        let _ = self.interoception_updates.take_ready_items()?;
         Ok(())
     }
 }
@@ -87,15 +87,15 @@ fn next_phase(
     current: HomeostaticPhase,
     entered_at: DateTime<Utc>,
     now: DateTime<Utc>,
-    vital: &VitalState,
+    interoception: &InteroceptiveState,
 ) -> HomeostaticPhase {
-    if vital.wake_arousal >= FORCE_WAKE {
+    if interoception.wake_arousal >= FORCE_WAKE {
         return HomeostaticPhase::Wake;
     }
     let elapsed = (now - entered_at).to_std().unwrap_or(Duration::ZERO);
     match current {
         HomeostaticPhase::Wake => {
-            if vital.nrem_pressure >= NREM_ENTER {
+            if interoception.nrem_pressure >= NREM_ENTER {
                 HomeostaticPhase::Compacting
             } else {
                 HomeostaticPhase::Wake
@@ -103,7 +103,7 @@ fn next_phase(
         }
         HomeostaticPhase::Compacting => {
             if elapsed >= MAX_NREM_DURATION
-                || (elapsed >= MIN_PHASE_DURATION && vital.nrem_pressure <= NREM_EXIT)
+                || (elapsed >= MIN_PHASE_DURATION && interoception.nrem_pressure <= NREM_EXIT)
             {
                 HomeostaticPhase::Recombining
             } else {
@@ -112,7 +112,7 @@ fn next_phase(
         }
         HomeostaticPhase::Recombining => {
             if elapsed >= MAX_REM_DURATION
-                || (elapsed >= MIN_PHASE_DURATION && vital.rem_pressure <= REM_EXIT)
+                || (elapsed >= MIN_PHASE_DURATION && interoception.rem_pressure <= REM_EXIT)
             {
                 HomeostaticPhase::Wake
             } else {
@@ -215,35 +215,35 @@ mod tests {
 
     #[test]
     fn phase_transitions_use_hysteresis_and_force_wake() {
-        let vital = VitalState {
+        let interoception = InteroceptiveState {
             nrem_pressure: 0.8,
-            ..VitalState::default()
+            ..InteroceptiveState::default()
         };
         assert_eq!(
-            next_phase(HomeostaticPhase::Wake, at(0), at(0), &vital),
+            next_phase(HomeostaticPhase::Wake, at(0), at(0), &interoception),
             HomeostaticPhase::Compacting
         );
 
-        let vital = VitalState {
+        let interoception = InteroceptiveState {
             nrem_pressure: 0.2,
-            ..VitalState::default()
+            ..InteroceptiveState::default()
         };
         assert_eq!(
-            next_phase(HomeostaticPhase::Compacting, at(0), at(1), &vital),
+            next_phase(HomeostaticPhase::Compacting, at(0), at(1), &interoception),
             HomeostaticPhase::Compacting
         );
         assert_eq!(
-            next_phase(HomeostaticPhase::Compacting, at(0), at(3), &vital),
+            next_phase(HomeostaticPhase::Compacting, at(0), at(3), &interoception),
             HomeostaticPhase::Recombining
         );
 
-        let vital = VitalState {
+        let interoception = InteroceptiveState {
             wake_arousal: 0.95,
             rem_pressure: 0.8,
-            ..VitalState::default()
+            ..InteroceptiveState::default()
         };
         assert_eq!(
-            next_phase(HomeostaticPhase::Recombining, at(0), at(3), &vital),
+            next_phase(HomeostaticPhase::Recombining, at(0), at(3), &interoception),
             HomeostaticPhase::Wake
         );
     }

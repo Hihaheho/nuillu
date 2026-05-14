@@ -52,7 +52,7 @@ query-policy
 memory
 memory-compaction
 memory-recombination
-vital
+interoception
 homeostatic-controller
 policy
 value-estimator
@@ -145,7 +145,7 @@ The intended artifact boundaries by module family are:
 | `memory-recombination` | source-tagged dream/hypothesis cognition entry |
 | `policy` | inserted policies |
 | `homeostatic-controller` | allocation drive/cap changes |
-| `vital` | vital state |
+| `interoception` | interoception state |
 
 If the intended boundary is not implemented in the executor yet, implement that
 executor support in the same change as the cases. Do not make the case score a

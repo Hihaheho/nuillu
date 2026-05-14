@@ -191,6 +191,9 @@ pub struct NewMemory {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 impl NewMemory {
@@ -206,6 +209,9 @@ impl NewMemory {
             kind: MemoryKind::Statement,
             concepts: Vec::new(),
             tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
         }
     }
 }
@@ -220,6 +226,9 @@ pub struct IndexedMemory {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 impl IndexedMemory {
@@ -233,6 +242,9 @@ impl IndexedMemory {
             kind: record.kind,
             concepts: record.concepts,
             tags: record.tags,
+            affect_arousal: record.affect_arousal,
+            valence: record.valence,
+            emotion: record.emotion,
         }
     }
 }
@@ -247,6 +259,9 @@ pub struct MemoryRecord {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +308,9 @@ impl MemoryStore for NoopMemoryStore {
             kind: mem.kind,
             concepts: mem.concepts,
             tags: mem.tags,
+            affect_arousal: mem.affect_arousal,
+            valence: mem.valence,
+            emotion: mem.emotion,
         })
     }
 
@@ -306,6 +324,9 @@ impl MemoryStore for NoopMemoryStore {
             kind: mem.kind,
             concepts: mem.concepts,
             tags: mem.tags,
+            affect_arousal: mem.affect_arousal,
+            valence: mem.valence,
+            emotion: mem.emotion,
         })
     }
 
@@ -488,6 +509,8 @@ impl MemoryWriter {
         new: NewMemory,
         decay_secs: i64,
     ) -> Result<MemoryRecord, PortError> {
+        let mut new = new;
+        self.stamp_interoception(&mut new).await;
         let rank = new.rank;
         let occurred_at = new.occurred_at;
         let now = self.clock.now();
@@ -520,6 +543,13 @@ impl MemoryWriter {
             })
             .await;
         Ok(record)
+    }
+
+    async fn stamp_interoception(&self, new: &mut NewMemory) {
+        let state = self.blackboard.read(|bb| bb.interoception().clone()).await;
+        new.affect_arousal = state.affect_arousal;
+        new.valence = state.valence;
+        new.emotion = state.emotion;
     }
 }
 
@@ -585,14 +615,18 @@ impl MemoryCompactor {
             .filter_map(|record| record.occurred_at)
             .min()
             .or_else(|| Some(self.clock.now()));
-        let new = NewMemory {
+        let mut new = NewMemory {
             content: MemoryContent::new(summary_content),
             rank: summary_rank,
             occurred_at,
             kind: MemoryKind::Reflection,
             concepts,
             tags,
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
         };
+        self.stamp_interoception(&mut new).await;
 
         let now = self.clock.now();
         let record = self.primary_store.compact(new, sources, now).await?;
@@ -633,6 +667,13 @@ impl MemoryCompactor {
         }
 
         Ok(record.index)
+    }
+
+    async fn stamp_interoception(&self, new: &mut NewMemory) {
+        let state = self.blackboard.read(|bb| bb.interoception().clone()).await;
+        new.affect_arousal = state.affect_arousal;
+        new.valence = state.valence;
+        new.emotion = state.emotion;
     }
 
     pub async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
@@ -742,6 +783,8 @@ impl MemoryDeleter {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use nuillu_module::ports::Clock;
 
@@ -760,6 +803,143 @@ mod tests {
     #[derive(Clone)]
     struct StaticMemoryStore {
         record: MemoryRecord,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingMemoryStore {
+        writes: Rc<RefCell<Vec<RecordedMemoryWrite>>>,
+    }
+
+    #[derive(Clone)]
+    enum RecordedMemoryWrite {
+        Insert(NewMemory),
+        Compact(NewMemory, Vec<MemoryIndex>),
+    }
+
+    impl RecordingMemoryStore {
+        fn record_from_new(
+            index: MemoryIndex,
+            mem: NewMemory,
+            stored_at: DateTime<Utc>,
+        ) -> MemoryRecord {
+            MemoryRecord {
+                index,
+                content: mem.content,
+                rank: mem.rank,
+                occurred_at: mem.occurred_at,
+                stored_at,
+                kind: mem.kind,
+                concepts: mem.concepts,
+                tags: mem.tags,
+                affect_arousal: mem.affect_arousal,
+                valence: mem.valence,
+                emotion: mem.emotion,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl MemoryStore for RecordingMemoryStore {
+        async fn insert(
+            &self,
+            mem: NewMemory,
+            stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            self.writes
+                .borrow_mut()
+                .push(RecordedMemoryWrite::Insert(mem.clone()));
+            Ok(Self::record_from_new(
+                MemoryIndex::new("recorded-memory"),
+                mem,
+                stored_at,
+            ))
+        }
+
+        async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
+            Ok(MemoryRecord {
+                index: mem.index,
+                content: mem.content,
+                rank: mem.rank,
+                occurred_at: mem.occurred_at,
+                stored_at: mem.stored_at,
+                kind: mem.kind,
+                concepts: mem.concepts,
+                tags: mem.tags,
+                affect_arousal: mem.affect_arousal,
+                valence: mem.valence,
+                emotion: mem.emotion,
+            })
+        }
+
+        async fn compact(
+            &self,
+            mem: NewMemory,
+            sources: &[MemoryIndex],
+            stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            self.writes
+                .borrow_mut()
+                .push(RecordedMemoryWrite::Compact(mem.clone(), sources.to_vec()));
+            Ok(Self::record_from_new(
+                MemoryIndex::new("recorded-compaction"),
+                mem,
+                stored_at,
+            ))
+        }
+
+        async fn put_compacted(
+            &self,
+            mem: IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<MemoryRecord, PortError> {
+            self.put(mem).await
+        }
+
+        async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+            let at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+            Ok(Some(MemoryRecord {
+                index: index.clone(),
+                content: MemoryContent::new("source memory"),
+                rank: MemoryRank::ShortTerm,
+                occurred_at: Some(at),
+                stored_at: at,
+                kind: MemoryKind::Statement,
+                concepts: Vec::new(),
+                tags: Vec::new(),
+                affect_arousal: 0.0,
+                valence: 0.0,
+                emotion: String::new(),
+            }))
+        }
+
+        async fn list_by_rank(&self, _rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn linked(
+            &self,
+            _q: &LinkedMemoryQuery,
+        ) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn upsert_link(
+            &self,
+            _link: NewMemoryLink,
+            _updated_at: DateTime<Utc>,
+        ) -> Result<MemoryLink, PortError> {
+            Err(PortError::InvalidInput(
+                "recording store does not support links".into(),
+            ))
+        }
+
+        async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+            Ok(())
+        }
     }
 
     #[async_trait(?Send)]
@@ -855,7 +1035,98 @@ mod tests {
             kind: MemoryKind::Statement,
             concepts: vec![MemoryConcept::new("alpha")],
             tags: vec![MemoryTag::operational("test")],
+            affect_arousal: 0.4,
+            valence: 0.2,
+            emotion: "curious".to_owned(),
         }
+    }
+
+    async fn set_test_interoception(blackboard: &Blackboard) {
+        blackboard
+            .apply(BlackboardCommand::UpdateInteroceptive {
+                patch: nuillu_blackboard::InteroceptivePatch {
+                    affect_arousal: Some(0.8),
+                    valence: Some(-0.35),
+                    emotion: Some("  tense focus  ".to_owned()),
+                    ..Default::default()
+                },
+                now: DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn memory_writer_stamps_current_interoception_on_insert() {
+        let now = DateTime::from_timestamp(1_700_000_010, 0).unwrap();
+        let blackboard = Blackboard::new();
+        set_test_interoception(&blackboard).await;
+        let store = RecordingMemoryStore::default();
+        let writer = MemoryWriter::new(
+            Rc::new(store.clone()),
+            Vec::new(),
+            blackboard,
+            Rc::new(FixedClock(now)),
+        );
+
+        let record = writer
+            .insert_entry(
+                NewMemory::statement(
+                    MemoryContent::new("affect stamped memory"),
+                    MemoryRank::ShortTerm,
+                    Some(now),
+                ),
+                60,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(record.affect_arousal, 0.8);
+        assert_eq!(record.valence, -0.35);
+        assert_eq!(record.emotion, "tense focus");
+        let writes = store.writes.borrow();
+        let RecordedMemoryWrite::Insert(new) = &writes[0] else {
+            panic!("expected insert write");
+        };
+        assert_eq!(new.affect_arousal, 0.8);
+        assert_eq!(new.valence, -0.35);
+        assert_eq!(new.emotion, "tense focus");
+    }
+
+    #[tokio::test]
+    async fn memory_compactor_stamps_current_interoception_on_summary() {
+        let now = DateTime::from_timestamp(1_700_000_010, 0).unwrap();
+        let blackboard = Blackboard::new();
+        set_test_interoception(&blackboard).await;
+        let store = RecordingMemoryStore::default();
+        let compactor = MemoryCompactor::new(
+            Rc::new(store.clone()),
+            Vec::new(),
+            blackboard,
+            Rc::new(FixedClock(now)),
+        );
+
+        let source = MemoryIndex::new("source-memory");
+        let index = compactor
+            .write_summary(
+                std::slice::from_ref(&source),
+                "summary memory".to_owned(),
+                MemoryRank::MidTerm,
+                120,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(index.as_str(), "recorded-compaction");
+        let writes = store.writes.borrow();
+        let RecordedMemoryWrite::Compact(new, sources) = &writes[0] else {
+            panic!("expected compact write");
+        };
+        assert_eq!(sources, &[source]);
+        assert_eq!(new.affect_arousal, 0.8);
+        assert_eq!(new.valence, -0.35);
+        assert_eq!(new.emotion, "tense focus");
     }
 
     #[tokio::test]

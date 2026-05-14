@@ -23,11 +23,12 @@ use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
     AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, LlmAccess, LutumTiers,
-    Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, Module, ModuleBatch,
-    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
-    SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VitalReader,
-    VitalUpdated, VitalUpdatedInbox, VitalUpdatedMailbox, VitalWriter,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, InteroceptiveReader,
+    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
+    InteroceptiveWriter, LlmAccess, LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox,
+    MemoUpdatedMailbox, Module, ModuleBatch, ModuleStatusReader, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox,
+    TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -45,7 +46,7 @@ struct CapabilityProvidersInner {
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     allocation_updates: Topic<AllocationUpdated>,
-    vital_updates: Topic<VitalUpdated>,
+    interoception_updates: Topic<InteroceptiveUpdated>,
     memo_updates: Topic<MemoUpdated>,
     sensory_input_topic: Topic<SensoryInput>,
     activation_gates: ActivationGateHub,
@@ -137,10 +138,10 @@ impl CapabilityProviders {
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
-                vital_updates: Topic::new(
+                interoception_updates: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::VitalUpdated,
+                    TopicKind::InteroceptiveUpdated,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -503,8 +504,11 @@ impl InternalHarnessIo {
         )
     }
 
-    pub fn vital_updated_mailbox(&self) -> VitalUpdatedMailbox {
-        TopicMailbox::new(self.owner.clone(), self.root.inner.vital_updates.clone())
+    pub fn interoception_updated_mailbox(&self) -> InteroceptiveUpdatedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.interoception_updates.clone(),
+        )
     }
 
     pub fn memo_updated_mailbox(&self) -> MemoUpdatedMailbox {
@@ -556,8 +560,11 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn vital_updated_inbox(&self) -> VitalUpdatedInbox {
-        TopicInbox::new_excluding_self(self.owner.clone(), self.root.inner.vital_updates.clone())
+    pub fn interoception_updated_inbox(&self) -> InteroceptiveUpdatedInbox {
+        TopicInbox::new_excluding_self(
+            self.owner.clone(),
+            self.root.inner.interoception_updates.clone(),
+        )
     }
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
@@ -643,8 +650,8 @@ impl ModuleCapabilityFactory {
         self.root.allocation_reader()
     }
 
-    pub fn vital_reader(&self) -> VitalReader {
-        VitalReader::new(self.root.inner.blackboard.clone())
+    pub fn interoception_reader(&self) -> InteroceptiveReader {
+        InteroceptiveReader::new(self.root.inner.blackboard.clone())
     }
 
     pub fn module_status_reader(&self) -> ModuleStatusReader {
@@ -681,11 +688,14 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn vital_writer(&self) -> VitalWriter {
-        VitalWriter::new(
+    pub fn interoception_writer(&self) -> InteroceptiveWriter {
+        InteroceptiveWriter::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
-            VitalUpdatedMailbox::new(self.owner.clone(), self.root.inner.vital_updates.clone()),
+            InteroceptiveUpdatedMailbox::new(
+                self.owner.clone(),
+                self.root.inner.interoception_updates.clone(),
+            ),
             self.root.inner.clock.clone(),
         )
     }

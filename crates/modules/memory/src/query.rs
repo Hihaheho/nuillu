@@ -80,6 +80,9 @@ pub struct QueryVectorMemoryHit {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 #[lutum::tool_input(name = "fetch_linked_memories", output = FetchLinkedMemoriesOutput)]
@@ -106,6 +109,9 @@ pub struct QueryVectorLinkedMemoryHit {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
     pub link: MemoryLink,
 }
 
@@ -124,13 +130,16 @@ pub struct QueryVectorMemoSearch {
     pub hit_indices: Vec<MemoryIndex>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct QueryVectorMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
     pub stored_at: DateTime<Utc>,
     pub kind: MemoryKind,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,6 +149,9 @@ pub struct QueryVectorMemoLinkedHit {
     pub occurred_at: Option<DateTime<Utc>>,
     pub stored_at: DateTime<Utc>,
     pub kind: MemoryKind,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
     pub link: MemoryLink,
 }
 
@@ -287,6 +299,9 @@ impl QueryVectorModule {
                         occurred_at: hit.occurred_at,
                         stored_at: hit.stored_at,
                         kind: hit.kind,
+                        affect_arousal: hit.affect_arousal,
+                        valence: hit.valence,
+                        emotion: hit.emotion.clone(),
                     })
                     .collect(),
                 linked_hits: linked_hits
@@ -297,6 +312,9 @@ impl QueryVectorModule {
                         occurred_at: hit.occurred_at,
                         stored_at: hit.stored_at,
                         kind: hit.kind,
+                        affect_arousal: hit.affect_arousal,
+                        valence: hit.valence,
+                        emotion: hit.emotion.clone(),
                         link: hit.link.clone(),
                     })
                     .collect(),
@@ -554,6 +572,9 @@ impl QueryVectorModule {
                     kind: record.kind,
                     concepts: record.concepts,
                     tags: record.tags,
+                    affect_arousal: record.affect_arousal,
+                    valence: record.valence,
+                    emotion: record.emotion,
                 })
                 .collect(),
         })
@@ -648,8 +669,13 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     let mut contents = Vec::new();
     for hit in hits {
         let content = hit.content.trim();
-        if !content.is_empty() && !contents.contains(&content) {
-            contents.push(content);
+        if !content.is_empty() && !contents.iter().any(|item: &String| item.ends_with(content)) {
+            contents.push(format_memory_with_affect(
+                content,
+                hit.affect_arousal,
+                hit.valence,
+                &hit.emotion,
+            ));
         }
     }
     contents.join("\n\n")
@@ -661,15 +687,39 @@ fn linked_hit_contents(hits: &[QueryVectorLinkedMemoryHit]) -> String {
         let content = hit.content.trim();
         if !content.is_empty() && !contents.iter().any(|item| item.ends_with(content)) {
             contents.push(format!(
-                "[{:?} {:?} {} -> {}] {content}",
+                "[{:?} {:?} {} -> {}] {}",
                 hit.link.relation,
                 hit.link.freeform_relation,
                 hit.link.from_memory,
-                hit.link.to_memory
+                hit.link.to_memory,
+                format_memory_with_affect(content, hit.affect_arousal, hit.valence, &hit.emotion)
             ));
         }
     }
     contents.join("\n\n")
+}
+
+fn format_memory_with_affect(
+    content: &str,
+    affect_arousal: f32,
+    valence: f32,
+    emotion: &str,
+) -> String {
+    let emotion = emotion.trim();
+    if emotion.is_empty() && affect_arousal == 0.0 && valence == 0.0 {
+        return content.to_owned();
+    }
+    format!(
+        "[stored affect: arousal {:.2}, valence {:.2}, emotion {}] {}",
+        affect_arousal,
+        valence,
+        if emotion.is_empty() {
+            "unknown"
+        } else {
+            emotion
+        },
+        content
+    )
 }
 
 fn render_memo(
@@ -713,6 +763,9 @@ fn render_linked_hit(linked: LinkedMemoryRecord, now: DateTime<Utc>) -> QueryVec
         kind: record.kind,
         concepts: record.concepts,
         tags: record.tags,
+        affect_arousal: record.affect_arousal,
+        valence: record.valence,
+        emotion: record.emotion,
         link: linked.link,
     }
 }

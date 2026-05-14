@@ -12,8 +12,8 @@ use tokio::sync::{RwLock, oneshot};
 use crate::{
     ActivationRatio, AgenticDeadlockMarker, AllocationLimits, BlackboardCommand, CognitionLog,
     CognitionLogEntryRecord, CognitionLogRecord, CognitionLogSet, CorePolicyRecord,
-    IdentityMemoryRecord, MemoryMetadata, ModulePolicy, PolicyMetadata, ResourceAllocation,
-    VitalState,
+    IdentityMemoryRecord, InteroceptiveState, MemoryMetadata, ModulePolicy, PolicyMetadata,
+    ResourceAllocation,
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
@@ -49,7 +49,7 @@ pub struct BlackboardInner {
     cognition_logs: HashMap<ModuleInstanceId, CognitionLog>,
     cognition_entry_log: Vec<CognitionLogEntryRecord>,
     cognition_next_index: u64,
-    vital: VitalState,
+    interoception: InteroceptiveState,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
     identity_memories: Vec<IdentityMemoryRecord>,
@@ -441,7 +441,7 @@ impl Default for BlackboardInner {
             cognition_logs: HashMap::new(),
             cognition_entry_log: Vec::new(),
             cognition_next_index: 0,
-            vital: VitalState::default(),
+            interoception: InteroceptiveState::default(),
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
             identity_memories: Vec::new(),
@@ -645,8 +645,8 @@ impl BlackboardInner {
         &self.core_policies
     }
 
-    pub fn vital(&self) -> &VitalState {
-        &self.vital
+    pub fn interoception(&self) -> &InteroceptiveState {
+        &self.interoception
     }
 
     pub fn allocation(&self) -> &ResourceAllocation {
@@ -723,8 +723,8 @@ impl BlackboardInner {
                 self.cognition_next_index = self.cognition_next_index.saturating_add(1);
                 self.cognition_logs.entry(source).or_default().append(entry);
             }
-            BlackboardCommand::UpdateVital { patch, now } => {
-                self.vital.apply_patch(patch, now);
+            BlackboardCommand::UpdateInteroceptive { patch, now } => {
+                self.interoception.apply_patch(patch, now);
             }
             BlackboardCommand::RecordAgenticDeadlockMarker(marker) => {
                 self.agentic_deadlock_marker = Some(marker);

@@ -1,23 +1,23 @@
 use std::rc::Rc;
 
-use nuillu_blackboard::{Blackboard, BlackboardCommand, VitalPatch};
+use nuillu_blackboard::{Blackboard, BlackboardCommand, InteroceptivePatch};
 use nuillu_types::ModuleInstanceId;
 
 use crate::ports::Clock;
-use crate::{VitalUpdated, VitalUpdatedMailbox};
+use crate::{InteroceptiveUpdated, InteroceptiveUpdatedMailbox};
 
-pub struct VitalWriter {
+pub struct InteroceptiveWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
-    updates: VitalUpdatedMailbox,
+    updates: InteroceptiveUpdatedMailbox,
     clock: Rc<dyn Clock>,
 }
 
-impl VitalWriter {
+impl InteroceptiveWriter {
     pub(crate) fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
-        updates: VitalUpdatedMailbox,
+        updates: InteroceptiveUpdatedMailbox,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
@@ -28,18 +28,18 @@ impl VitalWriter {
         }
     }
 
-    pub async fn update(&self, patch: VitalPatch) {
+    pub async fn update(&self, patch: InteroceptivePatch) {
         self.blackboard
-            .apply(BlackboardCommand::UpdateVital {
+            .apply(BlackboardCommand::UpdateInteroceptive {
                 patch,
                 now: self.clock.now(),
             })
             .await;
 
-        if self.updates.publish(VitalUpdated).await.is_err() {
+        if self.updates.publish(InteroceptiveUpdated).await.is_err() {
             tracing::trace!(
                 owner = %self.owner,
-                "vital update had no active subscribers"
+                "interoception update had no active subscribers"
             );
         }
     }

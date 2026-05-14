@@ -278,6 +278,9 @@ impl MemoryAssociationModule {
                         .map(memory_concept_from_input)
                         .collect(),
                     tags: args.tags.into_iter().map(memory_tag_from_input).collect(),
+                    affect_arousal: 0.0,
+                    valence: 0.0,
+                    emotion: String::new(),
                 },
                 args.decay_secs,
             )

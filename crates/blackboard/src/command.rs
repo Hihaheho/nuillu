@@ -3,8 +3,8 @@ use nuillu_types::{MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIn
 
 use crate::{
     AgenticDeadlockMarker, AllocationLimits, CognitionLogEntry, CorePolicyRecord,
-    IdentityMemoryRecord, MemoryMetaPatch, ModulePolicy, ModuleRunStatus, PolicyMetaPatch,
-    ResourceAllocation, UtteranceProgress, VitalPatch,
+    IdentityMemoryRecord, InteroceptivePatch, MemoryMetaPatch, ModulePolicy, ModuleRunStatus,
+    PolicyMetaPatch, ResourceAllocation, UtteranceProgress,
 };
 
 /// Internal blackboard mutation. Constructed only by the agent's
@@ -35,8 +35,8 @@ pub enum BlackboardCommand {
         source: ModuleInstanceId,
         entry: CognitionLogEntry,
     },
-    UpdateVital {
-        patch: VitalPatch,
+    UpdateInteroceptive {
+        patch: InteroceptivePatch,
         now: DateTime<Utc>,
     },
     RecordAgenticDeadlockMarker(AgenticDeadlockMarker),

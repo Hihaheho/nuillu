@@ -6,8 +6,8 @@ use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
+    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox,
+    Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
     compact_session_if_needed, format_available_faculties, format_current_attention_guidance,
     format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
     memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
@@ -60,6 +60,7 @@ allocation decisions. Do not invent facts. Return plain text only."#;
 fn format_allocation_controller_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
     current: &nuillu_module::ResourceAllocation,
+    interoception: &nuillu_blackboard::InteroceptiveState,
     modules: &[(ModuleId, &'static str)],
     stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
 ) -> String {
@@ -72,6 +73,20 @@ fn format_allocation_controller_context(
     if let Some(section) = format_current_attention_guidance(current) {
         sections.push(section);
     }
+    sections.push(format!(
+        "Current interoception: mode={:?}; wake_arousal={:.2}; nrem_pressure={:.2}; rem_pressure={:.2}; affect_arousal={:.2}; valence={:.2}; emotion={}",
+        interoception.mode,
+        interoception.wake_arousal,
+        interoception.nrem_pressure,
+        interoception.rem_pressure,
+        interoception.affect_arousal,
+        interoception.valence,
+        if interoception.emotion.trim().is_empty() {
+            "unknown"
+        } else {
+            interoception.emotion.trim()
+        }
+    ));
     if let Some(section) = format_available_faculties(modules) {
         sections.push(section);
     }
@@ -136,6 +151,7 @@ pub struct AllocationControllerModule {
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
     allocation_reader: AllocationReader,
+    interoception: InteroceptiveReader,
     allocation_writer: AllocationWriter,
     memo: Memo,
     llm: LlmAccess,
@@ -154,6 +170,7 @@ impl AllocationControllerModule {
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
         allocation_reader: AllocationReader,
+        interoception: InteroceptiveReader,
         allocation_writer: AllocationWriter,
         memo: Memo,
         llm: LlmAccess,
@@ -166,6 +183,7 @@ impl AllocationControllerModule {
             blackboard,
             cognition_log,
             allocation_reader,
+            interoception,
             allocation_writer,
             memo,
             llm,
@@ -230,6 +248,7 @@ impl AllocationControllerModule {
             })
             .await;
         let current = self.allocation_reader.snapshot().await;
+        let interoception = self.interoception.snapshot().await;
         let allowed_modules = self.allocation_writer.allowed_drive_modules().to_vec();
         let controller_schema = self
             .allocation_reader
@@ -249,6 +268,7 @@ impl AllocationControllerModule {
             .push_ephemeral_system(format_allocation_controller_context(
                 &rank_counts,
                 &visible_current,
+                &interoception,
                 &visible_modules,
                 stuckness.as_ref(),
             ));
@@ -617,6 +637,7 @@ mod tests {
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
+                    caps.interoception_reader(),
                     caps.allocation_writer(
                         vec![builtin::allocation_controller(), builtin::sensory()],
                         Vec::new(),

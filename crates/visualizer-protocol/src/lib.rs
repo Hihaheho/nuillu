@@ -474,6 +474,9 @@ pub struct MemoryRecordView {
     pub stored_at: DateTime<Utc>,
     pub concepts: Vec<MemoryConceptView>,
     pub tags: Vec<MemoryTagView>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
     pub content: String,
 }
 

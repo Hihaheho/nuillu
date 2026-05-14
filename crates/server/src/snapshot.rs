@@ -88,6 +88,9 @@ pub fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
                 confidence: tag.confidence,
             })
             .collect(),
+        affect_arousal: record.affect_arousal,
+        valence: record.valence,
+        emotion: record.emotion,
         content: record.content.as_str().to_string(),
     }
 }

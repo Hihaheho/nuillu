@@ -74,7 +74,7 @@ nuillu-allocation-controller = { path = "crates/modules/allocation-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
 nuillu-memory = { path = "crates/modules/memory" }
-nuillu-vital = { path = "crates/modules/vital" }
+nuillu-interoception = { path = "crates/modules/interoception" }
 nuillu-homeostatic-controller = { path = "crates/modules/homeostatic-controller" }
 nuillu-reward = { path = "crates/modules/reward" }
 nuillu-predict = { path = "crates/modules/predict" }

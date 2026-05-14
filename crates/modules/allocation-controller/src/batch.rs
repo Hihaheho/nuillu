@@ -196,6 +196,7 @@ mod tests {
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
                         caps.allocation_reader(),
+                        caps.interoception_reader(),
                         caps.allocation_writer(
                             vec![nuillu_types::builtin::allocation_controller()],
                             Vec::new(),

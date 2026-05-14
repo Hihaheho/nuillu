@@ -62,7 +62,7 @@ variants.memory = { = "memory", $variant => "literal" }
 variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
 variants.memory-association = { = "memory-association", $variant => "literal" }
 variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
-variants.vital = { = "vital", $variant => "literal" }
+variants.interoception = { = "interoception", $variant => "literal" }
 variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
 variants.policy = { = "policy", $variant => "literal" }
 variants.value-estimator = { = "value-estimator", $variant => "literal" }

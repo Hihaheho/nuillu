@@ -89,6 +89,9 @@ content = `$types.nullable-text`
 content.$optional = true
 content-rank = `$types.nullable-memory-rank`
 content-rank.$optional = true
+affect-arousal = `float`
+valence = `float`
+emotion = `text`
 metadata = `$types.memory-metadata`
 missing-content = `boolean`
 

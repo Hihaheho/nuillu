@@ -181,7 +181,7 @@ pub mod builtin {
         memory_compaction     => "memory-compaction",
         memory_association    => "memory-association",
         memory_recombination  => "memory-recombination",
-        vital                 => "vital",
+        interoception        => "interoception",
         homeostatic_controller => "homeostatic-controller",
         policy                => "policy",
         value_estimator       => "value-estimator",

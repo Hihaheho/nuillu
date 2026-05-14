@@ -1,6 +1,6 @@
 # Implementation Design
 
-Date: 2026-05-07
+Date: 2026-05-14
 Scope: Runtime and capability implementation for `attention-schema.md` on top of `lutum`.
 
 This document is the implementation source of truth. It describes the desired architecture, not work progress.
@@ -28,6 +28,8 @@ This document is the implementation source of truth. It describes the desired ar
 17. **Registry-derived controller schema** — The allocation-controller structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
 18. **Free-form memo logs** — `Memo` appends durable module-output log entries. Each entry is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Modules consume this surface through unread memo logs and keep any needed durable context in their own persistent `Session` plus compaction; there is no latest-memo snapshot read API. Structured output is reserved for runtime control decisions whose fields are read by code.
 19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and is reinforced by **reward** through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop split actor/critic style: `policy` proposes new behaviors as `(trigger, behavior)` pairs; `query-policy` retrieves candidates by vector search over the `trigger` field only; `value-estimator` predicts each retrieved policy's `expected_reward` in the current context (critic); `reward` aggregates the 6-source `ObservedReward`, computes `td_error = observed_reward − expected_reward`, and applies value, expected-reward, and confidence deltas through `PolicyValueUpdater::reinforce`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. Creating new policy entries belongs to `policy`; predicting value belongs to `value-estimator`; updating value, expected reward, confidence, rank, and reward tokens belongs to `reward`; retrieval belongs to `query-policy`. The retrieval module that surfaces memories is named `query-memory` (the role) rather than `query-vector` (the implementation); the underlying crate, tool ids, and `VectorMemorySearcher` capability keep their names for now and are renamed in a follow-up implementation pass.
+20. **Interoception and homeostasis are separate** — `interoception` owns the canonical internal-state estimate: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. `homeostatic-controller` reads that state and regulates allocation, but it does not estimate internal state. There is no separate `emotion` module in v1.
+21. **Memory records carry storage-time affect context** — `MemoryWriter` and `MemoryCompactor` stamp new records with the current `InteroceptiveState` affect fields (`affect_arousal`, `valence`, `emotion`). These fields are storage-time context, not truth labels and not later reinterpretation.
 
 ---
 
@@ -48,6 +50,8 @@ crates/
     query-policy/             # blackboard/policy store search -> query-policy memo logs
     memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
     memory-compaction/        # memory metadata/content -> merges
+    interoception/            # memo/cognition/allocation context -> internal state estimate
+    homeostatic-controller/   # interoceptive state -> sleep-like allocation drive/caps
     policy/                   # blackboard snapshot -> tentative (trigger, behavior) policy inserts
     value-estimator/          # query-policy memo + cognition context -> expected_reward predictions (critic)
     reward/                   # ObservedReward + value-estimator memo -> TD-error -> policy value/rank/confidence updates
@@ -182,6 +186,7 @@ pub enum AttentionControlRequest {
     Query { question: String, reason: Option<String> },
     SelfModel { question: String, reason: Option<String> },
     Memory { content: String, importance: MemoryImportance, reason: String },
+    Policy { reason: String, candidate_trigger: Option<String>, candidate_behavior: Option<String> },
 }
 pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
 pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
@@ -215,6 +220,30 @@ pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
 pub struct AllocationUpdated;
 pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 
+pub struct InteroceptiveUpdated;
+pub type InteroceptiveUpdatedInbox = TopicInbox<InteroceptiveUpdated>;
+
+pub struct InteroceptiveState {
+    pub mode: InteroceptiveMode,
+    pub wake_arousal: f32,      // 0.0..=1.0
+    pub nrem_pressure: f32,     // 0.0..=1.0
+    pub rem_pressure: f32,      // 0.0..=1.0
+    pub affect_arousal: f32,    // 0.0..=1.0
+    pub valence: f32,           // -1.0..=1.0
+    pub emotion: String,        // untyped free text
+    pub last_updated: DateTime<Utc>,
+}
+
+pub struct InteroceptivePatch {
+    pub mode: Option<InteroceptiveMode>,
+    pub wake_arousal: Option<f32>,
+    pub nrem_pressure: Option<f32>,
+    pub rem_pressure: Option<f32>,
+    pub affect_arousal: Option<f32>,
+    pub valence: Option<f32>,
+    pub emotion: Option<String>,
+}
+
 pub enum MemoryImportance {
     Normal,
     High,
@@ -228,6 +257,7 @@ Delivery policy is per topic:
 - `CognitionLogUpdated` is fanout: every active subscriber replica receives the wake signal.
 - `MemoUpdated` is fanout with self-filtering at the inbox handle: every active subscriber replica receives memo writes except its own writes.
 - `AllocationUpdated` is fanout: every active subscriber replica receives the wake signal when effective allocation or guidance changes.
+- `InteroceptiveUpdated` is fanout with self-filtering at the inbox handle: active subscribers receive wake signals when the canonical internal-state estimate changes.
 - `AttentionControlRequest` and `SensoryInput` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin. Boot wiring grants `AttentionControlRequestInbox` only to allocation-controller.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
@@ -368,6 +398,7 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `SensoryInputInbox` | yes | subscribe to external observations |
 | `MemoUpdatedInbox` | yes | subscribe to memo-update wake signals, excluding the holder's own memo writes |
 | `AllocationUpdatedInbox` | yes | subscribe to effective allocation/guidance changes |
+| `InteroceptiveUpdatedInbox` | yes | subscribe to interoceptive-state changes |
 | `AttentionControlRequestMailbox` | yes | publish internal attention-control bids to allocation-controller |
 | `AttentionControlRequestInbox` | yes | subscribe to internal attention-control bids; boot wiring grants this only to allocation-controller |
 | `Memo` | yes | append/read holder instance's own bounded indexed memo queue |
@@ -375,6 +406,7 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `BlackboardReader` | no | read whole blackboard through compact grouped views |
 | `CognitionLogReader` | no | read the cognition-log set only |
 | `AllocationReader` | no | read effective allocation snapshot and, for controller prompts, registry cap metadata |
+| `InteroceptiveReader` | no | read the current `InteroceptiveState` snapshot |
 | `ModuleStatusReader` | no | read scheduler-owned module run status |
 | `VectorMemorySearcher` | no | primary-store memory search + access metadata patch |
 | `MemoryContentReader` | no | primary-store content lookup by memory index |
@@ -382,6 +414,7 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `MemoryCompactor` | no | store-atomic compaction + storage-replica fan-out + remember-token increment |
 | `CognitionWriter` | yes | append holder instance's cognition log + persist + publish update |
 | `AllocationWriter` | yes | record holder controller instance's allocation proposal |
+| `InteroceptiveWriter` | yes | update canonical internal state + publish `InteroceptiveUpdated` |
 | `UtteranceWriter` | yes | emit app-facing speech actions for one speak replica + persist/notify through an adapter |
 | `Clock` | no | injected current time for timestamping and relative-time normalization |
 | `TimeDivision` | no | load cognition-boundary age buckets from `configs/time-division.eure` |
@@ -511,9 +544,9 @@ The module may summarize content as part of its decision, but its architectural 
 
 ### Allocation Controller
 
-Capabilities: `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `AllocationWriter`, `Memo`, `LlmAccess`.
 
-Wakes on memo updates, excluding its own memo writes, and internal `AttentionControlRequest` bids. It reads unread memo-log entries into a persistent `Session`, plus current attention-control requests, memory metadata, cognition-log set, effective allocation, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
+Wakes on memo updates, excluding its own memo writes, and internal `AttentionControlRequest` bids. It reads unread memo-log entries into a persistent `Session`, plus current attention-control requests, memory metadata, cognition-log set, effective allocation, interoceptive state, and registry cap metadata. It writes this controller replica's allocation proposal; the runtime averages active proposals into the effective allocation.
 
 The controller prompt receives a registry-derived JSON Schema. The schema enumerates known module ids and exposes exactly `activation_ratio`, `guidance`, and `tier` for each allocation entry. Runtime parsing clamps `activation_ratio` to `0.0..=1.0`; active replicas are derived later from the target module's `cap_range`.
 
@@ -551,31 +584,45 @@ Handles read-only file-search retrieval from controller guidance. Allocation upd
 
 Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryWriter`, `LlmAccess`.
 
-Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and allocation guidance are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and preservation guidance as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`.
+Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and allocation guidance are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and preservation guidance as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
 
 ### Memory Compaction
 
 Capabilities: `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryCompactor`, `LlmAccess`.
 
-Fetches related memory contents and merges redundant entries while accumulating remember tokens. Allocation updates wake it to consider compaction guidance.
+Fetches related memory contents and merges redundant entries while accumulating remember tokens. Allocation updates wake it to consider compaction guidance. `MemoryCompactor` stamps the current `InteroceptiveState` affect fields onto each summary record before storage.
+
+### Interoception
+
+Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `InteroceptiveWriter`, `LlmAccess`.
+
+Maintains the canonical internal-state estimate. The state type is `InteroceptiveState`; updates flow through `InteroceptivePatch`; readers and writers are `InteroceptiveReader` and `InteroceptiveWriter`; changes publish `InteroceptiveUpdated`.
+
+The deterministic part preserves the existing sleep-pressure dynamics: cognition volume raises `nrem_pressure` and `wake_arousal`, remember-token accumulation relieves NREM pressure and raises REM pressure, memory-recombination cognition entries relieve REM pressure, and elapsed time decays wake arousal while slowly increasing NREM pressure. The LLM part uses structured output only for `affect_arousal`, `valence`, and `emotion`, then clamps `affect_arousal` to `0.0..=1.0`, clamps `valence` to `-1.0..=1.0`, and trims `emotion` as untyped text.
+
+### Homeostatic Controller
+
+Capabilities: `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter`.
+
+Regulates allocation from the current interoceptive state. It drives memory compaction/association during NREM-like pressure, drives memory recombination during REM-like pressure, and caps other modules during those phases. It has no LLM and no blackboard reader; it does not estimate wake pressure, affect arousal, valence, or emotion.
 
 ### Policy
 
-Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `PolicyWriter`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `InteroceptiveReader`, `PolicyWriter`, `LlmAccess`.
 
-Decides whether a successful or distinctive behavior pattern visible in recent cognition-log entries and module memo logs should be preserved as a tentative policy. Cognition-log updates and allocation guidance are wake paths. Candidates include speak completion memos, surprise-resolved sequences, and explicit controller policy-formation guidance. Each persisted record is a `(trigger, behavior)` pair: `trigger` is the situation description that will be embedded and matched by `query-policy`, and `behavior` is the action/pattern to apply when the trigger matches. Only persists records the LLM chooses to write through `insert_policy`; all new entries start at `PolicyRank::Tentative` with `value = 0.0`, `expected_reward = 0.0`, `confidence = 0.0`, and `reward_tokens = 0`. The module may reject, normalize, deduplicate, or merge candidates against existing policies and may rewrite an existing trigger to broaden or narrow its scope when it inserts a refined record. It does not modify existing policy `value`, `expected_reward`, `confidence`, `rank`, `reward_tokens`, or `decay` — those mutations belong to `reward`. It does not write memory, cognition-log entries, allocation, or memos.
+Decides whether a successful or distinctive behavior pattern visible in recent cognition-log entries, module memo logs, allocation guidance, and current interoceptive context should be preserved as a tentative policy. Cognition-log updates and allocation guidance are wake paths. Candidates include speak completion memos, surprise-resolved sequences, and explicit controller policy-formation guidance. Each persisted record is a `(trigger, behavior)` pair: `trigger` is the situation description that will be embedded and matched by `query-policy`, and `behavior` is the action/pattern to apply when the trigger matches. Only persists records the LLM chooses to write through `insert_policy`; all new entries start at `PolicyRank::Tentative` with `value = 0.0`, `expected_reward = 0.0`, `confidence = 0.0`, and `reward_tokens = 0`. The module may reject, normalize, deduplicate, or merge candidates against existing policies and may rewrite an existing trigger to broaden or narrow its scope when it inserts a refined record. It does not modify existing policy `value`, `expected_reward`, `confidence`, `rank`, `reward_tokens`, or `decay` — those mutations belong to `reward`. It does not write memory, cognition-log entries, allocation, or memos.
 
 ### Value Estimator
 
-Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `Memo`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `Memo`, `LlmAccess`.
 
-Predicts the `expected_reward` for each policy currently surfaced by `query-policy` in the current cognitive context. It is the **critic** half of the actor/critic split: `query-policy` retrieves candidates, value-estimator scores them. Wakes primarily on `query-policy` memo updates (filtered through `MemoUpdatedInbox`); cognition-log updates and allocation guidance can also wake it when the context changes meaningfully between retrievals. Reads the retrieved policy entries (trigger, behavior, stored `expected_reward`, `confidence`) plus the recent cognition-log window, then writes a free-form memo containing a list of `(policy_index, predicted_expected_reward, rationale)` entries. The memo is the per-window prediction baseline that `reward` later compares against `ObservedReward` to compute `td_error`. Value-estimator does not modify policy state, write memory, write cognition-log entries, write allocation, or call `PolicyValueUpdater`. Its predictions can refine or override the stored `expected_reward` for the current window without persisting, leaving context-dependent valuation as a v2 schema extension.
+Predicts the `expected_reward` for each policy currently surfaced by `query-policy` in the current cognitive context. It is the **critic** half of the actor/critic split: `query-policy` retrieves candidates, value-estimator scores them. Wakes primarily on `query-policy` memo updates (filtered through `MemoUpdatedInbox`); cognition-log updates and allocation guidance can also wake it when the context changes meaningfully between retrievals. Reads the retrieved policy entries (trigger, behavior, stored `expected_reward`, `confidence`) plus the recent cognition-log window and current interoceptive state, then writes a free-form memo containing a list of `(policy_index, predicted_expected_reward, rationale)` entries. The memo is the per-window prediction baseline that `reward` later compares against `ObservedReward` to compute `td_error`. Value-estimator does not modify policy state, write memory, write cognition-log entries, write allocation, or call `PolicyValueUpdater`. Its predictions can refine or override the stored `expected_reward` for the current window without persisting, leaving context-dependent valuation as a v2 schema extension.
 
 ### Reward
 
-Capabilities: `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `PolicyValueUpdater`, `AttentionControlRequestMailbox`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `AllocationReader`, `InteroceptiveReader`, `PolicyValueUpdater`, `AttentionControlRequestMailbox`, `Memo`, `LlmAccess`.
 
-Closes the TD loop. Aggregates the v1 6-source `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise memos, speak completion memos, sensory memos (extrinsic signals), and controller guidance, then collapses the structured reward into a scalar `observed_scalar` (configured aggregation; v1 default is summed positives minus summed penalties). Pairs `observed_scalar` with the most recent value-estimator memo for the same policy retrieval window to compute `td_error = observed_scalar − expected_reward`. Applies the TD-0 update through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)`, where v1 deltas follow:
+Closes the TD loop. Aggregates the v1 6-source `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise memos, speak completion memos, sensory memos (extrinsic signals), controller guidance, and current interoceptive context, then collapses the structured reward into a scalar `observed_scalar` (configured aggregation; v1 default is summed positives minus summed penalties). Pairs `observed_scalar` with the most recent value-estimator memo for the same policy retrieval window to compute `td_error = observed_scalar − expected_reward`. Applies the TD-0 update through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)`, where v1 deltas follow:
 
 ```
 expected_reward_delta = α · td_error
@@ -656,7 +703,7 @@ cognition-gate, allocation-controller, attention-schema, self-model, query-memor
 
 `module::ports` defines adapter boundaries:
 
-- `MemoryStore`: replicated memory content plus adapter-owned search/indexing state. The primary store assigns `MemoryIndex` values; replica stores accept primary-assigned indexes. These storage replicas are persistence mirrors and are not module replicas. The store also owns memory's access-based rank elevation: when a read path records access (`record_access: true`), the store updates the in-window access counter and, when the configured threshold for the current rank is reached, promotes the entry to the next rank, resets the decay timer to that rank's default, and zeroes the in-window counter. Modules do not see this mechanism beyond the resulting metadata. v1 thresholds (`ShortTerm → MidTerm` at ≥ 3 accesses, `MidTerm → LongTerm` at ≥ 5, `LongTerm → Permanent` at ≥ 8; `Permanent` has no runtime promotion, `Identity` is boot-only) live in `configs/memory-reinforcement.eure` and are tunable without spec changes.
+- `MemoryStore`: replicated memory content plus adapter-owned search/indexing state. Each `MemoryRecord` holds `(index, content, rank, occurred_at, stored_at, kind, concepts, tags, affect_arousal, valence, emotion)`. The affect fields are storage-time interoceptive context copied by `MemoryWriter` or `MemoryCompactor`; the store persists and returns them but does not reinterpret them. The primary store assigns `MemoryIndex` values; replica stores accept primary-assigned indexes. These storage replicas are persistence mirrors and are not module replicas. The store also owns memory's access-based rank elevation: when a read path records access (`record_access: true`), the store updates the in-window access counter and, when the configured threshold for the current rank is reached, promotes the entry to the next rank, resets the decay timer to that rank's default, and zeroes the in-window counter. Modules do not see this mechanism beyond the resulting metadata. v1 thresholds (`ShortTerm → MidTerm` at ≥ 3 accesses, `MidTerm → LongTerm` at ≥ 5, `LongTerm → Permanent` at ≥ 8; `Permanent` has no runtime promotion, `Identity` is boot-only) live in `configs/memory-reinforcement.eure` and are tunable without spec changes.
 - `PolicyStore`: replicated policy content plus adapter-owned indexing state, parallel to `MemoryStore`. Each `PolicyRecord` holds `(rank, trigger, behavior, expected_reward, confidence, value, reward_tokens, decay, usage_history)`. `trigger` carries both the prose situation description and its embedding; `behavior` is the action/pattern text. The primary store assigns `PolicyIndex` values; replica stores accept primary-assigned indexes. Methods: `insert(NewPolicy) -> PolicyIndex`, `put(IndexedPolicy)`, `get(&PolicyIndex)`, `list_by_rank(PolicyRank)`, `search(&TriggerQuery)`, `reinforce(&PolicyIndex, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta) -> PolicyRecord`, and `delete(&PolicyIndex)`. `search()` performs vector similarity over the `trigger` embedding only; `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never participate in scoring. Decay is applied by the store. Rank changes are driven only by `reinforce()` — when `value` crosses a tier threshold with sufficient `reward_tokens` — or by decay expiry; access never elevates policy rank. `Core` rank is boot-only / manually seeded in v1, parallel to `Identity` memory.
 - `ObservedReward`: structured v1 reward payload `{ external, task, social, cost, risk, novelty }` (six `f32` channels). `external` carries explicit user/environment feedback, `task` covers task-completion signals, `social` covers conversation-quality signals, `cost` is a non-negative penalty for token/time/tool expense, `risk` is a non-negative penalty for uncertainty/danger, and `novelty` is an intrinsic exploration bonus. The `reward` module aggregates an `ObservedReward` from surprise, speak-completion, sensory, and controller memos, then collapses it to a scalar for TD comparison. Channels are not stored on `PolicyRecord` in v1 — only the aggregated `value` and `expected_reward` are persisted — but the reward memo records the full breakdown for audit and future context-aware extensions.
 - `FileSearchProvider`: read-only ripgrep-like file search with pattern, regex/literal mode, invert match, case sensitivity, context lines, and maximum match count.
@@ -686,7 +733,7 @@ fallback-longest-tag = "before_24hour"
 }
 ```
 
-Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` inserts new content into the primary store first, then mirrors the primary-assigned `MemoryIndex` to replica stores with indexed writes. `MemoryCompactor` uses store-level atomic compaction: primary `compact(new, sources)` must assign the merged `MemoryIndex` and atomically create the merged record while removing all source records; replica `put_compacted(indexed, sources)` must atomically mirror that replacement for the primary-assigned id. Memory metadata is mirrored once on the blackboard after primary success. Primary write/compaction failure fails the operation before metadata changes. Secondary failures are logged. Concrete adapters may be native-only; WASM builds use adapter alternatives.
+Memory content identity is owned by the primary `MemoryStore`. `MemoryWriter` stamps new content with the current interoceptive `affect_arousal`, `valence`, and `emotion`, inserts into the primary store first, then mirrors the primary-assigned `MemoryIndex` to replica stores with indexed writes. `MemoryCompactor` stamps compaction summaries the same way, then uses store-level atomic compaction: primary `compact(new, sources)` must assign the merged `MemoryIndex` and atomically create the merged record while removing all source records; replica `put_compacted(indexed, sources)` must atomically mirror that replacement for the primary-assigned id. Memory metadata is mirrored once on the blackboard after primary success. Primary write/compaction failure fails the operation before metadata changes. Secondary failures are logged. Concrete adapters may be native-only; WASM builds use adapter alternatives.
 
 Policy content identity is owned by the primary `PolicyStore`, parallel to memory. `PolicyWriter` inserts new `(trigger, behavior)` records into the primary store first, then mirrors the primary-assigned `PolicyIndex` to replica stores with indexed writes; new entries start at `PolicyRank::Tentative` with `value = 0.0`, `expected_reward = 0.0`, `confidence = 0.0`, and `reward_tokens = 0`. `PolicyValueUpdater::reinforce` is atomic at the primary store: the primary applies `(value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)`, clamps the resulting `value`, `expected_reward`, and `confidence` to their respective ranges, checks tier-transition thresholds against the new `value` and `reward_tokens` count, and returns the updated `PolicyRecord` whose rank reflects any transition. The store does not contain the TD formula; learning rates and aggregation rules live in the `reward` module and `configs/policy-reinforcement.eure`. Replicas accept the returned record by primary-assigned id. Policy metadata is mirrored once on the blackboard after primary success. Primary reinforce/insert failure fails the operation before metadata changes; secondary failures are logged.
 

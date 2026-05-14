@@ -42,6 +42,10 @@ wiring, migrations, prompts, or public boot APIs.
 10. **Hard delete is allowed** - User deletion can remove a memory and all attached
     sidecars, search rows, embeddings, and links. Orphaned concepts become garbage
     collection candidates.
+11. **Stored affect is write-time context** - `affect_arousal`, `valence`, and
+    `emotion` are copied from the current interoceptive state when a memory is
+    written. They are not truth labels, not current emotion, and not later
+    reinterpretation of the memory.
 
 ---
 
@@ -57,7 +61,7 @@ remain transient wake signals, and durable module output remains memo-authoritat
 | `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. Existing `query-vector` names may remain until a rename pass. |
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
 | `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
-| `vital` / `homeostatic-controller` | Drives sleep-like memory balancing by raising compaction or recombination allocation from homeostatic pressure. |
+| `interoception` / `homeostatic-controller` | `interoception` estimates internal state; `homeostatic-controller` regulates sleep-like memory balancing by raising compaction or recombination allocation from that state. |
 | `allocation-controller` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
 | `self-model` | Integrates retrieved identity and self-related memories into current self-description. Identity memories are high-rank memories, not current-fact rows. |
 
@@ -81,6 +85,9 @@ memory {
   rank
   occurred_at
   stored_at
+  affect_arousal
+  valence
+  emotion
   deleted_at
 }
 
@@ -145,6 +152,13 @@ memory_embedding {
 `stored_at` is when Nuillu stored the memory. Both are exact timestamps. Prompt and
 display surfaces may round time through existing time-division behavior, but the
 ledger stores exact values.
+
+`affect_arousal`, `valence`, and `emotion` are the interoceptive affect snapshot
+at `stored_at`. `affect_arousal` is clamped to `0.0..=1.0`, `valence` to
+`-1.0..=1.0`, and `emotion` remains untyped text. These fields describe the
+agent's storage-time context. They do not assert that the remembered event was
+objectively positive or negative, and they are not updated when the memory is
+later recalled or reinterpreted.
 
 The initial loose memory kinds are:
 
@@ -290,6 +304,9 @@ kind
 rank
 occurred_at
 stored_at
+affect_arousal
+valence
+emotion
 matched concepts
 operational tags
 direct link metadata when fetched
@@ -351,9 +368,11 @@ dream or hypothesis material. These entries may be useful for planning, surprise
 or later associations, but they are not verified evidence. They should use `dream`
 or `hypothesis` kind and operational tags when stored.
 
-Existing `vital` and `homeostatic-controller` roles drive this balancing through
-allocation. The memory ledger does not add a new memory tick API or a background SQL
-job that bypasses module capabilities.
+Existing `interoception` and `homeostatic-controller` roles drive this balancing through
+allocation. `interoception` owns the pressure and affect estimate; `homeostatic-controller`
+only regulates compaction/recombination drive and action caps from that estimate. The
+memory ledger does not add a new memory tick API or a background SQL job that bypasses
+module capabilities.
 
 ---
 

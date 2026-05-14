@@ -26,6 +26,7 @@ mod allocation_writer;
 mod capabilities;
 mod channels;
 mod cognition;
+mod interoception;
 mod llm;
 mod memo;
 mod memory_render;
@@ -41,7 +42,6 @@ mod session_compaction;
 mod tiers;
 mod time_division;
 mod r#trait;
-mod vital;
 
 #[cfg(test)]
 mod test_support;
@@ -60,11 +60,13 @@ pub use channels::{
     AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AmbientSensoryEntry,
     AttentionControlRequest, AttentionControlRequestInbox, AttentionControlRequestMailbox,
     CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope,
-    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput,
+    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, MemoUpdated,
+    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput,
     SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox, TopicMailbox,
-    TopicRecvError, VitalUpdated, VitalUpdatedInbox, VitalUpdatedMailbox,
+    TopicRecvError,
 };
 pub use cognition::CognitionWriter;
+pub use interoception::InteroceptiveWriter;
 pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};
 pub use memo::{Memo, TypedMemo};
 pub use memory_render::render_memory_for_llm;
@@ -86,7 +88,7 @@ pub use rate_limit::{
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
 pub use readers::{
-    AllocationReader, BlackboardReader, CognitionLogReader, ModuleStatusReader, VitalReader,
+    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, ModuleStatusReader,
 };
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
@@ -99,4 +101,3 @@ pub use session_compaction::{
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
-pub use vital::VitalWriter;

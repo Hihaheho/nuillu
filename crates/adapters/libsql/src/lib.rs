@@ -312,6 +312,9 @@ impl LibsqlMemoryStore {
               rank INTEGER NOT NULL,
               occurred_at_ms INTEGER,
               stored_at_ms INTEGER NOT NULL,
+              affect_arousal REAL NOT NULL DEFAULT 0.0,
+              valence REAL NOT NULL DEFAULT 0.0,
+              emotion TEXT NOT NULL DEFAULT '',
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
               source_ids TEXT,
@@ -422,6 +425,16 @@ impl LibsqlMemoryStore {
         self.add_column_if_missing(&self.table_name, "kind", "INTEGER")
             .await?;
         self.add_column_if_missing(&self.table_name, "stored_at_ms", "INTEGER")
+            .await?;
+        self.add_column_if_missing(
+            &self.table_name,
+            "affect_arousal",
+            "REAL NOT NULL DEFAULT 0.0",
+        )
+        .await?;
+        self.add_column_if_missing(&self.table_name, "valence", "REAL NOT NULL DEFAULT 0.0")
+            .await?;
+        self.add_column_if_missing(&self.table_name, "emotion", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.conn
             .execute(
@@ -598,6 +611,9 @@ impl LibsqlMemoryStore {
         rank: MemoryRank,
         occurred_at: Option<chrono::DateTime<chrono::Utc>>,
         stored_at: chrono::DateTime<chrono::Utc>,
+        affect_arousal: f32,
+        valence: f32,
+        emotion: &str,
         source_ids_json: Option<&str>,
         now: i64,
     ) -> Result<(i64, i64), PortError> {
@@ -610,19 +626,25 @@ impl LibsqlMemoryStore {
               rank,
               occurred_at_ms,
               stored_at_ms,
+              affect_arousal,
+              valence,
+              emotion,
               created_at_ms,
               updated_at_ms,
               source_ids,
               metadata_json,
               deleted_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL)
             ON CONFLICT(memory_index) DO UPDATE SET
               content = excluded.content,
               kind = excluded.kind,
               rank = excluded.rank,
               occurred_at_ms = excluded.occurred_at_ms,
               stored_at_ms = excluded.stored_at_ms,
+              affect_arousal = excluded.affect_arousal,
+              valence = excluded.valence,
+              emotion = excluded.emotion,
               updated_at_ms = excluded.updated_at_ms,
               source_ids = excluded.source_ids,
               deleted_at_ms = NULL
@@ -638,6 +660,9 @@ impl LibsqlMemoryStore {
                 rank_to_i64(rank),
                 occurred_at.map(|at| at.timestamp_millis()),
                 stored_at.timestamp_millis(),
+                clamp_confidence(affect_arousal),
+                clamp_signed_unit(valence),
+                emotion.trim(),
                 now,
                 now,
                 source_ids_json,
@@ -991,7 +1016,8 @@ impl LibsqlMemoryStore {
     async fn record_by_id(&self, id: i64) -> Result<Option<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms,
+                   affect_arousal, valence, emotion
             FROM {memories}
             WHERE id = ?1
               AND deleted_at_ms IS NULL
@@ -1180,6 +1206,9 @@ impl LibsqlMemoryStore {
         let rank: i64 = row.get(4).map_err(map_libsql_error)?;
         let occurred_at_ms: Option<i64> = row.get(5).map_err(map_libsql_error)?;
         let stored_at_ms: i64 = row.get(6).map_err(map_libsql_error)?;
+        let affect_arousal: f64 = row.get(7).map_err(map_libsql_error)?;
+        let valence: f64 = row.get(8).map_err(map_libsql_error)?;
+        let emotion: String = row.get(9).map_err(map_libsql_error)?;
         Ok(MemoryRecord {
             index: MemoryIndex::new(index),
             content: MemoryContent::new(content),
@@ -1193,6 +1222,9 @@ impl LibsqlMemoryStore {
             kind: kind_from_i64(kind)?,
             concepts: self.concepts_for_memory(id).await?,
             tags: self.tags_for_memory(id).await?,
+            affect_arousal: clamp_confidence(affect_arousal as f32),
+            valence: clamp_signed_unit(valence as f32),
+            emotion,
         })
     }
 
@@ -1272,6 +1304,9 @@ impl LibsqlMemoryStore {
                 mem.rank,
                 mem.occurred_at,
                 mem.stored_at,
+                mem.affect_arousal,
+                mem.valence,
+                &mem.emotion,
                 source_ids_json.as_deref(),
                 now,
             )
@@ -1991,6 +2026,9 @@ impl MemoryStore for LibsqlMemoryStore {
                 mem.rank,
                 mem.occurred_at,
                 stored_at,
+                mem.affect_arousal,
+                mem.valence,
+                &mem.emotion,
                 None,
                 now,
             )
@@ -2038,6 +2076,9 @@ impl MemoryStore for LibsqlMemoryStore {
                 mem.rank,
                 mem.occurred_at,
                 stored_at,
+                mem.affect_arousal,
+                mem.valence,
+                &mem.emotion,
                 Some(&source_ids_json),
                 now,
             )
@@ -2080,6 +2121,9 @@ impl MemoryStore for LibsqlMemoryStore {
                 mem.rank,
                 mem.occurred_at,
                 mem.stored_at,
+                mem.affect_arousal,
+                mem.valence,
+                &mem.emotion,
                 Some(&source_ids_json),
                 now,
             )
@@ -2107,7 +2151,8 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms,
+                   affect_arousal, valence, emotion
             FROM {memories}
             WHERE memory_index = ?1
               AND deleted_at_ms IS NULL
@@ -2129,7 +2174,8 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms,
+                   affect_arousal, valence, emotion
             FROM {memories}
             WHERE rank = ?1
               AND deleted_at_ms IS NULL
@@ -2256,7 +2302,8 @@ impl MemoryStore for LibsqlMemoryStore {
             push_query_param(&mut params, Value::Integer(limit_to_i64(q.limit)));
         let sql = format!(
             r#"
-            SELECT m.id, m.memory_index, m.content, m.kind, m.rank, m.occurred_at_ms, m.stored_at_ms
+            SELECT m.id, m.memory_index, m.content, m.kind, m.rank, m.occurred_at_ms, m.stored_at_ms,
+                   m.affect_arousal, m.valence, m.emotion
             FROM {memories} AS m
             {join_clause}
             WHERE {where_clause}
@@ -2581,6 +2628,14 @@ fn clamp_confidence(value: f32) -> f32 {
     }
 }
 
+fn clamp_signed_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn rank_from_i64(value: i64) -> Result<MemoryRank, PortError> {
     match value {
         0 => Ok(MemoryRank::ShortTerm),
@@ -2771,7 +2826,12 @@ mod tests {
         let stored_at = chrono::Utc.with_ymd_and_hms(2025, 5, 11, 1, 2, 3).unwrap();
         let id = store
             .insert(
-                new_memory("alpha beta", MemoryRank::LongTerm, Some(occurred_at)),
+                NewMemory {
+                    affect_arousal: 0.72,
+                    valence: -0.25,
+                    emotion: "focused concern".to_owned(),
+                    ..new_memory("alpha beta", MemoryRank::LongTerm, Some(occurred_at))
+                },
                 stored_at,
             )
             .await
@@ -2785,6 +2845,9 @@ mod tests {
         assert_eq!(got.occurred_at, Some(occurred_at));
         assert_eq!(got.stored_at, stored_at);
         assert_eq!(got.kind, MemoryKind::Statement);
+        assert_eq!(got.affect_arousal, 0.72);
+        assert_eq!(got.valence, -0.25);
+        assert_eq!(got.emotion, "focused concern");
     }
 
     #[tokio::test]
@@ -2921,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_adds_occurred_at_column_to_existing_memory_table() {
+    async fn migrate_adds_missing_memory_columns_to_existing_memory_table() {
         let path = test_db_path();
         let database = libsql::Builder::new_local(path.clone())
             .build()
@@ -2956,6 +3019,9 @@ mod tests {
         .unwrap();
 
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "occurred_at_ms").await);
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "affect_arousal").await);
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "valence").await);
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
     }
 
     #[tokio::test]
@@ -3740,6 +3806,9 @@ mod tests {
             kind: MemoryKind::Statement,
             concepts: Vec::new(),
             tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
         }
     }
 
@@ -3753,6 +3822,9 @@ mod tests {
             kind: MemoryKind::Statement,
             concepts: Vec::new(),
             tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
         }
     }
 

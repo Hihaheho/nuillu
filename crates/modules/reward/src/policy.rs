@@ -7,7 +7,8 @@ use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
 use nuillu_module::ports::PortError;
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, format_current_attention_guidance, push_formatted_memo_log_batch,
+    InteroceptiveReader, LlmAccess, Module, format_current_attention_guidance,
+    push_formatted_memo_log_batch,
 };
 use nuillu_types::{ModuleId, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -109,6 +110,7 @@ pub struct PolicyModule {
     allocation_updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
+    interoception: InteroceptiveReader,
     writer: PolicyWriter,
     llm: LlmAccess,
     session: Session,
@@ -120,6 +122,7 @@ impl PolicyModule {
         allocation_updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
         allocation: AllocationReader,
+        interoception: InteroceptiveReader,
         writer: PolicyWriter,
         llm: LlmAccess,
     ) -> Self {
@@ -129,6 +132,7 @@ impl PolicyModule {
             allocation_updates,
             blackboard,
             allocation,
+            interoception,
             writer,
             llm,
             session: Session::new(),
@@ -139,10 +143,21 @@ impl PolicyModule {
         let memos = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &memos, _cx.now());
         let allocation = self.allocation.snapshot().await;
+        let interoception = self.interoception.snapshot().await;
         self.session.push_ephemeral_system(SYSTEM_PROMPT);
         if let Some(guidance) = format_current_attention_guidance(&allocation) {
             self.session.push_ephemeral_system(guidance);
         }
+        self.session.push_ephemeral_system(format!(
+            "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
+            interoception.affect_arousal,
+            interoception.valence,
+            if interoception.emotion.trim().is_empty() {
+                "unknown"
+            } else {
+                interoception.emotion.trim()
+            }
+        ));
         let cognition = self
             .blackboard
             .read(|bb| {

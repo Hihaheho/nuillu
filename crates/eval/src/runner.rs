@@ -1641,6 +1641,9 @@ fn memory_record_materially_changed(previous: &MemoryRecord, current: &MemoryRec
         || previous.kind != current.kind
         || previous.concepts != current.concepts
         || previous.tags != current.tags
+        || previous.affect_arousal != current.affect_arousal
+        || previous.valence != current.valence
+        || previous.emotion != current.emotion
 }
 
 async fn render_memory_store_artifact(
@@ -1720,10 +1723,17 @@ fn render_memory_record_artifact(record: &MemoryRecord) -> String {
     };
 
     format!(
-        "Memory {}\nkind: {:?}\nrank: {:?}\ncontent: {}\nconcepts: {}\ntags: {}",
+        "Memory {}\nkind: {:?}\nrank: {:?}\naffect_arousal: {:.2}\nvalence: {:.2}\nemotion: {}\ncontent: {}\nconcepts: {}\ntags: {}",
         record.index,
         record.kind,
         record.rank,
+        record.affect_arousal,
+        record.valence,
+        if record.emotion.trim().is_empty() {
+            "unknown"
+        } else {
+            record.emotion.trim()
+        },
         record.content.as_str(),
         concepts,
         tags
@@ -2856,7 +2866,7 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
 
 fn hidden_from_attention_modules() -> Vec<ModuleId> {
     vec![
-        nuillu_types::builtin::vital(),
+        nuillu_types::builtin::interoception(),
         nuillu_types::builtin::homeostatic_controller(),
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
@@ -2964,6 +2974,7 @@ fn register_eval_module(
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
+                            caps.interoception_reader(),
                             caps.allocation_writer(voluntary.clone(), Vec::new()),
                             caps.memo(),
                             caps.llm_access(),
@@ -3130,16 +3141,18 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::Vital => registry
+        EvalModule::Interoception => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
                 replica_hard_cap,
                 |caps| {
-                    nuillu_vital::VitalModule::new(
+                    nuillu_interoception::InteroceptionModule::new(
+                        caps.memo_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
                         caps.allocation_updated_inbox(),
                         caps.blackboard_reader(),
-                        caps.vital_writer(),
+                        caps.interoception_writer(),
+                        caps.llm_access(),
                     )
                 },
             )
@@ -3150,8 +3163,8 @@ fn register_eval_module(
                 replica_hard_cap,
                 |caps| {
                     nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                        caps.vital_updated_inbox(),
-                        caps.vital_reader(),
+                        caps.interoception_updated_inbox(),
+                        caps.interoception_reader(),
                         caps.allocation_writer(
                             homeostatic_drive_modules(),
                             homeostatic_capped_modules(),
@@ -3172,6 +3185,7 @@ fn register_eval_module(
                             caps.allocation_updated_inbox(),
                             caps.blackboard_reader(),
                             caps.allocation_reader(),
+                            caps.interoception_reader(),
                             policy_caps.writer(),
                             caps.llm_access(),
                         )
@@ -3193,6 +3207,7 @@ fn register_eval_module(
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
+                            caps.interoception_reader(),
                             policy_caps.window_reader(),
                             caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
                             caps.llm_access(),
@@ -3215,6 +3230,7 @@ fn register_eval_module(
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
+                            caps.interoception_reader(),
                             policy_caps.window_reader(),
                             policy_caps.value_updater(),
                             caps.attention_control_mailbox(),
@@ -3328,7 +3344,7 @@ pub(crate) fn full_agent_allocation(
             EvalModule::MemoryCompaction => (0.0, ModelTier::Cheap),
             EvalModule::MemoryAssociation => (0.0, ModelTier::Cheap),
             EvalModule::MemoryRecombination => (0.0, ModelTier::Cheap),
-            EvalModule::Vital => (1.0, ModelTier::Cheap),
+            EvalModule::Interoception => (1.0, ModelTier::Cheap),
             EvalModule::HomeostaticController => (1.0, ModelTier::Cheap),
             EvalModule::Policy => (0.0, ModelTier::Default),
             EvalModule::ValueEstimator => (0.0, ModelTier::Cheap),
@@ -3413,7 +3429,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::MemoryCompaction
         | EvalModule::MemoryAssociation
         | EvalModule::MemoryRecombination
-        | EvalModule::Vital
+        | EvalModule::Interoception
         | EvalModule::HomeostaticController
         | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
@@ -3732,6 +3748,9 @@ async fn memory_last_state_dump(
                 content: Some(DumpText::new(record.content.as_str().to_owned())),
                 content_rank: Some(memory_rank_name(record.rank).to_owned()),
                 occurred_at: record.occurred_at.map(|at| at.to_rfc3339()),
+                affect_arousal: record.affect_arousal,
+                valence: record.valence,
+                emotion: record.emotion,
                 metadata,
                 missing_content: false,
             },
@@ -3740,6 +3759,9 @@ async fn memory_last_state_dump(
                 content: None,
                 content_rank: None,
                 occurred_at: None,
+                affect_arousal: 0.0,
+                valence: 0.0,
+                emotion: String::new(),
                 metadata,
                 missing_content: true,
             },
@@ -4618,6 +4640,9 @@ mod tests {
                 stored_at: Utc::now(),
                 concepts: Vec::new(),
                 tags: Vec::new(),
+                affect_arousal: 0.0,
+                valence: 0.0,
+                emotion: String::new(),
                 content: "rust memory".to_string(),
             }],
         );
@@ -5530,10 +5555,13 @@ prompt = "What am I attending to?"
         );
 
         assert_eq!(
-            allocation.activation_for(&builtin::vital()),
+            allocation.activation_for(&builtin::interoception()),
             ActivationRatio::ONE
         );
-        assert_eq!(allocation.tier_for(&builtin::vital()), ModelTier::Cheap);
+        assert_eq!(
+            allocation.tier_for(&builtin::interoception()),
+            ModelTier::Cheap
+        );
         assert_eq!(
             allocation.activation_for(&builtin::homeostatic_controller()),
             ActivationRatio::ONE

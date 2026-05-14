@@ -11,7 +11,7 @@ use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
+    InteroceptiveReader, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
 };
 use nuillu_types::{ModuleId, PolicyIndex, builtin};
 use schemars::JsonSchema;
@@ -290,6 +290,7 @@ pub struct RewardModule {
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
     allocation: AllocationReader,
+    interoception: InteroceptiveReader,
     windows: PolicyWindowReader,
     updater: PolicyValueUpdater,
     attention_control: AttentionControlRequestMailbox,
@@ -310,6 +311,7 @@ impl RewardModule {
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
         allocation: AllocationReader,
+        interoception: InteroceptiveReader,
         windows: PolicyWindowReader,
         updater: PolicyValueUpdater,
         attention_control: AttentionControlRequestMailbox,
@@ -323,6 +325,7 @@ impl RewardModule {
             blackboard,
             cognition,
             allocation,
+            interoception,
             windows,
             updater,
             attention_control,
@@ -484,14 +487,16 @@ impl RewardModule {
         let memos = self.blackboard.recent_memo_logs().await;
         let cognition = self.cognition.snapshot().await;
         let allocation = self.allocation.snapshot().await;
+        let interoception = self.interoception.snapshot().await;
         self.session.push_ephemeral_system(SYSTEM_PROMPT);
         self.session.push_ephemeral_user(format!(
-            "Retrieval window:\n{}\n\nValue estimate:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}",
+            "Retrieval window:\n{}\n\nValue estimate:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
             serde_json::to_string(retrieval).unwrap_or_default(),
             serde_json::to_string(estimate).unwrap_or_default(),
             serde_json::to_string(&memos).unwrap_or_default(),
             serde_json::to_string(&cognition).unwrap_or_default(),
             serde_json::to_string(&allocation).unwrap_or_default(),
+            serde_json::to_string(&interoception).unwrap_or_default(),
         ));
         let lutum = self.llm.lutum().await;
         let result = self

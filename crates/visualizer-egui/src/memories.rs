@@ -179,6 +179,11 @@ fn memory_list(
                                     .unwrap_or_else(|| "-".to_string()),
                             );
                             ui.label(format!("stored {}", record.stored_at.to_rfc3339()));
+                            ui.label(format!("arousal {:.2}", record.affect_arousal));
+                            ui.label(format!("valence {:.2}", record.valence));
+                            if !record.emotion.trim().is_empty() {
+                                ui.label(format!("emotion {}", record.emotion.trim()));
+                            }
                             if ui.small_button("Links").clicked() {
                                 let _ = commands.send(VisualizerClientMessage::Command {
                                     command: VisualizerCommand::FetchLinkedMemories {

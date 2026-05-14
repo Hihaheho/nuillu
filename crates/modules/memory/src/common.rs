@@ -15,6 +15,9 @@ pub struct MemoryContentView {
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -41,5 +44,8 @@ pub(crate) fn memory_record_to_view(record: MemoryRecord) -> MemoryContentView {
         kind: record.kind,
         concepts: record.concepts,
         tags: record.tags,
+        affect_arousal: record.affect_arousal,
+        valence: record.valence,
+        emotion: record.emotion,
     }
 }

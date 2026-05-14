@@ -123,6 +123,7 @@ fn register_server_module(
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
+                    caps.interoception_reader(),
                     caps.allocation_writer(voluntary.clone(), Vec::new()),
                     caps.memo(),
                     caps.llm_access(),
@@ -236,21 +237,23 @@ fn register_server_module(
                 )
             })
         }
-        RuntimeModule::Vital => {
+        RuntimeModule::Interoception => {
             registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), |caps| {
-                nuillu_vital::VitalModule::new(
+                nuillu_interoception::InteroceptionModule::new(
+                    caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
-                    caps.vital_writer(),
+                    caps.interoception_writer(),
+                    caps.llm_access(),
                 )
             })
         }
         RuntimeModule::HomeostaticController => {
             registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| {
                 nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                    caps.vital_updated_inbox(),
-                    caps.vital_reader(),
+                    caps.interoception_updated_inbox(),
+                    caps.interoception_reader(),
                     caps.allocation_writer(
                         homeostatic_drive_modules(),
                         homeostatic_capped_modules(),
@@ -266,6 +269,7 @@ fn register_server_module(
                     caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_reader(),
+                    caps.interoception_reader(),
                     policy_caps.writer(),
                     caps.llm_access(),
                 )
@@ -281,6 +285,7 @@ fn register_server_module(
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
+                    caps.interoception_reader(),
                     policy_caps.window_reader(),
                     caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
                     caps.llm_access(),
@@ -297,6 +302,7 @@ fn register_server_module(
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
+                    caps.interoception_reader(),
                     policy_caps.window_reader(),
                     policy_caps.value_updater(),
                     caps.attention_control_mailbox(),
@@ -379,7 +385,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::MemoryCompaction => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryAssociation => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryRecombination => (0.0, ModelTier::Cheap),
-            RuntimeModule::Vital => (1.0, ModelTier::Cheap),
+            RuntimeModule::Interoception => (1.0, ModelTier::Cheap),
             RuntimeModule::HomeostaticController => (1.0, ModelTier::Cheap),
             RuntimeModule::Policy => (0.0, ModelTier::Default),
             RuntimeModule::ValueEstimator => (0.0, ModelTier::Cheap),

@@ -134,19 +134,22 @@ pub struct ModuleInstanceDump {
     pub replica: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
+#[derive(Debug, Clone, PartialEq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemoryLastStateDump {
     pub entries: Vec<MemoryEntryDump>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
+#[derive(Debug, Clone, PartialEq, Serialize, IntoEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemoryEntryDump {
     pub index: String,
     pub content: Option<DumpText>,
     pub content_rank: Option<String>,
     pub occurred_at: Option<String>,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
     pub metadata: MemoryMetadataDump,
     pub missing_content: bool,
 }
@@ -238,6 +241,9 @@ mod tests {
                     content: Some(DumpText::new("remember this")),
                     content_rank: Some("permanent".to_string()),
                     occurred_at: Some("2026-05-07T00:00:00Z".to_string()),
+                    affect_arousal: 0.0,
+                    valence: 0.0,
+                    emotion: String::new(),
                     metadata: MemoryMetadataDump {
                         rank: "permanent".to_string(),
                         occurred_at: Some("2026-05-07T00:00:00Z".to_string()),

@@ -18,7 +18,7 @@ pub enum TopicKind {
     SensoryInput,
     CognitionLogUpdated,
     AllocationUpdated,
-    VitalUpdated,
+    InteroceptiveUpdated,
     MemoUpdated,
 }
 

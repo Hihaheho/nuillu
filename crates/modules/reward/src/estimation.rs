@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
+    CognitionLogUpdatedInbox, InteroceptiveReader, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
     format_current_attention_guidance,
 };
 use nuillu_types::{ModuleId, PolicyIndex};
@@ -53,6 +53,7 @@ pub struct ValueEstimatorModule {
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
     allocation: AllocationReader,
+    interoception: InteroceptiveReader,
     windows: PolicyWindowReader,
     memo: TypedMemo<ValueEstimateMemo>,
     llm: LlmAccess,
@@ -69,6 +70,7 @@ impl ValueEstimatorModule {
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
         allocation: AllocationReader,
+        interoception: InteroceptiveReader,
         windows: PolicyWindowReader,
         memo: TypedMemo<ValueEstimateMemo>,
         llm: LlmAccess,
@@ -81,6 +83,7 @@ impl ValueEstimatorModule {
             blackboard,
             cognition,
             allocation,
+            interoception,
             windows,
             memo,
             llm,
@@ -116,11 +119,22 @@ impl ValueEstimatorModule {
         let cognition = self.cognition.snapshot().await;
         let memos = self.blackboard.recent_memo_logs().await;
         let allocation = self.allocation.snapshot().await;
+        let interoception = self.interoception.snapshot().await;
 
         self.session.push_ephemeral_system(SYSTEM_PROMPT);
         if let Some(guidance) = format_current_attention_guidance(&allocation) {
             self.session.push_ephemeral_system(guidance);
         }
+        self.session.push_ephemeral_system(format!(
+            "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
+            interoception.affect_arousal,
+            interoception.valence,
+            if interoception.emotion.trim().is_empty() {
+                "unknown"
+            } else {
+                interoception.emotion.trim()
+            }
+        ));
         self.session.push_ephemeral_user(format!(
             "Value-estimation request for {}:\nRetrieval window:\n{}\n\nRecent cognition:\n{}\n\nRecent memos:\n{}",
             self.owner,
