@@ -3312,148 +3312,29 @@ pub(crate) fn full_agent_allocation(
     allocation.set_activation_table(eval_activation_table());
 
     for module in modules {
-        match module {
-            EvalModule::Sensory => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                1.0,
-                ModelTier::Cheap,
-                "Queued sensory input is waiting; activate when the controller is ready to process external observations.",
-            ),
-            EvalModule::CognitionGate => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Wait for memo or controller guidance before promoting relevant memos into cognition.",
-            ),
-            EvalModule::AttentionController => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                1.0,
-                ModelTier::Default,
-                "Bootstrap the case: activate sensory first so queued external observations become memo logs, then allocate cognition, query, and speech modules as evidence becomes ready.",
-            ),
-            EvalModule::AttentionSchema => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Default,
-                "Idle until memo, allocation, or cognition-log updates require attention-experience integration.",
-            ),
-            EvalModule::SelfModel => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Default,
-                "Idle until explicit self-model requests require work.",
-            ),
-            EvalModule::QueryVector => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until memory retrieval is needed.",
-            ),
-            EvalModule::QueryPolicy => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until policy retrieval is needed.",
-            ),
-            EvalModule::Memory => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until preservation guidance or memory requests arrive.",
-            ),
-            EvalModule::MemoryCompaction => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until compaction guidance arrives.",
-            ),
-            EvalModule::MemoryAssociation => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until non-destructive memory association guidance arrives.",
-            ),
-            EvalModule::MemoryRecombination => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until REM-like recombination guidance arrives.",
-            ),
-            EvalModule::Vital => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                1.0,
-                ModelTier::Cheap,
-                "Continuously update homeostatic vital state from cognition volume and memory traces.",
-            ),
-            EvalModule::HomeostaticController => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                1.0,
-                ModelTier::Cheap,
-                "Autonomically drive sleep-like memory modules and cap action modules from vital state.",
-            ),
-            EvalModule::Policy => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Default,
-                "Idle until policy formation guidance or distinctive outcomes arrive.",
-            ),
-            EvalModule::ValueEstimator => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until query-policy retrieval windows need value estimates.",
-            ),
-            EvalModule::Reward => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Default,
-                "Idle until outcomes settle value-estimate windows.",
-            ),
-            EvalModule::Predict => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Cheap,
-                "Idle until prediction guidance arrives.",
-            ),
-            EvalModule::Surprise => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Default,
-                "Idle until surprise detection is useful.",
-            ),
-            EvalModule::SpeakGate => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                1.0,
-                ModelTier::Premium,
-                "Always allocated so speak activation gates resolve promptly when speak fires.",
-            ),
-            EvalModule::Speak => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Premium,
-                "Idle until cognition-log updates are allowed through speak-gate.",
-            ),
-        }
+        let (activation, tier) = match module {
+            EvalModule::Sensory => (1.0, ModelTier::Cheap),
+            EvalModule::CognitionGate => (0.0, ModelTier::Cheap),
+            EvalModule::AttentionController => (1.0, ModelTier::Default),
+            EvalModule::AttentionSchema => (0.0, ModelTier::Default),
+            EvalModule::SelfModel => (0.0, ModelTier::Default),
+            EvalModule::QueryVector => (0.0, ModelTier::Cheap),
+            EvalModule::QueryPolicy => (0.0, ModelTier::Cheap),
+            EvalModule::Memory => (0.0, ModelTier::Cheap),
+            EvalModule::MemoryCompaction => (0.0, ModelTier::Cheap),
+            EvalModule::MemoryAssociation => (0.0, ModelTier::Cheap),
+            EvalModule::MemoryRecombination => (0.0, ModelTier::Cheap),
+            EvalModule::Vital => (1.0, ModelTier::Cheap),
+            EvalModule::HomeostaticController => (1.0, ModelTier::Cheap),
+            EvalModule::Policy => (0.0, ModelTier::Default),
+            EvalModule::ValueEstimator => (0.0, ModelTier::Cheap),
+            EvalModule::Reward => (0.0, ModelTier::Default),
+            EvalModule::Predict => (0.0, ModelTier::Cheap),
+            EvalModule::Surprise => (0.0, ModelTier::Default),
+            EvalModule::SpeakGate => (1.0, ModelTier::Premium),
+            EvalModule::Speak => (0.0, ModelTier::Premium),
+        };
+        set_allocation_module(&mut allocation, module.module_id(), activation, tier);
     }
     allocation
 }
@@ -3483,20 +3364,7 @@ fn module_allocation(
             target_module == EvalModule::SpeakGate && *module == EvalModule::Speak;
         let id = module.module_id();
         allocation.set_model_override(id.clone(), eval_module_tier(*module));
-        allocation.set(
-            id.clone(),
-            ModuleConfig {
-                guidance: if is_target {
-                    "Handle the module eval request.".into()
-                } else if is_required_driver {
-                    "Drive the pending speak activation so speak-gate can evaluate readiness."
-                        .into()
-                } else {
-                    "Registered for this module eval; idle unless activated by allocation guidance."
-                        .into()
-                },
-            },
-        );
+        allocation.set(id.clone(), ModuleConfig::default());
         allocation.set_activation(
             id,
             if is_target || is_required_driver {
@@ -3514,15 +3382,9 @@ fn set_allocation_module(
     id: ModuleId,
     activation_ratio: f64,
     tier: ModelTier,
-    guidance: impl Into<String>,
 ) {
     allocation.set_model_override(id.clone(), tier);
-    allocation.set(
-        id.clone(),
-        ModuleConfig {
-            guidance: guidance.into(),
-        },
-    );
+    allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 

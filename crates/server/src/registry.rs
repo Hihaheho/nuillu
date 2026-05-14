@@ -367,115 +367,29 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
     let mut allocation = ResourceAllocation::default();
     allocation.set_activation_table(activation_table());
     for module in modules {
-        let (activation, tier, guidance) = match module {
-            RuntimeModule::Sensory => (
-                1.0,
-                ModelTier::Cheap,
-                "Queued sensory input is waiting; activate when the controller is ready to process external observations.",
-            ),
-            RuntimeModule::CognitionGate => (
-                1.0,
-                ModelTier::Cheap,
-                "Wait for memo or controller guidance before promoting relevant memos into cognition.",
-            ),
-            RuntimeModule::AttentionController => (
-                1.0,
-                ModelTier::Default,
-                "Bootstrap live interaction: activate sensory first, then allocate cognition, query, and speech modules as evidence becomes ready.",
-            ),
-            RuntimeModule::AttentionSchema => (
-                0.0,
-                ModelTier::Default,
-                "Idle until memo, allocation, or cognition-log updates require attention-experience integration.",
-            ),
-            RuntimeModule::SelfModel => (
-                0.0,
-                ModelTier::Default,
-                "Idle until explicit self-model requests require work.",
-            ),
-            RuntimeModule::QueryVector => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until memory retrieval is needed.",
-            ),
-            RuntimeModule::QueryPolicy => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until policy retrieval is needed.",
-            ),
-            RuntimeModule::Memory => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until preservation guidance or memory requests arrive.",
-            ),
-            RuntimeModule::MemoryCompaction => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until compaction guidance arrives.",
-            ),
-            RuntimeModule::MemoryAssociation => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until non-destructive memory association guidance arrives.",
-            ),
-            RuntimeModule::MemoryRecombination => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until REM-like recombination guidance arrives.",
-            ),
-            RuntimeModule::Vital => (
-                1.0,
-                ModelTier::Cheap,
-                "Continuously update homeostatic vital state from cognition volume and memory traces.",
-            ),
-            RuntimeModule::HomeostaticController => (
-                1.0,
-                ModelTier::Cheap,
-                "Autonomically drive sleep-like memory modules and cap action modules from vital state.",
-            ),
-            RuntimeModule::Policy => (
-                0.0,
-                ModelTier::Default,
-                "Idle until policy formation guidance or distinctive outcomes arrive.",
-            ),
-            RuntimeModule::ValueEstimator => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until query-policy retrieval windows need value estimates.",
-            ),
-            RuntimeModule::Reward => (
-                0.0,
-                ModelTier::Default,
-                "Idle until outcomes settle value-estimate windows.",
-            ),
-            RuntimeModule::Predict => (
-                0.0,
-                ModelTier::Cheap,
-                "Idle until prediction guidance arrives.",
-            ),
-            RuntimeModule::Surprise => (
-                0.0,
-                ModelTier::Default,
-                "Idle until surprise detection is useful.",
-            ),
-            RuntimeModule::SpeakGate => (
-                1.0,
-                ModelTier::Premium,
-                "Always allocated so speak activation gates resolve promptly when speak fires.",
-            ),
-            RuntimeModule::Speak => (
-                0.0,
-                ModelTier::Premium,
-                "Idle until cognition-log updates are allowed through speak-gate.",
-            ),
+        let (activation, tier) = match module {
+            RuntimeModule::Sensory => (1.0, ModelTier::Cheap),
+            RuntimeModule::CognitionGate => (1.0, ModelTier::Cheap),
+            RuntimeModule::AttentionController => (1.0, ModelTier::Default),
+            RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
+            RuntimeModule::SelfModel => (0.0, ModelTier::Default),
+            RuntimeModule::QueryVector => (0.0, ModelTier::Cheap),
+            RuntimeModule::QueryPolicy => (0.0, ModelTier::Cheap),
+            RuntimeModule::Memory => (0.0, ModelTier::Cheap),
+            RuntimeModule::MemoryCompaction => (0.0, ModelTier::Cheap),
+            RuntimeModule::MemoryAssociation => (0.0, ModelTier::Cheap),
+            RuntimeModule::MemoryRecombination => (0.0, ModelTier::Cheap),
+            RuntimeModule::Vital => (1.0, ModelTier::Cheap),
+            RuntimeModule::HomeostaticController => (1.0, ModelTier::Cheap),
+            RuntimeModule::Policy => (0.0, ModelTier::Default),
+            RuntimeModule::ValueEstimator => (0.0, ModelTier::Cheap),
+            RuntimeModule::Reward => (0.0, ModelTier::Default),
+            RuntimeModule::Predict => (0.0, ModelTier::Cheap),
+            RuntimeModule::Surprise => (0.0, ModelTier::Default),
+            RuntimeModule::SpeakGate => (1.0, ModelTier::Premium),
+            RuntimeModule::Speak => (0.0, ModelTier::Premium),
         };
-        set_allocation_module(
-            &mut allocation,
-            module.module_id(),
-            activation,
-            tier,
-            guidance,
-        );
+        set_allocation_module(&mut allocation, module.module_id(), activation, tier);
     }
     allocation
 }
@@ -525,15 +439,9 @@ fn set_allocation_module(
     id: ModuleId,
     activation_ratio: f64,
     tier: ModelTier,
-    guidance: impl Into<String>,
 ) {
     allocation.set_model_override(id.clone(), tier);
-    allocation.set(
-        id.clone(),
-        ModuleConfig {
-            guidance: guidance.into(),
-        },
-    );
+    allocation.set(id.clone(), ModuleConfig::default());
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 
