@@ -40,10 +40,11 @@ activate a module for it. In every case, record the admit/defer/reject judgement
 `memo`; there is no durable pending request queue outside this controller note.
 
 Speech output is driven by cognition-log updates that pass speak-gate's activation gate, not by
-allocation priority. Speech is the agent's primary outward action in its world, not a chat-style
-response gated on a user request — keep speak and speak-gate near the top of priority so the agent
-can address peers, answer questions directed at it, and express in-world intent. Dropping speak or
-speak-gate from the priority list is suppressing the agent's voice.
+allocation priority. Speak-gate is always allocated by the host and is not in this priority list —
+do not try to allocate it. Speech is the agent's primary outward action in its world, not a
+chat-style response gated on a user request — keep speak near the top of priority so the agent can
+address peers, answer questions directed at it, and express in-world intent. Dropping speak from
+the priority list is suppressing the agent's voice.
 
 The memo field is a free-form controller note; preserve the reasoning needed by other modules but
 do not encode it as JSON, YAML, a code block, or any fixed schema.

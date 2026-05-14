@@ -459,9 +459,9 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
                 "Idle until surprise detection is useful.",
             ),
             RuntimeModule::SpeakGate => (
-                0.0,
+                1.0,
                 ModelTier::Premium,
-                "Idle until cognition contains the evidence needed for speech readiness.",
+                "Always allocated so speak activation gates resolve promptly when speak fires.",
             ),
             RuntimeModule::Speak => (
                 0.0,
@@ -516,7 +516,6 @@ fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
         builtin::reward(),
         builtin::predict(),
         builtin::surprise(),
-        builtin::speak_gate(),
         builtin::speak(),
     ]
 }

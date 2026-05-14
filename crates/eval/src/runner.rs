@@ -2857,6 +2857,7 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
+        nuillu_types::builtin::speak_gate(),
     ]
 }
 
@@ -3441,9 +3442,9 @@ pub(crate) fn full_agent_allocation(
             EvalModule::SpeakGate => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
-                0.0,
+                1.0,
                 ModelTier::Premium,
-                "Idle until cognition contains the evidence needed for speech readiness.",
+                "Always allocated so speak activation gates resolve promptly when speak fires.",
             ),
             EvalModule::Speak => set_allocation_module(
                 &mut allocation,
@@ -5678,7 +5679,7 @@ prompt = "What am I attending to?"
 
         assert_eq!(
             allocation.activation_for(&builtin::speak_gate()),
-            ActivationRatio::ZERO
+            ActivationRatio::ONE
         );
         assert_eq!(
             allocation.tier_for(&builtin::speak_gate()),
