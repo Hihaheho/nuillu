@@ -15,7 +15,7 @@ use lutum_libsql_adapter::{
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
-use nuillu_blackboard::Blackboard;
+use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
@@ -77,12 +77,7 @@ pub(super) async fn build_server_environment(
         },
         runtime: CapabilityProviderRuntime {
             event_sink,
-            policy: RuntimePolicy {
-                memo_retained_per_owner: 256,
-                max_concurrent_llm_calls: config.max_concurrent_llm_calls,
-                session_compaction: session_compaction_policy(config),
-                ..RuntimePolicy::default()
-            },
+            policy: server_runtime_policy(config),
         },
     });
 
@@ -113,6 +108,20 @@ pub(super) async fn build_server_environment(
         clock,
         utterance_sink,
     })
+}
+
+fn server_runtime_policy(config: &ServerConfig) -> RuntimePolicy {
+    RuntimePolicy {
+        allocation_limits: server_allocation_limits(),
+        memo_retained_per_owner: 256,
+        max_concurrent_llm_calls: config.max_concurrent_llm_calls,
+        session_compaction: session_compaction_policy(config),
+        ..RuntimePolicy::default()
+    }
+}
+
+fn server_allocation_limits() -> AllocationLimits {
+    AllocationLimits::unlimited()
 }
 
 fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
@@ -336,5 +345,71 @@ impl UtteranceSink for ServerUtteranceSink {
             },
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use nuillu_blackboard::{ActivationRatio, Bpm, ModuleConfig, ModulePolicy, linear_ratio_fn};
+    use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
+
+    use super::*;
+    use crate::config::DEFAULT_MODULES;
+    use crate::registry::full_agent_allocation;
+
+    #[test]
+    fn server_allocation_limits_keep_fifth_positive_priority_slot_active() {
+        let mut allocation = full_agent_allocation(DEFAULT_MODULES);
+        let table = allocation.activation_table().to_vec();
+        let priority_modules = [
+            builtin::attention_schema(),
+            builtin::self_model(),
+            builtin::query_vector(),
+            builtin::memory(),
+            builtin::speak(),
+        ];
+
+        for (rank, module) in priority_modules.iter().cloned().enumerate() {
+            allocation.set(
+                module.clone(),
+                ModuleConfig {
+                    guidance: format!("priority {rank}"),
+                },
+            );
+            allocation.set_activation(
+                module,
+                table.get(rank).copied().unwrap_or(ActivationRatio::ZERO),
+            );
+        }
+
+        let policies = DEFAULT_MODULES
+            .iter()
+            .map(|module| {
+                (
+                    module.module_id(),
+                    ModulePolicy::new(
+                        ReplicaCapRange::new(0, 1).unwrap(),
+                        Bpm::range(3.0, 6.0),
+                        linear_ratio_fn,
+                    ),
+                )
+            })
+            .collect::<HashMap<ModuleId, ModulePolicy>>();
+        let effective = allocation
+            .derived(&policies)
+            .limited(server_allocation_limits());
+
+        assert_eq!(
+            effective.activation_for(&builtin::speak()),
+            table[4],
+            "speak should retain the allocation-controller's positive fifth priority ratio"
+        );
+        assert_eq!(
+            effective.active_replicas(&builtin::speak()),
+            1,
+            "server should not clip speak solely because the default module set already has many active baseline roles"
+        );
     }
 }
