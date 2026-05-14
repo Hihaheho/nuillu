@@ -1153,7 +1153,10 @@ mod tests {
     #[tokio::test]
     async fn allocation_proposals_average_ratio_before_active_replica_derivation() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(
+            builtin::allocation_controller(),
+            crate::ActivationRatio::ONE,
+        );
         let bb = Blackboard::with_allocation(base);
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![
@@ -1356,7 +1359,10 @@ mod tests {
     #[tokio::test]
     async fn allocation_proposals_do_not_add_unregistered_modules() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(
+            builtin::allocation_controller(),
+            crate::ActivationRatio::ONE,
+        );
         let bb = Blackboard::with_allocation(base);
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![(
@@ -1389,7 +1395,10 @@ mod tests {
     #[tokio::test]
     async fn allocation_caps_clamp_active_drive_without_disabling_replica() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(
+            builtin::allocation_controller(),
+            crate::ActivationRatio::ONE,
+        );
         base.set_activation(
             builtin::homeostatic_controller(),
             crate::ActivationRatio::ONE,

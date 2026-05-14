@@ -158,7 +158,8 @@ impl AllocationControllerModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id()).expect("allocation-controller id is valid"),
+            owner: ModuleId::new(<Self as Module>::id())
+                .expect("allocation-controller id is valid"),
             updates,
             requests,
             blackboard,
