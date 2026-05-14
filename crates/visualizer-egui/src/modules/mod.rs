@@ -501,7 +501,7 @@ fn render_module_selector(
                 let selected = panel_id == selected_panel;
                 ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
                     let response = ui
-                        .selectable_label(selected, turn_selector_label(index))
+                        .selectable_label(selected, turn_selector_label(index, turn))
                         .on_hover_text(turn_selector_hover(turn));
                     if response.clicked() {
                         *next_panel = panel_id;
@@ -1365,18 +1365,30 @@ fn turn_selection_id(turn_id: &str) -> String {
     format!("{MODULE_TURN_SELECTION_PREFIX}{turn_id}")
 }
 
-fn turn_selector_label(index: usize) -> String {
-    format!("turn {}", index + 1)
+fn turn_selector_label(index: usize, turn: &LlmTurnState) -> String {
+    let label = format!("turn {}", index + 1);
+    if let Some(usage) = &turn.usage {
+        return format!("{label} ({})", turn_usage_tokens(usage));
+    }
+    label
 }
 
 fn turn_selector_hover(turn: &LlmTurnState) -> String {
-    format!(
+    let mut hover = format!(
         "{} {} {} ({})",
         status_label(turn.status),
         turn.operation,
         turn.source.label(),
         turn.turn_id
-    )
+    );
+    if let Some(usage) = &turn.usage {
+        hover.push_str(&format!(" tokens: {}", turn_usage_tokens(usage)));
+    }
+    hover
+}
+
+fn turn_usage_tokens(usage: &LlmUsageView) -> u64 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
 }
 
 fn ensure_turn<'a>(
@@ -1885,6 +1897,38 @@ mod tests {
         assert_eq!(selected_module_panel(&module, "turn:turn-1"), "turn:turn-1");
         assert_eq!(selected_module_panel(&module, "turn:missing"), "memos");
         assert_eq!(selected_module_panel(&module, "turn-1"), "memos");
+    }
+
+    #[test]
+    fn turn_selector_label_shows_input_plus_output_tokens() {
+        let mut turn = LlmTurnState {
+            turn_id: "turn-1".to_string(),
+            operation: "text_turn".to_string(),
+            source: LlmObservationSource::ModuleTurn,
+            tier: "Default".to_string(),
+            model: None,
+            request_id: None,
+            finish_reason: None,
+            usage: None,
+            batch: None,
+            input: Vec::new(),
+            output: Vec::new(),
+            status: ModuleSessionStatus::Running,
+        };
+
+        assert_eq!(turn_selector_label(0, &turn), "turn 1");
+
+        turn.usage = Some(LlmUsageView {
+            input_tokens: 2,
+            output_tokens: 3,
+            total_tokens: 99,
+            cost_micros_usd: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+        });
+
+        assert_eq!(turn_selector_label(0, &turn), "turn 1 (5)");
+        assert!(turn_selector_hover(&turn).contains("tokens: 5"));
     }
 
     #[test]
