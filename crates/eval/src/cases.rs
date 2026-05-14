@@ -109,7 +109,7 @@ pub enum FullAgentInput {
         direction: Option<String>,
         appearance: Text,
     },
-    Observed {
+    OneShot {
         modality: String,
         #[eure(default)]
         direction: Option<String>,
@@ -463,13 +463,13 @@ impl FullAgentInput {
                     appearance.content
                 )
             }
-            Self::Observed {
+            Self::OneShot {
                 modality,
                 direction,
                 content,
             } => {
                 format!(
-                    "observed:{modality}{}: {}",
+                    "one-shot:{modality}{}: {}",
                     direction_suffix(direction),
                     content.content
                 )
@@ -963,13 +963,13 @@ fn validate_full_agent_input(
                 message: format!("{label}.appearance must not be empty"),
             })
         }
-        FullAgentInput::Observed { modality, .. } if modality.trim().is_empty() => {
+        FullAgentInput::OneShot { modality, .. } if modality.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.modality must not be empty"),
             })
         }
-        FullAgentInput::Observed { content, .. } if content.content.trim().is_empty() => {
+        FullAgentInput::OneShot { content, .. } if content.content.trim().is_empty() => {
             Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("{label}.content must not be empty"),

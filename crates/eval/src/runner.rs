@@ -230,7 +230,7 @@ impl VisualizerHook {
                         records,
                     });
                 }
-                VisualizerCommand::SendSensoryInput { tab_id, .. } => {
+                VisualizerCommand::SendOneShotSensoryInput { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -1786,7 +1786,7 @@ async fn publish_full_agent_inputs(
     let now = clock.now();
     for input in inputs {
         let body = match input {
-            FullAgentInput::Heard { direction, content } => SensoryInput::Observed {
+            FullAgentInput::Heard { direction, content } => SensoryInput::OneShot {
                 modality: SensoryModality::Audition,
                 direction: direction.clone(),
                 content: content.content.clone(),
@@ -1795,17 +1795,17 @@ async fn publish_full_agent_inputs(
             FullAgentInput::Seen {
                 direction,
                 appearance,
-            } => SensoryInput::Observed {
+            } => SensoryInput::OneShot {
                 modality: SensoryModality::Vision,
                 direction: direction.clone(),
                 content: appearance.content.clone(),
                 observed_at: now,
             },
-            FullAgentInput::Observed {
+            FullAgentInput::OneShot {
                 modality,
                 direction,
                 content,
-            } => SensoryInput::Observed {
+            } => SensoryInput::OneShot {
                 modality: SensoryModality::parse(modality),
                 direction: direction.clone(),
                 content: content.content.clone(),
@@ -2103,7 +2103,9 @@ async fn handle_visualizer_commands(
                 visualizer.request_shutdown();
                 outcome.shutdown = true;
             }
-            VisualizerCommand::SendSensoryInput { tab_id, input } if tab_id.as_str() == case_id => {
+            VisualizerCommand::SendOneShotSensoryInput { tab_id, input }
+                if tab_id.as_str() == case_id =>
+            {
                 let Some(sensory) = sensory else {
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id,
@@ -2112,7 +2114,7 @@ async fn handle_visualizer_commands(
                     continue;
                 };
                 let observed_at = clock.now();
-                let body = SensoryInput::Observed {
+                let body = SensoryInput::OneShot {
                     modality: SensoryModality::parse(input.modality),
                     direction: None,
                     content: input.content,

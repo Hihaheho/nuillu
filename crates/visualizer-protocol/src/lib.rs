@@ -181,9 +181,9 @@ pub enum VisualizerEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VisualizerCommand {
-    SendSensoryInput {
+    SendOneShotSensoryInput {
         tab_id: VisualizerTabId,
-        input: ChatInput,
+        input: OneShotSensoryInput,
     },
     CreateAmbientSensoryRow {
         tab_id: VisualizerTabId,
@@ -331,7 +331,7 @@ pub enum TabStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatInput {
+pub struct OneShotSensoryInput {
     pub modality: String,
     pub content: String,
 }
@@ -766,9 +766,9 @@ mod tests {
         ));
 
         let command = VisualizerClientMessage::Command {
-            command: VisualizerCommand::SendSensoryInput {
+            command: VisualizerCommand::SendOneShotSensoryInput {
                 tab_id: VisualizerTabId::new("live"),
-                input: ChatInput {
+                input: OneShotSensoryInput {
                     modality: "touch".to_string(),
                     content: "the tabletop feels cold".to_string(),
                 },
@@ -779,7 +779,7 @@ mod tests {
         assert!(matches!(
             actual,
             VisualizerClientMessage::Command {
-                command: VisualizerCommand::SendSensoryInput { input, .. },
+                command: VisualizerCommand::SendOneShotSensoryInput { input, .. },
             } if input.modality == "touch" && input.content == "the tabletop feels cold"
         ));
 

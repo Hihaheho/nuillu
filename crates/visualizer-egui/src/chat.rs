@@ -4,8 +4,8 @@ use std::sync::mpsc::Sender;
 use nuillu_module::SensoryInput;
 
 use crate::{
-    AmbientSensoryRowView, ChatInput, UtteranceDeltaView, UtteranceView, VisualizerClientMessage,
-    VisualizerCommand, VisualizerTabId, text::wrapped_label,
+    AmbientSensoryRowView, OneShotSensoryInput, UtteranceDeltaView, UtteranceView,
+    VisualizerClientMessage, VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -82,12 +82,15 @@ impl ChatState {
 
     pub fn push_sensory_input(&mut self, input: SensoryInput) {
         let (source, content) = match input {
-            SensoryInput::Observed {
+            SensoryInput::OneShot {
                 modality,
                 content,
                 observed_at,
                 ..
-            } => (format!("{} at {}", modality.as_str(), observed_at), content),
+            } => (
+                format!("one-shot {} at {}", modality.as_str(), observed_at),
+                content,
+            ),
             SensoryInput::AmbientSnapshot {
                 entries,
                 observed_at,
@@ -296,9 +299,9 @@ fn one_shot_ui(
                         state.one_shot_modality.trim().to_owned()
                     };
                     let _ = commands.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::SendSensoryInput {
+                        command: VisualizerCommand::SendOneShotSensoryInput {
                             tab_id: tab_id.clone(),
-                            input: ChatInput { modality, content },
+                            input: OneShotSensoryInput { modality, content },
                         },
                     });
                     state.one_shot_draft.clear();

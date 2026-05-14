@@ -467,7 +467,7 @@ pub struct AmbientSensoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SensoryInput {
-    Observed {
+    OneShot {
         modality: SensoryModality,
         direction: Option<String>,
         content: String,
@@ -536,6 +536,27 @@ mod tests {
                         "content": "warm air near the door",
                     }
                 ],
+                "observed_at": "2026-05-13T00:00:00Z",
+            })
+        );
+        assert_eq!(serde_json::from_value::<SensoryInput>(json).unwrap(), input);
+
+        let input = SensoryInput::OneShot {
+            modality: SensoryModality::Audition,
+            direction: Some("front".to_string()),
+            content: "a bell rings".to_string(),
+            observed_at: DateTime::parse_from_rfc3339("2026-05-13T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let json = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "one_shot",
+                "modality": "audition",
+                "direction": "front",
+                "content": "a bell rings",
                 "observed_at": "2026-05-13T00:00:00Z",
             })
         );

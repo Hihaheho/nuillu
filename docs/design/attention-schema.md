@@ -38,7 +38,7 @@ External input and output sit at the boundary of cognition:
 
 `AttentionControlRequest` is the internal typed attention-bid message. It is consumed only by allocation-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
 
-Sensory input is multimodal. Initial built-in observations are `Heard { direction, content, observed_at }` for linguistic/auditory input and `Seen { direction, appearance, observed_at }` for visual input. The variant names are past-tense observations rather than actions: `Listen` would describe what the agent does, while `Heard` describes what arrived at the sensory boundary; `Visible` would describe a property, while `Seen` describes an observed event.
+Sensory input is split into `OneShot { modality, direction, content, observed_at }` and `AmbientSnapshot { entries, observed_at }`. One-shot input is a discrete stimulus such as a heard utterance, visual event, or custom modality. Ambient snapshots are the complete current enabled background field keyed by row id; omitted rows mean they are no longer active ambient context, not proof that an external condition disappeared.
 
 `observed_at` is the host-observed datetime of the stimulus. When the sensory module writes a memo-log entry, it compares the current clock time to `observed_at` and keeps a detailed human-readable relative age. The memo-log entry should preserve detail, for example `Ryo said "..." 1 minute 20 seconds ago`, not a time-division bucket and not a raw turn id.
 
@@ -187,7 +187,7 @@ The deterministic stage maintains stimulus habituation and decay:
 - old stimuli decay unless refreshed,
 - novel, user-directed, intense, or changed stimuli gain salience.
 
-The LLM stage receives the raw observation plus deterministic salience features and decides whether to ignore it, fold it into a background summary, or write a concise normalized observation to the sensory memo.
+The LLM stage receives one-shot events and ambient diffs plus deterministic salience features and decides whether to ignore them, fold them into a background summary, or write a concise normalized observation to the sensory memo. The current full ambient field is passed as ephemeral assistant context on each sensory LLM turn; only one-shot ledger entries and ambient add/update/remove diffs are persisted in sensory's private LLM session.
 
 The sensory memo is the only output. It should contain the filtered, normalized observations that other modules may inspect through the blackboard path, plus enough inspection detail to explain salience and the LLM decision. It should not mirror every raw input event. Sensory does not answer the user, append to the cognition log, publish query/self-model requests, or mutate shared state beyond its memo.
 

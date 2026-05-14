@@ -187,14 +187,14 @@ pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
 pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
 
 pub enum SensoryInput {
-    Heard {
+    OneShot {
+        modality: SensoryModality,
         direction: Option<String>,
         content: String,
         observed_at: DateTime<Utc>,
     },
-    Seen {
-        direction: Option<String>,
-        appearance: String,
+    AmbientSnapshot {
+        entries: Vec<AmbientSensoryEntry>,
         observed_at: DateTime<Utc>,
     },
 }
@@ -231,10 +231,10 @@ Delivery policy is per topic:
 - `AttentionControlRequest` and `SensoryInput` are role fanout plus replica load-balance: each subscribed module role receives the message, and one active replica of that role is selected round-robin. Boot wiring grants `AttentionControlRequestInbox` only to allocation-controller.
 - Disabled replicas receive no newly routed topic messages. Messages already in their local inbox remain there until the event loop starts that replica's next active batch.
 
-`SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The initial built-in variants are:
+`SensoryInput` is the only external stimulus type accepted by full-agent/app boot. It is not a durable answer. The built-in variants are:
 
-- `Heard { direction, content, observed_at }` for linguistic/auditory input,
-- `Seen { direction, appearance, observed_at }` for visual input.
+- `OneShot { modality, direction, content, observed_at }` for discrete stimuli,
+- `AmbientSnapshot { entries, observed_at }` for the complete active ambient sensory field keyed by row id.
 
 `direction` is an optional host-provided egocentric/source label such as `"front"`, `"left"`, `"screen"`, or `"user"`. It is intentionally a string in the first design pass; a richer direction/source type can replace it once real app and eval use cases make the needed geometry clear.
 
@@ -495,11 +495,11 @@ Activation gating is event-loop owned. The role-specific capability lists below 
 
 Capabilities: `SensoryInputInbox`, `AllocationReader`, `Memo`, `Clock`, `LlmAccess`.
 
-Receives external observations, computes deterministic salience features, then uses an LLM tool turn to decide whether to ignore the stimulus or write a concise normalized observation to the sensory memo. Memo writes happen only through the sensory memo-writing tool. Memo text should use the observation datetime and detailed relative-age formatting, for example `Ryo said "..." 1 minute 20 seconds ago`. It does not read the blackboard, append cognition-log entries, write allocation, write memory, publish query/self-model requests, or emit utterances.
+Receives external one-shot stimuli and ambient snapshots, computes deterministic salience features, then uses an LLM tool turn to decide whether to ignore the stimulus/diff or write a concise normalized observation to the sensory memo. Memo writes happen only through the sensory memo-writing tool. Memo text should use the observation datetime and detailed relative-age formatting, for example `Ryo said "..." 1 minute 20 seconds ago`. It does not read the blackboard, append cognition-log entries, write allocation, write memory, publish query/self-model requests, or emit utterances.
 
 The sensory module is deliberately a pre-attentive filter, not the conversation owner and not a work router. It maintains local stimulus state keyed by a normalized signature such as source/direction plus content or appearance. Habituation and decay are calculated, not delegated to the LLM: repeated low-change stimuli lose salience, old stimuli decay, and novel/user-directed/intense/changed stimuli gain salience.
 
-The LLM stage receives the raw observation, detailed relative age, normalized signature, repetition/change metrics, decay-adjusted salience, current allocation guidance, and any configured thresholds. Its durable output is constrained to tool calls: ignore the observation or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observations and enough inspection detail to explain the computed salience and the LLM decision. Raw sensory events are transient and should not be mirrored wholesale into durable state.
+The LLM stage receives persisted assistant-side sensory ledger entries for one-shots and ambient add/update/remove diffs, plus ephemeral assistant context containing the full current ambient field. It also receives detailed relative age, normalized signature, repetition/change metrics, decay-adjusted salience, current allocation guidance, and any configured thresholds. Its durable shared output is constrained to tool calls: ignore the observation/diff or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observations and enough inspection detail to explain the computed salience and the LLM decision. Raw sensory events and full ambient snapshots are transient and should not be mirrored wholesale into durable shared state.
 
 ### Cognition Gate
 
@@ -703,7 +703,7 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 `crates/eval` has two schema families because they exercise different boundaries.
 
-Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
+Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support batched `inputs[]` whose `heard`, `seen`, and `one-shot` variants all publish `SensoryInput::OneShot`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
 
 Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, allocation-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query (memory, policy), memory, memory-compaction, policy, value-estimator, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the allocation-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 

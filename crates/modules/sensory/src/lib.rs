@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -38,13 +38,49 @@ const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
 
 #[derive(Clone, Debug)]
 struct PreparedSensoryObservation {
+    kind: SensoryObservationKind,
     modality: SensoryModality,
-    ambient: bool,
+    ambient_id: Option<String>,
     direction: Option<String>,
     content: String,
     observed_at: DateTime<Utc>,
     relative_age: String,
     salience: SalienceFeatures,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SensoryObservationKind {
+    OneShot,
+    AmbientAdded,
+    AmbientUpdated,
+    AmbientRemoved,
+}
+
+impl SensoryObservationKind {
+    fn is_ambient(self) -> bool {
+        matches!(
+            self,
+            Self::AmbientAdded | Self::AmbientUpdated | Self::AmbientRemoved
+        )
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OneShot => "one-shot",
+            Self::AmbientAdded => "ambient added",
+            Self::AmbientUpdated => "ambient updated",
+            Self::AmbientRemoved => "ambient removed",
+        }
+    }
+
+    fn signature_prefix(self) -> &'static str {
+        match self {
+            Self::OneShot => "one-shot",
+            Self::AmbientAdded => "ambient-added",
+            Self::AmbientUpdated => "ambient-updated",
+            Self::AmbientRemoved => "ambient-removed",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +100,23 @@ struct StimulusState {
     repetition_count: u32,
 }
 
+#[derive(Clone, Debug)]
+enum AmbientDiff {
+    Added {
+        id: String,
+        entry: AmbientSensoryEntry,
+    },
+    Updated {
+        id: String,
+        previous: AmbientSensoryEntry,
+        current: AmbientSensoryEntry,
+    },
+    Removed {
+        id: String,
+        previous: AmbientSensoryEntry,
+    },
+}
+
 pub struct SensoryModule {
     owner: nuillu_types::ModuleId,
     inbox: SensoryInputInbox,
@@ -77,6 +130,7 @@ pub struct SensoryModule {
     burst: SensoryBurstConfig,
     system_prompt: std::sync::OnceLock<String>,
     stimuli: HashMap<String, StimulusState>,
+    ambient_entries: BTreeMap<String, AmbientSensoryEntry>,
 }
 
 #[lutum::tool_input(name = "write_sensory_memo", output = WriteSensoryMemoOutput)]
@@ -144,6 +198,7 @@ impl SensoryModule {
             burst: SensoryBurstConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             stimuli: HashMap::new(),
+            ambient_entries: BTreeMap::new(),
         }
     }
 
@@ -218,11 +273,21 @@ impl SensoryModule {
             .cloned()
             .flat_map(|input| self.prepare_input_observations(now, input))
             .collect::<Vec<_>>();
+        if observations.is_empty() {
+            return Ok(());
+        }
         self.ensure_session_seeded(cx);
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation.for_module(&self.owner).guidance;
         self.session
-            .push_user(format_sensory_batch(&observations, &guidance));
+            .push_assistant_text(format_sensory_ledger(&observations));
+        self.session
+            .push_ephemeral_assistant_text(format_current_ambient_context(
+                &self.ambient_entries,
+                now,
+            ));
+        self.session
+            .push_ephemeral_developer(format_sensory_decision_context(&guidance));
 
         let lutum = self.llm.lutum().await;
         let outcome = self
@@ -284,15 +349,16 @@ impl SensoryModule {
         input: SensoryInput,
     ) -> Vec<PreparedSensoryObservation> {
         match input {
-            SensoryInput::Observed {
+            SensoryInput::OneShot {
                 modality,
                 direction,
                 content,
                 observed_at,
             } => vec![self.prepare_observation(
                 now,
+                SensoryObservationKind::OneShot,
                 modality,
-                false,
+                None,
                 direction,
                 content,
                 observed_at,
@@ -300,49 +366,129 @@ impl SensoryModule {
             SensoryInput::AmbientSnapshot {
                 entries,
                 observed_at,
-            } => entries
-                .into_iter()
-                .map(|entry| self.prepare_ambient_observation(now, entry, observed_at))
-                .collect(),
+            } => self.prepare_ambient_snapshot_observations(now, entries, observed_at),
         }
     }
 
-    fn prepare_ambient_observation(
+    fn prepare_ambient_snapshot_observations(
         &mut self,
         now: DateTime<Utc>,
-        entry: AmbientSensoryEntry,
+        entries: Vec<AmbientSensoryEntry>,
+        observed_at: DateTime<Utc>,
+    ) -> Vec<PreparedSensoryObservation> {
+        let mut next = BTreeMap::new();
+        for entry in entries {
+            next.insert(entry.id.clone(), entry);
+        }
+
+        let mut diffs = Vec::new();
+        for (id, entry) in &next {
+            match self.ambient_entries.get(id) {
+                None => diffs.push(AmbientDiff::Added {
+                    id: id.clone(),
+                    entry: entry.clone(),
+                }),
+                Some(previous)
+                    if previous.modality != entry.modality || previous.content != entry.content =>
+                {
+                    diffs.push(AmbientDiff::Updated {
+                        id: id.clone(),
+                        previous: previous.clone(),
+                        current: entry.clone(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for (id, previous) in &self.ambient_entries {
+            if !next.contains_key(id) {
+                diffs.push(AmbientDiff::Removed {
+                    id: id.clone(),
+                    previous: previous.clone(),
+                });
+            }
+        }
+
+        self.ambient_entries = next;
+        diffs
+            .into_iter()
+            .map(|diff| self.prepare_ambient_diff_observation(now, diff, observed_at))
+            .collect()
+    }
+
+    fn prepare_ambient_diff_observation(
+        &mut self,
+        now: DateTime<Utc>,
+        diff: AmbientDiff,
         observed_at: DateTime<Utc>,
     ) -> PreparedSensoryObservation {
-        self.prepare_observation(
-            now,
-            entry.modality,
-            true,
-            Some(format!("ambient:{}", entry.id)),
-            entry.content,
-            observed_at,
-        )
+        match diff {
+            AmbientDiff::Added { id, entry } => self.prepare_observation(
+                now,
+                SensoryObservationKind::AmbientAdded,
+                entry.modality,
+                Some(id.clone()),
+                Some(format!("ambient:{id}")),
+                entry.content,
+                observed_at,
+            ),
+            AmbientDiff::Updated {
+                id,
+                previous,
+                current,
+            } => self.prepare_observation(
+                now,
+                SensoryObservationKind::AmbientUpdated,
+                current.modality.clone(),
+                Some(id.clone()),
+                Some(format!("ambient:{id}")),
+                format!(
+                    "was {}: {}; now {}: {}",
+                    previous.modality.as_str(),
+                    previous.content.trim(),
+                    current.modality.as_str(),
+                    current.content.trim()
+                ),
+                observed_at,
+            ),
+            AmbientDiff::Removed { id, previous } => self.prepare_observation(
+                now,
+                SensoryObservationKind::AmbientRemoved,
+                previous.modality.clone(),
+                Some(id.clone()),
+                Some(format!("ambient:{id}")),
+                format!(
+                    "removed; previous {}: {}",
+                    previous.modality.as_str(),
+                    previous.content.trim()
+                ),
+                observed_at,
+            ),
+        }
     }
 
     fn prepare_observation(
         &mut self,
         now: DateTime<Utc>,
+        kind: SensoryObservationKind,
         modality: SensoryModality,
-        ambient: bool,
+        ambient_id: Option<String>,
         direction: Option<String>,
         raw_content: String,
         observed_at: DateTime<Utc>,
     ) -> PreparedSensoryObservation {
         let relative_age = Self::format_age(now, observed_at);
         let salience = self.salience_features(
+            kind,
             modality.as_str(),
-            ambient,
             direction.as_deref(),
             &raw_content,
             observed_at,
         );
         PreparedSensoryObservation {
+            kind,
             modality,
-            ambient,
+            ambient_id,
             direction,
             content: raw_content,
             observed_at,
@@ -353,15 +499,15 @@ impl SensoryModule {
 
     fn salience_features(
         &mut self,
+        kind: SensoryObservationKind,
         modality: &str,
-        ambient: bool,
         direction: Option<&str>,
         content: &str,
         observed_at: DateTime<Utc>,
     ) -> SalienceFeatures {
         let signature = format!(
             "{}:{}:{}:{}",
-            if ambient { "ambient" } else { "observed" },
+            kind.signature_prefix(),
             modality,
             direction.unwrap_or_default().to_ascii_lowercase(),
             content.trim().to_ascii_lowercase()
@@ -504,32 +650,34 @@ fn is_user_directed_direction(direction: &str) -> bool {
     USER_DIRECTED_DIRECTIONS.contains(&direction.as_str())
 }
 
-fn format_sensory_batch(observations: &[PreparedSensoryObservation], guidance: &str) -> String {
-    let mut out = String::from("New sensory observations:");
+fn format_sensory_ledger(observations: &[PreparedSensoryObservation]) -> String {
+    let mut out = String::from("New sensory session ledger entries:");
     if observations.is_empty() {
         out.push_str("\n- none");
     } else {
-        if observations.iter().any(|observation| observation.ambient) {
+        if observations
+            .iter()
+            .any(|observation| observation.kind.is_ambient())
+        {
             out.push_str(
-                "\nAmbient snapshot entries are enabled background rows only; omitted rows are not evidence that a condition disappeared.",
+                "\nAmbient entries are enabled background rows only; removal from the active ambient field is not proof that a condition disappeared.",
             );
         }
         for observation in observations {
-            let mode = if observation.ambient {
-                "ambient"
+            let source = if let Some(id) = observation.ambient_id.as_deref() {
+                format!(" [{id}]")
             } else {
-                "observed"
+                observation
+                    .direction
+                    .as_deref()
+                    .map(|direction| format!(" from {direction}"))
+                    .unwrap_or_default()
             };
-            let direction = observation
-                .direction
-                .as_deref()
-                .map(|direction| format!(" from {direction}"))
-                .unwrap_or_default();
             out.push_str(&format!(
                 "\n- {} {}{} observed {} ({}): {}",
-                mode,
+                observation.kind.label(),
                 observation.modality.as_str(),
-                direction,
+                source,
                 observation.relative_age,
                 observation.observed_at.to_rfc3339(),
                 observation.content.trim()
@@ -551,14 +699,44 @@ fn format_sensory_batch(observations: &[PreparedSensoryObservation], guidance: &
         }
     }
 
-    out.push_str("\n\nCurrent sensory guidance: ");
+    out
+}
+
+fn format_current_ambient_context(
+    entries: &BTreeMap<String, AmbientSensoryEntry>,
+    now: DateTime<Utc>,
+) -> String {
+    let mut out = format!("Current ambient sensory field at {}:", now.to_rfc3339());
+    if entries.is_empty() {
+        out.push_str("\n- none");
+    } else {
+        out.push_str(
+            "\nThese are currently enabled background rows. They are dynamic context, not durable conclusions.",
+        );
+        for (id, entry) in entries {
+            out.push_str(&format!(
+                "\n- [{}] {}: {}",
+                id,
+                entry.modality.as_str(),
+                entry.content.trim()
+            ));
+        }
+    }
+    out
+}
+
+fn format_sensory_decision_context(guidance: &str) -> String {
+    let mut out = String::from(
+        "Evaluate the persisted sensory ledger entries using the current ambient field as background context.",
+    );
+    out.push_str("\nCurrent sensory guidance: ");
     let guidance = guidance.trim();
     if guidance.is_empty() {
         out.push_str("none");
     } else {
         out.push_str(guidance);
     }
-    out.push_str("\n\nDecision: use write_sensory_memo only for useful durable sensory memo-log output; otherwise use ignore_observations.");
+    out.push_str("\nDecision: use write_sensory_memo only for useful durable sensory memo-log output; otherwise use ignore_observations.");
     out
 }
 
@@ -817,7 +995,7 @@ mod tests {
     }
 
     fn heard(content: &str) -> SensoryInput {
-        SensoryInput::Observed {
+        SensoryInput::OneShot {
             modality: SensoryModality::Audition,
             direction: Some("front".to_string()),
             content: content.to_string(),
@@ -831,6 +1009,39 @@ mod tests {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn wait_for_batch_count(recorder: &SensoryTestRecorder, count: usize) {
+        for _ in 0..50 {
+            if recorder.batches.borrow().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn wait_for_session_count(recorder: &SensoryTestRecorder, count: usize) {
+        for _ in 0..50 {
+            if recorder.session_inputs.borrow().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn ambient_entry(id: &str, modality: SensoryModality, content: &str) -> AmbientSensoryEntry {
+        AmbientSensoryEntry {
+            id: id.to_string(),
+            modality,
+            content: content.to_string(),
+        }
+    }
+
+    fn ambient(entries: Vec<AmbientSensoryEntry>) -> SensoryInput {
+        SensoryInput::AmbientSnapshot {
+            entries,
+            observed_at: reference_now(),
         }
     }
 
@@ -882,8 +1093,9 @@ mod tests {
     #[test]
     fn ambient_snapshot_format_marks_background_context() {
         let observations = vec![PreparedSensoryObservation {
+            kind: SensoryObservationKind::AmbientAdded,
             modality: SensoryModality::Smell,
-            ambient: true,
+            ambient_id: Some("row-1".to_string()),
             direction: Some("ambient:row-1".to_string()),
             content: "wet stone smell".to_string(),
             observed_at: reference_now(),
@@ -898,11 +1110,30 @@ mod tests {
                 salience_score: 0.85,
             },
         }];
-        let text = format_sensory_batch(&observations, "");
+        let text = format_sensory_ledger(&observations);
 
-        assert!(text.contains("Ambient snapshot entries are enabled background rows only"));
-        assert!(text.contains("ambient smell"));
+        assert!(text.contains("Ambient entries are enabled background rows only"));
+        assert!(text.contains("ambient added smell [row-1]"));
         assert!(text.contains("wet stone smell"));
+    }
+
+    #[test]
+    fn current_ambient_context_formats_full_snapshot() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "ambient-1".to_string(),
+            ambient_entry("ambient-1", SensoryModality::Vision, "lamp is on"),
+        );
+        entries.insert(
+            "ambient-2".to_string(),
+            ambient_entry("ambient-2", SensoryModality::Audition, "fan hum"),
+        );
+
+        let text = format_current_ambient_context(&entries, reference_now());
+
+        assert!(text.contains("Current ambient sensory field at 2026-05-07T12:00:00+00:00"));
+        assert!(text.contains("[ambient-1] vision: lamp is on"));
+        assert!(text.contains("[ambient-2] audition: fan hum"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -955,7 +1186,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn memo_writes_come_from_tools_and_session_history_persists() {
+    async fn one_shot_ledger_is_persisted_as_assistant_history() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -968,8 +1199,8 @@ mod tests {
                     &caps,
                     recorder.clone(),
                     SensoryBurstConfig {
-                        silent_window: Duration::from_millis(1),
-                        budget: Duration::from_millis(1),
+                        silent_window: Duration::from_millis(30),
+                        budget: Duration::from_millis(100),
                     },
                     None,
                     Vec::new(),
@@ -1022,6 +1253,21 @@ mod tests {
                     count_message_role(first_session, InputMessageRole::Developer),
                     0
                 );
+                assert_eq!(count_message_role(first_session, InputMessageRole::User), 0);
+                let first_assistant_texts = assistant_texts(first_session);
+                assert!(
+                    first_assistant_texts.iter().any(|text| {
+                        text.contains("one-shot audition from front")
+                            && text.contains("Koro is standing at the front.")
+                    }),
+                    "one-shot sensory input should be persisted as assistant-side ledger history"
+                );
+                assert!(
+                    first_assistant_texts
+                        .iter()
+                        .all(|text| !text.contains("Current ambient sensory field")),
+                    "ambient snapshot context should not persist in assistant ledger history"
+                );
 
                 let second_session = sessions.get(1).expect("second sensory activation recorded");
                 assert!(
@@ -1042,6 +1288,134 @@ mod tests {
                 assert_eq!(
                     count_message_role(second_session, InputMessageRole::Developer),
                     0
+                );
+                assert_eq!(
+                    count_message_role(second_session, InputMessageRole::User),
+                    0
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambient_diffs_are_assistant_ledgers_and_ephemeral_context_is_stripped() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(ignore_scenario("ambient changes handled", 0));
+                let observed = adapter.clone();
+                let (_blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(30),
+                        budget: Duration::from_millis(100),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(ambient(vec![ambient_entry(
+                            "ambient-1",
+                            SensoryModality::Vision,
+                            "lamp is on",
+                        )]))
+                        .await
+                        .expect("sensory subscriber exists");
+                    sensory
+                        .publish(ambient(vec![ambient_entry(
+                            "ambient-1",
+                            SensoryModality::Vision,
+                            "lamp is off",
+                        )]))
+                        .await
+                        .expect("sensory subscriber exists");
+                    sensory
+                        .publish(ambient(Vec::new()))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_session_count(&recorder, 1).await;
+                })
+                .await;
+
+                let sessions = recorder.session_inputs.borrow();
+                assert_eq!(sessions.len(), 1);
+
+                let first = assistant_texts(&sessions[0]).join("\n");
+                assert!(first.contains("ambient added vision [ambient-1]"));
+                assert!(first.contains("lamp is on"));
+                assert!(!first.contains("Current ambient sensory field"));
+                assert!(first.contains("ambient updated vision [ambient-1]"));
+                assert!(first.contains("was vision: lamp is on; now vision: lamp is off"));
+                assert!(first.contains("ambient removed vision [ambient-1]"));
+                assert!(first.contains("removed; previous vision: lamp is off"));
+
+                let ephemeral_indices = observed.observed_ephemeral_indices();
+                assert_eq!(ephemeral_indices.len(), 1);
+                assert!(
+                    ephemeral_indices
+                        .iter()
+                        .all(|indices| indices.len() == 2),
+                    "each sensory LLM turn should carry ambient context and decision context as ephemeral items"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unchanged_ambient_snapshot_skips_llm_turn() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(ignore_scenario("ambient add handled", 0));
+                let observed = adapter.clone();
+                let (_blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+                let snapshot = ambient(vec![ambient_entry(
+                    "ambient-1",
+                    SensoryModality::Audition,
+                    "fan hum",
+                )]);
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(snapshot.clone())
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_batch_count(&recorder, 1).await;
+                    sensory
+                        .publish(snapshot)
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_session_count(&recorder, 2).await;
+                })
+                .await;
+
+                assert_eq!(recorder.batches.borrow().as_slice(), &[1, 1]);
+                assert_eq!(
+                    observed.observed_ephemeral_indices().len(),
+                    1,
+                    "unchanged ambient snapshots should not start another LLM turn"
                 );
             })
             .await;
@@ -1240,5 +1614,17 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn assistant_texts(items: &[ModelInputItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text)) => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
     }
 }

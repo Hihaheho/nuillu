@@ -84,11 +84,11 @@ async fn handle_server_visualizer_message(
             visualizer.request_shutdown();
             true
         }
-        VisualizerCommand::SendSensoryInput {
+        VisualizerCommand::SendOneShotSensoryInput {
             tab_id: command_tab,
             input,
         } if command_tab == *tab_id => {
-            let body = SensoryInput::Observed {
+            let body = SensoryInput::OneShot {
                 modality: SensoryModality::parse(input.modality),
                 direction: None,
                 content: input.content,
@@ -331,9 +331,6 @@ async fn publish_ambient_snapshot(
             content: row.content.clone(),
         })
         .collect::<Vec<_>>();
-    if entries.is_empty() {
-        return;
-    }
     let body = SensoryInput::AmbientSnapshot {
         entries,
         observed_at: clock.now(),
