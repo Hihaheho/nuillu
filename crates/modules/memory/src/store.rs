@@ -12,6 +12,8 @@ use chrono::{DateTime, Utc};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, MemoryMetaPatch};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Content-store for memory entries. Metadata (rank, decay, access counts)
 /// is mirrored on the blackboard; this trait owns durable content and any
@@ -24,22 +26,161 @@ use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 /// remove all sources as one backend operation.
 #[async_trait(?Send)]
 pub trait MemoryStore {
-    async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError>;
-    async fn put(&self, mem: IndexedMemory) -> Result<(), PortError>;
+    async fn insert(
+        &self,
+        mem: NewMemory,
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError>;
+    async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError>;
     async fn compact(
         &self,
         mem: NewMemory,
         sources: &[MemoryIndex],
-    ) -> Result<MemoryIndex, PortError>;
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError>;
     async fn put_compacted(
         &self,
         mem: IndexedMemory,
         sources: &[MemoryIndex],
-    ) -> Result<(), PortError>;
+    ) -> Result<MemoryRecord, PortError>;
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError>;
     async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError>;
     async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError>;
+    async fn linked(&self, q: &LinkedMemoryQuery) -> Result<Vec<LinkedMemoryRecord>, PortError>;
+    async fn upsert_link(
+        &self,
+        link: NewMemoryLink,
+        updated_at: DateTime<Utc>,
+    ) -> Result<MemoryLink, PortError>;
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Episode,
+    #[default]
+    Statement,
+    Reflection,
+    Hypothesis,
+    Dream,
+    Procedure,
+    Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryConcept {
+    pub label: String,
+    pub mention_text: Option<String>,
+    pub loose_type: Option<String>,
+    pub confidence: f32,
+}
+
+impl MemoryConcept {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            mention_text: None,
+            loose_type: None,
+            confidence: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryTag {
+    pub label: String,
+    pub namespace: String,
+    pub confidence: f32,
+}
+
+impl MemoryTag {
+    pub fn operational(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            namespace: "operation".to_owned(),
+            confidence: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLinkRelation {
+    Related,
+    Supports,
+    Contradicts,
+    Updates,
+    Corrects,
+    DerivedFrom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLinkDirection {
+    Outgoing,
+    Incoming,
+    #[default]
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct NewMemoryLink {
+    pub from_memory: MemoryIndex,
+    pub to_memory: MemoryIndex,
+    pub relation: MemoryLinkRelation,
+    pub freeform_relation: Option<String>,
+    pub strength: f32,
+    pub confidence: f32,
+}
+
+impl NewMemoryLink {
+    pub fn derived_from(from_memory: MemoryIndex, to_memory: MemoryIndex) -> Self {
+        Self {
+            from_memory,
+            to_memory,
+            relation: MemoryLinkRelation::DerivedFrom,
+            freeform_relation: None,
+            strength: 1.0,
+            confidence: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryLink {
+    pub from_memory: MemoryIndex,
+    pub to_memory: MemoryIndex,
+    pub relation: MemoryLinkRelation,
+    pub freeform_relation: Option<String>,
+    pub strength: f32,
+    pub confidence: f32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct LinkedMemoryRecord {
+    pub record: MemoryRecord,
+    pub link: MemoryLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedMemoryQuery {
+    pub memory_indexes: Vec<MemoryIndex>,
+    pub relation_filter: Vec<MemoryLinkRelation>,
+    pub direction: MemoryLinkDirection,
+    pub limit: usize,
+}
+
+impl LinkedMemoryQuery {
+    pub fn around(memory_indexes: Vec<MemoryIndex>, limit: usize) -> Self {
+        Self {
+            memory_indexes,
+            relation_filter: Vec::new(),
+            direction: MemoryLinkDirection::Both,
+            limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +188,26 @@ pub struct NewMemory {
     pub content: MemoryContent,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub kind: MemoryKind,
+    pub concepts: Vec<MemoryConcept>,
+    pub tags: Vec<MemoryTag>,
+}
+
+impl NewMemory {
+    pub fn statement(
+        content: impl Into<MemoryContent>,
+        rank: MemoryRank,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            rank,
+            occurred_at,
+            kind: MemoryKind::Statement,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,20 +216,58 @@ pub struct IndexedMemory {
     pub content: MemoryContent,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+    pub concepts: Vec<MemoryConcept>,
+    pub tags: Vec<MemoryTag>,
 }
 
-#[derive(Debug, Clone)]
+impl IndexedMemory {
+    pub fn from_record(record: MemoryRecord) -> Self {
+        Self {
+            index: record.index,
+            content: record.content,
+            rank: record.rank,
+            occurred_at: record.occurred_at,
+            stored_at: record.stored_at,
+            kind: record.kind,
+            concepts: record.concepts,
+            tags: record.tags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryRecord {
     pub index: MemoryIndex,
     pub content: MemoryContent,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+    pub concepts: Vec<MemoryConcept>,
+    pub tags: Vec<MemoryTag>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MemoryQuery {
     pub text: String,
     pub limit: usize,
+    pub kinds: Vec<MemoryKind>,
+    pub concepts: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl MemoryQuery {
+    pub fn text(text: impl Into<String>, limit: usize) -> Self {
+        Self {
+            text: text.into(),
+            limit,
+            kinds: Vec::new(),
+            concepts: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 /// Memory store that accepts every write, returns empty reads, and assigns
@@ -78,30 +277,53 @@ pub struct NoopMemoryStore;
 
 #[async_trait(?Send)]
 impl MemoryStore for NoopMemoryStore {
-    async fn insert(&self, _mem: NewMemory) -> Result<MemoryIndex, PortError> {
+    async fn insert(
+        &self,
+        mem: NewMemory,
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(MemoryIndex::new(format!("noop-memory-{id}")))
+        Ok(MemoryRecord {
+            index: MemoryIndex::new(format!("noop-memory-{id}")),
+            content: mem.content,
+            rank: mem.rank,
+            occurred_at: mem.occurred_at,
+            stored_at,
+            kind: mem.kind,
+            concepts: mem.concepts,
+            tags: mem.tags,
+        })
     }
 
-    async fn put(&self, _mem: IndexedMemory) -> Result<(), PortError> {
-        Ok(())
+    async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
+        Ok(MemoryRecord {
+            index: mem.index,
+            content: mem.content,
+            rank: mem.rank,
+            occurred_at: mem.occurred_at,
+            stored_at: mem.stored_at,
+            kind: mem.kind,
+            concepts: mem.concepts,
+            tags: mem.tags,
+        })
     }
 
     async fn compact(
         &self,
         mem: NewMemory,
         _sources: &[MemoryIndex],
-    ) -> Result<MemoryIndex, PortError> {
-        self.insert(mem).await
+        stored_at: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError> {
+        self.insert(mem, stored_at).await
     }
 
     async fn put_compacted(
         &self,
-        _mem: IndexedMemory,
+        mem: IndexedMemory,
         _sources: &[MemoryIndex],
-    ) -> Result<(), PortError> {
-        Ok(())
+    ) -> Result<MemoryRecord, PortError> {
+        self.put(mem).await
     }
 
     async fn get(&self, _index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
@@ -114,6 +336,26 @@ impl MemoryStore for NoopMemoryStore {
 
     async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
         Ok(Vec::new())
+    }
+
+    async fn linked(&self, _q: &LinkedMemoryQuery) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn upsert_link(
+        &self,
+        link: NewMemoryLink,
+        updated_at: DateTime<Utc>,
+    ) -> Result<MemoryLink, PortError> {
+        Ok(MemoryLink {
+            from_memory: link.from_memory,
+            to_memory: link.to_memory,
+            relation: link.relation,
+            freeform_relation: link.freeform_relation,
+            strength: link.strength,
+            confidence: link.confidence,
+            updated_at,
+        })
     }
 
     async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
@@ -143,10 +385,7 @@ impl VectorMemorySearcher {
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, PortError> {
-        let q = MemoryQuery {
-            text: query.to_owned(),
-            limit,
-        };
+        let q = MemoryQuery::text(query, limit);
         let hits = self.primary_store.search(&q).await?;
 
         if !hits.is_empty() {
@@ -184,6 +423,13 @@ impl MemoryContentReader {
 
     pub async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
         self.primary_store.get(index).await
+    }
+
+    pub async fn linked(
+        &self,
+        query: &LinkedMemoryQuery,
+    ) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+        self.primary_store.linked(query).await
     }
 }
 
@@ -228,19 +474,25 @@ impl MemoryWriter {
         decay_secs: i64,
         occurred_at: Option<DateTime<Utc>>,
     ) -> Result<MemoryIndex, PortError> {
-        let new = NewMemory {
-            content: MemoryContent::new(content.clone()),
-            rank,
-            occurred_at,
-        };
+        let record = self
+            .insert_entry(
+                NewMemory::statement(MemoryContent::new(content), rank, occurred_at),
+                decay_secs,
+            )
+            .await?;
+        Ok(record.index)
+    }
 
-        let index = self.primary_store.insert(new).await?;
-        let indexed = IndexedMemory {
-            index: index.clone(),
-            content: MemoryContent::new(content),
-            rank,
-            occurred_at,
-        };
+    pub async fn insert_entry(
+        &self,
+        new: NewMemory,
+        decay_secs: i64,
+    ) -> Result<MemoryRecord, PortError> {
+        let rank = new.rank;
+        let occurred_at = new.occurred_at;
+        let now = self.clock.now();
+        let record = self.primary_store.insert(new, now).await?;
+        let indexed = IndexedMemory::from_record(record.clone());
 
         let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
             let indexed = indexed.clone();
@@ -254,7 +506,7 @@ impl MemoryWriter {
 
         self.blackboard
             .apply(BlackboardCommand::UpsertMemoryMetadata {
-                index: index.clone(),
+                index: record.index.clone(),
                 rank_if_new: rank,
                 occurred_at_if_new: occurred_at,
                 decay_if_new_secs: decay_secs,
@@ -267,7 +519,7 @@ impl MemoryWriter {
                 },
             })
             .await;
-        Ok(index)
+        Ok(record)
     }
 }
 
@@ -296,14 +548,35 @@ impl MemoryCompactor {
         }
     }
 
-    /// Insert the merged entry, delete the sources, and increment
-    /// `remember_tokens` on the merged entry by the count of merged sources.
+    /// Insert a compaction summary and remove source memories from live
+    /// retrieval. `remember_tokens` are accumulated on the summary by the
+    /// count of source memories.
     pub async fn merge(
         &self,
         sources: &[MemoryIndex],
         merged_content: String,
         merged_rank: MemoryRank,
         decay_secs: i64,
+    ) -> Result<MemoryIndex, PortError> {
+        self.write_summary(
+            sources,
+            merged_content,
+            merged_rank,
+            decay_secs,
+            Vec::new(),
+            vec![MemoryTag::operational("compaction-summary")],
+        )
+        .await
+    }
+
+    pub async fn write_summary(
+        &self,
+        sources: &[MemoryIndex],
+        summary_content: String,
+        summary_rank: MemoryRank,
+        decay_secs: i64,
+        concepts: Vec<MemoryConcept>,
+        tags: Vec<MemoryTag>,
     ) -> Result<MemoryIndex, PortError> {
         let occurred_at = self
             .get_many(sources)
@@ -313,18 +586,17 @@ impl MemoryCompactor {
             .min()
             .or_else(|| Some(self.clock.now()));
         let new = NewMemory {
-            content: MemoryContent::new(merged_content.clone()),
-            rank: merged_rank,
+            content: MemoryContent::new(summary_content),
+            rank: summary_rank,
             occurred_at,
+            kind: MemoryKind::Reflection,
+            concepts,
+            tags,
         };
 
-        let id = self.primary_store.compact(new, sources).await?;
-        let indexed = IndexedMemory {
-            index: id.clone(),
-            content: MemoryContent::new(merged_content),
-            rank: merged_rank,
-            occurred_at,
-        };
+        let now = self.clock.now();
+        let record = self.primary_store.compact(new, sources, now).await?;
+        let indexed = IndexedMemory::from_record(record.clone());
 
         let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
             let indexed = indexed.clone();
@@ -338,13 +610,13 @@ impl MemoryCompactor {
 
         self.blackboard
             .apply(BlackboardCommand::UpsertMemoryMetadata {
-                index: id.clone(),
-                rank_if_new: merged_rank,
+                index: record.index.clone(),
+                rank_if_new: summary_rank,
                 occurred_at_if_new: occurred_at,
                 decay_if_new_secs: decay_secs,
                 now: self.clock.now(),
                 patch: MemoryMetaPatch {
-                    rank: Some(merged_rank),
+                    rank: Some(summary_rank),
                     occurred_at: Some(occurred_at),
                     decay_remaining_secs: Some(decay_secs),
                     increment_remember_tokens: Some(sources.len() as u32),
@@ -352,13 +624,15 @@ impl MemoryCompactor {
                 },
             })
             .await;
-        for src in sources {
+        for source in sources {
             self.blackboard
-                .apply(BlackboardCommand::RemoveMemoryMetadata { index: src.clone() })
+                .apply(BlackboardCommand::RemoveMemoryMetadata {
+                    index: source.clone(),
+                })
                 .await;
         }
 
-        Ok(id)
+        Ok(record.index)
     }
 
     pub async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
@@ -373,5 +647,260 @@ impl MemoryCompactor {
             }
         }
         Ok(records)
+    }
+}
+
+/// Non-destructive writer for memory-to-memory associations.
+#[derive(Clone)]
+pub struct MemoryAssociator {
+    primary_store: Arc<dyn MemoryStore>,
+    replicas: Vec<Arc<dyn MemoryStore>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl MemoryAssociator {
+    pub fn new(
+        primary_store: Arc<dyn MemoryStore>,
+        replicas: Vec<Arc<dyn MemoryStore>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            primary_store,
+            replicas,
+            clock,
+        }
+    }
+
+    pub async fn upsert_link(&self, link: NewMemoryLink) -> Result<MemoryLink, PortError> {
+        let updated_at = self.clock.now();
+        let record = self
+            .primary_store
+            .upsert_link(link.clone(), updated_at)
+            .await?;
+        let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
+            let link = link.clone();
+            async move {
+                if let Err(error) = store.upsert_link(link, updated_at).await {
+                    tracing::warn!(replica, ?error, "secondary memory link upsert failed");
+                }
+            }
+        });
+        futures::future::join_all(replica_writes).await;
+        Ok(record)
+    }
+}
+
+/// Hard-delete a memory entry and remove the blackboard metadata mirror.
+#[derive(Clone)]
+pub struct MemoryDeleter {
+    primary_store: Arc<dyn MemoryStore>,
+    replicas: Vec<Arc<dyn MemoryStore>>,
+    blackboard: Blackboard,
+}
+
+impl MemoryDeleter {
+    pub fn new(
+        primary_store: Arc<dyn MemoryStore>,
+        replicas: Vec<Arc<dyn MemoryStore>>,
+        blackboard: Blackboard,
+    ) -> Self {
+        Self {
+            primary_store,
+            replicas,
+            blackboard,
+        }
+    }
+
+    pub async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError> {
+        self.primary_store.delete(index).await?;
+        for (replica, store) in self.replicas.iter().enumerate() {
+            if let Err(error) = store.delete(index).await {
+                tracing::warn!(replica, ?error, "secondary memory delete failed");
+            }
+        }
+        self.blackboard
+            .apply(BlackboardCommand::RemoveMemoryMetadata {
+                index: index.clone(),
+            })
+            .await;
+        let identity_memories = self
+            .blackboard
+            .read(|bb| {
+                bb.identity_memories()
+                    .iter()
+                    .filter(|memory| memory.index != *index)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        self.blackboard
+            .apply(BlackboardCommand::SetIdentityMemories(identity_memories))
+            .await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nuillu_module::ports::Clock;
+
+    #[derive(Debug)]
+    struct FixedClock(DateTime<Utc>);
+
+    #[async_trait(?Send)]
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+
+        async fn sleep_until(&self, _deadline: DateTime<Utc>) {}
+    }
+
+    #[derive(Clone)]
+    struct StaticMemoryStore {
+        record: MemoryRecord,
+    }
+
+    #[async_trait(?Send)]
+    impl MemoryStore for StaticMemoryStore {
+        async fn insert(
+            &self,
+            _mem: NewMemory,
+            _stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            Ok(self.record.clone())
+        }
+
+        async fn put(&self, _mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
+            Ok(self.record.clone())
+        }
+
+        async fn compact(
+            &self,
+            _mem: NewMemory,
+            _sources: &[MemoryIndex],
+            _stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            Ok(self.record.clone())
+        }
+
+        async fn put_compacted(
+            &self,
+            _mem: IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<MemoryRecord, PortError> {
+            Ok(self.record.clone())
+        }
+
+        async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+            Ok((index == &self.record.index).then(|| self.record.clone()))
+        }
+
+        async fn list_by_rank(&self, _rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(vec![self.record.clone()])
+        }
+
+        async fn linked(
+            &self,
+            _q: &LinkedMemoryQuery,
+        ) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+            Ok(vec![LinkedMemoryRecord {
+                record: self.record.clone(),
+                link: MemoryLink {
+                    from_memory: MemoryIndex::new("source"),
+                    to_memory: self.record.index.clone(),
+                    relation: MemoryLinkRelation::Related,
+                    freeform_relation: None,
+                    strength: 1.0,
+                    confidence: 1.0,
+                    updated_at: self.record.stored_at,
+                },
+            }])
+        }
+
+        async fn upsert_link(
+            &self,
+            link: NewMemoryLink,
+            _updated_at: DateTime<Utc>,
+        ) -> Result<MemoryLink, PortError> {
+            Ok(MemoryLink {
+                from_memory: link.from_memory,
+                to_memory: link.to_memory,
+                relation: link.relation,
+                freeform_relation: link.freeform_relation,
+                strength: link.strength,
+                confidence: link.confidence,
+                updated_at: self.record.stored_at,
+            })
+        }
+
+        async fn delete(&self, _index: &MemoryIndex) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn test_record() -> MemoryRecord {
+        let at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        MemoryRecord {
+            index: MemoryIndex::new("memory-1"),
+            content: MemoryContent::new("alpha memory"),
+            rank: MemoryRank::LongTerm,
+            occurred_at: Some(at),
+            stored_at: at,
+            kind: MemoryKind::Statement,
+            concepts: vec![MemoryConcept::new("alpha")],
+            tags: vec![MemoryTag::operational("test")],
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_search_records_direct_access() {
+        let record = test_record();
+        let now = record.stored_at;
+        let blackboard = Blackboard::new();
+        let searcher = VectorMemorySearcher::new(
+            Arc::new(StaticMemoryStore {
+                record: record.clone(),
+            }),
+            blackboard.clone(),
+            Arc::new(FixedClock(now)),
+        );
+
+        let hits = searcher.search("alpha", 1).await.unwrap();
+
+        assert_eq!(hits[0].index, record.index);
+        let metadata = blackboard
+            .read(|bb| bb.memory_metadata().get(&record.index).cloned())
+            .await
+            .unwrap();
+        assert_eq!(metadata.access_count, 1);
+        assert_eq!(metadata.last_accessed, now);
+    }
+
+    #[tokio::test]
+    async fn linked_lookup_does_not_record_access() {
+        let record = test_record();
+        let blackboard = Blackboard::new();
+        let reader = MemoryContentReader::new(Arc::new(StaticMemoryStore {
+            record: record.clone(),
+        }));
+
+        let linked = reader
+            .linked(&LinkedMemoryQuery::around(vec![record.index.clone()], 8))
+            .await
+            .unwrap();
+
+        assert_eq!(linked[0].record.index, record.index);
+        assert!(
+            blackboard
+                .read(|bb| bb.memory_metadata().get(&record.index).cloned())
+                .await
+                .is_none()
+        );
     }
 }

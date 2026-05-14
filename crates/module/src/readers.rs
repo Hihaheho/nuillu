@@ -20,7 +20,8 @@ use nuillu_types::ModuleInstanceId;
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
 /// Held by modules that legitimately need a wide view (cognition-gate,
-/// query, memory, memory-compaction, and the attention controller.
+/// query, memory, memory-compaction, memory-association, and the attention
+/// controller.
 #[derive(Clone)]
 pub struct BlackboardReader {
     blackboard: Blackboard,

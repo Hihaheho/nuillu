@@ -1,0 +1,39 @@
+id = "module-memory-preserve-dream-as-dream"
+description = "Memory may preserve remembered dream material when it is explicitly stored as dream evidence, not as verified fact."
+modules = ["memory"]
+prompt = "Preserve this remembered internal simulation only if it is stored as dream memory with dream/hypothesis framing and operational tags. Do not store it as statement, episode, or verified fact."
+context = "The cognition log contains dream material with the standard non-verified prefix. The scored artifact is the memory store diff; a correct preservation keeps the dream framing visible."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Internal dream simulation, not a verified fact: Koro might hide food behind the blue gate if startled."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "stores-dream-kind"
+  must-pass = true
+  contains = "kind: Dream"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "keeps-dream-content"
+  must-pass = true
+  contains = "blue gate"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "stores-dream-without-fact-claim"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "cognition", "trace"]
+  rubric = ```
+  Pass if the memory artifact shows a newly inserted dream or hypothesis memory that preserves the internal-simulation framing and carries dream/hypothesis handling metadata.
+  Fail if it stores the scenario as a statement, episode, current fact, or verified evidence, or if it strips away the non-verified dream framing.
+  ```
+}

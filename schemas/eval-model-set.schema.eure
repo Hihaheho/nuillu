@@ -56,5 +56,5 @@ token-env = `text`
 token-env.$optional = true
 model = `text`
 model.$optional = true
-dimensions = `number`
+dimensions = `integer`
 dimensions.$optional = true

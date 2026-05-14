@@ -26,6 +26,22 @@ schema = "schemas/eval-speak-case.schema.eure"
 globs = ["eval-cases/modules/speak/**/*.eure"]
 schema = "schemas/eval-speak-case.schema.eure"
 
+@ targets.eval-memory-cases
+globs = ["eval-cases/modules/memory/**/*.eure"]
+schema = "schemas/eval-memory-case.schema.eure"
+
+@ targets.eval-memory-compaction-cases
+globs = ["eval-cases/modules/memory-compaction/**/*.eure"]
+schema = "schemas/eval-memory-case.schema.eure"
+
+@ targets.eval-memory-association-cases
+globs = ["eval-cases/modules/memory-association/**/*.eure"]
+schema = "schemas/eval-memory-case.schema.eure"
+
+@ targets.eval-memory-recombination-cases
+globs = ["eval-cases/modules/memory-recombination/**/*.eure"]
+schema = "schemas/eval-memory-case.schema.eure"
+
 @ targets.eval-attention-schema-cases
 globs = ["eval-cases/modules/attention-schema/**/*.eure"]
 schema = "schemas/eval-attention-schema-case.schema.eure"
@@ -41,6 +57,10 @@ default-targets = [
   "eval-cognition-gate-cases",
   "eval-speak-gate-cases",
   "eval-speak-cases",
+  "eval-memory-cases",
+  "eval-memory-compaction-cases",
+  "eval-memory-association-cases",
+  "eval-memory-recombination-cases",
   "eval-attention-schema-cases",
   "eval-modelsets",
 ]

@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use nuillu_blackboard::{Blackboard, BlackboardInner, ResourceAllocation, ZeroReplicaWindowPolicy};
-use nuillu_memory::{MemoryRecord, MemoryStore};
+use nuillu_memory::{LinkedMemoryRecord, MemoryRecord, MemoryStore};
 use nuillu_types::{MemoryRank, ModelTier};
 use nuillu_visualizer_protocol::{
-    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
-    MemoryMetadataView, MemoryRecordView, ModulePolicyView, ModuleStatusView,
-    UtteranceProgressView, VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView,
-    memory_page_from_records,
+    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView,
+    LinkedMemoryRecordView, MemoView, MemoryConceptView, MemoryLinkView, MemoryMetadataView,
+    MemoryRecordView, MemoryTagView, ModulePolicyView, ModuleStatusView, UtteranceProgressView,
+    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
 };
 
 use super::gui::VisualizerHook;
@@ -65,9 +65,45 @@ pub async fn list_all_memories(memory: &dyn MemoryStore) -> Vec<MemoryRecordView
 pub fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
     MemoryRecordView {
         index: record.index.as_str().to_string(),
+        kind: format!("{:?}", record.kind),
         rank: format!("{:?}", record.rank),
         occurred_at: record.occurred_at,
+        stored_at: record.stored_at,
+        concepts: record
+            .concepts
+            .into_iter()
+            .map(|concept| MemoryConceptView {
+                label: concept.label,
+                mention_text: concept.mention_text,
+                loose_type: concept.loose_type,
+                confidence: concept.confidence,
+            })
+            .collect(),
+        tags: record
+            .tags
+            .into_iter()
+            .map(|tag| MemoryTagView {
+                label: tag.label,
+                namespace: tag.namespace,
+                confidence: tag.confidence,
+            })
+            .collect(),
         content: record.content.as_str().to_string(),
+    }
+}
+
+pub fn linked_memory_record_view(record: LinkedMemoryRecord) -> LinkedMemoryRecordView {
+    LinkedMemoryRecordView {
+        record: memory_record_view(record.record),
+        link: MemoryLinkView {
+            from_memory: record.link.from_memory.to_string(),
+            to_memory: record.link.to_memory.to_string(),
+            relation: format!("{:?}", record.link.relation),
+            freeform_relation: record.link.freeform_relation,
+            strength: record.link.strength,
+            confidence: record.link.confidence,
+            updated_at: record.link.updated_at,
+        },
     }
 }
 

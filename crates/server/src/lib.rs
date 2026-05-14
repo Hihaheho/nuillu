@@ -27,7 +27,7 @@ pub use model_set::{
 };
 pub use runtime::run_server_with_visualizer;
 pub use snapshot::{
-    bpm_from_cooldown, duration_millis_u64, list_all_memories, memory_metadata_views,
-    memory_rank_name, memory_record_view, model_tier_name, module_policy_views,
-    zero_replica_window_view,
+    bpm_from_cooldown, duration_millis_u64, linked_memory_record_view, list_all_memories,
+    memory_metadata_views, memory_rank_name, memory_record_view, model_tier_name,
+    module_policy_views, zero_replica_window_view,
 };

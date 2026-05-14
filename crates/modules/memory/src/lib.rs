@@ -1,11 +1,12 @@
 //! Memory domain crate.
 //!
 //! Owns the [`MemoryStore`] port, the memory-domain capability handles
-//! ([`MemoryWriter`], [`MemoryCompactor`], [`VectorMemorySearcher`],
-//! [`MemoryContentReader`]), and the three modules that operate on memory:
-//! [`MemoryModule`] (writes), [`MemoryCompactionModule`] (merges), and
-//! [`MemoryRecombinationModule`] (dream-like recombination), and
-//! [`QueryVectorModule`] (vector-search retrieval).
+//! ([`MemoryWriter`], [`MemoryCompactor`], [`MemoryAssociator`],
+//! [`VectorMemorySearcher`], [`MemoryContentReader`]), and the modules that
+//! operate on memory: [`MemoryModule`] (writes), [`MemoryCompactionModule`]
+//! (destructive merges), [`MemoryAssociationModule`] (non-destructive
+//! relationship writes), [`MemoryRecombinationModule`] (dream-like
+//! recombination), and [`QueryVectorModule`] (vector-search retrieval).
 //!
 //! Hosts build a [`MemoryCapabilities`] provider once at boot to bundle the
 //! store + blackboard + clock, then either pass it to registration closures
@@ -21,29 +22,44 @@ use nuillu_blackboard::{Blackboard, BlackboardCommand};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_types::MemoryRank;
 
+mod association;
+mod common;
+mod compaction;
 mod memory;
 mod query;
 mod recombination;
 mod store;
 
-pub use memory::{
+pub use association::{
+    AssociationLinkArgs, AssociationTools, AssociationToolsCall, AssociationToolsSelector,
+    GetAssociationMemoriesArgs, MemoryAssociationModule, WriteAssociationSummaryArgs,
+    WriteAssociationSummaryOutput, WriteMemoryLinksArgs, WriteMemoryLinksOutput,
+};
+pub use common::{GetMemoriesOutput, MemoryContentView};
+pub use compaction::{
     CompactionTools, CompactionToolsCall, CompactionToolsSelector, GetMemoriesArgs,
-    GetMemoriesOutput, InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryCompactionModule,
-    MemoryContentView, MemoryModule, MemoryTools, MemoryToolsCall, MemoryToolsSelector,
-    MergeMemoriesArgs, MergeMemoriesOutput,
+    MemoryCompactionModule, MergeMemoriesArgs, MergeMemoriesOutput,
+};
+pub use memory::{
+    InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
+    MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector,
 };
 pub use query::{
-    QueryVectorBatch, QueryVectorMemo, QueryVectorMemoHit, QueryVectorMemoSearch,
-    QueryVectorMemoryHit, QueryVectorModule, QueryVectorTools, QueryVectorToolsCall,
-    QueryVectorToolsSelector, SearchVectorMemoryArgs, SearchVectorMemoryOutput,
+    FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryVectorBatch,
+    QueryVectorLinkedMemoryHit, QueryVectorMemo, QueryVectorMemoHit, QueryVectorMemoLinkedHit,
+    QueryVectorMemoSearch, QueryVectorMemoryHit, QueryVectorModule, QueryVectorTools,
+    QueryVectorToolsCall, QueryVectorToolsSelector, SearchVectorMemoryArgs,
+    SearchVectorMemoryOutput,
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
     RecombinationTools, RecombinationToolsCall, RecombinationToolsSelector,
 };
 pub use store::{
-    IndexedMemory, MemoryCompactor, MemoryContentReader, MemoryQuery, MemoryRecord, MemoryStore,
-    MemoryWriter, NewMemory, NoopMemoryStore, VectorMemorySearcher,
+    IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,
+    MemoryConcept, MemoryContentReader, MemoryDeleter, MemoryKind, MemoryLink, MemoryLinkDirection,
+    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag, MemoryWriter, NewMemory,
+    NewMemoryLink, NoopMemoryStore, VectorMemorySearcher,
 };
 
 /// Domain-scoped capability provider for the memory subsystem.
@@ -96,6 +112,14 @@ impl MemoryCapabilities {
         )
     }
 
+    pub fn associator(&self) -> MemoryAssociator {
+        MemoryAssociator::new(
+            self.primary_store.clone(),
+            self.replicas.clone(),
+            self.clock.clone(),
+        )
+    }
+
     pub fn searcher(&self) -> VectorMemorySearcher {
         VectorMemorySearcher::new(
             self.primary_store.clone(),
@@ -106,6 +130,14 @@ impl MemoryCapabilities {
 
     pub fn content_reader(&self) -> MemoryContentReader {
         MemoryContentReader::new(self.primary_store.clone())
+    }
+
+    pub fn deleter(&self) -> MemoryDeleter {
+        MemoryDeleter::new(
+            self.primary_store.clone(),
+            self.replicas.clone(),
+            self.blackboard.clone(),
+        )
     }
 
     /// Seed `Identity` rank memories onto the blackboard from the primary

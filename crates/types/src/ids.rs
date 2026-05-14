@@ -179,6 +179,7 @@ pub mod builtin {
         query_policy          => "query-policy",
         memory                => "memory",
         memory_compaction     => "memory-compaction",
+        memory_association    => "memory-association",
         memory_recombination  => "memory-recombination",
         vital                 => "vital",
         homeostatic_controller => "homeostatic-controller",

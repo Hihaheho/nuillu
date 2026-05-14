@@ -125,7 +125,7 @@ fn next_phase(
 fn drive_allocation(phase: HomeostaticPhase, allowed: &[ModuleId]) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
     for id in allowed {
-        let ratio = if *id == builtin::memory_compaction() {
+        let ratio = if *id == builtin::memory_compaction() || *id == builtin::memory_association() {
             match phase {
                 HomeostaticPhase::Compacting => 1.0,
                 HomeostaticPhase::Wake | HomeostaticPhase::Recombining => 0.0,
@@ -166,6 +166,10 @@ fn phase_guidance(phase: HomeostaticPhase, id: &ModuleId) -> String {
     match (phase, id.as_str()) {
         (HomeostaticPhase::Compacting, "memory-compaction") => {
             "NREM-like memory consolidation: merge redundant memories and reduce nrem pressure."
+                .into()
+        }
+        (HomeostaticPhase::Compacting, "memory-association") => {
+            "NREM-like memory association: write non-destructive reflection summaries and memory links where source memories should remain live."
                 .into()
         }
         (HomeostaticPhase::Recombining, "memory-recombination") => {
@@ -250,11 +254,16 @@ mod tests {
             HomeostaticPhase::Compacting,
             &[
                 builtin::memory_compaction(),
+                builtin::memory_association(),
                 builtin::memory_recombination(),
             ],
         );
         assert_eq!(
             drive.activation_for(&builtin::memory_compaction()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(
+            drive.activation_for(&builtin::memory_association()),
             ActivationRatio::ONE
         );
         assert_eq!(

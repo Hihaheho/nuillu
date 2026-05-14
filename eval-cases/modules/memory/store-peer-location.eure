@@ -1,0 +1,39 @@
+id = "module-memory-store-peer-location"
+description = "Memory should preserve stable cognition evidence as a concise ledger memory with sidecars."
+modules = ["memory"]
+prompt = "Preserve useful stable evidence from the current cognition log if appropriate. Store natural memory text, classify kind, and extract concepts or operational tags."
+context = "The cognition log contains an ordinary remembered peer/location observation worth preserving. The scored artifact is the memory store diff, not a memory module memo."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "stores-blue-pebble"
+  must-pass = true
+  contains = "blue pebble"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "stores-location"
+  must-pass = true
+  contains = "under the fern"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "ledger-evidence-memory"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "cognition", "trace"]
+  rubric = ```
+  Pass if the artifact shows a newly inserted memory that is concise natural-language evidence grounded in the cognition log, with an appropriate memory kind and useful concepts or tags when present.
+  Fail if no memory is inserted, if it stores advice or a current-truth projection instead of remembered evidence, if it rewrites the source into unsupported claims, or if it exposes implementation chatter rather than the memory store diff.
+  ```
+}

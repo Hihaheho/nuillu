@@ -1,0 +1,38 @@
+id = "module-query-vector-retrieve-ledger-evidence-flat"
+description = "Query-vector should retrieve flat memory evidence relevant to the prompt without synthesizing a current fact."
+modules = ["query-vector"]
+prompt = "Where did Mika leave the silver key?"
+context = "The module should search memory evidence and memo only retrieved memory content. Ordinary retrieval remains flat unless linked-memory expansion is explicitly needed."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memories[] {
+  rank = "permanent"
+  content = "Mika left the silver key in the cracked red cup on the workshop shelf."
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro relaxes near food when approached slowly from the side."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieves-key-location"
+  must-pass = true
+  contains = "cracked red cup on the workshop shelf"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "flat-evidence-output"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "trace"]
+  rubric = ```
+  Pass if the trace shows a targeted memory-evidence search and the artifact contains retrieved memory content about Mika's silver key without turning it into a synthesized current-fact answer.
+  Fail if the output is advice, module self-description, unrelated Koro content, or a fabricated answer not present in retrieved memory evidence.
+  ```
+}

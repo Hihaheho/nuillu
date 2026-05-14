@@ -23,10 +23,13 @@ use lutum_libsql_adapter::{
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation,
+    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ModuleRunStatus, ResourceAllocation,
     ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
-use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryStore};
+use nuillu_memory::{
+    LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
+    MemoryRecord, MemoryStore,
+};
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
     AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
@@ -37,7 +40,8 @@ use nuillu_module::{
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_types::{
-    MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
+    MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
+    builtin,
 };
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
@@ -234,6 +238,8 @@ impl VisualizerHook {
                 VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
+                | VisualizerCommand::FetchLinkedMemories { tab_id, .. }
+                | VisualizerCommand::DeleteMemory { tab_id, .. }
                 | VisualizerCommand::SetModuleDisabled { tab_id, .. }
                 | VisualizerCommand::SetModuleSettings { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
@@ -248,8 +254,8 @@ impl VisualizerHook {
 
 use nuillu_server::{
     VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder, build_lutum,
-    build_tiers, duration_millis_u64, memory_rank_name, memory_record_view, model_tier_name,
-    module_policy_views,
+    build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
+    memory_record_view, model_tier_name, module_policy_views,
 };
 
 #[derive(Debug, Clone)]
@@ -1158,6 +1164,11 @@ async fn execute_module_case(
         &case.memories,
     )
     .await?;
+    let memory_baseline = if module_target_uses_memory_store_artifact(target) {
+        memory_snapshot(env.memory.as_ref()).await?
+    } else {
+        BTreeMap::new()
+    };
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -1201,6 +1212,7 @@ async fn execute_module_case(
     let blackboard = env.blackboard.clone();
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
+    let memory_baseline_for_loop = memory_baseline.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
     let mut visualizer = hooks.visualizer.as_mut();
@@ -1275,6 +1287,30 @@ async fn execute_module_case(
                             .await
                             .is_empty()
                     }
+                    ModuleEvalTarget::MemoryRecombination => {
+                        !cognition_output_for_module(&blackboard, &shutdown_target_module)
+                            .await
+                            .is_empty()
+                            || module_activation_finished(
+                                &blackboard,
+                                events.as_ref(),
+                                &shutdown_target_module,
+                            )
+                            .await
+                    }
+                    ModuleEvalTarget::Memory
+                    | ModuleEvalTarget::MemoryCompaction
+                    | ModuleEvalTarget::MemoryAssociation => {
+                        !memory_diff_records(&memory_baseline_for_loop, memory.as_ref())
+                            .await
+                            .is_empty()
+                            || module_activation_finished(
+                                &blackboard,
+                                events.as_ref(),
+                                &shutdown_target_module,
+                            )
+                            .await
+                    }
                     ModuleEvalTarget::Speak => utterances.last_complete().is_some(),
                     _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                         .await
@@ -1291,8 +1327,15 @@ async fn execute_module_case(
     .await?;
 
     let output = match target {
-        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
+        ModuleEvalTarget::AttentionSchema
+        | ModuleEvalTarget::CognitionGate
+        | ModuleEvalTarget::MemoryRecombination => {
             cognition_output_for_module(&env.blackboard, &target_module).await
+        }
+        ModuleEvalTarget::Memory
+        | ModuleEvalTarget::MemoryCompaction
+        | ModuleEvalTarget::MemoryAssociation => {
+            render_memory_store_artifact(&memory_baseline, env.memory.as_ref()).await
         }
         ModuleEvalTarget::Speak => env
             .utterances
@@ -1303,7 +1346,7 @@ async fn execute_module_case(
             .await
             .unwrap_or_default(),
     };
-    let mut artifact = if output.is_empty() {
+    let mut artifact = if output.is_empty() && !case.allow_empty_output {
         if env.events.stop_requested() {
             CaseArtifact::failed("stopped after max-llm-calls before target module produced output")
         } else {
@@ -1417,6 +1460,48 @@ async fn activate_module_case_target(
                 .await
                 .expect("module eval failed to publish AllocationUpdated");
         }
+        ModuleEvalTarget::Memory => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+            harness
+                .allocation_updated_mailbox()
+                .publish(AllocationUpdated)
+                .await
+                .expect("module eval failed to publish AllocationUpdated");
+        }
+        ModuleEvalTarget::MemoryCompaction
+        | ModuleEvalTarget::MemoryAssociation
+        | ModuleEvalTarget::MemoryRecombination => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            harness
+                .allocation_updated_mailbox()
+                .publish(AllocationUpdated)
+                .await
+                .expect("module eval failed to publish AllocationUpdated");
+        }
         ModuleEvalTarget::Speak | ModuleEvalTarget::SpeakGate => {
             if has_cognition_log_seed {
                 harness
@@ -1434,10 +1519,6 @@ async fn activate_module_case_target(
     }
 }
 
-async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
-    cognition_output_for_module(blackboard, &builtin::attention_schema()).await
-}
-
 async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId) -> String {
     blackboard
         .read(|bb| {
@@ -1450,6 +1531,11 @@ async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId)
                 .join("\n\n")
         })
         .await
+}
+
+#[cfg(test)]
+async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
+    cognition_output_for_module(blackboard, &builtin::attention_schema()).await
 }
 
 async fn last_memo_log_content_for_module(
@@ -1470,6 +1556,188 @@ async fn last_memo_log_content_for_module(
                 .map(|record| record.content)
         })
         .await
+}
+
+fn module_target_uses_memory_store_artifact(target: ModuleEvalTarget) -> bool {
+    matches!(
+        target,
+        ModuleEvalTarget::Memory
+            | ModuleEvalTarget::MemoryCompaction
+            | ModuleEvalTarget::MemoryAssociation
+    )
+}
+
+async fn module_activation_finished(
+    blackboard: &Blackboard,
+    events: &RecordingRuntimeEventSink,
+    module: &ModuleId,
+) -> bool {
+    let saw_batch = events.snapshot().into_iter().any(|event| {
+        matches!(
+            event,
+            RuntimeEvent::ModuleBatchReady { owner, .. } if owner.module == *module
+        )
+    });
+    if !saw_batch {
+        return false;
+    }
+
+    blackboard
+        .read(|bb| {
+            bb.module_status_records()
+                .into_iter()
+                .find(|record| record.owner.module == *module)
+                .is_some_and(|record| {
+                    matches!(
+                        record.status,
+                        ModuleRunStatus::Inactive | ModuleRunStatus::AwaitingBatch
+                    )
+                })
+        })
+        .await
+}
+
+async fn memory_snapshot(memory: &dyn MemoryStore) -> Result<BTreeMap<String, MemoryRecord>> {
+    let mut records = BTreeMap::new();
+    for rank in [
+        MemoryRank::Identity,
+        MemoryRank::Permanent,
+        MemoryRank::LongTerm,
+        MemoryRank::MidTerm,
+        MemoryRank::ShortTerm,
+    ] {
+        for record in memory
+            .list_by_rank(rank)
+            .await
+            .with_context(|| format!("list {rank:?} memories for module artifact"))?
+        {
+            records.insert(record.index.as_str().to_owned(), record);
+        }
+    }
+    Ok(records)
+}
+
+async fn memory_diff_records(
+    baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+) -> Vec<MemoryRecord> {
+    let Ok(current) = memory_snapshot(memory).await else {
+        return Vec::new();
+    };
+    current
+        .into_iter()
+        .filter_map(|(index, record)| match baseline.get(&index) {
+            Some(previous) if !memory_record_materially_changed(previous, &record) => None,
+            _ => Some(record),
+        })
+        .collect()
+}
+
+fn memory_record_materially_changed(previous: &MemoryRecord, current: &MemoryRecord) -> bool {
+    previous.content.as_str() != current.content.as_str()
+        || previous.rank != current.rank
+        || previous.occurred_at != current.occurred_at
+        || previous.kind != current.kind
+        || previous.concepts != current.concepts
+        || previous.tags != current.tags
+}
+
+async fn render_memory_store_artifact(
+    baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+) -> String {
+    let records = memory_diff_records(baseline, memory).await;
+    if records.is_empty() {
+        return String::new();
+    }
+
+    let indexes = records
+        .iter()
+        .map(|record| record.index.clone())
+        .collect::<Vec<_>>();
+    let links = memory
+        .linked(&LinkedMemoryQuery {
+            memory_indexes: indexes,
+            relation_filter: Vec::new(),
+            direction: MemoryLinkDirection::Both,
+            limit: 128,
+        })
+        .await
+        .unwrap_or_default();
+
+    let mut out = String::from("Memory store changes:");
+    for record in records {
+        out.push_str("\n\n");
+        out.push_str(&render_memory_record_artifact(&record));
+    }
+
+    if !links.is_empty() {
+        out.push_str("\n\nMemory links:");
+        for linked in links {
+            out.push_str(&format!(
+                "\n- {} -> {} relation={} confidence={:.2} strength={:.2}",
+                linked.link.from_memory,
+                linked.link.to_memory,
+                memory_link_relation_label(linked.link.relation),
+                linked.link.confidence,
+                linked.link.strength,
+            ));
+            if let Some(label) = linked.link.freeform_relation.as_deref() {
+                out.push_str(&format!(" freeform={label}"));
+            }
+        }
+    }
+
+    out
+}
+
+fn render_memory_record_artifact(record: &MemoryRecord) -> String {
+    let concepts = if record.concepts.is_empty() {
+        "none".to_owned()
+    } else {
+        let mut labels = record
+            .concepts
+            .iter()
+            .map(|concept| match concept.loose_type.as_deref() {
+                Some(loose_type) => format!("{}:{loose_type}", concept.label),
+                None => concept.label.clone(),
+            })
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.join(", ")
+    };
+    let tags = if record.tags.is_empty() {
+        "none".to_owned()
+    } else {
+        let mut labels = record
+            .tags
+            .iter()
+            .map(|tag| format!("{}:{}", tag.namespace, tag.label))
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.join(", ")
+    };
+
+    format!(
+        "Memory {}\nkind: {:?}\nrank: {:?}\ncontent: {}\nconcepts: {}\ntags: {}",
+        record.index,
+        record.kind,
+        record.rank,
+        record.content.as_str(),
+        concepts,
+        tags
+    )
+}
+
+fn memory_link_relation_label(relation: MemoryLinkRelation) -> &'static str {
+    match relation {
+        MemoryLinkRelation::Related => "related",
+        MemoryLinkRelation::Supports => "supports",
+        MemoryLinkRelation::Contradicts => "contradicts",
+        MemoryLinkRelation::Updates => "updates",
+        MemoryLinkRelation::Corrects => "corrects",
+        MemoryLinkRelation::DerivedFrom => "derived_from",
+    }
 }
 
 pub(crate) async fn emit_visualizer_blackboard_snapshot(
@@ -1861,10 +2129,7 @@ async fn handle_visualizer_commands(
                 limit,
             } if tab_id.as_str() == case_id => {
                 let records = memory
-                    .search(&MemoryQuery {
-                        text: query.clone(),
-                        limit,
-                    })
+                    .search(&MemoryQuery::text(query.clone(), limit))
                     .await
                     .map(|records| records.into_iter().map(memory_record_view).collect())
                     .unwrap_or_default();
@@ -1885,6 +2150,50 @@ async fn handle_visualizer_commands(
                 visualizer.send_event(VisualizerEvent::MemoryPage {
                     tab_id,
                     page: records,
+                });
+            }
+            VisualizerCommand::FetchLinkedMemories {
+                tab_id,
+                memory_index,
+                relation_filter,
+                limit,
+            } if tab_id.as_str() == case_id => {
+                let relation_filter = relation_filter
+                    .into_iter()
+                    .filter_map(|relation| parse_memory_relation(&relation))
+                    .collect::<Vec<_>>();
+                let records = memory
+                    .linked(&LinkedMemoryQuery {
+                        memory_indexes: vec![MemoryIndex::new(memory_index.clone())],
+                        relation_filter,
+                        direction: MemoryLinkDirection::Both,
+                        limit,
+                    })
+                    .await
+                    .map(|records| records.into_iter().map(linked_memory_record_view).collect())
+                    .unwrap_or_default();
+                visualizer.send_event(VisualizerEvent::MemoryLinkedResult {
+                    tab_id,
+                    memory_index,
+                    records,
+                });
+            }
+            VisualizerCommand::DeleteMemory {
+                tab_id,
+                memory_index,
+                page,
+                per_page,
+            } if tab_id.as_str() == case_id => {
+                let index = MemoryIndex::new(memory_index);
+                let _ = memory.delete(&index).await;
+                blackboard
+                    .apply(BlackboardCommand::RemoveMemoryMetadata { index })
+                    .await;
+                let all_records = list_all_visualizer_memories(blackboard, memory).await;
+                visualizer.set_memory_cache(case_id, all_records.clone());
+                visualizer.send_event(VisualizerEvent::MemoryPage {
+                    tab_id,
+                    page: memory_page_from_records(&all_records, page, per_page),
                 });
             }
             VisualizerCommand::SetModuleDisabled {
@@ -1939,6 +2248,18 @@ async fn handle_visualizer_commands(
 struct VisualizerCommandOutcome {
     shutdown: bool,
     start_requested: bool,
+}
+
+fn parse_memory_relation(value: &str) -> Option<MemoryLinkRelation> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "related" => Some(MemoryLinkRelation::Related),
+        "supports" => Some(MemoryLinkRelation::Supports),
+        "contradicts" => Some(MemoryLinkRelation::Contradicts),
+        "updates" => Some(MemoryLinkRelation::Updates),
+        "corrects" => Some(MemoryLinkRelation::Corrects),
+        "derived_from" | "derived-from" => Some(MemoryLinkRelation::DerivedFrom),
+        _ => None,
+    }
 }
 
 pub(crate) async fn apply_visualizer_module_settings(
@@ -2511,6 +2832,7 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::value_estimator(), builtin::query_policy()),
         (builtin::reward(), builtin::value_estimator()),
         (builtin::policy(), builtin::reward()),
+        (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
             builtin::memory_compaction(),
@@ -2533,6 +2855,7 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::vital(),
         nuillu_types::builtin::homeostatic_controller(),
         nuillu_types::builtin::memory_compaction(),
+        nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
     ]
 }
@@ -2540,6 +2863,7 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
 fn homeostatic_drive_modules() -> Vec<ModuleId> {
     vec![
         nuillu_types::builtin::memory_compaction(),
+        nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
     ]
 }
@@ -2695,6 +3019,7 @@ fn register_eval_module(
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.searcher(),
+                            memory_caps.content_reader(),
                             caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
                             caps.llm_access(),
                         )
@@ -2755,6 +3080,26 @@ fn register_eval_module(
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.compactor(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
+            .expect("eval module registration should be unique"),
+        EvalModule::MemoryAssociation => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let memory_caps = memory_caps.clone();
+                    move |caps| {
+                        nuillu_memory::MemoryAssociationModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            memory_caps.content_reader(),
+                            memory_caps.writer(),
+                            memory_caps.associator(),
                             caps.llm_access(),
                         )
                     }
@@ -3030,6 +3375,13 @@ pub(crate) fn full_agent_allocation(
                 ModelTier::Cheap,
                 "Idle until compaction guidance arrives.",
             ),
+            EvalModule::MemoryAssociation => set_allocation_module(
+                &mut allocation,
+                module.module_id(),
+                0.0,
+                ModelTier::Cheap,
+                "Idle until non-destructive memory association guidance arrives.",
+            ),
             EvalModule::MemoryRecombination => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
@@ -3192,6 +3544,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::QueryPolicy
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
+        | EvalModule::MemoryAssociation
         | EvalModule::MemoryRecombination
         | EvalModule::Vital
         | EvalModule::HomeostaticController
@@ -4392,8 +4745,12 @@ mod tests {
             "case-1",
             vec![MemoryRecordView {
                 index: "m1".to_string(),
+                kind: "Statement".to_string(),
                 rank: "long-term".to_string(),
                 occurred_at: None,
+                stored_at: Utc::now(),
+                concepts: Vec::new(),
+                tags: Vec::new(),
                 content: "rust memory".to_string(),
             }],
         );
@@ -4523,13 +4880,17 @@ prompt = "Second?"
     #[test]
     fn visualizer_planned_tabs_use_filtered_case_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        let case_dir = dir.path().join("eval-cases/full-agent");
         std::fs::create_dir_all(&case_dir).unwrap();
         std::fs::write(
             case_dir.join("first-route.eure"),
             r#"
 id = "module-query-vector-first-route"
-prompt = "First?"
+
+@ inputs[] {
+  $variant: heard
+  content = "First?"
+}
 "#,
         )
         .unwrap();
@@ -4537,7 +4898,11 @@ prompt = "First?"
             case_dir.join("second-memory.eure"),
             r#"
 id = "module-query-vector-special-memory"
-prompt = "Second?"
+
+@ inputs[] {
+  $variant: heard
+  content = "Second?"
+}
 "#,
         )
         .unwrap();
@@ -5332,6 +5697,7 @@ prompt = "What am I attending to?"
             builtin::query_vector(),
             builtin::memory(),
             builtin::memory_compaction(),
+            builtin::memory_association(),
             builtin::memory_recombination(),
             builtin::predict(),
             builtin::surprise(),

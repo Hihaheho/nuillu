@@ -213,6 +213,39 @@ prompt = "What am I attending to?"
 }
 
 #[test]
+fn parses_memory_family_module_targets_and_allow_empty_output() {
+    let dir = tempfile::tempdir().unwrap();
+    for (module, id) in [
+        ("memory", "memory-target"),
+        ("memory-compaction", "memory-compaction-target"),
+        ("memory-association", "memory-association-target"),
+        ("memory-recombination", "memory-recombination-target"),
+    ] {
+        let case_dir = dir.path().join(format!("eval-cases/modules/{module}"));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let path = case_dir.join(format!("{id}.eure"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+id = "{id}"
+modules = ["{module}"]
+prompt = "Run the memory-family module."
+allow-empty-output = true
+"#
+            ),
+        )
+        .unwrap();
+
+        let EvalCase::Module { target, case } = parse_case_file(&path).unwrap() else {
+            panic!("expected module case");
+        };
+        assert_eq!(target.as_str(), module);
+        assert!(case.allow_empty_output);
+    }
+}
+
+#[test]
 fn rejects_negative_cognition_log_seed_seconds_ago() {
     let dir = tempfile::tempdir().unwrap();
     let case_dir = dir.path().join("eval-cases/modules/attention-schema");

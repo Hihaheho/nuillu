@@ -1,0 +1,50 @@
+id = "module-memory-association-associate-redundant-peer-preference"
+description = "Memory-association should write a reflection summary and explicit source links while preserving redundant source memories."
+modules = ["memory-association"]
+prompt = "Review redundant Koro food-boundary memories. If useful, write one reflection summary memory and link it to all source memories with derived_from links. Preserve source memories."
+context = "The seeded memories overlap around one peer preference. The scored artifact is the memory store diff plus link metadata."
+
+limits {
+  max-llm-calls = 10
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro relaxes when Nui approaches food slowly from the side."
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro stayed calm near food when Nui used short clear signals."
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "At lunch, Koro guarded food until Nui slowed down and approached from the side."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "writes-reflection-kind"
+  must-pass = true
+  contains = "kind: Reflection"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "records-derived-links"
+  must-pass = true
+  contains = "derived_from"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "summary-and-links-not-destructive-merge"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "trace"]
+  rubric = ```
+  Pass if the artifact shows a new reflection summary memory that captures the shared Koro food-boundary evidence and explicit derived_from links to the source memories.
+  Fail if the association output deletes or rewrites source memories, invents a current-truth decision, merges unrelated material, or omits source relationship metadata.
+  ```
+}

@@ -168,6 +168,11 @@ pub enum VisualizerEvent {
         query: String,
         records: Vec<MemoryRecordView>,
     },
+    MemoryLinkedResult {
+        tab_id: VisualizerTabId,
+        memory_index: String,
+        records: Vec<LinkedMemoryRecordView>,
+    },
     AmbientSensoryRows {
         tab_id: VisualizerTabId,
         rows: Vec<AmbientSensoryRowView>,
@@ -207,6 +212,18 @@ pub enum VisualizerCommand {
         tab_id: VisualizerTabId,
         query: String,
         limit: usize,
+    },
+    FetchLinkedMemories {
+        tab_id: VisualizerTabId,
+        memory_index: String,
+        relation_filter: Vec<String>,
+        limit: usize,
+    },
+    DeleteMemory {
+        tab_id: VisualizerTabId,
+        memory_index: String,
+        page: usize,
+        per_page: usize,
     },
     ListMemories {
         tab_id: VisualizerTabId,
@@ -451,9 +468,45 @@ pub struct MemoryMetadataView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRecordView {
     pub index: String,
+    pub kind: String,
     pub rank: String,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub concepts: Vec<MemoryConceptView>,
+    pub tags: Vec<MemoryTagView>,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConceptView {
+    pub label: String,
+    pub mention_text: Option<String>,
+    pub loose_type: Option<String>,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTagView {
+    pub label: String,
+    pub namespace: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLinkView {
+    pub from_memory: String,
+    pub to_memory: String,
+    pub relation: String,
+    pub freeform_relation: Option<String>,
+    pub strength: f32,
+    pub confidence: f32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedMemoryRecordView {
+    pub record: MemoryRecordView,
+    pub link: MemoryLinkView,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

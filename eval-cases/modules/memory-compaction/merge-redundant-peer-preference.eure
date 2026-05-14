@@ -1,0 +1,50 @@
+id = "module-memory-compaction-merge-redundant-peer-preference"
+description = "Memory-compaction should write a replacement reflection summary and remove redundant source memories from live retrieval."
+modules = ["memory-compaction"]
+prompt = "Review redundant Koro food-boundary memories. If useful, compact them into one reflection summary memory and remove the source memories from live memory. Do not write live links to deleted sources."
+context = "The seeded memories overlap around one peer preference. The scored artifact is the memory store diff."
+
+limits {
+  max-llm-calls = 10
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro relaxes when Nui approaches food slowly from the side."
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro stayed calm near food when Nui used short clear signals."
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "At lunch, Koro guarded food until Nui slowed down and approached from the side."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "writes-reflection-kind"
+  must-pass = true
+  contains = "kind: Reflection"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "captures-food-boundary"
+  must-pass = true
+  contains = "Koro"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "destructive-redundancy-merge"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "trace"]
+  rubric = ```
+  Pass if the artifact shows one new reflection summary memory that captures the shared Koro food-boundary evidence and the memory state no longer exposes the redundant source memories as live records.
+  Fail if the compaction output preserves source memories as live records, writes derived_from links to deleted sources, invents a current-truth decision, or merges unrelated material.
+  ```
+}

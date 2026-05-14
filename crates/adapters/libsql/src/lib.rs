@@ -8,8 +8,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libsql::{Connection, Transaction, params};
-use nuillu_memory::{IndexedMemory, MemoryQuery, MemoryRecord, MemoryStore, NewMemory};
+use libsql::{Connection, Transaction, Value, params, params_from_iter};
+use nuillu_memory::{
+    IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryKind, MemoryLink,
+    MemoryLinkDirection, MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag,
+    NewMemory, NewMemoryLink,
+};
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::ports::PortError;
 use nuillu_reward::{
@@ -197,6 +201,34 @@ impl LibsqlMemoryStore {
         &self.embedding_table_name
     }
 
+    fn concepts_table_name(&self) -> String {
+        format!("{}_concepts", self.table_name)
+    }
+
+    fn concept_aliases_table_name(&self) -> String {
+        format!("{}_concept_aliases", self.table_name)
+    }
+
+    fn memory_concepts_table_name(&self) -> String {
+        format!("{}_memory_concepts", self.table_name)
+    }
+
+    fn tags_table_name(&self) -> String {
+        format!("{}_tags", self.table_name)
+    }
+
+    fn memory_tags_table_name(&self) -> String {
+        format!("{}_memory_tags", self.table_name)
+    }
+
+    fn links_table_name(&self) -> String {
+        format!("{}_links", self.table_name)
+    }
+
+    fn search_table_name(&self) -> String {
+        format!("{}_search", self.table_name)
+    }
+
     pub async fn backfill_active_profile(&self, limit: usize) -> Result<usize, PortError> {
         if limit == 0 {
             return Ok(0);
@@ -251,6 +283,24 @@ impl LibsqlMemoryStore {
     async fn migrate(&self) -> Result<(), PortError> {
         let memory_rank_idx = format!("{}_rank_live_idx", self.table_name);
         validate_identifier("memory rank index name", &memory_rank_idx)?;
+        let concepts = self.concepts_table_name();
+        let concept_aliases = self.concept_aliases_table_name();
+        let memory_concepts = self.memory_concepts_table_name();
+        let tags = self.tags_table_name();
+        let memory_tags = self.memory_tags_table_name();
+        let links = self.links_table_name();
+        let search = self.search_table_name();
+        for (label, table) in [
+            ("concepts table name", concepts.as_str()),
+            ("concept aliases table name", concept_aliases.as_str()),
+            ("memory concepts table name", memory_concepts.as_str()),
+            ("tags table name", tags.as_str()),
+            ("memory tags table name", memory_tags.as_str()),
+            ("memory links table name", links.as_str()),
+            ("memory search table name", search.as_str()),
+        ] {
+            validate_identifier(label, table)?;
+        }
 
         let ddl = format!(
             r#"
@@ -258,8 +308,10 @@ impl LibsqlMemoryStore {
               id INTEGER PRIMARY KEY,
               memory_index TEXT NOT NULL UNIQUE,
               content TEXT NOT NULL,
+              kind INTEGER NOT NULL DEFAULT 1,
               rank INTEGER NOT NULL,
               occurred_at_ms INTEGER,
+              stored_at_ms INTEGER NOT NULL,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
               source_ids TEXT,
@@ -279,10 +331,87 @@ impl LibsqlMemoryStore {
               table_name TEXT NOT NULL UNIQUE,
               created_at_ms INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS {concepts} (
+              id INTEGER PRIMARY KEY,
+              canonical_label TEXT NOT NULL,
+              normalized_label TEXT NOT NULL UNIQUE,
+              loose_type TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS {concept_aliases} (
+              concept_id INTEGER NOT NULL,
+              alias TEXT NOT NULL,
+              normalized_alias TEXT NOT NULL UNIQUE,
+              FOREIGN KEY(concept_id) REFERENCES {concepts}(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS {memory_concepts} (
+              memory_id INTEGER NOT NULL,
+              concept_id INTEGER NOT NULL,
+              mention_text TEXT,
+              confidence REAL NOT NULL,
+              PRIMARY KEY(memory_id, concept_id, mention_text),
+              FOREIGN KEY(memory_id) REFERENCES {memories}(id),
+              FOREIGN KEY(concept_id) REFERENCES {concepts}(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS {tags} (
+              id INTEGER PRIMARY KEY,
+              label TEXT NOT NULL,
+              normalized_label TEXT NOT NULL,
+              namespace TEXT NOT NULL,
+              UNIQUE(namespace, normalized_label)
+            );
+
+            CREATE TABLE IF NOT EXISTS {memory_tags} (
+              memory_id INTEGER NOT NULL,
+              tag_id INTEGER NOT NULL,
+              confidence REAL NOT NULL,
+              PRIMARY KEY(memory_id, tag_id),
+              FOREIGN KEY(memory_id) REFERENCES {memories}(id),
+              FOREIGN KEY(tag_id) REFERENCES {tags}(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS {links} (
+              id INTEGER PRIMARY KEY,
+              from_memory_id INTEGER NOT NULL,
+              to_memory_id INTEGER NOT NULL,
+              relation INTEGER NOT NULL,
+              freeform_relation TEXT,
+              strength REAL NOT NULL,
+              confidence REAL NOT NULL,
+              updated_at_ms INTEGER NOT NULL,
+              FOREIGN KEY(from_memory_id) REFERENCES {memories}(id),
+              FOREIGN KEY(to_memory_id) REFERENCES {memories}(id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS {links}_unique_idx
+            ON {links}(
+              from_memory_id,
+              to_memory_id,
+              relation,
+              COALESCE(freeform_relation, '')
+            );
+
+            CREATE TABLE IF NOT EXISTS {search} (
+              memory_id INTEGER PRIMARY KEY,
+              search_text TEXT NOT NULL,
+              concept_text TEXT NOT NULL,
+              tag_text TEXT NOT NULL,
+              FOREIGN KEY(memory_id) REFERENCES {memories}(id)
+            );
             "#,
             memories = self.table_name,
             memory_rank_idx = memory_rank_idx,
             profiles = PROFILE_REGISTRY_TABLE,
+            concepts = concepts,
+            concept_aliases = concept_aliases,
+            memory_concepts = memory_concepts,
+            tags = tags,
+            memory_tags = memory_tags,
+            links = links,
+            search = search,
         );
         self.conn
             .execute_batch(&ddl)
@@ -290,6 +419,31 @@ impl LibsqlMemoryStore {
             .map_err(map_libsql_error)?;
         self.add_column_if_missing(&self.table_name, "occurred_at_ms", "INTEGER")
             .await?;
+        self.add_column_if_missing(&self.table_name, "kind", "INTEGER")
+            .await?;
+        self.add_column_if_missing(&self.table_name, "stored_at_ms", "INTEGER")
+            .await?;
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE {} SET kind = ?1 WHERE kind IS NULL",
+                    self.table_name
+                ),
+                [kind_to_i64(MemoryKind::Statement)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE {} SET stored_at_ms = created_at_ms WHERE stored_at_ms IS NULL",
+                    self.table_name
+                ),
+                (),
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        self.backfill_search_rows().await?;
 
         self.register_active_profile().await?;
         self.create_active_embedding_table().await
@@ -439,8 +593,10 @@ impl LibsqlMemoryStore {
         tx: &Transaction,
         index: &MemoryIndex,
         content: &str,
+        kind: MemoryKind,
         rank: MemoryRank,
         occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+        stored_at: chrono::DateTime<chrono::Utc>,
         source_ids_json: Option<&str>,
         now: i64,
     ) -> Result<(i64, i64), PortError> {
@@ -449,19 +605,23 @@ impl LibsqlMemoryStore {
             INSERT INTO {memories} (
               memory_index,
               content,
+              kind,
               rank,
               occurred_at_ms,
+              stored_at_ms,
               created_at_ms,
               updated_at_ms,
               source_ids,
               metadata_json,
               deleted_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
             ON CONFLICT(memory_index) DO UPDATE SET
               content = excluded.content,
+              kind = excluded.kind,
               rank = excluded.rank,
               occurred_at_ms = excluded.occurred_at_ms,
+              stored_at_ms = excluded.stored_at_ms,
               updated_at_ms = excluded.updated_at_ms,
               source_ids = excluded.source_ids,
               deleted_at_ms = NULL
@@ -473,8 +633,10 @@ impl LibsqlMemoryStore {
             params![
                 index.as_str(),
                 content,
+                kind_to_i64(kind),
                 rank_to_i64(rank),
                 occurred_at.map(|at| at.timestamp_millis()),
+                stored_at.timestamp_millis(),
                 now,
                 now,
                 source_ids_json,
@@ -514,6 +676,228 @@ impl LibsqlMemoryStore {
             row.get(0).map_err(map_libsql_error)?,
             row.get(1).map_err(map_libsql_error)?,
         ))
+    }
+
+    async fn memory_id_for_index_tx(
+        &self,
+        tx: &Transaction,
+        index: &MemoryIndex,
+    ) -> Result<Option<i64>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT id
+            FROM {memories}
+            WHERE memory_index = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = tx
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Some(row.get(0).map_err(map_libsql_error)?),
+            None => None,
+        })
+    }
+
+    async fn replace_sidecars_tx(
+        &self,
+        tx: &Transaction,
+        memory_id: i64,
+        content: &str,
+        concepts: &[MemoryConcept],
+        tags: &[MemoryTag],
+    ) -> Result<(), PortError> {
+        let memory_concepts = self.memory_concepts_table_name();
+        let memory_tags = self.memory_tags_table_name();
+        let search = self.search_table_name();
+
+        tx.execute(
+            &format!("DELETE FROM {memory_concepts} WHERE memory_id = ?1"),
+            [memory_id],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        tx.execute(
+            &format!("DELETE FROM {memory_tags} WHERE memory_id = ?1"),
+            [memory_id],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+
+        for concept in concepts {
+            let Some(concept_id) = self.upsert_concept_tx(tx, concept).await? else {
+                continue;
+            };
+            tx.execute(
+                &format!(
+                    r#"
+                    INSERT OR REPLACE INTO {memory_concepts} (
+                      memory_id,
+                      concept_id,
+                      mention_text,
+                      confidence
+                    )
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#
+                ),
+                params![
+                    memory_id,
+                    concept_id,
+                    concept.mention_text.as_deref(),
+                    clamp_confidence(concept.confidence),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        }
+
+        for tag in tags {
+            let Some(tag_id) = self.upsert_tag_tx(tx, tag).await? else {
+                continue;
+            };
+            tx.execute(
+                &format!(
+                    r#"
+                    INSERT OR REPLACE INTO {memory_tags} (
+                      memory_id,
+                      tag_id,
+                      confidence
+                    )
+                    VALUES (?1, ?2, ?3)
+                    "#
+                ),
+                params![memory_id, tag_id, clamp_confidence(tag.confidence)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        }
+
+        let concept_text = concepts
+            .iter()
+            .map(|concept| concept.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tag_text = tags
+            .iter()
+            .map(|tag| format!("{}:{}", tag.namespace.trim(), tag.label.trim()))
+            .filter(|tag| tag != ":")
+            .collect::<Vec<_>>()
+            .join(" ");
+        tx.execute(
+            &format!(
+                r#"
+                INSERT INTO {search} (
+                  memory_id,
+                  search_text,
+                  concept_text,
+                  tag_text
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                  search_text = excluded.search_text,
+                  concept_text = excluded.concept_text,
+                  tag_text = excluded.tag_text
+                "#
+            ),
+            params![memory_id, content, concept_text, tag_text],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn upsert_concept_tx(
+        &self,
+        tx: &Transaction,
+        concept: &MemoryConcept,
+    ) -> Result<Option<i64>, PortError> {
+        let label = concept.label.trim();
+        if label.is_empty() {
+            return Ok(None);
+        }
+        let normalized = normalize_label(label);
+        let concepts = self.concepts_table_name();
+        tx.execute(
+            &format!(
+                r#"
+                INSERT INTO {concepts} (
+                  canonical_label,
+                  normalized_label,
+                  loose_type
+                )
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(normalized_label) DO UPDATE SET
+                  canonical_label = {concepts}.canonical_label
+                "#
+            ),
+            params![label, normalized.as_str(), concept.loose_type.as_deref()],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        let mut rows = tx
+            .query(
+                &format!("SELECT id FROM {concepts} WHERE normalized_label = ?1 LIMIT 1"),
+                [normalized.as_str()],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Some(row.get(0).map_err(map_libsql_error)?),
+            None => None,
+        })
+    }
+
+    async fn upsert_tag_tx(
+        &self,
+        tx: &Transaction,
+        tag: &MemoryTag,
+    ) -> Result<Option<i64>, PortError> {
+        let label = tag.label.trim();
+        if label.is_empty() {
+            return Ok(None);
+        }
+        let namespace = if tag.namespace.trim().is_empty() {
+            "operation"
+        } else {
+            tag.namespace.trim()
+        };
+        let normalized = normalize_label(label);
+        let tags = self.tags_table_name();
+        tx.execute(
+            &format!(
+                r#"
+                INSERT INTO {tags} (
+                  label,
+                  normalized_label,
+                  namespace
+                )
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(namespace, normalized_label) DO UPDATE SET
+                  label = {tags}.label
+                "#
+            ),
+            params![label, normalized.as_str(), namespace],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        let mut rows = tx
+            .query(
+                &format!(
+                    "SELECT id FROM {tags} WHERE namespace = ?1 AND normalized_label = ?2 LIMIT 1"
+                ),
+                params![namespace, normalized.as_str()],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Some(row.get(0).map_err(map_libsql_error)?),
+            None => None,
+        })
     }
 
     async fn upsert_embedding_tx(
@@ -581,6 +965,98 @@ impl LibsqlMemoryStore {
         )
     }
 
+    async fn memory_id_for_index(&self, index: &MemoryIndex) -> Result<Option<i64>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT id
+            FROM {memories}
+            WHERE memory_index = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [index.as_str()])
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Some(row.get(0).map_err(map_libsql_error)?),
+            None => None,
+        })
+    }
+
+    async fn record_by_id(&self, id: i64) -> Result<Option<MemoryRecord>, PortError> {
+        let sql = format!(
+            r#"
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
+            FROM {memories}
+            WHERE id = ?1
+              AND deleted_at_ms IS NULL
+            LIMIT 1
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [id])
+            .await
+            .map_err(map_libsql_error)?;
+        match rows.next().await.map_err(map_libsql_error)? {
+            Some(row) => Ok(Some(self.row_to_record(&row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_link_tx(
+        &self,
+        tx: &Transaction,
+        from_memory_id: i64,
+        to_memory_id: i64,
+        link: NewMemoryLink,
+        updated_at_ms: i64,
+    ) -> Result<(), PortError> {
+        let links = self.links_table_name();
+        tx.execute(
+            &format!(
+                r#"
+                INSERT INTO {links} (
+                  from_memory_id,
+                  to_memory_id,
+                  relation,
+                  freeform_relation,
+                  strength,
+                  confidence,
+                  updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(
+                  from_memory_id,
+                  to_memory_id,
+                  relation,
+                  COALESCE(freeform_relation, '')
+                ) DO UPDATE SET
+                  strength = excluded.strength,
+                  confidence = excluded.confidence,
+                  updated_at_ms = excluded.updated_at_ms
+                "#
+            ),
+            params![
+                from_memory_id,
+                to_memory_id,
+                relation_to_i64(link.relation),
+                link.freeform_relation.as_deref(),
+                clamp_confidence(link.strength),
+                clamp_confidence(link.confidence),
+                updated_at_ms,
+            ],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
     async fn soft_delete_many_tx(
         &self,
         tx: &Transaction,
@@ -590,7 +1066,6 @@ impl LibsqlMemoryStore {
         if indexes.is_empty() {
             return Ok(());
         }
-
         let sql = format!(
             r#"
             UPDATE {memories}
@@ -608,24 +1083,182 @@ impl LibsqlMemoryStore {
         Ok(())
     }
 
-    fn row_to_record(row: &libsql::Row) -> Result<MemoryRecord, PortError> {
-        let index: String = row.get(0).map_err(map_libsql_error)?;
-        let content: String = row.get(1).map_err(map_libsql_error)?;
-        let rank: i64 = row.get(2).map_err(map_libsql_error)?;
-        let occurred_at_ms: Option<i64> = row.get(3).map_err(map_libsql_error)?;
+    async fn hard_delete_memory_tx(
+        &self,
+        tx: &Transaction,
+        memory_id: i64,
+        _now: i64,
+    ) -> Result<(), PortError> {
+        for table in [
+            self.memory_concepts_table_name(),
+            self.memory_tags_table_name(),
+            self.search_table_name(),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE memory_id = ?1"),
+                [memory_id],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        }
+        let links = self.links_table_name();
+        tx.execute(
+            &format!("DELETE FROM {links} WHERE from_memory_id = ?1 OR to_memory_id = ?1"),
+            [memory_id],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+
+        let mut rows = tx
+            .query(
+                &format!(
+                    r#"
+                    SELECT table_name
+                    FROM {PROFILE_REGISTRY_TABLE}
+                    WHERE table_name LIKE ?1
+                    "#
+                ),
+                [format!("{}_embeddings_%", self.table_name)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut embedding_tables = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let table: String = row.get(0).map_err(map_libsql_error)?;
+            embedding_tables.push(table);
+        }
+        drop(rows);
+        for table in embedding_tables {
+            validate_identifier("embedding table name", &table)?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE memory_id = ?1"),
+                [memory_id],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        }
+
+        tx.execute(
+            &format!("DELETE FROM {} WHERE id = ?1", self.table_name),
+            [memory_id],
+        )
+        .await
+        .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn backfill_search_rows(&self) -> Result<(), PortError> {
+        let search = self.search_table_name();
+        let sql = format!(
+            r#"
+            INSERT INTO {search} (
+              memory_id,
+              search_text,
+              concept_text,
+              tag_text
+            )
+            SELECT id, content, '', ''
+            FROM {memories}
+            WHERE deleted_at_ms IS NULL
+            ON CONFLICT(memory_id) DO NOTHING
+            "#,
+            memories = self.table_name,
+        );
+        self.conn
+            .execute(&sql, ())
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn row_to_record(&self, row: &libsql::Row) -> Result<MemoryRecord, PortError> {
+        let id: i64 = row.get(0).map_err(map_libsql_error)?;
+        let index: String = row.get(1).map_err(map_libsql_error)?;
+        let content: String = row.get(2).map_err(map_libsql_error)?;
+        let kind: i64 = row.get(3).map_err(map_libsql_error)?;
+        let rank: i64 = row.get(4).map_err(map_libsql_error)?;
+        let occurred_at_ms: Option<i64> = row.get(5).map_err(map_libsql_error)?;
+        let stored_at_ms: i64 = row.get(6).map_err(map_libsql_error)?;
         Ok(MemoryRecord {
             index: MemoryIndex::new(index),
             content: MemoryContent::new(content),
             rank: rank_from_i64(rank)?,
             occurred_at: occurred_at_ms.and_then(chrono::DateTime::from_timestamp_millis),
+            stored_at: chrono::DateTime::from_timestamp_millis(stored_at_ms).ok_or_else(|| {
+                PortError::InvalidData(format!(
+                    "invalid memory stored_at timestamp: {stored_at_ms}"
+                ))
+            })?,
+            kind: kind_from_i64(kind)?,
+            concepts: self.concepts_for_memory(id).await?,
+            tags: self.tags_for_memory(id).await?,
         })
+    }
+
+    async fn concepts_for_memory(&self, memory_id: i64) -> Result<Vec<MemoryConcept>, PortError> {
+        let concepts = self.concepts_table_name();
+        let memory_concepts = self.memory_concepts_table_name();
+        let sql = format!(
+            r#"
+            SELECT c.canonical_label, mc.mention_text, c.loose_type, mc.confidence
+            FROM {memory_concepts} AS mc
+            JOIN {concepts} AS c ON c.id = mc.concept_id
+            WHERE mc.memory_id = ?1
+            ORDER BY c.canonical_label ASC, mc.mention_text ASC
+            "#,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [memory_id])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let confidence: f64 = row.get(3).map_err(map_libsql_error)?;
+            out.push(MemoryConcept {
+                label: row.get(0).map_err(map_libsql_error)?,
+                mention_text: row.get(1).map_err(map_libsql_error)?,
+                loose_type: row.get(2).map_err(map_libsql_error)?,
+                confidence: confidence as f32,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn tags_for_memory(&self, memory_id: i64) -> Result<Vec<MemoryTag>, PortError> {
+        let tags = self.tags_table_name();
+        let memory_tags = self.memory_tags_table_name();
+        let sql = format!(
+            r#"
+            SELECT t.label, t.namespace, mt.confidence
+            FROM {memory_tags} AS mt
+            JOIN {tags} AS t ON t.id = mt.tag_id
+            WHERE mt.memory_id = ?1
+            ORDER BY t.namespace ASC, t.label ASC
+            "#,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, [memory_id])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let confidence: f64 = row.get(2).map_err(map_libsql_error)?;
+            out.push(MemoryTag {
+                label: row.get(0).map_err(map_libsql_error)?,
+                namespace: row.get(1).map_err(map_libsql_error)?,
+                confidence: confidence as f32,
+            });
+        }
+        Ok(out)
     }
 
     async fn put_indexed(
         &self,
         mem: IndexedMemory,
         source_ids_json: Option<String>,
-    ) -> Result<(), PortError> {
+    ) -> Result<MemoryRecord, PortError> {
         let embedding_json = self.embed_json(mem.content.as_str()).await?;
         let now = now_ms();
         let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
@@ -634,16 +1267,31 @@ impl LibsqlMemoryStore {
                 &tx,
                 &mem.index,
                 mem.content.as_str(),
+                mem.kind,
                 mem.rank,
                 mem.occurred_at,
+                mem.stored_at,
                 source_ids_json.as_deref(),
                 now,
             )
             .await?;
+        self.replace_sidecars_tx(
+            &tx,
+            memory_id,
+            mem.content.as_str(),
+            &mem.concepts,
+            &mem.tags,
+        )
+        .await?;
         self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
             .await?;
         tx.commit().await.map_err(map_libsql_error)?;
-        Ok(())
+        self.get(&mem.index).await?.ok_or_else(|| {
+            PortError::Backend(format!(
+                "memory row was not found after put: {}",
+                mem.index.as_str()
+            ))
+        })
     }
 }
 
@@ -1324,7 +1972,11 @@ impl PolicyStore for LibsqlPolicyStore {
 
 #[async_trait(?Send)]
 impl MemoryStore for LibsqlMemoryStore {
-    async fn insert(&self, mem: NewMemory) -> Result<MemoryIndex, PortError> {
+    async fn insert(
+        &self,
+        mem: NewMemory,
+        stored_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MemoryRecord, PortError> {
         let index = MemoryIndex::new(Uuid::now_v7().to_string());
         let embedding_json = self.embed_json(mem.content.as_str()).await?;
         let now = now_ms();
@@ -1334,19 +1986,34 @@ impl MemoryStore for LibsqlMemoryStore {
                 &tx,
                 &index,
                 mem.content.as_str(),
+                mem.kind,
                 mem.rank,
                 mem.occurred_at,
+                stored_at,
                 None,
                 now,
             )
             .await?;
+        self.replace_sidecars_tx(
+            &tx,
+            memory_id,
+            mem.content.as_str(),
+            &mem.concepts,
+            &mem.tags,
+        )
+        .await?;
         self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
             .await?;
         tx.commit().await.map_err(map_libsql_error)?;
-        Ok(index)
+        self.get(&index).await?.ok_or_else(|| {
+            PortError::Backend(format!(
+                "memory row was not found after insert: {}",
+                index.as_str()
+            ))
+        })
     }
 
-    async fn put(&self, mem: IndexedMemory) -> Result<(), PortError> {
+    async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
         self.put_indexed(mem, None).await
     }
 
@@ -1354,7 +2021,8 @@ impl MemoryStore for LibsqlMemoryStore {
         &self,
         mem: NewMemory,
         sources: &[MemoryIndex],
-    ) -> Result<MemoryIndex, PortError> {
+        stored_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MemoryRecord, PortError> {
         let index = MemoryIndex::new(Uuid::now_v7().to_string());
         let embedding_json = self.embed_json(mem.content.as_str()).await?;
         let source_ids_json = source_ids_json(sources)?;
@@ -1365,24 +2033,39 @@ impl MemoryStore for LibsqlMemoryStore {
                 &tx,
                 &index,
                 mem.content.as_str(),
+                mem.kind,
                 mem.rank,
                 mem.occurred_at,
+                stored_at,
                 Some(&source_ids_json),
                 now,
             )
             .await?;
+        self.replace_sidecars_tx(
+            &tx,
+            memory_id,
+            mem.content.as_str(),
+            &mem.concepts,
+            &mem.tags,
+        )
+        .await?;
         self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
             .await?;
         self.soft_delete_many_tx(&tx, sources, now).await?;
         tx.commit().await.map_err(map_libsql_error)?;
-        Ok(index)
+        self.get(&index).await?.ok_or_else(|| {
+            PortError::Backend(format!(
+                "memory row was not found after compact: {}",
+                index.as_str()
+            ))
+        })
     }
 
     async fn put_compacted(
         &self,
         mem: IndexedMemory,
         sources: &[MemoryIndex],
-    ) -> Result<(), PortError> {
+    ) -> Result<MemoryRecord, PortError> {
         let source_ids_json = source_ids_json(sources)?;
         let embedding_json = self.embed_json(mem.content.as_str()).await?;
         let now = now_ms();
@@ -1392,23 +2075,38 @@ impl MemoryStore for LibsqlMemoryStore {
                 &tx,
                 &mem.index,
                 mem.content.as_str(),
+                mem.kind,
                 mem.rank,
                 mem.occurred_at,
+                mem.stored_at,
                 Some(&source_ids_json),
                 now,
             )
             .await?;
+        self.replace_sidecars_tx(
+            &tx,
+            memory_id,
+            mem.content.as_str(),
+            &mem.concepts,
+            &mem.tags,
+        )
+        .await?;
         self.upsert_embedding_tx(&tx, memory_id, &embedding_json, now, updated_at_ms)
             .await?;
         self.soft_delete_many_tx(&tx, sources, now).await?;
         tx.commit().await.map_err(map_libsql_error)?;
-        Ok(())
+        self.get(&mem.index).await?.ok_or_else(|| {
+            PortError::Backend(format!(
+                "memory row was not found after put compacted: {}",
+                mem.index.as_str()
+            ))
+        })
     }
 
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT memory_index, content, rank, occurred_at_ms
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
             FROM {memories}
             WHERE memory_index = ?1
               AND deleted_at_ms IS NULL
@@ -1422,7 +2120,7 @@ impl MemoryStore for LibsqlMemoryStore {
             .await
             .map_err(map_libsql_error)?;
         match rows.next().await.map_err(map_libsql_error)? {
-            Some(row) => Ok(Some(Self::row_to_record(&row)?)),
+            Some(row) => Ok(Some(self.row_to_record(&row).await?)),
             None => Ok(None),
         }
     }
@@ -1430,7 +2128,7 @@ impl MemoryStore for LibsqlMemoryStore {
     async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
         let sql = format!(
             r#"
-            SELECT memory_index, content, rank, occurred_at_ms
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms
             FROM {memories}
             WHERE rank = ?1
               AND deleted_at_ms IS NULL
@@ -1445,7 +2143,7 @@ impl MemoryStore for LibsqlMemoryStore {
             .map_err(map_libsql_error)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
-            out.push(Self::row_to_record(&row)?);
+            out.push(self.row_to_record(&row).await?);
         }
         Ok(out)
     }
@@ -1455,50 +2153,271 @@ impl MemoryStore for LibsqlMemoryStore {
             return Ok(Vec::new());
         }
 
-        let embedding_json = self.embed_json(&q.text).await?;
-        let mut out = Vec::new();
+        let text = q.text.trim();
+        let mut params = Vec::<Value>::new();
+        let mut where_clauses = vec!["m.deleted_at_ms IS NULL".to_owned()];
+        let embedding_param = if text.is_empty() {
+            None
+        } else {
+            Some(push_query_param(
+                &mut params,
+                Value::Text(self.embed_json(text).await?),
+            ))
+        };
 
+        if embedding_param.is_some() {
+            where_clauses.push("e.content_updated_at_ms = m.updated_at_ms".to_owned());
+        }
+
+        let kind_placeholders = q
+            .kinds
+            .iter()
+            .map(|kind| push_query_param(&mut params, Value::Integer(kind_to_i64(*kind))))
+            .collect::<Vec<_>>();
+        if !kind_placeholders.is_empty() {
+            where_clauses.push(format!("m.kind IN ({})", kind_placeholders.join(", ")));
+        }
+
+        for concept in q
+            .concepts
+            .iter()
+            .map(|concept| normalize_label(concept))
+            .filter(|concept| !concept.is_empty())
+        {
+            let placeholder = push_query_param(&mut params, Value::Text(concept));
+            where_clauses.push(format!(
+                r#"
+                EXISTS (
+                  SELECT 1
+                  FROM {memory_concepts} AS mc
+                  JOIN {concepts} AS c ON c.id = mc.concept_id
+                  WHERE mc.memory_id = m.id
+                    AND c.normalized_label = {placeholder}
+                )
+                "#,
+                memory_concepts = self.memory_concepts_table_name(),
+                concepts = self.concepts_table_name(),
+            ));
+        }
+
+        for (namespace, label) in q.tags.iter().filter_map(|tag| normalized_tag_filter(tag)) {
+            let memory_tags = self.memory_tags_table_name();
+            let tags = self.tags_table_name();
+            match namespace {
+                Some(namespace) => {
+                    let namespace_placeholder =
+                        push_query_param(&mut params, Value::Text(namespace));
+                    let label_placeholder = push_query_param(&mut params, Value::Text(label));
+                    where_clauses.push(format!(
+                        r#"
+                        EXISTS (
+                          SELECT 1
+                          FROM {memory_tags} AS mt
+                          JOIN {tags} AS t ON t.id = mt.tag_id
+                          WHERE mt.memory_id = m.id
+                            AND LOWER(t.namespace) = {namespace_placeholder}
+                            AND t.normalized_label = {label_placeholder}
+                        )
+                        "#,
+                    ));
+                }
+                None => {
+                    let label_placeholder = push_query_param(&mut params, Value::Text(label));
+                    where_clauses.push(format!(
+                        r#"
+                        EXISTS (
+                          SELECT 1
+                          FROM {memory_tags} AS mt
+                          JOIN {tags} AS t ON t.id = mt.tag_id
+                          WHERE mt.memory_id = m.id
+                            AND t.normalized_label = {label_placeholder}
+                        )
+                        "#,
+                    ));
+                }
+            }
+        }
+
+        let join_clause = if embedding_param.is_some() {
+            format!(
+                "JOIN {embeddings} AS e ON e.memory_id = m.id",
+                embeddings = self.embedding_table_name,
+            )
+        } else {
+            String::new()
+        };
+        let order_clause = if let Some(placeholder) = embedding_param {
+            format!("vector_distance_cos(e.embedding, vector32({placeholder})) ASC, m.id ASC")
+        } else {
+            "m.stored_at_ms DESC, m.id ASC".to_owned()
+        };
+        let limit_placeholder =
+            push_query_param(&mut params, Value::Integer(limit_to_i64(q.limit)));
         let sql = format!(
             r#"
-            SELECT m.memory_index, m.content, m.rank, m.occurred_at_ms
+            SELECT m.id, m.memory_index, m.content, m.kind, m.rank, m.occurred_at_ms, m.stored_at_ms
             FROM {memories} AS m
-            JOIN {embeddings} AS e ON e.memory_id = m.id
-            WHERE m.deleted_at_ms IS NULL
-              AND e.content_updated_at_ms = m.updated_at_ms
-            ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC,
-                     m.id ASC
-            LIMIT ?2
+            {join_clause}
+            WHERE {where_clause}
+            ORDER BY {order_clause}
+            LIMIT {limit_placeholder}
             "#,
             memories = self.table_name,
-            embeddings = self.embedding_table_name,
+            where_clause = where_clauses.join("\n              AND "),
         );
+
         let mut rows = self
             .conn
-            .query(&sql, params![embedding_json, limit_to_i64(q.limit)])
+            .query(&sql, params_from_iter(params))
             .await
             .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
-            out.push(Self::row_to_record(&row)?);
+            out.push(self.row_to_record(&row).await?);
         }
 
         Ok(out)
     }
 
+    async fn linked(&self, q: &LinkedMemoryQuery) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+        if q.limit == 0 || q.memory_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let links = self.links_table_name();
+        let memories = &self.table_name;
+        let mut out = Vec::new();
+        let mut seen =
+            std::collections::HashSet::<(String, String, MemoryLinkRelation, String)>::new();
+        for index in &q.memory_indexes {
+            let root_id = self.memory_id_for_index(index).await?;
+            let Some(root_id) = root_id else {
+                continue;
+            };
+            let sql = format!(
+                r#"
+                SELECT
+                  l.from_memory_id,
+                  from_m.memory_index,
+                  l.to_memory_id,
+                  to_m.memory_index,
+                  l.relation,
+                  l.freeform_relation,
+                  l.strength,
+                  l.confidence,
+                  l.updated_at_ms,
+                  CASE WHEN l.from_memory_id = ?1 THEN l.to_memory_id ELSE l.from_memory_id END AS linked_id
+                FROM {links} AS l
+                JOIN {memories} AS from_m ON from_m.id = l.from_memory_id
+                JOIN {memories} AS to_m ON to_m.id = l.to_memory_id
+                WHERE (l.from_memory_id = ?1 OR l.to_memory_id = ?1)
+                  AND from_m.deleted_at_ms IS NULL
+                  AND to_m.deleted_at_ms IS NULL
+                ORDER BY l.updated_at_ms DESC, l.id ASC
+                "#,
+            );
+            let mut rows = self
+                .conn
+                .query(&sql, [root_id])
+                .await
+                .map_err(map_libsql_error)?;
+            while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+                let from_id: i64 = row.get(0).map_err(map_libsql_error)?;
+                let from_index: String = row.get(1).map_err(map_libsql_error)?;
+                let to_index: String = row.get(3).map_err(map_libsql_error)?;
+                let relation = relation_from_i64(row.get(4).map_err(map_libsql_error)?)?;
+                let freeform_relation: Option<String> = row.get(5).map_err(map_libsql_error)?;
+                if !q.relation_filter.is_empty() && !q.relation_filter.contains(&relation) {
+                    continue;
+                }
+                let outgoing = from_id == root_id;
+                if !matches!(q.direction, MemoryLinkDirection::Both)
+                    && !matches!(
+                        (q.direction, outgoing),
+                        (MemoryLinkDirection::Outgoing, true)
+                            | (MemoryLinkDirection::Incoming, false)
+                    )
+                {
+                    continue;
+                }
+                let key = (
+                    from_index.clone(),
+                    to_index.clone(),
+                    relation,
+                    freeform_relation.clone().unwrap_or_default(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                let linked_id: i64 = row.get(9).map_err(map_libsql_error)?;
+                let Some(record) = self.record_by_id(linked_id).await? else {
+                    continue;
+                };
+                let updated_at_ms: i64 = row.get(8).map_err(map_libsql_error)?;
+                let strength: f64 = row.get(6).map_err(map_libsql_error)?;
+                let confidence: f64 = row.get(7).map_err(map_libsql_error)?;
+                out.push(LinkedMemoryRecord {
+                    record,
+                    link: MemoryLink {
+                        from_memory: MemoryIndex::new(from_index),
+                        to_memory: MemoryIndex::new(to_index),
+                        relation,
+                        freeform_relation,
+                        strength: strength as f32,
+                        confidence: confidence as f32,
+                        updated_at: chrono::DateTime::from_timestamp_millis(updated_at_ms)
+                            .ok_or_else(|| {
+                                PortError::InvalidData(format!(
+                                    "invalid memory link timestamp: {updated_at_ms}"
+                                ))
+                            })?,
+                    },
+                });
+                if out.len() >= q.limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn upsert_link(
+        &self,
+        link: NewMemoryLink,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MemoryLink, PortError> {
+        let updated_at_ms = updated_at.timestamp_millis();
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let from_id = self
+            .memory_id_for_index_tx(&tx, &link.from_memory)
+            .await?
+            .ok_or_else(|| PortError::NotFound(link.from_memory.to_string()))?;
+        let to_id = self
+            .memory_id_for_index_tx(&tx, &link.to_memory)
+            .await?
+            .ok_or_else(|| PortError::NotFound(link.to_memory.to_string()))?;
+        self.upsert_link_tx(&tx, from_id, to_id, link.clone(), updated_at_ms)
+            .await?;
+        tx.commit().await.map_err(map_libsql_error)?;
+        Ok(MemoryLink {
+            from_memory: link.from_memory,
+            to_memory: link.to_memory,
+            relation: link.relation,
+            freeform_relation: link.freeform_relation,
+            strength: clamp_confidence(link.strength),
+            confidence: clamp_confidence(link.confidence),
+            updated_at,
+        })
+    }
+
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError> {
         let now = now_ms();
-        let sql = format!(
-            r#"
-            UPDATE {memories}
-            SET deleted_at_ms = ?2,
-                updated_at_ms = ?2
-            WHERE memory_index = ?1
-            "#,
-            memories = self.table_name,
-        );
-        self.conn
-            .execute(&sql, params![index.as_str(), now])
-            .await
-            .map_err(map_libsql_error)?;
+        let tx = self.conn.transaction().await.map_err(map_libsql_error)?;
+        let Some(memory_id) = self.memory_id_for_index_tx(&tx, index).await? else {
+            tx.commit().await.map_err(map_libsql_error)?;
+            return Ok(());
+        };
+        self.hard_delete_memory_tx(&tx, memory_id, now).await?;
+        tx.commit().await.map_err(map_libsql_error)?;
         Ok(())
     }
 }
@@ -1559,6 +2478,58 @@ fn source_ids_json(ids: &[MemoryIndex]) -> Result<String, PortError> {
     serde_json::to_string(&source_ids).map_err(|error| PortError::Backend(error.to_string()))
 }
 
+fn kind_to_i64(kind: MemoryKind) -> i64 {
+    match kind {
+        MemoryKind::Episode => 0,
+        MemoryKind::Statement => 1,
+        MemoryKind::Reflection => 2,
+        MemoryKind::Hypothesis => 3,
+        MemoryKind::Dream => 4,
+        MemoryKind::Procedure => 5,
+        MemoryKind::Plan => 6,
+    }
+}
+
+fn kind_from_i64(value: i64) -> Result<MemoryKind, PortError> {
+    match value {
+        0 => Ok(MemoryKind::Episode),
+        1 => Ok(MemoryKind::Statement),
+        2 => Ok(MemoryKind::Reflection),
+        3 => Ok(MemoryKind::Hypothesis),
+        4 => Ok(MemoryKind::Dream),
+        5 => Ok(MemoryKind::Procedure),
+        6 => Ok(MemoryKind::Plan),
+        _ => Err(PortError::InvalidData(format!(
+            "invalid memory kind: {value}"
+        ))),
+    }
+}
+
+fn relation_to_i64(relation: MemoryLinkRelation) -> i64 {
+    match relation {
+        MemoryLinkRelation::Related => 0,
+        MemoryLinkRelation::Supports => 1,
+        MemoryLinkRelation::Contradicts => 2,
+        MemoryLinkRelation::Updates => 3,
+        MemoryLinkRelation::Corrects => 4,
+        MemoryLinkRelation::DerivedFrom => 5,
+    }
+}
+
+fn relation_from_i64(value: i64) -> Result<MemoryLinkRelation, PortError> {
+    match value {
+        0 => Ok(MemoryLinkRelation::Related),
+        1 => Ok(MemoryLinkRelation::Supports),
+        2 => Ok(MemoryLinkRelation::Contradicts),
+        3 => Ok(MemoryLinkRelation::Updates),
+        4 => Ok(MemoryLinkRelation::Corrects),
+        5 => Ok(MemoryLinkRelation::DerivedFrom),
+        _ => Err(PortError::InvalidData(format!(
+            "invalid memory link relation: {value}"
+        ))),
+    }
+}
+
 fn rank_to_i64(rank: MemoryRank) -> i64 {
     match rank {
         MemoryRank::ShortTerm => 0,
@@ -1566,6 +2537,46 @@ fn rank_to_i64(rank: MemoryRank) -> i64 {
         MemoryRank::LongTerm => 2,
         MemoryRank::Permanent => 3,
         MemoryRank::Identity => 4,
+    }
+}
+
+fn normalize_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn push_query_param(params: &mut Vec<Value>, value: Value) -> String {
+    params.push(value);
+    format!("?{}", params.len())
+}
+
+fn normalized_tag_filter(value: &str) -> Option<(Option<String>, String)> {
+    let normalized = normalize_label(value);
+    if normalized.is_empty() {
+        return None;
+    }
+    let Some((namespace, label)) = normalized.split_once(':') else {
+        return Some((None, normalized));
+    };
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let namespace = namespace.trim();
+    Some((
+        (!namespace.is_empty()).then(|| namespace.to_owned()),
+        label.to_owned(),
+    ))
+}
+
+fn clamp_confidence(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1756,20 +2767,156 @@ mod tests {
     async fn insert_then_get_roundtrips_content_and_rank() {
         let store = store().await;
         let occurred_at = chrono::Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap();
+        let stored_at = chrono::Utc.with_ymd_and_hms(2025, 5, 11, 1, 2, 3).unwrap();
         let id = store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha beta"),
-                rank: MemoryRank::LongTerm,
-                occurred_at: Some(occurred_at),
-            })
+            .insert(
+                new_memory("alpha beta", MemoryRank::LongTerm, Some(occurred_at)),
+                stored_at,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         let got = store.get(&id).await.unwrap().unwrap();
         assert_eq!(got.index, id);
         assert_eq!(got.content.as_str(), "alpha beta");
         assert_eq!(got.rank, MemoryRank::LongTerm);
         assert_eq!(got.occurred_at, Some(occurred_at));
+        assert_eq!(got.stored_at, stored_at);
+        assert_eq!(got.kind, MemoryKind::Statement);
+    }
+
+    #[tokio::test]
+    async fn insert_stores_sidecars_and_search_filters() {
+        let store = store().await;
+        let id = store
+            .insert(
+                NewMemory {
+                    kind: MemoryKind::Episode,
+                    concepts: vec![MemoryConcept {
+                        label: "Ryo".to_string(),
+                        mention_text: Some("Ryo".to_string()),
+                        loose_type: Some("person".to_string()),
+                        confidence: 0.9,
+                    }],
+                    tags: vec![MemoryTag {
+                        label: "preference".to_string(),
+                        namespace: "operation".to_string(),
+                        confidence: 0.8,
+                    }],
+                    ..new_memory(
+                        "Ryo said he prefers Kyoto coffee shops.",
+                        MemoryRank::LongTerm,
+                        None,
+                    )
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.kind, MemoryKind::Episode);
+        assert_eq!(got.concepts[0].label, "Ryo");
+        assert_eq!(got.tags[0].label, "preference");
+
+        let hits = store
+            .search(&MemoryQuery {
+                text: String::new(),
+                limit: 10,
+                kinds: vec![MemoryKind::Episode],
+                concepts: vec!["ryo".to_string()],
+                tags: vec!["preference".to_string()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.index.clone()).collect::<Vec<_>>(),
+            vec![id]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_are_applied_before_vector_limit() {
+        let store = store().await;
+        for i in 0..10 {
+            store
+                .put(indexed_memory(
+                    MemoryIndex::new(format!("non-target-{i}")),
+                    "alpha",
+                    MemoryRank::LongTerm,
+                ))
+                .await
+                .unwrap();
+        }
+        let target = MemoryIndex::new("target");
+        store
+            .put(IndexedMemory {
+                concepts: vec![MemoryConcept::new("needle")],
+                ..indexed_memory(target.clone(), "alpha", MemoryRank::LongTerm)
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&MemoryQuery {
+                text: "alpha".to_string(),
+                limit: 1,
+                kinds: Vec::new(),
+                concepts: vec!["needle".to_string()],
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.index.clone()).collect::<Vec<_>>(),
+            vec![target]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tag_namespace_filter_is_sql_side() {
+        let store = store().await;
+        for i in 0..10 {
+            store
+                .put(indexed_memory(
+                    MemoryIndex::new(format!("non-target-tag-{i}")),
+                    "alpha",
+                    MemoryRank::LongTerm,
+                ))
+                .await
+                .unwrap();
+        }
+        let target = MemoryIndex::new("target-tag");
+        store
+            .put(IndexedMemory {
+                tags: vec![MemoryTag {
+                    label: "preference".to_string(),
+                    namespace: "operation".to_string(),
+                    confidence: 1.0,
+                }],
+                ..indexed_memory(target.clone(), "alpha", MemoryRank::LongTerm)
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .search(&MemoryQuery {
+                text: "alpha".to_string(),
+                limit: 1,
+                kinds: Vec::new(),
+                concepts: Vec::new(),
+                tags: vec!["operation:preference".to_string()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.iter().map(|hit| hit.index.clone()).collect::<Vec<_>>(),
+            vec![target]
+        );
     }
 
     #[tokio::test]
@@ -1820,30 +2967,27 @@ mod tests {
     async fn list_by_rank_returns_live_identity_records_in_index_order() {
         let store = store().await;
         store
-            .put(IndexedMemory {
-                index: MemoryIndex::new("identity-b"),
-                content: MemoryContent::new("second"),
-                rank: MemoryRank::Identity,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                MemoryIndex::new("identity-b"),
+                "second",
+                MemoryRank::Identity,
+            ))
             .await
             .unwrap();
         store
-            .put(IndexedMemory {
-                index: MemoryIndex::new("identity-a"),
-                content: MemoryContent::new("first"),
-                rank: MemoryRank::Identity,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                MemoryIndex::new("identity-a"),
+                "first",
+                MemoryRank::Identity,
+            ))
             .await
             .unwrap();
         store
-            .put(IndexedMemory {
-                index: MemoryIndex::new("ordinary"),
-                content: MemoryContent::new("ordinary"),
-                rank: MemoryRank::Permanent,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                MemoryIndex::new("ordinary"),
+                "ordinary",
+                MemoryRank::Permanent,
+            ))
             .await
             .unwrap();
         store.delete(&MemoryIndex::new("identity-b")).await.unwrap();
@@ -1864,24 +3008,14 @@ mod tests {
         let store = store().await;
         let id = MemoryIndex::new("replica-1");
         store
-            .put(IndexedMemory {
-                index: id.clone(),
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .put(indexed_memory(id.clone(), "alpha", MemoryRank::ShortTerm))
             .await
             .unwrap();
         store.delete(&id).await.unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
 
         store
-            .put(IndexedMemory {
-                index: id.clone(),
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::Permanent,
-                occurred_at: None,
-            })
+            .put(indexed_memory(id.clone(), "beta", MemoryRank::Permanent))
             .await
             .unwrap();
 
@@ -1894,37 +3028,29 @@ mod tests {
     async fn search_uses_cosine_order_and_limit() {
         let store = store().await;
         let alpha = store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        store
+            .insert(
+                new_memory("beta", MemoryRank::LongTerm, None),
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         store
-            .insert(NewMemory {
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::LongTerm,
-                occurred_at: None,
-            })
-            .await
-            .unwrap();
-        store
-            .insert(NewMemory {
-                content: MemoryContent::new("gamma"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("gamma", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
 
-        let hits = store
-            .search(&MemoryQuery {
-                text: "alpha".into(),
-                limit: 1,
-            })
-            .await
-            .unwrap();
+        let hits = store.search(&memory_query("alpha", 1)).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].index, alpha);
     }
@@ -1933,21 +3059,14 @@ mod tests {
     async fn search_returns_empty_for_zero_limit() {
         let store = store().await;
         store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
 
-        let hits = store
-            .search(&MemoryQuery {
-                text: "alpha".into(),
-                limit: 0,
-            })
-            .await
-            .unwrap();
+        let hits = store.search(&memory_query("alpha", 0)).await.unwrap();
         assert!(hits.is_empty());
     }
 
@@ -1955,68 +3074,227 @@ mod tests {
     async fn delete_hides_rows_and_is_idempotent() {
         let store = store().await;
         let id = store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         store.delete(&id).await.unwrap();
         store.delete(&id).await.unwrap();
 
         assert!(store.get(&id).await.unwrap().is_none());
-        let hits = store
-            .search(&MemoryQuery {
-                text: "alpha".into(),
-                limit: 10,
-            })
-            .await
-            .unwrap();
+        let hits = store.search(&memory_query("alpha", 10)).await.unwrap();
         assert!(hits.is_empty());
     }
 
     #[tokio::test]
-    async fn compact_inserts_merged_row_preserves_sources_and_hides_sources() {
+    async fn hard_delete_removes_sidecars_links_search_and_embeddings() {
         let store = store().await;
         let first = store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                NewMemory {
+                    concepts: vec![MemoryConcept::new("alpha-project")],
+                    tags: vec![MemoryTag::operational("follow-up")],
+                    ..new_memory("alpha", MemoryRank::ShortTerm, None)
+                },
+                chrono::Utc::now(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
         let second = store
-            .insert(NewMemory {
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("beta", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        store
+            .upsert_link(
+                NewMemoryLink {
+                    from_memory: second.clone(),
+                    to_memory: first.clone(),
+                    relation: MemoryLinkRelation::Updates,
+                    freeform_relation: None,
+                    strength: 0.7,
+                    confidence: 0.6,
+                },
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
+        let first_row_id = memory_row_id(&store, &first).await;
+
+        store.delete(&first).await.unwrap();
+        store.delete(&first).await.unwrap();
+
+        assert!(store.get(&first).await.unwrap().is_none());
+        assert_eq!(
+            count_rows_where(
+                &store,
+                &store.memory_concepts_table_name(),
+                "memory_id",
+                first_row_id
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_rows_where(
+                &store,
+                &store.memory_tags_table_name(),
+                "memory_id",
+                first_row_id
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_rows_where(
+                &store,
+                &store.search_table_name(),
+                "memory_id",
+                first_row_id
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count_rows_where(
+                &store,
+                store.embedding_table_name(),
+                "memory_id",
+                first_row_id
+            )
+            .await,
+            0
+        );
+        assert!(
+            store
+                .linked(&LinkedMemoryQuery::around(vec![second], 8))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search(&MemoryQuery {
+                    text: String::new(),
+                    limit: 10,
+                    kinds: Vec::new(),
+                    concepts: vec!["alpha-project".to_string()],
+                    tags: Vec::new(),
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_dedup_keeps_distinct_freeform_relations() {
+        let store = store().await;
+        let from = MemoryIndex::new("from");
+        let to = MemoryIndex::new("to");
+        let updated_at = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        store
+            .put(indexed_memory(from.clone(), "alpha", MemoryRank::LongTerm))
+            .await
+            .unwrap();
+        store
+            .put(indexed_memory(to.clone(), "beta", MemoryRank::LongTerm))
+            .await
+            .unwrap();
+
+        for freeform_relation in ["part-a", "part-b"] {
+            let link = store
+                .upsert_link(
+                    NewMemoryLink {
+                        from_memory: from.clone(),
+                        to_memory: to.clone(),
+                        relation: MemoryLinkRelation::Related,
+                        freeform_relation: Some(freeform_relation.to_string()),
+                        strength: 0.9,
+                        confidence: 0.8,
+                    },
+                    updated_at,
+                )
+                .await
+                .unwrap();
+            assert_eq!(link.updated_at, updated_at);
+        }
+
+        let linked = store
+            .linked(&LinkedMemoryQuery::around(vec![from], 8))
+            .await
+            .unwrap();
+        let mut freeform_relations = linked
+            .into_iter()
+            .map(|item| item.link.freeform_relation.unwrap())
+            .collect::<Vec<_>>();
+        freeform_relations.sort();
+
+        assert_eq!(freeform_relations, vec!["part-a", "part-b"]);
+    }
+
+    #[tokio::test]
+    async fn compact_inserts_summary_and_hides_sources() {
+        let store = store().await;
+        let first = store
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        let second = store
+            .insert(
+                new_memory("beta", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
 
         let merged = store
             .compact(
                 NewMemory {
-                    content: MemoryContent::new("alpha beta"),
-                    rank: MemoryRank::LongTerm,
-                    occurred_at: None,
+                    kind: MemoryKind::Reflection,
+                    concepts: vec![MemoryConcept::new("alpha")],
+                    tags: vec![MemoryTag::operational("compaction-summary")],
+                    ..new_memory("alpha beta", MemoryRank::LongTerm, None)
                 },
                 &[first.clone(), second.clone()],
+                chrono::Utc::now(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         assert!(store.get(&first).await.unwrap().is_none());
         assert!(store.get(&second).await.unwrap().is_none());
         let got = store.get(&merged).await.unwrap().unwrap();
         assert_eq!(got.content.as_str(), "alpha beta");
         assert_eq!(got.rank, MemoryRank::LongTerm);
+        assert_eq!(got.kind, MemoryKind::Reflection);
 
         let parsed = source_ids_for(&store, &merged).await;
         assert_eq!(parsed, vec![first.to_string(), second.to_string()]);
+        let linked = store
+            .linked(&LinkedMemoryQuery {
+                memory_indexes: vec![merged.clone()],
+                relation_filter: vec![MemoryLinkRelation::DerivedFrom],
+                direction: MemoryLinkDirection::Outgoing,
+                limit: 8,
+            })
+            .await
+            .unwrap();
+        assert!(linked.is_empty());
     }
 
     #[tokio::test]
@@ -2025,21 +3303,19 @@ mod tests {
         let first = MemoryIndex::new("first");
         let second = MemoryIndex::new("second");
         store
-            .put(IndexedMemory {
-                index: first.clone(),
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                first.clone(),
+                "alpha",
+                MemoryRank::ShortTerm,
+            ))
             .await
             .unwrap();
         store
-            .put(IndexedMemory {
-                index: second.clone(),
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                second.clone(),
+                "beta",
+                MemoryRank::ShortTerm,
+            ))
             .await
             .unwrap();
 
@@ -2047,10 +3323,9 @@ mod tests {
         store
             .put_compacted(
                 IndexedMemory {
-                    index: merged.clone(),
-                    content: MemoryContent::new("alpha beta"),
-                    rank: MemoryRank::LongTerm,
-                    occurred_at: None,
+                    kind: MemoryKind::Reflection,
+                    tags: vec![MemoryTag::operational("compaction-summary")],
+                    ..indexed_memory(merged.clone(), "alpha beta", MemoryRank::LongTerm)
                 },
                 &[first.clone(), second.clone()],
             )
@@ -2078,11 +3353,10 @@ mod tests {
         .unwrap();
 
         let error = store
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
             .unwrap_err();
 
@@ -2096,13 +3370,13 @@ mod tests {
         let profile_b = profile("test", "b", 2);
         let store_a = store_for_profile(path.clone(), profile_a).await;
         let id = store_a
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         let store_b = store_for_profile(path, profile_b).await;
         assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
@@ -2123,42 +3397,29 @@ mod tests {
         let path = test_db_path();
         let store_a = store_for_profile(path.clone(), profile("test", "a", 3)).await;
         let alpha = store_a
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         let store_b = store_for_profile(path, profile("test", "b", 2)).await;
         store_b
-            .put(IndexedMemory {
-                index: MemoryIndex::new("beta-only-b"),
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .put(indexed_memory(
+                MemoryIndex::new("beta-only-b"),
+                "beta",
+                MemoryRank::ShortTerm,
+            ))
             .await
             .unwrap();
 
-        let hits_a = store_a
-            .search(&MemoryQuery {
-                text: "beta".into(),
-                limit: 10,
-            })
-            .await
-            .unwrap();
+        let hits_a = store_a.search(&memory_query("beta", 10)).await.unwrap();
         assert_eq!(hits_a.len(), 1);
         assert_eq!(hits_a[0].index, alpha);
 
-        let hits_b = store_b
-            .search(&MemoryQuery {
-                text: "beta".into(),
-                limit: 10,
-            })
-            .await
-            .unwrap();
+        let hits_b = store_b.search(&memory_query("beta", 10)).await.unwrap();
         assert_eq!(hits_b.len(), 1);
         assert_eq!(hits_b[0].index, MemoryIndex::new("beta-only-b"));
     }
@@ -2168,22 +3429,19 @@ mod tests {
         let path = test_db_path();
         let store_a = store_for_profile(path.clone(), profile("test", "a", 3)).await;
         let id = store_a
-            .insert(NewMemory {
-                content: MemoryContent::new("alpha"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .insert(
+                new_memory("alpha", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .index;
 
         let store_b = store_for_profile(path, profile("test", "b", 2)).await;
         assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
         assert_eq!(
             store_b
-                .search(&MemoryQuery {
-                    text: "alpha".into(),
-                    limit: 10,
-                })
+                .search(&memory_query("alpha", 10))
                 .await
                 .unwrap()
                 .len(),
@@ -2191,21 +3449,13 @@ mod tests {
         );
 
         store_a
-            .put(IndexedMemory {
-                index: id,
-                content: MemoryContent::new("beta"),
-                rank: MemoryRank::ShortTerm,
-                occurred_at: None,
-            })
+            .put(indexed_memory(id, "beta", MemoryRank::ShortTerm))
             .await
             .unwrap();
 
         assert!(
             store_b
-                .search(&MemoryQuery {
-                    text: "beta".into(),
-                    limit: 10,
-                })
+                .search(&memory_query("beta", 10))
                 .await
                 .unwrap()
                 .is_empty()
@@ -2213,10 +3463,7 @@ mod tests {
         assert_eq!(store_b.backfill_active_profile(10).await.unwrap(), 1);
         assert_eq!(
             store_b
-                .search(&MemoryQuery {
-                    text: "beta".into(),
-                    limit: 10,
-                })
+                .search(&memory_query("beta", 10))
                 .await
                 .unwrap()
                 .len(),
@@ -2267,14 +3514,24 @@ mod tests {
                     INSERT INTO {DEFAULT_MEMORY_TABLE} (
                       memory_index,
                       content,
+                      kind,
                       rank,
+                      stored_at_ms,
                       created_at_ms,
                       updated_at_ms
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                     "#
                 ),
-                params![id.as_str(), "bad", 99_i64, now_ms(), now_ms()],
+                params![
+                    id.as_str(),
+                    "bad",
+                    kind_to_i64(MemoryKind::Statement),
+                    99_i64,
+                    now_ms(),
+                    now_ms(),
+                    now_ms()
+                ],
             )
             .await
             .unwrap();
@@ -2470,6 +3727,38 @@ mod tests {
         .unwrap()
     }
 
+    fn new_memory(
+        content: &str,
+        rank: MemoryRank,
+        occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> NewMemory {
+        NewMemory {
+            content: MemoryContent::new(content),
+            rank,
+            occurred_at,
+            kind: MemoryKind::Statement,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn indexed_memory(index: MemoryIndex, content: &str, rank: MemoryRank) -> IndexedMemory {
+        IndexedMemory {
+            index,
+            content: MemoryContent::new(content),
+            rank,
+            occurred_at: None,
+            stored_at: chrono::Utc::now(),
+            kind: MemoryKind::Statement,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn memory_query(text: &str, limit: usize) -> MemoryQuery {
+        MemoryQuery::text(text, limit)
+    }
+
     async fn policy_store() -> LibsqlPolicyStore {
         LibsqlPolicyStore::connect(
             LibsqlPolicyStoreConfig::local(test_db_path(), 3),
@@ -2497,6 +3786,39 @@ mod tests {
         let mut rows = store
             .conn
             .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    async fn count_rows_where(
+        store: &LibsqlMemoryStore,
+        table: &str,
+        column: &str,
+        value: i64,
+    ) -> i64 {
+        validate_identifier("test table", table).unwrap();
+        validate_identifier("test column", column).unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                [value],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    async fn memory_row_id(store: &LibsqlMemoryStore, index: &MemoryIndex) -> i64 {
+        let mut rows = store
+            .conn
+            .query(
+                &format!("SELECT id FROM {DEFAULT_MEMORY_TABLE} WHERE memory_index = ?1 LIMIT 1"),
+                [index.as_str()],
+            )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();

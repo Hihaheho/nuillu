@@ -1,14 +1,16 @@
 use std::sync::mpsc::Sender;
 
 use crate::{
-    MemoryPage, MemoryRecordView, VisualizerClientMessage, VisualizerCommand, VisualizerTabId,
-    text::wrapped_label,
+    LinkedMemoryRecordView, MemoryPage, MemoryRecordView, VisualizerClientMessage,
+    VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 #[derive(Debug)]
 pub struct MemoriesState {
     pub query: String,
     pub query_results: Vec<MemoryRecordView>,
+    pub linked_memory_index: String,
+    pub linked_results: Vec<LinkedMemoryRecordView>,
     pub page: MemoryPage,
     draft_query: String,
     page_index: usize,
@@ -21,6 +23,8 @@ impl Default for MemoriesState {
         Self {
             query: String::new(),
             query_results: Vec::new(),
+            linked_memory_index: String::new(),
+            linked_results: Vec::new(),
             page: MemoryPage {
                 page: 0,
                 per_page: 25,
@@ -115,10 +119,46 @@ pub fn ui(
         ui.label(format!("Query: {}", state.query));
         &state.query_results
     };
-    memory_list(ui, records);
+    memory_list(
+        ui,
+        tab_id,
+        records,
+        commands,
+        state.page_index,
+        state.per_page,
+    );
+
+    if !state.linked_results.is_empty() {
+        ui.separator();
+        ui.label(format!("Linked memories: {}", state.linked_memory_index));
+        egui::ScrollArea::vertical()
+            .id_salt("linked-memory-list")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                for linked in &state.linked_results {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&linked.link.relation);
+                        ui.label(format!(
+                            "{} -> {}",
+                            linked.link.from_memory, linked.link.to_memory
+                        ));
+                        ui.label(&linked.record.index);
+                    });
+                    wrapped_label(ui, &linked.record.content);
+                    ui.add_space(6.0);
+                }
+            });
+    }
 }
 
-fn memory_list(ui: &mut egui::Ui, records: &[MemoryRecordView]) {
+fn memory_list(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    records: &[MemoryRecordView],
+    commands: &Sender<VisualizerClientMessage>,
+    page: usize,
+    per_page: usize,
+) {
     egui::ScrollArea::vertical()
         .id_salt("memory-list")
         .show(ui, |ui| {
@@ -129,6 +169,7 @@ fn memory_list(ui: &mut egui::Ui, records: &[MemoryRecordView]) {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
+                            ui.strong(&record.kind);
                             ui.strong(&record.rank);
                             ui.label(&record.index);
                             ui.label(
@@ -137,7 +178,38 @@ fn memory_list(ui: &mut egui::Ui, records: &[MemoryRecordView]) {
                                     .map(|at| at.to_rfc3339())
                                     .unwrap_or_else(|| "-".to_string()),
                             );
+                            ui.label(format!("stored {}", record.stored_at.to_rfc3339()));
+                            if ui.small_button("Links").clicked() {
+                                let _ = commands.send(VisualizerClientMessage::Command {
+                                    command: VisualizerCommand::FetchLinkedMemories {
+                                        tab_id: tab_id.clone(),
+                                        memory_index: record.index.clone(),
+                                        relation_filter: Vec::new(),
+                                        limit: 16,
+                                    },
+                                });
+                            }
+                            if ui.small_button("Delete").clicked() {
+                                let _ = commands.send(VisualizerClientMessage::Command {
+                                    command: VisualizerCommand::DeleteMemory {
+                                        tab_id: tab_id.clone(),
+                                        memory_index: record.index.clone(),
+                                        page,
+                                        per_page,
+                                    },
+                                });
+                            }
                         });
+                        if !record.concepts.is_empty() || !record.tags.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for concept in &record.concepts {
+                                    ui.label(format!("concept:{}", concept.label));
+                                }
+                                for tag in &record.tags {
+                                    ui.label(format!("tag:{}:{}", tag.namespace, tag.label));
+                                }
+                            });
+                        }
                         ui.add_space(4.0);
                         wrapped_label(ui, &record.content);
                     });

@@ -1,4 +1,4 @@
-/// Schema for eval-cases/full-agent/**/*.eure files.
+/// Schema for eval-cases/modules/{memory,memory-compaction,memory-association,memory-recombination}/**/*.eure files.
 
 $schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
 
@@ -17,11 +17,16 @@ now.$optional = true
 modules = [`$types.eval-module`]
 modules.$optional = true
 
-inputs = [`$types.full-agent-input`]
-inputs.$optional = true
+prompt {
+  $variant: text
+  min-length = 1
+}
 
-steps = [`$types.eval-step`]
-steps.$optional = true
+context = `text`
+context.$optional = true
+
+allow-empty-output = `boolean`
+allow-empty-output.$optional = true
 
 participants = [`text`]
 participants.$optional = true
@@ -32,14 +37,14 @@ memories.$optional = true
 memos = [`$types.memo-seed`]
 memos.$optional = true
 
+cognition-log = [`$types.cognition-log-seed`]
+cognition-log.$optional = true
+
 limits = `$types.eval-limits`
 limits.$optional = true
 
 checks = [`$types.check`]
 checks.$optional = true
-
-modules-checks = [`$types.module-checks`]
-modules-checks.$optional = true
 
 scoring = `$types.case-scoring`
 scoring.$optional = true
@@ -57,6 +62,8 @@ variants.memory = { = "memory", $variant => "literal" }
 variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
 variants.memory-association = { = "memory-association", $variant => "literal" }
 variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
+variants.vital = { = "vital", $variant => "literal" }
+variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
 variants.policy = { = "policy", $variant => "literal" }
 variants.value-estimator = { = "value-estimator", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
@@ -64,57 +71,6 @@ variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
 variants.speak-gate = { = "speak-gate", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
-
-@ $types.full-agent-input
-$variant: union
-
-variants.heard {
-  direction = `text`
-  direction.$optional = true
-  content {
-    $variant: text
-    min-length = 1
-  }
-}
-
-variants.seen {
-  direction = `text`
-  direction.$optional = true
-  appearance {
-    $variant: text
-    min-length = 1
-  }
-}
-
-variants.observed {
-  modality {
-    $variant: text
-    min-length = 1
-  }
-  direction = `text`
-  direction.$optional = true
-  content {
-    $variant: text
-    min-length = 1
-  }
-}
-
-@ $types.eval-step
-description = `text`
-description.$optional = true
-inputs = [`$types.full-agent-input`]
-wait-for = `$types.wait-for`
-wait-for.$optional = true
-checks = [`$types.check`]
-checks.$optional = true
-
-@ $types.wait-for
-$variant: union
-
-variants.memo-from {
-  module = `$types.eval-module`
-  timeout-ms = `integer`
-}
 
 @ $types.memory-rank
 $variant: union
@@ -148,6 +104,14 @@ content {
   $variant: text
   min-length = 1
 }
+
+@ $types.cognition-log-seed
+text {
+  $variant: text
+  min-length = 1
+}
+seconds-ago = `integer`
+seconds-ago.$optional = true
 
 @ $types.eval-limits
 max-llm-calls = `integer`
@@ -193,24 +157,6 @@ weight = `integer`
 weight.$optional = true
 pass-score = `float`
 pass-score.$optional = true
-
-@ $types.module-checks
-module = `$types.eval-module`
-rubrics = [`$types.module-rubric`]
-
-@ $types.module-rubric
-name = `text`
-name.$optional = true
-rubric {
-  $variant: text
-  min-length = 1
-}
-pass-score = `float`
-pass-score.$optional = true
-judge-inputs = [`$types.rubric-judge-input`]
-judge-inputs.$optional = true
-criteria = [`$types.rubric-criterion`]
-criteria.$optional = true
 
 @ $types.check
 $variant: union

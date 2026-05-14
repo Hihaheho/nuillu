@@ -3,11 +3,12 @@ use std::time::Duration;
 use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
 };
+use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation};
 use nuillu_module::{
     AllocationUpdated, AllocationUpdatedMailbox, AmbientSensoryEntry, SensoryInput,
     SensoryInputMailbox, SensoryModality,
 };
-use nuillu_types::{ModuleId, ReplicaCapRange};
+use nuillu_types::{MemoryIndex, ModuleId, ReplicaCapRange};
 use nuillu_visualizer_protocol::{
     ModuleSettingsView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
     VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
@@ -16,7 +17,10 @@ use nuillu_visualizer_protocol::{
 use crate::SERVER_TAB_ID;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
-use crate::snapshot::{emit_visualizer_blackboard_snapshot, list_all_memories, memory_record_view};
+use crate::snapshot::{
+    emit_visualizer_blackboard_snapshot, linked_memory_record_view, list_all_memories,
+    memory_record_view,
+};
 use crate::state::{AmbientRows, ModuleSettingsState};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
@@ -171,10 +175,7 @@ async fn handle_server_visualizer_message(
         } if command_tab == *tab_id => {
             let records = env
                 .memory
-                .search(&nuillu_memory::MemoryQuery {
-                    text: query.clone(),
-                    limit,
-                })
+                .search(&nuillu_memory::MemoryQuery::text(query.clone(), limit))
                 .await
                 .map(|records| records.into_iter().map(memory_record_view).collect())
                 .unwrap_or_default();
@@ -182,6 +183,54 @@ async fn handle_server_visualizer_message(
                 tab_id: tab_id.clone(),
                 query,
                 records,
+            });
+            false
+        }
+        VisualizerCommand::FetchLinkedMemories {
+            tab_id: command_tab,
+            memory_index,
+            relation_filter,
+            limit,
+        } if command_tab == *tab_id => {
+            let relation_filter = relation_filter
+                .into_iter()
+                .filter_map(|relation| parse_memory_relation(&relation))
+                .collect::<Vec<_>>();
+            let records = env
+                .memory
+                .linked(&LinkedMemoryQuery {
+                    memory_indexes: vec![MemoryIndex::new(memory_index.clone())],
+                    relation_filter,
+                    direction: MemoryLinkDirection::Both,
+                    limit,
+                })
+                .await
+                .map(|records| records.into_iter().map(linked_memory_record_view).collect())
+                .unwrap_or_default();
+            visualizer.send_event(VisualizerEvent::MemoryLinkedResult {
+                tab_id: tab_id.clone(),
+                memory_index,
+                records,
+            });
+            false
+        }
+        VisualizerCommand::DeleteMemory {
+            tab_id: command_tab,
+            memory_index,
+            page,
+            per_page,
+        } if command_tab == *tab_id => {
+            let index = MemoryIndex::new(memory_index.clone());
+            if let Err(error) = env.memory_caps.deleter().delete(&index).await {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id: tab_id.clone(),
+                    message: format!("failed to delete memory {memory_index}: {error}"),
+                });
+            }
+            let records = list_all_memories(env.memory.as_ref()).await;
+            visualizer.send_event(VisualizerEvent::MemoryPage {
+                tab_id: tab_id.clone(),
+                page: memory_page_from_records(&records, page, per_page),
             });
             false
         }
@@ -198,6 +247,18 @@ async fn handle_server_visualizer_message(
             false
         }
         _ => false,
+    }
+}
+
+fn parse_memory_relation(value: &str) -> Option<MemoryLinkRelation> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "related" => Some(MemoryLinkRelation::Related),
+        "supports" => Some(MemoryLinkRelation::Supports),
+        "contradicts" => Some(MemoryLinkRelation::Contradicts),
+        "updates" => Some(MemoryLinkRelation::Updates),
+        "corrects" => Some(MemoryLinkRelation::Corrects),
+        "derived_from" | "derived-from" => Some(MemoryLinkRelation::DerivedFrom),
+        _ => None,
     }
 }
 

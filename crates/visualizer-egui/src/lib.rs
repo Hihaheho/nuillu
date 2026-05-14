@@ -224,6 +224,8 @@ impl VisualizerState {
                 let tab = self.tab_mut(tab_id);
                 tab.memories.query.clear();
                 tab.memories.query_results.clear();
+                tab.memories.linked_memory_index.clear();
+                tab.memories.linked_results.clear();
                 tab.memories.page = page;
             }
             VisualizerEvent::MemoryQueryResult {
@@ -234,6 +236,15 @@ impl VisualizerState {
                 let tab = self.tab_mut(tab_id);
                 tab.memories.query = query;
                 tab.memories.query_results = records;
+            }
+            VisualizerEvent::MemoryLinkedResult {
+                tab_id,
+                memory_index,
+                records,
+            } => {
+                let tab = self.tab_mut(tab_id);
+                tab.memories.linked_memory_index = memory_index;
+                tab.memories.linked_results = records;
             }
             VisualizerEvent::AmbientSensoryRows { tab_id, rows } => {
                 self.tab_mut(tab_id).chat.set_ambient_rows(rows);
@@ -553,8 +564,12 @@ mod tests {
             query: "rust".to_string(),
             records: vec![MemoryRecordView {
                 index: "m1".to_string(),
+                kind: "Statement".to_string(),
                 rank: "episodic".to_string(),
                 occurred_at: None,
+                stored_at: chrono::Utc::now(),
+                concepts: Vec::new(),
+                tags: Vec::new(),
                 content: "learned rust".to_string(),
             }],
         });

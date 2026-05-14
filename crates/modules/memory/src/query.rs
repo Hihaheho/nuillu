@@ -15,11 +15,16 @@ use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::store::VectorMemorySearcher;
+use crate::store::{
+    LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryContentReader, MemoryKind,
+    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemoryTag, VectorMemorySearcher,
+};
 
 const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
-Choose vector-memory searches only. Use search_vector_memory for factual memory lookup when needed,
-then stop.
+Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
+Use search_vector_memory for ordinary flat memory search. Use fetch_linked_memories only after a
+specific search hit or prior memo makes linked context useful. Linked lookup is explicit; ordinary
+search results are flat and do not include hidden bundles.
 If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
 phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
@@ -29,9 +34,9 @@ distinct questions or evidence requests. Prefer multiple targeted searches in on
 generic searches or later follow-up turns.
 If the requested facts are already covered by prior query-vector memo logs, previous tool results,
 or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
-Do not answer questions, explain results, describe this module, or add any text from outside tool
-results. The runtime memoizes only memory hit content returned by tools. Any final text is ignored;
-do not use a final answer as a data channel."#;
+You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do not
+produce user-facing answers, decide final truth, explain results from outside tool output, or use a
+final answer as a data channel."#;
 
 const COMPACTED_QUERY_VECTOR_SESSION_PREFIX: &str = "Compacted query-vector session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-vector module's persistent session history.
@@ -65,19 +70,51 @@ pub struct SearchVectorMemoryOutput {
     pub hits: Vec<QueryVectorMemoryHit>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QueryVectorMemoryHit {
     pub index: MemoryIndex,
     pub content: String,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+    pub concepts: Vec<MemoryConcept>,
+    pub tags: Vec<MemoryTag>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[lutum::tool_input(name = "fetch_linked_memories", output = FetchLinkedMemoriesOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FetchLinkedMemoriesArgs {
+    pub memory_indexes: Vec<MemoryIndex>,
+    pub relation_filter: Vec<MemoryLinkRelation>,
+    pub direction: MemoryLinkDirection,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FetchLinkedMemoriesOutput {
+    pub hits: Vec<QueryVectorLinkedMemoryHit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct QueryVectorLinkedMemoryHit {
+    pub index: MemoryIndex,
+    pub content: String,
+    pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+    pub concepts: Vec<MemoryConcept>,
+    pub tags: Vec<MemoryTag>,
+    pub link: MemoryLink,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct QueryVectorMemo {
     pub requests: Vec<String>,
     pub searches: Vec<QueryVectorMemoSearch>,
     pub hits: Vec<QueryVectorMemoHit>,
+    pub linked_hits: Vec<QueryVectorMemoLinkedHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,17 +129,31 @@ pub struct QueryVectorMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryVectorMemoLinkedHit {
+    pub index: MemoryIndex,
+    pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub stored_at: DateTime<Utc>,
+    pub kind: MemoryKind,
+    pub link: MemoryLink,
 }
 
 #[derive(Debug, Default)]
 struct QueryVectorRetrieval {
     searches: Vec<QueryVectorMemoSearch>,
     hits: Vec<QueryVectorMemoryHit>,
+    linked_hits: Vec<QueryVectorLinkedMemoryHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum QueryVectorTools {
     SearchVectorMemory(SearchVectorMemoryArgs),
+    FetchLinkedMemories(FetchLinkedMemoriesArgs),
 }
 
 pub struct QueryVectorModule {
@@ -112,6 +163,7 @@ pub struct QueryVectorModule {
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: VectorMemorySearcher,
+    linked_memory: MemoryContentReader,
     memo: TypedMemo<QueryVectorMemo>,
     llm: LlmAccess,
     session: Session,
@@ -128,6 +180,7 @@ impl QueryVectorModule {
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: VectorMemorySearcher,
+        linked_memory: MemoryContentReader,
         memo: TypedMemo<QueryVectorMemo>,
         llm: LlmAccess,
     ) -> Self {
@@ -139,6 +192,7 @@ impl QueryVectorModule {
             allocation,
             blackboard,
             memory,
+            linked_memory,
             memo,
             llm,
             session: Session::new(),
@@ -219,7 +273,8 @@ impl QueryVectorModule {
         retrieval: QueryVectorRetrieval,
     ) -> Result<()> {
         let hits = self.fresh_hits(&retrieval.hits).await;
-        let content = render_memo(requests, &retrieval.searches, &hits);
+        let linked_hits = self.fresh_linked_hits(&retrieval.linked_hits).await;
+        let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
         if !content.is_empty() {
             let payload = QueryVectorMemo {
                 requests: requests.to_vec(),
@@ -230,6 +285,19 @@ impl QueryVectorModule {
                         index: hit.index.clone(),
                         rank: hit.rank,
                         occurred_at: hit.occurred_at,
+                        stored_at: hit.stored_at,
+                        kind: hit.kind,
+                    })
+                    .collect(),
+                linked_hits: linked_hits
+                    .iter()
+                    .map(|hit| QueryVectorMemoLinkedHit {
+                        index: hit.index.clone(),
+                        rank: hit.rank,
+                        occurred_at: hit.occurred_at,
+                        stored_at: hit.stored_at,
+                        kind: hit.kind,
+                        link: hit.link.clone(),
                     })
                     .collect(),
             };
@@ -245,6 +313,36 @@ impl QueryVectorModule {
             .await
             .iter()
             .flat_map(|record| record.data().hits.iter().map(|hit| hit.index.clone()))
+            .collect::<HashSet<_>>();
+        hits.iter()
+            .filter(|hit| seen.insert(hit.index.clone()))
+            .cloned()
+            .collect()
+    }
+
+    async fn fresh_linked_hits(
+        &self,
+        hits: &[QueryVectorLinkedMemoryHit],
+    ) -> Vec<QueryVectorLinkedMemoryHit> {
+        let mut seen = self
+            .memo
+            .recent_logs()
+            .await
+            .iter()
+            .flat_map(|record| {
+                record
+                    .data()
+                    .hits
+                    .iter()
+                    .map(|hit| hit.index.clone())
+                    .chain(
+                        record
+                            .data()
+                            .linked_hits
+                            .iter()
+                            .map(|hit| hit.index.clone()),
+                    )
+            })
             .collect::<HashSet<_>>();
         hits.iter()
             .filter(|hit| seen.insert(hit.index.clone()))
@@ -274,48 +372,106 @@ impl QueryVectorModule {
         self.session
             .push_ephemeral_system(format_vector_memory_context(&rank_counts, &allocation));
 
-        let lutum = self.llm.lutum().await;
-        let outcome = self
-            .session
-            .text_turn(&lutum)
-            .tools::<QueryVectorTools>()
-            .available_tools([QueryVectorToolsSelector::SearchVectorMemory])
-            .collect()
-            .await
-            .context("query-vector text turn failed")?;
+        let mut retrieval = QueryVectorRetrieval::default();
+        for _ in 0..3 {
+            let lutum = self.llm.lutum().await;
+            let outcome = self
+                .session
+                .text_turn(&lutum)
+                .tools::<QueryVectorTools>()
+                .available_tools([
+                    QueryVectorToolsSelector::SearchVectorMemory,
+                    QueryVectorToolsSelector::FetchLinkedMemories,
+                ])
+                .collect()
+                .await
+                .context("query-vector text turn failed")?;
 
-        match outcome {
-            TextStepOutcomeWithTools::Finished(result) => {
-                compact_session_if_needed(
-                    &mut self.session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
-                Ok(QueryVectorRetrieval::default())
-            }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                compact_session_if_needed(
-                    &mut self.session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
-                Ok(QueryVectorRetrieval::default())
-            }
-            TextStepOutcomeWithTools::NeedsTools(round) => {
-                let input_tokens = round.usage.input_tokens;
-                if round.tool_calls.is_empty() {
+            match outcome {
+                TextStepOutcomeWithTools::Finished(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction(),
+                        self.session_compaction,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                        Self::id(),
+                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(retrieval);
+                }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        result.usage.input_tokens,
+                        cx.session_compaction(),
+                        self.session_compaction,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                        Self::id(),
+                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(retrieval);
+                }
+                TextStepOutcomeWithTools::NeedsTools(round) => {
+                    let input_tokens = round.usage.input_tokens;
+                    if round.tool_calls.is_empty() {
+                        compact_session_if_needed(
+                            &mut self.session,
+                            input_tokens,
+                            cx.session_compaction(),
+                            self.session_compaction,
+                            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                            Self::id(),
+                            COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                            SESSION_COMPACTION_PROMPT,
+                        )
+                        .await;
+                        return Ok(retrieval);
+                    }
+                    let mut tool_results: Vec<ToolResult> = Vec::new();
+                    for call in round.tool_calls.iter().cloned() {
+                        match call {
+                            QueryVectorToolsCall::SearchVectorMemory(call) => {
+                                let input = call.input.clone();
+                                let output = self
+                                    .search_vector_memory(input.clone(), cx.now())
+                                    .await
+                                    .context("run search_vector_memory tool")?;
+                                retrieval.searches.push(QueryVectorMemoSearch {
+                                    query: input.query,
+                                    limit: input.limit.clamp(1, 16),
+                                    hit_indices: output
+                                        .hits
+                                        .iter()
+                                        .map(|hit| hit.index.clone())
+                                        .collect(),
+                                });
+                                retrieval.hits.extend(output.hits.clone());
+                                tool_results.push(
+                                    call.complete(output)
+                                        .context("complete search_vector_memory tool call")?,
+                                );
+                            }
+                            QueryVectorToolsCall::FetchLinkedMemories(call) => {
+                                let output = self
+                                    .fetch_linked_memories(call.input.clone(), cx.now())
+                                    .await
+                                    .context("run fetch_linked_memories tool")?;
+                                retrieval.linked_hits.extend(output.hits.clone());
+                                tool_results.push(
+                                    call.complete(output)
+                                        .context("complete fetch_linked_memories tool call")?,
+                                );
+                            }
+                        }
+                    }
+                    round
+                        .commit(&mut self.session, tool_results)
+                        .context("commit query-vector tool round")?;
                     compact_session_if_needed(
                         &mut self.session,
                         input_tokens,
@@ -327,49 +483,10 @@ impl QueryVectorModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
-                    return Ok(QueryVectorRetrieval::default());
                 }
-                let mut all_hits = Vec::new();
-                let mut searches = Vec::new();
-                let mut tool_results: Vec<ToolResult> = Vec::new();
-                for call in round.tool_calls.iter().cloned() {
-                    let QueryVectorToolsCall::SearchVectorMemory(call) = call;
-                    let input = call.input.clone();
-                    let output = self
-                        .search_vector_memory(input.clone(), cx.now())
-                        .await
-                        .context("run search_vector_memory tool")?;
-                    searches.push(QueryVectorMemoSearch {
-                        query: input.query,
-                        limit: input.limit.clamp(1, 16),
-                        hit_indices: output.hits.iter().map(|hit| hit.index.clone()).collect(),
-                    });
-                    all_hits.extend(output.hits.clone());
-                    tool_results.push(
-                        call.complete(output)
-                            .context("complete search_vector_memory tool call")?,
-                    );
-                }
-                round
-                    .commit(&mut self.session, tool_results)
-                    .context("commit query-vector tool round")?;
-                compact_session_if_needed(
-                    &mut self.session,
-                    input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
-                Ok(QueryVectorRetrieval {
-                    searches,
-                    hits: all_hits,
-                })
             }
         }
+        Ok(retrieval)
     }
 
     async fn prior_query_vector_searches(&self) -> Option<String> {
@@ -433,7 +550,35 @@ impl QueryVectorModule {
                     ),
                     rank: record.rank,
                     occurred_at: record.occurred_at,
+                    stored_at: record.stored_at,
+                    kind: record.kind,
+                    concepts: record.concepts,
+                    tags: record.tags,
                 })
+                .collect(),
+        })
+    }
+
+    async fn fetch_linked_memories(
+        &self,
+        args: FetchLinkedMemoriesArgs,
+        now: DateTime<Utc>,
+    ) -> Result<FetchLinkedMemoriesOutput> {
+        let limit = args.limit.clamp(1, 16);
+        let records = self
+            .linked_memory
+            .linked(&LinkedMemoryQuery {
+                memory_indexes: args.memory_indexes,
+                relation_filter: args.relation_filter,
+                direction: args.direction,
+                limit,
+            })
+            .await
+            .context("fetch linked memory")?;
+        Ok(FetchLinkedMemoriesOutput {
+            hits: records
+                .into_iter()
+                .map(|linked| render_linked_hit(linked, now))
                 .collect(),
         })
     }
@@ -510,13 +655,32 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     contents.join("\n\n")
 }
 
+fn linked_hit_contents(hits: &[QueryVectorLinkedMemoryHit]) -> String {
+    let mut contents = Vec::<String>::new();
+    for hit in hits {
+        let content = hit.content.trim();
+        if !content.is_empty() && !contents.iter().any(|item| item.ends_with(content)) {
+            contents.push(format!(
+                "[{:?} {:?} {} -> {}] {content}",
+                hit.link.relation,
+                hit.link.freeform_relation,
+                hit.link.from_memory,
+                hit.link.to_memory
+            ));
+        }
+    }
+    contents.join("\n\n")
+}
+
 fn render_memo(
     requests: &[String],
     searches: &[QueryVectorMemoSearch],
     hits: &[QueryVectorMemoryHit],
+    linked_hits: &[QueryVectorLinkedMemoryHit],
 ) -> String {
     let retrieved = hit_contents(hits);
-    if retrieved.is_empty() {
+    let linked = linked_hit_contents(linked_hits);
+    if retrieved.is_empty() && linked.is_empty() {
         return String::new();
     }
 
@@ -529,8 +693,28 @@ fn render_memo(
     if !search_lines.is_empty() {
         sections.push(format!("Search queries:\n{search_lines}"));
     }
-    sections.push(format!("Retrieved memories:\n{retrieved}"));
+    if !retrieved.is_empty() {
+        sections.push(format!("Retrieved memory evidence:\n{retrieved}"));
+    }
+    if !linked.is_empty() {
+        sections.push(format!("Linked memory evidence:\n{linked}"));
+    }
     sections.join("\n\n")
+}
+
+fn render_linked_hit(linked: LinkedMemoryRecord, now: DateTime<Utc>) -> QueryVectorLinkedMemoryHit {
+    let record = linked.record;
+    QueryVectorLinkedMemoryHit {
+        index: record.index,
+        content: render_memory_for_llm(record.content.as_str(), record.occurred_at, now),
+        rank: record.rank,
+        occurred_at: record.occurred_at,
+        stored_at: record.stored_at,
+        kind: record.kind,
+        concepts: record.concepts,
+        tags: record.tags,
+        link: linked.link,
+    }
 }
 
 fn bullet_lines<'a>(items: impl Iterator<Item = &'a str>) -> String {

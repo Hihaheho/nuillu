@@ -1,0 +1,37 @@
+id = "module-memory-recombination-dream-from-peer-memory"
+description = "Memory-recombination should append an explicitly non-verified dream/hypothesis cognition entry from recent cognition plus memory."
+modules = ["memory-recombination"]
+prompt = "Run one REM-like recombination using recent cognition and related memory. Keep it internal and clearly non-verified."
+context = "The target output is a memory-recombination cognition entry, not a memory write or outward reply."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memories[] {
+  rank = "long-term"
+  content = "Koro relaxes near food when Nui approaches slowly from the side and uses short clear signals."
+}
+
+@ cognition-log[] {
+  text = "Nui noticed Koro guarding food beside the side path while Pibi waited for a safe signal."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "marks-non-verified-dream"
+  must-pass = true
+  contains = "Internal dream simulation, not a verified fact:"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "associative-but-not-factual"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "cognition", "trace"]
+  rubric = ```
+  Pass if the cognition artifact is a short internal dream or hypothesis simulation that combines the recent Koro food/path cognition with the related memory while clearly marking the result as non-verified.
+  Fail if it writes a memory, speaks outwardly, presents the recombination as fact, merely repeats one source without association, or omits the dream/hypothesis framing.
+  ```
+}

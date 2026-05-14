@@ -64,6 +64,7 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
         (builtin::value_estimator(), builtin::query_policy()),
         (builtin::reward(), builtin::value_estimator()),
         (builtin::policy(), builtin::reward()),
+        (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
             builtin::memory_compaction(),
@@ -163,6 +164,7 @@ fn register_server_module(
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.searcher(),
+                    memory_caps.content_reader(),
                     caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
                     caps.llm_access(),
                 )
@@ -203,6 +205,20 @@ fn register_server_module(
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.compactor(),
+                    caps.llm_access(),
+                )
+            })
+        }
+        RuntimeModule::MemoryAssociation => {
+            let memory_caps = memory_caps.clone();
+            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+                nuillu_memory::MemoryAssociationModule::new(
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    memory_caps.content_reader(),
+                    memory_caps.writer(),
+                    memory_caps.associator(),
                     caps.llm_access(),
                 )
             })
@@ -397,6 +413,11 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
                 ModelTier::Cheap,
                 "Idle until compaction guidance arrives.",
             ),
+            RuntimeModule::MemoryAssociation => (
+                0.0,
+                ModelTier::Cheap,
+                "Idle until non-destructive memory association guidance arrives.",
+            ),
             RuntimeModule::MemoryRecombination => (
                 0.0,
                 ModelTier::Cheap,
@@ -473,6 +494,7 @@ fn policy(
 fn homeostatic_drive_modules() -> Vec<ModuleId> {
     vec![
         builtin::memory_compaction(),
+        builtin::memory_association(),
         builtin::memory_recombination(),
     ]
 }
