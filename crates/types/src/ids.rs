@@ -177,7 +177,6 @@ pub mod builtin {
         self_model            => "self-model",
         query_vector          => "query-vector",
         query_policy          => "query-policy",
-        query_agentic         => "query-agentic",
         memory                => "memory",
         memory_compaction     => "memory-compaction",
         memory_recombination  => "memory-recombination",
@@ -247,7 +246,6 @@ mod tests {
         let _ = builtin::attention_schema();
         let _ = builtin::self_model();
         let _ = builtin::query_vector();
-        let _ = builtin::query_agentic();
     }
 
     #[test]

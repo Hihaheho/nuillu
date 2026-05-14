@@ -15,28 +15,28 @@ use nuillu_visualizer_protocol::{
 };
 
 #[derive(Clone, Debug)]
-pub(super) struct VisualizerEventSink {
+pub struct VisualizerEventSink {
     events: Sender<VisualizerServerMessage>,
 }
 
 impl VisualizerEventSink {
-    pub(super) fn new(events: Sender<VisualizerServerMessage>) -> Self {
+    pub fn new(events: Sender<VisualizerServerMessage>) -> Self {
         Self { events }
     }
 
-    pub(super) fn send(&self, event: VisualizerEvent) {
+    pub fn send(&self, event: VisualizerEvent) {
         let _ = self.events.send(VisualizerServerMessage::event(event));
     }
 }
 
-pub(super) struct VisualizerHook {
+pub struct VisualizerHook {
     events: Sender<VisualizerServerMessage>,
     commands: Receiver<VisualizerClientMessage>,
     shutdown_requested: bool,
 }
 
 impl VisualizerHook {
-    pub(super) fn new(
+    pub fn new(
         events: Sender<VisualizerServerMessage>,
         commands: Receiver<VisualizerClientMessage>,
     ) -> Self {
@@ -47,23 +47,23 @@ impl VisualizerHook {
         }
     }
 
-    pub(super) fn event_sender(&self) -> VisualizerEventSink {
+    pub fn event_sender(&self) -> VisualizerEventSink {
         VisualizerEventSink::new(self.events.clone())
     }
 
-    pub(super) fn send_event(&self, event: VisualizerEvent) {
+    pub fn send_event(&self, event: VisualizerEvent) {
         let _ = self.events.send(VisualizerServerMessage::event(event));
     }
 
-    pub(super) fn request_shutdown(&mut self) {
+    pub fn request_shutdown(&mut self) {
         self.shutdown_requested = true;
     }
 
-    pub(super) fn shutdown_requested(&self) -> bool {
+    pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
 
-    pub(super) fn try_recv_command(&mut self) -> Option<VisualizerClientMessage> {
+    pub fn try_recv_command(&mut self) -> Option<VisualizerClientMessage> {
         match self.commands.try_recv() {
             Ok(message) => Some(message),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
@@ -75,7 +75,7 @@ impl VisualizerHook {
     }
 }
 
-pub(super) fn accept_visualizer_connection(
+pub fn accept_visualizer_connection(
     listener: &TcpListener,
     child: &mut Child,
 ) -> anyhow::Result<TcpStream> {
@@ -96,7 +96,7 @@ pub(super) fn accept_visualizer_connection(
     }
 }
 
-pub(super) fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
+pub fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
     let mut command = visualizer_gui_command(host)?;
     command
         .stdin(Stdio::null())
@@ -180,7 +180,7 @@ fn workspace_root() -> &'static Path {
         .expect("server crate should be two levels below workspace root")
 }
 
-pub(super) fn wait_for_visualizer_exit_with_context(mut child: Child, context: &str) {
+pub fn wait_for_visualizer_exit_with_context(mut child: Child, context: &str) {
     match child.try_wait() {
         Ok(Some(_)) => return,
         Ok(None) => {
@@ -194,8 +194,7 @@ pub(super) fn wait_for_visualizer_exit_with_context(mut child: Child, context: &
     let _ = child.wait();
 }
 
-#[allow(dead_code)]
-fn drain_child_stdio(child: &mut Child) {
+pub fn drain_child_stdio(child: &mut Child) {
     if let Some(stdout) = child.stdout.as_mut() {
         let mut output = String::new();
         let _ = stdout.read_to_string(&mut output);

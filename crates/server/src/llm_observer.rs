@@ -22,21 +22,21 @@ use nuillu_visualizer_protocol::{
 use crate::gui::VisualizerEventSink;
 
 #[derive(Clone)]
-pub(super) struct ServerLlmObserver {
-    inner: Arc<ServerLlmObserverInner>,
+pub struct VisualizerLlmObserver {
+    inner: Arc<VisualizerLlmObserverInner>,
 }
 
-struct ServerLlmObserverInner {
+struct VisualizerLlmObserverInner {
     tab_id: String,
     events: VisualizerEventSink,
     next_turn: AtomicU64,
     extension_turns: Mutex<BTreeMap<usize, String>>,
 }
 
-impl ServerLlmObserver {
-    pub(super) fn new(tab_id: String, events: VisualizerEventSink) -> Self {
+impl VisualizerLlmObserver {
+    pub fn new(tab_id: String, events: VisualizerEventSink) -> Self {
         Self {
-            inner: Arc::new(ServerLlmObserverInner {
+            inner: Arc::new(VisualizerLlmObserverInner {
                 tab_id,
                 events,
                 next_turn: AtomicU64::new(0),
@@ -45,7 +45,7 @@ impl ServerLlmObserver {
         }
     }
 
-    pub(super) fn hook_set(&self) -> LutumHooksSet<'static> {
+    pub fn hook_set(&self) -> LutumHooksSet<'static> {
         LutumHooksSet::new()
             .with_on_model_input(self.clone())
             .with_on_stream_event(self.clone())
@@ -88,7 +88,7 @@ impl ServerLlmObserver {
     }
 }
 
-impl OnModelInput for ServerLlmObserver {
+impl OnModelInput for VisualizerLlmObserver {
     async fn call(&self, cx: &ModelInputHookContext<'_>) {
         let Some(metadata) = self.metadata(cx.extensions()) else {
             return;
@@ -107,7 +107,7 @@ impl OnModelInput for ServerLlmObserver {
     }
 }
 
-impl OnStreamEvent for ServerLlmObserver {
+impl OnStreamEvent for VisualizerLlmObserver {
     async fn call(&self, cx: &StreamEventHookContext<'_>) {
         let Some(metadata) = self.metadata(cx.extensions()) else {
             return;
@@ -122,7 +122,7 @@ fn extension_key(extensions: &RequestExtensions) -> usize {
 }
 
 fn emit_stream_observation(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     cx: &StreamEventHookContext<'_>,
     metadata: &LlmRequestMetadata,
     turn_id: String,
@@ -150,7 +150,7 @@ fn emit_stream_observation(
 }
 
 fn emit_started(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     metadata: &LlmRequestMetadata,
     turn_id: String,
     operation: OperationKind,
@@ -170,7 +170,7 @@ fn emit_started(
     });
 }
 
-fn emit_delta(observer: &ServerLlmObserver, turn_id: String, kind: &str, delta: String) {
+fn emit_delta(observer: &VisualizerLlmObserver, turn_id: String, kind: &str, delta: String) {
     observer.emit(LlmObservationEvent::StreamDelta {
         turn_id,
         kind: kind.to_string(),
@@ -179,7 +179,7 @@ fn emit_delta(observer: &ServerLlmObserver, turn_id: String, kind: &str, delta: 
 }
 
 fn emit_completed(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
     turn_id: String,
     request_id: Option<String>,
@@ -196,7 +196,7 @@ fn emit_completed(
 }
 
 fn emit_tool_call_chunk(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     turn_id: String,
     id: &lutum::ToolCallId,
     name: &lutum::ToolName,
@@ -211,7 +211,7 @@ fn emit_tool_call_chunk(
 }
 
 fn emit_tool_call_ready(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     turn_id: String,
     metadata: &lutum::ToolMetadata,
 ) {
@@ -224,7 +224,7 @@ fn emit_tool_call_ready(
 }
 
 fn emit_text_turn_stream_event(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
     metadata: &LlmRequestMetadata,
     turn_id: String,
@@ -273,7 +273,7 @@ fn emit_text_turn_stream_event(
 }
 
 fn emit_structured_turn_stream_event(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
     metadata: &LlmRequestMetadata,
     turn_id: String,
@@ -328,7 +328,7 @@ fn emit_structured_turn_stream_event(
 }
 
 fn emit_completion_stream_event(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
     metadata: &LlmRequestMetadata,
     turn_id: String,
@@ -377,7 +377,7 @@ fn emit_completion_stream_event(
 }
 
 fn emit_structured_completion_stream_event(
-    observer: &ServerLlmObserver,
+    observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
     metadata: &LlmRequestMetadata,
     turn_id: String,

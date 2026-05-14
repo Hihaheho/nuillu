@@ -165,8 +165,6 @@ pub struct ModuleCase {
     #[eure(default)]
     pub memos: Vec<MemoSeed>,
     #[eure(default)]
-    pub files: Vec<FileSeed>,
-    #[eure(default)]
     pub cognition_log: Vec<CognitionLogSeed>,
     #[eure(default)]
     pub limits: EvalLimits,
@@ -186,7 +184,6 @@ pub enum EvalModule {
     SelfModel,
     QueryVector,
     QueryPolicy,
-    QueryAgentic,
     Memory,
     MemoryCompaction,
     MemoryRecombination,
@@ -233,7 +230,6 @@ impl EvalModule {
             Self::SelfModel => "self-model",
             Self::QueryVector => "query-vector",
             Self::QueryPolicy => "query-policy",
-            Self::QueryAgentic => "query-agentic",
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryRecombination => "memory-recombination",
@@ -258,7 +254,6 @@ impl EvalModule {
             Self::SelfModel => builtin::self_model(),
             Self::QueryVector => builtin::query_vector(),
             Self::QueryPolicy => builtin::query_policy(),
-            Self::QueryAgentic => builtin::query_agentic(),
             Self::Memory => builtin::memory(),
             Self::MemoryCompaction => builtin::memory_compaction(),
             Self::MemoryRecombination => builtin::memory_recombination(),
@@ -304,7 +299,6 @@ impl FullAgentCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleEvalTarget {
     QueryVector,
-    QueryAgentic,
     AttentionSchema,
     SelfModel,
 }
@@ -313,7 +307,6 @@ impl ModuleEvalTarget {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::QueryVector => "query-vector",
-            Self::QueryAgentic => "query-agentic",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
         }
@@ -322,7 +315,6 @@ impl ModuleEvalTarget {
     pub fn module(self) -> EvalModule {
         match self {
             Self::QueryVector => EvalModule::QueryVector,
-            Self::QueryAgentic => EvalModule::QueryAgentic,
             Self::AttentionSchema => EvalModule::AttentionSchema,
             Self::SelfModel => EvalModule::SelfModel,
         }
@@ -333,7 +325,6 @@ impl ModuleEvalTarget {
             .filter_map(|component| component.as_os_str().to_str())
             .find_map(|part| match part {
                 "query-vector" => Some(Self::QueryVector),
-                "query-agentic" => Some(Self::QueryAgentic),
                 "attention-schema" => Some(Self::AttentionSchema),
                 "self-model" => Some(Self::SelfModel),
                 _ => None,
@@ -496,13 +487,6 @@ pub struct MemoSeed {
     pub content: Text,
     #[eure(default = "default_seed_seconds_ago")]
     pub seconds_ago: i64,
-}
-
-#[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
-pub struct FileSeed {
-    pub path: String,
-    pub content: Text,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -740,7 +724,7 @@ pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
     }
     let target = ModuleEvalTarget::from_path(path).ok_or_else(|| CaseFileError::Validation {
         path: path.to_path_buf(),
-        message: "module eval case path must include query-vector, query-agentic, attention-schema, or self-model"
+        message: "module eval case path must include query-vector, attention-schema, or self-model"
             .to_string(),
     })?;
     let case = parse_module_case_file(path)?;
@@ -998,20 +982,6 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             path: path.to_path_buf(),
             message: "prompt must not be empty".to_string(),
         });
-    }
-    for (index, file) in case.files.iter().enumerate() {
-        if file.path.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("files[{index}].path must not be empty"),
-            });
-        }
-        if file.content.content.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("files[{index}].content must not be empty"),
-            });
-        }
     }
     for (index, seed) in case.cognition_log.iter().enumerate() {
         if seed.text.content.trim().is_empty() {

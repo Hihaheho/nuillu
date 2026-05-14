@@ -133,7 +133,6 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `VectorMemorySearcher` |
-| query-agentic | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `FileSearcher` |
 | query-policy | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `PolicySearcher` |
 | memory | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
@@ -220,10 +219,6 @@ Stable self-knowledge belongs in memory and can be retrieved by query modules, b
 
 Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to retrieve memory relevant to the current cognitive surface. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers, describe itself, or query the policy store. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
 
-### Query Agentic
-
-Handles read-only file-search retrieval only. Allocation updates wake it to act on controller guidance. Its memo contains only retrieved file content/snippets, copied from query results; it does not synthesize answers or describe itself.
-
 ### Query Policy
 
 Retrieves applicable policies from the policy store. Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to surface policies relevant to a newly admitted situation. Vector search is over the `trigger` embedding only — `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never used as search keys. Memo-log entries contain only retrieved policy records (`trigger`, `behavior`, `expected_reward`, `confidence`, `value`) copied from search results; it does not synthesize advice, modify policy state, or describe itself. The retrieval memos are the substrate for both `value-estimator` (which predicts `expected_reward` for each hit) and `reward` (which uses the retrieval window for credit assignment). Retrieval counts as access for diagnostic `usage_history` only — access does not elevate policy rank.
@@ -301,7 +296,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - Cognition-log appenders cannot wake the controller directly; the controller wakes on memo updates.
 - The attention controller is not woken by cognition log updates.
 - Allocation activation ratios respect boot-time `cap_range.min/max`; modules with `cap_range.min = 0` are detachable by allocation.
-- Query-memory and query-agentic are independently detachable for ablation.
+- Query-memory and query-policy are independently detachable for ablation.
 - Predict and surprise are independently detachable for ablation.
 - Memory and learning are distinct reinforcement substrates: memory rank elevation is store-internal and access-driven; policy rank elevation is reward-driven and runs only through `PolicyValueUpdater::reinforce`.
 - Policy creation (`policy` module), value prediction (`value-estimator` module), and policy update (`reward` module) are separate roles: `policy` cannot mutate existing entries, `value-estimator` cannot mutate policy state, and `reward` cannot insert new entries or predict expected reward.

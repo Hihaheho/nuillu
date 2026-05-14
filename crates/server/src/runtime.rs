@@ -22,7 +22,7 @@ use crate::state::{AmbientRows, ModuleSettingsState};
 
 const SERVER_TITLE: &str = "nuillu-server";
 
-pub(crate) fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
+pub fn run_server_with_visualizer(config: ServerConfig) -> anyhow::Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create state dir {}", config.state_dir.display()))?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind visualizer RPC listener")?;
@@ -142,7 +142,6 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
             &modules,
             &env.memory_caps,
             &env.policy_caps,
-            &env.file_search,
             &env.utterance_sink,
         )
         .build(&env.caps)

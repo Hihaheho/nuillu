@@ -6,8 +6,8 @@ use std::{
     num::NonZeroUsize,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::{Arc, Mutex, OnceLock},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -15,40 +15,24 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use futures::FutureExt as _;
-use lutum::{
-    AssistantInputItem, CompletionEvent, ErasedStructuredCompletionEvent,
-    ErasedStructuredTurnEvent, ErasedTextTurnEvent, InputMessageRole, ItemView, Lutum,
-    LutumHooksSet, LutumStreamEvent, MessageContent, ModelInputHookContext, ModelInputItem,
-    ModelName, OnModelInput, OnStreamEvent, OperationKind, RawTelemetryConfig, RequestExtensions,
-    SharedPoolBudgetManager, SharedPoolBudgetOptions, StreamEventHookContext, TurnRole, TurnView,
-    Usage,
-};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{
-    EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig, LibsqlPolicyStore,
-    LibsqlPolicyStoreConfig,
+    LibsqlMemoryStore, LibsqlMemoryStoreConfig, LibsqlPolicyStore, LibsqlPolicyStoreConfig,
 };
-use lutum_model2vec_adapter::PotionBase8MEmbedder;
-use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ResourceAllocation,
     ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
-use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryRecord, MemoryStore};
-use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
+use nuillu_memory::{MemoryCapabilities, MemoryQuery, MemoryStore};
+use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
     AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
-    LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
-    RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality,
-    SessionCompactionPolicy,
-};
-use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
-use nuillu_query_agentic::{
-    FileSearchHit, FileSearchProvider, FileSearchQuery, FileSearcher, NoopFileSearchProvider,
+    ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
+    SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
@@ -56,18 +40,15 @@ use nuillu_types::{
     MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin,
 };
 use nuillu_visualizer_protocol::{
-    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, LlmInputItemView,
-    LlmObservationEvent, LlmObservationSource, LlmUsageView, MemoView, MemoryMetadataView,
-    MemoryPage, MemoryRecordView, ModulePolicyView, ModuleSettingsView, ModuleStatusView,
+    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
+    MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleSettingsView, ModuleStatusView,
     TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
     VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
     VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
 };
-use regex::RegexBuilder;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::task::LocalSet;
-use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::{
     artifact::CaseArtifact,
@@ -81,7 +62,6 @@ use crate::{
         evaluate_case, field_label, normalize_text_block, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
-    model_set::ReasoningEffort,
     state_dump::{
         AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
         CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
@@ -97,23 +77,7 @@ const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
 const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 256;
 
-#[derive(Debug, Clone)]
-pub struct LlmBackendConfig {
-    pub endpoint: String,
-    pub token: String,
-    pub model: String,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub use_responses_api: bool,
-    pub compaction_input_token_threshold: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmbeddingBackendConfig {
-    pub endpoint: String,
-    pub token: String,
-    pub model: String,
-    pub dimensions: usize,
-}
+pub use nuillu_server::{EmbeddingBackendConfig, LlmBackendConfig};
 
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -162,21 +126,6 @@ pub struct VisualizerHook {
     commands: std::sync::mpsc::Receiver<VisualizerClientMessage>,
     memory_cache: BTreeMap<String, Vec<MemoryRecordView>>,
     shutdown_requested: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct VisualizerEventSink {
-    events: std::sync::mpsc::Sender<VisualizerServerMessage>,
-}
-
-impl VisualizerEventSink {
-    fn new(events: std::sync::mpsc::Sender<VisualizerServerMessage>) -> Self {
-        Self { events }
-    }
-
-    fn send(&self, event: VisualizerEvent) {
-        let _ = self.events.send(VisualizerServerMessage::event(event));
-    }
 }
 
 impl VisualizerHook {
@@ -296,560 +245,11 @@ impl VisualizerHook {
     }
 }
 
-#[derive(Clone)]
-struct VisualizerLlmObserver {
-    inner: Arc<VisualizerLlmObserverInner>,
-}
-
-struct VisualizerLlmObserverInner {
-    case_id: String,
-    events: VisualizerEventSink,
-    next_turn: AtomicU64,
-    extension_turns: Mutex<BTreeMap<usize, String>>,
-}
-
-impl VisualizerLlmObserver {
-    fn new(case_id: String, events: VisualizerEventSink) -> Self {
-        Self {
-            inner: Arc::new(VisualizerLlmObserverInner {
-                case_id,
-                events,
-                next_turn: AtomicU64::new(0),
-                extension_turns: Mutex::new(BTreeMap::new()),
-            }),
-        }
-    }
-
-    fn hook_set(&self) -> LutumHooksSet<'static> {
-        LutumHooksSet::new()
-            .with_on_model_input(self.clone())
-            .with_on_stream_event(self.clone())
-    }
-
-    fn metadata<'a>(&self, extensions: &'a RequestExtensions) -> Option<&'a LlmRequestMetadata> {
-        extensions.get::<LlmRequestMetadata>()
-    }
-
-    fn turn_id_for(&self, extensions: &RequestExtensions) -> String {
-        let key = extension_key(extensions);
-        let mut turns = self
-            .inner
-            .extension_turns
-            .lock()
-            .expect("visualizer llm turn map lock poisoned");
-        turns
-            .entry(key)
-            .or_insert_with(|| {
-                let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
-                format!("{}-llm-{next}", self.inner.case_id)
-            })
-            .clone()
-    }
-
-    fn clear_turn_for(&self, extensions: &RequestExtensions) {
-        let key = extension_key(extensions);
-        self.inner
-            .extension_turns
-            .lock()
-            .expect("visualizer llm turn map lock poisoned")
-            .remove(&key);
-    }
-
-    fn emit(&self, event: LlmObservationEvent) {
-        self.inner.events.send(VisualizerEvent::LlmObserved {
-            tab_id: VisualizerTabId::new(self.inner.case_id.clone()),
-            event,
-        });
-    }
-}
-
-impl OnModelInput for VisualizerLlmObserver {
-    async fn call(&self, cx: &ModelInputHookContext<'_>) {
-        let Some(metadata) = self.metadata(cx.extensions()) else {
-            return;
-        };
-        let turn_id = self.turn_id_for(cx.extensions());
-        self.emit(LlmObservationEvent::ModelInput {
-            turn_id,
-            owner: metadata.owner.to_string(),
-            module: metadata.owner.module.to_string(),
-            replica: metadata.owner.replica.get(),
-            tier: format!("{:?}", metadata.tier),
-            source: observation_source(metadata.source),
-            operation: operation_kind_label(cx.kind()).to_string(),
-            items: model_input_views(cx.input().items()),
-        });
-    }
-}
-
-impl OnStreamEvent for VisualizerLlmObserver {
-    async fn call(&self, cx: &StreamEventHookContext<'_>) {
-        let Some(metadata) = self.metadata(cx.extensions()) else {
-            return;
-        };
-        let turn_id = self.turn_id_for(cx.extensions());
-        emit_stream_observation(self, cx, metadata, turn_id);
-    }
-}
-
-fn extension_key(extensions: &RequestExtensions) -> usize {
-    std::ptr::from_ref(extensions) as usize
-}
-
-fn emit_stream_observation(
-    observer: &VisualizerLlmObserver,
-    cx: &StreamEventHookContext<'_>,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-) {
-    match cx.event() {
-        LutumStreamEvent::TextTurn(event) => {
-            emit_text_turn_stream_event(observer, cx.extensions(), metadata, turn_id, event);
-        }
-        LutumStreamEvent::StructuredTurn(event) => {
-            emit_structured_turn_stream_event(observer, cx.extensions(), metadata, turn_id, event);
-        }
-        LutumStreamEvent::Completion(event) => {
-            emit_completion_stream_event(observer, cx.extensions(), metadata, turn_id, event);
-        }
-        LutumStreamEvent::StructuredCompletion(event) => {
-            emit_structured_completion_stream_event(
-                observer,
-                cx.extensions(),
-                metadata,
-                turn_id,
-                event,
-            );
-        }
-    }
-}
-
-fn emit_started(
-    observer: &VisualizerLlmObserver,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-    operation: OperationKind,
-    request_id: Option<String>,
-    model: String,
-) {
-    observer.emit(LlmObservationEvent::StreamStarted {
-        turn_id,
-        owner: metadata.owner.to_string(),
-        module: metadata.owner.module.to_string(),
-        replica: metadata.owner.replica.get(),
-        tier: format!("{:?}", metadata.tier),
-        source: observation_source(metadata.source),
-        operation: operation_kind_label(operation).to_string(),
-        request_id,
-        model,
-    });
-}
-
-fn emit_delta(observer: &VisualizerLlmObserver, turn_id: String, kind: &str, delta: String) {
-    observer.emit(LlmObservationEvent::StreamDelta {
-        turn_id,
-        kind: kind.to_string(),
-        delta,
-    });
-}
-
-fn emit_completed(
-    observer: &VisualizerLlmObserver,
-    extensions: &RequestExtensions,
-    turn_id: String,
-    request_id: Option<String>,
-    finish_reason: impl std::fmt::Debug,
-    usage: Usage,
-) {
-    observer.emit(LlmObservationEvent::Completed {
-        turn_id,
-        request_id,
-        finish_reason: format!("{finish_reason:?}"),
-        usage: usage_view(usage),
-    });
-    observer.clear_turn_for(extensions);
-}
-
-fn emit_tool_call_chunk(
-    observer: &VisualizerLlmObserver,
-    turn_id: String,
-    id: &lutum::ToolCallId,
-    name: &lutum::ToolName,
-    arguments_json_delta: String,
-) {
-    observer.emit(LlmObservationEvent::ToolCallChunk {
-        turn_id,
-        id: id.as_str().to_string(),
-        name: name.as_str().to_string(),
-        arguments_json_delta,
-    });
-}
-
-fn emit_tool_call_ready(
-    observer: &VisualizerLlmObserver,
-    turn_id: String,
-    metadata: &lutum::ToolMetadata,
-) {
-    observer.emit(LlmObservationEvent::ToolCallReady {
-        turn_id,
-        id: metadata.id.as_str().to_string(),
-        name: metadata.name.as_str().to_string(),
-        arguments_json: metadata.arguments.to_string(),
-    });
-}
-
-fn emit_text_turn_stream_event(
-    observer: &VisualizerLlmObserver,
-    extensions: &RequestExtensions,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-    event: &ErasedTextTurnEvent,
-) {
-    match event {
-        ErasedTextTurnEvent::Started { request_id, model } => emit_started(
-            observer,
-            metadata,
-            turn_id,
-            OperationKind::TextTurn,
-            request_id.clone(),
-            model.clone(),
-        ),
-        ErasedTextTurnEvent::TextDelta { delta } => {
-            emit_delta(observer, turn_id, "text", delta.clone());
-        }
-        ErasedTextTurnEvent::ReasoningDelta { delta } => {
-            emit_delta(observer, turn_id, "reasoning", delta.clone());
-        }
-        ErasedTextTurnEvent::RefusalDelta { delta } => {
-            emit_delta(observer, turn_id, "refusal", delta.clone());
-        }
-        ErasedTextTurnEvent::ToolCallChunk {
-            id,
-            name,
-            arguments_json_delta,
-        } => emit_tool_call_chunk(observer, turn_id, id, name, arguments_json_delta.clone()),
-        ErasedTextTurnEvent::ToolCallReady(tool) => {
-            emit_tool_call_ready(observer, turn_id, tool);
-        }
-        ErasedTextTurnEvent::Completed {
-            request_id,
-            finish_reason,
-            usage,
-            ..
-        } => emit_completed(
-            observer,
-            extensions,
-            turn_id,
-            request_id.clone(),
-            finish_reason,
-            *usage,
-        ),
-    }
-}
-
-fn emit_structured_turn_stream_event(
-    observer: &VisualizerLlmObserver,
-    extensions: &RequestExtensions,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-    event: &ErasedStructuredTurnEvent,
-) {
-    match event {
-        ErasedStructuredTurnEvent::Started { request_id, model } => emit_started(
-            observer,
-            metadata,
-            turn_id,
-            OperationKind::StructuredTurn,
-            request_id.clone(),
-            model.clone(),
-        ),
-        ErasedStructuredTurnEvent::StructuredOutputChunk { json_delta } => {
-            emit_delta(observer, turn_id, "structured", json_delta.clone());
-        }
-        ErasedStructuredTurnEvent::StructuredOutputReady(json) => {
-            observer.emit(LlmObservationEvent::StructuredReady {
-                turn_id,
-                json: json.to_string(),
-            });
-        }
-        ErasedStructuredTurnEvent::ReasoningDelta { delta } => {
-            emit_delta(observer, turn_id, "reasoning", delta.clone());
-        }
-        ErasedStructuredTurnEvent::RefusalDelta { delta } => {
-            emit_delta(observer, turn_id, "refusal", delta.clone());
-        }
-        ErasedStructuredTurnEvent::ToolCallChunk {
-            id,
-            name,
-            arguments_json_delta,
-        } => emit_tool_call_chunk(observer, turn_id, id, name, arguments_json_delta.clone()),
-        ErasedStructuredTurnEvent::ToolCallReady(tool) => {
-            emit_tool_call_ready(observer, turn_id, tool);
-        }
-        ErasedStructuredTurnEvent::Completed {
-            request_id,
-            finish_reason,
-            usage,
-            ..
-        } => emit_completed(
-            observer,
-            extensions,
-            turn_id,
-            request_id.clone(),
-            finish_reason,
-            *usage,
-        ),
-    }
-}
-
-fn emit_completion_stream_event(
-    observer: &VisualizerLlmObserver,
-    extensions: &RequestExtensions,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-    event: &CompletionEvent,
-) {
-    match event {
-        CompletionEvent::Started { request_id, model } => emit_started(
-            observer,
-            metadata,
-            turn_id,
-            OperationKind::Completion,
-            request_id.clone(),
-            model.clone(),
-        ),
-        CompletionEvent::WillRetry {
-            attempt,
-            after,
-            kind,
-            status,
-            ..
-        } => emit_delta(
-            observer,
-            turn_id,
-            "retry",
-            format!(
-                "attempt={attempt} after_ms={} kind={kind:?} status={status:?}",
-                after.as_millis()
-            ),
-        ),
-        CompletionEvent::TextDelta(delta) => {
-            emit_delta(observer, turn_id, "text", delta.clone());
-        }
-        CompletionEvent::Completed {
-            request_id,
-            finish_reason,
-            usage,
-        } => emit_completed(
-            observer,
-            extensions,
-            turn_id,
-            request_id.clone(),
-            finish_reason,
-            *usage,
-        ),
-    }
-}
-
-fn emit_structured_completion_stream_event(
-    observer: &VisualizerLlmObserver,
-    extensions: &RequestExtensions,
-    metadata: &LlmRequestMetadata,
-    turn_id: String,
-    event: &ErasedStructuredCompletionEvent,
-) {
-    match event {
-        ErasedStructuredCompletionEvent::Started { request_id, model } => emit_started(
-            observer,
-            metadata,
-            turn_id,
-            OperationKind::StructuredCompletion,
-            request_id.clone(),
-            model.clone(),
-        ),
-        ErasedStructuredCompletionEvent::StructuredOutputChunk { json_delta } => {
-            emit_delta(observer, turn_id, "structured", json_delta.clone());
-        }
-        ErasedStructuredCompletionEvent::StructuredOutputReady(json) => {
-            observer.emit(LlmObservationEvent::StructuredReady {
-                turn_id,
-                json: json.to_string(),
-            });
-        }
-        ErasedStructuredCompletionEvent::ReasoningDelta { delta } => {
-            emit_delta(observer, turn_id, "reasoning", delta.clone());
-        }
-        ErasedStructuredCompletionEvent::RefusalDelta { delta } => {
-            emit_delta(observer, turn_id, "refusal", delta.clone());
-        }
-        ErasedStructuredCompletionEvent::Completed {
-            request_id,
-            finish_reason,
-            usage,
-        } => emit_completed(
-            observer,
-            extensions,
-            turn_id,
-            request_id.clone(),
-            finish_reason,
-            *usage,
-        ),
-    }
-}
-
-fn model_input_views(items: &[ModelInputItem]) -> Vec<LlmInputItemView> {
-    let mut output = Vec::new();
-    for item in items {
-        match item {
-            ModelInputItem::Message { role, content } => {
-                for content in content.as_slice() {
-                    let MessageContent::Text(text) = content;
-                    output.push(LlmInputItemView {
-                        role: input_role_label(*role).to_string(),
-                        kind: "text".to_string(),
-                        content: text.clone(),
-                        ephemeral: false,
-                        source: None,
-                    });
-                }
-            }
-            ModelInputItem::Assistant(item) => {
-                let (kind, content) = assistant_input_view(item);
-                output.push(LlmInputItemView {
-                    role: "assistant".to_string(),
-                    kind: kind.to_string(),
-                    content: content.to_string(),
-                    ephemeral: false,
-                    source: None,
-                });
-            }
-            ModelInputItem::ToolResult(result) => {
-                output.push(LlmInputItemView {
-                    role: "tool".to_string(),
-                    kind: "tool_result".to_string(),
-                    content: format!(
-                        "arguments:\n{}\nresult:\n{}",
-                        result.arguments, result.result
-                    ),
-                    ephemeral: false,
-                    source: Some(format!("{}({})", result.name, result.id)),
-                });
-            }
-            ModelInputItem::Turn(turn) => {
-                push_turn_view(&mut output, turn.as_ref());
-            }
-        }
-    }
-    output
-}
-
-fn push_turn_view(output: &mut Vec<LlmInputItemView>, turn: &dyn TurnView) {
-    for index in 0..turn.item_count() {
-        let Some(item) = turn.item_at(index) else {
-            continue;
-        };
-        output.push(item_view(turn.role(), turn.ephemeral(), item));
-    }
-}
-
-fn item_view(role: TurnRole, ephemeral: bool, item: &dyn ItemView) -> LlmInputItemView {
-    if let Some(text) = item.as_text() {
-        return input_item(turn_role_label(role), "text", text, ephemeral, None);
-    }
-    if let Some(text) = item.as_reasoning() {
-        return input_item(turn_role_label(role), "reasoning", text, ephemeral, None);
-    }
-    if let Some(text) = item.as_refusal() {
-        return input_item(turn_role_label(role), "refusal", text, ephemeral, None);
-    }
-    if let Some(tool) = item.as_tool_call() {
-        return input_item(
-            turn_role_label(role),
-            "tool_call",
-            tool.arguments.get(),
-            ephemeral,
-            Some(format!("{}({})", tool.name, tool.id)),
-        );
-    }
-    if let Some(tool) = item.as_tool_result() {
-        return input_item(
-            "tool",
-            "tool_result",
-            &format!("arguments:\n{}\nresult:\n{}", tool.arguments, tool.result),
-            ephemeral,
-            Some(format!("{}({})", tool.name, tool.id)),
-        );
-    }
-    input_item(turn_role_label(role), "unknown", "", ephemeral, None)
-}
-
-fn input_item(
-    role: &str,
-    kind: &str,
-    content: &str,
-    ephemeral: bool,
-    source: Option<String>,
-) -> LlmInputItemView {
-    LlmInputItemView {
-        role: role.to_string(),
-        kind: kind.to_string(),
-        content: content.to_string(),
-        ephemeral,
-        source,
-    }
-}
-
-fn assistant_input_view(item: &AssistantInputItem) -> (&'static str, &str) {
-    match item {
-        AssistantInputItem::Text(text) => ("text", text.as_str()),
-        AssistantInputItem::Reasoning(text) => ("reasoning", text.as_str()),
-        AssistantInputItem::Refusal(text) => ("refusal", text.as_str()),
-    }
-}
-
-fn input_role_label(role: InputMessageRole) -> &'static str {
-    match role {
-        InputMessageRole::System => "system",
-        InputMessageRole::Developer => "developer",
-        InputMessageRole::User => "user",
-    }
-}
-
-fn turn_role_label(role: TurnRole) -> &'static str {
-    match role {
-        TurnRole::System => "system",
-        TurnRole::Developer => "developer",
-        TurnRole::User => "user",
-        TurnRole::Assistant => "assistant",
-    }
-}
-
-fn observation_source(source: LlmRequestSource) -> LlmObservationSource {
-    match source {
-        LlmRequestSource::ModuleTurn => LlmObservationSource::ModuleTurn,
-        LlmRequestSource::SessionCompaction => LlmObservationSource::SessionCompaction,
-    }
-}
-
-fn operation_kind_label(kind: OperationKind) -> &'static str {
-    match kind {
-        OperationKind::TextTurn => "text_turn",
-        OperationKind::StructuredTurn => "structured_turn",
-        OperationKind::StructuredCompletion => "structured_completion",
-        OperationKind::Completion => "completion",
-    }
-}
-
-fn usage_view(usage: Usage) -> LlmUsageView {
-    LlmUsageView {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        cost_micros_usd: usage.cost_micros_usd,
-        cache_creation_tokens: usage.cache_creation_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-    }
-}
+use nuillu_server::{
+    VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder, build_lutum,
+    build_tiers, duration_millis_u64, memory_rank_name, memory_record_view, model_tier_name,
+    module_policy_views,
+};
 
 #[derive(Debug, Clone)]
 pub struct CaseRunOutput {
@@ -929,7 +329,7 @@ pub async fn run_suite_with_hooks(
     config: &RunnerConfig,
     hooks: &mut RunnerHooks,
 ) -> Result<SuiteReport, RunnerError> {
-    install_lutum_trace_subscriber()?;
+    install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
     let mut case_paths =
         discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
@@ -967,18 +367,11 @@ pub async fn run_suite_with_hooks(
         ),
     )?;
 
-    let judge_llm = build_lutum(
-        &config.judge_backend.endpoint,
-        &config.judge_backend.token,
-        &config.judge_backend.model,
-        config.judge_backend.reasoning_effort,
-        config.judge_backend.use_responses_api,
-        None,
-    )
-    .map_err(|error| RunnerError::Driver {
-        path: config.cases_root.clone(),
-        message: error.to_string(),
-    })?;
+    let judge_llm =
+        build_lutum(&config.judge_backend, None).map_err(|error| RunnerError::Driver {
+            path: config.cases_root.clone(),
+            message: error.to_string(),
+        })?;
     let judge = LlmRubricJudge::new(judge_llm);
 
     let mut cases = Vec::new();
@@ -1071,7 +464,7 @@ pub async fn run_case_detailed(
     config: &RunnerConfig,
     judge: Option<&dyn RubricJudge>,
 ) -> Result<CaseRunOutput, RunnerError> {
-    install_lutum_trace_subscriber()?;
+    install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
     let run_dir = config.output_root.join(&config.run_id);
     std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
@@ -1452,7 +845,6 @@ async fn execute_full_agent_case(
         allocation,
         case.limits.max_llm_calls,
         action_module_ids(&case_modules),
-        Arc::new(NoopFileSearchProvider),
         case_now,
         case_id,
         reporter,
@@ -1505,7 +897,6 @@ async fn execute_full_agent_case(
         &case_modules,
         &env.memory_caps,
         &env.policy_caps,
-        &env.file_search,
         &env.utterance_sink,
         if gui_deferred_start {
             ReplicaHardCap::V1Max
@@ -1730,7 +1121,6 @@ async fn execute_module_case(
         module_allocation(target, &case.limits, &case_modules),
         case.limits.max_llm_calls,
         action_module_ids(&case_modules),
-        module_file_search_provider(target, case),
         case_now,
         case_id,
         reporter,
@@ -1770,7 +1160,6 @@ async fn execute_module_case(
         &case_modules,
         &env.memory_caps,
         &env.policy_caps,
-        &env.file_search,
         &env.utterance_sink,
         if gui_deferred_start {
             ReplicaHardCap::V1Max
@@ -1921,7 +1310,7 @@ async fn activate_module_case_target(
     has_cognition_log_seed: bool,
 ) {
     match target {
-        ModuleEvalTarget::QueryVector | ModuleEvalTarget::QueryAgentic => {
+        ModuleEvalTarget::QueryVector => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
             config.guidance = prompt.to_string();
@@ -2674,15 +2063,6 @@ fn memory_page_from_records(
     }
 }
 
-fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
-    MemoryRecordView {
-        index: record.index.as_str().to_owned(),
-        rank: memory_rank_name(record.rank).to_owned(),
-        occurred_at: record.occurred_at,
-        content: record.content.as_str().to_owned(),
-    }
-}
-
 pub(crate) struct EvalEnvironment {
     pub(crate) blackboard: Blackboard,
     pub(crate) caps: CapabilityProviders,
@@ -2693,7 +2073,6 @@ pub(crate) struct EvalEnvironment {
     pub(crate) actions: Arc<ActionActivityTracker>,
     pub(crate) events: Arc<RecordingRuntimeEventSink>,
     pub(crate) clock: Arc<dyn Clock>,
-    pub(crate) file_search: Arc<dyn FileSearchProvider>,
     pub(crate) utterance_sink: Arc<dyn UtteranceSink>,
 }
 
@@ -2735,7 +2114,6 @@ pub(crate) async fn build_eval_environment(
     allocation: ResourceAllocation,
     max_llm_calls: Option<u64>,
     action_modules: Vec<ModuleId>,
-    file_search: Arc<dyn FileSearchProvider>,
     case_now: Option<DateTime<FixedOffset>>,
     case_id: &str,
     reporter: &LiveReporter,
@@ -2765,7 +2143,16 @@ pub(crate) async fn build_eval_environment(
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
-    let tiers = build_tiers(config, llm_observer)?;
+    let tiers = build_tiers(
+        &config.cheap_backend,
+        &config.default_backend,
+        &config.premium_backend,
+        llm_observer,
+    )
+    .map_err(|error| RunnerError::Driver {
+        path: output_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls,
@@ -2815,7 +2202,6 @@ pub(crate) async fn build_eval_environment(
         actions,
         events,
         clock,
-        file_search,
         utterance_sink,
     })
 }
@@ -2837,38 +2223,12 @@ pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
         .collect()
 }
 
-fn build_embedder(config: &RunnerConfig) -> Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
-    if let Some(embedding) = &config.embedding_backend {
-        let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
-            base_url: embedding.endpoint.clone(),
-            api_key: embedding.token.clone(),
-            model: embedding.model.clone(),
-            target_dimensions: embedding.dimensions,
-            request_timeout: None,
-        })
-        .with_context(|| {
-            format!(
-                "build openai embedder for model {} at {}",
-                embedding.model, embedding.endpoint
-            )
-        })?;
-        let profile =
-            EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
-        Ok((Box::new(embedder), profile, embedding.dimensions))
-    } else {
-        let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-            .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
-        let dimensions = embedder.dimensions();
-        let profile = EmbeddingProfile::new("potion-base-8M", "local", dimensions);
-        Ok((Box::new(embedder), profile, dimensions))
-    }
-}
-
 async fn connect_memory_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlMemoryStore> {
-    let (embedder, profile, dimensions) = build_embedder(config)?;
+    let (embedder, profile, dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
     let db_path = output_dir.join("memory.db");
     LibsqlMemoryStore::connect(
         LibsqlMemoryStoreConfig::local(db_path, dimensions).with_active_profile(profile),
@@ -2882,7 +2242,8 @@ async fn connect_policy_store(
     output_dir: &Path,
     config: &RunnerConfig,
 ) -> Result<LibsqlPolicyStore> {
-    let (embedder, profile, dimensions) = build_embedder(config)?;
+    let (embedder, profile, dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
     let db_path = output_dir.join("policy.db");
     LibsqlPolicyStore::connect(
         LibsqlPolicyStoreConfig::local(db_path, dimensions).with_active_profile(profile),
@@ -2890,98 +2251,6 @@ async fn connect_policy_store(
     )
     .await
     .context("connect libsql policy store")
-}
-
-fn module_file_search_provider(
-    target: ModuleEvalTarget,
-    case: &ModuleCase,
-) -> Arc<dyn FileSearchProvider> {
-    if target == ModuleEvalTarget::QueryAgentic && !case.files.is_empty() {
-        Arc::new(SeededFileSearchProvider::new(case.files.clone()))
-    } else {
-        Arc::new(NoopFileSearchProvider)
-    }
-}
-
-#[derive(Debug)]
-struct SeededFileSearchProvider {
-    files: Vec<SeededFile>,
-}
-
-#[derive(Debug)]
-struct SeededFile {
-    path: String,
-    lines: Vec<String>,
-}
-
-impl SeededFileSearchProvider {
-    fn new(files: Vec<crate::cases::FileSeed>) -> Self {
-        Self {
-            files: files
-                .into_iter()
-                .map(|file| SeededFile {
-                    path: file.path,
-                    lines: file.content.content.lines().map(str::to_owned).collect(),
-                })
-                .collect(),
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl FileSearchProvider for SeededFileSearchProvider {
-    async fn search(&self, query: &FileSearchQuery) -> Result<Vec<FileSearchHit>, PortError> {
-        if query.pattern.is_empty() || query.max_matches == 0 {
-            return Ok(Vec::new());
-        }
-
-        let regex = if query.regex {
-            Some(
-                RegexBuilder::new(&query.pattern)
-                    .case_insensitive(!query.case_sensitive)
-                    .build()
-                    .map_err(|error| PortError::InvalidInput(error.to_string()))?,
-            )
-        } else {
-            None
-        };
-        let literal = if query.case_sensitive {
-            query.pattern.clone()
-        } else {
-            query.pattern.to_lowercase()
-        };
-
-        let mut hits = Vec::new();
-        for file in &self.files {
-            for (line_index, line) in file.lines.iter().enumerate() {
-                let line_matches = match &regex {
-                    Some(regex) => regex.is_match(line),
-                    None if query.case_sensitive => line.contains(&literal),
-                    None => line.to_lowercase().contains(&literal),
-                };
-                let line_matches = if query.invert_match {
-                    !line_matches
-                } else {
-                    line_matches
-                };
-                if !line_matches {
-                    continue;
-                }
-
-                let start = line_index.saturating_sub(query.context);
-                let end = (line_index + query.context + 1).min(file.lines.len());
-                hits.push(FileSearchHit {
-                    path: file.path.clone(),
-                    line: line_index + 1,
-                    snippet: file.lines[start..end].join("\n"),
-                });
-                if hits.len() >= query.max_matches {
-                    return Ok(hits);
-                }
-            }
-        }
-        Ok(hits)
-    }
 }
 
 async fn seed_memories(
@@ -3064,86 +2333,6 @@ async fn seed_cognition_log(
     }
 }
 
-fn build_tiers(
-    config: &RunnerConfig,
-    llm_observer: Option<VisualizerLlmObserver>,
-) -> Result<LutumTiers> {
-    let cheap = build_lutum(
-        &config.cheap_backend.endpoint,
-        &config.cheap_backend.token,
-        &config.cheap_backend.model,
-        config.cheap_backend.reasoning_effort,
-        config.cheap_backend.use_responses_api,
-        llm_observer.clone(),
-    )?;
-    let default = build_lutum(
-        &config.default_backend.endpoint,
-        &config.default_backend.token,
-        &config.default_backend.model,
-        config.default_backend.reasoning_effort,
-        config.default_backend.use_responses_api,
-        llm_observer.clone(),
-    )?;
-    let premium = build_lutum(
-        &config.premium_backend.endpoint,
-        &config.premium_backend.token,
-        &config.premium_backend.model,
-        config.premium_backend.reasoning_effort,
-        config.premium_backend.use_responses_api,
-        llm_observer,
-    )?;
-    Ok(LutumTiers {
-        cheap,
-        default,
-        premium,
-    })
-}
-
-fn build_lutum(
-    endpoint: &str,
-    token: &str,
-    model: &str,
-    reasoning_effort: Option<ReasoningEffort>,
-    use_responses_api: bool,
-    llm_observer: Option<VisualizerLlmObserver>,
-) -> Result<Lutum> {
-    let adapter = OpenAiAdapter::new(token.to_owned())
-        .with_base_url(endpoint.to_owned())
-        .with_default_model(ModelName::new(model)?)
-        .with_resolve_reasoning_effort(ConfiguredReasoningEffort);
-    let adapter = if use_responses_api {
-        adapter
-    } else {
-        adapter.with_chat_completions()
-    };
-    let mut lutum = Lutum::new(
-        Arc::new(adapter),
-        SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
-    )
-    .with_extension(RawTelemetryConfig::all());
-    if let Some(observer) = llm_observer {
-        lutum.extend_hooks(observer.hook_set());
-    }
-    Ok(match reasoning_effort {
-        Some(reasoning_effort) => {
-            lutum.with_extension(ReasoningEffortConfig(reasoning_effort.into()))
-        }
-        None => lutum,
-    })
-}
-
-#[derive(Clone, Copy)]
-struct ReasoningEffortConfig(OpenAiReasoningEffort);
-
-#[lutum::impl_hook(lutum_openai::ResolveReasoningEffort)]
-async fn configured_reasoning_effort(
-    extensions: &RequestExtensions,
-) -> Option<OpenAiReasoningEffort> {
-    extensions
-        .get::<ReasoningEffortConfig>()
-        .map(|value| value.0)
-}
-
 fn full_agent_case_modules(case: &FullAgentCase, disabled: &[EvalModule]) -> Vec<EvalModule> {
     let mut modules = case
         .modules
@@ -3176,7 +2365,6 @@ pub(crate) fn eval_registry(
     modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
     replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
@@ -3188,7 +2376,6 @@ pub(crate) fn eval_registry(
             modules,
             memory_caps,
             policy_caps,
-            file_search,
             utterance_sink,
             replica_hard_cap,
         );
@@ -3245,7 +2432,6 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_vector()),
         (builtin::cognition_gate(), builtin::query_policy()),
-        (builtin::cognition_gate(), builtin::query_agentic()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
         (builtin::value_estimator(), builtin::query_policy()),
@@ -3319,7 +2505,6 @@ fn register_eval_module(
     all_modules: &[EvalModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
     replica_hard_cap: ReplicaHardCap,
 ) -> ModuleRegistry {
@@ -3457,26 +2642,6 @@ fn register_eval_module(
                             caps.blackboard_reader(),
                             policy_caps.searcher(),
                             caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
-                            caps.llm_access(),
-                        )
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // File search is heavier and not on the speak critical path.
-        EvalModule::QueryAgentic => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
-                replica_hard_cap,
-                {
-                    let file_search = file_search.clone();
-                    move |caps| {
-                        nuillu_query_agentic::QueryAgenticModule::new(
-                            caps.allocation_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            FileSearcher::new(file_search.clone()),
-                            caps.memo(),
                             caps.llm_access(),
                         )
                     }
@@ -3777,13 +2942,6 @@ pub(crate) fn full_agent_allocation(
                 ModelTier::Cheap,
                 "Idle until policy retrieval is needed.",
             ),
-            EvalModule::QueryAgentic => set_allocation_module(
-                &mut allocation,
-                module.module_id(),
-                0.0,
-                ModelTier::Premium,
-                "Idle until file lookup is needed.",
-            ),
             EvalModule::Memory => set_allocation_module(
                 &mut allocation,
                 module.module_id(),
@@ -3960,7 +3118,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::HomeostaticController
         | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
-        EvalModule::QueryAgentic | EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
+        EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
         EvalModule::AttentionController => ModelTier::Default,
         EvalModule::AttentionSchema
         | EvalModule::SelfModel
@@ -4168,35 +3326,6 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             })
             .collect(),
         memory_metadata,
-    }
-}
-
-fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
-    let mut policies = bb
-        .module_policies()
-        .iter()
-        .map(|(module, policy)| ModulePolicyView {
-            module: module.as_str().to_owned(),
-            replica_min: policy.replicas_range.min,
-            replica_max: policy.replicas_range.max,
-            replica_capacity: bb
-                .module_replica_capacity(module)
-                .unwrap_or_else(|| policy.max_active_replicas()),
-            bpm_min: policy.rate_limit_range.start().as_f64(),
-            bpm_max: policy.rate_limit_range.end().as_f64(),
-            zero_replica_window: zero_replica_window_view(policy.zero_replica_window),
-        })
-        .collect::<Vec<_>>();
-    policies.sort_by(|left, right| left.module.cmp(&right.module));
-    policies
-}
-
-fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaWindowView {
-    match policy {
-        ZeroReplicaWindowPolicy::Disabled => ZeroReplicaWindowView::Disabled,
-        ZeroReplicaWindowPolicy::EveryControllerActivations(period) => {
-            ZeroReplicaWindowView::EveryControllerActivations { period }
-        }
     }
 }
 
@@ -4499,24 +3628,6 @@ fn module_instance_dump(owner: &ModuleInstanceId) -> ModuleInstanceDump {
     }
 }
 
-fn memory_rank_name(rank: MemoryRank) -> &'static str {
-    match rank {
-        MemoryRank::ShortTerm => "short-term",
-        MemoryRank::MidTerm => "mid-term",
-        MemoryRank::LongTerm => "long-term",
-        MemoryRank::Permanent => "permanent",
-        MemoryRank::Identity => "identity",
-    }
-}
-
-fn model_tier_name(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Cheap => "cheap",
-        ModelTier::Default => "default",
-        ModelTier::Premium => "premium",
-    }
-}
-
 struct AllocationChangeReporter {
     case_id: String,
     reporter: LiveReporter,
@@ -4603,15 +3714,6 @@ fn active_modules_live_summary(active_modules: &[ActiveModuleObservation]) -> St
 
 fn ticks_for_interval(interval: Duration, tick_ms: u64) -> u64 {
     (duration_millis_u64(interval) / tick_ms.max(1)).max(1)
-}
-
-fn duration_millis_u64(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
-    let seconds = cooldown.as_secs_f64();
-    (seconds.is_finite() && seconds > 0.0).then_some(60.0 / seconds)
 }
 
 #[derive(Clone)]
@@ -5119,18 +4221,12 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), RunnerErro
     })
 }
 
-pub fn install_lutum_trace_subscriber() -> Result<(), RunnerError> {
-    static INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
-    let result = INSTALL_RESULT.get_or_init(|| {
-        let subscriber = tracing_subscriber::registry().with(lutum_trace::layer());
-        tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
-    });
-    result
-        .as_ref()
-        .map(|_| ())
-        .map_err(|message| RunnerError::TraceSubscriber {
-            message: message.clone(),
-        })
+pub use nuillu_server::{default_run_id, install_lutum_trace_subscriber};
+
+fn install_trace_subscriber_for_runner() -> Result<(), RunnerError> {
+    install_lutum_trace_subscriber().map_err(|error| RunnerError::TraceSubscriber {
+        message: error.to_string(),
+    })
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -5141,10 +4237,6 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     } else {
         "non-string panic payload".to_string()
     }
-}
-
-pub fn default_run_id() -> String {
-    Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 #[cfg(test)]
@@ -5158,8 +4250,8 @@ mod tests {
     };
     use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
     use nuillu_memory::NoopMemoryStore;
-    use nuillu_module::MemoUpdated;
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::{LutumTiers, MemoUpdated};
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
@@ -5210,75 +4302,6 @@ mod tests {
         };
         assert_eq!(tab_id.as_str(), "case-1");
         assert_eq!(title, "case-1");
-    }
-
-    #[tokio::test]
-    async fn visualizer_llm_observer_emits_hook_events() {
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
-        let observer =
-            VisualizerLlmObserver::new("case-1".to_string(), VisualizerEventSink::new(event_tx));
-        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
-        let mut extensions = RequestExtensions::new();
-        extensions.insert(LlmRequestMetadata {
-            owner: owner.clone(),
-            tier: ModelTier::Default,
-            source: LlmRequestSource::ModuleTurn,
-        });
-        let input = lutum::ModelInput::new().user("hello");
-        let input_cx = ModelInputHookContext::new(&extensions, OperationKind::TextTurn, &input);
-
-        OnModelInput::call(&observer, &input_cx).await;
-
-        let event = match event_rx.recv().expect("model input event") {
-            VisualizerServerMessage::Event { event } => event,
-            _ => panic!("expected visualizer event"),
-        };
-        let VisualizerEvent::LlmObserved {
-            event:
-                LlmObservationEvent::ModelInput {
-                    turn_id,
-                    owner: observed_owner,
-                    items,
-                    ..
-                },
-            ..
-        } = event
-        else {
-            panic!("expected model input observation");
-        };
-        assert_eq!(observed_owner, owner.to_string());
-        assert_eq!(items[0].content, "hello");
-
-        let stream_event = ErasedTextTurnEvent::TextDelta {
-            delta: "world".to_string(),
-        };
-        let stream_cx = StreamEventHookContext::new(
-            &extensions,
-            OperationKind::TextTurn,
-            LutumStreamEvent::TextTurn(&stream_event),
-        );
-
-        OnStreamEvent::call(&observer, &stream_cx).await;
-
-        let event = match event_rx.recv().expect("stream event") {
-            VisualizerServerMessage::Event { event } => event,
-            _ => panic!("expected visualizer event"),
-        };
-        let VisualizerEvent::LlmObserved {
-            event:
-                LlmObservationEvent::StreamDelta {
-                    turn_id: delta_turn_id,
-                    kind,
-                    delta,
-                },
-            ..
-        } = event
-        else {
-            panic!("expected stream delta observation");
-        };
-        assert_eq!(delta_turn_id, turn_id);
-        assert_eq!(kind, "text");
-        assert_eq!(delta, "world");
     }
 
     #[test]
@@ -6120,13 +5143,11 @@ prompt = "What am I attending to?"
             Arc::new(nuillu_reward::NoopPolicyStore),
             Vec::new(),
         );
-        let file_search: Arc<dyn FileSearchProvider> = Arc::new(NoopFileSearchProvider);
         let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
         let allocated = eval_registry(
             &selected,
             &memory_caps,
             &policy_caps,
-            &file_search,
             &utterance_sink,
             ReplicaHardCap::PolicyMax,
         )
@@ -6238,7 +5259,6 @@ prompt = "What am I attending to?"
         ] {
             assert_eq!(allocation.activation_for(&module), ActivationRatio::ZERO);
         }
-        assert!(allocation.get(&builtin::query_agentic()).is_none());
     }
 
     #[tokio::test]
@@ -6265,13 +5285,11 @@ prompt = "What am I attending to?"
             Arc::new(nuillu_reward::NoopPolicyStore),
             Vec::new(),
         );
-        let file_search: Arc<dyn FileSearchProvider> = Arc::new(NoopFileSearchProvider);
         let utterance_sink: Arc<dyn UtteranceSink> = Arc::new(nuillu_speak::NoopUtteranceSink);
         let _allocated = eval_registry(
             &selected,
             &memory_caps,
             &policy_caps,
-            &file_search,
             &utterance_sink,
             ReplicaHardCap::PolicyMax,
         )

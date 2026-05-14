@@ -1,31 +1,18 @@
-mod commands;
-mod config;
-mod environment;
-mod gui;
-mod llm_observer;
-mod model_set;
-mod registry;
-mod runtime;
-mod snapshot;
-mod state;
-
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
-use config::{
-    EmbeddingBackendConfig, LlmBackendConfig, ServerConfig, ServerModule, default_run_id,
-    install_lutum_trace_subscriber,
-};
-use model_set::{EmbeddingRole, ModelSet, ModelSetRole, ReasoningEffort, parse_model_set_file};
 use nuillu_module::DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD;
-use runtime::run_server_with_visualizer;
+use nuillu_server::{
+    EmbeddingBackendConfig, EmbeddingRole, LlmBackendConfig, ModelSet, ModelSetRole,
+    ReasoningEffort, RuntimeModule, ServerConfig, default_run_id, install_lutum_trace_subscriber,
+    parse_model_set_file, run_server_with_visualizer,
+};
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
 const DEFAULT_OPENAI_COMPAT_TOKEN: &str = "local";
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
-pub(crate) const SERVER_TAB_ID: &str = "server";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -79,7 +66,7 @@ struct Args {
 
     /// Modules to force-disable at startup.
     #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
-    disable_module: Vec<ServerModule>,
+    disable_module: Vec<RuntimeModule>,
 
     /// Participants currently available to the speak module as targets.
     #[arg(long = "participant", value_name = "NAME")]

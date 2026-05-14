@@ -44,10 +44,10 @@ Return wants_to_speak and wait_for_evidence as separate decisions:
 Use a strict readiness gate before setting wants_to_speak=true and wait_for_evidence=false:
 - The cognition log must contain the facts needed for the utterance, not only raw sensory
   observations, open questions, predictions, or instructions for another module.
-- query-vector/query-agentic retrieve evidence into memo logs; self-model writes self evidence
+- query-vector retrieves evidence into memo logs; self-model writes self evidence
   into memo logs; cognition-gate promotes relevant memo-log facts into the cognition log.
   speak-gate and speak will guess if needed query results have not reached cognition.
-- If the current topic asks for stored memory, a self/peer/world model, file evidence, or a rule,
+- If the current topic asks for stored memory, a self/peer/world model, or a rule,
   do not let speak use memo-only facts directly. If a memo contains the needed fact but the
   cognition log does not, request cognition-promotion.
 - For ordinary peer-directed replies, do not require self-model role clarity. Require self-model
@@ -121,7 +121,6 @@ pub struct EvidenceGap {
 #[serde(rename_all = "kebab-case")]
 pub enum EvidenceGapSource {
     Memory,
-    File,
     SelfModel,
     CognitionPromotion,
 }
@@ -130,7 +129,6 @@ impl EvidenceGapSource {
     fn as_request_source_text(self) -> &'static str {
         match self {
             EvidenceGapSource::Memory => "memory",
-            EvidenceGapSource::File => "file",
             EvidenceGapSource::SelfModel => "self-model",
             EvidenceGapSource::CognitionPromotion => "cognition promotion",
         }
@@ -727,7 +725,6 @@ impl EvidenceGapSource {
     fn as_memo_text(self) -> &'static str {
         match self {
             EvidenceGapSource::Memory => "memory",
-            EvidenceGapSource::File => "file",
             EvidenceGapSource::SelfModel => "self-model",
             EvidenceGapSource::CognitionPromotion => "cognition promotion",
         }

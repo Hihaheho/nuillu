@@ -16,7 +16,7 @@ pub struct ServerConfig {
     pub model_dir: PathBuf,
     pub embedding_backend: Option<EmbeddingBackendConfig>,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
-    pub disabled_modules: Vec<ServerModule>,
+    pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
 }
 
@@ -39,7 +39,7 @@ pub struct EmbeddingBackendConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum)]
-pub enum ServerModule {
+pub enum RuntimeModule {
     Sensory,
     CognitionGate,
     AttentionController,
@@ -61,29 +61,29 @@ pub enum ServerModule {
     Speak,
 }
 
-pub const DEFAULT_MODULES: &[ServerModule] = &[
-    ServerModule::Sensory,
-    ServerModule::CognitionGate,
-    ServerModule::AttentionController,
-    ServerModule::AttentionSchema,
-    ServerModule::SelfModel,
-    ServerModule::QueryVector,
-    ServerModule::QueryPolicy,
-    ServerModule::Memory,
-    ServerModule::MemoryCompaction,
-    ServerModule::MemoryRecombination,
-    ServerModule::Vital,
-    ServerModule::HomeostaticController,
-    ServerModule::ValueEstimator,
-    ServerModule::Reward,
-    ServerModule::Policy,
-    ServerModule::Predict,
-    ServerModule::Surprise,
-    ServerModule::SpeakGate,
-    ServerModule::Speak,
+pub const DEFAULT_MODULES: &[RuntimeModule] = &[
+    RuntimeModule::Sensory,
+    RuntimeModule::CognitionGate,
+    RuntimeModule::AttentionController,
+    RuntimeModule::AttentionSchema,
+    RuntimeModule::SelfModel,
+    RuntimeModule::QueryVector,
+    RuntimeModule::QueryPolicy,
+    RuntimeModule::Memory,
+    RuntimeModule::MemoryCompaction,
+    RuntimeModule::MemoryRecombination,
+    RuntimeModule::Vital,
+    RuntimeModule::HomeostaticController,
+    RuntimeModule::ValueEstimator,
+    RuntimeModule::Reward,
+    RuntimeModule::Policy,
+    RuntimeModule::Predict,
+    RuntimeModule::Surprise,
+    RuntimeModule::SpeakGate,
+    RuntimeModule::Speak,
 ];
 
-impl ServerModule {
+impl RuntimeModule {
     pub fn module_id(self) -> ModuleId {
         match self {
             Self::Sensory => builtin::sensory(),

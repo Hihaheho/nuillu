@@ -3352,16 +3352,15 @@ dependencies = [
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
  "nuillu-predict",
- "nuillu-query-agentic",
  "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",
+ "nuillu-server",
  "nuillu-speak",
  "nuillu-surprise",
  "nuillu-types",
  "nuillu-visualizer-protocol",
  "nuillu-vital",
- "regex",
  "schemars",
  "serde",
  "serde_json",
@@ -3452,22 +3451,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-query-agentic"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lutum",
- "lutum-protocol",
- "nuillu-module",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "nuillu-reward"
 version = "0.1.0"
 dependencies = [
@@ -3546,7 +3529,6 @@ dependencies = [
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
  "nuillu-predict",
- "nuillu-query-agentic",
  "nuillu-reward",
  "nuillu-self-model",
  "nuillu-sensory",

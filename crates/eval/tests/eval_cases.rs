@@ -344,7 +344,7 @@ fn render_judge_input_includes_only_selected_sections() {
         "agent",
         serde_json::json!({
             "memo_logs": {
-                "query-agentic": [{
+                "query-vector": [{
                     "replica": 0,
                     "index": 0,
                     "written_at": "2026-05-08T00:00:00Z",
@@ -374,5 +374,5 @@ fn render_judge_input_includes_only_selected_sections() {
     assert!(rendered.contains("\"mem-1\""));
     assert!(!rendered.contains("Artifact observations JSON:"));
     assert!(!rendered.contains("Trace summary:"));
-    assert!(!rendered.contains("\"query-agentic\""));
+    assert!(!rendered.contains("\"memo_logs\""));
 }

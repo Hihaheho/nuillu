@@ -73,7 +73,6 @@ nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
 nuillu-attention-controller = { path = "crates/modules/attention-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
-nuillu-query-agentic = { path = "crates/modules/query-agentic" }
 nuillu-memory = { path = "crates/modules/memory" }
 nuillu-vital = { path = "crates/modules/vital" }
 nuillu-homeostatic-controller = { path = "crates/modules/homeostatic-controller" }
@@ -83,3 +82,4 @@ nuillu-surprise = { path = "crates/modules/surprise" }
 nuillu-sensory = { path = "crates/modules/sensory" }
 nuillu-speak = { path = "crates/modules/speak" }
 nuillu-visualizer-protocol = { path = "crates/visualizer-protocol" }
+nuillu-server = { path = "crates/server" }

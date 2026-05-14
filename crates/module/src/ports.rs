@@ -9,8 +9,7 @@
 //!
 //! Domain-specific ports live in their owning crates:
 //! `MemoryStore` (and the memory capabilities) in `nuillu-memory`,
-//! `PolicyStore` (and policy capabilities) in `nuillu-reward`,
-//! `FileSearchProvider` in `nuillu-query-agentic`, and
+//! `PolicyStore` (and policy capabilities) in `nuillu-reward`, and
 //! `UtteranceSink` in `nuillu-speak`.
 //!
 //! [`CapabilityProviders`]: crate::CapabilityProviders

@@ -5,18 +5,16 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::MemoryCapabilities;
 use nuillu_module::ModuleRegistry;
-use nuillu_query_agentic::FileSearchProvider;
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
 
-use super::config::ServerModule;
+use super::config::RuntimeModule;
 
 pub(super) fn server_registry(
-    modules: &[ServerModule],
+    modules: &[RuntimeModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
@@ -27,7 +25,6 @@ pub(super) fn server_registry(
             modules,
             memory_caps,
             policy_caps,
-            file_search,
             utterance_sink,
         );
     }
@@ -50,11 +47,11 @@ impl ServerRegistryExt for ModuleRegistry {
     }
 }
 
-fn declare_dependencies(registry: ModuleRegistry, modules: &[ServerModule]) -> ModuleRegistry {
+fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> ModuleRegistry {
     let present = modules
         .iter()
         .copied()
-        .map(ServerModule::module_id)
+        .map(RuntimeModule::module_id)
         .collect::<std::collections::HashSet<_>>();
     let edges = [
         (builtin::speak_gate(), builtin::cognition_gate()),
@@ -85,15 +82,14 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[ServerModule]) -> M
 
 fn register_server_module(
     registry: ModuleRegistry,
-    module: ServerModule,
-    all_modules: &[ServerModule],
+    module: RuntimeModule,
+    all_modules: &[RuntimeModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
-    _file_search: &Arc<dyn FileSearchProvider>,
     utterance_sink: &Arc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
     match module {
-        ServerModule::Sensory => {
+        RuntimeModule::Sensory => {
             registry.register_server(policy(1..=1, Bpm::range(3.0, 8.0)), |caps| {
                 nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
@@ -104,7 +100,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::CognitionGate => {
+        RuntimeModule::CognitionGate => {
             registry.register_server(policy(1..=1, Bpm::range(6.0, 12.0)), |caps| {
                 nuillu_cognition_gate::CognitionGateModule::new(
                     caps.memo_updated_inbox(),
@@ -117,7 +113,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::AttentionController => {
+        RuntimeModule::AttentionController => {
             let voluntary = voluntary_modules(all_modules);
             registry.register_server(policy(1..=1, Bpm::range(6.0, 6.0)), move |caps| {
                 nuillu_attention_controller::AttentionControllerModule::new(
@@ -132,7 +128,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::AttentionSchema => {
+        RuntimeModule::AttentionSchema => {
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.memo_updated_inbox(),
@@ -146,7 +142,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::SelfModel => {
+        RuntimeModule::SelfModel => {
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_self_model::SelfModelModule::new(
                     caps.allocation_updated_inbox(),
@@ -158,7 +154,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::QueryVector => {
+        RuntimeModule::QueryVector => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
                 nuillu_memory::QueryVectorModule::new(
@@ -172,7 +168,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::QueryPolicy => {
+        RuntimeModule::QueryPolicy => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
                 nuillu_reward::QueryPolicyModule::new(
@@ -186,7 +182,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Memory => {
+        RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
                 nuillu_memory::MemoryModule::new(
@@ -199,7 +195,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::MemoryCompaction => {
+        RuntimeModule::MemoryCompaction => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_memory::MemoryCompactionModule::new(
@@ -211,7 +207,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::MemoryRecombination => {
+        RuntimeModule::MemoryRecombination => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_memory::MemoryRecombinationModule::new(
@@ -224,7 +220,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Vital => {
+        RuntimeModule::Vital => {
             registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), |caps| {
                 nuillu_vital::VitalModule::new(
                     caps.cognition_log_updated_inbox(),
@@ -234,7 +230,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::HomeostaticController => {
+        RuntimeModule::HomeostaticController => {
             registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| {
                 nuillu_homeostatic_controller::HomeostaticControllerModule::new(
                     caps.vital_updated_inbox(),
@@ -246,7 +242,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Policy => {
+        RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_reward::PolicyModule::new(
@@ -259,7 +255,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::ValueEstimator => {
+        RuntimeModule::ValueEstimator => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_reward::ValueEstimatorModule::new(
@@ -275,7 +271,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Reward => {
+        RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(1.0, 2.0)), move |caps| {
                 nuillu_reward::RewardModule::new(
@@ -293,7 +289,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Predict => {
+        RuntimeModule::Predict => {
             registry.register_server(policy(0..=1, Bpm::range(1.0, 6.0)), |caps| {
                 nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
@@ -305,7 +301,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Surprise => {
+        RuntimeModule::Surprise => {
             registry.register_server(policy(0..=1, Bpm::range(1.0, 3.0)), |caps| {
                 nuillu_surprise::SurpriseModule::new(
                     caps.cognition_log_updated_inbox(),
@@ -318,7 +314,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::SpeakGate => {
+        RuntimeModule::SpeakGate => {
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_speak::SpeakGateModule::new(
                     caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
@@ -330,7 +326,7 @@ fn register_server_module(
                 )
             })
         }
-        ServerModule::Speak => {
+        RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), move |caps| {
                 nuillu_speak::SpeakModule::new(
@@ -351,102 +347,102 @@ fn register_server_module(
     }
 }
 
-pub(super) fn full_agent_allocation(modules: &[ServerModule]) -> ResourceAllocation {
+pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
     allocation.set_activation_table(activation_table());
     for module in modules {
         let (activation, tier, guidance) = match module {
-            ServerModule::Sensory => (
+            RuntimeModule::Sensory => (
                 1.0,
                 ModelTier::Cheap,
                 "Queued sensory input is waiting; activate when the controller is ready to process external observations.",
             ),
-            ServerModule::CognitionGate => (
+            RuntimeModule::CognitionGate => (
                 1.0,
                 ModelTier::Cheap,
                 "Wait for memo or controller guidance before promoting relevant memos into cognition.",
             ),
-            ServerModule::AttentionController => (
+            RuntimeModule::AttentionController => (
                 1.0,
                 ModelTier::Default,
                 "Bootstrap live interaction: activate sensory first, then allocate cognition, query, and speech modules as evidence becomes ready.",
             ),
-            ServerModule::AttentionSchema => (
+            RuntimeModule::AttentionSchema => (
                 0.0,
                 ModelTier::Default,
                 "Idle until memo, allocation, or cognition-log updates require attention-experience integration.",
             ),
-            ServerModule::SelfModel => (
+            RuntimeModule::SelfModel => (
                 0.0,
                 ModelTier::Default,
                 "Idle until explicit self-model requests require work.",
             ),
-            ServerModule::QueryVector => (
+            RuntimeModule::QueryVector => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until memory retrieval is needed.",
             ),
-            ServerModule::QueryPolicy => (
+            RuntimeModule::QueryPolicy => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until policy retrieval is needed.",
             ),
-            ServerModule::Memory => (
+            RuntimeModule::Memory => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until preservation guidance or memory requests arrive.",
             ),
-            ServerModule::MemoryCompaction => (
+            RuntimeModule::MemoryCompaction => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until compaction guidance arrives.",
             ),
-            ServerModule::MemoryRecombination => (
+            RuntimeModule::MemoryRecombination => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until REM-like recombination guidance arrives.",
             ),
-            ServerModule::Vital => (
+            RuntimeModule::Vital => (
                 1.0,
                 ModelTier::Cheap,
                 "Continuously update homeostatic vital state from cognition volume and memory traces.",
             ),
-            ServerModule::HomeostaticController => (
+            RuntimeModule::HomeostaticController => (
                 1.0,
                 ModelTier::Cheap,
                 "Autonomically drive sleep-like memory modules and cap action modules from vital state.",
             ),
-            ServerModule::Policy => (
+            RuntimeModule::Policy => (
                 0.0,
                 ModelTier::Default,
                 "Idle until policy formation guidance or distinctive outcomes arrive.",
             ),
-            ServerModule::ValueEstimator => (
+            RuntimeModule::ValueEstimator => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until query-policy retrieval windows need value estimates.",
             ),
-            ServerModule::Reward => (
+            RuntimeModule::Reward => (
                 0.0,
                 ModelTier::Default,
                 "Idle until outcomes settle value-estimate windows.",
             ),
-            ServerModule::Predict => (
+            RuntimeModule::Predict => (
                 0.0,
                 ModelTier::Cheap,
                 "Idle until prediction guidance arrives.",
             ),
-            ServerModule::Surprise => (
+            RuntimeModule::Surprise => (
                 0.0,
                 ModelTier::Default,
                 "Idle until surprise detection is useful.",
             ),
-            ServerModule::SpeakGate => (
+            RuntimeModule::SpeakGate => (
                 0.0,
                 ModelTier::Premium,
                 "Idle until cognition contains the evidence needed for speech readiness.",
             ),
-            ServerModule::Speak => (
+            RuntimeModule::Speak => (
                 0.0,
                 ModelTier::Premium,
                 "Idle until cognition-log updates are allowed through speak-gate.",
@@ -485,7 +481,7 @@ fn homeostatic_capped_modules() -> Vec<ModuleId> {
     vec![builtin::speak_gate(), builtin::speak()]
 }
 
-fn voluntary_modules(_modules: &[ServerModule]) -> Vec<ModuleId> {
+fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
     vec![
         builtin::sensory(),
         builtin::attention_schema(),

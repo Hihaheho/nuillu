@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -22,7 +23,6 @@ use nuillu_module::{
     SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
-use nuillu_query_agentic::{FileSearchProvider, NoopFileSearchProvider};
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink};
 use nuillu_visualizer_protocol::{
@@ -30,9 +30,9 @@ use nuillu_visualizer_protocol::{
 };
 
 use super::SERVER_TAB_ID;
-use super::config::{LlmBackendConfig, ServerConfig};
+use super::config::{EmbeddingBackendConfig, LlmBackendConfig, ServerConfig};
 use super::gui::VisualizerEventSink;
-use super::llm_observer::ServerLlmObserver;
+use super::llm_observer::VisualizerLlmObserver;
 
 pub(super) struct ServerEnvironment {
     pub(super) blackboard: Blackboard,
@@ -41,7 +41,6 @@ pub(super) struct ServerEnvironment {
     pub(super) memory_caps: MemoryCapabilities,
     pub(super) policy_caps: PolicyCapabilities,
     pub(super) clock: Arc<dyn Clock>,
-    pub(super) file_search: Arc<dyn FileSearchProvider>,
     pub(super) utterance_sink: Arc<dyn UtteranceSink>,
 }
 
@@ -55,7 +54,7 @@ pub(super) async fn build_server_environment(
         SERVER_TAB_ID.to_string(),
         visualizer.clone(),
     ));
-    let llm_observer = ServerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
+    let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
     let utterance_sink = Arc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer,
@@ -68,7 +67,12 @@ pub(super) async fn build_server_environment(
             blackboard: blackboard.clone(),
             cognition_log_port: Arc::new(InMemoryCognitionLogRepository::new()),
             clock: clock.clone(),
-            tiers: build_tiers(config, Some(llm_observer))?,
+            tiers: build_tiers(
+                &config.cheap_backend,
+                &config.default_backend,
+                &config.premium_backend,
+                Some(llm_observer),
+            )?,
         },
         runtime: CapabilityProviderRuntime {
             event_sink,
@@ -106,7 +110,6 @@ pub(super) async fn build_server_environment(
         memory_caps,
         policy_caps,
         clock,
-        file_search: Arc::new(NoopFileSearchProvider),
         utterance_sink,
     })
 }
@@ -120,7 +123,8 @@ fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
 }
 
 async fn connect_memory_store(config: &ServerConfig) -> anyhow::Result<LibsqlMemoryStore> {
-    let (embedder, profile, dimensions) = build_embedder(config)?;
+    let (embedder, profile, dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
     LibsqlMemoryStore::connect(
         LibsqlMemoryStoreConfig::local(config.state_dir.join("memory.db"), dimensions)
             .with_active_profile(profile),
@@ -131,7 +135,8 @@ async fn connect_memory_store(config: &ServerConfig) -> anyhow::Result<LibsqlMem
 }
 
 async fn connect_policy_store(config: &ServerConfig) -> anyhow::Result<LibsqlPolicyStore> {
-    let (embedder, profile, dimensions) = build_embedder(config)?;
+    let (embedder, profile, dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
     LibsqlPolicyStore::connect(
         LibsqlPolicyStoreConfig::local(config.state_dir.join("policy.db"), dimensions)
             .with_active_profile(profile),
@@ -141,10 +146,11 @@ async fn connect_policy_store(config: &ServerConfig) -> anyhow::Result<LibsqlPol
     .context("connect libsql policy store")
 }
 
-fn build_embedder(
-    config: &ServerConfig,
+pub fn build_embedder(
+    embedding_backend: Option<&EmbeddingBackendConfig>,
+    model_dir: &Path,
 ) -> anyhow::Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
-    if let Some(embedding) = &config.embedding_backend {
+    if let Some(embedding) = embedding_backend {
         let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
             base_url: embedding.endpoint.clone(),
             api_key: embedding.token.clone(),
@@ -156,8 +162,8 @@ fn build_embedder(
             EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
         Ok((Box::new(embedder), profile, embedding.dimensions))
     } else {
-        let embedder = PotionBase8MEmbedder::from_local_dir(&config.model_dir)
-            .with_context(|| format!("load model2vec model from {}", config.model_dir.display()))?;
+        let embedder = PotionBase8MEmbedder::from_local_dir(model_dir)
+            .with_context(|| format!("load model2vec model from {}", model_dir.display()))?;
         let dimensions = embedder.dimensions();
         Ok((
             Box::new(embedder),
@@ -167,20 +173,22 @@ fn build_embedder(
     }
 }
 
-fn build_tiers(
-    config: &ServerConfig,
-    llm_observer: Option<ServerLlmObserver>,
+pub fn build_tiers(
+    cheap: &LlmBackendConfig,
+    default: &LlmBackendConfig,
+    premium: &LlmBackendConfig,
+    llm_observer: Option<VisualizerLlmObserver>,
 ) -> anyhow::Result<LutumTiers> {
     Ok(LutumTiers {
-        cheap: build_lutum(&config.cheap_backend, llm_observer.clone())?,
-        default: build_lutum(&config.default_backend, llm_observer.clone())?,
-        premium: build_lutum(&config.premium_backend, llm_observer)?,
+        cheap: build_lutum(cheap, llm_observer.clone())?,
+        default: build_lutum(default, llm_observer.clone())?,
+        premium: build_lutum(premium, llm_observer)?,
     })
 }
 
-fn build_lutum(
+pub fn build_lutum(
     config: &LlmBackendConfig,
-    llm_observer: Option<ServerLlmObserver>,
+    llm_observer: Option<VisualizerLlmObserver>,
 ) -> anyhow::Result<Lutum> {
     let adapter = OpenAiAdapter::new(config.token.clone())
         .with_base_url(config.endpoint.clone())

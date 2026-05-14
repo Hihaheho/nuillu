@@ -29,7 +29,6 @@ nuillu-memory = { workspace = true }
 nuillu-module = { workspace = true }
 nuillu-openai-embedding-adapter = { workspace = true }
 nuillu-predict = { workspace = true }
-nuillu-query-agentic = { workspace = true }
 nuillu-reward = { workspace = true }
 nuillu-self-model = { workspace = true }
 nuillu-sensory = { workspace = true }

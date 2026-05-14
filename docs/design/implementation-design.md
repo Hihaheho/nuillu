@@ -45,7 +45,6 @@ crates/
     attention-schema/         # memo logs/allocation/cognition log -> first-person attention cognition-log entries
     self-model/               # attention-schema cognition log + memo logs -> self-model memo logs
     query-memory/             # blackboard/vector memory RAG -> query-memory memo logs (crate dir still query-vector/ in v1)
-    query-agentic/            # blackboard/file search -> query-agentic memo logs
     query-policy/             # blackboard/policy store search -> query-policy memo logs
     memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
     memory-compaction/        # memory metadata/content -> merges
@@ -381,7 +380,6 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `MemoryContentReader` | no | primary-store content lookup by memory index |
 | `MemoryWriter` | no | primary-assigned insert + storage-replica fan-out + single metadata mirror |
 | `MemoryCompactor` | no | store-atomic compaction + storage-replica fan-out + remember-token increment |
-| `FileSearcher` | no | read-only ripgrep-like file search |
 | `CognitionWriter` | yes | append holder instance's cognition log + persist + publish update |
 | `AllocationWriter` | yes | record holder controller instance's allocation proposal |
 | `UtteranceWriter` | yes | emit app-facing speech actions for one speak replica + persist/notify through an adapter |
@@ -646,7 +644,7 @@ Tool loops are written directly by each module so tool availability, round limit
 - the turn is part of a tool loop (`text_turn().tools::<T>().collect()`) — each round must complete before tool results can be committed,
 - the result is written directly to durable internal state such as free-form `Memo` text or a cognition-log entry — there is no consumer of partial output.
 
-cognition-gate, attention-controller, attention-schema, self-model, query-memory, query-agentic, query-policy, memory, memory-compaction, policy, value-estimator, and reward use `.collect()` exclusively.
+cognition-gate, attention-controller, attention-schema, self-model, query-memory, query-policy, memory, memory-compaction, policy, value-estimator, and reward use `.collect()` exclusively.
 
 `.stream()` is appropriate only for the `speak` module's text generation step, where the response is user-facing and `UtteranceSink` can act on each chunk as it arrives. See Section 4 (Speak) for the full streaming + interruption pattern.
 
@@ -707,9 +705,9 @@ Implementations may persist utterances, stream deltas to UI, or both. The `on_co
 
 Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. They model app input and therefore support only batched `inputs[]` whose variants map to `SensoryInput::Heard` and `SensoryInput::Seen`. They may seed memories, but the user-facing request still enters only through sensory input; memory-required full-agent cases exercise whether controller/query/cognition-gate/speak can surface stored context without direct harness messages. The runner publishes all inputs through `CapabilityProviders::host_io().sensory_input_mailbox()`, yields the current-thread runtime while module tasks react to channel updates, waits until the latest completed action has been silent for one second, max loop iterations, or runtime-event shutdown, and returns the latest complete `Utterance` as `CaseArtifact::output`.
 
-Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query (memory, agentic, policy), memory, memory-compaction, policy, value-estimator, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
+Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, attention-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query (memory, policy), memory, memory-compaction, policy, value-estimator, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the attention-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-vector,query-agentic,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
+Module eval cases live under `eval-cases/modules/{query-vector,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
 
 Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum values in the `.eure` case: `output`, `utterance`, `failure`, `trace`, `observations`, `blackboard`, `memory`, `memos`, `cognition`, and `allocation`. The `memos` judge input renders `memo_logs`. The rubric text and criteria are always included; the selected judge inputs control only evidence sections. This keeps full-agent rubrics focused on utterance/memory/blackboard state and query rubrics focused on output plus trace without always passing the whole artifact observation payload.
 
@@ -755,9 +753,8 @@ This keeps realistic artifacts observable without adding request/response correl
 | Attention schema models attention only | it receives memo, allocation, and cognition-log read/wake capabilities plus `CognitionWriter` and `LlmAccess`, not `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | attention-controller writes self-model guidance; self-model receives `AllocationUpdatedInbox` and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema cognition-log entries and current memo-log context |
-| Query memory is memory/RAG only | it receives `VectorMemorySearcher`, not file, policy, or self-model capabilities |
-| Query agentic is file-search only | it receives `FileSearcher`, not memory or self-model capabilities |
-| Query policy is policy-retrieval only | it receives `PolicySearcher`, not memory, file, or self-model capabilities; its memo entries contain only retrieved policy records |
+| Query memory is memory/RAG only | it receives `VectorMemorySearcher`, not policy or self-model capabilities |
+| Query policy is policy-retrieval only | it receives `PolicySearcher`, not memory or self-model capabilities; its memo entries contain only retrieved policy records |
 | Policy vector search is trigger-only | `PolicySearcher` performs similarity over the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys |
 | Memory rank elevation is store-internal | no module holds a memory rank-elevation capability; `MemoryStore` applies access-threshold promotions on read paths that set `record_access: true` |
 | Policy creation and policy update are separate roles | `policy` holds `PolicyWriter` but no mutation path on existing entries; `reward` holds `PolicyValueUpdater` but no insert path |
@@ -774,7 +771,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | No periodic activation | there is no `PeriodicInbox`, `PeriodicActivation`, `period`, `period_ms`, or scheduler tick path |
 | Modules with `cap_range.min = 0` are detachable by allocation | derived active replica count `0` fully disables all instances without killing loops |
 | Modules with `cap_range.min > 0` cannot be fully allocation-disabled | active replica derivation clamps requested replicas up to the registered minimum |
-| Query ablations are wiring-only | boot wiring may include query-memory, query-agentic, query-policy, any subset, or none |
+| Query ablations are wiring-only | boot wiring may include query-memory, query-policy, either, or neither |
 | Predict and surprise are separate modules | separate crates and separate constructor capabilities |
 | Surprise has no forward-modeling responsibility | it receives no direct memo path from predict; predict output arrives through unread memo-log entries on `BlackboardReader` |
 | Predict and surprise ablations are wiring-only | boot wiring may include predict, surprise, both, or neither |

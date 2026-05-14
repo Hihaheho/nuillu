@@ -12,7 +12,7 @@ use nuillu_visualizer_protocol::{
 
 use super::gui::VisualizerHook;
 
-pub(super) async fn emit_visualizer_blackboard_snapshot(
+pub(crate) async fn emit_visualizer_blackboard_snapshot(
     tab_id: &str,
     blackboard: &Blackboard,
     visualizer: &VisualizerHook,
@@ -24,7 +24,7 @@ pub(super) async fn emit_visualizer_blackboard_snapshot(
     });
 }
 
-pub(super) async fn emit_visualizer_memory_page(
+pub(crate) async fn emit_visualizer_memory_page(
     tab_id: &str,
     visualizer: &mut VisualizerHook,
     blackboard: &Blackboard,
@@ -40,7 +40,7 @@ pub(super) async fn emit_visualizer_memory_page(
     });
 }
 
-pub(super) async fn list_all_memories(memory: &dyn MemoryStore) -> Vec<MemoryRecordView> {
+pub async fn list_all_memories(memory: &dyn MemoryStore) -> Vec<MemoryRecordView> {
     let mut out = Vec::new();
     for rank in [
         MemoryRank::Identity,
@@ -62,7 +62,7 @@ pub(super) async fn list_all_memories(memory: &dyn MemoryStore) -> Vec<MemoryRec
     out
 }
 
-pub(super) fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
+pub fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
     MemoryRecordView {
         index: record.index.as_str().to_string(),
         rank: format!("{:?}", record.rank),
@@ -191,7 +191,7 @@ fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
     modules
 }
 
-fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
+pub fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
     let mut policies = bb
         .module_policies()
         .iter()
@@ -211,7 +211,7 @@ fn module_policy_views(bb: &BlackboardInner) -> Vec<ModulePolicyView> {
     policies
 }
 
-fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaWindowView {
+pub fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaWindowView {
     match policy {
         ZeroReplicaWindowPolicy::Disabled => ZeroReplicaWindowView::Disabled,
         ZeroReplicaWindowPolicy::EveryControllerActivations(period) => {
@@ -220,7 +220,7 @@ fn zero_replica_window_view(policy: ZeroReplicaWindowPolicy) -> ZeroReplicaWindo
     }
 }
 
-fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
+pub fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
     let mut memory_metadata = bb
         .memory_metadata()
         .iter()
@@ -236,7 +236,7 @@ fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
     memory_metadata
 }
 
-fn memory_rank_name(rank: MemoryRank) -> &'static str {
+pub fn memory_rank_name(rank: MemoryRank) -> &'static str {
     match rank {
         MemoryRank::Identity => "identity",
         MemoryRank::Permanent => "permanent",
@@ -246,7 +246,7 @@ fn memory_rank_name(rank: MemoryRank) -> &'static str {
     }
 }
 
-fn model_tier_name(tier: ModelTier) -> &'static str {
+pub fn model_tier_name(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Cheap => "cheap",
         ModelTier::Default => "default",
@@ -254,11 +254,11 @@ fn model_tier_name(tier: ModelTier) -> &'static str {
     }
 }
 
-fn duration_millis_u64(duration: Duration) -> u64 {
+pub fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
+pub fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
     let seconds = cooldown.as_secs_f64();
     (seconds.is_finite() && seconds > 0.0).then_some(60.0 / seconds)
 }

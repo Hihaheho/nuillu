@@ -4,7 +4,6 @@ pub mod cognition_gate;
 pub mod memory;
 pub mod memory_compaction;
 pub mod predict;
-pub mod query_agentic;
 pub mod query_vector;
 pub mod self_model;
 pub mod sensory;
