@@ -1,5 +1,6 @@
 use std::{
     fs, io,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -23,6 +24,8 @@ pub struct ModelSet {
     #[eure(default)]
     pub compaction_input_token_threshold: Option<u64>,
     #[eure(default)]
+    pub max_concurrent_llm_calls: Option<u64>,
+    #[eure(default)]
     pub judge: Option<ModelSetRole>,
     #[eure(default)]
     pub cheap: Option<ModelSetRole>,
@@ -32,6 +35,14 @@ pub struct ModelSet {
     pub premium: Option<ModelSetRole>,
     #[eure(default)]
     pub embedding: Option<EmbeddingRole>,
+}
+
+impl ModelSet {
+    pub fn max_concurrent_llm_calls(&self) -> Option<NonZeroUsize> {
+        self.max_concurrent_llm_calls
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(NonZeroUsize::new)
+    }
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -147,6 +158,20 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
             message: "compaction-input-token-threshold must be greater than zero when set"
                 .to_string(),
         });
+    }
+    if let Some(value) = model_set.max_concurrent_llm_calls {
+        if value == 0 {
+            return Err(ModelSetError::Validation {
+                path: path.to_path_buf(),
+                message: "max-concurrent-llm-calls must be greater than zero when set".to_string(),
+            });
+        }
+        if usize::try_from(value).is_err() {
+            return Err(ModelSetError::Validation {
+                path: path.to_path_buf(),
+                message: "max-concurrent-llm-calls must fit in usize".to_string(),
+            });
+        }
     }
     validate_role(path, "judge", model_set.judge.as_ref())?;
     validate_role(path, "cheap", model_set.cheap.as_ref())?;
@@ -264,6 +289,43 @@ cheap {
             model_set.cheap.unwrap().compaction_input_token_threshold,
             None
         );
+    }
+
+    #[test]
+    fn parses_max_concurrent_llm_calls() {
+        let model_set = parse_model_set(
+            r#"
+max-concurrent-llm-calls = 3
+
+cheap {
+  model = "cheap-model"
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(model_set.max_concurrent_llm_calls, Some(3));
+        assert_eq!(model_set.max_concurrent_llm_calls(), NonZeroUsize::new(3));
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent_llm_calls() {
+        let error = parse_model_set(
+            r#"
+max-concurrent-llm-calls = 0
+
+cheap {
+  model = "cheap-model"
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message == "max-concurrent-llm-calls must be greater than zero when set"
+        ));
     }
 
     #[test]

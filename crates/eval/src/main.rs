@@ -138,6 +138,11 @@ fn main() -> anyhow::Result<()> {
     )?;
     let embedding_backend =
         resolve_embedding(model_set.as_ref().and_then(|m| m.embedding.as_ref()))?;
+    let max_concurrent_llm_calls = args.max_concurrent_llm_calls.or_else(|| {
+        model_set
+            .as_ref()
+            .and_then(|model_set| model_set.max_concurrent_llm_calls())
+    });
     let config = RunnerConfig {
         cases_root: args.cases,
         output_root: args.output,
@@ -149,7 +154,7 @@ fn main() -> anyhow::Result<()> {
         model_dir: args.model_dir,
         embedding_backend,
         fail_fast: args.fail_fast,
-        max_concurrent_llm_calls: args.max_concurrent_llm_calls,
+        max_concurrent_llm_calls,
         case_patterns: args.patterns,
         disabled_modules: args.disable_module,
     };

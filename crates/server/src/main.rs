@@ -107,6 +107,11 @@ fn main() -> anyhow::Result<()> {
     )?;
     let embedding_backend =
         resolve_embedding(model_set.as_ref().and_then(|m| m.embedding.as_ref()))?;
+    let max_concurrent_llm_calls = args.max_concurrent_llm_calls.or_else(|| {
+        model_set
+            .as_ref()
+            .and_then(|model_set| model_set.max_concurrent_llm_calls())
+    });
     let run_id = args
         .run_id
         .unwrap_or_else(|| format!("server-{}", default_run_id()));
@@ -119,7 +124,7 @@ fn main() -> anyhow::Result<()> {
         premium_backend,
         model_dir: args.model_dir,
         embedding_backend,
-        max_concurrent_llm_calls: args.max_concurrent_llm_calls,
+        max_concurrent_llm_calls,
         disabled_modules: args.disable_module,
         participants: args.participants,
     })
