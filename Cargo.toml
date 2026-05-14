@@ -57,7 +57,7 @@ eure-document = "0.1.9"
 eure-fmt = "0.1.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # workspace-internal crates
 nuillu-types = { path = "crates/types" }
