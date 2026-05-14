@@ -44,6 +44,7 @@ use nuillu_module::{
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
     LlmRequestMetadata, LlmRequestSource, LutumTiers, ModuleRegistry, Participant, RuntimeEvent,
     RuntimeEventSink, RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality,
+    SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_query_agentic::{
@@ -103,6 +104,7 @@ pub struct LlmBackendConfig {
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub use_responses_api: bool,
+    pub compaction_input_token_threshold: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,6 +1035,7 @@ fn backend_report(backend: &LlmBackendConfig) -> serde_json::Value {
         "model": backend.model.as_str(),
         "reasoning_effort": backend.reasoning_effort,
         "use_responses_api": backend.use_responses_api,
+        "compaction_input_token_threshold": backend.compaction_input_token_threshold,
     })
 }
 
@@ -2766,6 +2769,7 @@ pub(crate) async fn build_eval_environment(
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls,
+        session_compaction: session_compaction_policy(config),
         ..RuntimePolicy::default()
     };
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
@@ -2814,6 +2818,14 @@ pub(crate) async fn build_eval_environment(
         file_search,
         utterance_sink,
     })
+}
+
+fn session_compaction_policy(config: &RunnerConfig) -> SessionCompactionPolicy {
+    SessionCompactionPolicy::new(
+        config.cheap_backend.compaction_input_token_threshold,
+        config.default_backend.compaction_input_token_threshold,
+        config.premium_backend.compaction_input_token_threshold,
+    )
 }
 
 pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
@@ -5177,6 +5189,7 @@ mod tests {
             model: model.to_string(),
             reasoning_effort: None,
             use_responses_api: false,
+            compaction_input_token_threshold: 16_000,
         }
     }
 

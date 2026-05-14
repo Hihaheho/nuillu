@@ -12,7 +12,7 @@ use nuillu_blackboard::{
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies, ModuleRunStatus,
-    ports::Clock,
+    SessionCompactionRuntime, ports::Clock,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
@@ -1427,18 +1427,23 @@ async fn activate_with_retries(
     activate_retries: u8,
 ) -> (AllocatedModule, Result<(), String>) {
     let module_owner = module.owner().clone();
+    let module_tier = runtime.tier_for(&module_owner).await;
     let cx = ActivateCx::new(
         catalog,
         identity_memories,
         core_policies,
-        runtime
-            .session_compaction_lutum()
-            .clone()
-            .with_extension(LlmRequestMetadata {
-                owner: module_owner,
-                tier: ModelTier::Cheap,
-                source: LlmRequestSource::SessionCompaction,
-            }),
+        SessionCompactionRuntime::new(
+            runtime
+                .session_compaction_lutum()
+                .clone()
+                .with_extension(LlmRequestMetadata {
+                    owner: module_owner,
+                    tier: ModelTier::Cheap,
+                    source: LlmRequestSource::SessionCompaction,
+                }),
+            module_tier,
+            runtime.session_compaction_policy(),
+        ),
         runtime.clock().now(),
     );
     let mut retries = 0_u8;
@@ -1508,7 +1513,7 @@ mod tests {
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
         CognitionWriter, LlmRequestMetadata, LlmRequestSource, Memo, Module, ModuleDependencies,
-        ModuleRegistry,
+        ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
@@ -1516,7 +1521,7 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    use crate::testing::{test_caps, test_caps_with_real_clock};
+    use crate::testing::{test_caps, test_caps_with_policy, test_caps_with_real_clock};
 
     fn test_config() -> AgentEventLoopConfig {
         AgentEventLoopConfig {
@@ -1666,7 +1671,14 @@ mod tests {
 
     struct CompactionMetadataObserver {
         attention_control_inbox: AttentionControlRequestInbox,
-        on_seen: Option<oneshot::Sender<Option<LlmRequestMetadata>>>,
+        on_seen: Option<oneshot::Sender<CompactionObservation>>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CompactionObservation {
+        metadata: Option<LlmRequestMetadata>,
+        module_tier: ModelTier,
+        threshold: u64,
     }
 
     #[async_trait(?Send)]
@@ -1691,12 +1703,17 @@ mod tests {
             _batch: &Self::Batch,
         ) -> anyhow::Result<()> {
             if let Some(tx) = self.on_seen.take() {
-                let metadata = cx
-                    .session_compaction_lutum()
+                let session_compaction = cx.session_compaction();
+                let metadata = session_compaction
+                    .lutum()
                     .default_extensions()
                     .get::<LlmRequestMetadata>()
                     .cloned();
-                let _ = tx.send(metadata);
+                let _ = tx.send(CompactionObservation {
+                    metadata,
+                    module_tier: session_compaction.module_tier(),
+                    threshold: session_compaction.input_token_threshold(),
+                });
             }
             Ok(())
         }
@@ -2690,16 +2707,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn activation_context_stamps_session_compaction_lutum_owner() {
+    async fn activation_context_uses_module_tier_threshold_and_compaction_lutum_metadata() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(compaction_observer_id(), ModuleConfig::default());
+                alloc.set_model_override(compaction_observer_id(), ModelTier::Premium);
                 alloc.set_activation(compaction_observer_id(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
-                let caps = test_caps(blackboard);
+                let caps = test_caps_with_policy(
+                    blackboard,
+                    RuntimePolicy {
+                        session_compaction: SessionCompactionPolicy::new(11, 22, 33),
+                        ..RuntimePolicy::default()
+                    },
+                );
                 let (seen_tx, seen_rx) = oneshot::channel();
                 let seen_tx = Rc::new(RefCell::new(Some(seen_tx)));
                 let modules = ModuleRegistry::new()
@@ -2724,9 +2748,9 @@ mod tests {
                         .publish(AttentionControlRequest::query("ping"))
                         .await
                         .expect("attention request should route to observer");
-                    let metadata = seen_rx.await.expect("metadata observed");
+                    let observation = seen_rx.await.expect("metadata observed");
                     assert_eq!(
-                        metadata,
+                        observation.metadata,
                         Some(LlmRequestMetadata {
                             owner: nuillu_types::ModuleInstanceId::new(
                                 compaction_observer_id(),
@@ -2736,6 +2760,8 @@ mod tests {
                             source: LlmRequestSource::SessionCompaction,
                         })
                     );
+                    assert_eq!(observation.module_tier, ModelTier::Premium);
+                    assert_eq!(observation.threshold, 33);
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }

@@ -7,6 +7,7 @@ use nuillu_eval::{
     ReasoningEffort, RunnerConfig, default_run_id, gui::run_suite_with_visualizer,
     install_lutum_trace_subscriber, parse_model_set_file, run_suite,
 };
+use nuillu_module::DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD;
 use tokio::runtime::Builder;
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
@@ -104,27 +105,34 @@ fn main() -> anyhow::Result<()> {
         .as_deref()
         .map(parse_model_set_file)
         .transpose()?;
+    let global_compaction_input_token_threshold = model_set
+        .as_ref()
+        .and_then(|model_set| model_set.compaction_input_token_threshold);
     let judge_backend = resolve_backend(
         "judge",
         role_ref(model_set.as_ref(), ModelRole::Judge),
+        global_compaction_input_token_threshold,
         args.judge_model.as_deref(),
         args.judge_reasoning_effort,
     )?;
     let cheap_backend = resolve_backend(
         "cheap",
         role_ref(model_set.as_ref(), ModelRole::Cheap),
+        global_compaction_input_token_threshold,
         args.cheap_model.as_deref(),
         args.cheap_reasoning_effort,
     )?;
     let default_backend = resolve_backend(
         "default",
         role_ref(model_set.as_ref(), ModelRole::Default),
+        global_compaction_input_token_threshold,
         args.default_model.as_deref(),
         args.default_reasoning_effort,
     )?;
     let premium_backend = resolve_backend(
         "premium",
         role_ref(model_set.as_ref(), ModelRole::Premium),
+        global_compaction_input_token_threshold,
         args.premium_model.as_deref(),
         args.premium_reasoning_effort,
     )?;
@@ -177,6 +185,7 @@ enum ModelRole {
 fn resolve_backend(
     label: &str,
     role: Option<&ModelSetRole>,
+    global_compaction_input_token_threshold: Option<u64>,
     explicit_model: Option<&str>,
     explicit_reasoning_effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<LlmBackendConfig> {
@@ -198,6 +207,10 @@ fn resolve_backend(
     let use_responses_api = role
         .and_then(|role| role.use_responses_api)
         .unwrap_or(false);
+    let compaction_input_token_threshold = role
+        .and_then(|role| role.compaction_input_token_threshold)
+        .or(global_compaction_input_token_threshold)
+        .unwrap_or(DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD);
 
     Ok(LlmBackendConfig {
         endpoint,
@@ -205,6 +218,7 @@ fn resolve_backend(
         model,
         reasoning_effort,
         use_responses_api,
+        compaction_input_token_threshold,
     })
 }
 
@@ -295,5 +309,62 @@ fn role_ref(model_set: Option<&ModelSet>, role: ModelRole) -> Option<&ModelSetRo
         ModelRole::Cheap => model_set.cheap.as_ref(),
         ModelRole::Default => model_set.default.as_ref(),
         ModelRole::Premium => model_set.premium.as_ref(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_role(threshold: Option<u64>) -> ModelSetRole {
+        ModelSetRole {
+            endpoint: None,
+            base_url: None,
+            token: Some("local".to_string()),
+            token_env: None,
+            model: Some("model".to_string()),
+            reasoning_effort: None,
+            use_responses_api: None,
+            compaction_input_token_threshold: threshold,
+        }
+    }
+
+    #[test]
+    fn resolve_backend_defaults_compaction_input_token_threshold_to_16k() {
+        let role = model_role(None);
+
+        let backend = resolve_backend("cheap", Some(&role), None, None, None).unwrap();
+
+        assert_eq!(
+            backend.compaction_input_token_threshold,
+            DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn resolve_backend_uses_model_set_compaction_input_token_threshold() {
+        let role = model_role(Some(4096));
+
+        let backend = resolve_backend("cheap", Some(&role), None, None, None).unwrap();
+
+        assert_eq!(backend.compaction_input_token_threshold, 4096);
+    }
+
+    #[test]
+    fn resolve_backend_uses_global_compaction_input_token_threshold() {
+        let role = model_role(None);
+
+        let backend = resolve_backend("cheap", Some(&role), Some(2048), None, None).unwrap();
+
+        assert_eq!(backend.compaction_input_token_threshold, 2048);
+    }
+
+    #[test]
+    fn resolve_backend_role_threshold_overrides_global_threshold() {
+        let role = model_role(Some(4096));
+
+        let backend = resolve_backend("cheap", Some(&role), Some(2048), None, None).unwrap();
+
+        assert_eq!(backend.compaction_input_token_threshold, 4096);
     }
 }

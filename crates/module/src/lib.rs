@@ -92,8 +92,9 @@ pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
 pub use session_compaction::{
     DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session,
-    compact_session_if_needed, session_compaction_cutoff,
+    SessionCompactionConfig, SessionCompactionPolicy, SessionCompactionProtectedPrefix,
+    SessionCompactionRuntime, compact_session, compact_session_if_needed,
+    session_compaction_cutoff,
 };
 pub use tiers::LutumTiers;
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};

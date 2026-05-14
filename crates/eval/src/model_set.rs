@@ -21,6 +21,8 @@ pub struct ModelSet {
     #[eure(default)]
     pub name: Option<String>,
     #[eure(default)]
+    pub compaction_input_token_threshold: Option<u64>,
+    #[eure(default)]
     pub judge: Option<ModelSetRole>,
     #[eure(default)]
     pub cheap: Option<ModelSetRole>,
@@ -49,6 +51,8 @@ pub struct ModelSetRole {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[eure(default)]
     pub use_responses_api: Option<bool>,
+    #[eure(default)]
+    pub compaction_input_token_threshold: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum, FromEure)]
@@ -137,6 +141,13 @@ pub fn parse_model_set_file(path: &Path) -> Result<ModelSet, ModelSetError> {
 
 fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetError> {
     validate_optional_text(path, "name", model_set.name.as_deref())?;
+    if model_set.compaction_input_token_threshold == Some(0) {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: "compaction-input-token-threshold must be greater than zero when set"
+                .to_string(),
+        });
+    }
     validate_role(path, "judge", model_set.judge.as_ref())?;
     validate_role(path, "cheap", model_set.cheap.as_ref())?;
     validate_role(path, "default", model_set.default.as_ref())?;
@@ -190,7 +201,16 @@ fn validate_role(
         &format!("{name}.token-env"),
         role.token_env.as_deref(),
     )?;
-    validate_optional_text(path, &format!("{name}.model"), role.model.as_deref())
+    validate_optional_text(path, &format!("{name}.model"), role.model.as_deref())?;
+    if role.compaction_input_token_threshold == Some(0) {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: format!(
+                "{name}.compaction-input-token-threshold must be greater than zero when set"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_optional_text(
@@ -205,4 +225,118 @@ fn validate_optional_text(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn parse_model_set(content: &str) -> Result<ModelSet, ModelSetError> {
+        let path = Path::new("test-model-set.eure");
+        let file: ModelSetFile =
+            eure::parse_content(content, path.to_path_buf()).map_err(|message| {
+                ModelSetError::Parse {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            })?;
+        validate_model_set(path, &file.model_set)?;
+        Ok(file.model_set)
+    }
+
+    #[test]
+    fn parses_global_compaction_input_token_threshold() {
+        let model_set = parse_model_set(
+            r#"
+compaction-input-token-threshold = 8192
+
+cheap {
+  model = "cheap-model"
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(model_set.compaction_input_token_threshold, Some(8192));
+        assert_eq!(
+            model_set.cheap.unwrap().compaction_input_token_threshold,
+            None
+        );
+    }
+
+    #[test]
+    fn parses_role_compaction_input_token_threshold() {
+        let model_set = parse_model_set(
+            r#"
+cheap {
+  model = "cheap-model"
+  compaction-input-token-threshold = 4096
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model_set.cheap.unwrap().compaction_input_token_threshold,
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn leaves_compaction_input_token_threshold_absent_when_unset() {
+        let model_set = parse_model_set(
+            r#"
+default {
+  model = "default-model"
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model_set.default.unwrap().compaction_input_token_threshold,
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_zero_global_compaction_input_token_threshold() {
+        let error = parse_model_set(
+            r#"
+compaction-input-token-threshold = 0
+
+cheap {
+  model = "cheap-model"
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message == "compaction-input-token-threshold must be greater than zero when set"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_compaction_input_token_threshold() {
+        let error = parse_model_set(
+            r#"
+premium {
+  model = "premium-model"
+  compaction-input-token-threshold = 0
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message == "premium.compaction-input-token-threshold must be greater than zero when set"
+        ));
+    }
 }

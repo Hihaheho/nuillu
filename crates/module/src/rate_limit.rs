@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Instant, sleep_until};
 
+use crate::session_compaction::SessionCompactionPolicy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicKind {
@@ -112,6 +114,7 @@ pub struct RuntimePolicy {
     pub allocation_limits: AllocationLimits,
     pub memo_retained_per_owner: usize,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
+    pub session_compaction: SessionCompactionPolicy,
 }
 
 impl Default for RuntimePolicy {
@@ -121,6 +124,7 @@ impl Default for RuntimePolicy {
             allocation_limits: AllocationLimits::default(),
             memo_retained_per_owner: 8,
             max_concurrent_llm_calls: None,
+            session_compaction: SessionCompactionPolicy::default(),
         }
     }
 }

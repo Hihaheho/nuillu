@@ -9,7 +9,8 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
     SensoryInputInbox, SensoryModality, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, ports::Clock, seed_persistent_faculty_session,
+    SessionCompactionRuntime, compact_session_if_needed, ports::Clock,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -262,15 +263,15 @@ impl SensoryModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit sensory tool round")?;
-                self.compact_if_needed(input_tokens, cx.session_compaction_lutum())
+                self.compact_if_needed(input_tokens, cx.session_compaction())
                     .await;
             }
             TextStepOutcomeWithTools::Finished(result) => {
-                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction_lutum())
+                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction())
                     .await;
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction_lutum())
+                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction())
                     .await;
             }
         }
@@ -417,14 +418,11 @@ impl SensoryModule {
         IgnoreObservationsOutput { ignored: true }
     }
 
-    async fn compact_if_needed(&mut self, input_tokens: u64, lutum: &lutum::Lutum) {
-        if input_tokens <= self.session_compaction.input_token_threshold {
-            return;
-        }
+    async fn compact_if_needed(&mut self, input_tokens: u64, runtime: &SessionCompactionRuntime) {
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
-            lutum,
+            runtime,
             self.session_compaction,
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
@@ -609,7 +607,9 @@ mod tests {
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
-        AllocationUpdated, CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry,
+        AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
+        CapabilityProviderRuntime, CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy,
+        SessionCompactionPolicy,
     };
     use nuillu_types::builtin;
     use tokio::task::LocalSet;
@@ -727,18 +727,31 @@ mod tests {
     }
 
     fn test_caps_with_adapter(adapter: MockLlmAdapter) -> (Blackboard, CapabilityProviders) {
+        test_caps_with_adapter_and_policy(adapter, RuntimePolicy::default())
+    }
+
+    fn test_caps_with_adapter_and_policy(
+        adapter: MockLlmAdapter,
+        policy: RuntimePolicy,
+    ) -> (Blackboard, CapabilityProviders) {
         let blackboard = Blackboard::with_allocation(sensory_allocation());
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        let caps = CapabilityProviders::new(CapabilityProviderPorts {
-            blackboard: blackboard.clone(),
-            cognition_log_port: Arc::new(NoopCognitionLogRepository),
-            clock: Arc::new(SystemClock),
-            tiers: LutumTiers {
-                cheap: lutum.clone(),
-                default: lutum.clone(),
-                premium: lutum,
+        let caps = CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard: blackboard.clone(),
+                cognition_log_port: Arc::new(NoopCognitionLogRepository),
+                clock: Arc::new(SystemClock),
+                tiers: LutumTiers {
+                    cheap: lutum.clone(),
+                    default: lutum.clone(),
+                    premium: lutum,
+                },
+            },
+            runtime: CapabilityProviderRuntime {
+                policy,
+                ..CapabilityProviderRuntime::default()
             },
         });
         (blackboard, caps)
@@ -1129,7 +1142,13 @@ mod tests {
                 let adapter = MockLlmAdapter::new()
                     .with_text_scenario(write_memo_scenario("Notable sensory change.", 2))
                     .with_text_scenario(text_scenario("old sensory history summarized", 0));
-                let (_blackboard, caps) = test_caps_with_adapter(adapter);
+                let (_blackboard, caps) = test_caps_with_adapter_and_policy(
+                    adapter,
+                    RuntimePolicy {
+                        session_compaction: SessionCompactionPolicy::new(1, 1, 1),
+                        ..RuntimePolicy::default()
+                    },
+                );
                 let recorder = SensoryTestRecorder::default();
                 let modules = build_recording_sensory(
                     &caps,
@@ -1138,10 +1157,7 @@ mod tests {
                         silent_window: Duration::from_millis(1),
                         budget: Duration::from_millis(1),
                     },
-                    Some(SessionCompactionConfig {
-                        input_token_threshold: 1,
-                        prefix_ratio: 0.8,
-                    }),
+                    Some(SessionCompactionConfig { prefix_ratio: 0.8 }),
                     (0..10).map(|index| format!("history-{index}")).collect(),
                 )
                 .await;

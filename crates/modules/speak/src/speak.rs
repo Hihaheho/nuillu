@@ -681,7 +681,11 @@ mod tests {
             &catalog,
             &identity_memories,
             &[],
-            compaction_lutum.lutum().clone(),
+            nuillu_module::SessionCompactionRuntime::new(
+                compaction_lutum.lutum().clone(),
+                nuillu_types::ModelTier::Cheap,
+                nuillu_module::SessionCompactionPolicy::default(),
+            ),
             clock.now(),
         );
         SpeakModule::activate(&mut module, &cx, &batch)

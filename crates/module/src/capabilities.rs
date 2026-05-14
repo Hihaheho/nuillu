@@ -10,7 +10,7 @@ use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
+use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
@@ -26,9 +26,9 @@ use crate::{
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
     CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, LlmAccess, LutumTiers,
     Memo, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, Module, ModuleBatch,
-    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox, TimeDivision,
-    TopicInbox, TopicMailbox, TypedMemo, VitalReader, VitalUpdated, VitalUpdatedInbox,
-    VitalUpdatedMailbox, VitalWriter,
+    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox, TypedMemo, VitalReader,
+    VitalUpdated, VitalUpdatedInbox, VitalUpdatedMailbox, VitalWriter,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -237,6 +237,7 @@ impl CapabilityProviders {
             ),
             clock: self.inner.clock.clone(),
             session_compaction_lutum: self.inner.tiers.cheap.clone(),
+            session_compaction_policy: self.inner.runtime_policy.session_compaction,
             runtime_events: self.inner.runtime_events.clone(),
             activation_gates: self.inner.activation_gates.clone(),
         }
@@ -293,6 +294,7 @@ pub struct AgentRuntimeControl {
     cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Arc<dyn Clock>,
     session_compaction_lutum: Lutum,
+    session_compaction_policy: SessionCompactionPolicy,
     runtime_events: RuntimeEventEmitter,
     activation_gates: ActivationGateHub,
 }
@@ -310,6 +312,16 @@ impl AgentRuntimeControl {
 
     pub fn session_compaction_lutum(&self) -> &Lutum {
         &self.session_compaction_lutum
+    }
+
+    pub fn session_compaction_policy(&self) -> SessionCompactionPolicy {
+        self.session_compaction_policy
+    }
+
+    pub async fn tier_for(&self, owner: &ModuleInstanceId) -> ModelTier {
+        self.blackboard
+            .read(|bb| bb.allocation().tier_for(&owner.module))
+            .await
     }
 
     /// Snapshot of the registered-module catalog. Cheap synchronous read; the

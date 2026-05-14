@@ -41,6 +41,13 @@ pub(crate) fn test_caps_with_real_clock(blackboard: Blackboard) -> CapabilityPro
     test_caps_inner(blackboard, RuntimePolicy::default(), Arc::new(SystemClock))
 }
 
+pub(crate) fn test_caps_with_policy(
+    blackboard: Blackboard,
+    policy: RuntimePolicy,
+) -> CapabilityProviders {
+    test_caps_inner(blackboard, policy, Arc::new(InstantSleepClock))
+}
+
 fn test_caps_inner(
     blackboard: Blackboard,
     policy: RuntimePolicy,

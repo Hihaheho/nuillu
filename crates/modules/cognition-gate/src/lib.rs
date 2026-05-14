@@ -4,10 +4,11 @@ use lutum::{Lutum, Session, StructuredTurnOutcome};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess,
     MemoUpdatedInbox, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    TimeDivision, compact_session_if_needed, format_current_attention_guidance,
-    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
-    format_time_division_guidance, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    SessionCompactionRuntime, TimeDivision, compact_session_if_needed,
+    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
+    format_stuckness, format_time_division_guidance, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -202,7 +203,7 @@ impl CognitionGateModule {
 
         let lutum = self.llm.lutum().await;
         let decision = self
-            .run_decision_turn(&lutum, cx.session_compaction_lutum())
+            .run_decision_turn(&lutum, cx.session_compaction())
             .await?;
 
         if decision.append_cognition
@@ -217,7 +218,7 @@ impl CognitionGateModule {
     async fn run_decision_turn(
         &mut self,
         lutum: &Lutum,
-        compaction_lutum: &Lutum,
+        compaction: &SessionCompactionRuntime,
     ) -> Result<CognitionGateDecision> {
         let result = self
             .session
@@ -233,7 +234,7 @@ impl CognitionGateModule {
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
-            compaction_lutum,
+            compaction,
             self.session_compaction,
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
@@ -290,9 +291,9 @@ mod tests {
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
-        session_compaction_cutoff,
+        SessionCompactionPolicy, SessionCompactionRuntime, session_compaction_cutoff,
     };
-    use nuillu_types::builtin;
+    use nuillu_types::{ModelTier, builtin};
 
     use super::*;
 
@@ -511,24 +512,26 @@ mod tests {
         ])
     }
 
+    fn compaction_runtime(lutum: &Lutum) -> SessionCompactionRuntime {
+        SessionCompactionRuntime::new(
+            lutum.clone(),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::default(),
+        )
+    }
+
     #[test]
-    fn session_compaction_config_defaults_to_16k_and_80_percent() {
+    fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
             CognitionGateSessionCompactionConfig::default(),
-            CognitionGateSessionCompactionConfig {
-                input_token_threshold: 16_000,
-                prefix_ratio: 0.8,
-            }
+            CognitionGateSessionCompactionConfig { prefix_ratio: 0.8 }
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_compaction_builder_replaces_config() {
         let fixture = gate_fixture().await;
-        let config = CognitionGateSessionCompactionConfig {
-            input_token_threshold: 42,
-            prefix_ratio: 0.5,
-        };
+        let config = CognitionGateSessionCompactionConfig { prefix_ratio: 0.5 };
         let gate = fixture.gate.with_session_compaction(config);
 
         assert_eq!(gate.session_compaction, config);
@@ -556,7 +559,7 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let decision = fixture
             .gate
-            .run_decision_turn(&lutum, &lutum)
+            .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
 
@@ -601,7 +604,7 @@ mod tests {
         let lutum = fixture.gate.llm.lutum().await;
         let decision = fixture
             .gate
-            .run_decision_turn(&lutum, &lutum)
+            .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
 
@@ -647,7 +650,7 @@ mod tests {
             &modules,
             &identity_memories,
             &[],
-            lutum.lutum().clone(),
+            compaction_runtime(&lutum),
             SystemClock.now(),
         );
 
@@ -713,7 +716,7 @@ mod tests {
             &modules,
             &identity_memories,
             &[],
-            lutum.lutum().clone(),
+            compaction_runtime(&lutum),
             SystemClock.now(),
         );
 
@@ -862,7 +865,7 @@ mod tests {
             &modules,
             &identity_memories,
             &[],
-            lutum.lutum().clone(),
+            compaction_runtime(&lutum),
             SystemClock.now(),
         );
 

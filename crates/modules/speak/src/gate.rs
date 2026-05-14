@@ -6,10 +6,10 @@ use lutum::{Lutum, Session, StructuredStepOutcomeWithTools, StructuredTurnOutcom
 use nuillu_module::{
     ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEntryRecord, CognitionLogReader,
-    LlmAccess, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
-    UtteranceProgress, UtteranceProgressState, compact_session_if_needed,
-    format_faculty_system_prompt, format_stuckness, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    LlmAccess, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    SessionCompactionRuntime, TypedMemo, UtteranceProgress, UtteranceProgressState,
+    compact_session_if_needed, format_faculty_system_prompt, format_stuckness,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use schemars::JsonSchema;
@@ -527,7 +527,7 @@ impl SpeakGateModule {
 
         let lutum = self.llm.lutum().await;
         let decision = self
-            .run_decision_turn(&lutum, cx.session_compaction_lutum(), self_model_available)
+            .run_decision_turn(&lutum, cx.session_compaction(), self_model_available)
             .await?;
         let memo =
             self.build_memo_from_decision(decision, latest_cognition_index, stuckness.is_some());
@@ -543,7 +543,7 @@ impl SpeakGateModule {
     async fn run_decision_turn(
         &mut self,
         lutum: &Lutum,
-        compaction_lutum: &Lutum,
+        compaction: &SessionCompactionRuntime,
         self_model_available: bool,
     ) -> Result<SpeakGateDecision> {
         let mut memory_requests = HashSet::<String>::new();
@@ -567,7 +567,7 @@ impl SpeakGateModule {
                     let StructuredTurnOutcome::Structured(decision) = result.semantic else {
                         anyhow::bail!("speak-gate decision turn refused");
                     };
-                    self.compact_if_needed(input_tokens, compaction_lutum).await;
+                    self.compact_if_needed(input_tokens, compaction).await;
                     return Ok(apply_requested_evidence_guard(
                         decision,
                         &requested_evidence_sources,
@@ -609,7 +609,7 @@ impl SpeakGateModule {
                     round
                         .commit(&mut self.session, results)
                         .context("commit speak-gate tool round")?;
-                    self.compact_if_needed(input_tokens, compaction_lutum).await;
+                    self.compact_if_needed(input_tokens, compaction).await;
                 }
             }
         }
@@ -617,11 +617,11 @@ impl SpeakGateModule {
         anyhow::bail!("speak-gate decision did not finish before tool-round limit")
     }
 
-    async fn compact_if_needed(&mut self, input_tokens: u64, lutum: &Lutum) {
+    async fn compact_if_needed(&mut self, input_tokens: u64, runtime: &SessionCompactionRuntime) {
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
-            lutum,
+            runtime,
             self.session_compaction,
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
@@ -768,27 +768,31 @@ mod tests {
     };
     use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, IdentityMemoryRecord};
     use nuillu_module::ports::{Clock, SystemClock};
-    use nuillu_module::session_compaction_cutoff;
-    use nuillu_types::{MemoryContent, MemoryIndex};
+    use nuillu_module::{
+        SessionCompactionPolicy, SessionCompactionRuntime, session_compaction_cutoff,
+    };
+    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier};
+
+    fn compaction_runtime(lutum: &Lutum) -> SessionCompactionRuntime {
+        SessionCompactionRuntime::new(
+            lutum.clone(),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::default(),
+        )
+    }
 
     #[test]
-    fn session_compaction_config_defaults_to_16k_and_80_percent() {
+    fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
             SpeakGateSessionCompactionConfig::default(),
-            SpeakGateSessionCompactionConfig {
-                input_token_threshold: 16_000,
-                prefix_ratio: 0.8,
-            }
+            SpeakGateSessionCompactionConfig { prefix_ratio: 0.8 }
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_compaction_builder_replaces_config() {
         let fixture = gate_tool_fixture().await;
-        let config = SpeakGateSessionCompactionConfig {
-            input_token_threshold: 42,
-            prefix_ratio: 0.5,
-        };
+        let config = SpeakGateSessionCompactionConfig { prefix_ratio: 0.5 };
         let gate = fixture.gate.with_session_compaction(config);
 
         assert_eq!(gate.session_compaction, config);
@@ -811,7 +815,7 @@ mod tests {
             &modules,
             &identity_memories,
             &[],
-            lutum.lutum().clone(),
+            compaction_runtime(lutum.lutum()),
             SystemClock.now(),
         );
 
@@ -852,9 +856,10 @@ mod tests {
         }
 
         let lutum = fixture.gate.llm.lutum().await;
+        let compaction = compaction_runtime(lutum.lutum());
         let decision = fixture
             .gate
-            .run_decision_turn(&lutum, &lutum, false)
+            .run_decision_turn(&lutum, &compaction, false)
             .await
             .unwrap();
 
@@ -898,9 +903,10 @@ mod tests {
         }
 
         let lutum = fixture.gate.llm.lutum().await;
+        let compaction = compaction_runtime(lutum.lutum());
         let decision = fixture
             .gate
-            .run_decision_turn(&lutum, &lutum, false)
+            .run_decision_turn(&lutum, &compaction, false)
             .await
             .unwrap();
 
@@ -939,9 +945,10 @@ mod tests {
         }
 
         let lutum = fixture.gate.llm.lutum().await;
+        let compaction = compaction_runtime(lutum.lutum());
         let decision = fixture
             .gate
-            .run_decision_turn(&lutum, &lutum, false)
+            .run_decision_turn(&lutum, &compaction, false)
             .await
             .unwrap();
 

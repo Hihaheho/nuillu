@@ -27,6 +27,7 @@ pub struct LlmBackendConfig {
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub use_responses_api: bool,
+    pub compaction_input_token_threshold: u64,
 }
 
 #[derive(Debug, Clone)]

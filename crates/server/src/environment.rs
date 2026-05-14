@@ -19,6 +19,7 @@ use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, LutumTiers, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
+    SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_query_agentic::{FileSearchProvider, NoopFileSearchProvider};
@@ -74,6 +75,7 @@ pub(super) async fn build_server_environment(
             policy: RuntimePolicy {
                 memo_retained_per_owner: 256,
                 max_concurrent_llm_calls: config.max_concurrent_llm_calls,
+                session_compaction: session_compaction_policy(config),
                 ..RuntimePolicy::default()
             },
         },
@@ -107,6 +109,14 @@ pub(super) async fn build_server_environment(
         file_search: Arc::new(NoopFileSearchProvider),
         utterance_sink,
     })
+}
+
+fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
+    SessionCompactionPolicy::new(
+        config.cheap_backend.compaction_input_token_threshold,
+        config.default_backend.compaction_input_token_threshold,
+        config.premium_backend.compaction_input_token_threshold,
+    )
 }
 
 async fn connect_memory_store(config: &ServerConfig) -> anyhow::Result<LibsqlMemoryStore> {

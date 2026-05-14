@@ -7,10 +7,10 @@ use nuillu_blackboard::{ActivationRatio, ModuleConfig};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     BlackboardReader, CognitionLogReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
-    format_available_faculties, format_current_attention_guidance, format_faculty_system_prompt,
-    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
+    compact_session_if_needed, format_available_faculties, format_current_attention_guidance,
+    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
+    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
     seed_persistent_faculty_session,
 };
 use nuillu_types::{ModuleId, builtin};
@@ -206,7 +206,7 @@ impl AttentionControllerModule {
     async fn activate_with(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        compaction_lutum: &lutum::Lutum,
+        compaction: &SessionCompactionRuntime,
         requests: &[AttentionControlRequest],
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
@@ -270,7 +270,7 @@ impl AttentionControllerModule {
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
-            compaction_lutum,
+            compaction,
             self.session_compaction,
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
@@ -452,7 +452,7 @@ impl Module for AttentionControllerModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        self.activate_with(cx, cx.session_compaction_lutum(), &batch.requests)
+        self.activate_with(cx, cx.session_compaction(), &batch.requests)
             .await
     }
 }
@@ -825,24 +825,29 @@ mod tests {
             (builtin::sensory(), "test stub"),
         ];
         let identity_memories = Vec::new();
+        let compaction = nuillu_module::SessionCompactionRuntime::new(
+            lutum.lutum().clone(),
+            nuillu_types::ModelTier::Cheap,
+            nuillu_module::SessionCompactionPolicy::default(),
+        );
         let cx = nuillu_module::ActivateCx::new(
             &modules,
             &identity_memories,
             &[],
-            lutum.lutum().clone(),
+            compaction.clone(),
             SystemClock.now(),
         );
 
         fixture.source_memo.write("sensory memo A").await;
         fixture
             .controller
-            .activate_with(&cx, &lutum, &[])
+            .activate_with(&cx, &compaction, &[])
             .await
             .unwrap();
         fixture.source_memo.write("sensory memo B").await;
         fixture
             .controller
-            .activate_with(&cx, &lutum, &[])
+            .activate_with(&cx, &compaction, &[])
             .await
             .unwrap();
 

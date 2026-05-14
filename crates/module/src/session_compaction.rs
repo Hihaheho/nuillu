@@ -1,13 +1,27 @@
 use anyhow::{Context, Result};
 use lutum::{AssistantInputItem, InputMessageRole, Lutum, ModelInput, ModelInputItem, Session};
+use nuillu_types::ModelTier;
 
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionCompactionConfig {
-    pub input_token_threshold: u64,
     pub prefix_ratio: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionCompactionPolicy {
+    pub cheap_input_token_threshold: u64,
+    pub default_input_token_threshold: u64,
+    pub premium_input_token_threshold: u64,
+}
+
+#[derive(Clone)]
+pub struct SessionCompactionRuntime {
+    lutum: Lutum,
+    module_tier: ModelTier,
+    policy: SessionCompactionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,9 +35,66 @@ pub enum SessionCompactionProtectedPrefix {
 impl Default for SessionCompactionConfig {
     fn default() -> Self {
         Self {
-            input_token_threshold: DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD,
             prefix_ratio: DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
         }
+    }
+}
+
+impl SessionCompactionPolicy {
+    pub const fn new(
+        cheap_input_token_threshold: u64,
+        default_input_token_threshold: u64,
+        premium_input_token_threshold: u64,
+    ) -> Self {
+        Self {
+            cheap_input_token_threshold,
+            default_input_token_threshold,
+            premium_input_token_threshold,
+        }
+    }
+
+    pub fn threshold_for(&self, tier: ModelTier) -> u64 {
+        match tier {
+            ModelTier::Cheap => self.cheap_input_token_threshold,
+            ModelTier::Default => self.default_input_token_threshold,
+            ModelTier::Premium => self.premium_input_token_threshold,
+        }
+    }
+}
+
+impl Default for SessionCompactionPolicy {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD,
+            DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD,
+            DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD,
+        )
+    }
+}
+
+impl SessionCompactionRuntime {
+    pub fn new(lutum: Lutum, module_tier: ModelTier, policy: SessionCompactionPolicy) -> Self {
+        Self {
+            lutum,
+            module_tier,
+            policy,
+        }
+    }
+
+    pub fn lutum(&self) -> &Lutum {
+        &self.lutum
+    }
+
+    pub fn module_tier(&self) -> ModelTier {
+        self.module_tier
+    }
+
+    pub fn policy(&self) -> SessionCompactionPolicy {
+        self.policy
+    }
+
+    pub fn input_token_threshold(&self) -> u64 {
+        self.policy.threshold_for(self.module_tier)
     }
 }
 
@@ -43,19 +114,20 @@ pub fn session_compaction_cutoff(item_count: usize, prefix_ratio: f64) -> Option
 pub async fn compact_session_if_needed(
     session: &mut Session,
     input_tokens: u64,
-    lutum: &Lutum,
+    runtime: &SessionCompactionRuntime,
     config: SessionCompactionConfig,
     protected_prefix: SessionCompactionProtectedPrefix,
     module_name: &str,
     compacted_prefix: &str,
     compaction_prompt: &str,
 ) {
-    if input_tokens <= config.input_token_threshold {
+    let threshold = runtime.input_token_threshold();
+    if input_tokens <= threshold {
         return;
     }
     if let Err(error) = compact_session(
         session,
-        lutum,
+        runtime.lutum(),
         config,
         protected_prefix,
         compacted_prefix,
@@ -66,7 +138,8 @@ pub async fn compact_session_if_needed(
         tracing::warn!(
             module = module_name,
             input_tokens,
-            threshold = config.input_token_threshold,
+            threshold,
+            module_tier = ?runtime.module_tier(),
             error = ?error,
             "module session compaction failed"
         );
@@ -169,6 +242,7 @@ mod tests {
         ErasedTextTurnEventStream, FinishReason, MessageContent, MockLlmAdapter, MockTextScenario,
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
+    use nuillu_types::ModelTier;
 
     use super::*;
 
@@ -218,6 +292,18 @@ mod tests {
         (lutum, observed)
     }
 
+    fn compaction_runtime(
+        lutum: Lutum,
+        module_tier: ModelTier,
+        threshold: u64,
+    ) -> SessionCompactionRuntime {
+        SessionCompactionRuntime::new(
+            lutum,
+            module_tier,
+            SessionCompactionPolicy::new(threshold, threshold, threshold),
+        )
+    }
+
     fn summary_scenario(summary: &str) -> MockTextScenario {
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
@@ -260,6 +346,76 @@ mod tests {
         text
     }
 
+    #[test]
+    fn policy_resolves_threshold_by_module_tier() {
+        let policy = SessionCompactionPolicy::new(11, 22, 33);
+
+        assert_eq!(policy.threshold_for(ModelTier::Cheap), 11);
+        assert_eq!(policy.threshold_for(ModelTier::Default), 22);
+        assert_eq!(policy.threshold_for(ModelTier::Premium), 33);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn below_runtime_threshold_does_not_call_compaction_llm() {
+        let adapter = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(summary_scenario("unexpected")),
+        );
+        let (lutum, observed) = lutum_with_adapter(adapter);
+        let runtime = compaction_runtime(lutum, ModelTier::Default, 42);
+        let mut session = Session::new();
+        session.push_user("history-0");
+        session.push_user("history-1");
+
+        compact_session_if_needed(
+            &mut session,
+            42,
+            &runtime,
+            SessionCompactionConfig::default(),
+            SessionCompactionProtectedPrefix::None,
+            "test-module",
+            "Compacted session:",
+            "Summarize.",
+        )
+        .await;
+
+        assert!(observed.text_inputs().is_empty());
+        assert_eq!(
+            text_of_user_messages(session.input().items()),
+            vec!["history-0", "history-1"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn above_runtime_threshold_compacts() {
+        let adapter = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(summary_scenario("old history")),
+        );
+        let (lutum, observed) = lutum_with_adapter(adapter);
+        let runtime = compaction_runtime(lutum, ModelTier::Default, 42);
+        let mut session = Session::new();
+        session.push_user("history-0");
+        session.push_user("history-1");
+        session.push_user("history-2");
+
+        compact_session_if_needed(
+            &mut session,
+            43,
+            &runtime,
+            SessionCompactionConfig::default(),
+            SessionCompactionProtectedPrefix::None,
+            "test-module",
+            "Compacted session:",
+            "Summarize.",
+        )
+        .await;
+
+        assert_eq!(observed.text_inputs().len(), 1);
+        assert_eq!(
+            assistant_text(&session.input().items()[0]),
+            "Compacted session:\nold history"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn protects_system_and_identity_and_summarizes_tail_only() {
         let adapter = CapturingAdapter::new(
@@ -278,10 +434,7 @@ mod tests {
         compact_session(
             &mut session,
             &lutum,
-            SessionCompactionConfig {
-                input_token_threshold: 1,
-                prefix_ratio: 0.6,
-            },
+            SessionCompactionConfig { prefix_ratio: 0.6 },
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             "Compacted session:",
             "Summarize.",
@@ -344,10 +497,7 @@ mod tests {
         compact_session(
             &mut session,
             &lutum,
-            SessionCompactionConfig {
-                input_token_threshold: 1,
-                prefix_ratio: 0.6,
-            },
+            SessionCompactionConfig { prefix_ratio: 0.6 },
             SessionCompactionProtectedPrefix::None,
             "Compacted session:",
             "Summarize.",
@@ -376,10 +526,7 @@ mod tests {
         compact_session(
             &mut session,
             &lutum,
-            SessionCompactionConfig {
-                input_token_threshold: 1,
-                prefix_ratio: 0.8,
-            },
+            SessionCompactionConfig { prefix_ratio: 0.8 },
             SessionCompactionProtectedPrefix::Count(99),
             "Compacted session:",
             "Summarize.",
@@ -415,10 +562,7 @@ mod tests {
         compact_session(
             &mut session,
             &lutum,
-            SessionCompactionConfig {
-                input_token_threshold: 1,
-                prefix_ratio: 1.0,
-            },
+            SessionCompactionConfig { prefix_ratio: 1.0 },
             SessionCompactionProtectedPrefix::LeadingSystem,
             "Compacted session:",
             "Summarize.",

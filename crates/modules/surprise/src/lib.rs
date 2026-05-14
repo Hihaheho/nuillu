@@ -141,7 +141,7 @@ impl SurpriseModule {
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
-            cx.session_compaction_lutum(),
+            cx.session_compaction(),
             self.session_compaction,
             SessionCompactionProtectedPrefix::None,
             Self::id(),

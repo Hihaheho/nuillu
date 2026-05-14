@@ -5,9 +5,10 @@ use std::rc::Rc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::Lutum;
 use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
 use nuillu_types::ModuleId;
+
+use crate::SessionCompactionRuntime;
 
 /// Read-only context passed to `Module::activate` carrying agent-wide
 /// information that is shared across all modules. **Capabilities are
@@ -18,7 +19,7 @@ pub struct ActivateCx<'a> {
     modules: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
     core_policies: &'a [CorePolicyRecord],
-    session_compaction_lutum: Lutum,
+    session_compaction: SessionCompactionRuntime,
     now: DateTime<Utc>,
 }
 
@@ -27,14 +28,14 @@ impl<'a> ActivateCx<'a> {
         modules: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
         core_policies: &'a [CorePolicyRecord],
-        session_compaction_lutum: Lutum,
+        session_compaction: SessionCompactionRuntime,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
             modules,
             identity_memories,
             core_policies,
-            session_compaction_lutum,
+            session_compaction,
             now,
         }
     }
@@ -54,9 +55,9 @@ impl<'a> ActivateCx<'a> {
         self.core_policies
     }
 
-    /// Cheap shared LLM handle for module-owned session compaction.
-    pub fn session_compaction_lutum(&self) -> &Lutum {
-        &self.session_compaction_lutum
+    /// Runtime state for module-owned session compaction.
+    pub fn session_compaction(&self) -> &SessionCompactionRuntime {
+        &self.session_compaction
     }
 
     pub fn now(&self) -> DateTime<Utc> {
