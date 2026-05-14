@@ -1,0 +1,210 @@
+/// Schema for eval-cases/modules/cognition-gate/**/*.eure files.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+id {
+  $variant: text
+  min-length = 1
+}
+id.$optional = true
+
+description = `text`
+description.$optional = true
+
+now = `text`
+now.$optional = true
+
+modules = [`$types.eval-module`]
+modules.$optional = true
+
+prompt {
+  $variant: text
+  min-length = 1
+}
+
+context = `text`
+context.$optional = true
+
+memories = [`$types.memory-seed`]
+memories.$optional = true
+
+memos = [`$types.memo-seed`]
+memos.$optional = true
+
+cognition-log = [`$types.cognition-log-seed`]
+cognition-log.$optional = true
+
+limits = `$types.eval-limits`
+limits.$optional = true
+
+checks = [`$types.check`]
+checks.$optional = true
+
+scoring = `$types.case-scoring`
+scoring.$optional = true
+
+@ $types.eval-module
+$variant: union
+variants.sensory = { = "sensory", $variant => "literal" }
+variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
+variants.attention-controller = { = "attention-controller", $variant => "literal" }
+variants.attention-schema = { = "attention-schema", $variant => "literal" }
+variants.self-model = { = "self-model", $variant => "literal" }
+variants.query-vector = { = "query-vector", $variant => "literal" }
+variants.query-policy = { = "query-policy", $variant => "literal" }
+variants.memory = { = "memory", $variant => "literal" }
+variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
+variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
+variants.vital = { = "vital", $variant => "literal" }
+variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
+variants.policy = { = "policy", $variant => "literal" }
+variants.value-estimator = { = "value-estimator", $variant => "literal" }
+variants.reward = { = "reward", $variant => "literal" }
+variants.predict = { = "predict", $variant => "literal" }
+variants.surprise = { = "surprise", $variant => "literal" }
+variants.speak-gate = { = "speak-gate", $variant => "literal" }
+variants.speak = { = "speak", $variant => "literal" }
+
+@ $types.memory-rank
+$variant: union
+variants.short-term = { = "short-term", $variant => "literal" }
+variants.mid-term = { = "mid-term", $variant => "literal" }
+variants.long-term = { = "long-term", $variant => "literal" }
+variants.permanent = { = "permanent", $variant => "literal" }
+variants.identity = { = "identity", $variant => "literal" }
+
+@ $types.memory-seed
+rank = `$types.memory-rank`
+rank.$optional = true
+decay-secs = `integer`
+decay-secs.$optional = true
+datetime = `text`
+datetime.$optional = true
+seconds-ago = `integer`
+seconds-ago.$optional = true
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.memo-seed
+module = `text`
+replica = `integer`
+replica.$optional = true
+seconds-ago = `integer`
+seconds-ago.$optional = true
+content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.cognition-log-seed
+text {
+  $variant: text
+  min-length = 1
+}
+seconds-ago = `integer`
+seconds-ago.$optional = true
+
+@ $types.eval-limits
+max-llm-calls = `integer`
+max-llm-calls.$optional = true
+
+@ $types.case-scoring
+judge-max-output-tokens = `integer`
+judge-max-output-tokens.$optional = true
+
+@ $types.check-common
+name = `text`
+name.$optional = true
+must-pass = `boolean`
+must-pass.$optional = true
+weight = `integer`
+weight.$optional = true
+
+@ $types.artifact-text-field
+$variant: union
+variants.output = { = "output", $variant => "literal" }
+variants.failure = { = "failure", $variant => "literal" }
+
+@ $types.rubric-judge-input
+$variant: union
+variants.output = { = "output", $variant => "literal" }
+variants.utterance = { = "utterance", $variant => "literal" }
+variants.failure = { = "failure", $variant => "literal" }
+variants.trace = { = "trace", $variant => "literal" }
+variants.observations = { = "observations", $variant => "literal" }
+variants.blackboard = { = "blackboard", $variant => "literal" }
+variants.memory = { = "memory", $variant => "literal" }
+variants.memos = { = "memos", $variant => "literal" }
+variants.cognition = { = "cognition", $variant => "literal" }
+variants.allocation = { = "allocation", $variant => "literal" }
+
+@ $types.rubric-criterion
+name = `text`
+description {
+  $variant: text
+  min-length = 1
+}
+weight = `integer`
+weight.$optional = true
+pass-score = `float`
+pass-score.$optional = true
+
+@ $types.check
+$variant: union
+
+variants.artifact-text-contains {
+  $flatten = [`$types.check-common`]
+  field = `$types.artifact-text-field`
+  field.$optional = true
+  contains = `text`
+}
+
+variants.artifact-text-exact {
+  $flatten = [`$types.check-common`]
+  field = `$types.artifact-text-field`
+  field.$optional = true
+  exact = `text`
+}
+
+variants.json-pointer-equals {
+  $flatten = [`$types.check-common`]
+  pointer = `text`
+  expected = `text`
+}
+
+variants.json-pointer-contains {
+  $flatten = [`$types.check-common`]
+  pointer = `text`
+  contains = `text`
+}
+
+variants.rubric {
+  $flatten = [`$types.check-common`]
+  rubric {
+    $variant: text
+    min-length = 1
+  }
+  pass-score = `float`
+  pass-score.$optional = true
+  judge-inputs = [`$types.rubric-judge-input`]
+  judge-inputs.$optional = true
+  criteria = [`$types.rubric-criterion`]
+  criteria.$optional = true
+}
+
+variants.trace-span {
+  $flatten = [`$types.check-common`]
+  span-name = `text`
+}
+
+variants.trace-event {
+  $flatten = [`$types.check-common`]
+  message-contains = `text`
+}
+
+variants.trace-spans-ordered {
+  $flatten = [`$types.check-common`]
+  names = [`text`]
+}

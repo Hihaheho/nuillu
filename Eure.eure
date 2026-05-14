@@ -14,6 +14,18 @@ schema = "schemas/eval-full-agent-last-state.schema.eure"
 globs = ["eval-cases/modules/query-vector/**/*.eure"]
 schema = "schemas/eval-query-vector-case.schema.eure"
 
+@ targets.eval-cognition-gate-cases
+globs = ["eval-cases/modules/cognition-gate/**/*.eure"]
+schema = "schemas/eval-cognition-gate-case.schema.eure"
+
+@ targets.eval-speak-gate-cases
+globs = ["eval-cases/modules/speak-gate/**/*.eure"]
+schema = "schemas/eval-speak-case.schema.eure"
+
+@ targets.eval-speak-cases
+globs = ["eval-cases/modules/speak/**/*.eure"]
+schema = "schemas/eval-speak-case.schema.eure"
+
 @ targets.eval-attention-schema-cases
 globs = ["eval-cases/modules/attention-schema/**/*.eure"]
 schema = "schemas/eval-attention-schema-case.schema.eure"
@@ -26,6 +38,9 @@ schema = "schemas/eval-model-set.schema.eure"
 default-targets = [
   "eval-full-agent-cases",
   "eval-query-vector-cases",
+  "eval-cognition-gate-cases",
+  "eval-speak-gate-cases",
+  "eval-speak-cases",
   "eval-attention-schema-cases",
   "eval-modelsets",
 ]

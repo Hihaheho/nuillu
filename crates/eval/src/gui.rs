@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
+    let planned_tabs = visualizer_planned_tabs(&config)?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind visualizer RPC listener")?;
     let addr = listener
         .local_addr()
@@ -34,7 +35,7 @@ pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
     port.send(VisualizerServerMessage::hello())
         .context("send visualizer protocol hello")?;
     wait_for_client_hello(&port)?;
-    for (tab_id, title) in visualizer_planned_tabs(&config)? {
+    for (tab_id, title) in planned_tabs {
         port.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
             tab_id: tab_id.clone(),
             title,

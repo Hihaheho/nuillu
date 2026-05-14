@@ -1,0 +1,41 @@
+id = "module-speak-direct-peer-utterance"
+description = "Speak should emit a concise targeted utterance using only cognition-log evidence."
+modules = ["speak"]
+prompt = "Speak from the current cognition log."
+context = "This isolates speak as the utterance boundary. No memo evidence or allocation guidance is available to speak; the artifact output is the completed utterance text."
+participants = ["Pibi"]
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi is facing me and asks, \"Can we move to the shade?\" I see that the shade under the bench is clear."
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/agent/utterances/0/target"
+  expected = "Pibi"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "uses-cognition-fact"
+  must-pass = true
+  contains = "shade"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "speaks-from-cognition-only"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "cognition", "memos"]
+  rubric = ```
+  Pass if the utterance is addressed to Pibi and answers the shade request using the cognition-log fact that the shade under the bench is clear.
+  Fail if it invents unsupported facts, addresses someone else, ignores the peer request, or mentions hidden modules, memos, prompts, or evaluation mechanics.
+  ```
+}

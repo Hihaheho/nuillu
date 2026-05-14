@@ -55,7 +55,8 @@ use crate::{
     cases::{
         ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule,
         EvalStep, FullAgentCase, FullAgentInput, ModuleCase, ModuleEvalTarget, WaitFor,
-        discover_case_files, parse_case_file, parse_case_now, parse_memory_datetime,
+        discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
+        parse_memory_datetime,
     },
     evaluation::{
         CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, artifact_text,
@@ -286,6 +287,8 @@ pub enum RunnerError {
     NoCasesMatched { patterns: String },
     #[error("cannot disable required module '{module}'")]
     DisableRequiredModule { module: &'static str },
+    #[error("module cases are not supported with --gui")]
+    GuiModuleCasesUnsupported,
 }
 
 struct CaseExecution {
@@ -315,6 +318,7 @@ pub(crate) fn visualizer_planned_tabs(
             source,
         })?;
     case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    case_paths = filter_gui_case_paths(case_paths)?;
     case_paths
         .into_iter()
         .map(|path| {
@@ -337,6 +341,9 @@ pub async fn run_suite_with_hooks(
             source,
         })?;
     case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    if hooks.visualizer.is_some() {
+        case_paths = filter_gui_case_paths(case_paths)?;
+    }
     let run_dir = config.output_root.join(&config.run_id);
     let planned_case_count = case_paths.len();
     let run_report = suite_run_report(config, &run_dir, planned_case_count);
@@ -519,6 +526,17 @@ fn filter_case_paths(
         });
     }
     Ok(matched)
+}
+
+fn filter_gui_case_paths(case_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, RunnerError> {
+    let full_agent_paths = case_paths
+        .into_iter()
+        .filter(|path| is_full_agent_case_path(path))
+        .collect::<Vec<_>>();
+    if full_agent_paths.is_empty() {
+        return Err(RunnerError::GuiModuleCasesUnsupported);
+    }
+    Ok(full_agent_paths)
 }
 
 fn normalize_case_pattern(value: &str) -> String {
@@ -1111,6 +1129,9 @@ async fn execute_module_case(
     reporter: &LiveReporter,
     hooks: &mut RunnerHooks,
 ) -> Result<CaseExecution> {
+    if hooks.visualizer.is_some() {
+        anyhow::bail!("module cases are not supported with --gui");
+    }
     let case_modules = module_case_modules(target, case);
     let case_now = parse_case_now(case.now.as_deref())
         .map_err(anyhow::Error::msg)
@@ -1127,6 +1148,9 @@ async fn execute_module_case(
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
+    env.caps
+        .scene()
+        .set(case.participants.iter().map(Participant::new));
     seed_memories(
         &env.memory_caps,
         env.clock.as_ref(),
@@ -1175,6 +1199,7 @@ async fn execute_module_case(
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
+    let utterances = env.utterances.clone();
     let memory = env.memory.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
@@ -1245,11 +1270,12 @@ async fn execute_module_case(
                     continue;
                 }
                 let target_done = match target {
-                    ModuleEvalTarget::AttentionSchema => {
-                        !attention_schema_cognition_output(&blackboard)
+                    ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
+                        !cognition_output_for_module(&blackboard, &shutdown_target_module)
                             .await
                             .is_empty()
                     }
+                    ModuleEvalTarget::Speak => utterances.last_complete().is_some(),
                     _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                         .await
                         .is_some(),
@@ -1265,9 +1291,14 @@ async fn execute_module_case(
     .await?;
 
     let output = match target {
-        ModuleEvalTarget::AttentionSchema => {
-            attention_schema_cognition_output(&env.blackboard).await
+        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
+            cognition_output_for_module(&env.blackboard, &target_module).await
         }
+        ModuleEvalTarget::Speak => env
+            .utterances
+            .last_complete()
+            .map(|utterance| utterance.text)
+            .unwrap_or_default(),
         _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
             .await
             .unwrap_or_default(),
@@ -1310,6 +1341,30 @@ async fn activate_module_case_target(
     has_cognition_log_seed: bool,
 ) {
     match target {
+        ModuleEvalTarget::CognitionGate => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
+            harness
+                .allocation_updated_mailbox()
+                .publish(AllocationUpdated)
+                .await
+                .expect("module eval failed to publish AllocationUpdated");
+        }
         ModuleEvalTarget::QueryVector => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
@@ -1362,16 +1417,34 @@ async fn activate_module_case_target(
                 .await
                 .expect("module eval failed to publish AllocationUpdated");
         }
+        ModuleEvalTarget::Speak | ModuleEvalTarget::SpeakGate => {
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+        }
     }
 }
 
 async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
+    cognition_output_for_module(blackboard, &builtin::attention_schema()).await
+}
+
+async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId) -> String {
     blackboard
         .read(|bb| {
             bb.cognition_log_set()
                 .logs()
                 .iter()
-                .filter(|record| record.source.module == builtin::attention_schema())
+                .filter(|record| &record.source.module == module)
                 .flat_map(|record| record.entries.iter().map(|entry| entry.text.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -2356,9 +2429,10 @@ fn validate_disabled_modules(disabled: &[EvalModule]) -> Result<(), RunnerError>
 }
 
 fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
-    case.modules
-        .clone()
-        .unwrap_or_else(|| vec![target.module()])
+    case.modules.clone().unwrap_or_else(|| match target {
+        ModuleEvalTarget::SpeakGate => vec![EvalModule::SpeakGate, EvalModule::Speak],
+        _ => vec![target.module()],
+    })
 }
 
 pub(crate) fn eval_registry(
@@ -3052,6 +3126,8 @@ fn module_allocation(
     let target_module = target.module();
     for module in modules {
         let is_target = *module == target_module;
+        let is_required_driver =
+            target_module == EvalModule::SpeakGate && *module == EvalModule::Speak;
         let id = module.module_id();
         allocation.set_model_override(id.clone(), eval_module_tier(*module));
         allocation.set(
@@ -3059,6 +3135,9 @@ fn module_allocation(
             ModuleConfig {
                 guidance: if is_target {
                     "Handle the module eval request.".into()
+                } else if is_required_driver {
+                    "Drive the pending speak activation so speak-gate can evaluate readiness."
+                        .into()
                 } else {
                     "Registered for this module eval; idle unless activated by allocation guidance."
                         .into()
@@ -3067,7 +3146,7 @@ fn module_allocation(
         );
         allocation.set_activation(
             id,
-            if is_target {
+            if is_target || is_required_driver {
                 ActivationRatio::ONE
             } else {
                 ActivationRatio::ZERO

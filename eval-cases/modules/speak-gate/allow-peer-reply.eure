@@ -1,0 +1,40 @@
+id = "module-speak-gate-allow-peer-reply"
+description = "Speak-gate should allow speech when the cognition log already contains the direct peer request and the facts needed to answer it."
+modules = ["speak-gate", "speak"]
+prompt = "Decide whether speak may answer the peer now."
+context = "This isolates speak-gate readiness. Speak is registered only to create the pending activation that triggers the gate; the scored artifact is the speak-gate memo."
+participants = ["Pibi"]
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi is facing me and asks, \"Can we move to the shade?\" I see that the shade under the bench is clear."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "allows-speech"
+  must-pass = true
+  contains = "Speak decision: wants to speak"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "no-evidence-gap"
+  must-pass = true
+  contains = "Evidence gaps: none"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "ready-when-cognition-is-sufficient"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "cognition", "memos"]
+  rubric = ```
+  Pass if speak-gate allows speech because the cognition log already contains a direct peer request and the answer-relevant fact that the shade under the bench is clear.
+  Fail if it waits for memory, self-model, or cognition-promotion evidence that is not needed for this simple peer reply, or if it leaks hidden implementation mechanics.
+  ```
+}

@@ -161,6 +161,8 @@ pub struct ModuleCase {
     #[eure(default)]
     pub context: Option<Text>,
     #[eure(default)]
+    pub participants: Vec<String>,
+    #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
     pub memos: Vec<MemoSeed>,
@@ -298,25 +300,34 @@ impl FullAgentCase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleEvalTarget {
+    CognitionGate,
     QueryVector,
     AttentionSchema,
     SelfModel,
+    SpeakGate,
+    Speak,
 }
 
 impl ModuleEvalTarget {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::CognitionGate => "cognition-gate",
             Self::QueryVector => "query-vector",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
+            Self::SpeakGate => "speak-gate",
+            Self::Speak => "speak",
         }
     }
 
     pub fn module(self) -> EvalModule {
         match self {
+            Self::CognitionGate => EvalModule::CognitionGate,
             Self::QueryVector => EvalModule::QueryVector,
             Self::AttentionSchema => EvalModule::AttentionSchema,
             Self::SelfModel => EvalModule::SelfModel,
+            Self::SpeakGate => EvalModule::SpeakGate,
+            Self::Speak => EvalModule::Speak,
         }
     }
 
@@ -324,9 +335,12 @@ impl ModuleEvalTarget {
         path.components()
             .filter_map(|component| component.as_os_str().to_str())
             .find_map(|part| match part {
+                "cognition-gate" => Some(Self::CognitionGate),
                 "query-vector" => Some(Self::QueryVector),
                 "attention-schema" => Some(Self::AttentionSchema),
                 "self-model" => Some(Self::SelfModel),
+                "speak-gate" => Some(Self::SpeakGate),
+                "speak" => Some(Self::Speak),
                 _ => None,
             })
     }
@@ -724,8 +738,7 @@ pub fn parse_case_file(path: &Path) -> Result<EvalCase, CaseFileError> {
     }
     let target = ModuleEvalTarget::from_path(path).ok_or_else(|| CaseFileError::Validation {
         path: path.to_path_buf(),
-        message: "module eval case path must include query-vector, attention-schema, or self-model"
-            .to_string(),
+        message: "module eval case path must include a supported module directory".to_string(),
     })?;
     let case = parse_module_case_file(path)?;
     validate_module_case_target(path, target, &case)?;
@@ -846,7 +859,7 @@ fn is_persisted_eval_output_file_name(name: &str) -> bool {
     )
 }
 
-fn is_full_agent_case_path(path: &Path) -> bool {
+pub(crate) fn is_full_agent_case_path(path: &Path) -> bool {
     path.components()
         .filter_map(|component| component.as_os_str().to_str())
         .any(|part| part == "full-agent")
@@ -982,6 +995,14 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             path: path.to_path_buf(),
             message: "prompt must not be empty".to_string(),
         });
+    }
+    for (index, participant) in case.participants.iter().enumerate() {
+        if participant.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("participants[{index}] must not be empty"),
+            });
+        }
     }
     for (index, seed) in case.cognition_log.iter().enumerate() {
         if seed.text.content.trim().is_empty() {

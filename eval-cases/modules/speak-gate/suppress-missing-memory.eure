@@ -1,0 +1,40 @@
+id = "module-speak-gate-suppress-missing-memory"
+description = "Speak-gate should suppress speech when a peer asks for a specific remembered fact that is absent from the cognition log."
+modules = ["speak-gate", "speak"]
+prompt = "Decide whether speak may answer the peer now."
+context = "The cognition log contains the request but not the remembered fact needed to answer. The correct gate behavior is to wait and name the missing evidence rather than allow guessed speech."
+participants = ["Pibi"]
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi asks me, \"Where exactly did Mika hide the blue pebble yesterday?\" The current cognition log contains no remembered location for the blue pebble."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "suppresses-for-missing-evidence"
+  must-pass = true
+  contains = "Speak decision: wants to speak but missing evidence"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "names-evidence-gap"
+  must-pass = true
+  contains = "Evidence gaps:"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "waits-for-memory-before-speaking"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "cognition", "memos", "trace"]
+  rubric = ```
+  Pass if speak-gate suppresses the pending speech because the exact remembered location of the blue pebble is missing from cognition, and its memo names a concrete memory or cognition-promotion evidence gap.
+  Fail if it allows speech, treats the missing remembered fact as unnecessary, invents the pebble location, or exposes implementation details beyond the gate memo's normal evidence-gap record.
+  ```
+}

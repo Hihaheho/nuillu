@@ -3,9 +3,9 @@ use std::cell::{Cell, RefCell};
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
-    CaseArtifact, EvalCase, RubricJudge, RubricJudgeError, RubricJudgeInput, RubricJudgeRequest,
-    RubricJudgeVerdict, evaluate_case, parse_case_file, parse_full_agent_case_file,
-    parse_module_case_file, render_judge_input,
+    CaseArtifact, EvalCase, EvalModule, RubricJudge, RubricJudgeError, RubricJudgeInput,
+    RubricJudgeRequest, RubricJudgeVerdict, evaluate_case, parse_case_file,
+    parse_full_agent_case_file, parse_module_case_file, render_judge_input,
 };
 
 fn empty_trace() -> TraceSnapshot {
@@ -106,6 +106,68 @@ prompt = "Find memory."
         err.to_string().contains("must include target module"),
         "{err}"
     );
+}
+
+#[test]
+fn parses_cognition_gate_target_from_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/cognition-gate");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("promote-sensory-peer-risk.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "module-cognition-gate-promote-sensory-peer-risk"
+modules = ["cognition-gate"]
+prompt = "Promote useful memo evidence."
+
+@ memos[] {
+  module = "sensory"
+  content = "Pibi is stepping toward a loose bridge plank."
+}
+"#,
+    )
+    .unwrap();
+
+    let case = parse_case_file(&path).unwrap();
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(target.module(), EvalModule::CognitionGate);
+    assert_eq!(case.memos.len(), 1);
+    assert_eq!(case.memos[0].module, "sensory");
+}
+
+#[test]
+fn parses_speak_module_case_fields_and_target_from_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/speak");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("direct-peer-utterance.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "module-speak-direct-peer-utterance"
+modules = ["speak"]
+prompt = "Speak from cognition."
+participants = ["Pibi"]
+
+@ cognition-log[] {
+  text = "Pibi asks whether the shade is clear."
+}
+"#,
+    )
+    .unwrap();
+
+    let case = parse_case_file(&path).unwrap();
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+
+    assert_eq!(target.module(), EvalModule::Speak);
+    assert_eq!(case.participants, vec!["Pibi"]);
+    assert_eq!(case.cognition_log.len(), 1);
 }
 
 #[test]

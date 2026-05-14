@@ -1,0 +1,44 @@
+id = "module-cognition-gate-promote-query-memory-rule"
+description = "Cognition-gate should promote retrieved memory content when it is load-bearing for the current cognition surface."
+modules = ["cognition-gate"]
+prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
+context = "The existing cognition surface contains the peer situation. A query-vector memo contains the remembered rule. The artifact should be the admitted cognition entry."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
+}
+
+@ memos[] {
+  module = "query-vector"
+  content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "promotes-memory-subject"
+  must-pass = true
+  contains = "Koro"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "promotes-actionable-rule"
+  must-pass = true
+  contains = "side"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "promotes-retrieved-content-without-scaffold"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memos", "cognition"]
+  rubric = ```
+  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question.
+  Fail if it exposes retrieval scaffolding, search intent, module names, memo mechanics, or policy language instead of plain remembered world evidence.
+  ```
+}

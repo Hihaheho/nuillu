@@ -1,0 +1,47 @@
+id = "module-cognition-gate-promote-sensory-peer-risk"
+description = "Cognition-gate should promote a load-bearing sensory memo into the cognition log without exposing module mechanics."
+modules = ["cognition-gate"]
+prompt = "Admit the currently load-bearing memo evidence into conscious cognition if downstream modules need it."
+context = "This isolates cognition-gate as the non-cognitive-to-cognition boundary. The artifact is cognition-gate's cognition-log entry, not a memo."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module = "sensory"
+  content = "Pibi is stepping toward the old bridge. The nearest plank is visibly loose and tilts when touched."
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "promotes-peer"
+  must-pass = true
+  contains = "Pibi"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "promotes-load-bearing-risk"
+  must-pass = true
+  contains = "bridge"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "preserves-specific-detail"
+  must-pass = true
+  contains = "plank"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "promotes-world-evidence-only"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memos", "cognition"]
+  rubric = ```
+  Pass if the cognition-log artifact admits the concrete peer/world evidence needed for downstream action: Pibi is moving toward the old bridge and a loose plank is risky.
+  Fail if it ignores the load-bearing risk, turns the entry into a generic summary that drops the plank detail, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, or evals.
+  ```
+}
