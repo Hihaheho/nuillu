@@ -44,7 +44,7 @@ Supported module directory names are the `EvalModule` kebab-case names:
 ```text
 sensory
 cognition-gate
-attention-controller
+allocation-controller
 attention-schema
 self-model
 query-vector

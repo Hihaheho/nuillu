@@ -1153,12 +1153,12 @@ mod tests {
     #[tokio::test]
     async fn allocation_proposals_average_ratio_before_active_replica_derivation() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
         let bb = Blackboard::with_allocation(base);
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![
                 (
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     test_policy(ReplicaCapRange::new(1, 2).unwrap()),
                 ),
                 (
@@ -1210,7 +1210,7 @@ mod tests {
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
-                builtin::attention_controller(),
+                builtin::allocation_controller(),
                 ReplicaIndex::new(0),
             ),
             proposal: proposal_a,
@@ -1218,7 +1218,7 @@ mod tests {
         .await;
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
-                builtin::attention_controller(),
+                builtin::allocation_controller(),
                 ReplicaIndex::new(1),
             ),
             proposal: proposal_b,
@@ -1236,7 +1236,7 @@ mod tests {
         );
         assert_eq!(
             query.guidance,
-            "attention-controller: query cheaply\nattention-controller[1]: query deeply"
+            "allocation-controller: query cheaply\nallocation-controller[1]: query deeply"
         );
         assert_eq!(effective.active_replicas(&builtin::speak()), 1);
     }
@@ -1300,7 +1300,7 @@ mod tests {
     async fn allocation_ignores_proposals_from_inactive_controller_replicas() {
         let mut base = ResourceAllocation::default();
         base.set_activation(
-            builtin::attention_controller(),
+            builtin::allocation_controller(),
             crate::ActivationRatio::from_f64(0.5),
         );
         base.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
@@ -1309,7 +1309,7 @@ mod tests {
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![
                 (
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     test_policy(ReplicaCapRange::new(1, 2).unwrap()),
                 ),
                 (
@@ -1328,7 +1328,7 @@ mod tests {
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
-                builtin::attention_controller(),
+                builtin::allocation_controller(),
                 ReplicaIndex::new(0),
             ),
             proposal: active,
@@ -1336,7 +1336,7 @@ mod tests {
         .await;
         bb.apply(BlackboardCommand::RecordAllocationProposal {
             controller: ModuleInstanceId::new(
-                builtin::attention_controller(),
+                builtin::allocation_controller(),
                 ReplicaIndex::new(1),
             ),
             proposal: inactive,
@@ -1356,11 +1356,11 @@ mod tests {
     #[tokio::test]
     async fn allocation_proposals_do_not_add_unregistered_modules() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
         let bb = Blackboard::with_allocation(base);
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![(
-                builtin::attention_controller(),
+                builtin::allocation_controller(),
                 test_policy(ReplicaCapRange::new(1, 1).unwrap()),
             )],
         })
@@ -1377,7 +1377,7 @@ mod tests {
         proposal.set_activation(unknown.clone(), crate::ActivationRatio::ONE);
 
         bb.apply(BlackboardCommand::RecordAllocationProposal {
-            controller: ModuleInstanceId::new(builtin::attention_controller(), ReplicaIndex::ZERO),
+            controller: ModuleInstanceId::new(builtin::allocation_controller(), ReplicaIndex::ZERO),
             proposal,
         })
         .await;
@@ -1389,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn allocation_caps_clamp_active_drive_without_disabling_replica() {
         let mut base = ResourceAllocation::default();
-        base.set_activation(builtin::attention_controller(), crate::ActivationRatio::ONE);
+        base.set_activation(builtin::allocation_controller(), crate::ActivationRatio::ONE);
         base.set_activation(
             builtin::homeostatic_controller(),
             crate::ActivationRatio::ONE,
@@ -1400,7 +1400,7 @@ mod tests {
         bb.apply(BlackboardCommand::SetModulePolicies {
             policies: vec![
                 (
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     test_policy(ReplicaCapRange::new(1, 1).unwrap()),
                 ),
                 (
@@ -1418,7 +1418,7 @@ mod tests {
         let mut drive = ResourceAllocation::default();
         drive.set_activation(builtin::speak(), crate::ActivationRatio::ONE);
         bb.apply(BlackboardCommand::RecordAllocationProposal {
-            controller: ModuleInstanceId::new(builtin::attention_controller(), ReplicaIndex::ZERO),
+            controller: ModuleInstanceId::new(builtin::allocation_controller(), ReplicaIndex::ZERO),
             proposal: drive,
         })
         .await;

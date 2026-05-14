@@ -183,7 +183,7 @@ pub struct ModuleCase {
 pub enum EvalModule {
     Sensory,
     CognitionGate,
-    AttentionController,
+    AllocationController,
     AttentionSchema,
     SelfModel,
     QueryVector,
@@ -206,7 +206,7 @@ pub enum EvalModule {
 pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Sensory,
     EvalModule::CognitionGate,
-    EvalModule::AttentionController,
+    EvalModule::AllocationController,
     EvalModule::AttentionSchema,
     EvalModule::SelfModel,
     EvalModule::QueryVector,
@@ -231,7 +231,7 @@ impl EvalModule {
         match self {
             Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
-            Self::AttentionController => "attention-controller",
+            Self::AllocationController => "allocation-controller",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
             Self::QueryVector => "query-vector",
@@ -256,7 +256,7 @@ impl EvalModule {
         match self {
             Self::Sensory => builtin::sensory(),
             Self::CognitionGate => builtin::cognition_gate(),
-            Self::AttentionController => builtin::attention_controller(),
+            Self::AllocationController => builtin::allocation_controller(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::SelfModel => builtin::self_model(),
             Self::QueryVector => builtin::query_vector(),

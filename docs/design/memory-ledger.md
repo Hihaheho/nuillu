@@ -58,7 +58,7 @@ remain transient wake signals, and durable module output remains memo-authoritat
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
 | `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
 | `vital` / `homeostatic-controller` | Drives sleep-like memory balancing by raising compaction or recombination allocation from homeostatic pressure. |
-| `attention-controller` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
+| `allocation-controller` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
 | `self-model` | Integrates retrieved identity and self-related memories into current self-description. Identity memories are high-rank memories, not current-fact rows. |
 
 The store owns ledger consistency, search indexes, embeddings, access accounting,

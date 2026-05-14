@@ -17,7 +17,7 @@ experiences written by attention-schema to the cognition log, and self-related f
 memory modules have surfaced in their memos.
 Stable self-knowledge may be present in retrieved memory memos, but do not claim direct access to
 raw hidden memories. Treat allocation guidance as the current self-model question or refresh
-instruction from attention-controller.
+instruction from allocation-controller.
 Write the memo as free-form prose. Preserve the current self-description and every explicit
 question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
@@ -100,7 +100,7 @@ impl SelfModelModule {
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(format!(
-            "Self-model guidance from attention-controller:\n{}",
+            "Self-model guidance from allocation-controller:\n{}",
             guidance.trim()
         ));
         push_formatted_cognition_log_batch(

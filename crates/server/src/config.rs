@@ -42,7 +42,7 @@ pub struct EmbeddingBackendConfig {
 pub enum RuntimeModule {
     Sensory,
     CognitionGate,
-    AttentionController,
+    AllocationController,
     AttentionSchema,
     SelfModel,
     QueryVector,
@@ -65,7 +65,7 @@ pub enum RuntimeModule {
 pub const DEFAULT_MODULES: &[RuntimeModule] = &[
     RuntimeModule::Sensory,
     RuntimeModule::CognitionGate,
-    RuntimeModule::AttentionController,
+    RuntimeModule::AllocationController,
     RuntimeModule::AttentionSchema,
     RuntimeModule::SelfModel,
     RuntimeModule::QueryVector,
@@ -90,7 +90,7 @@ impl RuntimeModule {
         match self {
             Self::Sensory => builtin::sensory(),
             Self::CognitionGate => builtin::cognition_gate(),
-            Self::AttentionController => builtin::attention_controller(),
+            Self::AllocationController => builtin::allocation_controller(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::SelfModel => builtin::self_model(),
             Self::QueryVector => builtin::query_vector(),

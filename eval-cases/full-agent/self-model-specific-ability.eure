@@ -1,7 +1,7 @@
 id = "full-agent-self-model-specific-ability"
 description = "Full-agent case: Koro asks Nui what special thing Nui can do that Koro cannot. Requires retrieving and applying a seeded specific body-ability fact rather than reciting the abstract 'frog-like traits' identity. Without the specific retrieval, the naive answer is generic identity recital and does not name the unique ability."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "attention-controller", "self-model", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "self-model", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22

@@ -20,7 +20,7 @@ lutum-model2vec-adapter = { workspace = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-agent = { workspace = true }
-nuillu-attention-controller = { workspace = true }
+nuillu-allocation-controller = { workspace = true }
 nuillu-attention-schema = { workspace = true }
 nuillu-blackboard = { workspace = true }
 nuillu-cognition-gate = { workspace = true }

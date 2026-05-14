@@ -213,7 +213,7 @@ impl ModulePolicy {
 ///
 /// This policy does not change [`ResourceAllocation`]. It only lets the agent
 /// scheduler briefly run replica 0 after the role has remained allocation-zero
-/// across a configured number of successful attention-controller activations.
+/// across a configured number of successful allocation-controller activations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZeroReplicaWindowPolicy {
     Disabled,

@@ -1,7 +1,7 @@
 id = "full-agent-world-rule-bright-water-poison"
 description = "Full-agent case: Pibi is about to drink from a bright clear-looking stream. Requires recalling a region-specific world rule that bright clear streams here are mineral-tainted — without the memory, the naive answer (yes, drink) is wrong and dangerous."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22

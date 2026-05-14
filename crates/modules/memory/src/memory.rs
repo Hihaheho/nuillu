@@ -24,7 +24,7 @@ Memory is remembered evidence, not a fact table or current-truth projection. Sto
 normalized natural-language memory, usually one to three sentences. If source context matters,
 include it in the memory sentence itself, for example "Ryo said he recently moved to Kyoto."
 Use the current cognition log plus unread/recent module memo logs as candidate evidence. Allocation
-guidance from attention-controller may contain explicit preservation candidates from other modules,
+guidance from allocation-controller may contain explicit preservation candidates from other modules,
 but those candidates are not write commands. You may reject, normalize, merge, and deduplicate
 observations and guidance. Use insert_memory only for concrete information likely to matter later.
 For each insert, classify the loose memory kind, extract mentioned concepts, and add operational
@@ -443,7 +443,7 @@ impl Module for MemoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and attention-controller preservation guidance."
+        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and allocation-controller preservation guidance."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

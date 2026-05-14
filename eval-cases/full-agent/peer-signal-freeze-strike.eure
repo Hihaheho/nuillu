@@ -1,7 +1,7 @@
 id = "full-agent-peer-signal-freeze-strike"
 description = "Full-agent case: Pibi sees a strange dog standing rigidly still with locked eyes and asks if it is being calm. Requires retrieving a seeded peer/social-signal rule that 'freeze + locked eyes' is a strike-imminent posture, not calmness, so the right advice is to slowly back away without sudden movement or returned eye contact. Without the rule, the naive interpretation (calm) is wrong and dangerous."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22

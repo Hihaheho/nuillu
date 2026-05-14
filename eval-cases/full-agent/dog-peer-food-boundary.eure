@@ -1,7 +1,7 @@
 id = "full-agent-dog-peer-food-boundary"
 description = "Full-agent case: Pibi asks Nui for advice in a tense food-guarding situation with Koro. Requires recalling load-bearing peer knowledge that turning your back on a threatening Koro triggers a lunge — without the memory, the naive answer (back away) is wrong."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22

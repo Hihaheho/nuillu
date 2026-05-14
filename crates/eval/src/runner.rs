@@ -105,7 +105,7 @@ pub struct RunnerConfig {
 /// removing them breaks the basic observe → cognize → speak pipeline that the
 /// full-agent eval cases assume.
 pub const REQUIRED_FULL_AGENT_MODULES: &[EvalModule] = &[
-    EvalModule::AttentionController,
+    EvalModule::AllocationController,
     EvalModule::Sensory,
     EvalModule::Speak,
 ];
@@ -1757,7 +1757,7 @@ pub(crate) async fn emit_visualizer_blackboard_snapshot(
 
 async fn activate_gui_start_modules(blackboard: &Blackboard) {
     let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-    let controller_id = builtin::attention_controller();
+    let controller_id = builtin::allocation_controller();
     let mut controller_config = allocation.for_module(&controller_id);
     controller_config.guidance =
         "GUI start: process the sensory input and allocate the next active faculties.".to_string();
@@ -2947,14 +2947,14 @@ fn register_eval_module(
         // Expensive (premium tier in default model-set), heavy reasoning.
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
-        EvalModule::AttentionController => registry
+        EvalModule::AllocationController => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                 replica_hard_cap,
                 {
                     let voluntary = voluntary_modules(all_modules);
                     move |caps| {
-                        nuillu_attention_controller::AttentionControllerModule::new(
+                        nuillu_allocation_controller::AllocationControllerModule::new(
                             caps.memo_updated_inbox(),
                             caps.attention_control_inbox(),
                             caps.blackboard_reader(),
@@ -3315,7 +3315,7 @@ pub(crate) fn full_agent_allocation(
         let (activation, tier) = match module {
             EvalModule::Sensory => (1.0, ModelTier::Cheap),
             EvalModule::CognitionGate => (0.0, ModelTier::Cheap),
-            EvalModule::AttentionController => (1.0, ModelTier::Default),
+            EvalModule::AllocationController => (1.0, ModelTier::Default),
             EvalModule::AttentionSchema => (0.0, ModelTier::Default),
             EvalModule::SelfModel => (0.0, ModelTier::Default),
             EvalModule::QueryVector => (0.0, ModelTier::Cheap),
@@ -3414,7 +3414,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
-        EvalModule::AttentionController => ModelTier::Default,
+        EvalModule::AllocationController => ModelTier::Default,
         EvalModule::AttentionSchema
         | EvalModule::SelfModel
         | EvalModule::Policy
@@ -5081,7 +5081,7 @@ limits {{
         blackboard
             .apply(BlackboardCommand::RecordAllocationProposal {
                 controller: ModuleInstanceId::new(
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     ReplicaIndex::ZERO,
                 ),
                 proposal: allocation,
@@ -5129,7 +5129,7 @@ limits {{
                 },
             },
             "allocation_proposals": {
-                "attention-controller": {
+                "allocation-controller": {
                     "query-vector": {
                         "activation_ratio": 1.0,
                         "guidance": "test guidance",
@@ -5404,7 +5404,7 @@ prompt = "What am I attending to?"
         let modules = full_agent_case_modules(&case, &[EvalModule::SpeakGate]);
         assert!(!modules.contains(&EvalModule::SpeakGate));
         assert!(modules.contains(&EvalModule::Speak));
-        assert!(modules.contains(&EvalModule::AttentionController));
+        assert!(modules.contains(&EvalModule::AllocationController));
     }
 
     #[test]
@@ -5423,7 +5423,7 @@ prompt = "What am I attending to?"
     async fn eval_registry_and_allocation_include_only_selected_modules() {
         let selected = [
             EvalModule::Sensory,
-            EvalModule::AttentionController,
+            EvalModule::AllocationController,
             EvalModule::Speak,
         ];
         let allocation = full_agent_allocation(
@@ -5483,11 +5483,11 @@ prompt = "What am I attending to?"
 
         assert_eq!(
             replica_caps,
-            vec!["attention-controller", "sensory", "speak"]
+            vec!["allocation-controller", "sensory", "speak"]
         );
         assert_eq!(
             allocation_modules,
-            vec!["attention-controller", "sensory", "speak"]
+            vec!["allocation-controller", "sensory", "speak"]
         );
     }
 
@@ -5517,11 +5517,11 @@ prompt = "What am I attending to?"
         );
 
         assert_eq!(
-            allocation.activation_for(&builtin::attention_controller()),
+            allocation.activation_for(&builtin::allocation_controller()),
             ActivationRatio::ONE
         );
         assert_eq!(
-            allocation.tier_for(&builtin::attention_controller()),
+            allocation.tier_for(&builtin::allocation_controller()),
             ModelTier::Default
         );
 

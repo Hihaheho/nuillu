@@ -1268,7 +1268,7 @@ mod tests {
     async fn capabilities_are_non_exclusive() {
         let caps = test_caps(Blackboard::default());
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
-        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let controller = scoped(&caps, builtin::allocation_controller(), 0);
         let _w1 = cognition_gate.cognition_writer();
         let _w2 = cognition_gate.cognition_writer();
         let _a1 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
@@ -1429,7 +1429,7 @@ mod tests {
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![
                     (
-                        builtin::attention_controller(),
+                        builtin::allocation_controller(),
                         nuillu_blackboard::ModulePolicy::new(
                             ReplicaCapRange::new(1, 1).unwrap(),
                             nuillu_blackboard::Bpm::from_f64(60.0)
@@ -1450,7 +1450,7 @@ mod tests {
             })
             .await;
         let caps = test_caps(blackboard);
-        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let controller = scoped(&caps, builtin::allocation_controller(), 0);
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let writer = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
         let mut inbox = cognition_gate.allocation_updated_inbox();
@@ -1466,7 +1466,7 @@ mod tests {
 
         writer.set(proposal.clone()).await;
         let event = inbox.next_item().await.unwrap();
-        assert_eq!(event.sender.module, builtin::attention_controller());
+        assert_eq!(event.sender.module, builtin::allocation_controller());
         assert_eq!(event.body, crate::AllocationUpdated);
 
         writer.set(proposal).await;
@@ -1476,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn cognition_log_updates_do_not_wake_controller_memo_inbox() {
         let caps = test_caps(Blackboard::default());
-        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let controller = scoped(&caps, builtin::allocation_controller(), 0);
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let mut memo_updates = controller.memo_updated_inbox();
 
@@ -1491,7 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn speak_completion_memo_wakes_controller() {
         let caps = test_caps(Blackboard::default());
-        let controller = scoped(&caps, builtin::attention_controller(), 0);
+        let controller = scoped(&caps, builtin::allocation_controller(), 0);
         let speak = scoped(&caps, builtin::speak(), 0);
         let mut memo_updates = controller.memo_updated_inbox();
 

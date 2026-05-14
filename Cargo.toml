@@ -70,7 +70,7 @@ lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }
 
 nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
-nuillu-attention-controller = { path = "crates/modules/attention-controller" }
+nuillu-allocation-controller = { path = "crates/modules/allocation-controller" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
 nuillu-memory = { path = "crates/modules/memory" }

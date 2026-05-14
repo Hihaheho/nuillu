@@ -36,7 +36,7 @@ External input and output sit at the boundary of cognition:
 - **sensory input** is the only external/app-facing input; it enters through a typed `SensoryInput` channel and is normalized by the sensory module into memo-log entries,
 - **speech output** leaves through a speak/action capability and is mirrored into the speak module's memo log.
 
-`AttentionControlRequest` is the internal typed attention-bid message. It is consumed only by attention-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
+`AttentionControlRequest` is the internal typed attention-bid message. It is consumed only by allocation-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
 
 Sensory input is multimodal. Initial built-in observations are `Heard { direction, content, observed_at }` for linguistic/auditory input and `Seen { direction, appearance, observed_at }` for visual input. The variant names are past-tense observations rather than actions: `Listen` would describe what the agent does, while `Heard` describes what arrived at the sensory boundary; `Visible` would describe a property, while `Seen` describes an observed event.
 
@@ -108,17 +108,17 @@ There is no periodic wake mechanism. Allocation guidance is the controller's dur
 Guidance-based allocation flow:
 
 ```text
-Sensory memo -> AttentionController -> allocation proposal
+Sensory memo -> AllocationController -> allocation proposal
 Sensory memo -> CognitionGate -> CognitionLogUpdated -> Speak
 Runtime Speak batch -> SpeakGate ActivationGate -> Speak activation
-SpeakGate -> AttentionControlRequest evidence bids -> AttentionController
-Surprise -> AttentionControlRequest::Memory -> AttentionController
-SpeakGate memo -> AttentionController -> allocation proposal
+SpeakGate -> AttentionControlRequest evidence bids -> AllocationController
+Surprise -> AttentionControlRequest::Memory -> AllocationController
+SpeakGate memo -> AllocationController -> allocation proposal
 CognitionLogUpdated -> QueryMemory/QueryPolicy/Memory/Policy/Reward/Predict/Surprise/AttentionSchema/ValueEstimator
 QueryPolicy memo -> ValueEstimator -> expected_reward memo
 ValueEstimator memo + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyValueUpdater::reinforce
-Reward -> AttentionControlRequest::Policy -> AttentionController
-QueryPolicy memo -> AttentionController / CognitionGate (memo-authoritative)
+Reward -> AttentionControlRequest::Policy -> AllocationController
+QueryPolicy memo -> AllocationController / CognitionGate (memo-authoritative)
 ```
 
 Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<Speak>` holders such as SpeakGate. SpeakGate returns allow or suppress; when it suppresses, its decision and missing-evidence notes are durable only in its memo, and that memo update wakes the controller through the ordinary memo path. Speak writes a completion memo after a finished utterance.
@@ -129,7 +129,7 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 |---|---|---|---|---|---|---|---|
 | sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox` |
 | cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
-| attention-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `AllocationWriter` |
+| allocation-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `VectorMemorySearcher` |
@@ -197,7 +197,7 @@ Reads the non-cognitive blackboard snapshot and current allocation guidance, the
 
 When sensory memo content is promoted, cognition-gate rounds the detailed memo age through `configs/time-division.eure` before appending the cognition-log entry. Detailed timing stays in the sensory memo; rounded timing belongs to the cognition log.
 
-### Attention Controller
+### Allocation Controller
 
 Wakes on memo updates from other modules and controller-only attention-control requests. It reads unread memo-log entries into its persistent session, plus current attention-control bids, memory metadata, cognition log, and current allocation, then writes the next resource allocation for every registered module: `activation_ratio`, natural-language `guidance`, and `tier`.
 
@@ -211,7 +211,7 @@ The attention schema is not a self-model and does not answer self-model guidance
 
 ### Self Model
 
-Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, self-related knowledge that query modules surface from memory, and self-model guidance from attention-controller. It writes self-model / self-report output to its memo log.
+Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, self-related knowledge that query modules surface from memory, and self-model guidance from allocation-controller. It writes self-model / self-report output to its memo log.
 
 Stable self-knowledge belongs in memory and can be retrieved by query modules, but a live self-model is not just memory retrieval. The self-model module turns long-lived self facts, current attention, active task context, uncertainty, and recent module outputs into a current first-person state. In v1, object/world models remain distributed through sensory, query, predict, and surprise memo logs; a dedicated `world-model` can be added later if those fragments need a single owner.
 
@@ -225,7 +225,7 @@ Retrieves applicable policies from the policy store. Allocation updates wake it 
 
 ### Memory
 
-Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from attention-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
+Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from allocation-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
 
 ### Memory Compaction
 
@@ -241,7 +241,7 @@ Predicts the `expected_reward` for each policy currently surfaced by `query-poli
 
 ### Reward
 
-Closes the TD-0 loop. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, and controller memos, collapses the channels to a scalar `observed_scalar`, and pairs that with the most recent value-estimator memo to compute `td_error = observed_scalar − expected_reward`. It applies the update through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)` with v1 deltas `α·td_error`, `β·clamp(td_error, ±1)`, and `γ_c·max(0, 1 − |td_error|/scale)` (coefficients in `configs/policy-reinforcement.eure`). It writes a reward-assessment memo recording the full channel breakdown, the compared `expected_reward`, the resulting `td_error`, and the applied deltas so the attention-controller can observe learning pressure. It may publish `AttentionControlRequest::Policy` to ask the controller to raise policy-module activation when a novel pattern deserves formation. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not predict `expected_reward` (that is value-estimator's role), create new policy entries, write memory, write cognition-log entries, or write allocation.
+Closes the TD-0 loop. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, and controller memos, collapses the channels to a scalar `observed_scalar`, and pairs that with the most recent value-estimator memo to compute `td_error = observed_scalar − expected_reward`. It applies the update through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)` with v1 deltas `α·td_error`, `β·clamp(td_error, ±1)`, and `γ_c·max(0, 1 − |td_error|/scale)` (coefficients in `configs/policy-reinforcement.eure`). It writes a reward-assessment memo recording the full channel breakdown, the compared `expected_reward`, the resulting `td_error`, and the applied deltas so the allocation-controller can observe learning pressure. It may publish `AttentionControlRequest::Policy` to ask the controller to raise policy-module activation when a novel pattern deserves formation. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not predict `expected_reward` (that is value-estimator's role), create new policy entries, write memory, write cognition-log entries, or write allocation.
 
 ### Predict
 

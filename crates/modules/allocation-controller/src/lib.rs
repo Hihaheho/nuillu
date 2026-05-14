@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 mod batch;
 
-const SYSTEM_PROMPT: &str = r#"You are the attention-controller module.
+const SYSTEM_PROMPT: &str = r#"You are the allocation-controller module.
 You wake on memo updates and internal attention-control requests. Use blackboard memos, attention
 control requests, the cognition log, the current allocation, and the registry schema to decide which
 modules deserve activation right now.
@@ -28,7 +28,7 @@ Output shape: a `memo` (free-form controller note for the shared memo surface) p
 array. The array lists modules to activate in descending priority order, each entry pairing a
 `module_id` (must be a registered module) with a `hint` — one concise sentence saying why that
 module needs activation now. Modules you omit receive zero activation; their typed mailboxes still
-flow through inactive replica-zero queues. The attention-controller itself is preserved at its
+flow through inactive replica-zero queues. The allocation-controller itself is preserved at its
 current activation so the control plane cannot disable itself. Position in the array maps to the
 host-configured activation table; positions beyond the table fall to zero, so prioritise tightly.
 Do not invent module ids and do not duplicate ids.
@@ -50,21 +50,21 @@ The memo field is a free-form controller note; preserve the reasoning needed by 
 do not encode it as JSON, YAML, a code block, or any fixed schema.
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
-const COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX: &str =
-    "Compacted attention-controller session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the attention-controller module's persistent session history.
+const COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX: &str =
+    "Compacted allocation-controller session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation-controller module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
 decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
 allocation decisions. Do not invent facts. Return plain text only."#;
 
-fn format_attention_controller_context(
+fn format_allocation_controller_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
     current: &nuillu_module::ResourceAllocation,
     modules: &[(ModuleId, &'static str)],
     stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
 ) -> String {
     let mut sections = vec![
-        "Attention-controller context for assigning the next activation priorities:".to_owned(),
+        "Allocation-controller context for assigning the next activation priorities:".to_owned(),
     ];
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
         sections.push(section);
@@ -113,7 +113,7 @@ impl JsonSchema for AllocationDecision {
     }
 
     fn schema_id() -> Cow<'static, str> {
-        "nuillu_attention_controller::AllocationDecision.dynamic".into()
+        "nuillu_allocation_controller::AllocationDecision.dynamic".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -129,7 +129,7 @@ pub struct PriorityEntry {
     pub hint: String,
 }
 
-pub struct AttentionControllerModule {
+pub struct AllocationControllerModule {
     owner: ModuleId,
     updates: MemoUpdatedInbox,
     requests: AttentionControlRequestInbox,
@@ -146,7 +146,7 @@ pub struct AttentionControllerModule {
     session_seeded: bool,
 }
 
-impl AttentionControllerModule {
+impl AllocationControllerModule {
     pub fn new(
         updates: MemoUpdatedInbox,
         requests: AttentionControlRequestInbox,
@@ -158,7 +158,7 @@ impl AttentionControllerModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id()).expect("attention-controller id is valid"),
+            owner: ModuleId::new(<Self as Module>::id()).expect("allocation-controller id is valid"),
             updates,
             requests,
             blackboard,
@@ -244,7 +244,7 @@ impl AttentionControllerModule {
         let visible_modules = visible_modules(cx.modules(), &allowed_modules);
 
         self.session
-            .push_ephemeral_system(format_attention_controller_context(
+            .push_ephemeral_system(format_allocation_controller_context(
                 &rank_counts,
                 &visible_current,
                 &visible_modules,
@@ -262,11 +262,11 @@ impl AttentionControllerModule {
                     .await
             })
             .await
-            .context("attention-controller structured turn failed")?;
+            .context("allocation-controller structured turn failed")?;
         let input_tokens = result.usage.input_tokens;
 
         let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-            anyhow::bail!("attention-controller structured turn refused");
+            anyhow::bail!("allocation-controller structured turn refused");
         };
         compact_session_if_needed(
             &mut self.session,
@@ -275,7 +275,7 @@ impl AttentionControllerModule {
             self.session_compaction,
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
-            COMPACTED_ATTENTION_CONTROLLER_SESSION_PREFIX,
+            COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,
         )
         .await;
@@ -298,7 +298,7 @@ fn apply_decision(
     registered: &std::collections::HashSet<ModuleId>,
     decision: AllocationDecision,
 ) -> AppliedDecision {
-    let controller_id = builtin::attention_controller();
+    let controller_id = builtin::allocation_controller();
     let controller_activation = current.activation_for(&controller_id);
     let mut next = current;
     let table = next.activation_table().to_vec();
@@ -320,11 +320,11 @@ fn apply_decision(
 
     for (rank, entry) in decision.priority.into_iter().enumerate() {
         let Ok(id) = ModuleId::new(entry.module_id) else {
-            tracing::warn!("attention-controller ignored invalid module id");
+            tracing::warn!("allocation-controller ignored invalid module id");
             continue;
         };
         if !registered.contains(&id) {
-            tracing::warn!(module = %id, "attention-controller ignored unregistered module id");
+            tracing::warn!(module = %id, "allocation-controller ignored unregistered module id");
             continue;
         }
         let ratio = table.get(rank).copied().unwrap_or(ActivationRatio::ZERO);
@@ -433,11 +433,11 @@ fn push_optional_reason(output: &mut String, reason: Option<&str>) {
 }
 
 #[async_trait(?Send)]
-impl Module for AttentionControllerModule {
+impl Module for AllocationControllerModule {
     type Batch = batch::NextBatch;
 
     fn id() -> &'static str {
-        "attention-controller"
+        "allocation-controller"
     }
 
     fn role_description() -> &'static str {
@@ -445,7 +445,7 @@ impl Module for AttentionControllerModule {
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        AttentionControllerModule::next_batch(self).await
+        AllocationControllerModule::next_batch(self).await
     }
 
     async fn activate(
@@ -539,7 +539,7 @@ mod tests {
 
     fn test_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
-        for module in [builtin::attention_controller(), builtin::sensory()] {
+        for module in [builtin::allocation_controller(), builtin::sensory()] {
             allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ONE);
         }
@@ -586,11 +586,11 @@ mod tests {
         };
     }
 
-    noop_stub!(AttentionControllerStub, "attention-controller");
+    noop_stub!(AllocationControllerStub, "allocation-controller");
     noop_stub!(SensoryStub, "sensory");
 
     struct ControllerFixture {
-        controller: AttentionControllerModule,
+        controller: AllocationControllerModule,
         source_memo: Memo,
     }
 
@@ -609,20 +609,20 @@ mod tests {
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *controller_sink.borrow_mut() = Some(AttentionControllerModule::new(
+                *controller_sink.borrow_mut() = Some(AllocationControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.attention_control_inbox(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
                     caps.allocation_writer(
-                        vec![builtin::attention_controller(), builtin::sensory()],
+                        vec![builtin::allocation_controller(), builtin::sensory()],
                         Vec::new(),
                     ),
                     caps.memo(),
                     caps.llm_access(),
                 ));
-                AttentionControllerStub
+                AllocationControllerStub
             })
             .unwrap()
             .register(test_policy(), move |caps| {
@@ -643,7 +643,7 @@ mod tests {
     fn decision_scenario(input_tokens: u64, memo: &str) -> MockStructuredScenario {
         MockStructuredScenario::events(vec![
             Ok(RawStructuredTurnEvent::Started {
-                request_id: Some("attention-controller-finished".into()),
+                request_id: Some("allocation-controller-finished".into()),
                 model: "mock".into(),
             }),
             Ok(RawStructuredTurnEvent::StructuredOutputChunk {
@@ -654,7 +654,7 @@ mod tests {
                 .to_string(),
             }),
             Ok(RawStructuredTurnEvent::Completed {
-                request_id: Some("attention-controller-finished".into()),
+                request_id: Some("allocation-controller-finished".into()),
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
                     input_tokens,
@@ -735,15 +735,15 @@ mod tests {
     #[test]
     fn apply_decision_preserves_active_controller_when_omitted() {
         let mut registered = std::collections::HashSet::new();
-        registered.insert(builtin::attention_controller());
+        registered.insert(builtin::allocation_controller());
         registered.insert(builtin::sensory());
         registered.insert(builtin::cognition_gate());
 
         let mut current = ResourceAllocation::default();
         current.set_activation_table(vec![ActivationRatio::ONE]);
-        current.set_activation(builtin::attention_controller(), ActivationRatio::ONE);
+        current.set_activation(builtin::allocation_controller(), ActivationRatio::ONE);
         current.set(
-            builtin::attention_controller(),
+            builtin::allocation_controller(),
             ModuleConfig {
                 guidance: "continue controlling allocation".into(),
             },
@@ -765,13 +765,13 @@ mod tests {
         assert_eq!(
             applied
                 .allocation
-                .activation_for(&builtin::attention_controller()),
+                .activation_for(&builtin::allocation_controller()),
             ActivationRatio::ONE
         );
         assert_eq!(
             applied
                 .allocation
-                .for_module(&builtin::attention_controller())
+                .for_module(&builtin::allocation_controller())
                 .guidance,
             "continue controlling allocation"
         );
@@ -820,8 +820,8 @@ mod tests {
         let lutum = fixture.controller.llm.lutum().await;
         let modules = vec![
             (
-                builtin::attention_controller(),
-                AttentionControllerModule::role_description(),
+                builtin::allocation_controller(),
+                AllocationControllerModule::role_description(),
             ),
             (builtin::sensory(), "test stub"),
         ];
@@ -863,7 +863,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected first input system prompt text");
         };
-        assert!(system.contains("You are the attention-controller module"));
+        assert!(system.contains("You are the allocation-controller module"));
 
         let ModelInputItem::Message { role, content } = &first_items[1] else {
             panic!("expected first input memo-log note");
@@ -879,7 +879,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation-controller context for assigning the next activation priorities")
                 )
         )));
 
@@ -891,7 +891,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected second input system prompt text");
         };
-        assert!(system.contains("You are the attention-controller module"));
+        assert!(system.contains("You are the allocation-controller module"));
         assert!(second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
@@ -924,7 +924,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation-controller context for assigning the next activation priorities")
                 )
         )));
         assert!(!second_items.iter().any(|item| matches!(
@@ -962,7 +962,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Attention-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation-controller context for assigning the next activation priorities")
                 )
         )));
         assert_eq!(fixture.controller.session.list_turns().count(), 2);

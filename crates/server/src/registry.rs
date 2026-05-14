@@ -114,10 +114,10 @@ fn register_server_module(
                 )
             })
         }
-        RuntimeModule::AttentionController => {
+        RuntimeModule::AllocationController => {
             let voluntary = voluntary_modules(all_modules);
             registry.register_server(policy(1..=1, Bpm::range(6.0, 6.0)), move |caps| {
-                nuillu_attention_controller::AttentionControllerModule::new(
+                nuillu_allocation_controller::AllocationControllerModule::new(
                     caps.memo_updated_inbox(),
                     caps.attention_control_inbox(),
                     caps.blackboard_reader(),
@@ -370,7 +370,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
         let (activation, tier) = match module {
             RuntimeModule::Sensory => (1.0, ModelTier::Cheap),
             RuntimeModule::CognitionGate => (1.0, ModelTier::Cheap),
-            RuntimeModule::AttentionController => (1.0, ModelTier::Default),
+            RuntimeModule::AllocationController => (1.0, ModelTier::Default),
             RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
             RuntimeModule::SelfModel => (0.0, ModelTier::Default),
             RuntimeModule::QueryVector => (0.0, ModelTier::Cheap),

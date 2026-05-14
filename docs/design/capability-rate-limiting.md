@@ -28,7 +28,7 @@ This document describes desired architecture, not implementation progress.
    receive rate-limit or throttle state.
 5. **No periodic or boost semantics** — The current runtime has no
    `PeriodicActivation`, period, or scheduler tick API. Low-activity recovery is
-   handled by attention-controller allocation guidance, not by a rate-limit
+   handled by allocation-controller allocation guidance, not by a rate-limit
    `min_rate` or boost factor.
 6. **Async delay, not background send** — `publish()` is already async, so a
    publish permit is awaited directly before routing. The design does not add an

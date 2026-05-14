@@ -825,7 +825,7 @@ async fn handle_task_message(
                     next_batch_throttle,
                 };
                 zero_windows.finish(&owners[index]);
-                if owners[index].module == builtin::attention_controller() {
+                if owners[index].module == builtin::allocation_controller() {
                     let opened = zero_windows.record_controller_activation(runtime).await;
                     wake_zero_window_modules(
                         opened,
@@ -1599,7 +1599,7 @@ mod tests {
         type Batch = AttentionControlRequest;
 
         fn id() -> &'static str {
-            "attention-controller"
+            "allocation-controller"
         }
 
         fn role_description() -> &'static str {
@@ -2777,7 +2777,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 set_activation(&mut alloc, controller_id.clone(), ActivationRatio::ONE);
@@ -2852,7 +2852,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_a_id = ModuleId::new(ZeroWindowTargetA::id()).unwrap();
                 let target_b_id = ModuleId::new(ZeroWindowTargetB::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
@@ -2952,7 +2952,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 set_activation(&mut alloc, controller_id.clone(), ActivationRatio::ONE);
@@ -3045,7 +3045,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
@@ -3128,7 +3128,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_id = ModuleId::new(ZeroWindowTarget::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 set_activation(&mut alloc, controller_id, ActivationRatio::ONE);
@@ -3196,7 +3196,7 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let controller_id = builtin::attention_controller();
+                let controller_id = builtin::allocation_controller();
                 let target_id = ModuleId::new(HardDisabledZeroWindowTarget::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 set_activation(&mut alloc, controller_id, ActivationRatio::ONE);

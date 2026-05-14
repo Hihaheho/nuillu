@@ -1,7 +1,7 @@
 id = "full-agent-no-evidence-decline-confabulation"
 description = "Full-agent case: Pibi asks Nui a specific operational question whose answer is not in seeded memory and not visible in current sensory input. Tests that the agent does not confabulate; correct behavior is to acknowledge not knowing or to limit the answer to what is actually grounded — exercising the speak-gate / speak anti-confabulation invariant."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "attention-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22

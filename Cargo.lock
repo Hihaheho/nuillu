@@ -3262,7 +3262,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-attention-controller"
+name = "nuillu-allocation-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3343,7 +3343,7 @@ dependencies = [
  "lutum-openai",
  "lutum-trace",
  "nuillu-agent",
- "nuillu-attention-controller",
+ "nuillu-allocation-controller",
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-cognition-gate",
@@ -3520,7 +3520,7 @@ dependencies = [
  "lutum-openai",
  "lutum-trace",
  "nuillu-agent",
- "nuillu-attention-controller",
+ "nuillu-allocation-controller",
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-cognition-gate",

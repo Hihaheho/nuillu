@@ -47,7 +47,7 @@ pub(crate) fn tool_test_allocation() -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
     for module in [
         builtin::speak_gate(),
-        builtin::attention_controller(),
+        builtin::allocation_controller(),
         builtin::query_vector(),
         builtin::self_model(),
         builtin::sensory(),
@@ -118,7 +118,7 @@ macro_rules! noop_stub {
 
 noop_stub!(SpeakGateStub, "speak-gate");
 noop_stub!(SpeakStub, "speak");
-noop_stub!(AttentionControllerStub, "attention-controller");
+noop_stub!(AllocationControllerStub, "allocation-controller");
 
 pub(crate) struct GateToolFixture {
     pub(crate) gate: SpeakGateModule,
@@ -155,7 +155,7 @@ pub(crate) async fn gate_tool_fixture_with_adapter(adapter: MockLlmAdapter) -> G
         .unwrap()
         .register(test_policy(), move |caps| {
             *attention_control_inbox_sink.borrow_mut() = Some(caps.attention_control_inbox());
-            AttentionControllerStub
+            AllocationControllerStub
         })
         .unwrap()
         .build(&caps)

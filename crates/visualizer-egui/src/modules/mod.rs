@@ -1,4 +1,4 @@
-pub mod attention_controller;
+pub mod allocation_controller;
 pub mod attention_schema;
 pub mod cognition_gate;
 pub mod memory;

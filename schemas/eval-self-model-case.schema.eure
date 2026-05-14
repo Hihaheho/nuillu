@@ -40,8 +40,8 @@ scoring.$optional = true
 @ $types.eval-module
 $variant: union
 variants.sensory = { = "sensory", $variant => "literal" }
-variants.attention-gate = { = "attention-gate", $variant => "literal" }
-variants.attention-controller = { = "attention-controller", $variant => "literal" }
+variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
+variants.allocation-controller = { = "allocation-controller", $variant => "literal" }
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
 variants.query-vector = { = "query-vector", $variant => "literal" }

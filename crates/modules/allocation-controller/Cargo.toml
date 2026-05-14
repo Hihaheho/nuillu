@@ -1,5 +1,5 @@
 [package]
-name = "nuillu-attention-controller"
+name = "nuillu-allocation-controller"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

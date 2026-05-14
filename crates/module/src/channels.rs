@@ -547,7 +547,7 @@ mod tests {
         let caps = test_caps(Blackboard::default());
         let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
         let mut controller =
-            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
 
         publisher
             .publish(AttentionControlRequest::query("find memories about rust"))
@@ -568,13 +568,13 @@ mod tests {
     #[tokio::test]
     async fn attention_control_load_balances_across_active_controller_replicas() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::attention_controller(), ModuleConfig::default());
-        alloc.set_activation(builtin::attention_controller(), ActivationRatio::ONE);
+        alloc.set(builtin::allocation_controller(), ModuleConfig::default());
+        alloc.set_activation(builtin::allocation_controller(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![(
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     nuillu_blackboard::ModulePolicy::new(
                         ReplicaCapRange::new(0, 2).unwrap(),
                         nuillu_blackboard::Bpm::from_f64(60.0)
@@ -587,9 +587,9 @@ mod tests {
         let caps = test_caps(blackboard);
         let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
         let mut controller_0 =
-            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
         let mut controller_1 =
-            scoped(&caps, builtin::attention_controller(), 1).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 1).attention_control_inbox();
 
         publisher
             .publish(AttentionControlRequest::query("first"))
@@ -613,13 +613,13 @@ mod tests {
     #[tokio::test]
     async fn attention_control_routes_to_replica_zero_when_controller_is_inactive() {
         let mut alloc = ResourceAllocation::default();
-        alloc.set(builtin::attention_controller(), ModuleConfig::default());
-        alloc.set_activation(builtin::attention_controller(), ActivationRatio::ZERO);
+        alloc.set(builtin::allocation_controller(), ModuleConfig::default());
+        alloc.set_activation(builtin::allocation_controller(), ActivationRatio::ZERO);
         let blackboard = Blackboard::with_allocation(alloc);
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![(
-                    builtin::attention_controller(),
+                    builtin::allocation_controller(),
                     nuillu_blackboard::ModulePolicy::new(
                         ReplicaCapRange::new(0, 2).unwrap(),
                         nuillu_blackboard::Bpm::from_f64(60.0)
@@ -632,9 +632,9 @@ mod tests {
         let caps = test_caps(blackboard);
         let publisher = scoped(&caps, ticker_id(), 0).attention_control_mailbox();
         let mut controller_0 =
-            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
         let mut controller_1 =
-            scoped(&caps, builtin::attention_controller(), 1).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 1).attention_control_inbox();
 
         publisher
             .publish(AttentionControlRequest::query("active only"))
@@ -667,7 +667,7 @@ mod tests {
         );
         let publisher = scoped(&caps, publisher_id, 0).attention_control_mailbox();
         let mut controller =
-            scoped(&caps, builtin::attention_controller(), 0).attention_control_inbox();
+            scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
 
         publisher
             .publish(AttentionControlRequest::query("first"))
