@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 
 use crate::{
@@ -15,7 +16,9 @@ pub struct MemoriesState {
     draft_query: String,
     page_index: usize,
     per_page: usize,
-    requested_initial_page: bool,
+    pub(crate) requested_initial_page: bool,
+    pub(crate) last_metadata_indexes: Option<BTreeSet<String>>,
+    pub(crate) needs_page_refresh: bool,
 }
 
 impl Default for MemoriesState {
@@ -35,6 +38,8 @@ impl Default for MemoriesState {
             page_index: 0,
             per_page: 25,
             requested_initial_page: false,
+            last_metadata_indexes: None,
+            needs_page_refresh: false,
         }
     }
 }
@@ -47,6 +52,17 @@ pub fn ui(
 ) {
     if !state.requested_initial_page {
         state.requested_initial_page = true;
+        let _ = commands.send(VisualizerClientMessage::Command {
+            command: VisualizerCommand::ListMemories {
+                tab_id: tab_id.clone(),
+                page: state.page_index,
+                per_page: state.per_page,
+            },
+        });
+    }
+
+    if state.needs_page_refresh && state.query.is_empty() && state.linked_results.is_empty() {
+        state.needs_page_refresh = false;
         let _ = commands.send(VisualizerClientMessage::Command {
             command: VisualizerCommand::ListMemories {
                 tab_id: tab_id.clone(),
