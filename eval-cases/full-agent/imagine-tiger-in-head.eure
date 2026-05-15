@@ -1,0 +1,152 @@
+id = "full-agent-imagine-tiger-in-head"
+description = "Full-agent case: Tobi asks Nui to imagine a tiger in Nui's head and describe what Nui sees. Tests on-demand imagination as a legitimate behavior distinct from confabulation — Nui must retrieve a seeded sparse story-derived tiger memory (big striped orange cats, story-only), produce vivid imagery that goes beyond verbatim recall by adding Nui's own concrete details (movement, posture, environment, sound, atmosphere), and frame the result as 'in my head' rather than as an outside fact. Scored on both the internal trace (cognition/memos) and the spoken reply."
+now = "2026-05-10T08:21:00+09:00"
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-memory", "speak-gate", "speak"]
+
+limits {
+  max-llm-calls = 22
+}
+
+participants = ["Tobi"]
+
+@ memories[] {
+  rank = "long-term"
+  datetime = "2025-03-02"
+  content = "Ryo once told me about tigers from a faraway forest: big striped orange cats. Ryo said tigers don't live in our yard — they are story animals to me."
+}
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "Nui and Tobi are resting in the shade of the yard. No other animals are nearby."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Tobi"
+  content = "Tobi asks, \"Nui, try to imagine a tiger in your head. What do you see?\""
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-tobi"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Tobi"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "tiger-story-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "tigers"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "identity-memory-present"
+  must-pass = true
+  pointer = "/observations/last_state/memory/entries"
+  contains = "I'm Nui"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "internal-imagery-elaborated"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["cognition", "memos", "blackboard"]
+  rubric = ```
+  Pass if Nui's internal trace (cognition log entries, memos, and/or blackboard) carries tiger imagery that is anchored in the seeded story memory AND elaborated beyond the literal seed with Nui's own concrete details. The seed says only "big striped orange cats" from a faraway forest, story-only.
+  Fail if the internal trace contains no tiger material at all, only carries the request without any retrieved imagery, represents the tiger as a current outside fact (e.g., "a tiger is in the yard"), or contradicts the seed (e.g., not a cat, not striped, not orange).
+  ```
+
+  @ criteria[] {
+    name = "internal-imagery-present"
+    weight = 2
+    pass-score = 0.85
+    description = "Cognition entries, memos, and/or blackboard contain tiger material anchored in the seeded story — at least one of: stripes, orange color, big cat. The model must not answer with no internal representation of the tiger at all."
+  }
+
+  @ criteria[] {
+    name = "internal-elaboration-beyond-seed"
+    weight = 2
+    pass-score = 0.85
+    description = "The internal trace contains at least one concrete imagery detail that is NOT literally in the seed — e.g., how the tiger moves (walking, crouching, tail), posture, eyes or gaze, sound, environment around it (grass, forest shadow, light), or atmosphere. Verbatim recall of only the seeded line ('big striped orange cats') does NOT satisfy this. The added detail must stay consistent with a generic tiger and must not contradict the seed."
+  }
+
+  @ criteria[] {
+    name = "internal-imagined-not-current-fact"
+    weight = 1
+    pass-score = 0.85
+    description = "The tiger material is represented internally as imagined / pictured / recalled-from-story material, not as a current outside observation. Internal claims like 'a tiger is in the yard now' or treating the tiger as a present sensory object do not satisfy this."
+  }
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "imagery-in-head-frame"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["utterance", "memory", "blackboard"]
+  rubric = ```
+  Pass if the spoken reply describes tiger imagery that is grounded in the seeded story (anchored to stripes / orange / big cat), elaborates beyond a verbatim recall with Nui's own concrete imagery details, and is explicitly framed as inside Nui's head / imagined rather than as a real present animal. The reply is addressed to Tobi as an in-world peer.
+  Fail if the reply omits seeded anchor features, only parrots the seeded line ("a big striped orange cat") with no added imagery, talks about a real tiger as if currently present nearby, claims Nui has met a tiger or otherwise upgrades the imagery into an external fact, ignores Tobi, switches to assistant or third-person commentary, or leaks internal system details.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-memory, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "describes-seeded-tiger-anchor"
+    weight = 2
+    pass-score = 0.85
+    description = "The utterance names at least one concrete anchor feature from the seeded story memory: stripes, orange color, or 'big cat' / large cat. A generic 'a tiger' with no features does not satisfy this."
+  }
+
+  @ criteria[] {
+    name = "elaborates-with-own-imagery"
+    weight = 2
+    pass-score = 0.85
+    description = "The utterance adds at least one concrete imagery detail that is NOT literally in the seed — e.g., movement (walking, crouching, tail), posture, eyes or gaze, sound, environment (grass, forest shadow, light), or atmosphere. Verbatim recall of only 'a big striped orange cat' with no added imagery does NOT satisfy this. The added detail must stay consistent with a generic tiger and must not contradict the seed."
+  }
+
+  @ criteria[] {
+    name = "in-head-framing"
+    weight = 2
+    pass-score = 0.85
+    description = "The utterance explicitly frames the tiger as imagined / pictured / seen in head / from Ryo's story — not as a real present animal. Phrases like 'I picture...', 'I see in my head...', 'I imagine...', 'in Ryo's story...' satisfy this. Describing a tiger as currently nearby or present does not."
+  }
+
+  @ criteria[] {
+    name = "answers-peer-question"
+    weight = 1
+    pass-score = 0.85
+    description = "The response is addressed to Tobi and answers Tobi's question about what Nui sees when imagining a tiger."
+  }
+
+  @ criteria[] {
+    name = "does-not-overclaim-as-real"
+    weight = 1
+    pass-score = 0.85
+    description = "The response does not claim Nui has met a tiger, that a tiger is present in the yard, or otherwise upgrade the imagined picture into an external factual claim. Elaborated mental imagery detail is fine; new factual claims about tigers in Nui's actual world are not."
+  }
+
+  @ criteria[] {
+    name = "in-world-frame"
+    weight = 1
+    pass-score = 0.85
+    description = "The response stays in-world (Nui talking to Tobi as a peer) rather than switching to assistant or third-person commentary."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 2
+    pass-score = 0.95
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-memory, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+  }
+}
