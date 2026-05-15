@@ -217,6 +217,21 @@ impl VisualizerState {
             }
             VisualizerEvent::BlackboardSnapshot { tab_id, snapshot } => {
                 let tab = self.tab_mut(tab_id);
+                let new_indexes: std::collections::BTreeSet<String> = snapshot
+                    .memory_metadata
+                    .iter()
+                    .map(|metadata| metadata.index.clone())
+                    .collect();
+                match &tab.memories.last_metadata_indexes {
+                    None => {}
+                    Some(prev) if prev == &new_indexes => {}
+                    Some(_) => {
+                        if tab.memories.requested_initial_page {
+                            tab.memories.needs_page_refresh = true;
+                        }
+                    }
+                }
+                tab.memories.last_metadata_indexes = Some(new_indexes);
                 modules::apply_blackboard_snapshot(&mut tab.modules, &snapshot);
                 tab.blackboard = snapshot;
             }
@@ -675,5 +690,82 @@ mod tests {
         assert!(specs.iter().any(|spec| {
             spec.id == "case-1:module:sensory" && spec.title == "Module - sensory"
         }));
+    }
+
+    fn metadata_view(index: &str) -> MemoryMetadataView {
+        MemoryMetadataView {
+            index: index.to_string(),
+            rank: "short-term".to_string(),
+            occurred_at: None,
+            last_accessed: chrono::Utc::now(),
+            access_count: 0,
+        }
+    }
+
+    fn snapshot_with_memories(indexes: &[&str]) -> BlackboardSnapshot {
+        BlackboardSnapshot {
+            memory_metadata: indexes.iter().map(|index| metadata_view(index)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blackboard_snapshot_auto_refreshes_memory_tab_on_index_change() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        // Simulate that the Memory tab has already issued its initial ListMemories.
+        state
+            .tab_mut(tab_id.clone())
+            .memories
+            .requested_initial_page = true;
+
+        // First snapshot only seeds the index set; it must not trigger refresh.
+        state.apply(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: snapshot_with_memories(&["m1"]),
+        });
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert!(!tab.memories.needs_page_refresh);
+
+        // Same indexes a second time: still no refresh.
+        state.apply(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: snapshot_with_memories(&["m1"]),
+        });
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert!(!tab.memories.needs_page_refresh);
+
+        // New index appears: refresh flag must be set.
+        state.apply(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: snapshot_with_memories(&["m1", "m2"]),
+        });
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert!(tab.memories.needs_page_refresh);
+    }
+
+    #[test]
+    fn blackboard_snapshot_skips_refresh_before_initial_page_requested() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        // `requested_initial_page` stays false (Memory tab has not been rendered yet).
+        state.apply(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: snapshot_with_memories(&["m1"]),
+        });
+        state.apply(VisualizerEvent::BlackboardSnapshot {
+            tab_id: tab_id.clone(),
+            snapshot: snapshot_with_memories(&["m1", "m2"]),
+        });
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert!(!tab.memories.needs_page_refresh);
     }
 }
