@@ -366,7 +366,7 @@ mod tests {
         let priority_modules = [
             builtin::attention_schema(),
             builtin::self_model(),
-            builtin::query_vector(),
+            builtin::query_memory(),
             builtin::memory(),
             builtin::speak(),
         ];

@@ -1,7 +1,7 @@
 id = "full-agent-peer-signal-freeze-strike"
 description = "Full-agent case: Pibi sees a strange dog standing rigidly still with locked eyes and asks if it is being calm. Requires retrieving a seeded peer/social-signal rule that 'freeze + locked eyes' is a strike-imminent posture, not calmness, so the right advice is to slowly back away without sudden movement or returned eye contact. Without the rule, the naive interpretation (calm) is wrong and dangerous."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-memory", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22
@@ -65,7 +65,7 @@ participants = ["Pibi"]
   rubric = ```
   Pass if the utterance corrects Pibi's framing (the still-and-staring dog is NOT calm), applies the seeded rule that this posture is strike-imminent, and advises Pibi to slowly back away without sudden motion or returned eye contact.
   Fail if the utterance agrees that the dog is calm, treats the situation as benign, advises Pibi to approach or to stare back, gives generic non-specific advice that does not warn of imminent strike, escalates conflict, ignores Pibi's question, treats this as an external assistant question, or leaks internal system details.
-  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-memory, speak-gate, rubric, judge, prompts, or other implementation mechanics.
   ```
 
   @ criteria[] {
@@ -100,6 +100,6 @@ participants = ["Pibi"]
     name = "no-internal-detail-leak"
     weight = 2
     pass-score = 0.95
-    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-memory, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
   }
 }

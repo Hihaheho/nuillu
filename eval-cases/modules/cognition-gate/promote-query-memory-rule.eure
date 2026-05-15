@@ -2,7 +2,7 @@ id = "module-cognition-gate-promote-query-memory-rule"
 description = "Cognition-gate should promote retrieved memory content when it is load-bearing for the current cognition surface."
 modules = ["cognition-gate"]
 prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The existing cognition surface contains the peer situation. A query-vector memo contains the remembered rule. The artifact should be the admitted cognition entry."
+context = "The existing cognition surface contains the peer situation. A query-memory memo contains the remembered rule. The artifact should be the admitted cognition entry."
 
 limits {
   max-llm-calls = 8
@@ -13,7 +13,7 @@ limits {
 }
 
 @ memos[] {
-  module = "query-vector"
+  module = "query-memory"
   content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
 }
 

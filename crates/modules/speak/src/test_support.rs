@@ -48,7 +48,7 @@ pub(crate) fn tool_test_allocation() -> ResourceAllocation {
     for module in [
         builtin::speak_gate(),
         builtin::allocation_controller(),
-        builtin::query_vector(),
+        builtin::query_memory(),
         builtin::self_model(),
         builtin::sensory(),
         builtin::speak(),

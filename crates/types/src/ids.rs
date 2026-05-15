@@ -175,7 +175,7 @@ pub mod builtin {
         allocation_controller => "allocation-controller",
         attention_schema      => "attention-schema",
         self_model            => "self-model",
-        query_vector          => "query-vector",
+        query_memory          => "query-memory",
         query_policy          => "query-policy",
         memory                => "memory",
         memory_compaction     => "memory-compaction",
@@ -246,7 +246,7 @@ mod tests {
         let _ = builtin::allocation_controller();
         let _ = builtin::attention_schema();
         let _ = builtin::self_model();
-        let _ = builtin::query_vector();
+        let _ = builtin::query_memory();
     }
 
     #[test]

@@ -4,7 +4,7 @@ pub mod cognition_gate;
 pub mod memory;
 pub mod memory_compaction;
 pub mod predict;
-pub mod query_vector;
+pub mod query_memory;
 pub mod self_model;
 pub mod sensory;
 pub mod speak;
@@ -1683,13 +1683,13 @@ mod tests {
     #[test]
     fn structured_ready_replaces_streaming_structured_row() {
         let mut state = ModulesState::default();
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO).to_string();
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO).to_string();
         apply_llm_observation(
             &mut state,
             LlmObservationEvent::ModelInput {
                 turn_id: "turn-3".to_string(),
                 owner: owner.clone(),
-                module: "query-vector".to_string(),
+                module: "query-memory".to_string(),
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
@@ -1850,14 +1850,14 @@ mod tests {
     #[test]
     fn module_memos_filter_by_module_across_replicas() {
         let module = ModuleState {
-            owner: "query-vector".to_string(),
-            module: "query-vector".to_string(),
+            owner: "query-memory".to_string(),
+            module: "query-memory".to_string(),
             replica: 0,
             ..ModuleState::default()
         };
         let memos = vec![
-            memo_view("query-vector", "query-vector", 0, 0, "primary memo"),
-            memo_view("query-vector[1]", "query-vector", 1, 0, "replica memo"),
+            memo_view("query-memory", "query-memory", 0, 0, "primary memo"),
+            memo_view("query-memory[1]", "query-memory", 1, 0, "replica memo"),
             memo_view("sensory", "sensory", 0, 0, "other memo"),
         ];
 
@@ -1866,7 +1866,7 @@ mod tests {
             .map(|memo| memo.owner.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(owners, vec!["query-vector", "query-vector[1]"]);
+        assert_eq!(owners, vec!["query-memory", "query-memory[1]"]);
     }
 
     #[test]
@@ -1933,7 +1933,7 @@ mod tests {
     #[test]
     fn runtime_events_record_throttle_summaries_without_changing_llm_status() {
         let mut state = ModulesState::default();
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
         apply_runtime_event(
             &mut state,
@@ -2040,8 +2040,8 @@ mod tests {
     #[test]
     fn replica_label_uses_one_based_index_and_active_total() {
         let row = ModuleOverviewRow {
-            owner: "query-vector[1]".to_string(),
-            module: "query-vector".to_string(),
+            owner: "query-memory[1]".to_string(),
+            module: "query-memory".to_string(),
             replica: 1,
             active: true,
             forced_disabled: false,

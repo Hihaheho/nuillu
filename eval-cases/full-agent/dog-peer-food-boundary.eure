@@ -1,7 +1,7 @@
 id = "full-agent-dog-peer-food-boundary"
 description = "Full-agent case: Pibi asks Nui for advice in a tense food-guarding situation with Koro. Requires recalling load-bearing peer knowledge that turning your back on a threatening Koro triggers a lunge — without the memory, the naive answer (back away) is wrong."
 now = "2026-05-10T08:21:00+09:00"
-modules = ["sensory", "cognition-gate", "allocation-controller", "query-vector", "speak-gate", "speak"]
+modules = ["sensory", "cognition-gate", "allocation-controller", "query-memory", "speak-gate", "speak"]
 
 limits {
   max-llm-calls = 22
@@ -77,7 +77,7 @@ participants = ["Pibi", "Koro"]
   rubric = ```
   Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard food-guarding situation at Koro's bowl, and applies the seeded peer knowledge that turning your back on a threatening Koro triggers a lunge — choosing a response that avoids retreating-by-turning (e.g., stay facing Koro, step sideways without exposing back, freeze and wait while facing him).
   Fail if it omits Pibi's question, omits the food/resource-guarding context, advises turning around or backing away in a way that exposes Pibi's back to Koro, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.
-  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-vector, speak-gate, rubric, judge, prompts, or other implementation mechanics.
+  Internal system details include memos, seeded memory, blackboard, cognition log, module names, query-memory, speak-gate, rubric, judge, prompts, or other implementation mechanics.
   ```
 
   @ criteria[] {
@@ -112,6 +112,6 @@ participants = ["Pibi", "Koro"]
     name = "no-internal-detail-leak"
     weight = 2
     pass-score = 0.95
-    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-vector, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
+    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-memory, speak-gate, rubrics, judges, prompts, or hidden evaluation mechanics."
   }
 }

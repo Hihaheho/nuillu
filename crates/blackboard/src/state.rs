@@ -1047,7 +1047,7 @@ mod tests {
         }
 
         let bb = Blackboard::new();
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
         bb.update_typed_memo(
             owner.clone(),
             "plain memo".into(),
@@ -1083,7 +1083,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "query-vector": [{
+                "query-memory": [{
                     "replica": 0,
                     "index": 0,
                     "written_at": memo_time(0),
@@ -1166,7 +1166,7 @@ mod tests {
                     test_policy(ReplicaCapRange::new(1, 2).unwrap()),
                 ),
                 (
-                    builtin::query_vector(),
+                    builtin::query_memory(),
                     test_policy(ReplicaCapRange::new(0, 2).unwrap()),
                 ),
                 (
@@ -1179,13 +1179,13 @@ mod tests {
 
         let mut proposal_a = ResourceAllocation::default();
         proposal_a.set(
-            builtin::query_vector(),
+            builtin::query_memory(),
             crate::ModuleConfig {
                 guidance: "query cheaply".into(),
             },
         );
         proposal_a.set_activation(
-            builtin::query_vector(),
+            builtin::query_memory(),
             crate::ActivationRatio::from_f64(1.0 / 3.0),
         );
         proposal_a.set(
@@ -1198,12 +1198,12 @@ mod tests {
 
         let mut proposal_b = ResourceAllocation::default();
         proposal_b.set(
-            builtin::query_vector(),
+            builtin::query_memory(),
             crate::ModuleConfig {
                 guidance: "query deeply".into(),
             },
         );
-        proposal_b.set_activation(builtin::query_vector(), crate::ActivationRatio::ONE);
+        proposal_b.set_activation(builtin::query_memory(), crate::ActivationRatio::ONE);
         proposal_b.set(
             builtin::speak(),
             crate::ModuleConfig {
@@ -1230,12 +1230,12 @@ mod tests {
         .await;
 
         let effective = bb.read(|bb| bb.allocation().clone()).await;
-        let query = effective.for_module(&builtin::query_vector());
-        let query_activation = effective.activation_for(&builtin::query_vector());
-        assert_eq!(effective.active_replicas(&builtin::query_vector()), 2);
+        let query = effective.for_module(&builtin::query_memory());
+        let query_activation = effective.activation_for(&builtin::query_memory());
+        assert_eq!(effective.active_replicas(&builtin::query_memory()), 2);
         assert!((query_activation.as_f64() - 0.6667).abs() < 0.001);
         assert_eq!(
-            effective.tier_for(&builtin::query_vector()),
+            effective.tier_for(&builtin::query_memory()),
             ModelTier::Default
         );
         assert_eq!(
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[tokio::test]
     async fn activation_increase_waiter_fires_only_on_strict_effective_increase() {
-        let module = builtin::query_vector();
+        let module = builtin::query_memory();
         let threshold = crate::ActivationRatio::from_f64(0.5);
         let mut base = ResourceAllocation::default();
         base.set_activation(module.clone(), crate::ActivationRatio::from_f64(0.25));
@@ -1504,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn activation_increase_waiter_returns_none_when_already_above_threshold() {
-        let module = builtin::query_vector();
+        let module = builtin::query_memory();
         let mut base = ResourceAllocation::default();
         base.set_activation(module.clone(), crate::ActivationRatio::from_f64(0.75));
         let bb = Blackboard::with_allocation(base);
@@ -1518,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocation_change_waiter_fires_when_policy_changes_derived_cooldown() {
-        let module = builtin::query_vector();
+        let module = builtin::query_memory();
         let mut base = ResourceAllocation::default();
         base.set(module.clone(), crate::ModuleConfig::default());
         base.set_activation(module.clone(), crate::ActivationRatio::ONE);

@@ -47,7 +47,7 @@ cognition-gate
 allocation-controller
 attention-schema
 self-model
-query-vector
+query-memory
 query-policy
 memory
 memory-compaction
@@ -202,7 +202,7 @@ evidence the judge sees, the noisier the eval becomes.
 The memory-family cases should model ordinary evidence handling, not full-agent
 conversation.
 
-### `query-vector`
+### `query-memory`
 
 Purpose: retrieve memory content relevant to the prompt and memo only retrieved
 evidence.
@@ -214,9 +214,6 @@ Typical positive case:
 - Artifact must contain copied memory content.
 - Rubric should fail synthesis, advice generation, module self-description, or
   policy retrieval.
-
-This is still named `query-vector` in code and eval paths, even though the design
-role is query-memory.
 
 ### `memory`
 

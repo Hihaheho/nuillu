@@ -39,7 +39,7 @@ impl RubricJudge for ModuleScopedJudge {
         assert_eq!(
             request.context.as_deref(),
             Some(
-                "Module-scoped full-agent check for 'query-vector'. Judge only the selected evidence for this module."
+                "Module-scoped full-agent check for 'query-memory'. Judge only the selected evidence for this module."
             )
         );
         assert_eq!(
@@ -68,14 +68,14 @@ impl RubricJudge for ModuleScopedJudge {
 #[test]
 fn rejects_duplicate_modules() {
     let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    let case_dir = dir.path().join("eval-cases/modules/query-memory");
     std::fs::create_dir_all(&case_dir).unwrap();
     let path = case_dir.join("duplicate-modules.eure");
     std::fs::write(
         &path,
         r#"
 id = "duplicate-modules"
-modules = ["query-vector", "query-vector"]
+modules = ["query-memory", "query-memory"]
 prompt = "Find memory."
 "#,
     )
@@ -88,7 +88,7 @@ prompt = "Find memory."
 #[test]
 fn rejects_module_case_modules_missing_target() {
     let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    let case_dir = dir.path().join("eval-cases/modules/query-memory");
     std::fs::create_dir_all(&case_dir).unwrap();
     let path = case_dir.join("missing-target.eure");
     std::fs::write(
@@ -272,7 +272,7 @@ prompt = "What am I attending to?"
 #[test]
 fn rejects_empty_rubric_judge_inputs() {
     let dir = tempfile::tempdir().unwrap();
-    let case_dir = dir.path().join("eval-cases/modules/query-vector");
+    let case_dir = dir.path().join("eval-cases/modules/query-memory");
     std::fs::create_dir_all(&case_dir).unwrap();
     let path = case_dir.join("empty-judge-inputs.eure");
     std::fs::write(
@@ -341,10 +341,10 @@ modules = ["sensory"]
 }
 
 @ modules-checks[] {
-  module = "query-vector"
+  module = "query-memory"
 
   @ rubrics[] {
-    rubric = "Judge query-vector output."
+    rubric = "Judge query-memory output."
   }
 }
 "#,
@@ -369,7 +369,7 @@ async fn evaluates_full_agent_modules_checks_from_scoped_memo_logs_without_affec
         &path,
         r#"
 id = "module-checks-eval"
-modules = ["sensory", "query-vector"]
+modules = ["sensory", "query-memory"]
 
 @ inputs[] {
   $variant: heard
@@ -377,13 +377,13 @@ modules = ["sensory", "query-vector"]
 }
 
 @ modules-checks[] {
-  module = "query-vector"
+  module = "query-memory"
 
   @ rubrics[] {
     name = "query-history"
     pass-score = 0.85
     judge-inputs = ["output", "memos"]
-    rubric = "Judge the query-vector memo history."
+    rubric = "Judge the query-memory memo history."
   }
 }
 "#,
@@ -394,7 +394,7 @@ modules = ["sensory", "query-vector"]
         "agent",
         serde_json::json!({
             "memo_logs": {
-                "query-vector": [
+                "query-memory": [
                     {
                         "replica": 0,
                         "index": 0,
@@ -427,7 +427,7 @@ modules = ["sensory", "query-vector"]
     assert!(report.passed(), "{report:#?}");
     assert_eq!(report.score, 1.0);
     assert_eq!(report.modules_checks.len(), 1);
-    assert_eq!(report.modules_checks[0].module, "query-vector");
+    assert_eq!(report.modules_checks[0].module, "query-memory");
     assert_eq!(report.modules_checks[0].rubrics.len(), 1);
     assert!(!report.modules_checks[0].rubrics[0].passed);
     assert!(!report.invalid);
@@ -439,7 +439,7 @@ fn render_judge_input_includes_only_selected_sections() {
         "agent",
         serde_json::json!({
             "memo_logs": {
-                "query-vector": [{
+                "query-memory": [{
                     "replica": 0,
                     "index": 0,
                     "written_at": "2026-05-08T00:00:00Z",

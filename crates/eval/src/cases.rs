@@ -186,7 +186,7 @@ pub enum EvalModule {
     AllocationController,
     AttentionSchema,
     SelfModel,
-    QueryVector,
+    QueryMemory,
     QueryPolicy,
     Memory,
     MemoryCompaction,
@@ -209,7 +209,7 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::AllocationController,
     EvalModule::AttentionSchema,
     EvalModule::SelfModel,
-    EvalModule::QueryVector,
+    EvalModule::QueryMemory,
     EvalModule::QueryPolicy,
     EvalModule::Memory,
     EvalModule::MemoryCompaction,
@@ -234,7 +234,7 @@ impl EvalModule {
             Self::AllocationController => "allocation-controller",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
-            Self::QueryVector => "query-vector",
+            Self::QueryMemory => "query-memory",
             Self::QueryPolicy => "query-policy",
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
@@ -259,7 +259,7 @@ impl EvalModule {
             Self::AllocationController => builtin::allocation_controller(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::SelfModel => builtin::self_model(),
-            Self::QueryVector => builtin::query_vector(),
+            Self::QueryMemory => builtin::query_memory(),
             Self::QueryPolicy => builtin::query_policy(),
             Self::Memory => builtin::memory(),
             Self::MemoryCompaction => builtin::memory_compaction(),
@@ -307,7 +307,7 @@ impl FullAgentCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleEvalTarget {
     CognitionGate,
-    QueryVector,
+    QueryMemory,
     AttentionSchema,
     SelfModel,
     Memory,
@@ -322,7 +322,7 @@ impl ModuleEvalTarget {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CognitionGate => "cognition-gate",
-            Self::QueryVector => "query-vector",
+            Self::QueryMemory => "query-memory",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
             Self::Memory => "memory",
@@ -337,7 +337,7 @@ impl ModuleEvalTarget {
     pub fn module(self) -> EvalModule {
         match self {
             Self::CognitionGate => EvalModule::CognitionGate,
-            Self::QueryVector => EvalModule::QueryVector,
+            Self::QueryMemory => EvalModule::QueryMemory,
             Self::AttentionSchema => EvalModule::AttentionSchema,
             Self::SelfModel => EvalModule::SelfModel,
             Self::Memory => EvalModule::Memory,
@@ -354,7 +354,7 @@ impl ModuleEvalTarget {
             .filter_map(|component| component.as_os_str().to_str())
             .find_map(|part| match part {
                 "cognition-gate" => Some(Self::CognitionGate),
-                "query-vector" => Some(Self::QueryVector),
+                "query-memory" => Some(Self::QueryMemory),
                 "attention-schema" => Some(Self::AttentionSchema),
                 "self-model" => Some(Self::SelfModel),
                 "memory" => Some(Self::Memory),

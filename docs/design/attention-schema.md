@@ -137,7 +137,7 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | allocation-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `InteroceptiveReader`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
-| query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `VectorMemorySearcher` |
+| query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `MemorySearcher` |
 | query-policy | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `PolicySearcher` |
 | memory | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |

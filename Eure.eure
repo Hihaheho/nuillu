@@ -10,9 +10,9 @@ schema = "schemas/eval-full-agent-case.schema.eure"
 globs = [".tmp/eval/**/last-state.eure"]
 schema = "schemas/eval-full-agent-last-state.schema.eure"
 
-@ targets.eval-query-vector-cases
-globs = ["eval-cases/modules/query-vector/**/*.eure"]
-schema = "schemas/eval-query-vector-case.schema.eure"
+@ targets.eval-query-memory-cases
+globs = ["eval-cases/modules/query-memory/**/*.eure"]
+schema = "schemas/eval-query-memory-case.schema.eure"
 
 @ targets.eval-cognition-gate-cases
 globs = ["eval-cases/modules/cognition-gate/**/*.eure"]
@@ -53,7 +53,7 @@ schema = "schemas/eval-model-set.schema.eure"
 @ cli
 default-targets = [
   "eval-full-agent-cases",
-  "eval-query-vector-cases",
+  "eval-query-memory-cases",
   "eval-cognition-gate-cases",
   "eval-speak-gate-cases",
   "eval-speak-cases",

@@ -58,7 +58,7 @@ remain transient wake signals, and durable module output remains memo-authoritat
 | Role | Memory-ledger responsibility |
 |---|---|
 | `memory` | Preserves useful cognitive evidence as short normalized memory text. Ingest extracts only kind, concepts, and operational tags. |
-| `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. Existing `query-vector` names may remain until a rename pass. |
+| `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. |
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
 | `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
 | `interoception` / `homeostatic-controller` | `interoception` estimates internal state; `homeostatic-controller` regulates sleep-like memory balancing by raising compaction or recombination allocation from that state. |

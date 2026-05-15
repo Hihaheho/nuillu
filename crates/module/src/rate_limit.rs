@@ -320,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_policy_grants_immediately() {
         let limiter = RateLimiter::disabled();
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
         let outcome = limiter.acquire(&owner, CapabilityKind::LlmCall).await;
 
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn delays_when_next_event_would_exceed_rate() {
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
         let policy = RateLimitPolicy::for_module(
             owner.module.clone(),
             CapabilityKind::LlmCall,
@@ -349,8 +349,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_module_budget_counts_multiple_replicas() {
-        let owner_0 = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
-        let owner_1 = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::new(1));
+        let owner_0 = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        let owner_1 = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::new(1));
         let policy = RateLimitPolicy::for_module(
             owner_0.module.clone(),
             CapabilityKind::ChannelPublish {
@@ -384,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_keys_are_independent() {
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
         let policy = RateLimitPolicy::for_module(
             owner.module.clone(),
             CapabilityKind::ChannelPublish {

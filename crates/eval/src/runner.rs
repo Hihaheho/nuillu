@@ -1409,7 +1409,7 @@ async fn activate_module_case_target(
                 .await
                 .expect("module eval failed to publish AllocationUpdated");
         }
-        ModuleEvalTarget::QueryVector => {
+        ModuleEvalTarget::QueryMemory => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
             config.guidance = prompt.to_string();
@@ -2837,9 +2837,9 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         .collect::<std::collections::HashSet<_>>();
     let edges = [
         (builtin::speak_gate(), builtin::cognition_gate()),
-        (builtin::self_model(), builtin::query_vector()),
+        (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
-        (builtin::cognition_gate(), builtin::query_vector()),
+        (builtin::cognition_gate(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::query_policy()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
@@ -3022,21 +3022,21 @@ fn register_eval_module(
             .expect("eval module registration should be unique"),
         // Memory retrieval is on the critical path between cognition-gate
         // and speak-gate; needs a quick active pace.
-        EvalModule::QueryVector => registry
+        EvalModule::QueryMemory => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 15.0)),
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::QueryVectorModule::new(
+                        nuillu_memory::QueryMemoryModule::new(
                             caps.allocation_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.searcher(),
                             memory_caps.content_reader(),
-                            caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
+                            caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                             caps.llm_access(),
                         )
                     }
@@ -3338,7 +3338,7 @@ pub(crate) fn full_agent_allocation(
             EvalModule::AllocationController => (1.0, ModelTier::Default),
             EvalModule::AttentionSchema => (0.0, ModelTier::Default),
             EvalModule::SelfModel => (0.0, ModelTier::Default),
-            EvalModule::QueryVector => (0.0, ModelTier::Cheap),
+            EvalModule::QueryMemory => (0.0, ModelTier::Cheap),
             EvalModule::QueryPolicy => (0.0, ModelTier::Cheap),
             EvalModule::Memory => (0.0, ModelTier::Cheap),
             EvalModule::MemoryCompaction => (0.0, ModelTier::Cheap),
@@ -3423,7 +3423,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
     match module {
         EvalModule::Sensory
         | EvalModule::CognitionGate
-        | EvalModule::QueryVector
+        | EvalModule::QueryMemory
         | EvalModule::QueryPolicy
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
@@ -4736,14 +4736,14 @@ mod tests {
     #[test]
     fn case_patterns_match_case_id_or_path_substrings() {
         let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        let case_dir = dir.path().join("eval-cases/modules/query-memory");
         std::fs::create_dir_all(&case_dir).unwrap();
         let first = case_dir.join("first-route.eure");
         let second = case_dir.join("second-memory.eure");
         std::fs::write(
             &first,
             r#"
-id = "module-query-vector-first-route"
+id = "module-query-memory-first-route"
 prompt = "First?"
 "#,
         )
@@ -4751,7 +4751,7 @@ prompt = "First?"
         std::fs::write(
             &second,
             r#"
-id = "module-query-vector-special-memory"
+id = "module-query-memory-special-memory"
 prompt = "Second?"
 "#,
         )
@@ -4777,7 +4777,7 @@ prompt = "Second?"
         std::fs::write(
             case_dir.join("first-route.eure"),
             r#"
-id = "module-query-vector-first-route"
+id = "module-query-memory-first-route"
 
 @ inputs[] {
   $variant: heard
@@ -4789,7 +4789,7 @@ id = "module-query-vector-first-route"
         std::fs::write(
             case_dir.join("second-memory.eure"),
             r#"
-id = "module-query-vector-special-memory"
+id = "module-query-memory-special-memory"
 
 @ inputs[] {
   $variant: heard
@@ -4817,8 +4817,8 @@ id = "module-query-vector-special-memory"
         let tabs = visualizer_planned_tabs(&config).unwrap();
 
         assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].0.as_str(), "module-query-vector-special-memory");
-        assert_eq!(tabs[0].1, "module-query-vector-special-memory");
+        assert_eq!(tabs[0].0.as_str(), "module-query-memory-special-memory");
+        assert_eq!(tabs[0].1, "module-query-memory-special-memory");
     }
 
     #[test]
@@ -4902,11 +4902,11 @@ id = "module-query-vector-special-memory"
         let completed_at = Instant::now();
         let after_window = completed_at + Duration::from_secs(2);
 
-        tracker.record_completed_at(&builtin::query_vector(), completed_at);
+        tracker.record_completed_at(&builtin::query_memory(), completed_at);
         assert!(!tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
 
         tracker.record_completed_at(&builtin::speak(), completed_at);
-        tracker.record_completed_at(&builtin::query_vector(), after_window);
+        tracker.record_completed_at(&builtin::query_memory(), after_window);
         assert!(tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
     }
 
@@ -4915,7 +4915,7 @@ id = "module-query-vector-special-memory"
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
         let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter, None);
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
         sink.on_event(RuntimeEvent::LlmAccessed {
             sequence: 0,
@@ -4965,7 +4965,7 @@ id = "module-query-vector-special-memory"
     #[tokio::test]
     async fn run_suite_records_case_runtime_failures_and_continues() {
         let dir = tempfile::tempdir().unwrap();
-        let case_dir = dir.path().join("eval-cases/modules/query-vector");
+        let case_dir = dir.path().join("eval-cases/modules/query-memory");
         std::fs::create_dir_all(&case_dir).unwrap();
         for id in ["runtime-failure-one", "runtime-failure-two"] {
             std::fs::write(
@@ -5068,16 +5068,16 @@ limits {{
     async fn agent_observation_serializes_string_keyed_blackboard_maps() {
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 0, 0, 0).unwrap();
         let mut allocation = ResourceAllocation::default();
-        allocation.set_model_override(builtin::query_vector(), ModelTier::Default);
+        allocation.set_model_override(builtin::query_memory(), ModelTier::Default);
         allocation.set(
-            builtin::query_vector(),
+            builtin::query_memory(),
             ModuleConfig {
                 guidance: "test guidance".into(),
             },
         );
-        allocation.set_activation(builtin::query_vector(), ActivationRatio::ONE);
+        allocation.set_activation(builtin::query_memory(), ActivationRatio::ONE);
         let blackboard = Blackboard::with_allocation(allocation.clone());
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
         blackboard
             .apply(BlackboardCommand::UpdateMemo {
@@ -5098,7 +5098,7 @@ limits {{
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![(
-                    builtin::query_vector(),
+                    builtin::query_memory(),
                     nuillu_blackboard::ModulePolicy::new(
                         ReplicaCapRange::new(0, 0).unwrap(),
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
@@ -5133,7 +5133,7 @@ limits {{
         let actual = serde_json::to_value(observation).unwrap();
         let expected = serde_json::json!({
             "memo_logs": {
-                "query-vector": [{
+                "query-memory": [{
                     "replica": 0,
                     "index": 0,
                     "written_at": "2026-05-07T00:00:00+00:00",
@@ -5142,7 +5142,7 @@ limits {{
             },
             "cognition_logs": [{
                 "source": {
-                    "module": "query-vector",
+                    "module": "query-memory",
                     "replica": 0,
                 },
                 "entries": [{
@@ -5151,7 +5151,7 @@ limits {{
                 }],
             }],
             "allocation": {
-                "query-vector": {
+                "query-memory": {
                     "activation_ratio": 1.0,
                     "guidance": "test guidance",
                     "tier": "Default",
@@ -5159,7 +5159,7 @@ limits {{
             },
             "allocation_proposals": {
                 "allocation-controller": {
-                    "query-vector": {
+                    "query-memory": {
                         "activation_ratio": 1.0,
                         "guidance": "test guidance",
                         "tier": "Default",
@@ -5167,7 +5167,7 @@ limits {{
                 },
             },
             "replica_caps": {
-                "query-vector": {
+                "query-memory": {
                     "min": 0,
                     "max": 0,
                 },
@@ -5461,7 +5461,7 @@ prompt = "What am I attending to?"
             },
             &selected,
         );
-        assert!(allocation.get(&builtin::query_vector()).is_none());
+        assert!(allocation.get(&builtin::query_memory()).is_none());
         assert!(allocation.get(&builtin::speak_gate()).is_none());
 
         let blackboard = Blackboard::with_allocation(allocation);
@@ -5589,7 +5589,7 @@ prompt = "What am I attending to?"
         for module in [
             builtin::attention_schema(),
             builtin::self_model(),
-            builtin::query_vector(),
+            builtin::query_memory(),
             builtin::memory(),
             builtin::memory_compaction(),
             builtin::memory_association(),

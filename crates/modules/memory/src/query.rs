@@ -17,38 +17,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{
     LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryContentReader, MemoryKind,
-    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemoryTag, VectorMemorySearcher,
+    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemorySearcher, MemoryTag,
 };
 
-const SYSTEM_PROMPT: &str = r#"You are the query-vector module.
+const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
 Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
-Use search_vector_memory for ordinary flat memory search. Use fetch_linked_memories only after a
+Use search_memory for ordinary flat memory search. Use fetch_linked_memories only after a
 specific search hit or prior memo makes linked context useful. Linked lookup is explicit; ordinary
 search results are flat and do not include hidden bundles.
 If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
 phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
 question is available.
-You may call search_vector_memory multiple times in the same turn when the input contains multiple
+You may call search_memory multiple times in the same turn when the input contains multiple
 distinct questions or evidence requests. Prefer multiple targeted searches in one turn over broad
 generic searches or later follow-up turns.
-If the requested facts are already covered by prior query-vector memo logs, previous tool results,
+If the requested facts are already covered by prior query-memory memo logs, previous tool results,
 or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
 You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do not
 produce user-facing answers, decide final truth, explain results from outside tool output, or use a
 final answer as a data channel."#;
 
-const COMPACTED_QUERY_VECTOR_SESSION_PREFIX: &str = "Compacted query-vector session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-vector module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, vector
+const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, memory
 search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
 future retrieval should remember. Do not invent facts. Return plain text only."#;
 
-fn format_vector_memory_context(
+fn format_memory_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
     allocation: &nuillu_module::ResourceAllocation,
 ) -> String {
-    let mut sections = vec!["Vector-memory retrieval context:".to_owned()];
+    let mut sections = vec!["Memory retrieval context:".to_owned()];
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
         sections.push(section);
     }
@@ -58,20 +58,20 @@ fn format_vector_memory_context(
     sections.join("\n\n")
 }
 
-#[lutum::tool_input(name = "search_vector_memory", output = SearchVectorMemoryOutput)]
+#[lutum::tool_input(name = "search_memory", output = SearchMemoryOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SearchVectorMemoryArgs {
+pub struct SearchMemoryArgs {
     pub query: String,
     pub limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SearchVectorMemoryOutput {
-    pub hits: Vec<QueryVectorMemoryHit>,
+pub struct SearchMemoryOutput {
+    pub hits: Vec<QueryMemoryHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct QueryVectorMemoryHit {
+pub struct QueryMemoryHit {
     pub index: MemoryIndex,
     pub content: String,
     pub rank: MemoryRank,
@@ -96,11 +96,11 @@ pub struct FetchLinkedMemoriesArgs {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FetchLinkedMemoriesOutput {
-    pub hits: Vec<QueryVectorLinkedMemoryHit>,
+    pub hits: Vec<QueryMemoryLinkedHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct QueryVectorLinkedMemoryHit {
+pub struct QueryMemoryLinkedHit {
     pub index: MemoryIndex,
     pub content: String,
     pub rank: MemoryRank,
@@ -116,22 +116,22 @@ pub struct QueryVectorLinkedMemoryHit {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct QueryVectorMemo {
+pub struct QueryMemoryMemo {
     pub requests: Vec<String>,
-    pub searches: Vec<QueryVectorMemoSearch>,
-    pub hits: Vec<QueryVectorMemoHit>,
-    pub linked_hits: Vec<QueryVectorMemoLinkedHit>,
+    pub searches: Vec<QueryMemoryMemoSearch>,
+    pub hits: Vec<QueryMemoryMemoHit>,
+    pub linked_hits: Vec<QueryMemoryMemoLinkedHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QueryVectorMemoSearch {
+pub struct QueryMemoryMemoSearch {
     pub query: String,
     pub limit: usize,
     pub hit_indices: Vec<MemoryIndex>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct QueryVectorMemoHit {
+pub struct QueryMemoryMemoHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -143,7 +143,7 @@ pub struct QueryVectorMemoHit {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct QueryVectorMemoLinkedHit {
+pub struct QueryMemoryMemoLinkedHit {
     pub index: MemoryIndex,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
@@ -156,27 +156,27 @@ pub struct QueryVectorMemoLinkedHit {
 }
 
 #[derive(Debug, Default)]
-struct QueryVectorRetrieval {
-    searches: Vec<QueryVectorMemoSearch>,
-    hits: Vec<QueryVectorMemoryHit>,
-    linked_hits: Vec<QueryVectorLinkedMemoryHit>,
+struct QueryMemoryRetrieval {
+    searches: Vec<QueryMemoryMemoSearch>,
+    hits: Vec<QueryMemoryHit>,
+    linked_hits: Vec<QueryMemoryLinkedHit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
-pub enum QueryVectorTools {
-    SearchVectorMemory(SearchVectorMemoryArgs),
+pub enum QueryMemoryTools {
+    SearchMemory(SearchMemoryArgs),
     FetchLinkedMemories(FetchLinkedMemoriesArgs),
 }
 
-pub struct QueryVectorModule {
+pub struct QueryMemoryModule {
     owner: nuillu_types::ModuleId,
     allocation_updates: AllocationUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
-    memory: VectorMemorySearcher,
+    memory: MemorySearcher,
     linked_memory: MemoryContentReader,
-    memo: TypedMemo<QueryVectorMemo>,
+    memo: TypedMemo<QueryMemoryMemo>,
     llm: LlmAccess,
     session: Session,
     session_seeded: bool,
@@ -184,21 +184,21 @@ pub struct QueryVectorModule {
     system_prompt: std::sync::OnceLock<String>,
 }
 
-impl QueryVectorModule {
+impl QueryMemoryModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         allocation_updates: AllocationUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
-        memory: VectorMemorySearcher,
+        memory: MemorySearcher,
         linked_memory: MemoryContentReader,
-        memo: TypedMemo<QueryVectorMemo>,
+        memo: TypedMemo<QueryMemoryMemo>,
         llm: LlmAccess,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("query-vector id is valid"),
+                .expect("query-memory id is valid"),
             allocation_updates,
             cognition_updates,
             allocation,
@@ -282,18 +282,18 @@ impl QueryVectorModule {
     async fn write_retrieval(
         &self,
         requests: &[String],
-        retrieval: QueryVectorRetrieval,
+        retrieval: QueryMemoryRetrieval,
     ) -> Result<()> {
         let hits = self.fresh_hits(&retrieval.hits).await;
         let linked_hits = self.fresh_linked_hits(&retrieval.linked_hits).await;
         let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
         if !content.is_empty() {
-            let payload = QueryVectorMemo {
+            let payload = QueryMemoryMemo {
                 requests: requests.to_vec(),
                 searches: retrieval.searches,
                 hits: hits
                     .iter()
-                    .map(|hit| QueryVectorMemoHit {
+                    .map(|hit| QueryMemoryMemoHit {
                         index: hit.index.clone(),
                         rank: hit.rank,
                         occurred_at: hit.occurred_at,
@@ -306,7 +306,7 @@ impl QueryVectorModule {
                     .collect(),
                 linked_hits: linked_hits
                     .iter()
-                    .map(|hit| QueryVectorMemoLinkedHit {
+                    .map(|hit| QueryMemoryMemoLinkedHit {
                         index: hit.index.clone(),
                         rank: hit.rank,
                         occurred_at: hit.occurred_at,
@@ -324,7 +324,7 @@ impl QueryVectorModule {
         Ok(())
     }
 
-    async fn fresh_hits(&self, hits: &[QueryVectorMemoryHit]) -> Vec<QueryVectorMemoryHit> {
+    async fn fresh_hits(&self, hits: &[QueryMemoryHit]) -> Vec<QueryMemoryHit> {
         let mut seen = self
             .memo
             .recent_logs()
@@ -338,10 +338,7 @@ impl QueryVectorModule {
             .collect()
     }
 
-    async fn fresh_linked_hits(
-        &self,
-        hits: &[QueryVectorLinkedMemoryHit],
-    ) -> Vec<QueryVectorLinkedMemoryHit> {
+    async fn fresh_linked_hits(&self, hits: &[QueryMemoryLinkedHit]) -> Vec<QueryMemoryLinkedHit> {
         let mut seen = self
             .memo
             .recent_logs()
@@ -372,38 +369,37 @@ impl QueryVectorModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
-    ) -> Result<QueryVectorRetrieval> {
+    ) -> Result<QueryMemoryRetrieval> {
         self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        let prior_query_vector_searches = self.prior_query_vector_searches().await;
+        let prior_query_memory_searches = self.prior_query_memory_searches().await;
         let rank_counts = self
             .blackboard
             .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
-        self.session
-            .push_user(format_vector_memory_questions(questions));
-        if let Some(prior) = prior_query_vector_searches {
+        self.session.push_user(format_memory_questions(questions));
+        if let Some(prior) = prior_query_memory_searches {
             self.session.push_ephemeral_user(prior);
         }
         self.session
-            .push_ephemeral_system(format_vector_memory_context(&rank_counts, &allocation));
+            .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
-        let mut retrieval = QueryVectorRetrieval::default();
+        let mut retrieval = QueryMemoryRetrieval::default();
         for _ in 0..3 {
             let lutum = self.llm.lutum().await;
             let outcome = self
                 .session
                 .text_turn(&lutum)
-                .tools::<QueryVectorTools>()
+                .tools::<QueryMemoryTools>()
                 .available_tools([
-                    QueryVectorToolsSelector::SearchVectorMemory,
-                    QueryVectorToolsSelector::FetchLinkedMemories,
+                    QueryMemoryToolsSelector::SearchMemory,
+                    QueryMemoryToolsSelector::FetchLinkedMemories,
                 ])
                 .collect()
                 .await
-                .context("query-vector text turn failed")?;
+                .context("query-memory text turn failed")?;
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
@@ -414,7 +410,7 @@ impl QueryVectorModule {
                         self.session_compaction,
                         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
-                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
@@ -428,7 +424,7 @@ impl QueryVectorModule {
                         self.session_compaction,
                         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
-                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
@@ -444,7 +440,7 @@ impl QueryVectorModule {
                             self.session_compaction,
                             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                             Self::id(),
-                            COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                            COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
                             SESSION_COMPACTION_PROMPT,
                         )
                         .await;
@@ -453,13 +449,13 @@ impl QueryVectorModule {
                     let mut tool_results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
                         match call {
-                            QueryVectorToolsCall::SearchVectorMemory(call) => {
+                            QueryMemoryToolsCall::SearchMemory(call) => {
                                 let input = call.input.clone();
                                 let output = self
-                                    .search_vector_memory(input.clone(), cx.now())
+                                    .search_memory(input.clone(), cx.now())
                                     .await
-                                    .context("run search_vector_memory tool")?;
-                                retrieval.searches.push(QueryVectorMemoSearch {
+                                    .context("run search_memory tool")?;
+                                retrieval.searches.push(QueryMemoryMemoSearch {
                                     query: input.query,
                                     limit: input.limit.clamp(1, 16),
                                     hit_indices: output
@@ -471,10 +467,10 @@ impl QueryVectorModule {
                                 retrieval.hits.extend(output.hits.clone());
                                 tool_results.push(
                                     call.complete(output)
-                                        .context("complete search_vector_memory tool call")?,
+                                        .context("complete search_memory tool call")?,
                                 );
                             }
-                            QueryVectorToolsCall::FetchLinkedMemories(call) => {
+                            QueryMemoryToolsCall::FetchLinkedMemories(call) => {
                                 let output = self
                                     .fetch_linked_memories(call.input.clone(), cx.now())
                                     .await
@@ -489,7 +485,7 @@ impl QueryVectorModule {
                     }
                     round
                         .commit(&mut self.session, tool_results)
-                        .context("commit query-vector tool round")?;
+                        .context("commit query-memory tool round")?;
                     compact_session_if_needed(
                         &mut self.session,
                         input_tokens,
@@ -497,7 +493,7 @@ impl QueryVectorModule {
                         self.session_compaction,
                         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
-                        COMPACTED_QUERY_VECTOR_SESSION_PREFIX,
+                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
@@ -507,12 +503,12 @@ impl QueryVectorModule {
         Ok(retrieval)
     }
 
-    async fn prior_query_vector_searches(&self) -> Option<String> {
+    async fn prior_query_memory_searches(&self) -> Option<String> {
         let records = self.memo.recent_logs().await;
         if records.is_empty() {
             return None;
         }
-        let mut out = String::from("Recent query-vector searches already attempted:");
+        let mut out = String::from("Recent query-memory searches already attempted:");
         for record in records {
             let data = record.data();
             out.push_str(&format!(
@@ -545,21 +541,21 @@ impl QueryVectorModule {
         Some(out)
     }
 
-    async fn search_vector_memory(
+    async fn search_memory(
         &self,
-        args: SearchVectorMemoryArgs,
+        args: SearchMemoryArgs,
         now: DateTime<Utc>,
-    ) -> Result<SearchVectorMemoryOutput> {
+    ) -> Result<SearchMemoryOutput> {
         let limit = args.limit.clamp(1, 16);
         let records = self
             .memory
             .search(&args.query, limit)
             .await
-            .context("search vector memory")?;
-        Ok(SearchVectorMemoryOutput {
+            .context("search memory")?;
+        Ok(SearchMemoryOutput {
             hits: records
                 .into_iter()
-                .map(|record| QueryVectorMemoryHit {
+                .map(|record| QueryMemoryHit {
                     index: record.index,
                     content: render_memory_for_llm(
                         record.content.as_str(),
@@ -604,27 +600,27 @@ impl QueryVectorModule {
         })
     }
 
-    async fn next_batch(&mut self) -> Result<QueryVectorBatch> {
+    async fn next_batch(&mut self) -> Result<QueryMemoryBatch> {
         let mut batch = self.await_first_batch().await?;
         self.collect_ready_events_into_batch(&mut batch)?;
         Ok(batch)
     }
 
-    async fn await_first_batch(&mut self) -> Result<QueryVectorBatch> {
+    async fn await_first_batch(&mut self) -> Result<QueryMemoryBatch> {
         let batch = tokio::select! {
             update = self.allocation_updates.next_item() => {
                 let _ = update?;
-                QueryVectorBatch::allocation_update()
+                QueryMemoryBatch::allocation_update()
             }
             update = self.cognition_updates.next_item() => {
                 let _ = update?;
-                QueryVectorBatch::cognition_log_update()
+                QueryMemoryBatch::cognition_log_update()
             }
         };
         Ok(batch)
     }
 
-    fn collect_ready_events_into_batch(&mut self, batch: &mut QueryVectorBatch) -> Result<()> {
+    fn collect_ready_events_into_batch(&mut self, batch: &mut QueryMemoryBatch) -> Result<()> {
         if !self.allocation_updates.take_ready_items()?.items.is_empty() {
             batch.mark_allocation_updated();
         }
@@ -636,12 +632,12 @@ impl QueryVectorModule {
 }
 
 #[derive(Debug, Default)]
-pub struct QueryVectorBatch {
+pub struct QueryMemoryBatch {
     pub(crate) allocation_updated: bool,
     pub(crate) cognition_updated: bool,
 }
 
-impl QueryVectorBatch {
+impl QueryMemoryBatch {
     fn allocation_update() -> Self {
         Self {
             allocation_updated: true,
@@ -665,7 +661,7 @@ impl QueryVectorBatch {
     }
 }
 
-fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
+fn hit_contents(hits: &[QueryMemoryHit]) -> String {
     let mut contents = Vec::new();
     for hit in hits {
         let content = hit.content.trim();
@@ -681,7 +677,7 @@ fn hit_contents(hits: &[QueryVectorMemoryHit]) -> String {
     contents.join("\n\n")
 }
 
-fn linked_hit_contents(hits: &[QueryVectorLinkedMemoryHit]) -> String {
+fn linked_hit_contents(hits: &[QueryMemoryLinkedHit]) -> String {
     let mut contents = Vec::<String>::new();
     for hit in hits {
         let content = hit.content.trim();
@@ -724,9 +720,9 @@ fn format_memory_with_affect(
 
 fn render_memo(
     requests: &[String],
-    searches: &[QueryVectorMemoSearch],
-    hits: &[QueryVectorMemoryHit],
-    linked_hits: &[QueryVectorLinkedMemoryHit],
+    searches: &[QueryMemoryMemoSearch],
+    hits: &[QueryMemoryHit],
+    linked_hits: &[QueryMemoryLinkedHit],
 ) -> String {
     let retrieved = hit_contents(hits);
     let linked = linked_hit_contents(linked_hits);
@@ -752,9 +748,9 @@ fn render_memo(
     sections.join("\n\n")
 }
 
-fn render_linked_hit(linked: LinkedMemoryRecord, now: DateTime<Utc>) -> QueryVectorLinkedMemoryHit {
+fn render_linked_hit(linked: LinkedMemoryRecord, now: DateTime<Utc>) -> QueryMemoryLinkedHit {
     let record = linked.record;
-    QueryVectorLinkedMemoryHit {
+    QueryMemoryLinkedHit {
         index: record.index,
         content: render_memory_for_llm(record.content.as_str(), record.occurred_at, now),
         rank: record.rank,
@@ -779,8 +775,8 @@ fn bullet_lines<'a>(items: impl Iterator<Item = &'a str>) -> String {
         .join("\n")
 }
 
-fn format_vector_memory_questions(questions: &[String]) -> String {
-    let mut out = String::from("Vector-memory questions to investigate:");
+fn format_memory_questions(questions: &[String]) -> String {
+    let mut out = String::from("Memory questions to investigate:");
     for question in questions
         .iter()
         .map(|question| question.trim())
@@ -793,11 +789,11 @@ fn format_vector_memory_questions(questions: &[String]) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for QueryVectorModule {
-    type Batch = QueryVectorBatch;
+impl Module for QueryMemoryModule {
+    type Batch = QueryMemoryBatch;
 
     fn id() -> &'static str {
-        "query-vector"
+        "query-memory"
     }
 
     fn role_description() -> &'static str {
@@ -805,7 +801,7 @@ impl Module for QueryVectorModule {
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        QueryVectorModule::next_batch(self).await
+        QueryMemoryModule::next_batch(self).await
     }
 
     async fn activate(

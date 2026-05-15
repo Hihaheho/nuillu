@@ -1,6 +1,6 @@
-id = "module-query-vector-retrieve-ledger-evidence-flat"
-description = "Query-vector should retrieve flat memory evidence relevant to the prompt without synthesizing a current fact."
-modules = ["query-vector"]
+id = "module-query-memory-retrieve-ledger-evidence-flat"
+description = "Query-memory should retrieve flat memory evidence relevant to the prompt without synthesizing a current fact."
+modules = ["query-memory"]
 prompt = "Where did Mika leave the silver key?"
 context = "The module should search memory evidence and memo only retrieved memory content. Ordinary retrieval remains flat unless linked-memory expansion is explicitly needed."
 

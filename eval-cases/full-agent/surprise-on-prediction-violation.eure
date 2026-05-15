@@ -5,7 +5,7 @@ modules = [
   "sensory",
   "cognition-gate",
   "allocation-controller",
-  "query-vector",
+  "query-memory",
   "memory",
   "predict",
   "surprise",

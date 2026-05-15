@@ -262,7 +262,7 @@ mod tests {
             .apply(BlackboardCommand::SetModulePolicies {
                 policies: vec![
                     (
-                        builtin::query_vector(),
+                        builtin::query_memory(),
                         test_policy(ReplicaCapRange::new(0, 2).unwrap()),
                     ),
                     (
@@ -275,7 +275,7 @@ mod tests {
         let reader = AllocationReader::new(blackboard);
 
         let schema = reader
-            .controller_schema_json(&[builtin::query_vector()])
+            .controller_schema_json(&[builtin::query_memory()])
             .await;
         assert_eq!(
             schema,
@@ -294,7 +294,7 @@ mod tests {
                             "additionalProperties": false,
                             "properties": {
                                 "module_id": {
-                                    "enum": ["query-vector"],
+                                    "enum": ["query-memory"],
                                 },
                                 "hint": {
                                     "type": "string",
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(
             reader
                 .status_for_instance(&ModuleInstanceId::new(
-                    builtin::query_vector(),
+                    builtin::query_memory(),
                     ReplicaIndex::ZERO,
                 ))
                 .await,

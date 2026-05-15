@@ -2,11 +2,11 @@
 //!
 //! Owns the [`MemoryStore`] port, the memory-domain capability handles
 //! ([`MemoryWriter`], [`MemoryCompactor`], [`MemoryAssociator`],
-//! [`VectorMemorySearcher`], [`MemoryContentReader`]), and the modules that
+//! [`MemorySearcher`], [`MemoryContentReader`]), and the modules that
 //! operate on memory: [`MemoryModule`] (writes), [`MemoryCompactionModule`]
 //! (destructive merges), [`MemoryAssociationModule`] (non-destructive
 //! relationship writes), [`MemoryRecombinationModule`] (dream-like
-//! recombination), and [`QueryVectorModule`] (vector-search retrieval).
+//! recombination), and [`QueryMemoryModule`] (vector-search retrieval).
 //!
 //! Hosts build a [`MemoryCapabilities`] provider once at boot to bundle the
 //! store + blackboard + clock, then either pass it to registration closures
@@ -45,11 +45,10 @@ pub use memory::{
     MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector,
 };
 pub use query::{
-    FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryVectorBatch,
-    QueryVectorLinkedMemoryHit, QueryVectorMemo, QueryVectorMemoHit, QueryVectorMemoLinkedHit,
-    QueryVectorMemoSearch, QueryVectorMemoryHit, QueryVectorModule, QueryVectorTools,
-    QueryVectorToolsCall, QueryVectorToolsSelector, SearchVectorMemoryArgs,
-    SearchVectorMemoryOutput,
+    FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryMemoryBatch, QueryMemoryHit,
+    QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit, QueryMemoryMemoLinkedHit,
+    QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools, QueryMemoryToolsCall,
+    QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput,
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
@@ -58,8 +57,8 @@ pub use recombination::{
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,
     MemoryConcept, MemoryContentReader, MemoryDeleter, MemoryKind, MemoryLink, MemoryLinkDirection,
-    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag, MemoryWriter, NewMemory,
-    NewMemoryLink, NoopMemoryStore, VectorMemorySearcher,
+    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemorySearcher, MemoryStore, MemoryTag,
+    MemoryWriter, NewMemory, NewMemoryLink, NoopMemoryStore,
 };
 
 /// Domain-scoped capability provider for the memory subsystem.
@@ -120,8 +119,8 @@ impl MemoryCapabilities {
         )
     }
 
-    pub fn searcher(&self) -> VectorMemorySearcher {
-        VectorMemorySearcher::new(
+    pub fn searcher(&self) -> MemorySearcher {
+        MemorySearcher::new(
             self.primary_store.clone(),
             self.blackboard.clone(),
             self.clock.clone(),

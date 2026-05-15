@@ -27,7 +27,7 @@ This document is the implementation source of truth. It describes the desired ar
 16. **Controller proposals with deterministic effective allocation** — Allocation-controller replicas write allocation proposals. The runtime derives the effective `ResourceAllocation` by deterministic averaging of `activation_ratio`, `guidance`, and `tier`, computes active replicas from each module's boot-time cap range, then applies `RuntimePolicy` hard limits such as max total active replicas and max Premium replicas.
 17. **Registry-derived controller schema** — The allocation-controller structured-output JSON Schema is generated from module registrations, enumerates module ids, and exposes only `activation_ratio`, `guidance`, and `tier`. Parsed ratios are still clamped to `0.0..=1.0` because LLM output is not a trust boundary.
 18. **Free-form memo logs** — `Memo` appends durable module-output log entries. Each entry is plain free-form text, not JSON/YAML, a code-fenced format, or a structured data exchange protocol. Modules consume this surface through unread memo logs and keep any needed durable context in their own persistent `Session` plus compaction; there is no latest-memo snapshot read API. Structured output is reserved for runtime control decisions whose fields are read by code.
-19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and is reinforced by **reward** through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop split actor/critic style: `policy` proposes new behaviors as `(trigger, behavior)` pairs; `query-policy` retrieves candidates by vector search over the `trigger` field only; `value-estimator` predicts each retrieved policy's `expected_reward` in the current context (critic); `reward` aggregates the 6-source `ObservedReward`, computes `td_error = observed_reward − expected_reward`, and applies value, expected-reward, and confidence deltas through `PolicyValueUpdater::reinforce`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. Creating new policy entries belongs to `policy`; predicting value belongs to `value-estimator`; updating value, expected reward, confidence, rank, and reward tokens belongs to `reward`; retrieval belongs to `query-policy`. The retrieval module that surfaces memories is named `query-memory` (the role) rather than `query-vector` (the implementation); the underlying crate, tool ids, and `VectorMemorySearcher` capability keep their names for now and are renamed in a follow-up implementation pass.
+19. **Memory and learning are distinct reinforcement substrates** — Memory preserves *what happened* and is reinforced by **access**: rank rises when entries are read or queried, and this rule is owned by `MemoryStore` rather than by any module. Learning preserves *what worked* and is reinforced by **reward** through a TD-0 (temporal-difference, one-step lookbehind, no discount) credit-assignment loop split actor/critic style: `policy` proposes new behaviors as `(trigger, behavior)` pairs; `query-policy` retrieves candidates by vector search over the `trigger` field only; `value-estimator` predicts each retrieved policy's `expected_reward` in the current context (critic); `reward` aggregates the 6-source `ObservedReward`, computes `td_error = observed_reward − expected_reward`, and applies value, expected-reward, and confidence deltas through `PolicyValueUpdater::reinforce`. Rank crosses tiers only as a derived consequence of value × reward-tokens. Policies and memories never share a store, a rank enum, or a strengthening rule. Creating new policy entries belongs to `policy`; predicting value belongs to `value-estimator`; updating value, expected reward, confidence, rank, and reward tokens belongs to `reward`; retrieval belongs to `query-policy`. The retrieval module that surfaces memories is named `query-memory`.
 20. **Interoception and homeostasis are separate** — `interoception` owns the canonical internal-state estimate: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. `homeostatic-controller` reads that state and regulates allocation, but it does not estimate internal state. There is no separate `emotion` module in v1.
 21. **Memory records carry storage-time affect context** — `MemoryWriter` and `MemoryCompactor` stamp new records with the current `InteroceptiveState` affect fields (`affect_arousal`, `valence`, `emotion`). These fields are storage-time context, not truth labels and not later reinterpretation.
 
@@ -46,7 +46,7 @@ crates/
     allocation-controller/     # cognition log -> resource allocation
     attention-schema/         # memo logs/allocation/cognition log -> first-person attention cognition-log entries
     self-model/               # attention-schema cognition log + memo logs -> self-model memo logs
-    query-memory/             # blackboard/vector memory RAG -> query-memory memo logs (crate dir still query-vector/ in v1)
+    query-memory/             # blackboard/vector memory RAG -> query-memory memo logs
     query-policy/             # blackboard/policy store search -> query-policy memo logs
     memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
     memory-compaction/        # memory metadata/content -> merges
@@ -106,13 +106,13 @@ pub struct ModuleInstanceId {
 Application boot registers modules as `(module_id, cap_range, builder)`:
 
 ```rust
-let registry = ModuleRegistry::new().register(builtin::query_vector(), 0..=3, |caps| {
-    QueryVectorModule::new(
+let registry = ModuleRegistry::new().register(builtin::query_memory(), 0..=3, |caps| {
+    QueryMemoryModule::new(
         caps.allocation_updated_inbox(),
         caps.cognition_log_updated_inbox(),
         caps.allocation_reader(),
         caps.blackboard_reader(),
-        caps.vector_memory_searcher(),
+        caps.memory_searcher(),
         caps.memo(),
         caps.llm_access(),
     )
@@ -408,7 +408,7 @@ All capabilities are non-exclusive: capability issuers do not enforce uniqueness
 | `AllocationReader` | no | read effective allocation snapshot and, for controller prompts, registry cap metadata |
 | `InteroceptiveReader` | no | read the current `InteroceptiveState` snapshot |
 | `ModuleStatusReader` | no | read scheduler-owned module run status |
-| `VectorMemorySearcher` | no | primary-store memory search + access metadata patch |
+| `MemorySearcher` | no | primary-store memory search + access metadata patch |
 | `MemoryContentReader` | no | primary-store content lookup by memory index |
 | `MemoryWriter` | no | primary-assigned insert + storage-replica fan-out + single metadata mirror |
 | `MemoryCompactor` | no | store-atomic compaction + storage-replica fan-out + remember-token increment |
@@ -462,13 +462,13 @@ Boot expands registered modules into persistent replica instances before the sch
 
 ```rust
 let modules = ModuleRegistry::new()
-    .register(builtin::query_vector(), 0..=3, |caps| {
-        QueryVectorModule::new(
+    .register(builtin::query_memory(), 0..=3, |caps| {
+        QueryMemoryModule::new(
             caps.query_inbox(),
             caps.allocation_updated_inbox(),
             caps.allocation_reader(),
             caps.blackboard_reader(),
-            caps.vector_memory_searcher(),
+            caps.memory_searcher(),
             caps.memo(),
             caps.llm_access(),
         )
@@ -570,9 +570,9 @@ Stable self-knowledge belongs in memory and is surfaced through query-module mem
 
 ### Query Memory
 
-Capabilities: `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `VectorMemorySearcher`, `Memo`, `LlmAccess`.
+Capabilities: `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemorySearcher`, `Memo`, `LlmAccess`.
 
-Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration, and does not query the policy store. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible. The crate directory remains `crates/modules/query-vector/` in this revision; the rename of the crate, eval-case directory, tool id, and `VectorMemorySearcher` capability is a follow-up implementation pass.
+Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates may also wake it to retrieve memory relevant to the current cognitive surface. It does not handle self-referential or self-model integration, and does not query the policy store. Output is appended to this replica's memo log, and those entries contain only retrieved memory content copied from query results. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
 
 ### Query Agentic
 
@@ -754,7 +754,7 @@ Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. The
 
 Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory, allocation-controller, speak-gate, and speak start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority query (memory, policy), memory, memory-compaction, policy, value-estimator, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the allocation-controller proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-vector,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
+Module eval cases live under `eval-cases/modules/{query-memory,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner seeds the target module's allocation guidance with the module prompt, publishes `AllocationUpdated`, then scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `trace` as a rubric `judge-inputs[]` value.
 
 Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum values in the `.eure` case: `output`, `utterance`, `failure`, `trace`, `observations`, `blackboard`, `memory`, `memos`, `cognition`, and `allocation`. The `memos` judge input renders `memo_logs`. The rubric text and criteria are always included; the selected judge inputs control only evidence sections. This keeps full-agent rubrics focused on utterance/memory/blackboard state and query rubrics focused on output plus trace without always passing the whole artifact observation payload.
 
@@ -800,7 +800,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Attention schema models attention only | it receives memo, allocation, and cognition-log read/wake capabilities plus `CognitionWriter` and `LlmAccess`, not `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | allocation-controller writes self-model guidance; self-model receives `AllocationUpdatedInbox` and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema cognition-log entries and current memo-log context |
-| Query memory is memory/RAG only | it receives `VectorMemorySearcher`, not policy or self-model capabilities |
+| Query memory is memory/RAG only | it receives `MemorySearcher`, not policy or self-model capabilities |
 | Query policy is policy-retrieval only | it receives `PolicySearcher`, not memory or self-model capabilities; its memo entries contain only retrieved policy records |
 | Policy vector search is trigger-only | `PolicySearcher` performs similarity over the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys |
 | Memory rank elevation is store-internal | no module holds a memory rank-elevation capability; `MemoryStore` applies access-threshold promotions on read paths that set `record_access: true` |

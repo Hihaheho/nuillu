@@ -55,9 +55,9 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
         .collect::<std::collections::HashSet<_>>();
     let edges = [
         (builtin::speak_gate(), builtin::cognition_gate()),
-        (builtin::self_model(), builtin::query_vector()),
+        (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
-        (builtin::cognition_gate(), builtin::query_vector()),
+        (builtin::cognition_gate(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::query_policy()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
@@ -156,17 +156,17 @@ fn register_server_module(
                 )
             })
         }
-        RuntimeModule::QueryVector => {
+        RuntimeModule::QueryMemory => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
-                nuillu_memory::QueryVectorModule::new(
+                nuillu_memory::QueryMemoryModule::new(
                     caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.searcher(),
                     memory_caps.content_reader(),
-                    caps.typed_memo::<nuillu_memory::QueryVectorMemo>(),
+                    caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                     caps.llm_access(),
                 )
             })
@@ -379,7 +379,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::AllocationController => (1.0, ModelTier::Default),
             RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
             RuntimeModule::SelfModel => (0.0, ModelTier::Default),
-            RuntimeModule::QueryVector => (0.0, ModelTier::Cheap),
+            RuntimeModule::QueryMemory => (0.0, ModelTier::Cheap),
             RuntimeModule::QueryPolicy => (0.0, ModelTier::Cheap),
             RuntimeModule::Memory => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryCompaction => (0.0, ModelTier::Cheap),
@@ -428,7 +428,7 @@ fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
         builtin::sensory(),
         builtin::attention_schema(),
         builtin::self_model(),
-        builtin::query_vector(),
+        builtin::query_memory(),
         builtin::query_policy(),
         builtin::memory(),
         builtin::policy(),

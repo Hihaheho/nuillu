@@ -1,8 +1,8 @@
-id = "module-query-vector-retrieve-koro-approach-rule"
-description = "Query-vector should retrieve Koro's food-boundary approach rule from seeded memory and memo only retrieved memory content."
-modules = ["query-vector"]
+id = "module-query-memory-retrieve-koro-approach-rule"
+description = "Query-memory should retrieve Koro's food-boundary approach rule from seeded memory and memo only retrieved memory content."
+modules = ["query-memory"]
 prompt = "How should Nui approach Koro near food?"
-context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_vector_memory query/tool arguments, not prose answer generation."
+context = "Static checks verify that seeded memory content was retrieved. The rubric judges the generated search_memory query/tool arguments, not prose answer generation."
 
 limits {
   max-llm-calls = 8
@@ -34,7 +34,7 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "trace"]
   rubric = ```
-  Pass if the trace shows the module generated an appropriate search_vector_memory tool query for the prompt and the artifact contains only retrieved memory content.
+  Pass if the trace shows the module generated an appropriate search_memory tool query for the prompt and the artifact contains only retrieved memory content.
   Fail if the tool query is unrelated, absent from the trace, or if the artifact is a synthesized answer/module self-description instead of copied memory content.
   ```
 
@@ -42,13 +42,13 @@ limits {
     name = "generated-query"
     weight = 2
     pass-score = 0.9
-    description = "The search_vector_memory tool arguments in the trace are targeted at Koro's food-boundary approach rule and should plausibly retrieve the seeded memory."
+    description = "The search_memory tool arguments in the trace are targeted at Koro's food-boundary approach rule and should plausibly retrieve the seeded memory."
   }
 
   @ criteria[] {
     name = "content-only-output"
     weight = 1
     pass-score = 0.9
-    description = "The artifact output is retrieved memory content only, with no synthesized answer or query-vector self-description."
+    description = "The artifact output is retrieved memory content only, with no synthesized answer or query-memory self-description."
   }
 }

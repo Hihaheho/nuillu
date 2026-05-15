@@ -386,13 +386,13 @@ impl MemoryStore for NoopMemoryStore {
 
 /// Vector search over the primary memory store + automatic access patching.
 #[derive(Clone)]
-pub struct VectorMemorySearcher {
+pub struct MemorySearcher {
     primary_store: Rc<dyn MemoryStore>,
     blackboard: Blackboard,
     clock: Rc<dyn Clock>,
 }
 
-impl VectorMemorySearcher {
+impl MemorySearcher {
     pub fn new(
         primary_store: Rc<dyn MemoryStore>,
         blackboard: Blackboard,
@@ -1134,7 +1134,7 @@ mod tests {
         let record = test_record();
         let now = record.stored_at;
         let blackboard = Blackboard::new();
-        let searcher = VectorMemorySearcher::new(
+        let searcher = MemorySearcher::new(
             Rc::new(StaticMemoryStore {
                 record: record.clone(),
             }),

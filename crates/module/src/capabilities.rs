@@ -1347,12 +1347,12 @@ mod tests {
 
         let blackboard = Blackboard::default();
         let caps = test_caps(blackboard.clone());
-        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+        let query_memory = scoped(&caps, builtin::query_memory(), 0);
         let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
-        let owner = ModuleInstanceId::new(builtin::query_vector(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
         let mut inbox = cognition_gate.memo_updated_inbox();
 
-        query_vector
+        query_memory
             .typed_memo::<TestMemoPayload>()
             .write(
                 TestMemoPayload {
@@ -1388,10 +1388,10 @@ mod tests {
     )]
     fn memo_then_typed_memo_panics() {
         let caps = test_caps(Blackboard::default());
-        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+        let query_memory = scoped(&caps, builtin::query_memory(), 0);
 
-        let _plain = query_vector.memo();
-        let _typed = query_vector.typed_memo::<u8>();
+        let _plain = query_memory.memo();
+        let _typed = query_memory.typed_memo::<u8>();
     }
 
     #[test]
@@ -1400,10 +1400,10 @@ mod tests {
     )]
     fn typed_memo_then_typed_memo_panics() {
         let caps = test_caps(Blackboard::default());
-        let query_vector = scoped(&caps, builtin::query_vector(), 0);
+        let query_memory = scoped(&caps, builtin::query_memory(), 0);
 
-        let _first = query_vector.typed_memo::<u8>();
-        let _second = query_vector.typed_memo::<u16>();
+        let _first = query_memory.typed_memo::<u8>();
+        let _second = query_memory.typed_memo::<u16>();
     }
 
     #[tokio::test]
