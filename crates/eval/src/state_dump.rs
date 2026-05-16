@@ -64,11 +64,25 @@ pub struct FullAgentLastStateCaseDump {
 pub struct BlackboardLastStateDump {
     pub memo_logs: Vec<MemoLogDump>,
     pub cognition_logs: Vec<CognitionLogDump>,
+    pub interoception: InteroceptionDump,
     pub agentic_deadlock: Option<AgenticDeadlockDump>,
     pub base_allocation: Vec<AllocationModuleDump>,
     pub allocation: Vec<AllocationModuleDump>,
     pub allocation_proposals: Vec<AllocationProposalDump>,
     pub replica_caps: Vec<ReplicaCapDump>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, IntoEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct InteroceptionDump {
+    pub mode: String,
+    pub wake_arousal: f32,
+    pub nrem_pressure: f32,
+    pub rem_pressure: f32,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
+    pub last_updated: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
@@ -108,6 +122,7 @@ pub struct AllocationModuleDump {
     pub module: String,
     pub activation_ratio: f64,
     pub active_replicas: u8,
+    pub cooldown_ms: Option<u64>,
     pub tier: String,
     pub guidance: DumpText,
 }
@@ -235,6 +250,16 @@ mod tests {
                         text: DumpText::new("cognition"),
                     }],
                 }],
+                interoception: InteroceptionDump {
+                    mode: "wake".to_string(),
+                    wake_arousal: 1.0,
+                    nrem_pressure: 0.0,
+                    rem_pressure: 0.0,
+                    affect_arousal: 0.0,
+                    valence: 0.0,
+                    emotion: String::new(),
+                    last_updated: "2026-05-08T00:00:00Z".to_string(),
+                },
                 agentic_deadlock: None,
                 base_allocation: Vec::new(),
                 allocation: Vec::new(),

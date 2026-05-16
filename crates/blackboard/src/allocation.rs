@@ -36,6 +36,110 @@ impl ActivationRatio {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationEffectLevel {
+    Off,
+    Minimal,
+    Low,
+    Normal,
+    High,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationEffectKind {
+    Target,
+    Suppression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationCommand {
+    pub effect: AllocationEffectKind,
+    pub module: ModuleId,
+    pub level: AllocationEffectLevel,
+    pub guidance: Option<String>,
+}
+
+impl AllocationCommand {
+    pub fn target(
+        module: ModuleId,
+        level: AllocationEffectLevel,
+        guidance: impl Into<Option<String>>,
+    ) -> Self {
+        Self {
+            effect: AllocationEffectKind::Target,
+            module,
+            level,
+            guidance: guidance.into(),
+        }
+    }
+
+    pub fn suppression(module: ModuleId, level: AllocationEffectLevel) -> Self {
+        Self {
+            effect: AllocationEffectKind::Suppression,
+            module,
+            level,
+            guidance: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AllocationEffectPolicy {
+    target: BTreeMap<AllocationEffectLevel, ActivationRatio>,
+    suppression_multiplier: BTreeMap<AllocationEffectLevel, ActivationRatio>,
+}
+
+impl AllocationEffectPolicy {
+    pub fn target_ratio(&self, level: AllocationEffectLevel) -> ActivationRatio {
+        self.target.get(&level).copied().unwrap_or_default()
+    }
+
+    pub fn suppression_multiplier(&self, level: AllocationEffectLevel) -> ActivationRatio {
+        self.suppression_multiplier
+            .get(&level)
+            .copied()
+            .unwrap_or(ActivationRatio::ONE)
+    }
+}
+
+impl Default for AllocationEffectPolicy {
+    fn default() -> Self {
+        Self {
+            target: BTreeMap::from([
+                (AllocationEffectLevel::Off, ActivationRatio::ZERO),
+                (
+                    AllocationEffectLevel::Minimal,
+                    ActivationRatio::from_f64(0.05),
+                ),
+                (AllocationEffectLevel::Low, ActivationRatio::from_f64(0.15)),
+                (
+                    AllocationEffectLevel::Normal,
+                    ActivationRatio::from_f64(0.50),
+                ),
+                (AllocationEffectLevel::High, ActivationRatio::from_f64(0.85)),
+                (AllocationEffectLevel::Max, ActivationRatio::ONE),
+            ]),
+            suppression_multiplier: BTreeMap::from([
+                (AllocationEffectLevel::Off, ActivationRatio::ONE),
+                (
+                    AllocationEffectLevel::Minimal,
+                    ActivationRatio::from_f64(0.75),
+                ),
+                (AllocationEffectLevel::Low, ActivationRatio::from_f64(0.50)),
+                (
+                    AllocationEffectLevel::Normal,
+                    ActivationRatio::from_f64(0.25),
+                ),
+                (AllocationEffectLevel::High, ActivationRatio::from_f64(0.10)),
+                (AllocationEffectLevel::Max, ActivationRatio::from_f64(0.03)),
+            ]),
+        }
+    }
+}
+
 impl Default for ActivationRatio {
     fn default() -> Self {
         Self::ONE
@@ -336,6 +440,15 @@ impl ResourceAllocation {
     /// Write the controller's activation knob for a module.
     pub fn set_activation(&mut self, id: ModuleId, ratio: ActivationRatio) {
         self.activation.insert(id, ratio);
+    }
+
+    pub fn multiply_activation(&mut self, id: ModuleId, multiplier: ActivationRatio) {
+        let current = self.activation_for(&id);
+        let product = u32::from(current.raw()) * u32::from(multiplier.raw());
+        let rounded =
+            (product + u32::from(ACTIVATION_RATIO_SCALE / 2)) / u32::from(ACTIVATION_RATIO_SCALE);
+        self.activation
+            .insert(id, ActivationRatio::from_raw(rounded as u16));
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ModuleId, &ModuleConfig)> {

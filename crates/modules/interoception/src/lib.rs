@@ -5,12 +5,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{
-    CognitionLogEntryRecord, InteroceptiveMode, InteroceptivePatch, InteroceptiveState,
-    MemoLogRecord,
+    AllocationCommand, AllocationEffectLevel, CognitionLogEntryRecord, InteroceptiveMode,
+    InteroceptivePatch, InteroceptiveState, MemoLogRecord,
 };
 use nuillu_module::{
-    AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox, InteroceptiveWriter,
-    LlmAccess, MemoUpdatedInbox, Module,
+    AllocationUpdatedInbox, AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox,
+    InteroceptionRuntimePolicy, InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 const SYSTEM_PROMPT: &str = r#"You are the interoception module.
 Maintain the agent's internal state from the recent cognitive workspace. Estimate affect as
 current internal condition, not a moral judgment and not a memory fact.
-Return affect_arousal in [0, 1], valence in [-1, 1], and one short untyped emotion phrase.
+For arousal, return structured increase levels rather than numeric deltas. Use higher wake and
+affect increase levels only when the unread sensory/cognitive evidence is salient enough to wake or
+emotionally activate the agent. Return valence in [-1, 1] and one short untyped emotion phrase.
 Use neutral values when evidence is weak. Do not mention implementation details."#;
 
 const PERIODIC_WAKEUP: Duration = Duration::from_secs(1);
@@ -30,10 +32,39 @@ const REM_FROM_REMEMBER_TOKEN: f32 = 0.20;
 const REM_RELIEF_PER_RECOMBINATION: f32 = 0.35;
 const WAKE_AROUSAL_FROM_COGNITION: f32 = 0.03;
 const WAKE_AROUSAL_DECAY_PER_SEC: f32 = 0.02;
+const QUIET_WAKE_AROUSAL_DECAY_PER_SEC: f32 = 0.08;
+const QUIET_AFFECT_AROUSAL_DECAY_PER_SEC: f32 = 0.08;
+const WAKE_AROUSAL_WAKE_LEVEL: f32 = 0.70;
+const WAKE_AROUSAL_SLEEP_LEVEL: f32 = 0.25;
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArousalEffectLevel {
+    Off,
+    Minimal,
+    Low,
+    Normal,
+    High,
+    Max,
+}
+
+impl From<ArousalEffectLevel> for AllocationEffectLevel {
+    fn from(level: ArousalEffectLevel) -> Self {
+        match level {
+            ArousalEffectLevel::Off => Self::Off,
+            ArousalEffectLevel::Minimal => Self::Minimal,
+            ArousalEffectLevel::Low => Self::Low,
+            ArousalEffectLevel::Normal => Self::Normal,
+            ArousalEffectLevel::High => Self::High,
+            ArousalEffectLevel::Max => Self::Max,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AffectAssessment {
-    pub affect_arousal: f32,
+    pub wake_arousal_increase: ArousalEffectLevel,
+    pub affect_arousal_increase: ArousalEffectLevel,
     pub valence: f32,
     pub emotion: String,
 }
@@ -48,11 +79,14 @@ pub struct InteroceptionModule {
     cognition_updates: CognitionLogUpdatedInbox,
     allocation_updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
+    allocation_writer: AllocationWriter,
     interoception: InteroceptiveWriter,
+    policy: InteroceptionRuntimePolicy,
     llm: LlmAccess,
     session: Session,
     last_seen_cognition_index: Option<u64>,
     last_total_remember_tokens: Option<u32>,
+    last_activity_at: Option<DateTime<Utc>>,
 }
 
 impl InteroceptionModule {
@@ -61,6 +95,8 @@ impl InteroceptionModule {
         cognition_updates: CognitionLogUpdatedInbox,
         allocation_updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
+        allocation_writer: AllocationWriter,
+        policy: InteroceptionRuntimePolicy,
         interoception: InteroceptiveWriter,
         llm: LlmAccess,
     ) -> Self {
@@ -69,11 +105,14 @@ impl InteroceptionModule {
             cognition_updates,
             allocation_updates,
             blackboard,
+            allocation_writer,
+            policy,
             interoception,
             llm,
             session: Session::new(),
             last_seen_cognition_index: None,
             last_total_remember_tokens: None,
+            last_activity_at: None,
         }
     }
 
@@ -120,6 +159,22 @@ impl InteroceptionModule {
             .iter()
             .filter(|record| record.source.module != builtin::memory_recombination())
             .count() as u32;
+        let sensory_activity = unread_memos
+            .iter()
+            .any(|record| record.owner.module == builtin::sensory());
+        let cognitive_activity = non_dream_entries > 0;
+        let activity = sensory_activity || cognitive_activity;
+        let previous_activity_at = self.last_activity_at.unwrap_or_else(|| cx.now());
+        let quiet_for = if activity {
+            Duration::ZERO
+        } else {
+            (cx.now() - previous_activity_at)
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+        };
+        if self.last_activity_at.is_none() || activity {
+            self.last_activity_at = Some(cx.now());
+        }
 
         let mut patch = next_interoception_patch(
             &current,
@@ -127,14 +182,19 @@ impl InteroceptionModule {
             non_dream_entries,
             recombination_entries,
             remember_delta,
+            quiet_for,
+            &self.policy,
         );
         if batch.affect_candidate && (!unread_memos.is_empty() || !unread_cognition.is_empty()) {
             let affect = self
                 .estimate_affect(&current, &unread_memos, &unread_cognition, &allocation)
                 .await?;
-            merge_affect_patch(&mut patch, affect);
+            merge_affect_patch(&mut patch, &current, affect, &self.policy);
         }
+        let mut next_state = current.clone();
+        next_state.apply_patch(patch.clone(), cx.now());
         self.interoception.update(patch).await;
+        self.emit_suppression(&next_state).await;
         Ok(())
     }
 
@@ -191,14 +251,30 @@ impl InteroceptionModule {
 
 fn normalize_affect_assessment(assessment: AffectAssessment) -> AffectAssessment {
     AffectAssessment {
-        affect_arousal: clamp_unit(assessment.affect_arousal),
+        wake_arousal_increase: assessment.wake_arousal_increase,
+        affect_arousal_increase: assessment.affect_arousal_increase,
         valence: clamp_signed_unit(assessment.valence),
         emotion: assessment.emotion.trim().to_owned(),
     }
 }
 
-fn merge_affect_patch(patch: &mut InteroceptivePatch, affect: AffectAssessment) {
-    patch.affect_arousal = Some(affect.affect_arousal);
+fn merge_affect_patch(
+    patch: &mut InteroceptivePatch,
+    current: &InteroceptiveState,
+    affect: AffectAssessment,
+    policy: &InteroceptionRuntimePolicy,
+) {
+    let base_wake = patch.wake_arousal.unwrap_or(current.wake_arousal);
+    let base_affect = patch.affect_arousal.unwrap_or(current.affect_arousal);
+    let wake_arousal =
+        clamp_unit(base_wake + policy.wake_increase_for(affect.wake_arousal_increase.into()));
+    patch.wake_arousal = Some(wake_arousal);
+    patch.affect_arousal = Some(clamp_unit(
+        base_affect + policy.affect_increase_for(affect.affect_arousal_increase.into()),
+    ));
+    if wake_arousal >= WAKE_AROUSAL_WAKE_LEVEL {
+        patch.mode = Some(InteroceptiveMode::Wake);
+    }
     patch.valence = Some(affect.valence);
     patch.emotion = Some(affect.emotion);
 }
@@ -209,6 +285,8 @@ fn next_interoception_patch(
     non_dream_entries: u32,
     recombination_entries: u32,
     remember_delta: u32,
+    quiet_for: Duration,
+    policy: &InteroceptionRuntimePolicy,
 ) -> InteroceptivePatch {
     let elapsed_secs = (now - current.last_updated)
         .to_std()
@@ -221,15 +299,29 @@ fn next_interoception_patch(
         - remember_delta as f32 * NREM_RELIEF_PER_REMEMBER_TOKEN;
     let rem_pressure = current.rem_pressure + remember_delta as f32 * REM_FROM_REMEMBER_TOKEN
         - recombination_entries as f32 * REM_RELIEF_PER_RECOMBINATION;
+    let quiet_excess_secs = quiet_for
+        .saturating_sub(policy.quiet_sleep_threshold)
+        .as_secs_f32()
+        .min(120.0);
     let wake_arousal = current.wake_arousal
         + non_dream_entries as f32 * WAKE_AROUSAL_FROM_COGNITION
-        - elapsed_secs * WAKE_AROUSAL_DECAY_PER_SEC;
+        - elapsed_secs * WAKE_AROUSAL_DECAY_PER_SEC
+        - quiet_excess_secs
+            * QUIET_WAKE_AROUSAL_DECAY_PER_SEC
+            * policy.wake_arousal_change_multiplier;
+    let affect_arousal = current.affect_arousal
+        - quiet_excess_secs
+            * QUIET_AFFECT_AROUSAL_DECAY_PER_SEC
+            * policy.affect_arousal_change_multiplier;
     let nrem_pressure = clamp_unit(nrem_pressure);
     let rem_pressure = clamp_unit(rem_pressure);
     let wake_arousal = clamp_unit(wake_arousal);
-    let mode = if wake_arousal >= 0.9 {
+    let affect_arousal = clamp_unit(affect_arousal);
+    let mode = if wake_arousal >= WAKE_AROUSAL_WAKE_LEVEL {
         InteroceptiveMode::Wake
-    } else if nrem_pressure >= 0.7 {
+    } else if nrem_pressure >= 0.7
+        || (quiet_excess_secs > 0.0 && wake_arousal <= WAKE_AROUSAL_SLEEP_LEVEL)
+    {
         InteroceptiveMode::NremPressure
     } else if rem_pressure >= 0.4 && nrem_pressure <= 0.35 {
         InteroceptiveMode::RemPressure
@@ -242,9 +334,40 @@ fn next_interoception_patch(
         wake_arousal: Some(wake_arousal),
         nrem_pressure: Some(nrem_pressure),
         rem_pressure: Some(rem_pressure),
-        affect_arousal: None,
+        affect_arousal: Some(affect_arousal),
         valence: None,
         emotion: None,
+    }
+}
+
+impl InteroceptionModule {
+    async fn emit_suppression(&self, state: &InteroceptiveState) {
+        let level = suppression_level(state);
+        let commands = self
+            .allocation_writer
+            .allowed_suppression_modules()
+            .iter()
+            .cloned()
+            .map(|id| AllocationCommand::suppression(id, level))
+            .collect::<Vec<_>>();
+        self.allocation_writer.submit(commands).await;
+    }
+}
+
+fn suppression_level(state: &InteroceptiveState) -> AllocationEffectLevel {
+    if state.wake_arousal >= 0.70 {
+        AllocationEffectLevel::Off
+    } else if state.wake_arousal >= 0.45 {
+        AllocationEffectLevel::Low
+    } else if state.wake_arousal >= 0.25 {
+        AllocationEffectLevel::Normal
+    } else if matches!(
+        state.mode,
+        InteroceptiveMode::NremPressure | InteroceptiveMode::RemPressure
+    ) {
+        AllocationEffectLevel::Max
+    } else {
+        AllocationEffectLevel::High
     }
 }
 
@@ -296,12 +419,13 @@ mod tests {
     #[test]
     fn interoception_pressure_cycles_from_cognition_compaction_and_recombination() {
         let now = DateTime::<Utc>::from_timestamp(10, 0).unwrap();
+        let policy = InteroceptionRuntimePolicy::default();
         let current = InteroceptiveState {
             last_updated: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
             ..InteroceptiveState::default()
         };
 
-        let patch = next_interoception_patch(&current, now, 12, 0, 0);
+        let patch = next_interoception_patch(&current, now, 12, 0, 0, Duration::ZERO, &policy);
         assert_eq!(patch.mode, Some(InteroceptiveMode::NremPressure));
         assert!(patch.nrem_pressure.unwrap() >= 0.7);
 
@@ -311,7 +435,7 @@ mod tests {
             last_updated: now,
             ..InteroceptiveState::default()
         };
-        let patch = next_interoception_patch(&compacted, now, 0, 0, 3);
+        let patch = next_interoception_patch(&compacted, now, 0, 0, 3, Duration::ZERO, &policy);
         assert!(patch.nrem_pressure.unwrap() <= 0.3);
         assert!(patch.rem_pressure.unwrap() > 0.4);
 
@@ -320,20 +444,83 @@ mod tests {
             last_updated: now,
             ..InteroceptiveState::default()
         };
-        let patch = next_interoception_patch(&recombined, now, 0, 2, 0);
+        let patch = next_interoception_patch(&recombined, now, 0, 2, 0, Duration::ZERO, &policy);
         assert!(patch.rem_pressure.unwrap() <= 0.1);
     }
 
     #[test]
     fn affect_assessment_is_normalized() {
         let normalized = normalize_affect_assessment(AffectAssessment {
-            affect_arousal: f32::NAN,
+            wake_arousal_increase: ArousalEffectLevel::High,
+            affect_arousal_increase: ArousalEffectLevel::Low,
             valence: -1.5,
             emotion: "  startled relief  ".to_owned(),
         });
 
-        assert_eq!(normalized.affect_arousal, 0.0);
+        assert!(matches!(
+            normalized.wake_arousal_increase,
+            ArousalEffectLevel::High
+        ));
         assert_eq!(normalized.valence, -1.0);
         assert_eq!(normalized.emotion, "startled relief");
+    }
+
+    #[test]
+    fn quiet_period_decays_wake_and_affect_arousal() {
+        let now = DateTime::<Utc>::from_timestamp(40, 0).unwrap();
+        let policy = InteroceptionRuntimePolicy {
+            quiet_sleep_threshold: Duration::from_secs(5),
+            wake_arousal_change_multiplier: 2.0,
+            affect_arousal_change_multiplier: 2.0,
+        };
+        let current = InteroceptiveState {
+            wake_arousal: 0.8,
+            affect_arousal: 0.7,
+            last_updated: DateTime::<Utc>::from_timestamp(39, 0).unwrap(),
+            ..InteroceptiveState::default()
+        };
+
+        let patch =
+            next_interoception_patch(&current, now, 0, 0, 0, Duration::from_secs(10), &policy);
+
+        assert!(patch.wake_arousal.unwrap() < 0.1);
+        assert!(patch.affect_arousal.unwrap() < 0.1);
+        assert_eq!(patch.mode, Some(InteroceptiveMode::NremPressure));
+    }
+
+    #[test]
+    fn salient_affect_assessment_raises_arousal_from_levels() {
+        let policy = InteroceptionRuntimePolicy {
+            wake_arousal_change_multiplier: 2.0,
+            ..InteroceptionRuntimePolicy::default()
+        };
+        let current = InteroceptiveState {
+            wake_arousal: 0.2,
+            affect_arousal: 0.1,
+            ..InteroceptiveState::default()
+        };
+        let mut patch = InteroceptivePatch {
+            wake_arousal: Some(0.2),
+            affect_arousal: Some(0.1),
+            ..InteroceptivePatch::default()
+        };
+
+        merge_affect_patch(
+            &mut patch,
+            &current,
+            AffectAssessment {
+                wake_arousal_increase: ArousalEffectLevel::Max,
+                affect_arousal_increase: ArousalEffectLevel::High,
+                valence: 0.4,
+                emotion: "alert".to_owned(),
+            },
+            &policy,
+        );
+
+        assert!(patch.wake_arousal.unwrap() > 0.7);
+        assert!(patch.affect_arousal.unwrap() > 0.2);
+        assert_eq!(patch.mode, Some(InteroceptiveMode::Wake));
+        assert_eq!(patch.valence, Some(0.4));
+        assert_eq!(patch.emotion.as_deref(), Some("alert"));
     }
 }

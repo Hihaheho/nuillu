@@ -24,12 +24,12 @@ use crate::{
     AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEvictedInbox,
     CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox,
-    CognitionLogUpdatedMailbox, CognitionWriter, InteroceptiveReader, InteroceptiveUpdated,
-    InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess,
-    LutumTiers, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox,
-    MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
-    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
-    TopicInbox, TopicMailbox, TypedMemo,
+    CognitionLogUpdatedMailbox, CognitionWriter, InteroceptionRuntimePolicy, InteroceptiveReader,
+    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
+    InteroceptiveWriter, LlmAccess, LutumTiers, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox,
+    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
+    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -755,8 +755,8 @@ impl ModuleCapabilityFactory {
 
     pub fn allocation_writer(
         &self,
-        allowed_drive_modules: Vec<ModuleId>,
-        allowed_cap_modules: Vec<ModuleId>,
+        allowed_target_modules: Vec<ModuleId>,
+        allowed_suppression_modules: Vec<ModuleId>,
     ) -> AllocationWriter {
         AllocationWriter::new(
             self.owner.clone(),
@@ -765,9 +765,14 @@ impl ModuleCapabilityFactory {
                 self.owner.clone(),
                 self.root.inner.allocation_updates.clone(),
             ),
-            allowed_drive_modules,
-            allowed_cap_modules,
+            allowed_target_modules,
+            allowed_suppression_modules,
+            self.root.inner.runtime_policy.allocation_effects.clone(),
         )
+    }
+
+    pub fn interoception_policy(&self) -> InteroceptionRuntimePolicy {
+        self.root.inner.runtime_policy.interoception.clone()
     }
 
     pub fn interoception_writer(&self) -> InteroceptiveWriter {
@@ -1204,8 +1209,8 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
-        ResourceAllocation,
+        ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
+        CognitionLogEntry, ResourceAllocation,
     };
     use nuillu_types::{ReplicaCapRange, builtin};
 
@@ -1592,22 +1597,103 @@ mod tests {
         let writer = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
         let mut inbox = cognition_gate.allocation_updated_inbox();
 
-        let mut proposal = ResourceAllocation::default();
-        proposal.set(
+        let commands = vec![AllocationCommand::target(
             builtin::cognition_gate(),
-            ModuleConfig {
-                guidance: "promote current sensory memo into attention".into(),
-            },
-        );
-        proposal.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
+            AllocationEffectLevel::Max,
+            Some("promote current sensory memo into attention".into()),
+        )];
 
-        writer.set(proposal.clone()).await;
+        writer.submit(commands.clone()).await;
         let event = inbox.next_item().await.unwrap();
         assert_eq!(event.sender.module, builtin::allocation_controller());
         assert_eq!(event.body, crate::AllocationUpdated);
 
-        writer.set(proposal).await;
+        writer.submit(commands).await;
         assert!(inbox.take_ready_items().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allocation_writer_applies_only_allowed_command_kinds() {
+        let mut base = ResourceAllocation::default();
+        base.set_activation(builtin::allocation_controller(), ActivationRatio::ONE);
+        base.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
+        base.set_activation(builtin::speak(), ActivationRatio::ZERO);
+        let blackboard = Blackboard::with_allocation(base);
+        blackboard
+            .apply(BlackboardCommand::SetModulePolicies {
+                policies: vec![
+                    (
+                        builtin::allocation_controller(),
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(1, 1).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
+                    ),
+                    (
+                        builtin::cognition_gate(),
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 1).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
+                    ),
+                    (
+                        builtin::speak(),
+                        nuillu_blackboard::ModulePolicy::new(
+                            ReplicaCapRange::new(0, 1).unwrap(),
+                            nuillu_blackboard::Bpm::from_f64(60.0)
+                                ..=nuillu_blackboard::Bpm::from_f64(60.0),
+                            nuillu_blackboard::linear_ratio_fn,
+                        ),
+                    ),
+                ],
+            })
+            .await;
+        let caps = test_caps(blackboard.clone());
+        let controller = scoped(&caps, builtin::allocation_controller(), 0);
+        let writer =
+            controller.allocation_writer(vec![builtin::speak()], vec![builtin::cognition_gate()]);
+
+        writer
+            .submit([
+                AllocationCommand::target(
+                    builtin::speak(),
+                    AllocationEffectLevel::Max,
+                    Some("speak if attention is ready".into()),
+                ),
+                AllocationCommand::target(
+                    builtin::cognition_gate(),
+                    AllocationEffectLevel::Max,
+                    Some("disallowed target".into()),
+                ),
+                AllocationCommand::suppression(
+                    builtin::cognition_gate(),
+                    AllocationEffectLevel::High,
+                ),
+                AllocationCommand::suppression(builtin::speak(), AllocationEffectLevel::Max),
+            ])
+            .await;
+
+        let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            allocation.activation_for(&builtin::speak()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(
+            allocation.for_module(&builtin::speak()).guidance,
+            "speak if attention is ready"
+        );
+        assert_eq!(
+            allocation.activation_for(&builtin::cognition_gate()),
+            ActivationRatio::from_f64(0.10)
+        );
+        assert_ne!(
+            allocation.for_module(&builtin::cognition_gate()).guidance,
+            "disallowed target"
+        );
     }
 
     #[tokio::test]

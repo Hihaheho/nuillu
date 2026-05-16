@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nuillu_blackboard::{ActivationRatio, InteroceptiveState, ModuleConfig, ResourceAllocation};
+use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel, InteroceptiveState};
 use nuillu_module::{AllocationWriter, InteroceptiveReader, InteroceptiveUpdatedInbox, Module};
 use nuillu_types::{ModuleId, builtin};
 
@@ -11,7 +11,7 @@ const PERIODIC_WAKEUP: Duration = Duration::from_secs(1);
 const NREM_ENTER: f32 = 0.7;
 const NREM_EXIT: f32 = 0.3;
 const REM_EXIT: f32 = 0.2;
-const FORCE_WAKE: f32 = 0.9;
+const FORCE_WAKE: f32 = 0.7;
 const MIN_PHASE_DURATION: Duration = Duration::from_secs(2);
 const MAX_NREM_DURATION: Duration = Duration::from_secs(30);
 const MAX_REM_DURATION: Duration = Duration::from_secs(20);
@@ -65,10 +65,12 @@ impl HomeostaticControllerModule {
     }
 
     async fn emit_phase(&self, phase: HomeostaticPhase) {
-        let drive = drive_allocation(phase, self.allocation.allowed_drive_modules());
-        self.allocation.set_drive(drive).await;
-        let cap = cap_allocation(phase, self.allocation.allowed_cap_modules());
-        self.allocation.set_cap(cap).await;
+        let mut commands = drive_commands(phase, self.allocation.allowed_target_modules());
+        commands.extend(suppression_commands(
+            phase,
+            self.allocation.allowed_suppression_modules(),
+        ));
+        self.allocation.submit(commands).await;
     }
 
     async fn next_batch(&mut self) -> Result<()> {
@@ -95,7 +97,12 @@ fn next_phase(
     let elapsed = (now - entered_at).to_std().unwrap_or(Duration::ZERO);
     match current {
         HomeostaticPhase::Wake => {
-            if interoception.nrem_pressure >= NREM_ENTER {
+            if interoception.nrem_pressure >= NREM_ENTER
+                || matches!(
+                    interoception.mode,
+                    nuillu_blackboard::InteroceptiveMode::NremPressure
+                )
+            {
                 HomeostaticPhase::Compacting
             } else {
                 HomeostaticPhase::Wake
@@ -114,7 +121,11 @@ fn next_phase(
             if elapsed >= MAX_REM_DURATION
                 || (elapsed >= MIN_PHASE_DURATION && interoception.rem_pressure <= REM_EXIT)
             {
-                HomeostaticPhase::Wake
+                if sleep_persists(interoception) {
+                    HomeostaticPhase::Compacting
+                } else {
+                    HomeostaticPhase::Wake
+                }
             } else {
                 HomeostaticPhase::Recombining
             }
@@ -122,47 +133,57 @@ fn next_phase(
     }
 }
 
-fn drive_allocation(phase: HomeostaticPhase, allowed: &[ModuleId]) -> ResourceAllocation {
-    let mut allocation = ResourceAllocation::default();
+fn sleep_persists(interoception: &InteroceptiveState) -> bool {
+    interoception.wake_arousal < FORCE_WAKE
+        && (interoception.nrem_pressure >= NREM_EXIT
+            || matches!(
+                interoception.mode,
+                nuillu_blackboard::InteroceptiveMode::NremPressure
+                    | nuillu_blackboard::InteroceptiveMode::RemPressure
+            ))
+}
+
+fn drive_commands(phase: HomeostaticPhase, allowed: &[ModuleId]) -> Vec<AllocationCommand> {
+    let mut commands = Vec::new();
     for id in allowed {
-        let ratio = if *id == builtin::memory_compaction()
+        let level = if *id == builtin::memory_compaction()
             || *id == builtin::memory_association()
             || *id == builtin::policy_compaction()
         {
             match phase {
-                HomeostaticPhase::Compacting => 1.0,
-                HomeostaticPhase::Wake | HomeostaticPhase::Recombining => 0.0,
+                HomeostaticPhase::Compacting => AllocationEffectLevel::Low,
+                HomeostaticPhase::Wake | HomeostaticPhase::Recombining => {
+                    AllocationEffectLevel::Off
+                }
             }
         } else if *id == builtin::memory_recombination() {
             match phase {
-                HomeostaticPhase::Recombining => 1.0,
-                HomeostaticPhase::Wake | HomeostaticPhase::Compacting => 0.0,
+                HomeostaticPhase::Recombining => AllocationEffectLevel::Low,
+                HomeostaticPhase::Wake | HomeostaticPhase::Compacting => AllocationEffectLevel::Off,
             }
         } else {
             continue;
         };
-        allocation.set(
+        commands.push(AllocationCommand::target(
             id.clone(),
-            ModuleConfig {
-                guidance: phase_guidance(phase, id),
-            },
-        );
-        allocation.set_activation(id.clone(), ActivationRatio::from_f64(ratio));
+            level,
+            Some(phase_guidance(phase, id)),
+        ));
     }
-    allocation
+    commands
 }
 
-fn cap_allocation(phase: HomeostaticPhase, capped: &[ModuleId]) -> ResourceAllocation {
-    let ratio = match phase {
-        HomeostaticPhase::Wake => 1.0,
-        HomeostaticPhase::Compacting => 0.15,
-        HomeostaticPhase::Recombining => 0.25,
+fn suppression_commands(phase: HomeostaticPhase, capped: &[ModuleId]) -> Vec<AllocationCommand> {
+    let level = match phase {
+        HomeostaticPhase::Wake => AllocationEffectLevel::Off,
+        HomeostaticPhase::Compacting => AllocationEffectLevel::Max,
+        HomeostaticPhase::Recombining => AllocationEffectLevel::High,
     };
-    let mut allocation = ResourceAllocation::default();
-    for id in capped {
-        allocation.set_activation(id.clone(), ActivationRatio::from_f64(ratio));
-    }
-    allocation
+    capped
+        .iter()
+        .cloned()
+        .map(|id| AllocationCommand::suppression(id, level))
+        .collect()
 }
 
 fn phase_guidance(phase: HomeostaticPhase, id: &ModuleId) -> String {
@@ -256,8 +277,51 @@ mod tests {
     }
 
     #[test]
-    fn allocations_drive_memory_and_cap_actions() {
-        let drive = drive_allocation(
+    fn phase_transitions_enter_and_cycle_sleep_from_interoceptive_mode() {
+        let sleeping = InteroceptiveState {
+            mode: nuillu_blackboard::InteroceptiveMode::NremPressure,
+            wake_arousal: 0.1,
+            nrem_pressure: 0.2,
+            ..InteroceptiveState::default()
+        };
+        assert_eq!(
+            next_phase(HomeostaticPhase::Wake, at(0), at(1), &sleeping),
+            HomeostaticPhase::Compacting
+        );
+
+        let rem_done_but_sleeping = InteroceptiveState {
+            mode: nuillu_blackboard::InteroceptiveMode::RemPressure,
+            wake_arousal: 0.1,
+            nrem_pressure: 0.4,
+            rem_pressure: 0.1,
+            ..InteroceptiveState::default()
+        };
+        assert_eq!(
+            next_phase(
+                HomeostaticPhase::Recombining,
+                at(0),
+                at(3),
+                &rem_done_but_sleeping,
+            ),
+            HomeostaticPhase::Compacting
+        );
+
+        let awake = InteroceptiveState {
+            mode: nuillu_blackboard::InteroceptiveMode::Wake,
+            wake_arousal: 0.8,
+            nrem_pressure: 1.0,
+            rem_pressure: 1.0,
+            ..InteroceptiveState::default()
+        };
+        assert_eq!(
+            next_phase(HomeostaticPhase::Compacting, at(0), at(3), &awake),
+            HomeostaticPhase::Wake
+        );
+    }
+
+    #[test]
+    fn allocation_commands_drive_memory_and_suppress_actions() {
+        let drive = drive_commands(
             HomeostaticPhase::Compacting,
             &[
                 builtin::memory_compaction(),
@@ -267,29 +331,65 @@ mod tests {
             ],
         );
         assert_eq!(
-            drive.activation_for(&builtin::memory_compaction()),
-            ActivationRatio::ONE
+            target_level(&drive, &builtin::memory_compaction()),
+            Some(AllocationEffectLevel::Low)
         );
         assert_eq!(
-            drive.activation_for(&builtin::memory_association()),
-            ActivationRatio::ONE
+            target_level(&drive, &builtin::memory_association()),
+            Some(AllocationEffectLevel::Low)
         );
         assert_eq!(
-            drive.activation_for(&builtin::policy_compaction()),
-            ActivationRatio::ONE
+            target_level(&drive, &builtin::policy_compaction()),
+            Some(AllocationEffectLevel::Low)
         );
         assert_eq!(
-            drive.activation_for(&builtin::memory_recombination()),
-            ActivationRatio::ZERO
+            target_level(&drive, &builtin::memory_recombination()),
+            Some(AllocationEffectLevel::Off)
         );
 
-        let cap = cap_allocation(
+        let drive = drive_commands(
+            HomeostaticPhase::Recombining,
+            &[
+                builtin::memory_compaction(),
+                builtin::memory_recombination(),
+            ],
+        );
+        assert_eq!(
+            target_level(&drive, &builtin::memory_compaction()),
+            Some(AllocationEffectLevel::Off)
+        );
+        assert_eq!(
+            target_level(&drive, &builtin::memory_recombination()),
+            Some(AllocationEffectLevel::Low)
+        );
+
+        let suppressions = suppression_commands(
             HomeostaticPhase::Compacting,
             &[builtin::speak_gate(), builtin::speak()],
         );
         assert_eq!(
-            cap.activation_for(&builtin::speak()),
-            ActivationRatio::from_f64(0.15)
+            suppression_level_for(&suppressions, &builtin::speak()),
+            Some(AllocationEffectLevel::Max)
         );
+    }
+
+    fn target_level(
+        commands: &[AllocationCommand],
+        module: &ModuleId,
+    ) -> Option<AllocationEffectLevel> {
+        commands
+            .iter()
+            .find(|command| command.module == *module)
+            .map(|command| command.level)
+    }
+
+    fn suppression_level_for(
+        commands: &[AllocationCommand],
+        module: &ModuleId,
+    ) -> Option<AllocationEffectLevel> {
+        commands
+            .iter()
+            .find(|command| command.module == *module)
+            .map(|command| command.level)
     }
 }

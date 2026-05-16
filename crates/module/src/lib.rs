@@ -17,7 +17,8 @@
 //!   modules don't pick tiers themselves.
 
 pub use nuillu_blackboard::{
-    AgenticDeadlockMarker, CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord,
+    AgenticDeadlockMarker, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
+    AllocationEffectPolicy, CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord,
     ResourceAllocation, UtteranceProgress, UtteranceProgressState,
 };
 
@@ -85,8 +86,8 @@ pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
 pub use prompt::{format_faculty_system_prompt, format_system_prompt};
 pub use rate_limit::{
-    ActivitySnapshot, CapabilityKind, RateLimitConfig, RateLimitOutcome, RateLimitPolicy,
-    RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
+    ActivitySnapshot, CapabilityKind, InteroceptionRuntimePolicy, RateLimitConfig,
+    RateLimitOutcome, RateLimitPolicy, RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
 pub use readers::{
     AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader,

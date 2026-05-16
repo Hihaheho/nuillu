@@ -54,6 +54,22 @@ fn default_max_llm_calls() -> Option<u64> {
     Some(10)
 }
 
+fn default_quiet_sleep_threshold_ms() -> u64 {
+    30_000
+}
+
+fn default_arousal_change_multiplier() -> f64 {
+    1.0
+}
+
+fn default_wake_arousal_at_least() -> f64 {
+    -1.0
+}
+
+fn default_wake_arousal_at_most() -> f64 {
+    2.0
+}
+
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct FullAgentCaseFile {
@@ -79,6 +95,10 @@ pub struct FullAgentCase {
     #[eure(default)]
     pub participants: Vec<String>,
     #[eure(default)]
+    pub allow_empty_output: bool,
+    #[eure(default)]
+    pub activate_allocation: Vec<ActivateAllocation>,
+    #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
     pub memos: Vec<MemoSeed>,
@@ -90,6 +110,15 @@ pub struct FullAgentCase {
     pub modules_checks: Vec<ModuleChecks>,
     #[eure(default)]
     pub scoring: CaseScoring,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ActivateAllocation {
+    pub module: EvalModule,
+    pub activation_ratio: f64,
+    #[eure(default)]
+    pub guidance: Option<Text>,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -122,6 +151,7 @@ pub enum FullAgentInput {
 pub struct EvalStep {
     #[eure(default)]
     pub description: Option<Text>,
+    #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
     pub wait_for: Option<WaitFor>,
@@ -136,7 +166,19 @@ pub struct EvalStep {
     rename_all_fields = "kebab-case"
 )]
 pub enum WaitFor {
-    MemoFrom { module: EvalModule, timeout_ms: u64 },
+    MemoFrom {
+        module: EvalModule,
+        timeout_ms: u64,
+    },
+    Interoception {
+        timeout_ms: u64,
+        #[eure(default)]
+        mode: Option<EvalInteroceptiveMode>,
+        #[eure(default = "default_wake_arousal_at_least")]
+        wake_arousal_at_least: f64,
+        #[eure(default = "default_wake_arousal_at_most")]
+        wake_arousal_at_most: f64,
+    },
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -486,12 +528,54 @@ fn direction_suffix(direction: &Option<String>) -> String {
 pub struct EvalLimits {
     #[eure(default = "default_max_llm_calls")]
     pub max_llm_calls: Option<u64>,
+    #[eure(default)]
+    pub interoception: EvalInteroceptionLimits,
 }
 
 impl Default for EvalLimits {
     fn default() -> Self {
         Self {
             max_llm_calls: default_max_llm_calls(),
+            interoception: EvalInteroceptionLimits::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct EvalInteroceptionLimits {
+    #[eure(default = "default_quiet_sleep_threshold_ms")]
+    pub quiet_sleep_threshold_ms: u64,
+    #[eure(default = "default_arousal_change_multiplier")]
+    pub wake_arousal_change_multiplier: f64,
+    #[eure(default = "default_arousal_change_multiplier")]
+    pub affect_arousal_change_multiplier: f64,
+}
+
+impl Default for EvalInteroceptionLimits {
+    fn default() -> Self {
+        Self {
+            quiet_sleep_threshold_ms: default_quiet_sleep_threshold_ms(),
+            wake_arousal_change_multiplier: default_arousal_change_multiplier(),
+            affect_arousal_change_multiplier: default_arousal_change_multiplier(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum EvalInteroceptiveMode {
+    Wake,
+    NremPressure,
+    RemPressure,
+}
+
+impl EvalInteroceptiveMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wake => "wake",
+            Self::NremPressure => "nrem-pressure",
+            Self::RemPressure => "rem-pressure",
         }
     }
 }
@@ -900,10 +984,12 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
         validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
     }
     for (step_index, step) in case.steps.iter().enumerate() {
-        if step.inputs.is_empty() {
+        if step.inputs.is_empty() && step.wait_for.is_none() {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
-                message: format!("steps[{step_index}].inputs must not be empty"),
+                message: format!(
+                    "steps[{step_index}].inputs must not be empty unless wait-for is set"
+                ),
             });
         }
         for (input_index, input) in step.inputs.iter().enumerate() {
@@ -930,6 +1016,7 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
         }
     }
     validate_modules(path, case.modules.as_deref())?;
+    validate_activate_allocation(path, case)?;
     validate_module_checks(path, case)?;
     validate_common(
         path,
@@ -981,7 +1068,7 @@ fn validate_wait_for(
     wait_for: &WaitFor,
 ) -> Result<(), CaseFileError> {
     match wait_for {
-        WaitFor::MemoFrom { timeout_ms, .. } => {
+        WaitFor::MemoFrom { timeout_ms, .. } | WaitFor::Interoception { timeout_ms, .. } => {
             if *timeout_ms == 0 {
                 return Err(CaseFileError::Validation {
                     path: path.to_path_buf(),
@@ -992,7 +1079,32 @@ fn validate_wait_for(
             }
         }
     }
+    if let WaitFor::Interoception {
+        mode,
+        wake_arousal_at_least,
+        wake_arousal_at_most,
+        ..
+    } = wait_for
+        && mode.is_none()
+        && !wake_arousal_min_is_set(*wake_arousal_at_least)
+        && !wake_arousal_max_is_set(*wake_arousal_at_most)
+    {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!(
+                "steps[{step_index}].wait-for.interoception must set at least one condition"
+            ),
+        });
+    }
     Ok(())
+}
+
+pub(crate) fn wake_arousal_min_is_set(value: f64) -> bool {
+    value >= 0.0
+}
+
+pub(crate) fn wake_arousal_max_is_set(value: f64) -> bool {
+    value <= 1.0
 }
 
 /// Mid-step checks can only consult agent observations (JSON pointers / text in
@@ -1086,6 +1198,42 @@ fn validate_modules(path: &Path, modules: Option<&[EvalModule]>) -> Result<(), C
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: format!("modules contains duplicate module '{}'", module.as_str()),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_activate_allocation(path: &Path, case: &FullAgentCase) -> Result<(), CaseFileError> {
+    let modules = case.effective_modules();
+    let mut seen = BTreeSet::new();
+    for (index, activation) in case.activate_allocation.iter().enumerate() {
+        if !modules.contains(&activation.module) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "activate-allocation[{index}].module '{}' must be included in full-agent modules",
+                    activation.module.as_str()
+                ),
+            });
+        }
+        if !seen.insert(activation.module) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "activate-allocation contains duplicate module '{}'",
+                    activation.module.as_str()
+                ),
+            });
+        }
+        if !activation.activation_ratio.is_finite()
+            || !(0.0..=1.0).contains(&activation.activation_ratio)
+        {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "activate-allocation[{index}].activation-ratio must be between 0.0 and 1.0"
+                ),
             });
         }
     }
@@ -1393,6 +1541,8 @@ mod tests {
             inputs,
             steps,
             participants: Vec::new(),
+            allow_empty_output: false,
+            activate_allocation: Vec::new(),
             memories: Vec::new(),
             memos: Vec::new(),
             limits: EvalLimits::default(),
@@ -1442,6 +1592,76 @@ mod tests {
         let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
         assert!(
             matches!(error, CaseFileError::Validation { message, .. } if message.contains("steps[0].inputs must not be empty"))
+        );
+    }
+
+    #[test]
+    fn validate_full_agent_case_accepts_empty_step_inputs_with_interoception_wait() {
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![EvalStep {
+                description: None,
+                inputs: Vec::new(),
+                wait_for: Some(WaitFor::Interoception {
+                    timeout_ms: 5_000,
+                    mode: Some(EvalInteroceptiveMode::NremPressure),
+                    wake_arousal_at_least: default_wake_arousal_at_least(),
+                    wake_arousal_at_most: 0.25,
+                }),
+                checks: Vec::new(),
+            }],
+        );
+
+        validate_full_agent_case(Path::new("case.eure"), &case).unwrap();
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_empty_interoception_wait_conditions() {
+        let case = full_agent_case_with(
+            Vec::new(),
+            vec![EvalStep {
+                description: None,
+                inputs: Vec::new(),
+                wait_for: Some(WaitFor::Interoception {
+                    timeout_ms: 5_000,
+                    mode: None,
+                    wake_arousal_at_least: default_wake_arousal_at_least(),
+                    wake_arousal_at_most: default_wake_arousal_at_most(),
+                }),
+                checks: Vec::new(),
+            }],
+        );
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("wait-for.interoception must set at least one condition"))
+        );
+    }
+
+    #[test]
+    fn validate_full_agent_case_rejects_invalid_activate_allocation() {
+        let mut case = full_agent_case_with(vec![seen_input("input")], Vec::new());
+        case.modules = Some(vec![EvalModule::Sensory]);
+        case.activate_allocation = vec![ActivateAllocation {
+            module: EvalModule::Interoception,
+            activation_ratio: 1.0,
+            guidance: None,
+        }];
+
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("activate-allocation[0].module 'interoception' must be included"))
+        );
+
+        let mut case = full_agent_case_with(vec![seen_input("input")], Vec::new());
+        case.activate_allocation = vec![ActivateAllocation {
+            module: EvalModule::Sensory,
+            activation_ratio: 1.2,
+            guidance: None,
+        }];
+        let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("activation-ratio must be between"))
         );
     }
 
@@ -1509,6 +1729,50 @@ mod tests {
             })
         ));
         assert_eq!(case.steps[0].checks.len(), 1);
+    }
+
+    #[test]
+    fn parses_sleep_wake_sample_cases() {
+        let quiet = Path::new("../../eval-cases/full-agent/sleep-after-sensory-quiet.eure");
+        let quiet = parse_full_agent_case_file(quiet).expect("sleep case should parse");
+        assert!(quiet.allow_empty_output);
+        assert_eq!(quiet.activate_allocation.len(), 5);
+        assert_eq!(
+            quiet.activate_allocation[2].module,
+            EvalModule::Interoception
+        );
+        assert_eq!(quiet.activate_allocation[2].activation_ratio, 1.0);
+        assert_eq!(quiet.limits.interoception.quiet_sleep_threshold_ms, 1_000);
+        assert_eq!(
+            quiet.limits.interoception.wake_arousal_change_multiplier,
+            8.0
+        );
+        assert!(matches!(
+            quiet.steps[0].wait_for,
+            Some(WaitFor::Interoception {
+                mode: Some(EvalInteroceptiveMode::NremPressure),
+                wake_arousal_at_most: 0.25,
+                ..
+            })
+        ));
+
+        let wake = Path::new("../../eval-cases/full-agent/wake-from-sleep-on-salient-sensory.eure");
+        let wake = parse_full_agent_case_file(wake).expect("wake case should parse");
+        assert!(wake.allow_empty_output);
+        let wake_modules = wake.modules.as_ref().expect("wake case lists modules");
+        assert!(!wake_modules.contains(&EvalModule::MemoryCompaction));
+        assert!(!wake_modules.contains(&EvalModule::MemoryAssociation));
+        assert!(!wake_modules.contains(&EvalModule::MemoryRecombination));
+        assert!(!wake_modules.contains(&EvalModule::PolicyCompaction));
+        assert_eq!(wake.steps.len(), 2);
+        assert!(matches!(
+            wake.steps[1].wait_for,
+            Some(WaitFor::Interoception {
+                mode: Some(EvalInteroceptiveMode::Wake),
+                wake_arousal_at_least: 0.70,
+                ..
+            })
+        ));
     }
 
     #[test]

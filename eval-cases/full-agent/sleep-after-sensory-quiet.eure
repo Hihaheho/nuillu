@@ -1,0 +1,99 @@
+id = "full-agent-sleep-after-sensory-quiet"
+description = "Full-agent case: a quiet sensory/cognition period lets interoception lower wake and affect arousal, homeostasis enters NREM-like sleep, and voluntary modules are heavily suppressed while sleep-memory modules are driven."
+now = "2026-05-10T08:21:00+09:00"
+allow-empty-output = true
+modules = [
+  "sensory",
+  "cognition-gate",
+  "allocation-controller",
+  "memory-compaction",
+  "memory-association",
+  "memory-recombination",
+  "interoception",
+  "homeostatic-controller",
+  "policy-compaction",
+  "speak-gate",
+  "speak",
+]
+
+limits {
+  max-llm-calls = 10
+
+  interoception {
+    quiet-sleep-threshold-ms = 1000
+    wake-arousal-change-multiplier = 8.0
+    affect-arousal-change-multiplier = 8.0
+  }
+}
+
+participants = ["Koro"]
+
+@ activate-allocation[] {
+  module = "sensory"
+  activation-ratio = 1.0
+  guidance = "GUI activate: keep accepting sensory input even while the agent can fall asleep."
+}
+
+@ activate-allocation[] {
+  module = "allocation-controller"
+  activation-ratio = 1.0
+  guidance = "GUI activate: keep allocation control available for wake/sleep transitions."
+}
+
+@ activate-allocation[] {
+  module = "interoception"
+  activation-ratio = 1.0
+  guidance = "GUI activate: monitor quiet duration and arousal decay."
+}
+
+@ activate-allocation[] {
+  module = "homeostatic-controller"
+  activation-ratio = 1.0
+  guidance = "GUI activate: convert interoceptive sleep pressure into sleep-phase allocation."
+}
+
+@ activate-allocation[] {
+  module = "speak-gate"
+  activation-ratio = 1.0
+  guidance = "GUI activate: remain available when wake arousal is high, but accept sleep suppression."
+}
+
+@ steps[] {
+  description = "Wait with no sensory input until interoception reports NREM pressure and low wake arousal."
+  wait-for.$variant: some.interoception
+  wait-for.timeout-ms = 15000
+  wait-for.mode = "nrem-pressure"
+  wait-for.wake-arousal-at-most = 0.25
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "interoception-entered-nrem"
+  must-pass = true
+  pointer = "/observations/agent/interoception/mode"
+  expected = "nrem_pressure"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "speak-gate-heavily-suppressed"
+  must-pass = true
+  pointer = "/observations/agent/allocation/speak-gate/activation_ratio"
+  contains = "0.0009"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "suppressed-bpm-is-near-sleep-floor"
+  must-pass = true
+  pointer = "/observations/agent/allocation/speak-gate/cooldown_ms"
+  contains = "9982"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "nrem-memory-compaction-low-frequency"
+  must-pass = true
+  pointer = "/observations/agent/allocation/memory-compaction/activation_ratio"
+  contains = "0.15"
+}

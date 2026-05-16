@@ -26,6 +26,12 @@ steps.$optional = true
 participants = [`text`]
 participants.$optional = true
 
+allow-empty-output = `boolean`
+allow-empty-output.$optional = true
+
+activate-allocation = [`$types.activate-allocation`]
+activate-allocation.$optional = true
+
 memories = [`$types.memory-seed`]
 memories.$optional = true
 
@@ -56,7 +62,10 @@ variants.memory = { = "memory", $variant => "literal" }
 variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
 variants.memory-association = { = "memory-association", $variant => "literal" }
 variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
+variants.interoception = { = "interoception", $variant => "literal" }
+variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
 variants.policy = { = "policy", $variant => "literal" }
+variants.policy-compaction = { = "policy-compaction", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
@@ -84,7 +93,7 @@ variants.seen {
   }
 }
 
-variants.observed {
+variants.one-shot {
   modality {
     $variant: text
     min-length = 1
@@ -97,10 +106,17 @@ variants.observed {
   }
 }
 
+@ $types.activate-allocation
+module = `$types.eval-module`
+activation-ratio = `float`
+guidance = `text`
+guidance.$optional = true
+
 @ $types.eval-step
 description = `text`
 description.$optional = true
 inputs = [`$types.full-agent-input`]
+inputs.$optional = true
 wait-for = `$types.wait-for`
 wait-for.$optional = true
 checks = [`$types.check`]
@@ -113,6 +129,22 @@ variants.memo-from {
   module = `$types.eval-module`
   timeout-ms = `integer`
 }
+
+variants.interoception {
+  timeout-ms = `integer`
+  mode = `$types.eval-interoceptive-mode`
+  mode.$optional = true
+  wake-arousal-at-least = `float`
+  wake-arousal-at-least.$optional = true
+  wake-arousal-at-most = `float`
+  wake-arousal-at-most.$optional = true
+}
+
+@ $types.eval-interoceptive-mode
+$variant: union
+variants.wake = { = "wake", $variant => "literal" }
+variants.nrem-pressure = { = "nrem-pressure", $variant => "literal" }
+variants.rem-pressure = { = "rem-pressure", $variant => "literal" }
 
 @ $types.memory-rank
 $variant: union
@@ -150,6 +182,16 @@ content {
 @ $types.eval-limits
 max-llm-calls = `integer`
 max-llm-calls.$optional = true
+interoception = `$types.eval-interoception-limits`
+interoception.$optional = true
+
+@ $types.eval-interoception-limits
+quiet-sleep-threshold-ms = `integer`
+quiet-sleep-threshold-ms.$optional = true
+wake-arousal-change-multiplier = `float`
+wake-arousal-change-multiplier.$optional = true
+affect-arousal-change-multiplier = `float`
+affect-arousal-change-multiplier.$optional = true
 
 @ $types.case-scoring
 judge-max-output-tokens = `integer`

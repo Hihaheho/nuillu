@@ -33,8 +33,8 @@ use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
     AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
-    ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SensoryInput,
-    SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
+    InteroceptionRuntimePolicy, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink,
+    RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
@@ -56,10 +56,11 @@ use tokio::task::LocalSet;
 use crate::{
     artifact::CaseArtifact,
     cases::{
-        ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES, EvalCase, EvalModule,
-        EvalStep, FullAgentCase, FullAgentInput, ModuleCase, ModuleEvalTarget, WaitFor,
-        discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
-        parse_memory_datetime,
+        ActivateAllocation, ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES,
+        EvalCase, EvalInteroceptiveMode, EvalLimits, EvalModule, EvalStep, FullAgentCase,
+        FullAgentInput, ModuleCase, ModuleEvalTarget, WaitFor, discover_case_files,
+        is_full_agent_case_path, parse_case_file, parse_case_now, parse_memory_datetime,
+        wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
         CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, artifact_text,
@@ -69,8 +70,8 @@ use crate::{
     state_dump::{
         AgenticDeadlockDump, AllocationModuleDump, AllocationProposalDump, BlackboardLastStateDump,
         CognitionEntryDump, CognitionLogDump, DumpText, FullAgentLastStateCaseDump,
-        FullAgentLastStateDump, MemoLogDump, MemoryEntryDump, MemoryLastStateDump,
-        MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
+        FullAgentLastStateDump, InteroceptionDump, MemoLogDump, MemoryEntryDump,
+        MemoryLastStateDump, MemoryMetadataDump, ModuleInstanceDump, ReplicaCapDump, UtteranceDump,
         render_full_agent_last_state_eure,
     },
     trace_json::{raw_trace_has_error, raw_trace_snapshot_json, trace_snapshot_json},
@@ -893,7 +894,7 @@ async fn execute_full_agent_case(
         output_dir,
         config,
         allocation,
-        case.limits.max_llm_calls,
+        &case.limits,
         action_module_ids(&case_modules),
         case_now,
         case_id,
@@ -933,6 +934,7 @@ async fn execute_full_agent_case(
     let allocation_updates = host.allocation_updated_mailbox();
     let inputs = case.inputs.clone();
     let steps = case.steps.clone();
+    let activate_allocation = case.activate_allocation.clone();
     let actions = env.actions.clone();
     let events = env.events.clone();
     let clock = env.clock.clone();
@@ -969,9 +971,11 @@ async fn execute_full_agent_case(
             activate_retries: 2,
         },
         async move {
-            let _ = allocation_reporter
-                .emit_if_changed(&allocation_blackboard)
-                .await;
+            if !gui_deferred_start {
+                let _ = allocation_reporter
+                    .emit_if_changed(&allocation_blackboard)
+                    .await;
+            }
             emit_visualizer_blackboard_snapshot(
                 &case_id_for_idle,
                 &allocation_blackboard,
@@ -1010,9 +1014,6 @@ async fn execute_full_agent_case(
                 tokio::task::yield_now().await;
                 tokio::time::sleep(EVAL_POLL_INTERVAL).await;
                 tick = tick.saturating_add(1);
-                let _ = allocation_reporter
-                    .emit_if_changed(&allocation_blackboard)
-                    .await;
                 if let Some(visualizer) = visualizer.as_deref_mut() {
                     let command_outcome = handle_visualizer_commands(
                         &case_id_for_idle,
@@ -1031,7 +1032,11 @@ async fn execute_full_agent_case(
                         visualizer.revoke_action(start_activation_action_id(
                             &VisualizerTabId::new(case_id_for_idle.clone()),
                         ));
-                        activate_gui_start_modules(&allocation_blackboard).await;
+                        activate_gui_start_modules(&allocation_blackboard, &activate_allocation)
+                            .await;
+                        let _ = allocation_reporter
+                            .emit_if_changed(&allocation_blackboard)
+                            .await;
                         run_input_phase(
                             &case_id_for_idle,
                             &inputs,
@@ -1048,6 +1053,11 @@ async fn execute_full_agent_case(
                         .await;
                         started = true;
                     }
+                }
+                if started {
+                    let _ = allocation_reporter
+                        .emit_if_changed(&allocation_blackboard)
+                        .await;
                 }
                 emit_visualizer_blackboard_snapshot(
                     &case_id_for_idle,
@@ -1113,6 +1123,8 @@ async fn execute_full_agent_case(
         artifact
     } else if let Some(utterance) = env.utterances.last_complete() {
         CaseArtifact::new(utterance.text)
+    } else if case.allow_empty_output {
+        CaseArtifact::new(String::new())
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
     } else {
@@ -1172,7 +1184,7 @@ async fn execute_module_case(
         output_dir,
         config,
         module_allocation(target, &case.limits, &case_modules),
-        case.limits.max_llm_calls,
+        &case.limits,
         action_module_ids(&case_modules),
         case_now,
         case_id,
@@ -1791,24 +1803,55 @@ pub(crate) async fn emit_visualizer_blackboard_snapshot(
     });
 }
 
-async fn activate_gui_start_modules(blackboard: &Blackboard) {
+async fn activate_gui_start_modules(
+    blackboard: &Blackboard,
+    activate_allocation: &[ActivateAllocation],
+) {
     let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
-    let controller_id = builtin::allocation_controller();
-    let mut controller_config = allocation.for_module(&controller_id);
-    controller_config.guidance =
-        "GUI start: process the sensory input and allocate the next active faculties.".to_string();
-    allocation.set(controller_id.clone(), controller_config);
-    allocation.set_activation(controller_id, ActivationRatio::ONE);
-
-    let sensory_id = builtin::sensory();
-    let mut sensory_config = allocation.for_module(&sensory_id);
-    sensory_config.guidance = "GUI start: normalize the queued sensory input.".to_string();
-    allocation.set(sensory_id.clone(), sensory_config);
-    allocation.set_activation(sensory_id, ActivationRatio::ONE);
+    if activate_allocation.is_empty() {
+        apply_gui_activation(
+            &mut allocation,
+            builtin::allocation_controller(),
+            ActivationRatio::ONE,
+            Some("GUI start: process the sensory input and allocate the next active faculties."),
+        );
+        apply_gui_activation(
+            &mut allocation,
+            builtin::sensory(),
+            ActivationRatio::ONE,
+            Some("GUI start: normalize the queued sensory input."),
+        );
+    } else {
+        for activation in activate_allocation {
+            apply_gui_activation(
+                &mut allocation,
+                activation.module.module_id(),
+                ActivationRatio::from_f64(activation.activation_ratio),
+                activation
+                    .guidance
+                    .as_ref()
+                    .map(|guidance| guidance.content.as_str()),
+            );
+        }
+    }
 
     blackboard
         .apply(BlackboardCommand::SetAllocation(allocation))
         .await;
+}
+
+fn apply_gui_activation(
+    allocation: &mut ResourceAllocation,
+    module: ModuleId,
+    activation: ActivationRatio,
+    guidance: Option<&str>,
+) {
+    if let Some(guidance) = guidance {
+        let mut config = allocation.for_module(&module);
+        config.guidance = guidance.trim().to_owned();
+        allocation.set(module.clone(), config);
+    }
+    allocation.set_activation(module, activation);
 }
 
 async fn publish_full_agent_inputs(
@@ -2000,6 +2043,40 @@ async fn wait_for_condition(
                 tokio::time::sleep(remaining.min(poll)).await;
             }
         }
+        WaitFor::Interoception {
+            timeout_ms,
+            mode,
+            wake_arousal_at_least,
+            wake_arousal_at_most,
+        } => {
+            let deadline = Duration::from_millis(*timeout_ms);
+            let start = Instant::now();
+            let poll = Duration::from_millis(50);
+            loop {
+                if events.stop_requested() {
+                    return WaitOutcome::Stopped;
+                }
+                let matched = blackboard
+                    .read(|bb| {
+                        let state = bb.interoception();
+                        mode.is_none_or(|mode| eval_mode_matches(mode, state.mode))
+                            && (!wake_arousal_min_is_set(*wake_arousal_at_least)
+                                || f64::from(state.wake_arousal) >= *wake_arousal_at_least)
+                            && (!wake_arousal_max_is_set(*wake_arousal_at_most)
+                                || f64::from(state.wake_arousal) <= *wake_arousal_at_most)
+                    })
+                    .await;
+                if matched {
+                    return WaitOutcome::Met;
+                }
+                let elapsed = start.elapsed();
+                if elapsed >= deadline {
+                    return WaitOutcome::Timeout;
+                }
+                let remaining = deadline.saturating_sub(elapsed);
+                tokio::time::sleep(remaining.min(poll)).await;
+            }
+        }
     }
 }
 
@@ -2009,7 +2086,43 @@ fn wait_for_label(wait_for: Option<&WaitFor>) -> String {
             "memo from module '{module}' within {timeout_ms}ms",
             module = module.as_str(),
         ),
+        Some(WaitFor::Interoception {
+            timeout_ms,
+            mode,
+            wake_arousal_at_least,
+            wake_arousal_at_most,
+        }) => {
+            let mut conditions = Vec::new();
+            if let Some(mode) = mode {
+                conditions.push(format!("mode={}", mode.as_str()));
+            }
+            if wake_arousal_min_is_set(*wake_arousal_at_least) {
+                conditions.push(format!("wake_arousal>={wake_arousal_at_least:.2}"));
+            }
+            if wake_arousal_max_is_set(*wake_arousal_at_most) {
+                conditions.push(format!("wake_arousal<={wake_arousal_at_most:.2}"));
+            }
+            format!(
+                "interoception {} within {timeout_ms}ms",
+                conditions.join(", ")
+            )
+        }
         None => "<no wait-for>".to_string(),
+    }
+}
+
+fn eval_mode_matches(
+    expected: EvalInteroceptiveMode,
+    actual: nuillu_blackboard::InteroceptiveMode,
+) -> bool {
+    match expected {
+        EvalInteroceptiveMode::Wake => actual == nuillu_blackboard::InteroceptiveMode::Wake,
+        EvalInteroceptiveMode::NremPressure => {
+            actual == nuillu_blackboard::InteroceptiveMode::NremPressure
+        }
+        EvalInteroceptiveMode::RemPressure => {
+            actual == nuillu_blackboard::InteroceptiveMode::RemPressure
+        }
     }
 }
 
@@ -2545,7 +2658,7 @@ pub(crate) async fn build_eval_environment(
     output_dir: &Path,
     config: &RunnerConfig,
     allocation: ResourceAllocation,
-    max_llm_calls: Option<u64>,
+    limits: &EvalLimits,
     action_modules: Vec<ModuleId>,
     case_now: Option<DateTime<FixedOffset>>,
     case_id: &str,
@@ -2555,7 +2668,7 @@ pub(crate) async fn build_eval_environment(
     let blackboard = Blackboard::with_allocation(allocation);
     let events = Rc::new(RecordingRuntimeEventSink::new(
         case_id.to_string(),
-        max_llm_calls,
+        limits.max_llm_calls,
         reporter.clone(),
         visualizer.clone(),
     ));
@@ -2591,6 +2704,7 @@ pub(crate) async fn build_eval_environment(
         cognition_log_retained_entries: EVAL_COGNITION_LOG_RETAINED_ENTRIES,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         session_compaction: session_compaction_policy(config),
+        interoception: interoception_runtime_policy(limits),
         ..RuntimePolicy::default()
     };
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
@@ -2646,6 +2760,15 @@ fn session_compaction_policy(config: &RunnerConfig) -> SessionCompactionPolicy {
         config.default_backend.compaction_input_token_threshold,
         config.premium_backend.compaction_input_token_threshold,
     )
+}
+
+fn interoception_runtime_policy(limits: &EvalLimits) -> InteroceptionRuntimePolicy {
+    InteroceptionRuntimePolicy {
+        quiet_sleep_threshold: Duration::from_millis(limits.interoception.quiet_sleep_threshold_ms),
+        wake_arousal_change_multiplier: limits.interoception.wake_arousal_change_multiplier as f32,
+        affect_arousal_change_multiplier: limits.interoception.affect_arousal_change_multiplier
+            as f32,
+    }
 }
 
 pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
@@ -2899,8 +3022,17 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
     ]
 }
 
-fn homeostatic_capped_modules() -> Vec<ModuleId> {
+fn sleep_suppressed_modules() -> Vec<ModuleId> {
     vec![
+        nuillu_types::builtin::cognition_gate(),
+        nuillu_types::builtin::attention_schema(),
+        nuillu_types::builtin::self_model(),
+        nuillu_types::builtin::query_memory(),
+        nuillu_types::builtin::memory(),
+        nuillu_types::builtin::policy(),
+        nuillu_types::builtin::reward(),
+        nuillu_types::builtin::predict(),
+        nuillu_types::builtin::surprise(),
         nuillu_types::builtin::speak_gate(),
         nuillu_types::builtin::speak(),
     ]
@@ -3142,15 +3274,20 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_interoception::InteroceptionModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.allocation_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.interoception_writer(),
-                        caps.llm_access(),
-                    )
+                {
+                    let suppressed = sleep_suppressed_modules();
+                    move |caps| {
+                        nuillu_interoception::InteroceptionModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.allocation_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.allocation_writer(Vec::new(), suppressed.clone()),
+                            caps.interoception_policy(),
+                            caps.interoception_writer(),
+                            caps.llm_access(),
+                        )
+                    }
                 },
             )
             .expect("eval module registration should be unique"),
@@ -3164,7 +3301,7 @@ fn register_eval_module(
                         caps.interoception_reader(),
                         caps.allocation_writer(
                             homeostatic_drive_modules(),
-                            homeostatic_capped_modules(),
+                            sleep_suppressed_modules(),
                         ),
                     )
                 },
@@ -3527,6 +3664,7 @@ fn blackboard_last_state_dump(bb: &BlackboardInner) -> BlackboardLastStateDump {
                     .collect(),
             })
             .collect(),
+        interoception: interoception_dump(bb),
         agentic_deadlock: cognition_log_set.agentic_deadlock_marker().map(|marker| {
             AgenticDeadlockDump {
                 at: marker.at.to_rfc3339(),
@@ -3659,6 +3797,7 @@ fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationMod
             module: module.as_str().to_owned(),
             activation_ratio: allocation.activation_for(module).as_f64(),
             active_replicas: allocation.active_replicas(module),
+            cooldown_ms: allocation.cooldown_for(module).map(duration_millis_u64),
             tier: model_tier_name(allocation.tier_for(module)).to_owned(),
             guidance: DumpText::new(config.guidance.clone()),
         })
@@ -3795,6 +3934,7 @@ fn utterance_dumps(utterances: Vec<RecordedUtterance>) -> Vec<UtteranceDump> {
 struct AgentObservation {
     memo_logs: BTreeMap<String, Vec<MemoLogObservation>>,
     cognition_logs: Vec<CognitionLogObservation>,
+    interoception: nuillu_blackboard::InteroceptiveState,
     allocation: BTreeMap<String, AllocationModuleObservation>,
     allocation_proposals: BTreeMap<String, BTreeMap<String, AllocationModuleObservation>>,
     replica_caps: BTreeMap<String, ReplicaCapRange>,
@@ -3807,6 +3947,7 @@ impl AgentObservation {
         Self {
             memo_logs: memo_log_observations(bb),
             cognition_logs: cognition_log_observations(bb),
+            interoception: bb.interoception().clone(),
             allocation: allocation_observation(bb.allocation()),
             allocation_proposals: allocation_proposal_observations(bb),
             replica_caps: replica_cap_observations(bb),
@@ -3819,6 +3960,8 @@ impl AgentObservation {
 #[derive(Debug, Clone, Serialize)]
 struct AllocationModuleObservation {
     activation_ratio: ActivationRatio,
+    active_replicas: u8,
+    cooldown_ms: Option<u64>,
     guidance: String,
     tier: ModelTier,
 }
@@ -3877,6 +4020,28 @@ fn cognition_log_observations(bb: &BlackboardInner) -> Vec<CognitionLogObservati
         .collect()
 }
 
+fn interoception_dump(bb: &BlackboardInner) -> InteroceptionDump {
+    let state = bb.interoception();
+    InteroceptionDump {
+        mode: interoceptive_mode_name(state.mode).to_owned(),
+        wake_arousal: state.wake_arousal,
+        nrem_pressure: state.nrem_pressure,
+        rem_pressure: state.rem_pressure,
+        affect_arousal: state.affect_arousal,
+        valence: state.valence,
+        emotion: state.emotion.clone(),
+        last_updated: state.last_updated.to_rfc3339(),
+    }
+}
+
+fn interoceptive_mode_name(mode: nuillu_blackboard::InteroceptiveMode) -> &'static str {
+    match mode {
+        nuillu_blackboard::InteroceptiveMode::Wake => "wake",
+        nuillu_blackboard::InteroceptiveMode::NremPressure => "nrem-pressure",
+        nuillu_blackboard::InteroceptiveMode::RemPressure => "rem-pressure",
+    }
+}
+
 fn allocation_observation(
     allocation: &ResourceAllocation,
 ) -> BTreeMap<String, AllocationModuleObservation> {
@@ -3887,6 +4052,8 @@ fn allocation_observation(
                 module.as_str().to_owned(),
                 AllocationModuleObservation {
                     activation_ratio: allocation.activation_for(module),
+                    active_replicas: allocation.active_replicas(module),
+                    cooldown_ms: allocation.cooldown_for(module).map(duration_millis_u64),
                     guidance: config.guidance.clone(),
                     tier: allocation.tier_for(module),
                 },
@@ -5191,9 +5358,21 @@ limits {{
                     "text": "cognition",
                 }],
             }],
+            "interoception": {
+                "mode": "wake",
+                "wake_arousal": 0.0,
+                "nrem_pressure": 0.0,
+                "rem_pressure": 0.0,
+                "affect_arousal": 0.0,
+                "valence": 0.0,
+                "emotion": "",
+                "last_updated": "1970-01-01T00:00:00Z",
+            },
             "allocation": {
                 "query-memory": {
                     "activation_ratio": 1.0,
+                    "active_replicas": 0,
+                    "cooldown_ms": 1000,
                     "guidance": "test guidance",
                     "tier": "Default",
                 },
@@ -5202,6 +5381,8 @@ limits {{
                 "allocation-controller": {
                     "query-memory": {
                         "activation_ratio": 1.0,
+                        "active_replicas": 0,
+                        "cooldown_ms": null,
                         "guidance": "test guidance",
                         "tier": "Default",
                     },
@@ -5468,10 +5649,13 @@ prompt = "What am I attending to?"
             inputs: Vec::new(),
             steps: Vec::new(),
             participants: Vec::new(),
+            allow_empty_output: false,
+            activate_allocation: Vec::new(),
             memories: Vec::new(),
             memos: Vec::new(),
             limits: crate::cases::EvalLimits {
                 max_llm_calls: None,
+                ..Default::default()
             },
             checks: Vec::new(),
             modules_checks: Vec::new(),
@@ -5505,6 +5689,7 @@ prompt = "What am I attending to?"
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
                 max_llm_calls: None,
+                ..Default::default()
             },
             &selected,
         );
@@ -5573,6 +5758,7 @@ prompt = "What am I attending to?"
         let allocation = full_agent_allocation(
             &crate::cases::EvalLimits {
                 max_llm_calls: None,
+                ..Default::default()
             },
             &selected,
         );
@@ -5654,6 +5840,7 @@ prompt = "What am I attending to?"
         let allocation = full_agent_gui_initial_allocation(
             &crate::cases::EvalLimits {
                 max_llm_calls: None,
+                ..Default::default()
             },
             &selected,
         );
@@ -5693,5 +5880,54 @@ prompt = "What am I attending to?"
                 }
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn gui_activate_applies_case_activation_allocation() {
+        let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
+        let allocation = full_agent_gui_initial_allocation(
+            &crate::cases::EvalLimits {
+                max_llm_calls: None,
+                ..Default::default()
+            },
+            &selected,
+        );
+        let blackboard = Blackboard::with_allocation(allocation);
+        let activate_allocation = vec![
+            ActivateAllocation {
+                module: EvalModule::Interoception,
+                activation_ratio: 1.0,
+                guidance: Some(eure::value::Text::plaintext("watch arousal")),
+            },
+            ActivateAllocation {
+                module: EvalModule::HomeostaticController,
+                activation_ratio: 0.5,
+                guidance: None,
+            },
+        ];
+
+        activate_gui_start_modules(&blackboard, &activate_allocation).await;
+
+        let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            allocation.activation_for(&builtin::interoception()),
+            ActivationRatio::ONE
+        );
+        assert_eq!(
+            allocation.for_module(&builtin::interoception()).guidance,
+            "watch arousal"
+        );
+        assert_eq!(
+            allocation.activation_for(&builtin::homeostatic_controller()),
+            ActivationRatio::from_f64(0.5)
+        );
+        assert_eq!(
+            allocation.activation_for(&builtin::sensory()),
+            ActivationRatio::ZERO
+        );
+        assert_eq!(
+            allocation.activation_for(&builtin::allocation_controller()),
+            ActivationRatio::ZERO
+        );
     }
 }

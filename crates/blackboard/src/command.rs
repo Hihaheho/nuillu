@@ -84,4 +84,9 @@ pub enum BlackboardCommand {
         controller: ModuleInstanceId,
         cap: ResourceAllocation,
     },
+    RecordAllocationEffects {
+        writer: ModuleInstanceId,
+        targets: ResourceAllocation,
+        suppressions: ResourceAllocation,
+    },
 }

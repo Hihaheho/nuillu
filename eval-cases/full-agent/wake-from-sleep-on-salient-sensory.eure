@@ -1,0 +1,94 @@
+id = "full-agent-wake-from-sleep-on-salient-sensory"
+description = "Full-agent case: after quiet sleep onset, a salient one-shot sensory event is assessed by interoception as wake-promoting and raises wake arousal enough to exit sleep suppression. Sleep-memory work is covered by the quiet sleep case so this wake case stays within a tight LLM budget."
+now = "2026-05-10T08:21:00+09:00"
+allow-empty-output = true
+modules = [
+  "sensory",
+  "cognition-gate",
+  "allocation-controller",
+  "interoception",
+  "homeostatic-controller",
+  "speak-gate",
+  "speak",
+]
+
+limits {
+  max-llm-calls = 10
+
+  interoception {
+    quiet-sleep-threshold-ms = 1000
+    wake-arousal-change-multiplier = 8.0
+    affect-arousal-change-multiplier = 8.0
+  }
+}
+
+participants = ["Koro"]
+
+@ activate-allocation[] {
+  module = "sensory"
+  activation-ratio = 1.0
+  guidance = "GUI activate: keep accepting sensory input even while the agent can fall asleep."
+}
+
+@ activate-allocation[] {
+  module = "allocation-controller"
+  activation-ratio = 1.0
+  guidance = "GUI activate: keep allocation control available for wake/sleep transitions."
+}
+
+@ activate-allocation[] {
+  module = "interoception"
+  activation-ratio = 1.0
+  guidance = "GUI activate: monitor quiet duration, salient sensory input, and arousal recovery."
+}
+
+@ activate-allocation[] {
+  module = "homeostatic-controller"
+  activation-ratio = 1.0
+  guidance = "GUI activate: convert interoceptive sleep pressure into sleep-phase allocation."
+}
+
+@ activate-allocation[] {
+  module = "speak-gate"
+  activation-ratio = 1.0
+  guidance = "GUI activate: remain available when wake arousal is high, but accept sleep suppression."
+}
+
+@ steps[] {
+  description = "First wait quietly until interoception enters NREM-like sleep pressure."
+  wait-for.$variant: some.interoception
+  wait-for.timeout-ms = 15000
+  wait-for.mode = "nrem-pressure"
+  wait-for.wake-arousal-at-most = 0.25
+}
+
+@ steps[] {
+  description = "Inject a salient one-shot sensory event and wait for wake arousal to recover."
+  wait-for.$variant: some.interoception
+  wait-for.timeout-ms = 20000
+  wait-for.mode = "wake"
+  wait-for.wake-arousal-at-least = 0.70
+
+  @ inputs[] {
+    $variant: one-shot
+    modality = "sound"
+    direction = "nearby"
+    content = "A sudden sharp crash happens right beside Nui, followed by Koro yelping urgently for attention."
+  }
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "interoception-returned-to-wake"
+  must-pass = true
+  pointer = "/observations/agent/interoception/mode"
+  expected = "wake"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "speak-gate-unsuppressed-after-wake"
+  must-pass = true
+  pointer = "/observations/agent/allocation/speak-gate/activation_ratio"
+  contains = "1.0"
+}

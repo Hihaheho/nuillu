@@ -873,6 +873,15 @@ impl BlackboardInner {
                 self.allocation_caps.insert(controller, cap);
                 self.recompute_effective_allocation();
             }
+            BlackboardCommand::RecordAllocationEffects {
+                writer,
+                targets,
+                suppressions,
+            } => {
+                self.allocation_proposals.insert(writer.clone(), targets);
+                self.allocation_caps.insert(writer, suppressions);
+                self.recompute_effective_allocation();
+            }
         }
     }
 
@@ -1037,14 +1046,13 @@ impl BlackboardInner {
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in capped_ids {
-            let cap = active_caps
+            let multipliers = active_caps
                 .iter()
                 .filter(|(_, cap)| cap.has_activation(&id))
                 .map(|(_, cap)| cap.activation_for(&id))
-                .min();
-            if let Some(cap) = cap {
-                let current = effective.activation_for(&id);
-                effective.set_activation(id, current.min(cap));
+                .collect::<Vec<_>>();
+            for multiplier in multipliers {
+                effective.multiply_activation(id.clone(), multiplier);
             }
         }
 
@@ -1657,6 +1665,104 @@ mod tests {
         assert_eq!(
             effective.activation_for(&builtin::speak()),
             crate::ActivationRatio::ONE
+        );
+    }
+
+    #[tokio::test]
+    async fn allocation_effects_average_targets_multiply_suppressions_and_derive_bpm() {
+        let mut base = ResourceAllocation::default();
+        base.set_activation(
+            builtin::allocation_controller(),
+            crate::ActivationRatio::ONE,
+        );
+        base.set_activation(builtin::interoception(), crate::ActivationRatio::ONE);
+        base.set_activation(
+            builtin::homeostatic_controller(),
+            crate::ActivationRatio::ONE,
+        );
+        base.set_activation(builtin::speak(), crate::ActivationRatio::ZERO);
+
+        let bb = Blackboard::with_allocation(base);
+        bb.apply(BlackboardCommand::SetModulePolicies {
+            policies: vec![
+                (
+                    builtin::allocation_controller(),
+                    test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+                ),
+                (
+                    builtin::interoception(),
+                    test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+                ),
+                (
+                    builtin::homeostatic_controller(),
+                    test_policy(ReplicaCapRange::new(1, 1).unwrap()),
+                ),
+                (
+                    builtin::speak(),
+                    crate::ModulePolicy::new(
+                        ReplicaCapRange::new(0, 2).unwrap(),
+                        crate::Bpm::from_f64(1.0)..=crate::Bpm::from_f64(101.0),
+                        crate::linear_ratio_fn,
+                    ),
+                ),
+            ],
+        })
+        .await;
+
+        let mut target_a = ResourceAllocation::default();
+        target_a.set(
+            builtin::speak(),
+            crate::ModuleConfig {
+                guidance: "target A".into(),
+            },
+        );
+        target_a.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.2));
+        bb.apply(BlackboardCommand::RecordAllocationEffects {
+            writer: ModuleInstanceId::new(builtin::allocation_controller(), ReplicaIndex::ZERO),
+            targets: target_a,
+            suppressions: ResourceAllocation::default(),
+        })
+        .await;
+
+        let mut target_b = ResourceAllocation::default();
+        target_b.set(
+            builtin::speak(),
+            crate::ModuleConfig {
+                guidance: "target B".into(),
+            },
+        );
+        target_b.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.8));
+        let mut suppression_b = ResourceAllocation::default();
+        suppression_b.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.5));
+        bb.apply(BlackboardCommand::RecordAllocationEffects {
+            writer: ModuleInstanceId::new(builtin::interoception(), ReplicaIndex::ZERO),
+            targets: target_b,
+            suppressions: suppression_b,
+        })
+        .await;
+
+        let mut suppression_c = ResourceAllocation::default();
+        suppression_c.set_activation(builtin::speak(), crate::ActivationRatio::from_f64(0.25));
+        bb.apply(BlackboardCommand::RecordAllocationEffects {
+            writer: ModuleInstanceId::new(builtin::homeostatic_controller(), ReplicaIndex::ZERO),
+            targets: ResourceAllocation::default(),
+            suppressions: suppression_c,
+        })
+        .await;
+
+        let effective = bb.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            effective.activation_for(&builtin::speak()),
+            crate::ActivationRatio::from_f64(0.0625)
+        );
+        assert_eq!(effective.active_replicas(&builtin::speak()), 1);
+        assert_eq!(
+            effective.cooldown_for(&builtin::speak()),
+            Some(crate::Bpm::from_f64(7.25).cooldown())
+        );
+        assert_eq!(
+            effective.for_module(&builtin::speak()).guidance,
+            "allocation-controller: target A\ninteroception: target B"
         );
     }
 

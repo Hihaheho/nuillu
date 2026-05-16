@@ -1,11 +1,14 @@
 use std::collections::HashSet;
 
-use nuillu_blackboard::{Blackboard, BlackboardCommand, ResourceAllocation};
+use nuillu_blackboard::{
+    AllocationCommand, AllocationEffectKind, AllocationEffectPolicy, Blackboard, BlackboardCommand,
+    ModuleConfig, ResourceAllocation,
+};
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
 use crate::{AllocationUpdated, AllocationUpdatedMailbox};
 
-/// Replace the agent's resource-allocation snapshot.
+/// Submit owner-stamped allocation effect commands.
 ///
 /// Capability issuers do not enforce uniqueness: capabilities are non-exclusive.
 /// By boot-time wiring convention only the attention controller receives
@@ -14,8 +17,9 @@ pub struct AllocationWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
     updates: AllocationUpdatedMailbox,
-    allowed_drive_modules: Vec<ModuleId>,
-    allowed_cap_modules: Vec<ModuleId>,
+    allowed_target_modules: Vec<ModuleId>,
+    allowed_suppression_modules: Vec<ModuleId>,
+    effect_policy: AllocationEffectPolicy,
 }
 
 impl AllocationWriter {
@@ -23,27 +27,70 @@ impl AllocationWriter {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: AllocationUpdatedMailbox,
-        allowed_drive_modules: Vec<ModuleId>,
-        allowed_cap_modules: Vec<ModuleId>,
+        allowed_target_modules: Vec<ModuleId>,
+        allowed_suppression_modules: Vec<ModuleId>,
+        effect_policy: AllocationEffectPolicy,
     ) -> Self {
         Self {
             owner,
             blackboard,
             updates,
-            allowed_drive_modules,
-            allowed_cap_modules,
+            allowed_target_modules,
+            allowed_suppression_modules,
+            effect_policy,
         }
     }
 
-    /// Record this controller replica's proposal. The runtime derives the
-    /// effective allocation from active controller proposals.
-    pub async fn set_drive(&self, mut allocation: ResourceAllocation) {
-        self.retain_allowed(&mut allocation, &self.allowed_drive_modules, "drive");
+    /// Submit this writer's complete allocation effects.
+    ///
+    /// The command payload is semantic: modules choose an effect kind and
+    /// level, while runtime policy resolves those levels to concrete activation
+    /// ratios before the blackboard deterministically combines active writers.
+    pub async fn submit(&self, commands: impl IntoIterator<Item = AllocationCommand>) {
+        let mut targets = ResourceAllocation::default();
+        let mut suppressions = ResourceAllocation::default();
+
+        for command in commands {
+            match command.effect {
+                AllocationEffectKind::Target => {
+                    if !self.is_allowed(&command.module, &self.allowed_target_modules, "target") {
+                        continue;
+                    }
+                    targets.set_activation(
+                        command.module.clone(),
+                        self.effect_policy.target_ratio(command.level),
+                    );
+                    if let Some(guidance) = command.guidance {
+                        targets.set(
+                            command.module,
+                            ModuleConfig {
+                                guidance: guidance.trim().to_owned(),
+                            },
+                        );
+                    }
+                }
+                AllocationEffectKind::Suppression => {
+                    if !self.is_allowed(
+                        &command.module,
+                        &self.allowed_suppression_modules,
+                        "suppression",
+                    ) {
+                        continue;
+                    }
+                    suppressions.set_activation(
+                        command.module,
+                        self.effect_policy.suppression_multiplier(command.level),
+                    );
+                }
+            }
+        }
+
         let before = self.blackboard.read(|bb| bb.allocation().clone()).await;
         self.blackboard
-            .apply(BlackboardCommand::RecordAllocationProposal {
-                controller: self.owner.clone(),
-                proposal: allocation,
+            .apply(BlackboardCommand::RecordAllocationEffects {
+                writer: self.owner.clone(),
+                targets,
+                suppressions,
             })
             .await;
         let after = self.blackboard.read(|bb| bb.allocation().clone()).await;
@@ -52,59 +99,31 @@ impl AllocationWriter {
         }
     }
 
-    /// Backwards-compatible name for drive proposals.
-    pub async fn set(&self, allocation: ResourceAllocation) {
-        self.set_drive(allocation).await;
+    pub fn allowed_target_modules(&self) -> &[ModuleId] {
+        &self.allowed_target_modules
     }
 
-    /// Record activation ceilings. The runtime applies these after drive
-    /// proposal merging by clamping matching module activations downward.
-    pub async fn set_cap(&self, mut cap: ResourceAllocation) {
-        self.retain_allowed(&mut cap, &self.allowed_cap_modules, "cap");
-        let before = self.blackboard.read(|bb| bb.allocation().clone()).await;
-        self.blackboard
-            .apply(BlackboardCommand::RecordAllocationCap {
-                controller: self.owner.clone(),
-                cap,
-            })
-            .await;
-        let after = self.blackboard.read(|bb| bb.allocation().clone()).await;
-        if before != after && self.updates.publish(AllocationUpdated).await.is_err() {
-            tracing::trace!("allocation update had no active subscribers");
-        }
+    pub fn allowed_suppression_modules(&self) -> &[ModuleId] {
+        &self.allowed_suppression_modules
     }
 
-    pub fn allowed_drive_modules(&self) -> &[ModuleId] {
-        &self.allowed_drive_modules
-    }
-
-    pub fn allowed_cap_modules(&self) -> &[ModuleId] {
-        &self.allowed_cap_modules
-    }
-
-    fn retain_allowed(
+    fn is_allowed(
         &self,
-        allocation: &mut ResourceAllocation,
+        module: &ModuleId,
         allowed_modules: &[ModuleId],
         kind: &'static str,
-    ) {
+    ) -> bool {
         let allowed = allowed_modules.iter().cloned().collect::<HashSet<_>>();
-        let dropped = allocation
-            .iter()
-            .map(|(id, _)| id.clone())
-            .chain(allocation.iter_activation().map(|(id, _)| id.clone()))
-            .filter(|id| !allowed.contains(id))
-            .collect::<HashSet<_>>();
-        if !dropped.is_empty() {
-            let mut dropped = dropped.into_iter().collect::<Vec<_>>();
-            dropped.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        if allowed.contains(module) {
+            true
+        } else {
             tracing::warn!(
                 owner = %self.owner,
                 allocation_kind = kind,
-                dropped = ?dropped,
-                "allocation writer dropped disallowed module updates"
+                module = %module,
+                "allocation writer dropped disallowed module effect"
             );
+            false
         }
-        allocation.retain_modules(&allowed);
     }
 }

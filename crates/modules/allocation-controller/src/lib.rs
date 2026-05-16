@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
-use nuillu_blackboard::{ActivationRatio, ModuleConfig};
+use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox,
@@ -203,8 +203,10 @@ impl AllocationControllerModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            let visible_modules =
-                visible_modules(cx.modules(), self.allocation_writer.allowed_drive_modules());
+            let visible_modules = visible_modules(
+                cx.modules(),
+                self.allocation_writer.allowed_target_modules(),
+            );
             format_faculty_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
         })
     }
@@ -249,7 +251,7 @@ impl AllocationControllerModule {
             .await;
         let current = self.allocation_reader.snapshot().await;
         let interoception = self.interoception.snapshot().await;
-        let allowed_modules = self.allocation_writer.allowed_drive_modules().to_vec();
+        let allowed_modules = self.allocation_writer.allowed_target_modules().to_vec();
         let controller_schema = self
             .allocation_reader
             .controller_schema_json(&allowed_modules)
@@ -305,14 +307,14 @@ impl AllocationControllerModule {
         let next = apply_decision(current, &registered, decision);
 
         self.memo.write(next.memo.clone()).await;
-        self.allocation_writer.set(next.allocation).await;
+        self.allocation_writer.submit(next.commands).await;
         Ok(())
     }
 }
 
 struct AppliedDecision {
     memo: String,
-    allocation: nuillu_blackboard::ResourceAllocation,
+    commands: Vec<AllocationCommand>,
 }
 
 fn apply_decision(
@@ -320,24 +322,22 @@ fn apply_decision(
     registered: &std::collections::HashSet<ModuleId>,
     decision: AllocationDecision,
 ) -> AppliedDecision {
+    let _ = current;
     let controller_id = builtin::allocation_controller();
-    let controller_activation = current.activation_for(&controller_id);
-    let mut next = current;
-    let table = next.activation_table().to_vec();
+    let mut commands = Vec::new();
 
-    // Controller's baseline: zero out every registered module. Entries listed
-    // in `priority` will overwrite below; everything else stays at 0.0 so the
-    // module stays detached until new evidence or guidance makes it useful.
-    // Keep this controller alive once the host has activated it; otherwise one
-    // omitted self-entry would stop future allocation decisions.
+    // Controller's baseline: zero out every registered target module. Entries
+    // listed in `priority` overwrite below; everything else stays detached
+    // until new evidence or guidance makes it useful.
     for id in registered {
         if id == &controller_id {
             continue;
         }
-        next.set_activation(id.clone(), ActivationRatio::ZERO);
-        let mut config: ModuleConfig = next.for_module(id);
-        config.guidance.clear();
-        next.set(id.clone(), config);
+        commands.push(AllocationCommand::target(
+            id.clone(),
+            AllocationEffectLevel::Off,
+            None,
+        ));
     }
 
     for (rank, entry) in decision.priority.into_iter().enumerate() {
@@ -349,21 +349,27 @@ fn apply_decision(
             tracing::warn!(module = %id, "allocation-controller ignored unregistered module id");
             continue;
         }
-        let ratio = table.get(rank).copied().unwrap_or(ActivationRatio::ZERO);
-        let mut config: ModuleConfig = next.for_module(&id);
-        config.guidance = entry.hint;
-        next.set(id.clone(), config);
-        next.set_activation(id, ratio);
-    }
-    if registered.contains(&controller_id)
-        && next.activation_for(&controller_id) < controller_activation
-    {
-        next.set_activation(controller_id, controller_activation);
+        commands.push(AllocationCommand::target(
+            id,
+            priority_level(rank),
+            Some(entry.hint),
+        ));
     }
 
     AppliedDecision {
         memo: decision.memo,
-        allocation: next,
+        commands,
+    }
+}
+
+fn priority_level(rank: usize) -> AllocationEffectLevel {
+    match rank {
+        0 => AllocationEffectLevel::Max,
+        1 => AllocationEffectLevel::High,
+        2 => AllocationEffectLevel::Normal,
+        3 => AllocationEffectLevel::Low,
+        4 => AllocationEffectLevel::Minimal,
+        _ => AllocationEffectLevel::Off,
     }
 }
 
@@ -439,7 +445,7 @@ impl Module for AllocationControllerModule {
     }
 
     fn role_description() -> &'static str {
-        "Allocates resources across modules — emits a priority-ordered list of modules to activate, each with a one-line hint, on memo updates. Tier is host-fixed; activation_ratio comes from a host-set table indexed by priority position."
+        "Allocates resources across modules — emits command-style activation targets from a priority-ordered list of modules, each with a one-line hint, on memo updates. Tier is host-fixed; target levels come from priority position."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -470,7 +476,10 @@ mod tests {
         MockLlmAdapter, MockStructuredScenario, ModelInputItem, RawStructuredTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
-    use nuillu_blackboard::{Blackboard, Bpm, ResourceAllocation, linear_ratio_fn};
+    use nuillu_blackboard::{
+        ActivationRatio, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
+        Blackboard, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+    };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
@@ -663,8 +672,17 @@ mod tests {
         ])
     }
 
+    fn last_target<'a>(
+        commands: &'a [AllocationCommand],
+        module: &ModuleId,
+    ) -> Option<&'a AllocationCommand> {
+        commands.iter().rev().find(|command| {
+            command.effect == AllocationEffectKind::Target && &command.module == module
+        })
+    }
+
     #[test]
-    fn apply_decision_assigns_table_by_rank_and_zeroes_unlisted() {
+    fn apply_decision_assigns_levels_by_rank_and_zeroes_unlisted() {
         let mut registered = std::collections::HashSet::new();
         registered.insert(builtin::speak());
         registered.insert(builtin::sensory());
@@ -699,40 +717,32 @@ mod tests {
         );
 
         assert_eq!(applied.memo, "checked");
-        // Unregistered module is dropped.
         assert!(
-            applied
-                .allocation
-                .get(&ModuleId::new("invented-module").unwrap())
-                .is_none()
+            last_target(
+                &applied.commands,
+                &ModuleId::new("invented-module").unwrap()
+            )
+            .is_none()
         );
-        // Speak landed at rank 1 (after the discarded invented-module entry):
-        // table[1] = 0.5.
+        let speak = last_target(&applied.commands, &builtin::speak()).unwrap();
+        assert_eq!(speak.level, AllocationEffectLevel::High);
         assert_eq!(
-            applied.allocation.activation_for(&builtin::speak()),
-            ActivationRatio::from_f64(0.5)
+            speak.guidance.as_deref(),
+            Some("respond from cognition log when ready")
         );
-        assert_eq!(
-            applied.allocation.for_module(&builtin::speak()).guidance,
-            "respond from cognition log when ready"
-        );
-        // Sensory landed at rank 2; table only has 2 entries so the rest fall
-        // to ZERO.
-        assert_eq!(
-            applied.allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ZERO
-        );
+        let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
+        assert_eq!(sensory.level, AllocationEffectLevel::Normal);
         // Cognition-gate was registered but absent from priority — zero.
         assert_eq!(
-            applied
-                .allocation
-                .activation_for(&builtin::cognition_gate()),
-            ActivationRatio::ZERO
+            last_target(&applied.commands, &builtin::cognition_gate())
+                .unwrap()
+                .level,
+            AllocationEffectLevel::Off
         );
     }
 
     #[test]
-    fn apply_decision_preserves_active_controller_when_omitted() {
+    fn apply_decision_leaves_controller_to_base_allocation_when_omitted() {
         let mut registered = std::collections::HashSet::new();
         registered.insert(builtin::allocation_controller());
         registered.insert(builtin::sensory());
@@ -761,28 +771,18 @@ mod tests {
             },
         );
 
+        assert!(last_target(&applied.commands, &builtin::allocation_controller()).is_none());
         assert_eq!(
-            applied
-                .allocation
-                .activation_for(&builtin::allocation_controller()),
-            ActivationRatio::ONE
+            last_target(&applied.commands, &builtin::sensory())
+                .unwrap()
+                .level,
+            AllocationEffectLevel::Max
         );
         assert_eq!(
-            applied
-                .allocation
-                .for_module(&builtin::allocation_controller())
-                .guidance,
-            "continue controlling allocation"
-        );
-        assert_eq!(
-            applied.allocation.activation_for(&builtin::sensory()),
-            ActivationRatio::ONE
-        );
-        assert_eq!(
-            applied
-                .allocation
-                .activation_for(&builtin::cognition_gate()),
-            ActivationRatio::ZERO
+            last_target(&applied.commands, &builtin::cognition_gate())
+                .unwrap()
+                .level,
+            AllocationEffectLevel::Off
         );
     }
 

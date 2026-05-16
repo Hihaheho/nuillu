@@ -224,12 +224,15 @@ fn register_server_module(
             })
         }
         RuntimeModule::Interoception => {
-            registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), |caps| {
+            let suppressed = sleep_suppressed_modules();
+            registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), move |caps| {
                 nuillu_interoception::InteroceptionModule::new(
                     caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
+                    caps.allocation_writer(Vec::new(), suppressed.clone()),
+                    caps.interoception_policy(),
                     caps.interoception_writer(),
                     caps.llm_access(),
                 )
@@ -240,10 +243,7 @@ fn register_server_module(
                 nuillu_homeostatic_controller::HomeostaticControllerModule::new(
                     caps.interoception_updated_inbox(),
                     caps.interoception_reader(),
-                    caps.allocation_writer(
-                        homeostatic_drive_modules(),
-                        homeostatic_capped_modules(),
-                    ),
+                    caps.allocation_writer(homeostatic_drive_modules(), sleep_suppressed_modules()),
                 )
             })
         }
@@ -402,13 +402,26 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
     ]
 }
 
-fn homeostatic_capped_modules() -> Vec<ModuleId> {
-    vec![builtin::speak_gate(), builtin::speak()]
+fn sleep_suppressed_modules() -> Vec<ModuleId> {
+    vec![
+        builtin::cognition_gate(),
+        builtin::attention_schema(),
+        builtin::self_model(),
+        builtin::query_memory(),
+        builtin::memory(),
+        builtin::policy(),
+        builtin::reward(),
+        builtin::predict(),
+        builtin::surprise(),
+        builtin::speak_gate(),
+        builtin::speak(),
+    ]
 }
 
 fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
     vec![
         builtin::sensory(),
+        builtin::cognition_gate(),
         builtin::attention_schema(),
         builtin::self_model(),
         builtin::query_memory(),
