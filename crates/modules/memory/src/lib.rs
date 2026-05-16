@@ -2,7 +2,7 @@
 //!
 //! Owns the [`MemoryStore`] port, the memory-domain capability handles
 //! ([`MemoryWriter`], [`MemoryCompactor`], [`MemoryAssociator`],
-//! [`MemorySearcher`], [`MemoryContentReader`]), and the modules that
+//! [`MemoryRetriever`], [`MemoryContentReader`]), and the modules that
 //! operate on memory: [`MemoryModule`] (writes), [`MemoryCompactionModule`]
 //! (destructive merges), [`MemoryAssociationModule`] (non-destructive
 //! relationship writes), [`MemoryRecombinationModule`] (dream-like
@@ -42,13 +42,15 @@ pub use compaction::{
 };
 pub use memory::{
     InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
-    MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector,
+    MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector, ReinforceMemoryArgs,
+    ReinforceMemoryOutput,
 };
 pub use query::{
     FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryMemoryBatch, QueryMemoryHit,
     QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit, QueryMemoryMemoLinkedHit,
     QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools, QueryMemoryToolsCall,
-    QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput,
+    QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput, WriteRetrievalMemoArgs,
+    WriteRetrievalMemoOutput,
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
@@ -57,15 +59,15 @@ pub use recombination::{
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,
     MemoryConcept, MemoryContentReader, MemoryDeleter, MemoryKind, MemoryLink, MemoryLinkDirection,
-    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemorySearcher, MemoryStore, MemoryTag,
-    MemoryWriter, NewMemory, NewMemoryLink, NoopMemoryStore,
+    MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryRetriever, MemoryStore, MemoryTag,
+    MemoryUsageTarget, MemoryWriter, NewMemory, NewMemoryLink, NoopMemoryStore,
 };
 
 /// Domain-scoped capability provider for the memory subsystem.
 ///
 /// Bundles the primary memory store, optional replica stores, the
-/// blackboard, and the clock. Constructs the four memory-domain capability
-/// handles on demand and seeds boot-time identity memories.
+/// blackboard, and the clock. Constructs memory-domain capability handles
+/// on demand and seeds boot-time identity memories.
 #[derive(Clone)]
 pub struct MemoryCapabilities {
     primary_store: Rc<dyn MemoryStore>,
@@ -119,8 +121,8 @@ impl MemoryCapabilities {
         )
     }
 
-    pub fn searcher(&self) -> MemorySearcher {
-        MemorySearcher::new(
+    pub fn retriever(&self) -> MemoryRetriever {
+        MemoryRetriever::new(
             self.primary_store.clone(),
             self.blackboard.clone(),
             self.clock.clone(),

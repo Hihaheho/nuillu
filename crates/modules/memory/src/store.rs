@@ -384,15 +384,17 @@ impl MemoryStore for NoopMemoryStore {
     }
 }
 
-/// Vector search over the primary memory store + automatic access patching.
+/// Retrieval + usage accounting capability for memory entries that may be
+/// exposed to LLM context. Search stays a pure read; callers record access
+/// after deciding which returned entries actually reached the model.
 #[derive(Clone)]
-pub struct MemorySearcher {
+pub struct MemoryRetriever {
     primary_store: Rc<dyn MemoryStore>,
     blackboard: Blackboard,
     clock: Rc<dyn Clock>,
 }
 
-impl MemorySearcher {
+impl MemoryRetriever {
     pub fn new(
         primary_store: Rc<dyn MemoryStore>,
         blackboard: Blackboard,
@@ -407,28 +409,88 @@ impl MemorySearcher {
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>, PortError> {
         let q = MemoryQuery::text(query, limit);
-        let hits = self.primary_store.search(&q).await?;
+        self.primary_store.search(&q).await
+    }
 
-        if !hits.is_empty() {
-            for hit in &hits {
-                self.blackboard
-                    .apply(BlackboardCommand::UpsertMemoryMetadata {
-                        index: hit.index.clone(),
-                        rank_if_new: hit.rank,
-                        occurred_at_if_new: hit.occurred_at,
-                        decay_if_new_secs: 0,
-                        now: self.clock.now(),
-                        patch: MemoryMetaPatch {
+    pub async fn record_accesses(&self, targets: &[MemoryUsageTarget]) {
+        self.record_many(targets, MemoryUsageEvent::Access).await;
+    }
+
+    pub async fn record_uses(&self, targets: &[MemoryUsageTarget]) {
+        self.record_many(targets, MemoryUsageEvent::Use).await;
+    }
+
+    pub async fn record_reinforcement(&self, target: &MemoryUsageTarget) {
+        self.record_many(
+            std::slice::from_ref(target),
+            MemoryUsageEvent::Reinforcement,
+        )
+        .await;
+    }
+
+    async fn record_many(&self, targets: &[MemoryUsageTarget], event: MemoryUsageEvent) {
+        let mut seen = std::collections::HashSet::new();
+        let now = self.clock.now();
+        for target in targets {
+            if !seen.insert(target.index.clone()) {
+                continue;
+            }
+            self.blackboard
+                .apply(BlackboardCommand::UpsertMemoryMetadata {
+                    index: target.index.clone(),
+                    rank_if_new: target.rank,
+                    occurred_at_if_new: target.occurred_at,
+                    decay_if_new_secs: 0,
+                    now,
+                    patch: match event {
+                        MemoryUsageEvent::Access => MemoryMetaPatch {
                             record_access: true,
                             ..Default::default()
                         },
-                    })
-                    .await;
-            }
+                        MemoryUsageEvent::Use => MemoryMetaPatch {
+                            record_use: true,
+                            ..Default::default()
+                        },
+                        MemoryUsageEvent::Reinforcement => MemoryMetaPatch {
+                            record_reinforcement: true,
+                            ..Default::default()
+                        },
+                    },
+                })
+                .await;
         }
-
-        Ok(hits)
     }
+}
+
+/// Minimal metadata needed to record memory exposure/use events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryUsageTarget {
+    pub index: MemoryIndex,
+    pub rank: MemoryRank,
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+impl MemoryUsageTarget {
+    pub fn new(index: MemoryIndex, rank: MemoryRank, occurred_at: Option<DateTime<Utc>>) -> Self {
+        Self {
+            index,
+            rank,
+            occurred_at,
+        }
+    }
+}
+
+impl From<&MemoryRecord> for MemoryUsageTarget {
+    fn from(record: &MemoryRecord) -> Self {
+        Self::new(record.index.clone(), record.rank, record.occurred_at)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoryUsageEvent {
+    Access,
+    Use,
+    Reinforcement,
 }
 
 /// Content lookup by memory index without implying vector search.
@@ -1187,27 +1249,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vector_search_records_direct_access() {
+    async fn retriever_search_is_a_pure_read() {
+        let record = test_record();
+        let blackboard = Blackboard::new();
+        let retriever = MemoryRetriever::new(
+            Rc::new(StaticMemoryStore {
+                record: record.clone(),
+            }),
+            blackboard.clone(),
+            Rc::new(FixedClock(record.stored_at)),
+        );
+
+        let hits = retriever.search("alpha", 1).await.unwrap();
+
+        assert_eq!(hits[0].index, record.index);
+        assert!(
+            blackboard
+                .read(|bb| bb.memory_metadata().get(&record.index).is_none())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn retriever_records_access_use_and_reinforcement_separately() {
         let record = test_record();
         let now = record.stored_at;
         let blackboard = Blackboard::new();
-        let searcher = MemorySearcher::new(
+        let retriever = MemoryRetriever::new(
             Rc::new(StaticMemoryStore {
                 record: record.clone(),
             }),
             blackboard.clone(),
             Rc::new(FixedClock(now)),
         );
+        let target = MemoryUsageTarget::from(&record);
 
-        let hits = searcher.search("alpha", 1).await.unwrap();
+        retriever
+            .record_accesses(std::slice::from_ref(&target))
+            .await;
+        retriever.record_uses(std::slice::from_ref(&target)).await;
+        retriever.record_reinforcement(&target).await;
 
-        assert_eq!(hits[0].index, record.index);
         let metadata = blackboard
             .read(|bb| bb.memory_metadata().get(&record.index).cloned())
             .await
             .unwrap();
         assert_eq!(metadata.access_count, 1);
+        assert_eq!(metadata.use_count, 1);
+        assert_eq!(metadata.reinforcement_count, 1);
         assert_eq!(metadata.last_accessed, now);
+        assert_eq!(metadata.last_used, Some(now));
+        assert_eq!(metadata.last_reinforced_at, Some(now));
     }
 
     #[tokio::test]

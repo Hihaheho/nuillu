@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{
     LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryContentReader, MemoryKind,
-    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemorySearcher, MemoryTag,
+    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemoryRetriever, MemoryTag,
+    MemoryUsageTarget,
 };
 
 const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
@@ -34,9 +35,11 @@ distinct questions or evidence requests. Prefer multiple targeted searches in on
 generic searches or later follow-up turns.
 If the requested facts are already covered by prior query-memory memo logs, previous tool results,
 or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
-You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do not
-produce user-facing answers, decide final truth, explain results from outside tool output, or use a
-final answer as a data channel."#;
+When retrieved evidence is useful, call write_retrieval_memo exactly once with only the hit indexes
+that should enter query-memory's memo. Search hits are candidates, not automatic memo content.
+You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do
+not produce user-facing answers, decide final truth, explain results from outside tool output, or
+use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's persistent session history.
@@ -115,6 +118,24 @@ pub struct QueryMemoryLinkedHit {
     pub link: MemoryLink,
 }
 
+#[lutum::tool_input(name = "write_retrieval_memo", output = WriteRetrievalMemoOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WriteRetrievalMemoArgs {
+    #[serde(default)]
+    pub hit_indexes: Vec<MemoryIndex>,
+    #[serde(default)]
+    pub linked_hit_indexes: Vec<MemoryIndex>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WriteRetrievalMemoOutput {
+    pub written: bool,
+    pub selected_hits: usize,
+    pub selected_linked_hits: usize,
+    pub used_indexes: Vec<MemoryIndex>,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryMemoryMemo {
     pub requests: Vec<String>,
@@ -166,6 +187,7 @@ struct QueryMemoryRetrieval {
 pub enum QueryMemoryTools {
     SearchMemory(SearchMemoryArgs),
     FetchLinkedMemories(FetchLinkedMemoriesArgs),
+    WriteRetrievalMemo(WriteRetrievalMemoArgs),
 }
 
 pub struct QueryMemoryModule {
@@ -174,7 +196,7 @@ pub struct QueryMemoryModule {
     cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
-    memory: MemorySearcher,
+    memory: MemoryRetriever,
     linked_memory: MemoryContentReader,
     memo: TypedMemo<QueryMemoryMemo>,
     llm: LlmAccess,
@@ -191,7 +213,7 @@ impl QueryMemoryModule {
         cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
-        memory: MemorySearcher,
+        memory: MemoryRetriever,
         linked_memory: MemoryContentReader,
         memo: TypedMemo<QueryMemoryMemo>,
         llm: LlmAccess,
@@ -249,8 +271,7 @@ impl QueryMemoryModule {
         if questions.is_empty() {
             return Ok(());
         }
-        let retrieval = self.search_with_memory(cx, &questions).await?;
-        self.write_retrieval(&questions, retrieval).await
+        self.search_with_memory(cx, &questions).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -275,53 +296,92 @@ impl QueryMemoryModule {
             })
             .await;
         let questions = [question];
-        let retrieval = self.search_with_memory(cx, &questions).await?;
-        self.write_retrieval(&questions, retrieval).await
+        self.search_with_memory(cx, &questions).await
     }
 
-    async fn write_retrieval(
+    async fn write_retrieval_memo(
         &self,
         requests: &[String],
-        retrieval: QueryMemoryRetrieval,
-    ) -> Result<()> {
-        let hits = self.fresh_hits(&retrieval.hits).await;
-        let linked_hits = self.fresh_linked_hits(&retrieval.linked_hits).await;
-        let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
-        if !content.is_empty() {
-            let payload = QueryMemoryMemo {
-                requests: requests.to_vec(),
-                searches: retrieval.searches,
-                hits: hits
-                    .iter()
-                    .map(|hit| QueryMemoryMemoHit {
-                        index: hit.index.clone(),
-                        rank: hit.rank,
-                        occurred_at: hit.occurred_at,
-                        stored_at: hit.stored_at,
-                        kind: hit.kind,
-                        affect_arousal: hit.affect_arousal,
-                        valence: hit.valence,
-                        emotion: hit.emotion.clone(),
-                    })
-                    .collect(),
-                linked_hits: linked_hits
-                    .iter()
-                    .map(|hit| QueryMemoryMemoLinkedHit {
-                        index: hit.index.clone(),
-                        rank: hit.rank,
-                        occurred_at: hit.occurred_at,
-                        stored_at: hit.stored_at,
-                        kind: hit.kind,
-                        affect_arousal: hit.affect_arousal,
-                        valence: hit.valence,
-                        emotion: hit.emotion.clone(),
-                        link: hit.link.clone(),
-                    })
-                    .collect(),
-            };
-            self.memo.write(payload, content).await;
+        retrieval: &QueryMemoryRetrieval,
+        args: WriteRetrievalMemoArgs,
+        memo_written: &mut bool,
+    ) -> Result<WriteRetrievalMemoOutput> {
+        if *memo_written {
+            return Ok(WriteRetrievalMemoOutput {
+                written: false,
+                selected_hits: 0,
+                selected_linked_hits: 0,
+                used_indexes: Vec::new(),
+                message: "retrieval memo was already written for this activation".to_owned(),
+            });
         }
-        Ok(())
+        *memo_written = true;
+
+        let selected_hits = select_hits(&retrieval.hits, &args.hit_indexes);
+        let selected_linked_hits =
+            select_linked_hits(&retrieval.linked_hits, &args.linked_hit_indexes);
+        let hits = self.fresh_hits(&selected_hits).await;
+        let linked_hits = self.fresh_linked_hits(&selected_linked_hits).await;
+        let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
+        if content.is_empty() {
+            return Ok(WriteRetrievalMemoOutput {
+                written: false,
+                selected_hits: hits.len(),
+                selected_linked_hits: linked_hits.len(),
+                used_indexes: Vec::new(),
+                message: "no fresh selected evidence was available to write".to_owned(),
+            });
+        }
+        let payload = QueryMemoryMemo {
+            requests: requests.to_vec(),
+            searches: retrieval.searches.clone(),
+            hits: hits
+                .iter()
+                .map(|hit| QueryMemoryMemoHit {
+                    index: hit.index.clone(),
+                    rank: hit.rank,
+                    occurred_at: hit.occurred_at,
+                    stored_at: hit.stored_at,
+                    kind: hit.kind,
+                    affect_arousal: hit.affect_arousal,
+                    valence: hit.valence,
+                    emotion: hit.emotion.clone(),
+                })
+                .collect(),
+            linked_hits: linked_hits
+                .iter()
+                .map(|hit| QueryMemoryMemoLinkedHit {
+                    index: hit.index.clone(),
+                    rank: hit.rank,
+                    occurred_at: hit.occurred_at,
+                    stored_at: hit.stored_at,
+                    kind: hit.kind,
+                    affect_arousal: hit.affect_arousal,
+                    valence: hit.valence,
+                    emotion: hit.emotion.clone(),
+                    link: hit.link.clone(),
+                })
+                .collect(),
+        };
+        self.memo.write(payload, content).await;
+        let use_targets = usage_targets(&hits, &linked_hits);
+        self.memory.record_uses(&use_targets).await;
+        let mut seen_used = HashSet::new();
+        let used_indexes = use_targets
+            .into_iter()
+            .filter_map(|target| {
+                seen_used
+                    .insert(target.index.clone())
+                    .then_some(target.index)
+            })
+            .collect();
+        Ok(WriteRetrievalMemoOutput {
+            written: true,
+            selected_hits: hits.len(),
+            selected_linked_hits: linked_hits.len(),
+            used_indexes,
+            message: "retrieval memo written".to_owned(),
+        })
     }
 
     async fn fresh_hits(&self, hits: &[QueryMemoryHit]) -> Vec<QueryMemoryHit> {
@@ -369,7 +429,7 @@ impl QueryMemoryModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         questions: &[String],
-    ) -> Result<QueryMemoryRetrieval> {
+    ) -> Result<()> {
         self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
@@ -387,7 +447,8 @@ impl QueryMemoryModule {
             .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
         let mut retrieval = QueryMemoryRetrieval::default();
-        for _ in 0..3 {
+        let mut memo_written = false;
+        for _ in 0..4 {
             let lutum = self.llm.lutum().await;
             let outcome = self
                 .session
@@ -396,6 +457,7 @@ impl QueryMemoryModule {
                 .available_tools([
                     QueryMemoryToolsSelector::SearchMemory,
                     QueryMemoryToolsSelector::FetchLinkedMemories,
+                    QueryMemoryToolsSelector::WriteRetrievalMemo,
                 ])
                 .collect()
                 .await
@@ -414,7 +476,7 @@ impl QueryMemoryModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
-                    return Ok(retrieval);
+                    return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                     compact_session_if_needed(
@@ -428,7 +490,7 @@ impl QueryMemoryModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
-                    return Ok(retrieval);
+                    return Ok(());
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let input_tokens = round.usage.input_tokens;
@@ -444,7 +506,7 @@ impl QueryMemoryModule {
                             SESSION_COMPACTION_PROMPT,
                         )
                         .await;
-                        return Ok(retrieval);
+                        return Ok(());
                     }
                     let mut tool_results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
@@ -481,6 +543,21 @@ impl QueryMemoryModule {
                                         .context("complete fetch_linked_memories tool call")?,
                                 );
                             }
+                            QueryMemoryToolsCall::WriteRetrievalMemo(call) => {
+                                let output = self
+                                    .write_retrieval_memo(
+                                        questions,
+                                        &retrieval,
+                                        call.input.clone(),
+                                        &mut memo_written,
+                                    )
+                                    .await
+                                    .context("run write_retrieval_memo tool")?;
+                                tool_results.push(
+                                    call.complete(output)
+                                        .context("complete write_retrieval_memo tool call")?,
+                                );
+                            }
                         }
                     }
                     round
@@ -500,7 +577,7 @@ impl QueryMemoryModule {
                 }
             }
         }
-        Ok(retrieval)
+        Ok(())
     }
 
     async fn prior_query_memory_searches(&self) -> Option<String> {
@@ -552,6 +629,11 @@ impl QueryMemoryModule {
             .search(&args.query, limit)
             .await
             .context("search memory")?;
+        let targets = records
+            .iter()
+            .map(MemoryUsageTarget::from)
+            .collect::<Vec<_>>();
+        self.memory.record_accesses(&targets).await;
         Ok(SearchMemoryOutput {
             hits: records
                 .into_iter()
@@ -592,6 +674,11 @@ impl QueryMemoryModule {
             })
             .await
             .context("fetch linked memory")?;
+        let targets = records
+            .iter()
+            .map(|linked| MemoryUsageTarget::from(&linked.record))
+            .collect::<Vec<_>>();
+        self.memory.record_accesses(&targets).await;
         Ok(FetchLinkedMemoriesOutput {
             hits: records
                 .into_iter()
@@ -659,6 +746,41 @@ impl QueryMemoryBatch {
     fn mark_allocation_updated(&mut self) {
         self.allocation_updated = true;
     }
+}
+
+fn select_hits(hits: &[QueryMemoryHit], indexes: &[MemoryIndex]) -> Vec<QueryMemoryHit> {
+    let wanted = indexes.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    hits.iter()
+        .filter(|hit| wanted.contains(&hit.index) && seen.insert(hit.index.clone()))
+        .cloned()
+        .collect()
+}
+
+fn select_linked_hits(
+    hits: &[QueryMemoryLinkedHit],
+    indexes: &[MemoryIndex],
+) -> Vec<QueryMemoryLinkedHit> {
+    let wanted = indexes.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    hits.iter()
+        .filter(|hit| wanted.contains(&hit.index) && seen.insert(hit.index.clone()))
+        .cloned()
+        .collect()
+}
+
+fn usage_targets(
+    hits: &[QueryMemoryHit],
+    linked_hits: &[QueryMemoryLinkedHit],
+) -> Vec<MemoryUsageTarget> {
+    hits.iter()
+        .map(|hit| MemoryUsageTarget::new(hit.index.clone(), hit.rank, hit.occurred_at))
+        .chain(
+            linked_hits
+                .iter()
+                .map(|hit| MemoryUsageTarget::new(hit.index.clone(), hit.rank, hit.occurred_at)),
+        )
+        .collect()
 }
 
 fn hit_contents(hits: &[QueryMemoryHit]) -> String {

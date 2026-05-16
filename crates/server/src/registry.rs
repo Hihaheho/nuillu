@@ -162,7 +162,7 @@ fn register_server_module(
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
-                    memory_caps.searcher(),
+                    memory_caps.retriever(),
                     memory_caps.content_reader(),
                     caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                     caps.llm_access(),
@@ -178,6 +178,7 @@ fn register_server_module(
                     caps.allocation_reader(),
                     caps.memory_metadata_reader(),
                     memory_caps.writer(),
+                    memory_caps.retriever(),
                     caps.llm_access(),
                 )
             })
@@ -215,7 +216,7 @@ fn register_server_module(
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
-                    memory_caps.searcher(),
+                    memory_caps.retriever(),
                     caps.cognition_writer(),
                     caps.llm_access(),
                 )

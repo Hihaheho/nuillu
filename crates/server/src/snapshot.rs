@@ -269,6 +269,8 @@ pub fn memory_metadata_views(bb: &BlackboardInner) -> Vec<MemoryMetadataView> {
             occurred_at: metadata.occurred_at,
             last_accessed: metadata.last_accessed,
             access_count: metadata.access_count,
+            use_count: metadata.use_count,
+            reinforcement_count: metadata.reinforcement_count,
         })
         .collect::<Vec<_>>();
     memory_metadata.sort_by(|left, right| left.index.cmp(&right.index));

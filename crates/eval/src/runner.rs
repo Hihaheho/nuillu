@@ -3034,7 +3034,7 @@ fn register_eval_module(
                             caps.cognition_log_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
-                            memory_caps.searcher(),
+                            memory_caps.retriever(),
                             memory_caps.content_reader(),
                             caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                             caps.llm_access(),
@@ -3057,6 +3057,7 @@ fn register_eval_module(
                             caps.allocation_reader(),
                             caps.memory_metadata_reader(),
                             memory_caps.writer(),
+                            memory_caps.retriever(),
                             caps.llm_access(),
                         )
                     }
@@ -3113,7 +3114,7 @@ fn register_eval_module(
                             caps.allocation_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
-                            memory_caps.searcher(),
+                            memory_caps.retriever(),
                             caps.cognition_writer(),
                             caps.llm_access(),
                         )
@@ -3513,6 +3514,8 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             occurred_at: metadata.occurred_at,
             last_accessed: metadata.last_accessed,
             access_count: metadata.access_count,
+            use_count: metadata.use_count,
+            reinforcement_count: metadata.reinforcement_count,
         })
         .collect::<Vec<_>>();
     memory_metadata.sort_by(|left, right| left.index.cmp(&right.index));
@@ -3673,8 +3676,22 @@ fn memory_metadata_dump_records(bb: &BlackboardInner) -> Vec<(String, MemoryMeta
                     remember_tokens: metadata.remember_tokens,
                     last_accessed: metadata.last_accessed.to_rfc3339(),
                     access_count: metadata.access_count,
+                    use_count: metadata.use_count,
+                    last_used: metadata.last_used.map(|at| at.to_rfc3339()),
+                    reinforcement_count: metadata.reinforcement_count,
+                    last_reinforced_at: metadata.last_reinforced_at.map(|at| at.to_rfc3339()),
                     query_history: metadata
                         .query_history
+                        .iter()
+                        .map(|at| at.to_rfc3339())
+                        .collect(),
+                    use_history: metadata
+                        .use_history
+                        .iter()
+                        .map(|at| at.to_rfc3339())
+                        .collect(),
+                    reinforcement_history: metadata
+                        .reinforcement_history
                         .iter()
                         .map(|at| at.to_rfc3339())
                         .collect(),
@@ -5136,7 +5153,13 @@ limits {{
                     "remember_tokens": 0,
                     "last_accessed": "2026-05-07T00:00:00Z",
                     "access_count": 0,
+                    "last_used": null,
+                    "use_count": 0,
+                    "last_reinforced_at": null,
+                    "reinforcement_count": 0,
                     "query_history": [],
+                    "use_history": [],
+                    "reinforcement_history": [],
                 },
             },
             "utterances": [],

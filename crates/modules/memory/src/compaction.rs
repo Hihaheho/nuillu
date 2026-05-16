@@ -111,6 +111,8 @@ impl MemoryCompactionModule {
                             .unwrap_or_else(|| "unknown".to_owned()),
                         decay_remaining_secs: item.decay_remaining_secs,
                         access_count: item.access_count,
+                        use_count: item.use_count,
+                        reinforcement_count: item.reinforcement_count,
                     })
                     .collect::<Vec<_>>();
                 metadata.sort_by(|left, right| left.index.cmp(&right.index));
@@ -247,12 +249,14 @@ fn format_compaction_context(
     } else {
         for item in memory_metadata {
             out.push_str(&format!(
-                "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}",
+                "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}; use_count={}; reinforcement_count={}",
                 item.index,
                 item.rank,
                 item.occurred_at,
                 item.decay_remaining_secs,
-                item.access_count
+                item.access_count,
+                item.use_count,
+                item.reinforcement_count
             ));
         }
     }

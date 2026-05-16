@@ -163,7 +163,13 @@ pub struct MemoryMetadataDump {
     pub remember_tokens: u32,
     pub last_accessed: String,
     pub access_count: u32,
+    pub use_count: u32,
+    pub last_used: Option<String>,
+    pub reinforcement_count: u32,
+    pub last_reinforced_at: Option<String>,
     pub query_history: Vec<String>,
+    pub use_history: Vec<String>,
+    pub reinforcement_history: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, IntoEure)]
@@ -251,7 +257,13 @@ mod tests {
                         remember_tokens: 1,
                         last_accessed: "2026-05-08T00:00:00Z".to_string(),
                         access_count: 0,
+                        use_count: 0,
+                        last_used: None,
+                        reinforcement_count: 0,
+                        last_reinforced_at: None,
                         query_history: Vec::new(),
+                        use_history: Vec::new(),
+                        reinforcement_history: Vec::new(),
                     },
                     missing_content: false,
                 }],

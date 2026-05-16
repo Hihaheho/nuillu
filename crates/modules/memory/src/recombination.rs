@@ -9,7 +9,7 @@ use nuillu_types::{MemoryRank, builtin};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::store::{MemoryRecord, MemorySearcher};
+use crate::store::{MemoryRecord, MemoryRetriever, MemoryUsageTarget};
 
 const SYSTEM_PROMPT: &str = r#"You are the memory-recombination module.
 You run a REM-like internal dream simulation. Combine recent non-dream cognition with retrieved
@@ -42,7 +42,7 @@ pub struct MemoryRecombinationModule {
     allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
-    memory: MemorySearcher,
+    memory: MemoryRetriever,
     cognition: CognitionWriter,
     llm: LlmAccess,
 }
@@ -52,7 +52,7 @@ impl MemoryRecombinationModule {
         allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
-        memory: MemorySearcher,
+        memory: MemoryRetriever,
         cognition: CognitionWriter,
         llm: LlmAccess,
     ) -> Self {
@@ -108,6 +108,11 @@ impl MemoryRecombinationModule {
             .search(&seed, 5)
             .await
             .context("search memory for recombination")?;
+        let targets = related
+            .iter()
+            .map(MemoryUsageTarget::from)
+            .collect::<Vec<_>>();
+        self.memory.record_accesses(&targets).await;
 
         let mut session = Session::new();
         session.push_system(nuillu_module::format_system_prompt(

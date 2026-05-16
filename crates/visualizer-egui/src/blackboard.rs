@@ -62,12 +62,16 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                     ui.strong("Index");
                     ui.strong("Rank");
                     ui.strong("Accesses");
+                    ui.strong("Uses");
+                    ui.strong("Reinforces");
                     ui.strong("Occurred");
                     ui.end_row();
                     for memory in &snapshot.memory_metadata {
                         ui.label(&memory.index);
                         ui.label(&memory.rank);
                         ui.label(memory.access_count.to_string());
+                        ui.label(memory.use_count.to_string());
+                        ui.label(memory.reinforcement_count.to_string());
                         ui.label(
                             memory
                                 .occurred_at

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -8,13 +10,17 @@ use nuillu_module::{
     LlmAccess, MemoryMetadataReader, Module, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
     format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
+    render_memory_for_llm,
 };
-use nuillu_types::MemoryRank;
+use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::store::{MemoryConcept, MemoryKind, MemoryTag, MemoryWriter, NewMemory};
+use crate::store::{
+    MemoryConcept, MemoryKind, MemoryRetriever, MemoryTag, MemoryUsageTarget, MemoryWriter,
+    NewMemory,
+};
 
 // ---------------------------------------------------------------------------
 // MemoryModule
@@ -30,6 +36,10 @@ contain explicit preservation candidates from other modules, but those candidate
 context rather than write commands. Use insert_memory only for concrete information likely to matter
 later and grounded in cognition-log evidence. You may reject, normalize, merge, and deduplicate
 observations and guidance.
+When related existing memories are provided, decide whether the evicted evidence is already covered
+by one of those memories. If it is, call reinforce_memory for that candidate instead of inserting a
+duplicate. If the evidence adds new detail, contradicts, updates, or is not clearly covered by an
+existing candidate, write a new short-term memory with insert_memory.
 insert_memory always writes short-term memory; later access, compaction, or other memory-system
 mechanisms may change rank outside this tool. When calling insert_memory, prefer kinds episode,
 statement, reflection, hypothesis, dream, procedure, or plan. Concepts and tags are simple name
@@ -43,6 +53,7 @@ simulations, not evidence. Do not store them as factual memories; preserve them 
 framed as dream or hypothesis material with dream/hypothesis kind and operational tags."#;
 
 const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
+const RELATED_MEMORY_SEARCH_LIMIT: usize = 4;
 const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
@@ -89,9 +100,24 @@ pub struct InsertMemoryOutput {
     pub index: String,
 }
 
+#[lutum::tool_input(name = "reinforce_memory", output = ReinforceMemoryOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReinforceMemoryArgs {
+    pub index: MemoryIndex,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReinforceMemoryOutput {
+    pub reinforced: bool,
+    pub index: MemoryIndex,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum MemoryTools {
     InsertMemory(InsertMemoryArgs),
+    ReinforceMemory(ReinforceMemoryArgs),
 }
 
 pub struct MemoryModule {
@@ -101,6 +127,7 @@ pub struct MemoryModule {
     allocation: AllocationReader,
     memory_metadata: MemoryMetadataReader,
     memory: MemoryWriter,
+    memory_retriever: MemoryRetriever,
     llm: LlmAccess,
     session: Session,
     session_compaction: SessionCompactionConfig,
@@ -115,15 +142,27 @@ struct MemoryMetadataContext {
     occurred_at: String,
     decay_remaining_secs: i64,
     access_count: u32,
+    use_count: u32,
+    reinforcement_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct RelatedMemoryCandidate {
+    target: MemoryUsageTarget,
+    content: String,
+    stored_at: String,
+    kind: MemoryKind,
 }
 
 impl MemoryModule {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cognition_evictions: CognitionLogEvictedInbox,
         allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         memory_metadata: MemoryMetadataReader,
         memory: MemoryWriter,
+        memory_retriever: MemoryRetriever,
         llm: LlmAccess,
     ) -> Self {
         Self {
@@ -133,6 +172,7 @@ impl MemoryModule {
             allocation,
             memory_metadata,
             memory,
+            memory_retriever,
             llm,
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
@@ -181,6 +221,8 @@ impl MemoryModule {
                             .unwrap_or_else(|| "unknown".to_owned()),
                         decay_remaining_secs: item.decay_remaining_secs,
                         access_count: item.access_count,
+                        use_count: item.use_count,
+                        reinforcement_count: item.reinforcement_count,
                     })
                     .collect::<Vec<_>>();
                 metadata.sort_by(|left, right| left.index.cmp(&right.index));
@@ -189,6 +231,13 @@ impl MemoryModule {
             .await;
         let allocation = self.allocation.snapshot().await;
         let allocation_guidance = allocation.for_module(&self.owner).guidance;
+        let related_memories = self
+            .related_memory_candidates(&batch.cognition_log, cx.now())
+            .await?;
+        let reinforcement_targets = related_memories
+            .iter()
+            .map(|candidate| (candidate.target.index.clone(), candidate.target.clone()))
+            .collect::<HashMap<_, _>>();
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
@@ -200,6 +249,9 @@ impl MemoryModule {
         if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
             self.session.push_ephemeral_user(metadata_context);
         }
+        if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
+            self.session.push_ephemeral_user(candidate_context);
+        }
         self.session
             .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
 
@@ -209,7 +261,10 @@ impl MemoryModule {
                 .session
                 .text_turn(&lutum)
                 .tools::<MemoryTools>()
-                .available_tools([MemoryToolsSelector::InsertMemory])
+                .available_tools([
+                    MemoryToolsSelector::InsertMemory,
+                    MemoryToolsSelector::ReinforceMemory,
+                ])
                 .collect()
                 .await
                 .context("memory text turn failed")?;
@@ -247,15 +302,28 @@ impl MemoryModule {
                     let input_tokens = round.usage.input_tokens;
                     let mut results: Vec<ToolResult> = Vec::new();
                     for call in round.tool_calls.iter().cloned() {
-                        let MemoryToolsCall::InsertMemory(call) = call;
-                        let output = self
-                            .insert_memory(call.input.clone())
-                            .await
-                            .context("run insert_memory tool")?;
-                        let result = call
-                            .complete(output)
-                            .context("complete insert_memory tool call")?;
-                        results.push(result);
+                        match call {
+                            MemoryToolsCall::InsertMemory(call) => {
+                                let output = self
+                                    .insert_memory(call.input.clone())
+                                    .await
+                                    .context("run insert_memory tool")?;
+                                let result = call
+                                    .complete(output)
+                                    .context("complete insert_memory tool call")?;
+                                results.push(result);
+                            }
+                            MemoryToolsCall::ReinforceMemory(call) => {
+                                let output = self
+                                    .reinforce_memory(call.input.clone(), &reinforcement_targets)
+                                    .await
+                                    .context("run reinforce_memory tool")?;
+                                let result = call
+                                    .complete(output)
+                                    .context("complete reinforce_memory tool call")?;
+                                results.push(result);
+                            }
+                        }
                     }
                     round
                         .commit(&mut self.session, results)
@@ -304,6 +372,64 @@ impl MemoryModule {
             index: record.index.to_string(),
         })
     }
+
+    async fn reinforce_memory(
+        &self,
+        args: ReinforceMemoryArgs,
+        targets: &HashMap<MemoryIndex, MemoryUsageTarget>,
+    ) -> Result<ReinforceMemoryOutput> {
+        let Some(target) = targets.get(&args.index) else {
+            return Ok(ReinforceMemoryOutput {
+                reinforced: false,
+                index: args.index,
+                message: "memory was not in the related-memory candidate set".to_owned(),
+            });
+        };
+        self.memory_retriever.record_reinforcement(target).await;
+        Ok(ReinforceMemoryOutput {
+            reinforced: true,
+            index: args.index,
+            message: "memory reinforcement recorded".to_owned(),
+        })
+    }
+
+    async fn related_memory_candidates(
+        &self,
+        cognition_log: &[CognitionLogEntryRecord],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<RelatedMemoryCandidate>> {
+        let queries = cognition_log
+            .iter()
+            .map(|record| record.entry.text.trim().to_owned())
+            .filter(|query| !query.is_empty())
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        for query in queries {
+            let hits = self
+                .memory_retriever
+                .search(&query, RELATED_MEMORY_SEARCH_LIMIT)
+                .await
+                .context("search related memory candidates")?;
+            for hit in hits {
+                if !seen.insert(hit.index.clone()) {
+                    continue;
+                }
+                candidates.push(RelatedMemoryCandidate {
+                    target: MemoryUsageTarget::from(&hit),
+                    content: render_memory_for_llm(hit.content.as_str(), hit.occurred_at, now),
+                    stored_at: hit.stored_at.to_rfc3339(),
+                    kind: hit.kind,
+                });
+            }
+        }
+        let targets = candidates
+            .iter()
+            .map(|candidate| candidate.target.clone())
+            .collect::<Vec<_>>();
+        self.memory_retriever.record_accesses(&targets).await;
+        Ok(candidates)
+    }
 }
 
 pub(crate) fn confidence_percent_to_f32(value: u8) -> f32 {
@@ -342,8 +468,39 @@ fn format_memory_metadata_candidates(metadata: &[MemoryMetadataContext]) -> Opti
     let mut out = String::from("Existing memory metadata for deduplication:");
     for item in metadata {
         out.push_str(&format!(
-            "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}",
-            item.index, item.rank, item.occurred_at, item.decay_remaining_secs, item.access_count
+            "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}; use_count={}; reinforcement_count={}",
+            item.index,
+            item.rank,
+            item.occurred_at,
+            item.decay_remaining_secs,
+            item.access_count,
+            item.use_count,
+            item.reinforcement_count
+        ));
+    }
+    Some(out)
+}
+
+fn format_related_memory_candidates(candidates: &[RelatedMemoryCandidate]) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Related existing memory candidates. Use reinforce_memory only when a candidate already covers the evicted cognition-log evidence:",
+    );
+    for candidate in candidates {
+        out.push_str(&format!(
+            "\n- [{}] rank={:?}; kind={:?}; occurred_at={}; stored_at={}\n  {}",
+            candidate.target.index,
+            candidate.target.rank,
+            candidate.kind,
+            candidate
+                .target
+                .occurred_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            candidate.stored_at,
+            candidate.content.trim()
         ));
     }
     Some(out)
@@ -601,6 +758,7 @@ mod tests {
                         caps.allocation_reader(),
                         caps.memory_metadata_reader(),
                         memory_caps.writer(),
+                        memory_caps.retriever(),
                         caps.llm_access(),
                     )
                     .with_batch_config(batching),

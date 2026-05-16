@@ -463,6 +463,8 @@ pub struct MemoryMetadataView {
     pub occurred_at: Option<DateTime<Utc>>,
     pub last_accessed: DateTime<Utc>,
     pub access_count: u32,
+    pub use_count: u32,
+    pub reinforcement_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

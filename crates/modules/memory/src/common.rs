@@ -32,6 +32,8 @@ pub(crate) struct MemoryMetadataContext {
     pub(crate) occurred_at: String,
     pub(crate) decay_remaining_secs: i64,
     pub(crate) access_count: u32,
+    pub(crate) use_count: u32,
+    pub(crate) reinforcement_count: u32,
 }
 
 pub(crate) fn memory_record_to_view(record: MemoryRecord) -> MemoryContentView {
