@@ -1,33 +1,32 @@
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use eure::FromEure;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, AttentionControlRequest,
-    AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    InteroceptiveReader, LlmAccess, MemoUpdatedInbox, Module, TypedMemo,
+    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo,
+    Module,
 };
-use nuillu_types::{ModuleId, PolicyIndex, builtin};
+use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    IndexedPolicy, PolicyRecord, PolicyRetrievalMemo, PolicyStore, PolicyWindowKey,
-    PolicyWindowReader, ValueEstimateMemo, ValueEstimatePrediction, fanout_policy_put,
+    IndexedPolicy, NewPolicy, PolicyConsiderationEvicted, PolicyConsiderationEvictedInbox,
+    PolicyConsiderationKey, PolicyConsiderationSource, PolicyRecord, PolicyStore,
+    SyntheticPolicyConsideration, fanout_policy_put,
 };
 
 const SYSTEM_PROMPT: &str = r#"You are the reward module.
-Assess outcomes after a policy retrieval/value-estimate window. Return structured reward channels
-and per-policy credit values in [0, 1]. Credit only policies that plausibly affected the later
-behavior or outcome. Do not invent policy indexes."#;
+Assess outcomes after a policy-consideration memo has left the retained memo surface. Return
+structured reward channels and per-candidate credit values in [0, 1]. Credit only candidates that
+plausibly affected later behavior or outcome. Use candidate_id values exactly as provided."#;
 const DEFAULT_POLICY_REINFORCEMENT_CONFIG: &str =
     include_str!("../../../../configs/policy-reinforcement.eure");
+const DEFAULT_SYNTHETIC_POLICY_DECAY_SECS: i64 = 86_400;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ObservedReward {
@@ -49,37 +48,30 @@ impl ObservedReward {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RewardAssessment {
     pub observed_reward: ObservedReward,
-    pub policy_credits: Vec<PolicyCredit>,
-    pub novel_policy_request: Option<NovelPolicyRequest>,
+    pub candidate_credits: Vec<PolicyCandidateCredit>,
     pub rationale: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PolicyCredit {
-    pub policy_index: PolicyIndex,
+pub struct PolicyCandidateCredit {
+    pub candidate_id: String,
     pub credit: f32,
     pub rationale: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct NovelPolicyRequest {
-    pub reason: String,
-    pub candidate_trigger: Option<String>,
-    pub candidate_behavior: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct RewardMemo {
-    pub value_estimate_window: PolicyWindowKey,
+    pub policy_consideration: PolicyConsiderationKey,
     pub observed_reward: ObservedReward,
     pub observed_scalar: f32,
     pub updates: Vec<PolicyRewardUpdate>,
-    pub novel_policy_requested: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyRewardUpdate {
+    pub candidate_id: String,
     pub policy_index: PolicyIndex,
+    pub inserted: bool,
     pub credit: f32,
     pub compared_expected_reward: f32,
     pub td_error: f32,
@@ -89,17 +81,17 @@ pub struct PolicyRewardUpdate {
     pub confidence_delta: f32,
 }
 
-/// Atomically applies TD-style reinforcement deltas to the primary policy
-/// store and mirrors metadata onto the blackboard.
+/// Inserts synthetic policy candidates and applies reward updates to existing
+/// or newly inserted policy records.
 #[derive(Clone)]
-pub struct PolicyValueUpdater {
+pub struct PolicyUpserter {
     primary_store: Rc<dyn PolicyStore>,
     replicas: Vec<Rc<dyn PolicyStore>>,
     blackboard: Blackboard,
     clock: Rc<dyn Clock>,
 }
 
-impl PolicyValueUpdater {
+impl PolicyUpserter {
     pub(crate) fn new(
         primary_store: Rc<dyn PolicyStore>,
         replicas: Vec<Rc<dyn PolicyStore>>,
@@ -112,6 +104,46 @@ impl PolicyValueUpdater {
             blackboard,
             clock,
         }
+    }
+
+    pub async fn insert_candidate(
+        &self,
+        candidate: &SyntheticPolicyConsideration,
+        initial_expected_reward: f32,
+        initial_confidence: f32,
+        initial_value: f32,
+        decay_secs: i64,
+    ) -> Result<PolicyRecord, PortError> {
+        let trigger = candidate.trigger.trim().to_owned();
+        let behavior = candidate.behavior.trim().to_owned();
+        let expected_reward = SignedUnitF32::clamp(initial_expected_reward);
+        let confidence = UnitF32::clamp(initial_confidence);
+        let value = SignedUnitF32::clamp(initial_value);
+        let new = NewPolicy {
+            trigger: trigger.clone(),
+            behavior: behavior.clone(),
+            rank: PolicyRank::Tentative,
+            expected_reward,
+            confidence,
+            value,
+            reward_tokens: 0,
+            decay_remaining_secs: decay_secs,
+        };
+        let index = self.primary_store.insert(new).await?;
+        let record = PolicyRecord {
+            index,
+            trigger,
+            behavior,
+            rank: PolicyRank::Tentative,
+            expected_reward,
+            confidence,
+            value,
+            reward_tokens: 0,
+            decay_remaining_secs: decay_secs,
+        };
+        fanout_policy_put(&self.replicas, indexed_policy(&record)).await;
+        self.mirror_metadata(&record, None).await;
+        Ok(record)
     }
 
     pub async fn reinforce(
@@ -133,6 +165,15 @@ impl PolicyValueUpdater {
             )
             .await?;
         fanout_policy_put(&self.replicas, indexed_policy(&record)).await;
+        self.mirror_metadata(&record, Some(self.clock.now())).await;
+        Ok(record)
+    }
+
+    async fn mirror_metadata(
+        &self,
+        record: &PolicyRecord,
+        reinforced_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         self.blackboard
             .apply(BlackboardCommand::UpsertPolicyMetadata {
                 index: record.index.clone(),
@@ -145,12 +186,11 @@ impl PolicyValueUpdater {
                     value: Some(record.value),
                     reward_tokens: Some(record.reward_tokens),
                     decay_remaining_secs: Some(record.decay_remaining_secs),
-                    reinforced_at: Some(self.clock.now()),
+                    reinforced_at,
                     ..Default::default()
                 },
             })
             .await;
-        Ok(record)
     }
 }
 
@@ -284,133 +324,54 @@ impl ReinforcementConfigFile {
 }
 
 pub struct RewardModule {
-    cognition_updates: CognitionLogUpdatedInbox,
-    memo_updates: MemoUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
+    policy_evictions: PolicyConsiderationEvictedInbox,
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
     allocation: AllocationReader,
     interoception: InteroceptiveReader,
-    windows: PolicyWindowReader,
-    updater: PolicyValueUpdater,
-    attention_control: AttentionControlRequestMailbox,
-    memo: TypedMemo<RewardMemo>,
+    upserter: PolicyUpserter,
+    memo: Memo,
     llm: LlmAccess,
     session: Session,
-    settled_value_estimates: HashSet<PolicyWindowKey>,
-    settled_retrievals: HashSet<PolicyWindowKey>,
     config: ReinforcementConfig,
 }
 
 impl RewardModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cognition_updates: CognitionLogUpdatedInbox,
-        memo_updates: MemoUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
+        policy_evictions: PolicyConsiderationEvictedInbox,
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
         allocation: AllocationReader,
         interoception: InteroceptiveReader,
-        windows: PolicyWindowReader,
-        updater: PolicyValueUpdater,
-        attention_control: AttentionControlRequestMailbox,
-        memo: TypedMemo<RewardMemo>,
+        upserter: PolicyUpserter,
+        memo: Memo,
         llm: LlmAccess,
     ) -> Self {
         Self {
-            cognition_updates,
-            memo_updates,
-            allocation_updates,
+            policy_evictions,
             blackboard,
             cognition,
             allocation,
             interoception,
-            windows,
-            updater,
-            attention_control,
+            upserter,
             memo,
             llm,
             session: Session::new(),
-            settled_value_estimates: HashSet::new(),
-            settled_retrievals: HashSet::new(),
             config: ReinforcementConfig::default(),
         }
     }
 
-    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        self.settle_value_estimates().await?;
-        if !module_registered(cx, &builtin::value_estimator()) {
-            self.settle_retrieval_baselines().await?;
-        }
-        Ok(())
-    }
-
-    async fn settle_value_estimates(&mut self) -> Result<()> {
-        let estimates = self.windows.value_estimates().await;
-        for estimate in estimates {
-            if !self.settled_value_estimates.insert(estimate.key.clone()) {
-                continue;
-            }
-            let Some(retrieval) = self
-                .windows
-                .retrieval_by_key(&estimate.payload.retrieval_window)
-                .await
-            else {
-                continue;
-            };
-            self.settle_estimate(estimate.key, estimate.payload, retrieval)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn settle_retrieval_baselines(&mut self) -> Result<()> {
-        let retrievals = self.windows.retrieval_windows().await;
-        for retrieval in retrievals {
-            if !self.settled_retrievals.insert(retrieval.key.clone()) {
-                continue;
-            }
-            let predictions = retrieval
-                .payload
-                .hits
-                .iter()
-                .map(|hit| ValueEstimatePrediction {
-                    policy_index: hit.policy_index.clone(),
-                    predicted_expected_reward: hit.expected_reward,
-                    confidence_hint: hit.confidence,
-                    rationale: "v1 fallback: value-estimator absent, use stored expected_reward"
-                        .into(),
-                })
-                .collect::<Vec<_>>();
-            if predictions.is_empty() {
-                continue;
-            }
-            let estimate = ValueEstimateMemo {
-                retrieval_window: retrieval.key.clone(),
-                predictions,
-            };
-            self.settle_estimate(retrieval.key, estimate, retrieval.payload)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn settle_estimate(
-        &mut self,
-        estimate_key: PolicyWindowKey,
-        estimate: ValueEstimateMemo,
-        retrieval: PolicyRetrievalMemo,
-    ) -> Result<()> {
-        let assessment = self.assess(&estimate, &retrieval).await?;
+    async fn settle(&mut self, evicted: PolicyConsiderationEvicted) -> Result<()> {
+        let assessment = self.assess(&evicted).await?;
         let observed_scalar = self.config.observed_scalar(&assessment.observed_reward);
         let mut updates = Vec::new();
 
-        for prediction in &estimate.predictions {
+        for candidate in &evicted.payload.considerations {
             let Some(credit) = assessment
-                .policy_credits
+                .candidate_credits
                 .iter()
-                .find(|credit| credit.policy_index == prediction.policy_index)
+                .find(|credit| credit.candidate_id == candidate.candidate_id)
                 .map(|credit| credit.credit.clamp(0.0, 1.0))
             else {
                 continue;
@@ -418,14 +379,8 @@ impl RewardModule {
             if credit <= 0.0 {
                 continue;
             }
-            if !retrieval
-                .hits
-                .iter()
-                .any(|hit| hit.policy_index == prediction.policy_index)
-            {
-                continue;
-            };
-            let td_error = observed_scalar - prediction.predicted_expected_reward;
+
+            let td_error = observed_scalar - candidate.predicted_expected_reward;
             let expected_reward_delta = self.config.alpha * credit * td_error;
             let value_delta = self.config.beta * credit * td_error.clamp(-1.0, 1.0);
             let confidence_delta = confidence_delta(
@@ -434,9 +389,29 @@ impl RewardModule {
                 self.config.confidence_scale,
             ) * credit;
             let reward_tokens_delta = u32::from(td_error.abs() <= self.config.settle_band);
-            self.updater
+
+            let (policy_index, inserted) = match &candidate.source {
+                PolicyConsiderationSource::Existing(existing) => {
+                    (existing.policy_index.clone(), false)
+                }
+                PolicyConsiderationSource::Synthetic(synthetic) => {
+                    let record = self
+                        .upserter
+                        .insert_candidate(
+                            synthetic,
+                            candidate.predicted_expected_reward,
+                            candidate.confidence_hint,
+                            candidate.predicted_expected_reward,
+                            DEFAULT_SYNTHETIC_POLICY_DECAY_SECS,
+                        )
+                        .await?;
+                    (record.index, true)
+                }
+            };
+
+            self.upserter
                 .reinforce(
-                    &prediction.policy_index,
+                    &policy_index,
                     value_delta,
                     reward_tokens_delta,
                     expected_reward_delta,
@@ -444,9 +419,11 @@ impl RewardModule {
                 )
                 .await?;
             updates.push(PolicyRewardUpdate {
-                policy_index: prediction.policy_index.clone(),
+                candidate_id: candidate.candidate_id.clone(),
+                policy_index,
+                inserted,
                 credit,
-                compared_expected_reward: prediction.predicted_expected_reward,
+                compared_expected_reward: candidate.predicted_expected_reward,
                 td_error,
                 value_delta,
                 reward_tokens_delta,
@@ -455,48 +432,32 @@ impl RewardModule {
             });
         }
 
-        let novel_policy_requested = assessment.novel_policy_request.is_some();
-        if let Some(request) = &assessment.novel_policy_request {
-            let _ = self
-                .attention_control
-                .publish(AttentionControlRequest::policy(
-                    request.reason.clone(),
-                    request.candidate_trigger.clone(),
-                    request.candidate_behavior.clone(),
-                ))
-                .await;
-        }
-
         let payload = RewardMemo {
-            value_estimate_window: estimate_key,
+            policy_consideration: evicted.key,
             observed_reward: assessment.observed_reward.clone(),
             observed_scalar,
             updates,
-            novel_policy_requested,
         };
         let plaintext = render_reward_memo(&payload, &assessment);
-        self.memo.write(payload, plaintext).await;
+        self.memo.write(plaintext).await;
         Ok(())
     }
 
-    async fn assess(
-        &mut self,
-        estimate: &ValueEstimateMemo,
-        retrieval: &PolicyRetrievalMemo,
-    ) -> Result<RewardAssessment> {
+    async fn assess(&mut self, evicted: &PolicyConsiderationEvicted) -> Result<RewardAssessment> {
         let memos = self.blackboard.recent_memo_logs().await;
         let cognition = self.cognition.snapshot().await;
         let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
         self.session.push_ephemeral_system(SYSTEM_PROMPT);
         self.session.push_ephemeral_user(format!(
-            "Retrieval window:\n{}\n\nValue estimate:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
-            serde_json::to_string(retrieval).unwrap_or_default(),
-            serde_json::to_string(estimate).unwrap_or_default(),
-            serde_json::to_string(&memos).unwrap_or_default(),
-            serde_json::to_string(&cognition).unwrap_or_default(),
-            serde_json::to_string(&allocation).unwrap_or_default(),
-            serde_json::to_string(&interoception).unwrap_or_default(),
+            "Evicted policy consideration:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
+            serde_json::to_string(&evicted.payload)
+                .expect("policy consideration serialization should not fail"),
+            serde_json::to_string(&memos).expect("memo log serialization should not fail"),
+            serde_json::to_string(&cognition).expect("cognition log serialization should not fail"),
+            serde_json::to_string(&allocation).expect("allocation serialization should not fail"),
+            serde_json::to_string(&interoception)
+                .expect("interoception serialization should not fail"),
         ));
         let lutum = self.llm.lutum().await;
         let result = self
@@ -530,8 +491,8 @@ fn validate_finite(name: &str, value: f64) -> Result<()> {
 fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> String {
     let mut output = format!(
         "Reward assessment for {}#{}\nObserved scalar: {:.3}\nObserved channels: external {:.3}, task {:.3}, social {:.3}, cost {:.3}, risk {:.3}, novelty {:.3}\nRationale: {}",
-        memo.value_estimate_window.owner,
-        memo.value_estimate_window.memo_index,
+        memo.policy_consideration.owner,
+        memo.policy_consideration.memo_index,
         memo.observed_scalar,
         assessment.observed_reward.external,
         assessment.observed_reward.task,
@@ -546,10 +507,13 @@ fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> Strin
     } else {
         output.push_str("\nPolicy updates:");
         for update in &memo.updates {
-            output.push_str("\nPolicy [");
+            output.push_str("\nCandidate [");
+            output.push_str(update.candidate_id.as_str());
+            output.push_str("] -> policy [");
             output.push_str(update.policy_index.as_str());
             output.push_str(&format!(
-                "]: credit {:.3}; expected_reward {:.3}; td_error {:.3}; value_delta {:.3}; expected_reward_delta {:.3}; confidence_delta {:.3}; reward_tokens_delta {}",
+                "]: inserted {}; credit {:.3}; expected_reward {:.3}; td_error {:.3}; value_delta {:.3}; expected_reward_delta {:.3}; confidence_delta {:.3}; reward_tokens_delta {}",
+                update.inserted,
                 update.credit,
                 update.compared_expected_reward,
                 update.td_error,
@@ -560,60 +524,60 @@ fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> Strin
             ));
         }
     }
-    if let Some(request) = &assessment.novel_policy_request {
-        output.push_str("\nNovel policy request: ");
-        output.push_str(request.reason.trim());
-    } else {
-        output.push_str("\nNovel policy request: none");
-    }
     output
 }
 
 #[async_trait(?Send)]
 impl Module for RewardModule {
-    type Batch = ();
+    type Batch = Vec<PolicyConsiderationEvicted>;
 
     fn id() -> &'static str {
         "reward"
     }
 
     fn role_description() -> &'static str {
-        "Aggregates observed reward, assigns per-policy credit, and updates policy value state."
+        "Assesses evicted policy considerations and consolidates rewarded or failed policy candidates."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        tokio::select! {
-            result = self.cognition_updates.next_item() => {
-                result?;
-            }
-            result = self.memo_updates.next_item() => {
-                result?;
-            }
-            result = self.allocation_updates.next_item() => {
-                result?;
-            }
-        }
-        Ok(())
+        let Some(first) = self.policy_evictions.next_item().await else {
+            anyhow::bail!("policy-consideration eviction inbox closed");
+        };
+        let mut batch = vec![first];
+        batch.extend(self.policy_evictions.take_ready_items());
+        Ok(batch)
     }
 
     async fn activate(
         &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        _batch: &Self::Batch,
+        _cx: &nuillu_module::ActivateCx<'_>,
+        batch: &Self::Batch,
     ) -> Result<()> {
-        RewardModule::activate(self, cx).await
+        let mut first_error = None;
+        for evicted in batch {
+            if let Err(error) = RewardModule::settle(self, evicted.clone()).await {
+                tracing::warn!(?error, "failed to settle policy consideration");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 }
 
-fn module_registered(cx: &nuillu_module::ActivateCx<'_>, id: &ModuleId) -> bool {
-    cx.modules().iter().any(|(module, _)| module == id)
-}
-
-#[allow(dead_code)]
-fn _suppress_unused(_: DateTime<Utc>) {}
-
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use async_trait::async_trait;
+    use nuillu_module::ports::SystemClock;
+
     use super::*;
 
     #[test]
@@ -641,5 +605,133 @@ mod tests {
         assert_eq!(confidence_delta(0.0, 0.05, 0.5), 0.05);
         assert_eq!(confidence_delta(0.5, 0.05, 0.5), 0.0);
         assert_eq!(confidence_delta(1.0, 0.05, 0.5), 0.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upserter_inserts_negative_synthetic_policy_and_reinforces_it() {
+        let store = Rc::new(RecordingPolicyStore::default());
+        let upserter = PolicyUpserter::new(
+            store.clone(),
+            Vec::new(),
+            Blackboard::default(),
+            Rc::new(SystemClock),
+        );
+        let candidate = SyntheticPolicyConsideration {
+            trigger: "rushed answer after weak evidence".into(),
+            behavior: "avoid answering until evidence is promoted".into(),
+        };
+
+        let inserted = upserter
+            .insert_candidate(&candidate, -0.6, 0.35, -0.6, 123)
+            .await
+            .unwrap();
+        upserter
+            .reinforce(&inserted.index, -0.1, 1, -0.2, 0.03)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .inserts
+                .borrow()
+                .iter()
+                .map(|policy| (
+                    policy.trigger.as_str(),
+                    policy.behavior.as_str(),
+                    policy.rank,
+                    policy.expected_reward,
+                    policy.confidence,
+                    policy.value,
+                    policy.reward_tokens,
+                    policy.decay_remaining_secs,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                "rushed answer after weak evidence",
+                "avoid answering until evidence is promoted",
+                PolicyRank::Tentative,
+                SignedUnitF32::clamp(-0.6),
+                UnitF32::clamp(0.35),
+                SignedUnitF32::clamp(-0.6),
+                0,
+                123,
+            )]
+        );
+        assert_eq!(
+            store.reinforces.borrow().as_slice(),
+            &[(PolicyIndex::new("recording-policy-0"), -0.1, 1, -0.2, 0.03)]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingPolicyStore {
+        inserts: RefCell<Vec<NewPolicy>>,
+        reinforces: RefCell<Vec<(PolicyIndex, f32, u32, f32, f32)>>,
+    }
+
+    #[async_trait(?Send)]
+    impl PolicyStore for RecordingPolicyStore {
+        async fn insert(&self, policy: NewPolicy) -> std::result::Result<PolicyIndex, PortError> {
+            let id = self.inserts.borrow().len();
+            self.inserts.borrow_mut().push(policy);
+            Ok(PolicyIndex::new(format!("recording-policy-{id}")))
+        }
+
+        async fn put(&self, _policy: IndexedPolicy) -> std::result::Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _index: &PolicyIndex,
+        ) -> std::result::Result<Option<PolicyRecord>, PortError> {
+            Ok(None)
+        }
+
+        async fn list_by_rank(
+            &self,
+            _rank: PolicyRank,
+        ) -> std::result::Result<Vec<PolicyRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn search(
+            &self,
+            _q: &crate::PolicyQuery,
+        ) -> std::result::Result<Vec<crate::PolicySearchHit>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn reinforce(
+            &self,
+            index: &PolicyIndex,
+            value_delta: f32,
+            reward_tokens_delta: u32,
+            expected_reward_delta: f32,
+            confidence_delta: f32,
+        ) -> std::result::Result<PolicyRecord, PortError> {
+            self.reinforces.borrow_mut().push((
+                index.clone(),
+                value_delta,
+                reward_tokens_delta,
+                expected_reward_delta,
+                confidence_delta,
+            ));
+            Ok(PolicyRecord {
+                index: index.clone(),
+                trigger: "rushed answer after weak evidence".into(),
+                behavior: "avoid answering until evidence is promoted".into(),
+                rank: PolicyRank::Tentative,
+                expected_reward: SignedUnitF32::clamp(-0.8),
+                confidence: UnitF32::clamp(0.38),
+                value: SignedUnitF32::clamp(-0.7),
+                reward_tokens: reward_tokens_delta,
+                decay_remaining_secs: 123,
+            })
+        }
+
+        async fn delete(&self, _index: &PolicyIndex) -> std::result::Result<(), PortError> {
+            Ok(())
+        }
     }
 }

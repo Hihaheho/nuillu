@@ -48,14 +48,12 @@ allocation-controller
 attention-schema
 self-model
 query-memory
-query-policy
 memory
 memory-compaction
 memory-recombination
 interoception
 homeostatic-controller
 policy
-value-estimator
 reward
 predict
 surprise
@@ -143,7 +141,8 @@ The intended artifact boundaries by module family are:
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |
 | `memory-recombination` | source-tagged dream/hypothesis cognition entry |
-| `policy` | inserted policies |
+| `policy` | policy-consideration advice memo |
+| `reward` | reward memo plus policy store insert/reinforce effects |
 | `homeostatic-controller` | allocation drive/cap changes |
 | `interoception` | interoception state |
 
@@ -190,7 +189,8 @@ Choose `judge-inputs` deliberately:
 - `memory`: last-state memory observations.
 - `cognition`: cognition-log observations.
 - `memos`: memo-log observations.
-- `trace`: tool calls and LLM trace, useful when judging retrieval or insert
+- `trace`: tool calls and LLM trace, useful when judging retrieval, policy
+  consideration, or insert
   tool use.
 - `allocation`: allocation observations.
 
@@ -213,7 +213,7 @@ Typical positive case:
 - Prompt for that fact.
 - Artifact must contain copied memory content.
 - Rubric should fail synthesis, advice generation, module self-description, or
-  policy retrieval.
+  policy advice.
 
 ### `memory`
 

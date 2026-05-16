@@ -2842,12 +2842,10 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::query_policy()),
+        (builtin::cognition_gate(), builtin::policy()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
-        (builtin::value_estimator(), builtin::query_policy()),
-        (builtin::reward(), builtin::value_estimator()),
-        (builtin::policy(), builtin::reward()),
+        (builtin::reward(), builtin::policy()),
         (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
@@ -3045,26 +3043,6 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::QueryPolicy => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
-                replica_hard_cap,
-                {
-                    let policy_caps = policy_caps.clone();
-                    move |caps| {
-                        nuillu_reward::QueryPolicyModule::new(
-                            caps.allocation_updated_inbox(),
-                            caps.cognition_log_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            policy_caps.searcher(),
-                            caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
-                            caps.llm_access(),
-                        )
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
             .register_eval(
@@ -3182,27 +3160,9 @@ fn register_eval_module(
                 {
                     let policy_caps = policy_caps.clone();
                     move |caps| {
+                        let consideration_writer =
+                            policy_caps.consideration_writer(caps.owner().clone());
                         nuillu_reward::PolicyModule::new(
-                            caps.memo_log_evicted_inbox(),
-                            caps.cognition_log_evicted_inbox(),
-                            caps.allocation_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.interoception_reader(),
-                            policy_caps.writer(),
-                            caps.llm_access(),
-                        )
-                    }
-                },
-            )
-            .expect("eval module registration should be unique"),
-        EvalModule::ValueEstimator => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
-                replica_hard_cap,
-                {
-                    let policy_caps = policy_caps.clone();
-                    move |caps| {
-                        nuillu_reward::ValueEstimatorModule::new(
                             caps.memo_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
                             caps.allocation_updated_inbox(),
@@ -3210,8 +3170,9 @@ fn register_eval_module(
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
                             caps.interoception_reader(),
-                            policy_caps.window_reader(),
-                            caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
+                            policy_caps.searcher(),
+                            caps.memo(),
+                            consideration_writer,
                             caps.llm_access(),
                         )
                     }
@@ -3226,17 +3187,13 @@ fn register_eval_module(
                     let policy_caps = policy_caps.clone();
                     move |caps| {
                         nuillu_reward::RewardModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.memo_updated_inbox(),
-                            caps.allocation_updated_inbox(),
+                            policy_caps.consideration_evicted_inbox(),
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
                             caps.interoception_reader(),
-                            policy_caps.window_reader(),
-                            policy_caps.value_updater(),
-                            caps.attention_control_mailbox(),
-                            caps.typed_memo::<nuillu_reward::RewardMemo>(),
+                            policy_caps.upserter(),
+                            caps.memo(),
                             caps.llm_access(),
                         )
                     }
@@ -3341,7 +3298,6 @@ pub(crate) fn full_agent_allocation(
             EvalModule::AttentionSchema => (0.0, ModelTier::Default),
             EvalModule::SelfModel => (0.0, ModelTier::Default),
             EvalModule::QueryMemory => (0.0, ModelTier::Cheap),
-            EvalModule::QueryPolicy => (0.0, ModelTier::Cheap),
             EvalModule::Memory => (0.0, ModelTier::Cheap),
             EvalModule::MemoryCompaction => (0.0, ModelTier::Cheap),
             EvalModule::MemoryAssociation => (0.0, ModelTier::Cheap),
@@ -3349,7 +3305,6 @@ pub(crate) fn full_agent_allocation(
             EvalModule::Interoception => (1.0, ModelTier::Cheap),
             EvalModule::HomeostaticController => (1.0, ModelTier::Cheap),
             EvalModule::Policy => (0.0, ModelTier::Default),
-            EvalModule::ValueEstimator => (0.0, ModelTier::Cheap),
             EvalModule::Reward => (0.0, ModelTier::Default),
             EvalModule::Predict => (0.0, ModelTier::Cheap),
             EvalModule::Surprise => (0.0, ModelTier::Default),
@@ -3426,14 +3381,12 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         EvalModule::Sensory
         | EvalModule::CognitionGate
         | EvalModule::QueryMemory
-        | EvalModule::QueryPolicy
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
         | EvalModule::MemoryAssociation
         | EvalModule::MemoryRecombination
         | EvalModule::Interoception
         | EvalModule::HomeostaticController
-        | EvalModule::ValueEstimator
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
         EvalModule::AllocationController => ModelTier::Default,

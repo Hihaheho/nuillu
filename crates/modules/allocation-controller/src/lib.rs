@@ -417,30 +417,6 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
                 output.push_str(content.trim());
                 push_optional_reason(&mut output, Some(reason));
             }
-            AttentionControlRequest::Policy {
-                reason,
-                candidate_trigger,
-                candidate_behavior,
-            } => {
-                output.push_str("Policy formation: ");
-                output.push_str(reason.trim());
-                if let Some(trigger) = candidate_trigger
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    output.push_str(" Candidate trigger: ");
-                    output.push_str(trigger);
-                }
-                if let Some(behavior) = candidate_behavior
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    output.push_str(" Candidate behavior: ");
-                    output.push_str(behavior);
-                }
-            }
         }
     }
     output

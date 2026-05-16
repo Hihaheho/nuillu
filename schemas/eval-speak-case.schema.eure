@@ -54,7 +54,6 @@ variants.allocation-controller = { = "allocation-controller", $variant => "liter
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
 variants.query-memory = { = "query-memory", $variant => "literal" }
-variants.query-policy = { = "query-policy", $variant => "literal" }
 variants.memory = { = "memory", $variant => "literal" }
 variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
 variants.memory-association = { = "memory-association", $variant => "literal" }
@@ -62,7 +61,6 @@ variants.memory-recombination = { = "memory-recombination", $variant => "literal
 variants.interoception = { = "interoception", $variant => "literal" }
 variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
 variants.policy = { = "policy", $variant => "literal" }
-variants.value-estimator = { = "value-estimator", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }

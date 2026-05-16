@@ -1,10 +1,8 @@
 //! Reward / policy domain crate.
 //!
-//! Owns the [`PolicyStore`] port, the four policy-domain capability handles
-//! ([`PolicyWriter`], [`PolicySearcher`], [`PolicyValueUpdater`],
-//! [`PolicyWindowReader`]), and the four modules that operate on policy:
-//! [`PolicyModule`] (proposes), [`QueryPolicyModule`] (retrieves),
-//! [`ValueEstimatorModule`] (predicts), and [`RewardModule`] (reinforces).
+//! Owns the [`PolicyStore`] port, the policy-domain capability handles, and
+//! the two modules that operate on policy: [`PolicyModule`] (read-only
+//! advisor/proposer) and [`RewardModule`] (consolidates and reinforces).
 //!
 //! Hosts build a [`PolicyCapabilities`] provider once at boot to bundle the
 //! store + blackboard + clock, then pass it to registration closures and
@@ -13,27 +11,31 @@
 //!
 //! [`ModuleRegistry::build`]: nuillu_module::ModuleRegistry::build
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use nuillu_blackboard::{Blackboard, BlackboardCommand, CorePolicyRecord};
+use futures::StreamExt;
+use futures::channel::mpsc;
+use nuillu_blackboard::{Blackboard, BlackboardCommand, CorePolicyRecord, PolicyMetaPatch};
 use nuillu_module::ports::{Clock, PortError};
-use nuillu_types::{ModuleInstanceId, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32, builtin};
+use nuillu_types::{ModuleInstanceId, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-mod estimation;
 mod policy;
-mod query;
 mod reward;
 
-pub use estimation::{ValueEstimateMemo, ValueEstimatePrediction, ValueEstimatorModule};
-pub use policy::{PolicyCandidate, PolicyFormationDecision, PolicyModule, PolicyWriter};
-pub use query::{PolicyRetrievalHit, PolicyRetrievalMemo, PolicySearcher, QueryPolicyModule};
+pub use policy::{
+    ExistingPolicyConsideration, PolicyConsideration, PolicyConsiderationDecision,
+    PolicyConsiderationPayload, PolicyConsiderationSource, PolicyConsiderationWriter, PolicyModule,
+    SyntheticPolicyConsideration,
+};
 pub use reward::{
-    NovelPolicyRequest, ObservedReward, PolicyCredit, PolicyRewardUpdate, PolicyValueUpdater,
-    RewardAssessment, RewardMemo, RewardModule,
+    ObservedReward, PolicyCandidateCredit, PolicyRewardUpdate, PolicyUpserter, RewardAssessment,
+    RewardMemo, RewardModule,
 };
 
 // ---------------------------------------------------------------------------
@@ -111,6 +113,195 @@ pub struct PolicyQuery {
     pub limit: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyConsiderationKey {
+    pub owner: ModuleInstanceId,
+    pub memo_index: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyConsiderationEvicted {
+    pub key: PolicyConsiderationKey,
+    pub written_at: DateTime<Utc>,
+    pub payload: PolicyConsiderationPayload,
+}
+
+#[derive(Clone)]
+struct PolicyConsiderationLog {
+    inner: Rc<RefCell<PolicyConsiderationLogInner>>,
+}
+
+#[derive(Default)]
+struct PolicyConsiderationLogInner {
+    retained_per_owner: usize,
+    next_indices: HashMap<ModuleInstanceId, u64>,
+    records: HashMap<ModuleInstanceId, VecDeque<PolicyConsiderationLogRecord>>,
+    subscribers: Vec<mpsc::UnboundedSender<PolicyConsiderationEvicted>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PolicyConsiderationLogRecord {
+    key: PolicyConsiderationKey,
+    written_at: DateTime<Utc>,
+    payload: PolicyConsiderationPayload,
+}
+
+impl PolicyConsiderationLog {
+    fn new(retained_per_owner: usize) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(PolicyConsiderationLogInner {
+                retained_per_owner: retained_per_owner.max(1),
+                ..PolicyConsiderationLogInner::default()
+            })),
+        }
+    }
+
+    fn append(
+        &self,
+        owner: ModuleInstanceId,
+        payload: PolicyConsiderationPayload,
+        written_at: DateTime<Utc>,
+    ) -> PolicyConsiderationLogRecord {
+        let mut inner = self.inner.borrow_mut();
+        let index = inner.next_indices.entry(owner.clone()).or_default();
+        let record = PolicyConsiderationLogRecord {
+            key: PolicyConsiderationKey {
+                owner: owner.clone(),
+                memo_index: *index,
+            },
+            written_at,
+            payload,
+        };
+        *index = (*index).saturating_add(1);
+
+        let retained = inner.retained_per_owner.max(1);
+        let records = inner.records.entry(owner).or_default();
+        records.push_back(record.clone());
+        let mut evicted = Vec::new();
+        while records.len() > retained {
+            if let Some(record) = records.pop_front() {
+                evicted.push(PolicyConsiderationEvicted {
+                    key: record.key,
+                    written_at: record.written_at,
+                    payload: record.payload,
+                });
+            }
+        }
+        drop(inner);
+
+        for evicted in evicted {
+            let delivered = self.publish(evicted);
+            if delivered == 0 {
+                tracing::trace!("policy-consideration eviction had no active subscribers");
+            }
+        }
+        record
+    }
+
+    fn subscribe(&self) -> PolicyConsiderationEvictedInbox {
+        let (sender, receiver) = mpsc::unbounded();
+        self.inner.borrow_mut().subscribers.push(sender);
+        PolicyConsiderationEvictedInbox { receiver }
+    }
+
+    fn publish(&self, evicted: PolicyConsiderationEvicted) -> usize {
+        let mut inner = self.inner.borrow_mut();
+        let subscribers = &mut inner.subscribers;
+        subscribers.retain(|sender| !sender.is_closed());
+        let mut delivered = 0;
+        for sender in subscribers.iter() {
+            if sender.unbounded_send(evicted.clone()).is_ok() {
+                delivered += 1;
+            }
+        }
+        delivered
+    }
+}
+
+pub struct PolicyConsiderationEvictedInbox {
+    receiver: mpsc::UnboundedReceiver<PolicyConsiderationEvicted>,
+}
+
+impl PolicyConsiderationEvictedInbox {
+    pub async fn next_item(&mut self) -> Option<PolicyConsiderationEvicted> {
+        self.receiver.next().await
+    }
+
+    pub fn take_ready_items(&mut self) -> Vec<PolicyConsiderationEvicted> {
+        let mut items = Vec::new();
+        loop {
+            match self.receiver.try_recv() {
+                Ok(item) => items.push(item),
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Closed) => return items,
+            }
+        }
+    }
+}
+
+/// Trigger-similarity search over the primary policy store with diagnostic
+/// access metadata mirrored to the blackboard.
+#[derive(Clone)]
+pub struct PolicySearcher {
+    primary_store: Rc<dyn PolicyStore>,
+    blackboard: Blackboard,
+    clock: Rc<dyn Clock>,
+}
+
+impl PolicySearcher {
+    pub(crate) fn new(
+        primary_store: Rc<dyn PolicyStore>,
+        blackboard: Blackboard,
+        clock: Rc<dyn Clock>,
+    ) -> Self {
+        Self {
+            primary_store,
+            blackboard,
+            clock,
+        }
+    }
+
+    pub async fn search(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<PolicySearchHit>, PortError> {
+        let hits = self
+            .primary_store
+            .search(&PolicyQuery {
+                trigger: trigger.to_owned(),
+                limit,
+            })
+            .await?;
+        let hits = hits
+            .into_iter()
+            .filter(|hit| {
+                hit.policy.rank == PolicyRank::Core || hit.policy.decay_remaining_secs > 0
+            })
+            .collect::<Vec<_>>();
+        let now = self.clock.now();
+        for hit in &hits {
+            self.blackboard
+                .apply(BlackboardCommand::UpsertPolicyMetadata {
+                    index: hit.policy.index.clone(),
+                    rank_if_new: hit.policy.rank,
+                    decay_if_new_secs: hit.policy.decay_remaining_secs,
+                    patch: PolicyMetaPatch {
+                        rank: Some(hit.policy.rank),
+                        expected_reward: Some(hit.policy.expected_reward),
+                        confidence: Some(hit.policy.confidence),
+                        value: Some(hit.policy.value),
+                        reward_tokens: Some(hit.policy.reward_tokens),
+                        decay_remaining_secs: Some(hit.policy.decay_remaining_secs),
+                        record_access_at: Some(now),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        Ok(hits)
+    }
+}
+
 /// Policy store that accepts every write, returns empty reads, and assigns a
 /// unique synthetic [`PolicyIndex`] to each insert.
 #[derive(Debug, Default)]
@@ -166,133 +357,6 @@ impl PolicyStore for NoopPolicyStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cross-cutting capability + provider
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-pub struct PolicyWindowKey {
-    pub owner: ModuleInstanceId,
-    pub memo_index: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct TypedPolicyRetrievalWindow {
-    pub key: PolicyWindowKey,
-    pub written_at: DateTime<Utc>,
-    pub plaintext: String,
-    pub payload: PolicyRetrievalMemo,
-}
-
-#[derive(Clone, Debug)]
-pub struct TypedValueEstimateWindow {
-    pub key: PolicyWindowKey,
-    pub written_at: DateTime<Utc>,
-    pub plaintext: String,
-    pub payload: ValueEstimateMemo,
-}
-
-/// Reads typed policy windows out of the blackboard memo log. Spans both
-/// query-policy and value-estimator memos because reward, value-estimator
-/// and downstream consumers all need cross-module memo aggregation.
-#[derive(Clone)]
-pub struct PolicyWindowReader {
-    blackboard: Blackboard,
-}
-
-impl PolicyWindowReader {
-    pub fn new(blackboard: Blackboard) -> Self {
-        Self { blackboard }
-    }
-
-    pub async fn retrieval_windows(&self) -> Vec<TypedPolicyRetrievalWindow> {
-        let owners = self.owners_for_module(builtin::query_policy()).await;
-        let mut records = Vec::new();
-        for owner in owners {
-            for record in self
-                .blackboard
-                .typed_memo_logs::<PolicyRetrievalMemo>(&owner)
-                .await
-            {
-                let payload = record.data().clone();
-                records.push(TypedPolicyRetrievalWindow {
-                    key: PolicyWindowKey {
-                        owner: record.owner.clone(),
-                        memo_index: record.index,
-                    },
-                    written_at: record.written_at,
-                    plaintext: record.content,
-                    payload,
-                });
-            }
-        }
-        records.sort_by(|a, b| {
-            a.written_at
-                .cmp(&b.written_at)
-                .then(a.key.memo_index.cmp(&b.key.memo_index))
-        });
-        records
-    }
-
-    pub async fn value_estimates(&self) -> Vec<TypedValueEstimateWindow> {
-        let owners = self.owners_for_module(builtin::value_estimator()).await;
-        let mut records = Vec::new();
-        for owner in owners {
-            for record in self
-                .blackboard
-                .typed_memo_logs::<ValueEstimateMemo>(&owner)
-                .await
-            {
-                let payload = record.data().clone();
-                records.push(TypedValueEstimateWindow {
-                    key: PolicyWindowKey {
-                        owner: record.owner.clone(),
-                        memo_index: record.index,
-                    },
-                    written_at: record.written_at,
-                    plaintext: record.content,
-                    payload,
-                });
-            }
-        }
-        records.sort_by(|a, b| {
-            a.written_at
-                .cmp(&b.written_at)
-                .then(a.key.memo_index.cmp(&b.key.memo_index))
-        });
-        records
-    }
-
-    async fn owners_for_module(&self, module: nuillu_types::ModuleId) -> Vec<ModuleInstanceId> {
-        let mut owners = self
-            .blackboard
-            .read(|bb| {
-                bb.recent_memo_logs()
-                    .into_iter()
-                    .filter(|record| record.owner.module == module)
-                    .map(|record| record.owner)
-                    .collect::<Vec<_>>()
-            })
-            .await;
-        owners.sort_by(|a, b| {
-            a.module
-                .as_str()
-                .cmp(b.module.as_str())
-                .then_with(|| a.replica.cmp(&b.replica))
-        });
-        owners.dedup();
-        owners
-    }
-
-    pub async fn retrieval_by_key(&self, key: &PolicyWindowKey) -> Option<PolicyRetrievalMemo> {
-        self.blackboard
-            .typed_memo_logs::<PolicyRetrievalMemo>(&key.owner)
-            .await
-            .into_iter()
-            .find(|record| record.index == key.memo_index)
-            .map(|record| record.data().clone())
-    }
-}
-
 pub(crate) async fn fanout_policy_put(replicas: &[Rc<dyn PolicyStore>], indexed: IndexedPolicy) {
     let replica_writes = replicas.iter().enumerate().map(|(replica, store)| {
         let indexed = indexed.clone();
@@ -324,29 +388,41 @@ pub struct PolicyCapabilities {
     replicas: Vec<Rc<dyn PolicyStore>>,
     blackboard: Blackboard,
     clock: Rc<dyn Clock>,
+    considerations: PolicyConsiderationLog,
 }
 
 impl PolicyCapabilities {
+    const DEFAULT_CONSIDERATION_RETAINED_PER_OWNER: usize = 8;
+
     pub fn new(
         blackboard: Blackboard,
         clock: Rc<dyn Clock>,
         primary_store: Rc<dyn PolicyStore>,
         replicas: Vec<Rc<dyn PolicyStore>>,
     ) -> Self {
+        Self::new_with_consideration_retention(
+            blackboard,
+            clock,
+            primary_store,
+            replicas,
+            Self::DEFAULT_CONSIDERATION_RETAINED_PER_OWNER,
+        )
+    }
+
+    pub fn new_with_consideration_retention(
+        blackboard: Blackboard,
+        clock: Rc<dyn Clock>,
+        primary_store: Rc<dyn PolicyStore>,
+        replicas: Vec<Rc<dyn PolicyStore>>,
+        consideration_retained_per_owner: usize,
+    ) -> Self {
         Self {
             primary_store,
             replicas,
             blackboard,
             clock,
+            considerations: PolicyConsiderationLog::new(consideration_retained_per_owner),
         }
-    }
-
-    pub fn writer(&self) -> PolicyWriter {
-        PolicyWriter::new(
-            self.primary_store.clone(),
-            self.replicas.clone(),
-            self.blackboard.clone(),
-        )
     }
 
     pub fn searcher(&self) -> PolicySearcher {
@@ -357,17 +433,21 @@ impl PolicyCapabilities {
         )
     }
 
-    pub fn value_updater(&self) -> PolicyValueUpdater {
-        PolicyValueUpdater::new(
+    pub fn consideration_writer(&self, owner: ModuleInstanceId) -> PolicyConsiderationWriter {
+        PolicyConsiderationWriter::new(owner, self.considerations.clone(), self.clock.clone())
+    }
+
+    pub fn consideration_evicted_inbox(&self) -> PolicyConsiderationEvictedInbox {
+        self.considerations.subscribe()
+    }
+
+    pub fn upserter(&self) -> PolicyUpserter {
+        PolicyUpserter::new(
             self.primary_store.clone(),
             self.replicas.clone(),
             self.blackboard.clone(),
             self.clock.clone(),
         )
-    }
-
-    pub fn window_reader(&self) -> PolicyWindowReader {
-        PolicyWindowReader::new(self.blackboard.clone())
     }
 
     /// Seed `Core` rank policies onto the blackboard from the primary

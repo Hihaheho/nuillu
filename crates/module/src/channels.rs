@@ -294,11 +294,6 @@ pub enum AttentionControlRequest {
         importance: MemoryImportance,
         reason: String,
     },
-    Policy {
-        reason: String,
-        candidate_trigger: Option<String>,
-        candidate_behavior: Option<String>,
-    },
 }
 
 impl AttentionControlRequest {
@@ -339,18 +334,6 @@ impl AttentionControlRequest {
             content: content.into(),
             importance,
             reason: reason.into(),
-        }
-    }
-
-    pub fn policy(
-        reason: impl Into<String>,
-        candidate_trigger: Option<String>,
-        candidate_behavior: Option<String>,
-    ) -> Self {
-        Self::Policy {
-            reason: reason.into(),
-            candidate_trigger,
-            candidate_behavior,
         }
     }
 }

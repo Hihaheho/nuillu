@@ -58,12 +58,10 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
         (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::query_policy()),
+        (builtin::cognition_gate(), builtin::policy()),
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
-        (builtin::value_estimator(), builtin::query_policy()),
-        (builtin::reward(), builtin::value_estimator()),
-        (builtin::policy(), builtin::reward()),
+        (builtin::reward(), builtin::policy()),
         (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
@@ -171,20 +169,6 @@ fn register_server_module(
                 )
             })
         }
-        RuntimeModule::QueryPolicy => {
-            let policy_caps = policy_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
-                nuillu_reward::QueryPolicyModule::new(
-                    caps.allocation_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    policy_caps.searcher(),
-                    caps.typed_memo::<nuillu_reward::PolicyRetrievalMemo>(),
-                    caps.llm_access(),
-                )
-            })
-        }
         RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
@@ -263,22 +247,9 @@ fn register_server_module(
         }
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+                let consideration_writer = policy_caps.consideration_writer(caps.owner().clone());
                 nuillu_reward::PolicyModule::new(
-                    caps.memo_log_evicted_inbox(),
-                    caps.cognition_log_evicted_inbox(),
-                    caps.allocation_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    policy_caps.writer(),
-                    caps.llm_access(),
-                )
-            })
-        }
-        RuntimeModule::ValueEstimator => {
-            let policy_caps = policy_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                nuillu_reward::ValueEstimatorModule::new(
                     caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_updated_inbox(),
@@ -286,8 +257,9 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
                     caps.interoception_reader(),
-                    policy_caps.window_reader(),
-                    caps.typed_memo::<nuillu_reward::ValueEstimateMemo>(),
+                    policy_caps.searcher(),
+                    caps.memo(),
+                    consideration_writer,
                     caps.llm_access(),
                 )
             })
@@ -296,17 +268,13 @@ fn register_server_module(
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(1.0, 2.0)), move |caps| {
                 nuillu_reward::RewardModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
+                    policy_caps.consideration_evicted_inbox(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
                     caps.interoception_reader(),
-                    policy_caps.window_reader(),
-                    policy_caps.value_updater(),
-                    caps.attention_control_mailbox(),
-                    caps.typed_memo::<nuillu_reward::RewardMemo>(),
+                    policy_caps.upserter(),
+                    caps.memo(),
                     caps.llm_access(),
                 )
             })
@@ -380,7 +348,6 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
             RuntimeModule::SelfModel => (0.0, ModelTier::Default),
             RuntimeModule::QueryMemory => (0.0, ModelTier::Cheap),
-            RuntimeModule::QueryPolicy => (0.0, ModelTier::Cheap),
             RuntimeModule::Memory => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryCompaction => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryAssociation => (0.0, ModelTier::Cheap),
@@ -388,7 +355,6 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::Interoception => (1.0, ModelTier::Cheap),
             RuntimeModule::HomeostaticController => (1.0, ModelTier::Cheap),
             RuntimeModule::Policy => (0.0, ModelTier::Default),
-            RuntimeModule::ValueEstimator => (0.0, ModelTier::Cheap),
             RuntimeModule::Reward => (0.0, ModelTier::Default),
             RuntimeModule::Predict => (0.0, ModelTier::Cheap),
             RuntimeModule::Surprise => (0.0, ModelTier::Default),
@@ -429,10 +395,8 @@ fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
         builtin::attention_schema(),
         builtin::self_model(),
         builtin::query_memory(),
-        builtin::query_policy(),
         builtin::memory(),
         builtin::policy(),
-        builtin::value_estimator(),
         builtin::reward(),
         builtin::predict(),
         builtin::surprise(),

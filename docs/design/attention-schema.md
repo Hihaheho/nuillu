@@ -75,7 +75,7 @@ start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence metad
 A policy is `(rank, trigger, behavior, expected_reward, confidence, value, reward_tokens, decay, usage_history)`.
 
 - **rank**: tentative, provisional, established, habit, core
-- **trigger**: situation description plus its embedding; the only field used for `query-policy` vector search
+- **trigger**: situation description plus its embedding; the only field used for `PolicySearcher` vector search
 - **behavior**: the action/pattern to apply when the trigger matches
 - **expected_reward**: scalar in `[-1, 1]`; TD-updated prediction of reward when the policy fires
 - **confidence**: scalar in `[0, 1]`; rises when prediction accuracy is high (small `|td_error|`)
@@ -93,12 +93,13 @@ share rank enums or strengthening rules.
 ### Reward signals
 
 `reward` consumes a structured v1 `ObservedReward = { external, task, social, cost, risk, novelty }`
-aggregated from surprise, speak-completion, sensory, and controller memos. The reward module
-collapses the six channels into a scalar `observed_scalar` and computes `td_error =
-observed_scalar − expected_reward` against the latest `value-estimator` memo. The full channel
-breakdown is preserved in the reward memo for audit; only the aggregated `value`, `expected_reward`,
-and `confidence` are persisted on the policy record in v1. Per-policy per-channel value tracking is
-a v2 extension.
+aggregated from surprise, speak-completion, sensory, controller, and recent context memos. The
+reward module settles evicted `PolicyConsiderationPayload` records, collapses the six channels into a
+scalar `observed_scalar`, and computes `td_error = observed_scalar − predicted_expected_reward`
+against the baseline that `policy` wrote into the evicted consideration memo. The full channel
+breakdown is preserved in the reward memo for audit; only the aggregated `value`,
+`expected_reward`, and `confidence` are persisted on the policy record in v1. Per-policy
+per-channel value tracking is a v2 extension.
 
 ## Activations
 
@@ -123,11 +124,10 @@ Runtime Speak batch -> SpeakGate ActivationGate -> Speak activation
 SpeakGate -> AttentionControlRequest evidence bids -> AllocationController
 Surprise -> AttentionControlRequest::Memory -> AllocationController
 SpeakGate memo -> AllocationController -> allocation proposal
-CognitionLogUpdated -> QueryMemory/QueryPolicy/Memory/Policy/Reward/Predict/Surprise/AttentionSchema/ValueEstimator
-QueryPolicy memo -> ValueEstimator -> expected_reward memo
-ValueEstimator memo + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyValueUpdater::reinforce
-Reward -> AttentionControlRequest::Policy -> AllocationController
-QueryPolicy memo -> AllocationController / CognitionGate (memo-authoritative)
+CognitionLogUpdated -> QueryMemory/Memory/Policy/Predict/Surprise/AttentionSchema
+Memo/Cognition/Allocation updates -> Policy -> advice memo + custom PolicyConsiderationPayload
+PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyUpserter insert/reinforce
+Policy memo -> AllocationController / CognitionGate (memo-authoritative)
 ```
 
 Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<Speak>` holders such as SpeakGate. SpeakGate returns allow or suppress; when it suppresses, its decision and missing-evidence notes are durable only in its memo, and that memo update wakes the controller through the ordinary memo path. Speak writes a completion memo after a finished utterance.
@@ -142,14 +142,12 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `MemorySearcher` |
-| query-policy | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `PolicySearcher` |
 | memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `AllocationUpdatedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
 | interoception | ✓ | ✓ | ✓ | — | ✓ | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveWriter` |
 | homeostatic-controller | — | — | — | — | — | — | `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter` |
-| policy | — | — | ✓ | — | — | ✓ | `MemoLogEvictedInbox`, `CognitionLogEvictedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicyWriter` |
-| value-estimator | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader` |
-| reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicyValueUpdater`, `AttentionControlRequestMailbox` |
+| policy | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyConsiderationWriter` |
+| reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `PolicyConsiderationEvictedInbox`, `InteroceptiveReader`, `PolicyUpserter` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
 | speak-gate | ✓ | ✓ | — | ✓ | — | ✓ | `ActivationGate<SpeakModule>`, `ModuleStatusReader`, `AttentionControlRequestMailbox` |
@@ -169,14 +167,13 @@ Notable absences:
 - Only the attention controller can write resource allocation.
 - The memory module cannot increment remember tokens; that belongs to memory compaction.
 - The memory module cannot elevate memory rank; that belongs to `MemoryStore` on read-path access.
-- The policy module cannot mutate existing policies; value, expected-reward, confidence, rank, and reward-token changes belong to reward.
-- The reward module cannot create new policies; insertion belongs to the policy module.
-- The reward module cannot predict `expected_reward`; that is value-estimator's role.
-- The value-estimator module cannot mutate policy state; its predictions live only in its memo and never persist to the policy record in v1.
+- The policy module cannot mutate the policy store. It can search existing policies, synthesize candidates, predict current contextual value, write ordinary advice memos, and write structured considerations only through the reward-crate custom capability.
+- The reward module is the only ordinary policy-store writer. It inserts credited synthetic candidates and reinforces existing or newly inserted policies.
+- The value baseline used by reward is `predicted_expected_reward` inside an evicted `PolicyConsiderationPayload`, not a continuously maintained separate estimator memo.
 - Interoception is the only canonical internal-state estimator. There is no separate emotion module in v1.
 - The homeostatic-controller regulates allocation from interoceptive state; it does not estimate wake pressure, affect, valence, or emotion.
 - `PolicySearcher` is trigger-only; `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never participate in similarity scoring.
-- Reward cannot write allocation; it may only bid through `AttentionControlRequest::Policy`.
+- Reward cannot write allocation or attention-control requests.
 - Access does not strengthen policies; reward does not strengthen memories.
 - Predict does not write memory; preservation belongs to surprise requests and the memory module.
 - Surprise does not generate forward predictions; that belongs to predict.
@@ -232,10 +229,6 @@ Stable self-knowledge belongs in memory and can be retrieved by query modules, b
 
 Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to retrieve memory relevant to the current cognitive surface. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers, describe itself, or query the policy store. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
 
-### Query Policy
-
-Retrieves applicable policies from the policy store. Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to surface policies relevant to a newly admitted situation. Vector search is over the `trigger` embedding only — `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never used as search keys. Memo-log entries contain only retrieved policy records (`trigger`, `behavior`, `expected_reward`, `confidence`, `value`) copied from search results; it does not synthesize advice, modify policy state, or describe itself. The retrieval memos are the substrate for both `value-estimator` (which predicts `expected_reward` for each hit) and `reward` (which uses the retrieval window for credit assignment). Retrieval counts as access for diagnostic `usage_history` only — access does not elevate policy rank.
-
 ### Memory
 
 Preserves useful information by inserting memory entries after cognition-log entries are evicted from the retained cognitive surface, or after preservation guidance from allocation-controller. Memo-log entries are non-conscious working traces and must not be stored directly as memory; memory writes must be grounded in cognition-log evidence. The module uses memory metadata for deduplication. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
@@ -256,15 +249,11 @@ Regulates allocation from interoceptive state. It reads `InteroceptiveState`, th
 
 ### Policy
 
-Preserves successful or distinctive behavior patterns as tentative `(trigger, behavior)` policy records. Memo-log evictions, cognition-log evictions, and allocation guidance are wake paths; candidates include speak completion memos, surprise-resolved sequences, explicit controller policy-formation guidance, and current interoceptive context. Unlike memory ingest, policy formation may learn from non-conscious memo-log traces because it stores reusable behavior patterns rather than remembered evidence. `trigger` is the situation description that `query-policy` will embed and match against future situations; `behavior` is the action/pattern to apply when the trigger matches. The module may reject, normalize, deduplicate, or merge candidates against existing policies and may rewrite an existing trigger to broaden or narrow its scope. New entries start at `tentative` rank with `value = 0`, `expected_reward = 0`, `confidence = 0`, and `reward_tokens = 0`. It does not mutate existing policy entries — value, expected reward, confidence, rank, and reward-token changes belong to reward.
-
-### Value Estimator
-
-Predicts the `expected_reward` for each policy currently surfaced by `query-policy`. It is the critic half of the actor/critic split — `query-policy` retrieves candidates, value-estimator scores them. It wakes primarily on `query-policy` memo updates; cognition-log updates and allocation guidance can also wake it when the cognitive surface changes meaningfully between retrievals. It reads each hit's stored `expected_reward` and `confidence` plus the recent cognition log and current interoceptive state, then writes a per-window prediction memo of `(policy_index, predicted_expected_reward, rationale)` entries. The memo is the prediction baseline that reward compares against `ObservedReward` to compute `td_error`. It does not modify policy state, write memory, write cognition-log entries, write allocation, or call `PolicyValueUpdater`; context-dependent valuation lives only in this memo, never on the persisted record in v1.
+Reads other modules' memo logs, the cognition log, allocation guidance, interoception, and the policy store to produce policy advice for the current context. It searches existing policies through `PolicySearcher`, synthesizes new reusable `(trigger, behavior)` candidates when existing records are insufficient, predicts each candidate's current `predicted_expected_reward`, writes ordinary plaintext advice to its memo, and writes the structured `PolicyConsiderationPayload` through a reward-crate custom capability. The structured payload does not use blackboard memo storage or typed memo transport. Negative or low-value policies are surfaced as caution / avoidance advice rather than as execution recommendations. It has no policy-store write capability: it cannot insert, reinforce, delete, or mutate policy records.
 
 ### Reward
 
-Closes the TD-0 loop. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, controller memos, and current interoceptive context, collapses the channels to a scalar `observed_scalar`, and pairs that with the most recent value-estimator memo to compute `td_error = observed_scalar − expected_reward`. It applies the update through `PolicyValueUpdater::reinforce(index, value_delta, reward_tokens_delta, expected_reward_delta, confidence_delta)` with v1 deltas `α·td_error`, `β·clamp(td_error, ±1)`, and `γ_c·max(0, 1 − |td_error|/scale)` (coefficients in `configs/policy-reinforcement.eure`). It writes a reward-assessment memo recording the full channel breakdown, the compared `expected_reward`, the resulting `td_error`, and the applied deltas so the allocation-controller can observe learning pressure. It may publish `AttentionControlRequest::Policy` to ask the controller to raise policy-module activation when a novel pattern deserves formation. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not predict `expected_reward` (that is value-estimator's role), create new policy entries, write memory, write cognition-log entries, or write allocation.
+Closes the TD-0 loop when a structured policy consideration is evicted from the reward-crate custom retained surface. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, controller, recent memo/cognition, and current interoceptive context, collapses the channels to a scalar `observed_scalar`, and computes `td_error = observed_scalar − predicted_expected_reward` per credited candidate. Existing policy candidates are reinforced through `PolicyUpserter::reinforce`. Synthetic candidates with non-zero credit are inserted first and then reinforced through the same path, whether the observed reward is positive or negative. Failed policies therefore remain stored as negative-value / negative-expected-reward records that future policy advice can interpret as avoidance guidance. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not write memory, cognition-log entries, allocation, or attention-control requests.
 
 ### Predict
 
@@ -319,16 +308,17 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - Cognition-log appenders cannot wake the controller directly; the controller wakes on memo updates.
 - The attention controller is not woken by cognition log updates.
 - Allocation activation ratios respect boot-time `cap_range.min/max`; modules with `cap_range.min = 0` are detachable by allocation.
-- Query-memory and query-policy are independently detachable for ablation.
+- Query-memory is independently detachable for ablation.
 - Predict and surprise are independently detachable for ablation.
-- Memory and learning are distinct reinforcement substrates: memory rank elevation is store-internal and access-driven; policy rank elevation is reward-driven and runs only through `PolicyValueUpdater::reinforce`.
-- Policy creation (`policy` module), value prediction (`value-estimator` module), and policy update (`reward` module) are separate roles: `policy` cannot mutate existing entries, `value-estimator` cannot mutate policy state, and `reward` cannot insert new entries or predict expected reward.
+- Memory and learning are distinct reinforcement substrates: memory rank elevation is store-internal and access-driven; policy rank elevation is reward-driven and runs only through the reward-owned `PolicyUpserter::reinforce` path.
+- Policy advice and policy persistence are separate roles: `policy` cannot mutate the policy store, and `reward` is the only module that inserts or reinforces policy records.
+- Value prediction is a contextual baseline inside `PolicyConsiderationPayload`; there is no continuously maintained separate estimator module in v1.
 - Policy vector search is trigger-only: `PolicySearcher` scores similarity against the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys.
-- TD learning is TD-0 in v1: `td_error = observed_scalar − expected_reward`; no discount factor, no `next_state` bootstrap, no eligibility traces.
+- TD learning is TD-0 in v1: `td_error = observed_scalar − predicted_expected_reward`; no discount factor, no `next_state` bootstrap, no eligibility traces.
 - `ObservedReward` is fixed at six channels in v1 (external, task, social, cost, risk, novelty); per-policy per-channel storage is a v2 extension.
-- Reward cannot write allocation; it may only bid through `AttentionControlRequest::Policy`.
+- Reward cannot write allocation or attention-control requests.
 - `PolicySearcher` does not return demoted or expired policies.
-- Policy, value-estimator, reward, and query-policy are independently detachable for ablation; ablating value-estimator collapses `expected_reward` to the stored value with degraded credit assignment but functional learning.
+- Policy and reward are independently detachable for ablation; without policy considerations, reward has no policy window to settle.
 - Ablating the attention schema module should degrade attention-state modeling while task performance largely survives.
 - Ablating the self-model module should degrade self-report specifically while task performance largely survives.
 - Ablating sensory or speak should degrade end-to-end artifact evaluation while leaving lower-level query, attention-schema, and self-model module evaluations possible.
