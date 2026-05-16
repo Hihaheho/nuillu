@@ -339,9 +339,19 @@ impl RuntimeTab {
         ui.menu_button("View", |ui| {
             for spec in specs {
                 let mut open = self.window_open.get(&spec.id).copied().unwrap_or(true);
-                if ui.checkbox(&mut open, &spec.title).changed() {
-                    self.window_requests.insert(spec.id, open);
-                }
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Checkbox::without_text(&mut open)).changed() {
+                        self.window_requests.insert(spec.id.clone(), open);
+                    }
+
+                    if ui
+                        .add(egui::Label::new(&spec.title).sense(egui::Sense::click()))
+                        .clicked()
+                    {
+                        self.window_requests.insert(spec.id.clone(), true);
+                        ui.close();
+                    }
+                });
             }
         });
     }
