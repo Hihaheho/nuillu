@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use nuillu_blackboard::{
     Blackboard, BlackboardInner, CognitionLog, CognitionLogEntryRecord, InteroceptiveState,
-    MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
+    MemoLogRecord, MemoryMetadata, ModuleRunStatus, ModuleRunStatusRecord, ResourceAllocation,
 };
-use nuillu_types::ModuleInstanceId;
+use nuillu_types::{MemoryIndex, ModuleInstanceId};
 
 /// Read-only access to the entire blackboard (memos + memory metadata).
 ///
@@ -69,6 +69,29 @@ impl BlackboardReader {
             }
         }
         records
+    }
+}
+
+/// Read-only access to memory metadata without exposing memo or cognition-log
+/// state.
+#[derive(Clone)]
+pub struct MemoryMetadataReader {
+    blackboard: Blackboard,
+}
+
+impl MemoryMetadataReader {
+    pub(crate) fn new(blackboard: Blackboard) -> Self {
+        Self { blackboard }
+    }
+
+    pub async fn read<R>(&self, f: impl FnOnce(&HashMap<MemoryIndex, MemoryMetadata>) -> R) -> R {
+        self.blackboard.read(|bb| f(bb.memory_metadata())).await
+    }
+
+    pub async fn snapshot(&self) -> HashMap<MemoryIndex, MemoryMetadata> {
+        self.blackboard
+            .read(|bb| bb.memory_metadata().clone())
+            .await
     }
 }
 

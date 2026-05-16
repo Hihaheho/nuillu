@@ -22,13 +22,14 @@ use crate::r#trait::ErasedModule;
 use crate::{
     AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
     AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter, InteroceptiveReader,
-    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
-    InteroceptiveWriter, LlmAccess, LutumTiers, Memo, MemoUpdated, MemoUpdatedInbox,
-    MemoUpdatedMailbox, Module, ModuleBatch, ModuleStatusReader, SensoryInput, SensoryInputInbox,
-    SensoryInputMailbox, SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox,
-    TypedMemo,
+    AttentionControlRequestMailbox, BlackboardReader, CognitionLogEvictedInbox,
+    CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox,
+    CognitionLogUpdatedMailbox, CognitionWriter, InteroceptiveReader, InteroceptiveUpdated,
+    InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess,
+    LutumTiers, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox,
+    MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
+    TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -45,9 +46,11 @@ struct CapabilityProvidersInner {
     blackboard: Blackboard,
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
+    cognition_log_evictions: Topic<nuillu_blackboard::CognitionLogEntryRecord>,
     allocation_updates: Topic<AllocationUpdated>,
     interoception_updates: Topic<InteroceptiveUpdated>,
     memo_updates: Topic<MemoUpdated>,
+    memo_log_evictions: Topic<nuillu_blackboard::MemoLogRecord>,
     sensory_input_topic: Topic<SensoryInput>,
     activation_gates: ActivationGateHub,
     cognition_log_port: Rc<dyn CognitionLogRepository>,
@@ -131,6 +134,13 @@ impl CapabilityProviders {
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
+                cognition_log_evictions: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::CognitionLogEvicted,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
                 allocation_updates: Topic::new(
                     blackboard.clone(),
                     TopicPolicy::Fanout,
@@ -149,6 +159,13 @@ impl CapabilityProviders {
                     blackboard.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::MemoUpdated,
+                    rate_limiter.clone(),
+                    runtime_events.clone(),
+                ),
+                memo_log_evictions: Topic::new(
+                    blackboard.clone(),
+                    TopicPolicy::Fanout,
+                    TopicKind::MemoLogEvicted,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -222,6 +239,12 @@ impl CapabilityProviders {
                 self.inner.runtime_policy.memo_retained_per_owner,
             ))
             .await;
+        self.inner
+            .blackboard
+            .apply(BlackboardCommand::SetCognitionLogRetentionEntries(
+                self.inner.runtime_policy.cognition_log_retained_entries,
+            ))
+            .await;
     }
 
     pub(crate) fn runtime_control(&self) -> AgentRuntimeControl {
@@ -245,6 +268,10 @@ impl CapabilityProviders {
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
         BlackboardReader::new(self.inner.blackboard.clone())
+    }
+
+    pub fn memory_metadata_reader(&self) -> MemoryMetadataReader {
+        MemoryMetadataReader::new(self.inner.blackboard.clone())
     }
 
     pub fn cognition_log_reader(&self) -> CognitionLogReader {
@@ -497,6 +524,13 @@ impl InternalHarnessIo {
         )
     }
 
+    pub fn cognition_log_evicted_mailbox(&self) -> CognitionLogEvictedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.cognition_log_evictions.clone(),
+        )
+    }
+
     pub fn allocation_updated_mailbox(&self) -> AllocationUpdatedMailbox {
         TopicMailbox::new(
             self.owner.clone(),
@@ -513,6 +547,13 @@ impl InternalHarnessIo {
 
     pub fn memo_updated_mailbox(&self) -> MemoUpdatedMailbox {
         TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone())
+    }
+
+    pub fn memo_log_evicted_mailbox(&self) -> MemoLogEvictedMailbox {
+        TopicMailbox::new(
+            self.owner.clone(),
+            self.root.inner.memo_log_evictions.clone(),
+        )
     }
 }
 
@@ -553,6 +594,13 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    pub fn cognition_log_evicted_inbox(&self) -> CognitionLogEvictedInbox {
+        TopicInbox::new_excluding_self(
+            self.owner.clone(),
+            self.root.inner.cognition_log_evictions.clone(),
+        )
+    }
+
     pub fn allocation_updated_inbox(&self) -> AllocationUpdatedInbox {
         TopicInbox::new(
             self.owner.clone(),
@@ -569,6 +617,13 @@ impl ModuleCapabilityFactory {
 
     pub fn memo_updated_inbox(&self) -> MemoUpdatedInbox {
         TopicInbox::new_excluding_self(self.owner.clone(), self.root.inner.memo_updates.clone())
+    }
+
+    pub fn memo_log_evicted_inbox(&self) -> MemoLogEvictedInbox {
+        TopicInbox::new_excluding_self(
+            self.owner.clone(),
+            self.root.inner.memo_log_evictions.clone(),
+        )
     }
 
     pub fn sensory_input_mailbox(&self) -> SensoryInputMailbox {
@@ -605,6 +660,10 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
+            TopicMailbox::new(
+                self.owner.clone(),
+                self.root.inner.memo_log_evictions.clone(),
+            ),
             self.root.inner.clock.clone(),
             self.root.inner.runtime_events.clone(),
         )
@@ -616,6 +675,10 @@ impl ModuleCapabilityFactory {
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
             TopicMailbox::new(self.owner.clone(), self.root.inner.memo_updates.clone()),
+            TopicMailbox::new(
+                self.owner.clone(),
+                self.root.inner.memo_log_evictions.clone(),
+            ),
             self.root.inner.clock.clone(),
             self.root.inner.runtime_events.clone(),
         )
@@ -634,6 +697,10 @@ impl ModuleCapabilityFactory {
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
         self.root.blackboard_reader()
+    }
+
+    pub fn memory_metadata_reader(&self) -> MemoryMetadataReader {
+        self.root.memory_metadata_reader()
     }
 
     /// Raw [`Blackboard`] handle. Domain crates use this to build their own
@@ -666,6 +733,10 @@ impl ModuleCapabilityFactory {
             CognitionLogUpdatedMailbox::new(
                 self.owner.clone(),
                 self.root.inner.cognition_log_updates.clone(),
+            ),
+            CognitionLogEvictedMailbox::new(
+                self.owner.clone(),
+                self.root.inner.cognition_log_evictions.clone(),
             ),
             self.root.inner.clock.clone(),
         )
@@ -1380,6 +1451,50 @@ mod tests {
                 value: "typed".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn memo_log_evicted_inbox_receives_evicted_records() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetMemoRetentionPerOwner(1))
+            .await;
+        let caps = test_caps(blackboard);
+        let sensory = scoped(&caps, builtin::sensory(), 0);
+        let policy = scoped(&caps, builtin::policy(), 0);
+        let memo = sensory.memo();
+        let mut inbox = policy.memo_log_evicted_inbox();
+
+        memo.write("first").await;
+        memo.write("second").await;
+
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::sensory());
+        assert_eq!(event.body.owner.module, builtin::sensory());
+        assert_eq!(event.body.index, 0);
+        assert_eq!(event.body.content, "first");
+    }
+
+    #[tokio::test]
+    async fn cognition_log_evicted_inbox_receives_evicted_records() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetCognitionLogRetentionEntries(1))
+            .await;
+        let caps = test_caps(blackboard);
+        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
+        let memory = scoped(&caps, builtin::memory(), 0);
+        let writer = cognition_gate.cognition_writer();
+        let mut inbox = memory.cognition_log_evicted_inbox();
+
+        writer.append("first cognition").await;
+        writer.append("second cognition").await;
+
+        let event = inbox.next_item().await.unwrap();
+        assert_eq!(event.sender.module, builtin::cognition_gate());
+        assert_eq!(event.body.source.module, builtin::cognition_gate());
+        assert_eq!(event.body.index, 0);
+        assert_eq!(event.body.entry.text, "first cognition");
     }
 
     #[test]

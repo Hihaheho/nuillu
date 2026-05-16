@@ -20,6 +20,14 @@ impl CognitionLog {
         self.entries.push(entry);
     }
 
+    pub(crate) fn remove_oldest(&mut self) -> Option<CognitionLogEntry> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.entries.remove(0))
+        }
+    }
+
     pub fn entries(&self) -> &[CognitionLogEntry] {
         &self.entries
     }

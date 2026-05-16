@@ -189,10 +189,10 @@ fn register_server_module(
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
                 nuillu_memory::MemoryModule::new(
-                    caps.cognition_log_updated_inbox(),
+                    caps.cognition_log_evicted_inbox(),
                     caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
-                    caps.blackboard_reader(),
+                    caps.memory_metadata_reader(),
                     memory_caps.writer(),
                     caps.llm_access(),
                 )
@@ -265,9 +265,9 @@ fn register_server_module(
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_reward::PolicyModule::new(
-                    caps.cognition_log_updated_inbox(),
+                    caps.memo_log_evicted_inbox(),
+                    caps.cognition_log_evicted_inbox(),
                     caps.allocation_updated_inbox(),
-                    caps.blackboard_reader(),
                     caps.allocation_reader(),
                     caps.interoception_reader(),
                     policy_caps.writer(),

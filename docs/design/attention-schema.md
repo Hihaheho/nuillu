@@ -24,7 +24,8 @@ Log entry: `(time, event)`.
 
 The non-cognitive blackboard holds:
 
-- **per-module memo logs** — each module owner writes only its own bounded indexed log,
+- **per-module memo logs** — each module owner writes only its own bounded indexed log; evicted entries are published to holders of the memo-log eviction capability, but memo entries are not admitted conscious evidence and are not valid direct memory-ingest evidence,
+- **cognition log retained surface** — the bounded admitted cognitive surface; evicted entries are published to holders of the cognition-log eviction capability,
 - **memory metadata** — rank, decay, access counts, and remember tokens,
 - **identity memory snapshot** — identity-ranked memories loaded once at agent startup,
 - **interoceptive state** — wake arousal, NREM/REM pressure, affect arousal, valence, and untyped emotion text,
@@ -142,11 +143,11 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `MemorySearcher` |
 | query-policy | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `PolicySearcher` |
-| memory | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `MemoryWriter` |
+| memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `AllocationUpdatedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
 | memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
 | interoception | ✓ | ✓ | ✓ | — | ✓ | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveWriter` |
 | homeostatic-controller | — | — | — | — | — | — | `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter` |
-| policy | ✓ | — | ✓ | — | — | ✓ | `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicyWriter` |
+| policy | — | — | ✓ | — | — | ✓ | `MemoLogEvictedInbox`, `CognitionLogEvictedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicyWriter` |
 | value-estimator | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader` |
 | reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicyValueUpdater`, `AttentionControlRequestMailbox` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
@@ -237,7 +238,7 @@ Retrieves applicable policies from the policy store. Allocation updates wake it 
 
 ### Memory
 
-Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from allocation-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
+Preserves useful information by inserting memory entries after cognition-log entries are evicted from the retained cognitive surface, or after preservation guidance from allocation-controller. Memo-log entries are non-conscious working traces and must not be stored directly as memory; memory writes must be grounded in cognition-log evidence. The module uses memory metadata for deduplication. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
 
 ### Memory Compaction
 
@@ -255,7 +256,7 @@ Regulates allocation from interoceptive state. It reads `InteroceptiveState`, th
 
 ### Policy
 
-Preserves successful or distinctive behavior patterns as tentative `(trigger, behavior)` policy records. Cognition-log updates and allocation guidance are wake paths; candidates include speak completion memos, surprise-resolved sequences, explicit controller policy-formation guidance, and current interoceptive context. `trigger` is the situation description that `query-policy` will embed and match against future situations; `behavior` is the action/pattern to apply when the trigger matches. The module may reject, normalize, deduplicate, or merge candidates against existing policies and may rewrite an existing trigger to broaden or narrow its scope. New entries start at `tentative` rank with `value = 0`, `expected_reward = 0`, `confidence = 0`, and `reward_tokens = 0`. It does not mutate existing policy entries — value, expected reward, confidence, rank, and reward-token changes belong to reward.
+Preserves successful or distinctive behavior patterns as tentative `(trigger, behavior)` policy records. Memo-log evictions, cognition-log evictions, and allocation guidance are wake paths; candidates include speak completion memos, surprise-resolved sequences, explicit controller policy-formation guidance, and current interoceptive context. Unlike memory ingest, policy formation may learn from non-conscious memo-log traces because it stores reusable behavior patterns rather than remembered evidence. `trigger` is the situation description that `query-policy` will embed and match against future situations; `behavior` is the action/pattern to apply when the trigger matches. The module may reject, normalize, deduplicate, or merge candidates against existing policies and may rewrite an existing trigger to broaden or narrow its scope. New entries start at `tentative` rank with `value = 0`, `expected_reward = 0`, `confidence = 0`, and `reward_tokens = 0`. It does not mutate existing policy entries — value, expected reward, confidence, rank, and reward-token changes belong to reward.
 
 ### Value Estimator
 

@@ -17,6 +17,7 @@ use crate::{
 };
 
 const DEFAULT_MEMO_RETAINED_PER_OWNER: usize = 8;
+const DEFAULT_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 
 /// The non-cognitive blackboard plus the cognitive surface and its
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
@@ -49,6 +50,7 @@ pub struct BlackboardInner {
     cognition_logs: HashMap<ModuleInstanceId, CognitionLog>,
     cognition_entry_log: Vec<CognitionLogEntryRecord>,
     cognition_next_index: u64,
+    cognition_log_retained_entries: usize,
     interoception: InteroceptiveState,
     agentic_deadlock_marker: Option<AgenticDeadlockMarker>,
     memory_metadata: HashMap<MemoryIndex, MemoryMetadata>,
@@ -71,6 +73,18 @@ pub struct MemoLogRecord {
     pub index: u64,
     pub written_at: DateTime<Utc>,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoAppendResult {
+    pub record: MemoLogRecord,
+    pub evicted: Vec<MemoLogRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CognitionLogAppendResult {
+    pub record: CognitionLogEntryRecord,
+    pub evicted: Vec<CognitionLogEntryRecord>,
 }
 
 #[derive(Clone)]
@@ -298,7 +312,19 @@ impl Blackboard {
         memo: String,
         written_at: DateTime<Utc>,
     ) -> MemoLogRecord {
-        self.update_typed_memo(owner, memo, (), written_at).await
+        self.update_memo_with_evictions(owner, memo, written_at)
+            .await
+            .record
+    }
+
+    pub async fn update_memo_with_evictions(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        written_at: DateTime<Utc>,
+    ) -> MemoAppendResult {
+        self.update_typed_memo_with_evictions(owner, memo, (), written_at)
+            .await
     }
 
     pub async fn update_typed_memo<T: 'static>(
@@ -308,8 +334,29 @@ impl Blackboard {
         payload: T,
         written_at: DateTime<Utc>,
     ) -> MemoLogRecord {
+        self.update_typed_memo_with_evictions(owner, memo, payload, written_at)
+            .await
+            .record
+    }
+
+    pub async fn update_typed_memo_with_evictions<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        payload: T,
+        written_at: DateTime<Utc>,
+    ) -> MemoAppendResult {
         let mut guard = self.inner.write().await;
         guard.append_memo(owner, memo, Arc::new(payload), written_at)
+    }
+
+    pub async fn append_cognition_log(
+        &self,
+        source: ModuleInstanceId,
+        entry: crate::CognitionLogEntry,
+    ) -> CognitionLogAppendResult {
+        let mut guard = self.inner.write().await;
+        guard.append_cognition_log(source, entry)
     }
 
     pub async fn typed_memo_logs<T: 'static>(
@@ -441,6 +488,7 @@ impl Default for BlackboardInner {
             cognition_logs: HashMap::new(),
             cognition_entry_log: Vec::new(),
             cognition_next_index: 0,
+            cognition_log_retained_entries: DEFAULT_COGNITION_LOG_RETAINED_ENTRIES,
             interoception: InteroceptiveState::default(),
             agentic_deadlock_marker: None,
             memory_metadata: HashMap::new(),
@@ -629,6 +677,10 @@ impl BlackboardInner {
         self.agentic_deadlock_marker.as_ref()
     }
 
+    pub fn cognition_log_retained_entries(&self) -> usize {
+        self.cognition_log_retained_entries
+    }
+
     pub fn memory_metadata(&self) -> &HashMap<MemoryIndex, MemoryMetadata> {
         &self.memory_metadata
     }
@@ -715,13 +767,7 @@ impl BlackboardInner {
                 self.utterance_progresses.insert(owner, progress);
             }
             BlackboardCommand::AppendCognitionLog { source, entry } => {
-                self.cognition_entry_log.push(CognitionLogEntryRecord {
-                    index: self.cognition_next_index,
-                    source: source.clone(),
-                    entry: entry.clone(),
-                });
-                self.cognition_next_index = self.cognition_next_index.saturating_add(1);
-                self.cognition_logs.entry(source).or_default().append(entry);
+                self.append_cognition_log(source, entry);
             }
             BlackboardCommand::UpdateInteroceptive { patch, now } => {
                 self.interoception.apply_patch(patch, now);
@@ -804,6 +850,10 @@ impl BlackboardInner {
                 self.memo_retained_per_owner = retained.max(1);
                 self.truncate_memos_to_retention();
             }
+            BlackboardCommand::SetCognitionLogRetentionEntries(retained) => {
+                self.cognition_log_retained_entries = retained.max(1);
+                self.truncate_cognition_log_to_retention();
+            }
             BlackboardCommand::SetModuleForcedDisabled { module, disabled } => {
                 if disabled {
                     self.forced_disabled_modules.insert(module);
@@ -832,7 +882,7 @@ impl BlackboardInner {
         content: String,
         payload: Arc<dyn Any>,
         written_at: DateTime<Utc>,
-    ) -> MemoLogRecord {
+    ) -> MemoAppendResult {
         let index = self.memo_next_indices.entry(owner.clone()).or_default();
         let record = MemoLogRecord {
             owner: owner.clone(),
@@ -845,19 +895,63 @@ impl BlackboardInner {
         let retained = self.memo_retained_per_owner.max(1);
         let records = self.memos.entry(owner).or_default();
         records.push_back(MemoLogEntry::new(record.clone(), payload));
+        let mut evicted = Vec::new();
         while records.len() > retained {
-            records.pop_front();
-        }
-        record
-    }
-
-    fn truncate_memos_to_retention(&mut self) {
-        let retained = self.memo_retained_per_owner.max(1);
-        for records in self.memos.values_mut() {
-            while records.len() > retained {
-                records.pop_front();
+            if let Some(entry) = records.pop_front() {
+                evicted.push(entry.record());
             }
         }
+        MemoAppendResult { record, evicted }
+    }
+
+    fn truncate_memos_to_retention(&mut self) -> Vec<MemoLogRecord> {
+        let retained = self.memo_retained_per_owner.max(1);
+        let mut evicted = Vec::new();
+        for records in self.memos.values_mut() {
+            while records.len() > retained {
+                if let Some(entry) = records.pop_front() {
+                    evicted.push(entry.record());
+                }
+            }
+        }
+        sort_memo_logs(&mut evicted);
+        evicted
+    }
+
+    fn append_cognition_log(
+        &mut self,
+        source: ModuleInstanceId,
+        entry: crate::CognitionLogEntry,
+    ) -> CognitionLogAppendResult {
+        let record = CognitionLogEntryRecord {
+            index: self.cognition_next_index,
+            source: source.clone(),
+            entry: entry.clone(),
+        };
+        self.cognition_next_index = self.cognition_next_index.saturating_add(1);
+        self.cognition_entry_log.push(record.clone());
+        self.cognition_logs.entry(source).or_default().append(entry);
+        let evicted = self.truncate_cognition_log_to_retention();
+        CognitionLogAppendResult { record, evicted }
+    }
+
+    fn truncate_cognition_log_to_retention(&mut self) -> Vec<CognitionLogEntryRecord> {
+        let retained = self.cognition_log_retained_entries.max(1);
+        let mut evicted = Vec::new();
+        while self.cognition_entry_log.len() > retained {
+            let record = self.cognition_entry_log.remove(0);
+            let remove_source = if let Some(log) = self.cognition_logs.get_mut(&record.source) {
+                log.remove_oldest();
+                log.is_empty()
+            } else {
+                false
+            };
+            if remove_source {
+                self.cognition_logs.remove(&record.source);
+            }
+            evicted.push(record);
+        }
+        evicted
     }
 
     fn recompute_effective_allocation(&mut self) {
@@ -1148,6 +1242,103 @@ mod tests {
                 .map(|record| (record.index, record.content.as_str()))
                 .collect::<Vec<_>>(),
             vec![(1, "second"), (2, "third")]
+        );
+    }
+
+    #[tokio::test]
+    async fn memo_append_result_reports_evicted_entries() {
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        bb.apply(BlackboardCommand::SetMemoRetentionPerOwner(1))
+            .await;
+
+        let first = bb
+            .update_memo(owner.clone(), "first".into(), memo_time(1))
+            .await;
+        assert_eq!(first.index, 0);
+
+        let second = bb
+            .update_typed_memo_with_evictions(owner.clone(), "second".into(), (), memo_time(2))
+            .await;
+        assert_eq!(second.record.index, 1);
+        assert_eq!(
+            second.evicted,
+            vec![MemoLogRecord {
+                owner,
+                index: 0,
+                written_at: memo_time(1),
+                content: "first".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn cognition_log_retains_latest_entries_and_reports_evictions() {
+        let bb = Blackboard::new();
+        let cognition_gate = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let attention_schema =
+            ModuleInstanceId::new(builtin::attention_schema(), ReplicaIndex::ZERO);
+        bb.apply(BlackboardCommand::SetCognitionLogRetentionEntries(2))
+            .await;
+
+        let first = bb
+            .append_cognition_log(
+                cognition_gate.clone(),
+                crate::CognitionLogEntry {
+                    at: memo_time(1),
+                    text: "first".into(),
+                },
+            )
+            .await;
+        assert_eq!(first.record.index, 0);
+        assert!(first.evicted.is_empty());
+
+        let second = bb
+            .append_cognition_log(
+                attention_schema.clone(),
+                crate::CognitionLogEntry {
+                    at: memo_time(2),
+                    text: "second".into(),
+                },
+            )
+            .await;
+        assert_eq!(second.record.index, 1);
+        assert!(second.evicted.is_empty());
+
+        let third = bb
+            .append_cognition_log(
+                cognition_gate.clone(),
+                crate::CognitionLogEntry {
+                    at: memo_time(3),
+                    text: "third".into(),
+                },
+            )
+            .await;
+        assert_eq!(third.record.index, 2);
+        assert_eq!(
+            third.evicted,
+            vec![CognitionLogEntryRecord {
+                index: 0,
+                source: cognition_gate.clone(),
+                entry: crate::CognitionLogEntry {
+                    at: memo_time(1),
+                    text: "first".into(),
+                },
+            }]
+        );
+
+        let retained = bb
+            .read(|bb| bb.unread_cognition_log_entries(None))
+            .await
+            .into_iter()
+            .map(|record| (record.index, record.source, record.entry.text))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            vec![
+                (1, attention_schema, "second".to_owned()),
+                (2, cognition_gate, "third".to_owned()),
+            ]
         );
     }
 

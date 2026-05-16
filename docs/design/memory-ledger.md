@@ -191,9 +191,10 @@ graph. Initial uses include tags such as `dream`, `hypothesis`, `follow-up`, and
 
 Ingest keeps the first write simple.
 
-The memory module writes a short normalized memory sentence from cognition-log and
-memo-log evidence. The sentence should be readable by a human and a small LLM. If
-source context matters, it is part of the sentence:
+The memory module writes a short normalized memory sentence from evicted
+cognition-log evidence. Memo-log entries are non-conscious working traces and
+are not valid direct memory-ingest evidence. The sentence should be readable by a
+human and a small LLM. If source context matters, it is part of the sentence:
 
 ```text
 Ryo said he no longer lives in Tokyo and recently moved to Kyoto.

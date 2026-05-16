@@ -71,6 +71,7 @@ pub enum BlackboardCommand {
     },
     SetAllocationLimits(AllocationLimits),
     SetMemoRetentionPerOwner(usize),
+    SetCognitionLogRetentionEntries(usize),
     SetModuleForcedDisabled {
         module: ModuleId,
         disabled: bool,

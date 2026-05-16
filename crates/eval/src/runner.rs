@@ -81,7 +81,8 @@ use crate::{
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
 const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const EVAL_MEMO_RETAINED_PER_OWNER: usize = 256;
+const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
+const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 
 pub use nuillu_server::{EmbeddingBackendConfig, LlmBackendConfig};
 
@@ -2563,6 +2564,7 @@ pub(crate) async fn build_eval_environment(
     })?;
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
+        cognition_log_retained_entries: EVAL_COGNITION_LOG_RETAINED_ENTRIES,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         session_compaction: session_compaction_policy(config),
         ..RuntimePolicy::default()
@@ -3072,10 +3074,10 @@ fn register_eval_module(
                     let memory_caps = memory_caps.clone();
                     move |caps| {
                         nuillu_memory::MemoryModule::new(
-                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_evicted_inbox(),
                             caps.allocation_updated_inbox(),
                             caps.allocation_reader(),
-                            caps.blackboard_reader(),
+                            caps.memory_metadata_reader(),
                             memory_caps.writer(),
                             caps.llm_access(),
                         )
@@ -3181,9 +3183,9 @@ fn register_eval_module(
                     let policy_caps = policy_caps.clone();
                     move |caps| {
                         nuillu_reward::PolicyModule::new(
-                            caps.cognition_log_updated_inbox(),
+                            caps.memo_log_evicted_inbox(),
+                            caps.cognition_log_evicted_inbox(),
                             caps.allocation_updated_inbox(),
-                            caps.blackboard_reader(),
                             caps.allocation_reader(),
                             caps.interoception_reader(),
                             policy_caps.writer(),

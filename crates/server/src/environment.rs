@@ -113,7 +113,8 @@ pub(super) async fn build_server_environment(
 fn server_runtime_policy(config: &ServerConfig) -> RuntimePolicy {
     RuntimePolicy {
         allocation_limits: server_allocation_limits(),
-        memo_retained_per_owner: 256,
+        memo_retained_per_owner: 8,
+        cognition_log_retained_entries: 16,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         session_compaction: session_compaction_policy(config),
         ..RuntimePolicy::default()

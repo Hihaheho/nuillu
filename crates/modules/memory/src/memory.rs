@@ -1,16 +1,18 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogEntryRecord,
-    CognitionLogUpdatedInbox, LlmAccess, Module, SessionCompactionConfig,
+    AllocationReader, AllocationUpdatedInbox, CognitionLogEntryRecord, CognitionLogEvictedInbox,
+    LlmAccess, MemoryMetadataReader, Module, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
     format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
 };
 use nuillu_types::MemoryRank;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use crate::store::{MemoryConcept, MemoryKind, MemoryTag, MemoryWriter, NewMemory};
 
@@ -18,14 +20,16 @@ use crate::store::{MemoryConcept, MemoryKind, MemoryTag, MemoryWriter, NewMemory
 // MemoryModule
 
 const SYSTEM_PROMPT: &str = r#"You are the memory module.
-Inspect the current cognitive workspace and decide whether to preserve short, useful memories.
+Inspect evicted cognitive workspace evidence and decide whether to preserve short, useful memories.
 Memory is remembered evidence, not a fact table or current-truth projection. Store a concise,
 normalized natural-language memory, usually one to three sentences. If source context matters,
 include it in the memory sentence itself, for example "Ryo said he recently moved to Kyoto."
-Use the current cognition log plus unread/recent module memo logs as candidate evidence. Allocation
-guidance from allocation-controller may contain explicit preservation candidates from other modules,
-but those candidates are not write commands. You may reject, normalize, merge, and deduplicate
-observations and guidance. Use insert_memory only for concrete information likely to matter later.
+Use evicted cognition-log entries as candidate evidence. Memo-log entries are non-conscious working
+traces and are not valid direct memory evidence. Allocation guidance from allocation-controller may
+contain explicit preservation candidates from other modules, but those candidates are prioritization
+context rather than write commands. Use insert_memory only for concrete information likely to matter
+later and grounded in cognition-log evidence. You may reject, normalize, merge, and deduplicate
+observations and guidance.
 insert_memory always writes short-term memory; later access, compaction, or other memory-system
 mechanisms may change rank outside this tool. When calling insert_memory, prefer kinds episode,
 statement, reflection, hypothesis, dream, procedure, or plan. Concepts and tags are simple name
@@ -39,11 +43,13 @@ simulations, not evidence. Do not store them as factual memories; preserve them 
 framed as dream or hypothesis material with dream/hypothesis kind and operational tags."#;
 
 const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
+const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
+const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve memo-log facts, memory requests,
-inserted memory content, rejected candidates, deduplication decisions, and relevant cognition-log
-context future memory decisions need. Do not invent facts. Return plain text only."#;
+Summarize only the prefix transcript you receive. Preserve cognition-log facts, memory requests,
+inserted memory content, rejected candidates, and deduplication decisions future memory decisions
+need. Do not invent facts. Return plain text only."#;
 
 fn format_memory_decision_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -90,16 +96,16 @@ pub enum MemoryTools {
 
 pub struct MemoryModule {
     owner: nuillu_types::ModuleId,
-    cognition_updates: CognitionLogUpdatedInbox,
+    cognition_evictions: CognitionLogEvictedInbox,
     allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
-    blackboard: BlackboardReader,
+    memory_metadata: MemoryMetadataReader,
     memory: MemoryWriter,
     llm: LlmAccess,
     session: Session,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
-    last_seen_cognition_index: Option<u64>,
+    batching: MemoryBatchConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -113,26 +119,32 @@ struct MemoryMetadataContext {
 
 impl MemoryModule {
     pub fn new(
-        cognition_updates: CognitionLogUpdatedInbox,
+        cognition_evictions: CognitionLogEvictedInbox,
         allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
-        blackboard: BlackboardReader,
+        memory_metadata: MemoryMetadataReader,
         memory: MemoryWriter,
         llm: LlmAccess,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
-            cognition_updates,
+            cognition_evictions,
             allocation_updates,
             allocation,
-            blackboard,
+            memory_metadata,
             memory,
             llm,
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            last_seen_cognition_index: None,
+            batching: MemoryBatchConfig::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_batch_config(mut self, batching: MemoryBatchConfig) -> Self {
+        self.batching = batching;
+        self
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -148,32 +160,17 @@ impl MemoryModule {
         })
     }
 
-    async fn unread_cognition_log(&mut self) -> Vec<CognitionLogEntryRecord> {
-        let unread = self
-            .blackboard
-            .read(|bb| bb.unread_cognition_log_entries(self.last_seen_cognition_index))
-            .await;
-        if let Some(index) = unread.last().map(|record| record.index) {
-            self.last_seen_cognition_index = Some(index);
-        }
-        unread
-    }
-
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        allocation_updated: bool,
-        cognition_updated: bool,
+        batch: &MemoryBatch,
     ) -> Result<()> {
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        let cognition_log = self.unread_cognition_log().await;
+        push_formatted_cognition_log_batch(&mut self.session, &batch.cognition_log, cx.now());
         let (memory_metadata, rank_counts) = self
-            .blackboard
-            .read(|bb| {
-                let mut metadata = bb
-                    .memory_metadata()
+            .memory_metadata
+            .read(|metadata_map| {
+                let mut metadata = metadata_map
                     .values()
                     .map(|item| MemoryMetadataContext {
                         index: item.index.to_string(),
@@ -187,7 +184,7 @@ impl MemoryModule {
                     })
                     .collect::<Vec<_>>();
                 metadata.sort_by(|left, right| left.index.cmp(&right.index));
-                (metadata, memory_rank_counts(bb.memory_metadata()))
+                (metadata, memory_rank_counts(metadata_map))
             })
             .await;
         let allocation = self.allocation.snapshot().await;
@@ -197,10 +194,9 @@ impl MemoryModule {
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(format_memory_activation_request(
             &allocation_guidance,
-            allocation_updated,
-            cognition_updated,
+            batch.allocation_updated,
+            batch.cognition_log.len(),
         ));
-        push_formatted_cognition_log_batch(&mut self.session, &cognition_log, cx.now());
         if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
             self.session.push_ephemeral_user(metadata_context);
         }
@@ -325,17 +321,17 @@ pub(crate) fn memory_tag_from_input(input: MemoryTagInput) -> MemoryTag {
 fn format_memory_activation_request(
     guidance: &str,
     allocation_updated: bool,
-    cognition_updated: bool,
+    cognition_evicted_count: usize,
 ) -> String {
     format!(
-        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nCognition updated: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed.",
+        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nEvicted cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed. Memo-log entries are not valid direct memory evidence.",
         if guidance.trim().is_empty() {
             "none"
         } else {
             guidance.trim()
         },
         if allocation_updated { "yes" } else { "no" },
-        if cognition_updated { "yes" } else { "no" },
+        cognition_evicted_count,
     )
 }
 
@@ -356,26 +352,49 @@ fn format_memory_metadata_candidates(metadata: &[MemoryMetadataContext]) -> Opti
 #[derive(Debug, Default)]
 pub struct MemoryBatch {
     pub(crate) allocation_updated: bool,
-    pub(crate) cognition_updated: bool,
+    pub(crate) cognition_log: Vec<CognitionLogEntryRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoryBatchConfig {
+    silent_window: Duration,
+    budget: Duration,
+}
+
+impl Default for MemoryBatchConfig {
+    fn default() -> Self {
+        Self {
+            silent_window: DEFAULT_MEMORY_BATCH_SILENT_WINDOW,
+            budget: DEFAULT_MEMORY_BATCH_BUDGET,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReadyCounts {
+    allocation_updates: usize,
+    cognition_evictions: usize,
+}
+
+impl ReadyCounts {
+    fn is_empty(self) -> bool {
+        self.allocation_updates == 0 && self.cognition_evictions == 0
+    }
 }
 
 impl MemoryBatch {
     fn allocation_update() -> Self {
         Self {
             allocation_updated: true,
-            cognition_updated: false,
+            ..Self::default()
         }
     }
 
-    fn cognition_log_update() -> Self {
+    fn cognition_log_eviction(record: CognitionLogEntryRecord) -> Self {
         Self {
-            allocation_updated: false,
-            cognition_updated: true,
+            cognition_log: vec![record],
+            ..Self::default()
         }
-    }
-
-    fn mark_cognition_updated(&mut self) {
-        self.cognition_updated = true;
     }
 
     fn mark_allocation_updated(&mut self) {
@@ -386,7 +405,8 @@ impl MemoryBatch {
 impl MemoryModule {
     async fn next_batch(&mut self) -> Result<MemoryBatch> {
         let mut batch = self.await_first_batch().await?;
-        self.collect_ready_events_into_batch(&mut batch)?;
+        let _ = self.collect_ready_events_into_batch(&mut batch)?;
+        self.collect_eviction_burst(&mut batch).await?;
         Ok(batch)
     }
 
@@ -396,24 +416,65 @@ impl MemoryModule {
                 let _ = update?;
                 MemoryBatch::allocation_update()
             }
-            update = self.cognition_updates.next_item() => {
-                let _ = update?;
-                MemoryBatch::cognition_log_update()
+            evicted = self.cognition_evictions.next_item() => {
+                MemoryBatch::cognition_log_eviction(evicted?.body)
             }
         };
         Ok(batch)
     }
 
-    fn collect_ready_events_into_batch(&mut self, batch: &mut MemoryBatch) -> Result<()> {
-        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
+    async fn collect_eviction_burst(&mut self, batch: &mut MemoryBatch) -> Result<()> {
+        let mut waited = Duration::ZERO;
+        while waited < self.batching.budget {
+            let remaining = self.batching.budget.saturating_sub(waited);
+            let wait_for = std::cmp::min(self.batching.silent_window, remaining);
+            if wait_for.is_zero() {
+                break;
+            }
+
+            let started = Instant::now();
+            tokio::select! {
+                update = self.allocation_updates.next_item() => {
+                    let _ = update?;
+                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    let _ = self.collect_ready_events_into_batch(batch)?;
+                }
+                evicted = self.cognition_evictions.next_item() => {
+                    batch.cognition_log.push(evicted?.body);
+                    waited += std::cmp::min(started.elapsed(), wait_for);
+                    let _ = self.collect_ready_events_into_batch(batch)?;
+                }
+                _ = tokio::time::sleep(wait_for) => {
+                    waited += wait_for;
+                    let ready = self.collect_ready_events_into_batch(batch)?;
+                    if ready.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_ready_events_into_batch(&mut self, batch: &mut MemoryBatch) -> Result<ReadyCounts> {
+        let allocation_updates = self.allocation_updates.take_ready_items()?.items.len();
+        if allocation_updates > 0 {
             batch.mark_allocation_updated();
         }
 
-        if !self.cognition_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_cognition_updated();
-        }
+        let cognition_evictions = self.cognition_evictions.take_ready_items()?;
+        let cognition_count = cognition_evictions.items.len();
+        batch.cognition_log.extend(
+            cognition_evictions
+                .items
+                .into_iter()
+                .map(|envelope| envelope.body),
+        );
 
-        Ok(())
+        Ok(ReadyCounts {
+            allocation_updates,
+            cognition_evictions: cognition_count,
+        })
     }
 }
 
@@ -426,7 +487,7 @@ impl Module for MemoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Preserves useful information by inserting normalized, deduplicated memory entries from cognition-log evidence and allocation-controller preservation guidance."
+        "Preserves useful information by inserting normalized, deduplicated memory entries from evicted cognition-log evidence and allocation-controller preservation guidance."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -438,13 +499,132 @@ impl Module for MemoryModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        MemoryModule::activate(self, cx, batch.allocation_updated, batch.cognition_updated).await
+        MemoryModule::activate(self, cx, batch).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use chrono::{TimeZone, Utc};
+    use lutum::{Lutum, MockLlmAdapter, SharedPoolBudgetManager, SharedPoolBudgetOptions};
+    use nuillu_blackboard::{Blackboard, Bpm, ModulePolicy, linear_ratio_fn};
+    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
+    use nuillu_types::{ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin};
+
+    use crate::{MemoryCapabilities, NoopMemoryStore};
+
+    type BatchRecorder = Rc<RefCell<Vec<(bool, usize)>>>;
+
+    struct RecordingMemory {
+        inner: MemoryModule,
+        recorder: BatchRecorder,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for RecordingMemory {
+        type Batch = MemoryBatch;
+
+        fn id() -> &'static str {
+            MemoryModule::id()
+        }
+
+        fn role_description() -> &'static str {
+            MemoryModule::role_description()
+        }
+
+        async fn next_batch(&mut self) -> Result<Self::Batch> {
+            let batch = self.inner.next_batch().await?;
+            self.recorder
+                .borrow_mut()
+                .push((batch.allocation_updated, batch.cognition_log.len()));
+            Ok(batch)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_caps() -> (Blackboard, CapabilityProviders, MemoryCapabilities) {
+        let blackboard = Blackboard::default();
+        let adapter = Arc::new(MockLlmAdapter::new());
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        let clock = Rc::new(SystemClock);
+        let caps = CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard: blackboard.clone(),
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
+            clock: clock.clone(),
+            tiers: LutumTiers {
+                cheap: lutum.clone(),
+                default: lutum.clone(),
+                premium: lutum,
+            },
+        });
+        let memory_caps = MemoryCapabilities::new(
+            blackboard.clone(),
+            clock,
+            Rc::new(NoopMemoryStore),
+            Vec::new(),
+        );
+        (blackboard, caps, memory_caps)
+    }
+
+    async fn build_recording_memory(
+        caps: &CapabilityProviders,
+        memory_caps: MemoryCapabilities,
+        recorder: BatchRecorder,
+        batching: MemoryBatchConfig,
+    ) -> nuillu_module::AllocatedModule {
+        let modules = ModuleRegistry::new()
+            .register(
+                ModulePolicy::new(
+                    ReplicaCapRange::new(1, 1).unwrap(),
+                    Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+                    linear_ratio_fn,
+                ),
+                move |caps| RecordingMemory {
+                    inner: MemoryModule::new(
+                        caps.cognition_log_evicted_inbox(),
+                        caps.allocation_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.memory_metadata_reader(),
+                        memory_caps.writer(),
+                        caps.llm_access(),
+                    )
+                    .with_batch_config(batching),
+                    recorder: recorder.clone(),
+                },
+            )
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let (_, mut modules) = modules.into_parts();
+        modules.remove(0)
+    }
+
+    fn cognition_record(index: u64, content: &str) -> CognitionLogEntryRecord {
+        CognitionLogEntryRecord {
+            index,
+            source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+            entry: nuillu_blackboard::CognitionLogEntry {
+                at: Utc.timestamp_opt(index as i64, 0).unwrap(),
+                text: content.to_owned(),
+            },
+        }
+    }
 
     #[test]
     fn insert_memory_args_accepts_name_arrays_without_rank() {
@@ -494,6 +674,43 @@ mod tests {
                 MemoryTag::operational("context_binding"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn next_batch_collects_cognition_eviction_burst_with_idle_window() {
+        let (_blackboard, caps, memory_caps) = test_caps();
+        let recorder = Rc::new(RefCell::new(Vec::new()));
+        let mut module = build_recording_memory(
+            &caps,
+            memory_caps,
+            recorder.clone(),
+            MemoryBatchConfig {
+                silent_window: Duration::from_millis(10),
+                budget: Duration::from_millis(50),
+            },
+        )
+        .await;
+        let harness = caps.internal_harness_io();
+        let cognition_evictions = harness.cognition_log_evicted_mailbox();
+
+        cognition_evictions
+            .publish(cognition_record(0, "first"))
+            .await
+            .expect("memory cognition-eviction subscriber exists");
+
+        let delayed_evictions = async {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            cognition_evictions
+                .publish(cognition_record(1, "second"))
+                .await
+                .expect("memory cognition-eviction subscriber exists");
+        };
+        let next_batch = module.next_batch();
+
+        let (batch_result, _) = tokio::join!(next_batch, delayed_evictions);
+        batch_result.expect("memory next batch succeeds");
+
+        assert_eq!(recorder.borrow().as_slice(), &[(false, 2)]);
     }
 
     #[test]

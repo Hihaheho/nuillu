@@ -59,11 +59,12 @@ pub use capabilities::{
 pub use channels::{
     AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AmbientSensoryEntry,
     AttentionControlRequest, AttentionControlRequestInbox, AttentionControlRequestMailbox,
-    CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope,
-    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, MemoUpdated,
-    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance, ReadyItems, SensoryInput,
-    SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox, TopicMailbox,
-    TopicRecvError,
+    CognitionLogEvictedInbox, CognitionLogEvictedMailbox, CognitionLogUpdated,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope, InteroceptiveUpdated,
+    InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, MemoLogEvictedInbox,
+    MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance,
+    ReadyItems, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox,
+    TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
 pub use interoception::InteroceptiveWriter;
@@ -88,7 +89,8 @@ pub use rate_limit::{
     RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
 };
 pub use readers::{
-    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, ModuleStatusReader,
+    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader,
+    MemoryMetadataReader, ModuleStatusReader,
 };
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};

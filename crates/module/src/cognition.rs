@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
-use nuillu_blackboard::{Blackboard, BlackboardCommand, CognitionLogEntry};
+use nuillu_blackboard::{Blackboard, CognitionLogEntry, CognitionLogEntryRecord};
 use nuillu_types::ModuleInstanceId;
 
 use crate::ports::{Clock, CognitionLogRepository};
-use crate::{CognitionLogUpdated, CognitionLogUpdatedMailbox};
+use crate::{CognitionLogEvictedMailbox, CognitionLogUpdated, CognitionLogUpdatedMailbox};
 
 /// Append-only access to the cognition log.
 ///
@@ -15,6 +15,7 @@ pub struct CognitionWriter {
     blackboard: Blackboard,
     cognition_log_port: Rc<dyn CognitionLogRepository>,
     updates: CognitionLogUpdatedMailbox,
+    evictions: CognitionLogEvictedMailbox,
     clock: Rc<dyn Clock>,
 }
 
@@ -24,6 +25,7 @@ impl CognitionWriter {
         blackboard: Blackboard,
         cognition_log_port: Rc<dyn CognitionLogRepository>,
         updates: CognitionLogUpdatedMailbox,
+        evictions: CognitionLogEvictedMailbox,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
@@ -31,6 +33,7 @@ impl CognitionWriter {
             blackboard,
             cognition_log_port,
             updates,
+            evictions,
             clock,
         }
     }
@@ -47,11 +50,9 @@ impl CognitionWriter {
             text: text.into(),
         };
 
-        self.blackboard
-            .apply(BlackboardCommand::AppendCognitionLog {
-                source: self.owner.clone(),
-                entry: entry.clone(),
-            })
+        let result = self
+            .blackboard
+            .append_cognition_log(self.owner.clone(), entry.clone())
             .await;
 
         if let Err(e) = self
@@ -71,6 +72,16 @@ impl CognitionWriter {
             .is_err()
         {
             tracing::trace!("cognition-log update had no active subscribers",);
+        }
+
+        self.publish_evictions(result.evicted).await;
+    }
+
+    async fn publish_evictions(&self, evicted: Vec<CognitionLogEntryRecord>) {
+        for record in evicted {
+            if self.evictions.publish(record).await.is_err() {
+                tracing::trace!("cognition-log eviction had no active subscribers");
+            }
         }
     }
 }

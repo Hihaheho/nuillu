@@ -6,7 +6,7 @@ use nuillu_types::ModuleInstanceId;
 
 use crate::ports::Clock;
 use crate::runtime_events::RuntimeEventEmitter;
-use crate::{MemoUpdated, MemoUpdatedMailbox};
+use crate::{MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedMailbox};
 
 /// Plaintext write handle for the activating module's own memo log.
 ///
@@ -35,6 +35,7 @@ struct MemoCore {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
     updates: MemoUpdatedMailbox,
+    evictions: MemoLogEvictedMailbox,
     clock: Rc<dyn Clock>,
     events: RuntimeEventEmitter,
 }
@@ -44,11 +45,12 @@ impl Memo {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
+        evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
-            core: MemoCore::new(owner, blackboard, updates, clock, events),
+            core: MemoCore::new(owner, blackboard, updates, evictions, clock, events),
         }
     }
 
@@ -64,11 +66,12 @@ impl<T: 'static> TypedMemo<T> {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
+        evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
         Self {
-            core: MemoCore::new(owner, blackboard, updates, clock, events),
+            core: MemoCore::new(owner, blackboard, updates, evictions, clock, events),
             _marker: PhantomData,
         }
     }
@@ -89,6 +92,7 @@ impl MemoCore {
         owner: ModuleInstanceId,
         blackboard: Blackboard,
         updates: MemoUpdatedMailbox,
+        evictions: MemoLogEvictedMailbox,
         clock: Rc<dyn Clock>,
         events: RuntimeEventEmitter,
     ) -> Self {
@@ -96,6 +100,7 @@ impl MemoCore {
             owner,
             blackboard,
             updates,
+            evictions,
             clock,
             events,
         }
@@ -103,22 +108,24 @@ impl MemoCore {
 
     async fn write_plain(&self, memo: String) -> MemoLogRecord {
         let char_count = memo.chars().count();
-        let record = self
+        let result = self
             .blackboard
-            .update_memo(self.owner.clone(), memo, self.clock.now())
+            .update_memo_with_evictions(self.owner.clone(), memo, self.clock.now())
             .await;
-        self.publish_update(record.index, char_count).await;
-        record
+        self.publish_update(result.record.index, char_count).await;
+        self.publish_evictions(result.evicted).await;
+        result.record
     }
 
     async fn write_typed<T: 'static>(&self, payload: T, memo: String) -> MemoLogRecord {
         let char_count = memo.chars().count();
-        let record = self
+        let result = self
             .blackboard
-            .update_typed_memo(self.owner.clone(), memo, payload, self.clock.now())
+            .update_typed_memo_with_evictions(self.owner.clone(), memo, payload, self.clock.now())
             .await;
-        self.publish_update(record.index, char_count).await;
-        record
+        self.publish_update(result.record.index, char_count).await;
+        self.publish_evictions(result.evicted).await;
+        result.record
     }
 
     async fn publish_update(&self, index: u64, char_count: usize) {
@@ -135,6 +142,14 @@ impl MemoCore {
             .is_err()
         {
             tracing::trace!("memo update had no active subscribers");
+        }
+    }
+
+    async fn publish_evictions(&self, evicted: Vec<MemoLogRecord>) {
+        for record in evicted {
+            if self.evictions.publish(record).await.is_err() {
+                tracing::trace!("memo-log eviction had no active subscribers");
+            }
         }
     }
 }

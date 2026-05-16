@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use nuillu_blackboard::Blackboard;
+use nuillu_blackboard::{Blackboard, CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_types::{ModuleId, ModuleInstanceId};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -384,6 +384,10 @@ pub type InteroceptiveUpdatedMailbox = TopicMailbox<InteroceptiveUpdated>;
 pub type InteroceptiveUpdatedInbox = TopicInbox<InteroceptiveUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;
 pub type MemoUpdatedInbox = TopicInbox<MemoUpdated>;
+pub type MemoLogEvictedMailbox = TopicMailbox<MemoLogRecord>;
+pub type MemoLogEvictedInbox = TopicInbox<MemoLogRecord>;
+pub type CognitionLogEvictedMailbox = TopicMailbox<CognitionLogEntryRecord>;
+pub type CognitionLogEvictedInbox = TopicInbox<CognitionLogEntryRecord>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SensoryModality {

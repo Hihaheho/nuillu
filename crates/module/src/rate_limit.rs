@@ -20,6 +20,8 @@ pub enum TopicKind {
     AllocationUpdated,
     InteroceptiveUpdated,
     MemoUpdated,
+    MemoLogEvicted,
+    CognitionLogEvicted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,6 +115,7 @@ pub struct RuntimePolicy {
     pub rate_limits: RateLimitPolicy,
     pub allocation_limits: AllocationLimits,
     pub memo_retained_per_owner: usize,
+    pub cognition_log_retained_entries: usize,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub session_compaction: SessionCompactionPolicy,
 }
@@ -123,6 +126,7 @@ impl Default for RuntimePolicy {
             rate_limits: RateLimitPolicy::default(),
             allocation_limits: AllocationLimits::default(),
             memo_retained_per_owner: 8,
+            cognition_log_retained_entries: 16,
             max_concurrent_llm_calls: None,
             session_compaction: SessionCompactionPolicy::default(),
         }

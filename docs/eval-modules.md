@@ -93,8 +93,8 @@ Common fields:
 id = "module-memory-store-peer-fact"
 description = "Memory should preserve useful cognitive evidence as a concise memory."
 modules = ["memory"]
-prompt = "Preserve useful information from current cognition if appropriate."
-context = "The cognition log contains a stable peer-related fact worth remembering."
+prompt = "Preserve useful information from evicted cognition evidence if appropriate."
+context = "The evicted cognition-log evidence contains a stable peer-related fact worth remembering."
 
 limits {
   max-llm-calls = 8

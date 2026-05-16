@@ -40,6 +40,7 @@ pub use interoception::{InteroceptiveMode, InteroceptivePatch, InteroceptiveStat
 pub use memory::{IdentityMemoryRecord, MemoryMetaPatch, MemoryMetadata};
 pub use policy::{CorePolicyRecord, PolicyMetaPatch, PolicyMetadata};
 pub use state::{
-    Blackboard, BlackboardInner, MemoLogRecord, ModuleRunStatus, ModuleRunStatusRecord,
-    TypedMemoLogRecord, UtteranceProgress, UtteranceProgressRecord, UtteranceProgressState,
+    Blackboard, BlackboardInner, CognitionLogAppendResult, MemoAppendResult, MemoLogRecord,
+    ModuleRunStatus, ModuleRunStatusRecord, TypedMemoLogRecord, UtteranceProgress,
+    UtteranceProgressRecord, UtteranceProgressState,
 };
