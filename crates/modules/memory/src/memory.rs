@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogEntryRecord,
@@ -27,6 +26,11 @@ Use the current cognition log plus unread/recent module memo logs as candidate e
 guidance from allocation-controller may contain explicit preservation candidates from other modules,
 but those candidates are not write commands. You may reject, normalize, merge, and deduplicate
 observations and guidance. Use insert_memory only for concrete information likely to matter later.
+insert_memory always writes short-term memory; later access, compaction, or other memory-system
+mechanisms may change rank outside this tool. When calling insert_memory, prefer kinds episode,
+statement, reflection, hypothesis, dream, procedure, or plan. Concepts and tags are simple name
+arrays, for example concepts ["Ryo", "super red apple"] and tags ["dialogue_flow"]; do not invent
+concept ids or tag ids. Do not provide decay or occurrence timestamps; runtime stamps them.
 For each insert, classify the loose memory kind, extract mentioned concepts, and add operational
 tags only when useful. Do not create memory-to-memory links, infer corrections, overwrite old
 memories, decide what is currently true, or treat user/agent/import source as authority.
@@ -34,8 +38,7 @@ Entries beginning "Internal dream simulation, not a verified fact:" are associat
 simulations, not evidence. Do not store them as factual memories; preserve them only when explicitly
 framed as dream or hypothesis material with dream/hypothesis kind and operational tags."#;
 
-const NORMAL_REQUEST_DECAY_SECS: i64 = 86_400;
-const HIGH_REQUEST_DECAY_SECS: i64 = 604_800;
+const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, memory requests,
@@ -60,28 +63,20 @@ fn format_memory_decision_context(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InsertMemoryArgs {
     pub content: String,
-    pub rank: MemoryRank,
-    pub decay_secs: i64,
-    pub occurred_at: Option<DateTime<Utc>>,
     pub kind: MemoryKind,
+    #[serde(default)]
     pub concepts: Vec<MemoryConceptInput>,
+    #[serde(default)]
     pub tags: Vec<MemoryTagInput>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryConceptInput {
-    pub label: String,
-    pub mention_text: Option<String>,
-    pub loose_type: Option<String>,
-    pub confidence_percent: u8,
-}
+#[serde(transparent)]
+pub struct MemoryConceptInput(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MemoryTagInput {
-    pub label: String,
-    pub namespace: String,
-    pub confidence_percent: u8,
-}
+#[serde(transparent)]
+pub struct MemoryTagInput(pub String);
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct InsertMemoryOutput {
@@ -289,11 +284,11 @@ impl MemoryModule {
     async fn insert_memory(&self, args: InsertMemoryArgs) -> Result<InsertMemoryOutput> {
         let record = self
             .memory
-            .insert_entry(
+            .insert_entry_now(
                 NewMemory {
                     content: nuillu_types::MemoryContent::new(args.content),
-                    rank: args.rank,
-                    occurred_at: args.occurred_at,
+                    rank: MemoryRank::ShortTerm,
+                    occurred_at: None,
                     kind: args.kind,
                     concepts: args
                         .concepts
@@ -305,7 +300,7 @@ impl MemoryModule {
                     valence: 0.0,
                     emotion: String::new(),
                 },
-                args.decay_secs,
+                SHORT_TERM_MEMORY_DECAY_SECS,
             )
             .await
             .context("insert memory")?;
@@ -320,24 +315,11 @@ pub(crate) fn confidence_percent_to_f32(value: u8) -> f32 {
 }
 
 pub(crate) fn memory_concept_from_input(input: MemoryConceptInput) -> MemoryConcept {
-    MemoryConcept {
-        label: input.label,
-        mention_text: input.mention_text,
-        loose_type: input.loose_type,
-        confidence: confidence_percent_to_f32(input.confidence_percent),
-    }
+    MemoryConcept::new(input.0)
 }
 
 pub(crate) fn memory_tag_from_input(input: MemoryTagInput) -> MemoryTag {
-    MemoryTag {
-        label: input.label,
-        namespace: if input.namespace.trim().is_empty() {
-            "operation".to_owned()
-        } else {
-            input.namespace
-        },
-        confidence: confidence_percent_to_f32(input.confidence_percent),
-    }
+    MemoryTag::operational(input.0)
 }
 
 fn format_memory_activation_request(
@@ -346,7 +328,7 @@ fn format_memory_activation_request(
     cognition_updated: bool,
 ) -> String {
     format!(
-        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nCognition updated: {}\nNormal explicit request default decay: {} seconds.\nHigh-importance explicit request default decay: {} seconds.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed.",
+        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nCognition updated: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed.",
         if guidance.trim().is_empty() {
             "none"
         } else {
@@ -354,8 +336,6 @@ fn format_memory_activation_request(
         },
         if allocation_updated { "yes" } else { "no" },
         if cognition_updated { "yes" } else { "no" },
-        NORMAL_REQUEST_DECAY_SECS,
-        HIGH_REQUEST_DECAY_SECS,
     )
 }
 
@@ -459,5 +439,78 @@ impl Module for MemoryModule {
         batch: &Self::Batch,
     ) -> Result<()> {
         MemoryModule::activate(self, cx, batch.allocation_updated, batch.cognition_updated).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_memory_args_accepts_name_arrays_without_rank() {
+        let args: InsertMemoryArgs = serde_json::from_value(serde_json::json!({
+            "concepts": ["Ryo", "super red apple"],
+            "content": "I successfully responded to Ryo's greeting (\"Hi\") and began integrating the social exchange with the persistent visual context of the super red apple.",
+            "kind": "episode",
+            "tags": ["dialogue_flow", "successful_engagement", "context_binding"]
+        }))
+        .expect("compatible insert_memory payload should deserialize");
+
+        assert_eq!(args.kind, MemoryKind::Episode);
+
+        let concepts = args
+            .concepts
+            .into_iter()
+            .map(memory_concept_from_input)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            concepts,
+            vec![
+                MemoryConcept {
+                    label: "Ryo".to_owned(),
+                    mention_text: None,
+                    loose_type: None,
+                    confidence: 1.0,
+                },
+                MemoryConcept {
+                    label: "super red apple".to_owned(),
+                    mention_text: None,
+                    loose_type: None,
+                    confidence: 1.0,
+                },
+            ]
+        );
+
+        let tags = args
+            .tags
+            .into_iter()
+            .map(memory_tag_from_input)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            vec![
+                MemoryTag::operational("dialogue_flow"),
+                MemoryTag::operational("successful_engagement"),
+                MemoryTag::operational("context_binding"),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_memory_schema_does_not_expose_runtime_metadata() {
+        let schema = serde_json::to_value(schemars::schema_for!(InsertMemoryArgs))
+            .expect("insert memory schema should serialize");
+
+        assert_eq!(schema.pointer("/properties/rank"), None);
+        assert_eq!(schema.pointer("/properties/decay_secs"), None);
+        assert_eq!(schema.pointer("/properties/occurred_at"), None);
+        assert_eq!(
+            schema.pointer("/properties/concepts/items/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/tags/items/type"),
+            Some(&serde_json::json!("string"))
+        );
     }
 }

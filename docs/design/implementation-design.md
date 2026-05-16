@@ -584,7 +584,7 @@ Handles read-only file-search retrieval from controller guidance. Allocation upd
 
 Capabilities: `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `MemoryWriter`, `LlmAccess`.
 
-Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and allocation guidance are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and preservation guidance as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
+Decides whether useful information should be preserved and inserts memory entries. Cognition-log updates and allocation guidance are wake paths. The memory module evaluates current cognition-log entries, indexed unread/recent memo logs, and preservation guidance as candidates; it may reject, normalize, deduplicate, or merge them, and only persists records that the LLM chooses to write through `insert_memory`. The `insert_memory` tool accepts only content, kind, concepts, and tags. Every ordinary memory-module write is inserted as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Concepts and tags are name newtypes serialized as simple string arrays. `MemoryWriter` stamps the current `InteroceptiveState` affect fields onto each new record before storage.
 
 ### Memory Compaction
 
@@ -803,6 +803,8 @@ This keeps realistic artifacts observable without adding request/response correl
 | Query memory is memory/RAG only | it receives `MemorySearcher`, not policy or self-model capabilities |
 | Query policy is policy-retrieval only | it receives `PolicySearcher`, not memory or self-model capabilities; its memo entries contain only retrieved policy records |
 | Policy vector search is trigger-only | `PolicySearcher` performs similarity over the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys |
+| Memory ingest starts short-term | `insert_memory` has no rank, decay, or `occurred_at` arguments; ordinary memory-module writes always enter as `MemoryRank::ShortTerm` with runtime-stamped metadata |
+| Memory concept/tag inputs are names | concept and tag inputs are newtypes serialized as string arrays; ids, aliases, and name compaction are outside ordinary ingest |
 | Memory rank elevation is store-internal | no module holds a memory rank-elevation capability; `MemoryStore` applies access-threshold promotions on read paths that set `record_access: true` |
 | Policy creation and policy update are separate roles | `policy` holds `PolicyWriter` but no mutation path on existing entries; `reward` holds `PolicyValueUpdater` but no insert path |
 | Value prediction and value update are separate roles | `value-estimator` writes only its own memo with `expected_reward` predictions; it holds no `PolicyValueUpdater` and no `PolicyWriter` |

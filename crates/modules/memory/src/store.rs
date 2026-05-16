@@ -509,11 +509,30 @@ impl MemoryWriter {
         new: NewMemory,
         decay_secs: i64,
     ) -> Result<MemoryRecord, PortError> {
+        let now = self.clock.now();
+        self.insert_entry_at(new, decay_secs, now).await
+    }
+
+    pub async fn insert_entry_now(
+        &self,
+        mut new: NewMemory,
+        decay_secs: i64,
+    ) -> Result<MemoryRecord, PortError> {
+        let now = self.clock.now();
+        new.occurred_at = Some(now);
+        self.insert_entry_at(new, decay_secs, now).await
+    }
+
+    async fn insert_entry_at(
+        &self,
+        new: NewMemory,
+        decay_secs: i64,
+        now: DateTime<Utc>,
+    ) -> Result<MemoryRecord, PortError> {
         let mut new = new;
         self.stamp_interoception(&mut new).await;
         let rank = new.rank;
         let occurred_at = new.occurred_at;
-        let now = self.clock.now();
         let record = self.primary_store.insert(new, now).await?;
         let indexed = IndexedMemory::from_record(record.clone());
 
@@ -533,7 +552,7 @@ impl MemoryWriter {
                 rank_if_new: rank,
                 occurred_at_if_new: occurred_at,
                 decay_if_new_secs: decay_secs,
-                now: self.clock.now(),
+                now,
                 patch: MemoryMetaPatch {
                     rank: Some(rank),
                     occurred_at: Some(occurred_at),
@@ -1090,6 +1109,44 @@ mod tests {
         assert_eq!(new.affect_arousal, 0.8);
         assert_eq!(new.valence, -0.35);
         assert_eq!(new.emotion, "tense focus");
+    }
+
+    #[tokio::test]
+    async fn memory_writer_insert_entry_now_stamps_current_occurrence_time() {
+        let now = DateTime::from_timestamp(1_700_000_020, 0).unwrap();
+        let blackboard = Blackboard::new();
+        let store = RecordingMemoryStore::default();
+        let writer = MemoryWriter::new(
+            Rc::new(store.clone()),
+            Vec::new(),
+            blackboard,
+            Rc::new(FixedClock(now)),
+        );
+
+        let record = writer
+            .insert_entry_now(
+                NewMemory {
+                    kind: MemoryKind::Episode,
+                    concepts: vec![MemoryConcept::new("Ryo")],
+                    tags: vec![MemoryTag::operational("dialogue_flow")],
+                    ..NewMemory::statement(
+                        MemoryContent::new("runtime-stamped memory"),
+                        MemoryRank::ShortTerm,
+                        None,
+                    )
+                },
+                86_400,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(record.occurred_at, Some(now));
+        assert_eq!(record.stored_at, now);
+        let writes = store.writes.borrow();
+        let RecordedMemoryWrite::Insert(new) = &writes[0] else {
+            panic!("expected insert write");
+        };
+        assert_eq!(new.occurred_at, Some(now));
     }
 
     #[tokio::test]

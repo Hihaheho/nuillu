@@ -57,7 +57,7 @@ remain transient wake signals, and durable module output remains memo-authoritat
 
 | Role | Memory-ledger responsibility |
 |---|---|
-| `memory` | Preserves useful cognitive evidence as short normalized memory text. Ingest extracts only kind, concepts, and operational tags. |
+| `memory` | Preserves useful cognitive evidence as short normalized memory text. Ingest always creates short-term memory and extracts only kind, concepts, and operational tags. |
 | `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. |
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
 | `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
@@ -92,35 +92,30 @@ memory {
 }
 
 concept {
-  id
-  canonical_label
-  normalized_label
+  name
   loose_type?
 }
 
 concept_alias {
-  concept_id
+  concept_name
   alias
-  normalized_alias
 }
 
 memory_concept {
   memory_id
-  concept_id
+  concept_name
   mention_text?
   confidence
 }
 
 tag {
-  id
-  label
-  normalized_label
+  name
   namespace
 }
 
 memory_tag {
   memory_id
-  tag_id
+  tag_name
   confidence
 }
 
@@ -211,6 +206,19 @@ kind
 concepts
 operational tags
 ```
+
+Ingest does not choose memory rank, decay, or occurrence time. The
+`insert_memory` tool has no rank, decay, or `occurred_at` arguments, and every
+ordinary memory-module insert starts as `MemoryRank::ShortTerm` with runtime-stamped
+decay and occurrence metadata. Higher ranks come only from store-owned
+reinforcement, compaction/ledger maintenance paths, or boot/manual identity seeding.
+
+Concepts and tags at ingest are name newtypes serialized as simple string arrays,
+for example `concepts: ["Ryo", "super red apple"]` and
+`tags: ["dialogue_flow"]`. Concept and tag names are the ledger keys. Ingest does
+not create concept ids, tag ids, aliases, or canonicalization records; later
+compaction or ledger-maintenance work may merge or relate names when there is
+enough context.
 
 Ingest does not create direct memory-to-memory links. It also does not infer
 updates, corrections, contradictions, or truth. Those relationships require broader

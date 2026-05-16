@@ -65,6 +65,9 @@ access advance an in-window counter, and crossing a per-rank threshold promotes 
 resets the decay timer. Identity-ranked memories are startup identity facts: the agent loads all of
 them from the primary memory store before module activation and injects that stable snapshot into
 LLM system prompts.
+The ordinary `memory` module does not choose rank, decay, or occurrence time at ingest: its
+`insert_memory` tool has no rank, decay, or `occurred_at` arguments, and all new records it writes
+start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence metadata.
 
 ### Policies
 
@@ -234,7 +237,7 @@ Retrieves applicable policies from the policy store. Allocation updates wake it 
 
 ### Memory
 
-Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from allocation-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
+Preserves useful information by inserting memory entries after cognition-log updates or preservation guidance from allocation-controller. It inspects the current cognition log plus indexed unread/recent memo logs as candidate evidence. Attention-schema entries are ordinary cognition-log evidence when the current attention state matters. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
 
 ### Memory Compaction
 
