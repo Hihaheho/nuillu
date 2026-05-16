@@ -1,6 +1,7 @@
 pub mod blackboard;
 pub mod chat;
 pub mod cognition;
+pub mod errors;
 pub mod memories;
 pub mod memos;
 pub mod modules;
@@ -212,6 +213,16 @@ impl VisualizerState {
                     tab.runtime_events.pop_front();
                 }
             }
+            VisualizerEvent::Error { tab_id, error } => {
+                let selected = {
+                    let tab = self.tab_mut(tab_id);
+                    let errors_id = tab.errors_window_id();
+                    tab.push_error(error);
+                    tab.window_requests.insert(errors_id, true);
+                    tab.id.clone()
+                };
+                self.selected = Some(selected);
+            }
             VisualizerEvent::LlmObserved { tab_id, event } => {
                 modules::apply_llm_observation(&mut self.tab_mut(tab_id).modules, event);
             }
@@ -283,6 +294,7 @@ pub struct RuntimeTab {
     memories: memories::MemoriesState,
     modules: modules::ModulesState,
     runtime_events: VecDeque<RuntimeEvent>,
+    errors: VecDeque<VisualizerErrorView>,
     logs: VecDeque<String>,
     window_open: BTreeMap<String, bool>,
     window_requests: BTreeMap<String, bool>,
@@ -305,6 +317,7 @@ impl RuntimeTab {
             memories: memories::MemoriesState::default(),
             modules: modules::ModulesState::default(),
             runtime_events: VecDeque::new(),
+            errors: VecDeque::new(),
             logs: VecDeque::new(),
             window_open: BTreeMap::new(),
             window_requests: BTreeMap::new(),
@@ -355,6 +368,10 @@ impl RuntimeTab {
             ViewWindowSpec {
                 id: format!("{base}:cognition"),
                 title: format!("🧩 Cognition Log - {}", self.title),
+            },
+            ViewWindowSpec {
+                id: format!("{base}:errors"),
+                title: format!("Errors - {}", self.title),
             },
             ViewWindowSpec {
                 id: format!("{base}:logs"),
@@ -425,11 +442,20 @@ impl RuntimeTab {
             .show(ui, |ui| cognition::ui(ui, &self.blackboard.cognition_logs));
         self.record_window_open(cognition_id, open);
 
+        let errors_id = self.errors_window_id();
+        let errors_title = format!("Errors - {}", self.title);
+        let open = window::PersistedWindow::new(&errors_id, &errors_title)
+            .open_override(window_requests.remove(&errors_id))
+            .default_pos(24.0, 1020.0)
+            .default_size(640.0, 360.0)
+            .show(ui, |ui| errors::ui(ui, &mut self.errors));
+        self.record_window_open(errors_id, open);
+
         let logs_id = format!("{base}:logs");
         let logs_title = format!("📜 Logs - {}", self.title);
         let open = window::PersistedWindow::new(&logs_id, &logs_title)
             .open_override(window_requests.remove(&logs_id))
-            .default_pos(24.0, 1020.0)
+            .default_pos(688.0, 1020.0)
             .default_size(520.0, 360.0)
             .show(ui, |ui| self.logs_ui(ui));
         self.record_window_open(logs_id, open);
@@ -512,6 +538,17 @@ impl RuntimeTab {
         if self.logs.len() > 512 {
             self.logs.pop_front();
         }
+    }
+
+    fn push_error(&mut self, error: VisualizerErrorView) {
+        self.errors.push_back(error);
+        if self.errors.len() > 256 {
+            self.errors.pop_front();
+        }
+    }
+
+    fn errors_window_id(&self) -> String {
+        format!("{}:errors", self.id.as_str())
     }
 
     fn logs_ui(&self, ui: &mut egui::Ui) {
@@ -675,5 +712,27 @@ mod tests {
         assert!(specs.iter().any(|spec| {
             spec.id == "case-1:module:sensory" && spec.title == "Module - sensory"
         }));
+    }
+
+    #[test]
+    fn reducer_opens_errors_window_when_error_arrives() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+
+        state.apply(VisualizerEvent::Error {
+            tab_id: tab_id.clone(),
+            error: VisualizerErrorView {
+                at: chrono::Utc::now(),
+                source: "runtime".to_string(),
+                phase: "activate".to_string(),
+                owner: Some("sensory".to_string()),
+                message: "planned failure".to_string(),
+            },
+        });
+
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert_eq!(tab.errors.len(), 1);
+        assert_eq!(state.selected.as_ref(), Some(&tab_id));
+        assert_eq!(tab.window_requests.get("case-1:errors"), Some(&true));
     }
 }

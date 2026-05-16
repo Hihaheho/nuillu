@@ -452,6 +452,17 @@ impl AgentRuntimeControl {
         self.runtime_events.module_batch_ready(owner, batch).await;
     }
 
+    pub async fn record_module_task_failed(
+        &self,
+        owner: ModuleInstanceId,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.runtime_events
+            .module_task_failed(owner, phase.into(), message.into())
+            .await;
+    }
+
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
         self.blackboard
             .apply(BlackboardCommand::RecordAgenticDeadlockMarker(

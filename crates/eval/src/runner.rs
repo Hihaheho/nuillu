@@ -48,8 +48,8 @@ use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
     MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleSettingsView, ModuleStatusView,
     TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
-    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerServerMessage,
-    VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
+    VisualizerClientMessage, VisualizerCommand, VisualizerErrorView, VisualizerEvent,
+    VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -611,6 +611,8 @@ async fn run_case_detailed_with_reporter(
     let execution = match collected.output {
         Ok(Ok(execution)) => execution,
         Ok(Err(error)) => {
+            let message = error.to_string();
+            emit_visualizer_error(hooks, &id, "eval", "execute_case", None, message.clone());
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.clone()),
@@ -625,13 +627,14 @@ async fn run_case_detailed_with_reporter(
                     id: &id,
                     reporter,
                 },
-                error.to_string(),
+                message,
                 trace,
                 raw_trace,
             );
         }
         Err(payload) => {
             let message = format!("panic: {}", panic_payload_message(payload.as_ref()));
+            emit_visualizer_error(hooks, &id, "eval", "panic", None, message.clone());
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.clone()),
@@ -826,6 +829,29 @@ fn emit_visualizer_open_tab(hooks: &RunnerHooks, id: &str) {
     visualizer.send_event(VisualizerEvent::OpenTab {
         tab_id: VisualizerTabId::new(id.to_string()),
         title: id.to_string(),
+    });
+}
+
+fn emit_visualizer_error(
+    hooks: &RunnerHooks,
+    id: &str,
+    source: impl Into<String>,
+    phase: impl Into<String>,
+    owner: Option<String>,
+    message: String,
+) {
+    let Some(visualizer) = hooks.visualizer.as_ref() else {
+        return;
+    };
+    visualizer.send_event(VisualizerEvent::Error {
+        tab_id: VisualizerTabId::new(id.to_string()),
+        error: VisualizerErrorView {
+            at: Utc::now(),
+            source: source.into(),
+            phase: phase.into(),
+            owner,
+            message,
+        },
     });
 }
 
@@ -4371,6 +4397,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::RateLimitDelayed { .. } => false,
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
             RuntimeEvent::ModuleBatchReady { .. } => false,
+            RuntimeEvent::ModuleTaskFailed { .. } => false,
         };
         let live_message = match &event {
             RuntimeEvent::LlmAccessed {
@@ -4427,6 +4454,19 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 batch_type,
                 batch_debug.chars().count()
             ),
+            RuntimeEvent::ModuleTaskFailed {
+                owner,
+                phase,
+                message,
+                ..
+            } => format!(
+                "{} module-task-failed {} owner={} phase={} error={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                phase,
+                message
+            ),
         };
         self.events
             .lock()
@@ -4441,8 +4481,26 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
         if let Some(visualizer) = &self.visualizer {
             visualizer.send(VisualizerEvent::RuntimeEvent {
                 tab_id: VisualizerTabId::new(self.case_id.clone()),
-                event,
+                event: event.clone(),
             });
+            if let RuntimeEvent::ModuleTaskFailed {
+                owner,
+                phase,
+                message,
+                ..
+            } = &event
+            {
+                visualizer.send(VisualizerEvent::Error {
+                    tab_id: VisualizerTabId::new(self.case_id.clone()),
+                    error: VisualizerErrorView {
+                        at: Utc::now(),
+                        source: "runtime".to_string(),
+                        phase: phase.clone(),
+                        owner: Some(owner.to_string()),
+                        message: message.clone(),
+                    },
+                });
+            }
         }
         if should_stop && !self.stop.swap(true, Ordering::Relaxed) {
             self.reporter.emit_port(

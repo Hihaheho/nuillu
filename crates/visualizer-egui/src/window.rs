@@ -100,6 +100,9 @@ impl<'a> PersistedWindow<'a> {
             });
 
             if let Some(response) = response {
+                if self.open_override == Some(true) {
+                    response.response.request_focus();
+                }
                 let rect = response.response.rect;
                 state.set_next(WindowState {
                     open,

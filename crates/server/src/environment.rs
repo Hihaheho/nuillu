@@ -298,6 +298,15 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
                 batch_type,
                 batch_debug.chars().count()
             ),
+            RuntimeEvent::ModuleTaskFailed {
+                owner,
+                phase,
+                message,
+                ..
+            } => eprintln!(
+                "nuillu-server module-task-failed tab={} owner={} phase={} error={}",
+                self.tab_id, owner, phase, message
+            ),
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),

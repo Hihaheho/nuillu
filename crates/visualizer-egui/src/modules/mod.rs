@@ -194,6 +194,16 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 debug: batch_debug.clone(),
             });
         }
+        RuntimeEvent::ModuleTaskFailed {
+            owner,
+            phase,
+            message,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.status = ModuleSessionStatus::Failed;
+            module.runtime_status = Some(format!("Failed {phase}: {message}"));
+        }
     }
 }
 
@@ -1957,6 +1967,32 @@ mod tests {
                 detail: "LlmCall".to_string(),
                 delayed_ms: 25,
             })
+        );
+    }
+
+    #[test]
+    fn runtime_error_marks_module_failed() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleTaskFailed {
+                sequence: 2,
+                owner: owner.clone(),
+                phase: "activate".to_string(),
+                message: "llm request failed".to_string(),
+            },
+        );
+
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(module.status, ModuleSessionStatus::Failed);
+        assert_eq!(
+            module.runtime_status.as_deref(),
+            Some("Failed activate: llm request failed")
         );
     }
 

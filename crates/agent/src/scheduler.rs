@@ -744,6 +744,9 @@ async fn handle_task_message(
                         },
                     )
                     .await;
+                runtime
+                    .record_module_task_failed(owners[index].clone(), "next_batch", message.clone())
+                    .await;
                 Err(SchedulerError::ModuleTaskFailed {
                     owner: owners[index].clone(),
                     phase: "next_batch",
@@ -847,6 +850,9 @@ async fn handle_task_message(
                             message: message.clone(),
                         },
                     )
+                    .await;
+                runtime
+                    .record_module_task_failed(owners[index].clone(), "activate", message.clone())
                     .await;
                 Err(SchedulerError::ModuleTaskFailed {
                     owner: owners[index].clone(),

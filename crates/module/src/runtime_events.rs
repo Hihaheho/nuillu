@@ -44,6 +44,12 @@ pub enum RuntimeEvent {
         batch_type: String,
         batch_debug: String,
     },
+    ModuleTaskFailed {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        phase: String,
+        message: String,
+    },
 }
 
 #[async_trait(?Send)]
@@ -133,6 +139,21 @@ impl RuntimeEventEmitter {
             owner,
             batch_type,
             batch_debug,
+        })
+        .await;
+    }
+
+    pub(crate) async fn module_task_failed(
+        &self,
+        owner: ModuleInstanceId,
+        phase: String,
+        message: String,
+    ) {
+        self.emit(|sequence| RuntimeEvent::ModuleTaskFailed {
+            sequence,
+            owner,
+            phase,
+            message,
         })
         .await;
     }

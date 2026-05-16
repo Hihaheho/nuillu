@@ -151,6 +151,10 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         event: RuntimeEvent,
     },
+    Error {
+        tab_id: VisualizerTabId,
+        error: VisualizerErrorView,
+    },
     LlmObserved {
         tab_id: VisualizerTabId,
         event: LlmObservationEvent,
@@ -319,6 +323,15 @@ pub struct LlmUsageView {
     pub cost_micros_usd: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualizerErrorView {
+    pub at: DateTime<Utc>,
+    pub source: String,
+    pub phase: String,
+    pub owner: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
