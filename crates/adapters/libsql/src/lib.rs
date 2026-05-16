@@ -25,6 +25,10 @@ use nuillu_types::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod migrations;
+
+use migrations::run_agent_migrations;
+
 const DEFAULT_MEMORY_TABLE: &str = "memories";
 const DEFAULT_POLICY_TABLE: &str = "policies";
 const PROFILE_REGISTRY_TABLE: &str = "memory_embedding_profiles";
@@ -59,7 +63,7 @@ impl EmbeddingProfile {
         hasher.update([0]);
         hasher.update(self.dimensions.to_string().as_bytes());
         let digest = hasher.finalize();
-        format!("p{}", short_hex(&digest[..8]))
+        format!("p{}", hex_string(&digest[..8]))
     }
 
     fn validate(&self) -> Result<(), PortError> {
@@ -78,47 +82,44 @@ impl EmbeddingProfile {
 }
 
 #[derive(Clone, Debug)]
-pub struct LibsqlMemoryStoreConfig {
+pub struct LibsqlAgentStoreConfig {
     pub path: PathBuf,
-    pub table_name: String,
-    pub active_profile: EmbeddingProfile,
+    pub memory_table_name: String,
+    pub policy_table_name: String,
+    pub memory_active_profile: EmbeddingProfile,
+    pub policy_active_profile: EmbeddingProfile,
 }
 
-impl LibsqlMemoryStoreConfig {
-    pub fn local(path: impl Into<PathBuf>, vector_dims: usize) -> Self {
+impl LibsqlAgentStoreConfig {
+    pub fn local(
+        path: impl Into<PathBuf>,
+        memory_vector_dims: usize,
+        policy_vector_dims: usize,
+    ) -> Self {
         Self {
             path: path.into(),
-            table_name: DEFAULT_MEMORY_TABLE.to_owned(),
-            active_profile: EmbeddingProfile::default_for_dimensions(vector_dims),
+            memory_table_name: DEFAULT_MEMORY_TABLE.to_owned(),
+            policy_table_name: DEFAULT_POLICY_TABLE.to_owned(),
+            memory_active_profile: EmbeddingProfile::default_for_dimensions(memory_vector_dims),
+            policy_active_profile: EmbeddingProfile::default_for_dimensions(policy_vector_dims),
         }
     }
 
-    pub fn with_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
-        self.active_profile = active_profile;
+    pub fn with_memory_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
+        self.memory_active_profile = active_profile;
+        self
+    }
+
+    pub fn with_policy_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
+        self.policy_active_profile = active_profile;
         self
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LibsqlPolicyStoreConfig {
-    pub path: PathBuf,
-    pub table_name: String,
-    pub active_profile: EmbeddingProfile,
-}
-
-impl LibsqlPolicyStoreConfig {
-    pub fn local(path: impl Into<PathBuf>, vector_dims: usize) -> Self {
-        Self {
-            path: path.into(),
-            table_name: DEFAULT_POLICY_TABLE.to_owned(),
-            active_profile: EmbeddingProfile::default_for_dimensions(vector_dims),
-        }
-    }
-
-    pub fn with_active_profile(mut self, active_profile: EmbeddingProfile) -> Self {
-        self.active_profile = active_profile;
-        self
-    }
+#[derive(Clone)]
+pub struct LibsqlAgentStore {
+    memory: LibsqlMemoryStore,
+    policy: LibsqlPolicyStore,
 }
 
 #[derive(Clone)]
@@ -141,20 +142,46 @@ pub struct LibsqlPolicyStore {
     embedder: Arc<dyn Embedder>,
 }
 
-impl LibsqlMemoryStore {
+impl LibsqlAgentStore {
     pub async fn connect(
-        config: LibsqlMemoryStoreConfig,
-        embedder: Box<dyn Embedder>,
+        config: LibsqlAgentStoreConfig,
+        memory_embedder: Box<dyn Embedder>,
+        policy_embedder: Box<dyn Embedder>,
     ) -> Result<Self, PortError> {
         let database = libsql::Builder::new_local(config.path)
             .build()
             .await
             .map_err(map_libsql_error)?;
         let conn = database.connect().map_err(map_libsql_error)?;
-        Self::from_connection(conn, config.table_name, config.active_profile, embedder).await
+        run_agent_migrations(&conn).await?;
+        let memory = LibsqlMemoryStore::from_connection(
+            conn.clone(),
+            config.memory_table_name,
+            config.memory_active_profile,
+            memory_embedder,
+        )
+        .await?;
+        let policy = LibsqlPolicyStore::from_connection(
+            conn.clone(),
+            config.policy_table_name,
+            config.policy_active_profile,
+            policy_embedder,
+        )
+        .await?;
+        Ok(Self { memory, policy })
     }
 
-    pub async fn from_connection(
+    pub fn memory_store(&self) -> LibsqlMemoryStore {
+        self.memory.clone()
+    }
+
+    pub fn policy_store(&self) -> LibsqlPolicyStore {
+        self.policy.clone()
+    }
+}
+
+impl LibsqlMemoryStore {
+    async fn from_connection(
         conn: Connection,
         table_name: impl Into<String>,
         active_profile: EmbeddingProfile,
@@ -185,7 +212,7 @@ impl LibsqlMemoryStore {
             embedding_table_name,
             embedder,
         };
-        store.migrate().await?;
+        store.initialize_profile_schema().await?;
         Ok(store)
     }
 
@@ -203,10 +230,6 @@ impl LibsqlMemoryStore {
 
     fn concepts_table_name(&self) -> String {
         format!("{}_concepts", self.table_name)
-    }
-
-    fn concept_aliases_table_name(&self) -> String {
-        format!("{}_concept_aliases", self.table_name)
     }
 
     fn memory_concepts_table_name(&self) -> String {
@@ -280,215 +303,9 @@ impl LibsqlMemoryStore {
         Ok(written)
     }
 
-    async fn migrate(&self) -> Result<(), PortError> {
-        let memory_rank_idx = format!("{}_rank_live_idx", self.table_name);
-        validate_identifier("memory rank index name", &memory_rank_idx)?;
-        let concepts = self.concepts_table_name();
-        let concept_aliases = self.concept_aliases_table_name();
-        let memory_concepts = self.memory_concepts_table_name();
-        let tags = self.tags_table_name();
-        let memory_tags = self.memory_tags_table_name();
-        let links = self.links_table_name();
-        let search = self.search_table_name();
-        for (label, table) in [
-            ("concepts table name", concepts.as_str()),
-            ("concept aliases table name", concept_aliases.as_str()),
-            ("memory concepts table name", memory_concepts.as_str()),
-            ("tags table name", tags.as_str()),
-            ("memory tags table name", memory_tags.as_str()),
-            ("memory links table name", links.as_str()),
-            ("memory search table name", search.as_str()),
-        ] {
-            validate_identifier(label, table)?;
-        }
-
-        let ddl = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {memories} (
-              id INTEGER PRIMARY KEY,
-              memory_index TEXT NOT NULL UNIQUE,
-              content TEXT NOT NULL,
-              kind INTEGER NOT NULL DEFAULT 1,
-              rank INTEGER NOT NULL,
-              occurred_at_ms INTEGER,
-              stored_at_ms INTEGER NOT NULL,
-              affect_arousal REAL NOT NULL DEFAULT 0.0,
-              valence REAL NOT NULL DEFAULT 0.0,
-              emotion TEXT NOT NULL DEFAULT '',
-              created_at_ms INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL,
-              source_ids TEXT,
-              metadata_json TEXT,
-              deleted_at_ms INTEGER
-            );
-
-            CREATE INDEX IF NOT EXISTS {memory_rank_idx}
-            ON {memories}(rank)
-            WHERE deleted_at_ms IS NULL;
-
-            CREATE TABLE IF NOT EXISTS {profiles} (
-              profile_id TEXT PRIMARY KEY,
-              name TEXT NOT NULL,
-              version TEXT NOT NULL,
-              dimensions INTEGER NOT NULL,
-              table_name TEXT NOT NULL UNIQUE,
-              created_at_ms INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS {concepts} (
-              id INTEGER PRIMARY KEY,
-              canonical_label TEXT NOT NULL,
-              normalized_label TEXT NOT NULL UNIQUE,
-              loose_type TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS {concept_aliases} (
-              concept_id INTEGER NOT NULL,
-              alias TEXT NOT NULL,
-              normalized_alias TEXT NOT NULL UNIQUE,
-              FOREIGN KEY(concept_id) REFERENCES {concepts}(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS {memory_concepts} (
-              memory_id INTEGER NOT NULL,
-              concept_id INTEGER NOT NULL,
-              mention_text TEXT,
-              confidence REAL NOT NULL,
-              PRIMARY KEY(memory_id, concept_id, mention_text),
-              FOREIGN KEY(memory_id) REFERENCES {memories}(id),
-              FOREIGN KEY(concept_id) REFERENCES {concepts}(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS {tags} (
-              id INTEGER PRIMARY KEY,
-              label TEXT NOT NULL,
-              normalized_label TEXT NOT NULL,
-              namespace TEXT NOT NULL,
-              UNIQUE(namespace, normalized_label)
-            );
-
-            CREATE TABLE IF NOT EXISTS {memory_tags} (
-              memory_id INTEGER NOT NULL,
-              tag_id INTEGER NOT NULL,
-              confidence REAL NOT NULL,
-              PRIMARY KEY(memory_id, tag_id),
-              FOREIGN KEY(memory_id) REFERENCES {memories}(id),
-              FOREIGN KEY(tag_id) REFERENCES {tags}(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS {links} (
-              id INTEGER PRIMARY KEY,
-              from_memory_id INTEGER NOT NULL,
-              to_memory_id INTEGER NOT NULL,
-              relation INTEGER NOT NULL,
-              freeform_relation TEXT,
-              strength REAL NOT NULL,
-              confidence REAL NOT NULL,
-              updated_at_ms INTEGER NOT NULL,
-              FOREIGN KEY(from_memory_id) REFERENCES {memories}(id),
-              FOREIGN KEY(to_memory_id) REFERENCES {memories}(id)
-            );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS {links}_unique_idx
-            ON {links}(
-              from_memory_id,
-              to_memory_id,
-              relation,
-              COALESCE(freeform_relation, '')
-            );
-
-            CREATE TABLE IF NOT EXISTS {search} (
-              memory_id INTEGER PRIMARY KEY,
-              search_text TEXT NOT NULL,
-              concept_text TEXT NOT NULL,
-              tag_text TEXT NOT NULL,
-              FOREIGN KEY(memory_id) REFERENCES {memories}(id)
-            );
-            "#,
-            memories = self.table_name,
-            memory_rank_idx = memory_rank_idx,
-            profiles = PROFILE_REGISTRY_TABLE,
-            concepts = concepts,
-            concept_aliases = concept_aliases,
-            memory_concepts = memory_concepts,
-            tags = tags,
-            memory_tags = memory_tags,
-            links = links,
-            search = search,
-        );
-        self.conn
-            .execute_batch(&ddl)
-            .await
-            .map_err(map_libsql_error)?;
-        self.add_column_if_missing(&self.table_name, "occurred_at_ms", "INTEGER")
-            .await?;
-        self.add_column_if_missing(&self.table_name, "kind", "INTEGER")
-            .await?;
-        self.add_column_if_missing(&self.table_name, "stored_at_ms", "INTEGER")
-            .await?;
-        self.add_column_if_missing(
-            &self.table_name,
-            "affect_arousal",
-            "REAL NOT NULL DEFAULT 0.0",
-        )
-        .await?;
-        self.add_column_if_missing(&self.table_name, "valence", "REAL NOT NULL DEFAULT 0.0")
-            .await?;
-        self.add_column_if_missing(&self.table_name, "emotion", "TEXT NOT NULL DEFAULT ''")
-            .await?;
-        self.conn
-            .execute(
-                &format!(
-                    "UPDATE {} SET kind = ?1 WHERE kind IS NULL",
-                    self.table_name
-                ),
-                [kind_to_i64(MemoryKind::Statement)],
-            )
-            .await
-            .map_err(map_libsql_error)?;
-        self.conn
-            .execute(
-                &format!(
-                    "UPDATE {} SET stored_at_ms = created_at_ms WHERE stored_at_ms IS NULL",
-                    self.table_name
-                ),
-                (),
-            )
-            .await
-            .map_err(map_libsql_error)?;
-        self.backfill_search_rows().await?;
-
+    async fn initialize_profile_schema(&self) -> Result<(), PortError> {
         self.register_active_profile().await?;
         self.create_active_embedding_table().await
-    }
-
-    async fn add_column_if_missing(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        column_type: &str,
-    ) -> Result<(), PortError> {
-        validate_identifier("migration table name", table_name)?;
-        validate_identifier("migration column name", column_name)?;
-        let pragma = format!("PRAGMA table_info({table_name})");
-        let mut rows = self
-            .conn
-            .query(&pragma, ())
-            .await
-            .map_err(map_libsql_error)?;
-        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
-            let name: String = row.get(1).map_err(map_libsql_error)?;
-            if name == column_name {
-                return Ok(());
-            }
-        }
-
-        let sql = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
-        self.conn
-            .execute(&sql, ())
-            .await
-            .map_err(map_libsql_error)?;
-        Ok(())
     }
 
     async fn register_active_profile(&self) -> Result<(), PortError> {
@@ -1174,30 +991,6 @@ impl LibsqlMemoryStore {
         Ok(())
     }
 
-    async fn backfill_search_rows(&self) -> Result<(), PortError> {
-        let search = self.search_table_name();
-        let sql = format!(
-            r#"
-            INSERT INTO {search} (
-              memory_id,
-              search_text,
-              concept_text,
-              tag_text
-            )
-            SELECT id, content, '', ''
-            FROM {memories}
-            WHERE deleted_at_ms IS NULL
-            ON CONFLICT(memory_id) DO NOTHING
-            "#,
-            memories = self.table_name,
-        );
-        self.conn
-            .execute(&sql, ())
-            .await
-            .map_err(map_libsql_error)?;
-        Ok(())
-    }
-
     async fn row_to_record(&self, row: &libsql::Row) -> Result<MemoryRecord, PortError> {
         let id: i64 = row.get(0).map_err(map_libsql_error)?;
         let index: String = row.get(1).map_err(map_libsql_error)?;
@@ -1332,19 +1125,7 @@ impl LibsqlMemoryStore {
 }
 
 impl LibsqlPolicyStore {
-    pub async fn connect(
-        config: LibsqlPolicyStoreConfig,
-        embedder: Box<dyn Embedder>,
-    ) -> Result<Self, PortError> {
-        let database = libsql::Builder::new_local(config.path)
-            .build()
-            .await
-            .map_err(map_libsql_error)?;
-        let conn = database.connect().map_err(map_libsql_error)?;
-        Self::from_connection(conn, config.table_name, config.active_profile, embedder).await
-    }
-
-    pub async fn from_connection(
+    async fn from_connection(
         conn: Connection,
         table_name: impl Into<String>,
         active_profile: EmbeddingProfile,
@@ -1375,7 +1156,7 @@ impl LibsqlPolicyStore {
             embedding_table_name,
             embedder,
         };
-        store.migrate().await?;
+        store.initialize_profile_schema().await?;
         Ok(store)
     }
 
@@ -1442,51 +1223,7 @@ impl LibsqlPolicyStore {
         Ok(written)
     }
 
-    async fn migrate(&self) -> Result<(), PortError> {
-        let policy_rank_idx = format!("{}_rank_live_idx", self.table_name);
-        validate_identifier("policy rank index name", &policy_rank_idx)?;
-
-        let ddl = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS {policies} (
-              id INTEGER PRIMARY KEY,
-              policy_index TEXT NOT NULL UNIQUE,
-              trigger TEXT NOT NULL,
-              behavior TEXT NOT NULL,
-              rank INTEGER NOT NULL,
-              expected_reward REAL NOT NULL,
-              confidence REAL NOT NULL,
-              value REAL NOT NULL,
-              reward_tokens INTEGER NOT NULL,
-              decay_remaining_secs INTEGER NOT NULL,
-              created_at_ms INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL,
-              last_reinforced_at_ms INTEGER,
-              deleted_at_ms INTEGER
-            );
-
-            CREATE INDEX IF NOT EXISTS {policy_rank_idx}
-            ON {policies}(rank)
-            WHERE deleted_at_ms IS NULL;
-
-            CREATE TABLE IF NOT EXISTS {profiles} (
-              profile_id TEXT PRIMARY KEY,
-              name TEXT NOT NULL,
-              version TEXT NOT NULL,
-              dimensions INTEGER NOT NULL,
-              table_name TEXT NOT NULL UNIQUE,
-              created_at_ms INTEGER NOT NULL
-            );
-            "#,
-            policies = self.table_name,
-            policy_rank_idx = policy_rank_idx,
-            profiles = POLICY_PROFILE_REGISTRY_TABLE,
-        );
-        self.conn
-            .execute_batch(&ddl)
-            .await
-            .map_err(map_libsql_error)?;
-
+    async fn initialize_profile_schema(&self) -> Result<(), PortError> {
         self.register_active_profile().await?;
         self.create_active_embedding_table().await
     }
@@ -2713,7 +2450,7 @@ fn limit_to_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
-fn short_hex(bytes: &[u8]) -> String {
+fn hex_string(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2742,6 +2479,12 @@ fn map_libsql_error(error: libsql::Error) -> PortError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::{
+        BridgeMigration, CURRENT_RELEASED_MIGRATIONS, CURRENT_SCHEMA_MAJOR, CURRENT_SCHEMA_MINOR,
+        CURRENT_SCHEMA_SNAPSHOT_SQL, DevMigration, MIGRATION_METADATA_DDL, MigrationBundle,
+        ReleasedMigration, SCHEMA_DEV_TASK_TABLE, SCHEMA_FAMILY, SCHEMA_VERSION_TABLE,
+        SchemaVersion, run_migration_bundle,
+    };
     use chrono::TimeZone as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2803,15 +2546,46 @@ mod tests {
 
         let profiles = count_rows(&store, PROFILE_REGISTRY_TABLE).await;
         let memories = count_rows(&store, DEFAULT_MEMORY_TABLE).await;
+        let policies = count_rows(&store, DEFAULT_POLICY_TABLE).await;
+        let version = schema_version_for_conn(&store.conn).await;
 
         assert_eq!(profiles, 1);
         assert_eq!(memories, 0);
+        assert_eq!(policies, 0);
+        assert_eq!(
+            version,
+            SchemaVersion {
+                major: CURRENT_SCHEMA_MAJOR,
+                minor: CURRENT_SCHEMA_MINOR
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_store_uses_one_database_for_memory_and_policy() {
+        let path = test_db_path();
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(path.clone(), 3, 3)
+                .with_memory_active_profile(profile("memory", "v1", 3))
+                .with_policy_active_profile(profile("policy", "v1", 3)),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+
+        let memory = agent.memory_store();
+        let policy = agent.policy_store();
+        assert!(table_exists(&memory.conn, DEFAULT_MEMORY_TABLE).await);
+        assert!(table_exists(&policy.conn, DEFAULT_POLICY_TABLE).await);
+        assert!(path.exists());
     }
 
     #[tokio::test]
     async fn connect_rejects_dimension_mismatch() {
-        let result = LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(test_db_path(), 2),
+        let result = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 2, 3),
+            TestEmbedder::boxed(3),
             TestEmbedder::boxed(3),
         )
         .await;
@@ -2984,44 +2758,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_adds_missing_memory_columns_to_existing_memory_table() {
-        let path = test_db_path();
-        let database = libsql::Builder::new_local(path.clone())
-            .build()
-            .await
-            .unwrap();
-        let conn = database.connect().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE memories (
-              id INTEGER PRIMARY KEY,
-              memory_index TEXT NOT NULL UNIQUE,
-              content TEXT NOT NULL,
-              rank INTEGER NOT NULL,
-              created_at_ms INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL,
-              source_ids TEXT,
-              metadata_json TEXT,
-              deleted_at_ms INTEGER
-            );
-            "#,
-        )
-        .await
-        .unwrap();
-        drop(conn);
-        drop(database);
-
-        let store = LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(path, 3),
-            TestEmbedder::boxed(3),
-        )
-        .await
-        .unwrap();
+    async fn initial_dev_migration_contains_current_memory_columns() {
+        let store = store().await;
 
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "occurred_at_ms").await);
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "stored_at_ms").await);
+        assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "kind").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "affect_arousal").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "valence").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 1);
+    }
+
+    #[tokio::test]
+    async fn dev_migrations_apply_in_order_and_skip_matching_checksums() {
+        const DEV_A: &str = "CREATE TABLE IF NOT EXISTS dev_a(id INTEGER);";
+        const DEV_B: &str = "CREATE TABLE IF NOT EXISTS dev_b(id INTEGER);";
+        const DEV_TASKS: &[DevMigration] = &[
+            DevMigration {
+                major: 0,
+                minor: 2,
+                task_tag: "first-task",
+                sql: DEV_A,
+            },
+            DevMigration {
+                major: 0,
+                minor: 2,
+                task_tag: "second-task",
+                sql: DEV_B,
+            },
+        ];
+        let bundle = MigrationBundle {
+            current: SchemaVersion { major: 0, minor: 1 },
+            snapshot_sql: CURRENT_SCHEMA_SNAPSHOT_SQL,
+            released: CURRENT_RELEASED_MIGRATIONS,
+            dev: DEV_TASKS,
+            bridge: None,
+        };
+        let conn = open_test_conn(test_db_path()).await;
+
+        run_migration_bundle(&conn, bundle).await.unwrap();
+        run_migration_bundle(&conn, bundle).await.unwrap();
+
+        assert!(table_exists(&conn, "dev_a").await);
+        assert!(table_exists(&conn, "dev_b").await);
+        assert_eq!(dev_task_count(&conn, 0, 2).await, 2);
+    }
+
+    #[tokio::test]
+    async fn dev_migration_checksum_drift_is_rejected() {
+        const DEV_A: &str = "CREATE TABLE IF NOT EXISTS dev_checksum_a(id INTEGER);";
+        const DEV_B: &str = "CREATE TABLE IF NOT EXISTS dev_checksum_b(id INTEGER);";
+        const DEV_TASKS_A: &[DevMigration] = &[DevMigration {
+            major: 0,
+            minor: 2,
+            task_tag: "checksum-task",
+            sql: DEV_A,
+        }];
+        const DEV_TASKS_B: &[DevMigration] = &[DevMigration {
+            major: 0,
+            minor: 2,
+            task_tag: "checksum-task",
+            sql: DEV_B,
+        }];
+        let conn = open_test_conn(test_db_path()).await;
+        let bundle_a = MigrationBundle {
+            current: SchemaVersion { major: 0, minor: 1 },
+            snapshot_sql: CURRENT_SCHEMA_SNAPSHOT_SQL,
+            released: CURRENT_RELEASED_MIGRATIONS,
+            dev: DEV_TASKS_A,
+            bridge: None,
+        };
+        let bundle_b = MigrationBundle {
+            dev: DEV_TASKS_B,
+            ..bundle_a
+        };
+
+        run_migration_bundle(&conn, bundle_a).await.unwrap();
+        let error = run_migration_bundle(&conn, bundle_b).await.unwrap_err();
+
+        assert!(matches!(error, PortError::InvalidData(_)));
+    }
+
+    #[tokio::test]
+    async fn bridge_migration_upgrades_previous_terminal_then_current_minor() {
+        const BRIDGE_SQL: &str = "CREATE TABLE IF NOT EXISTS bridge_marker(id INTEGER);";
+        const RELEASE_SQL: &str = "CREATE TABLE IF NOT EXISTS release_marker(id INTEGER);";
+        const RELEASED: &[ReleasedMigration] = &[ReleasedMigration {
+            from: SchemaVersion { major: 1, minor: 0 },
+            to: SchemaVersion { major: 1, minor: 1 },
+            sql: RELEASE_SQL,
+        }];
+        let bundle = MigrationBundle {
+            current: SchemaVersion { major: 1, minor: 1 },
+            snapshot_sql: "CREATE TABLE IF NOT EXISTS current_marker(id INTEGER);",
+            released: RELEASED,
+            dev: &[],
+            bridge: Some(BridgeMigration {
+                from: SchemaVersion { major: 0, minor: 1 },
+                to: SchemaVersion { major: 1, minor: 0 },
+                sql: BRIDGE_SQL,
+            }),
+        };
+        let conn = open_test_conn(test_db_path()).await;
+        seed_schema_version(&conn, SchemaVersion { major: 0, minor: 1 }).await;
+
+        run_migration_bundle(&conn, bundle).await.unwrap();
+
+        assert_eq!(schema_version_for_conn(&conn).await, bundle.current);
+        assert_eq!(
+            bridge_audit_for_conn(&conn).await,
+            Some(SchemaVersion { major: 0, minor: 1 })
+        );
+        assert!(table_exists(&conn, "bridge_marker").await);
+        assert!(table_exists(&conn, "release_marker").await);
+    }
+
+    #[tokio::test]
+    async fn bridge_migration_rejects_non_terminal_old_major() {
+        const RELEASED: &[ReleasedMigration] = &[];
+        let bundle = MigrationBundle {
+            current: SchemaVersion { major: 1, minor: 0 },
+            snapshot_sql: "CREATE TABLE IF NOT EXISTS current_marker(id INTEGER);",
+            released: RELEASED,
+            dev: &[],
+            bridge: Some(BridgeMigration {
+                from: SchemaVersion { major: 0, minor: 1 },
+                to: SchemaVersion { major: 1, minor: 0 },
+                sql: "CREATE TABLE IF NOT EXISTS bridge_marker(id INTEGER);",
+            }),
+        };
+        let conn = open_test_conn(test_db_path()).await;
+        seed_schema_version(&conn, SchemaVersion { major: 0, minor: 0 }).await;
+
+        let error = run_migration_bundle(&conn, bundle).await.unwrap_err();
+
+        assert!(matches!(error, PortError::InvalidData(_)));
+    }
+
+    #[tokio::test]
+    async fn released_migration_after_dev_tasks_clears_folded_task_tags() {
+        const DEV_SQL: &str = "CREATE TABLE IF NOT EXISTS folded_dev(id INTEGER);";
+        const RELEASE_SQL: &str = "CREATE TABLE IF NOT EXISTS folded_dev(id INTEGER);";
+        const DEV_TASKS: &[DevMigration] = &[DevMigration {
+            major: 0,
+            minor: 2,
+            task_tag: "folded-task",
+            sql: DEV_SQL,
+        }];
+        const RELEASED: &[ReleasedMigration] = &[
+            ReleasedMigration {
+                from: SchemaVersion { major: 0, minor: 0 },
+                to: SchemaVersion { major: 0, minor: 1 },
+                sql: CURRENT_SCHEMA_SNAPSHOT_SQL,
+            },
+            ReleasedMigration {
+                from: SchemaVersion { major: 0, minor: 1 },
+                to: SchemaVersion { major: 0, minor: 2 },
+                sql: RELEASE_SQL,
+            },
+        ];
+        let dev_bundle = MigrationBundle {
+            current: SchemaVersion { major: 0, minor: 1 },
+            snapshot_sql: CURRENT_SCHEMA_SNAPSHOT_SQL,
+            released: CURRENT_RELEASED_MIGRATIONS,
+            dev: DEV_TASKS,
+            bridge: None,
+        };
+        let release_bundle = MigrationBundle {
+            current: SchemaVersion { major: 0, minor: 2 },
+            snapshot_sql: CURRENT_SCHEMA_SNAPSHOT_SQL,
+            released: RELEASED,
+            dev: &[],
+            bridge: None,
+        };
+        let conn = open_test_conn(test_db_path()).await;
+
+        run_migration_bundle(&conn, dev_bundle).await.unwrap();
+        assert_eq!(dev_task_count(&conn, 0, 2).await, 1);
+        run_migration_bundle(&conn, release_bundle).await.unwrap();
+
+        assert_eq!(
+            schema_version_for_conn(&conn).await,
+            SchemaVersion { major: 0, minor: 2 }
+        );
+        assert_eq!(dev_task_count(&conn, 0, 2).await, 0);
     }
 
     #[tokio::test]
@@ -3412,12 +3333,14 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_embedding_dimensions_are_rejected_on_write() {
-        let store = LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(test_db_path(), 3),
+        let store = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
             Box::new(WrongDimEmbedder) as Box<dyn Embedder>,
+            TestEmbedder::boxed(3),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .memory_store();
 
         let error = store
             .insert(
@@ -3560,8 +3483,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(path, profile.dimensions).with_active_profile(profile),
+        let result = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(path, profile.dimensions, profile.dimensions)
+                .with_memory_active_profile(profile),
+            TestEmbedder::boxed(3),
             TestEmbedder::boxed(3),
         )
         .await;
@@ -3786,12 +3711,14 @@ mod tests {
     }
 
     async fn store() -> LibsqlMemoryStore {
-        LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(test_db_path(), 3),
+        LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
             TestEmbedder::boxed(3),
         )
         .await
         .unwrap()
+        .memory_store()
     }
 
     fn new_memory(
@@ -3833,22 +3760,26 @@ mod tests {
     }
 
     async fn policy_store() -> LibsqlPolicyStore {
-        LibsqlPolicyStore::connect(
-            LibsqlPolicyStoreConfig::local(test_db_path(), 3),
+        LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
             TestEmbedder::boxed(3),
         )
         .await
         .unwrap()
+        .policy_store()
     }
 
     async fn store_for_profile(path: PathBuf, profile: EmbeddingProfile) -> LibsqlMemoryStore {
         let dims = profile.dimensions;
-        LibsqlMemoryStore::connect(
-            LibsqlMemoryStoreConfig::local(path, dims).with_active_profile(profile),
+        LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(path, dims, dims).with_memory_active_profile(profile),
+            TestEmbedder::boxed(dims),
             TestEmbedder::boxed(dims),
         )
         .await
         .unwrap()
+        .memory_store()
     }
 
     fn profile(name: &str, version: &str, dimensions: usize) -> EmbeddingProfile {
@@ -3913,6 +3844,113 @@ mod tests {
         false
     }
 
+    async fn table_exists(conn: &Connection, table: &str) -> bool {
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT 1
+                FROM sqlite_schema
+                WHERE type = 'table'
+                  AND name = ?1
+                LIMIT 1
+                "#,
+                [table],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().is_some()
+    }
+
+    async fn schema_version_for_conn(conn: &Connection) -> SchemaVersion {
+        let mut rows = conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT major, minor
+                    FROM {SCHEMA_VERSION_TABLE}
+                    WHERE schema_family = ?1
+                    LIMIT 1
+                    "#
+                ),
+                [SCHEMA_FAMILY],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        SchemaVersion {
+            major: row.get(0).unwrap(),
+            minor: row.get(1).unwrap(),
+        }
+    }
+
+    async fn bridge_audit_for_conn(conn: &Connection) -> Option<SchemaVersion> {
+        let mut rows = conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT bridge_from_major, bridge_from_minor
+                    FROM {SCHEMA_VERSION_TABLE}
+                    WHERE schema_family = ?1
+                    LIMIT 1
+                    "#
+                ),
+                [SCHEMA_FAMILY],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let major: Option<i64> = row.get(0).unwrap();
+        let minor: Option<i64> = row.get(1).unwrap();
+        major
+            .zip(minor)
+            .map(|(major, minor)| SchemaVersion { major, minor })
+    }
+
+    async fn dev_task_count(conn: &Connection, major: i64, minor: i64) -> i64 {
+        let mut rows = conn
+            .query(
+                &format!(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM {SCHEMA_DEV_TASK_TABLE}
+                    WHERE schema_family = ?1
+                      AND major = ?2
+                      AND minor = ?3
+                    "#
+                ),
+                params![SCHEMA_FAMILY, major, minor],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    async fn open_test_conn(path: PathBuf) -> Connection {
+        let database = libsql::Builder::new_local(path).build().await.unwrap();
+        database.connect().unwrap()
+    }
+
+    async fn seed_schema_version(conn: &Connection, version: SchemaVersion) {
+        conn.execute_batch(MIGRATION_METADATA_DDL).await.unwrap();
+        conn.execute(
+            &format!(
+                r#"
+                INSERT INTO {SCHEMA_VERSION_TABLE} (
+                  schema_family,
+                  major,
+                  minor,
+                  updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4)
+                "#
+            ),
+            params![SCHEMA_FAMILY, version.major, version.minor, now_ms()],
+        )
+        .await
+        .unwrap();
+    }
+
     async fn source_ids_for(store: &LibsqlMemoryStore, index: &MemoryIndex) -> Vec<String> {
         let mut rows = store
             .conn
@@ -3944,6 +3982,6 @@ mod tests {
                 NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("memory.db")
+        dir.join("agent.db")
     }
 }

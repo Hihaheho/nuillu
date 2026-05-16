@@ -18,9 +18,7 @@ use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use futures::FutureExt as _;
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
-use lutum_libsql_adapter::{
-    LibsqlMemoryStore, LibsqlMemoryStoreConfig, LibsqlPolicyStore, LibsqlPolicyStoreConfig,
-};
+use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
@@ -2572,9 +2570,9 @@ pub(crate) async fn build_eval_environment(
         Some(now) => Rc::new(AnchoredRealtimeClock::new(now.with_timezone(&Utc))),
         None => Rc::new(SystemClock),
     };
-    let memory: Rc<dyn MemoryStore> = Rc::new(connect_memory_store(output_dir, config).await?);
-    let policy_store: Rc<dyn PolicyStore> =
-        Rc::new(connect_policy_store(output_dir, config).await?);
+    let agent_store = connect_agent_store(output_dir, config).await?;
+    let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
+    let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
@@ -2659,34 +2657,24 @@ pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
         .collect()
 }
 
-async fn connect_memory_store(
-    output_dir: &Path,
-    config: &RunnerConfig,
-) -> Result<LibsqlMemoryStore> {
-    let (embedder, profile, dimensions) =
+async fn connect_agent_store(output_dir: &Path, config: &RunnerConfig) -> Result<LibsqlAgentStore> {
+    let (memory_embedder, memory_profile, memory_dimensions) =
         build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
-    let db_path = output_dir.join("memory.db");
-    LibsqlMemoryStore::connect(
-        LibsqlMemoryStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        embedder,
+    let (policy_embedder, policy_profile, policy_dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+    LibsqlAgentStore::connect(
+        LibsqlAgentStoreConfig::local(
+            output_dir.join("agent.db"),
+            memory_dimensions,
+            policy_dimensions,
+        )
+        .with_memory_active_profile(memory_profile)
+        .with_policy_active_profile(policy_profile),
+        memory_embedder,
+        policy_embedder,
     )
     .await
-    .context("connect libsql memory store")
-}
-
-async fn connect_policy_store(
-    output_dir: &Path,
-    config: &RunnerConfig,
-) -> Result<LibsqlPolicyStore> {
-    let (embedder, profile, dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
-    let db_path = output_dir.join("policy.db");
-    LibsqlPolicyStore::connect(
-        LibsqlPolicyStoreConfig::local(db_path, dimensions).with_active_profile(profile),
-        embedder,
-    )
-    .await
-    .context("connect libsql policy store")
+    .context("connect libsql agent store")
 }
 
 async fn seed_memories(

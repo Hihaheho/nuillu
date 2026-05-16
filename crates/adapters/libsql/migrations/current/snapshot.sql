@@ -1,0 +1,1 @@
+-- v0.0 is the released baseline with no domain schema.

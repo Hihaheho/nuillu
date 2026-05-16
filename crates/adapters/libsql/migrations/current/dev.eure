@@ -1,0 +1,8 @@
+schema-family = "agent"
+next-major = 0
+next-minor = 1
+
+@ tasks[] {
+  tag = "initial-agent-schema"
+  file = "dev/v0.1.initial-agent-schema.sql"
+}

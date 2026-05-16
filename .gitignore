@@ -2,6 +2,7 @@
 !*/
 
 !.gitignore
+!AGENTS.md
 !README.md
 !LICENSE
 
@@ -15,6 +16,9 @@
 
 !configs/**/*.toml
 !configs/**/*.csv
+
+!crates/adapters/libsql/migrations/**/*.sql
+!crates/adapters/libsql/migrations/**/*.eure
 
 !.github/workflows/*.yml
 

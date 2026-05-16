@@ -9,10 +9,7 @@ use lutum::{
     SharedPoolBudgetOptions,
 };
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
-use lutum_libsql_adapter::{
-    EmbeddingProfile, LibsqlMemoryStore, LibsqlMemoryStoreConfig, LibsqlPolicyStore,
-    LibsqlPolicyStoreConfig,
-};
+use lutum_libsql_adapter::{EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
@@ -61,8 +58,9 @@ pub(super) async fn build_server_environment(
         visualizer,
     ));
     let clock: Rc<dyn Clock> = Rc::new(SystemClock);
-    let memory: Rc<dyn MemoryStore> = Rc::new(connect_memory_store(config).await?);
-    let policy_store: Rc<dyn PolicyStore> = Rc::new(connect_policy_store(config).await?);
+    let agent_store = connect_agent_store(config).await?;
+    let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
+    let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
@@ -133,28 +131,24 @@ fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
     )
 }
 
-async fn connect_memory_store(config: &ServerConfig) -> anyhow::Result<LibsqlMemoryStore> {
-    let (embedder, profile, dimensions) =
+async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgentStore> {
+    let (memory_embedder, memory_profile, memory_dimensions) =
         build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
-    LibsqlMemoryStore::connect(
-        LibsqlMemoryStoreConfig::local(config.state_dir.join("memory.db"), dimensions)
-            .with_active_profile(profile),
-        embedder,
+    let (policy_embedder, policy_profile, policy_dimensions) =
+        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+    LibsqlAgentStore::connect(
+        LibsqlAgentStoreConfig::local(
+            config.state_dir.join("agent.db"),
+            memory_dimensions,
+            policy_dimensions,
+        )
+        .with_memory_active_profile(memory_profile)
+        .with_policy_active_profile(policy_profile),
+        memory_embedder,
+        policy_embedder,
     )
     .await
-    .context("connect libsql memory store")
-}
-
-async fn connect_policy_store(config: &ServerConfig) -> anyhow::Result<LibsqlPolicyStore> {
-    let (embedder, profile, dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
-    LibsqlPolicyStore::connect(
-        LibsqlPolicyStoreConfig::local(config.state_dir.join("policy.db"), dimensions)
-            .with_active_profile(profile),
-        embedder,
-    )
-    .await
-    .context("connect libsql policy store")
+    .context("connect libsql agent store")
 }
 
 pub fn build_embedder(
