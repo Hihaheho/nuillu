@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use chrono::{DateTime, Utc};
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use serde::{Deserialize, Serialize};
@@ -25,9 +23,11 @@ pub struct PolicyMetadata {
     pub reward_tokens: u32,
     pub decay_remaining_secs: i64,
     pub last_reinforced_at: Option<DateTime<Utc>>,
-    pub last_accessed: Option<DateTime<Utc>>,
-    /// Recent diagnostic retrieval timestamps, capped to 10 most recent.
-    pub usage_history: VecDeque<DateTime<Utc>>,
+    /// Count of reward-credited TD updates applied to this policy. This is
+    /// separate from `reward_tokens`, which only counts settled predictions
+    /// used for rank thresholds.
+    #[serde(default)]
+    pub reinforcement_count: u32,
 }
 
 impl PolicyMetadata {
@@ -41,16 +41,7 @@ impl PolicyMetadata {
             reward_tokens: 0,
             decay_remaining_secs,
             last_reinforced_at: None,
-            last_accessed: None,
-            usage_history: VecDeque::new(),
-        }
-    }
-
-    pub fn record_access_at(&mut self, now: DateTime<Utc>) {
-        self.last_accessed = Some(now);
-        self.usage_history.push_back(now);
-        if self.usage_history.len() > 10 {
-            self.usage_history.pop_front();
+            reinforcement_count: 0,
         }
     }
 }
@@ -64,7 +55,6 @@ pub struct PolicyMetaPatch {
     pub reward_tokens: Option<u32>,
     pub decay_remaining_secs: Option<i64>,
     pub reinforced_at: Option<DateTime<Utc>>,
-    pub record_access_at: Option<DateTime<Utc>>,
 }
 
 impl PolicyMetaPatch {
@@ -89,9 +79,30 @@ impl PolicyMetaPatch {
         }
         if let Some(reinforced_at) = self.reinforced_at {
             meta.last_reinforced_at = Some(reinforced_at);
+            meta.reinforcement_count = meta.reinforcement_count.saturating_add(1);
         }
-        if let Some(accessed_at) = self.record_access_at {
-            meta.record_access_at(accessed_at);
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_deserializes_without_reinforcement_count() {
+        let value = serde_json::json!({
+            "index": "policy-1",
+            "rank": "Tentative",
+            "expected_reward": 0.0,
+            "confidence": 0.0,
+            "value": 0.0,
+            "reward_tokens": 0,
+            "decay_remaining_secs": 10,
+            "last_reinforced_at": null
+        });
+
+        let decoded: PolicyMetadata = serde_json::from_value(value).unwrap();
+
+        assert_eq!(decoded.reinforcement_count, 0);
     }
 }

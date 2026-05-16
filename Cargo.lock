@@ -3477,6 +3477,7 @@ dependencies = [
  "eure",
  "futures",
  "lutum",
+ "lutum-protocol",
  "nuillu-blackboard",
  "nuillu-module",
  "nuillu-types",

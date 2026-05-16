@@ -1,8 +1,9 @@
 //! Reward / policy domain crate.
 //!
 //! Owns the [`PolicyStore`] port, the policy-domain capability handles, and
-//! the two modules that operate on policy: [`PolicyModule`] (read-only
-//! advisor/proposer) and [`RewardModule`] (consolidates and reinforces).
+//! the modules that operate on policy: [`PolicyModule`] (read-only
+//! advisor/proposer), [`RewardModule`] (consolidates and reinforces), and
+//! [`PolicyCompactionModule`] (conservative duplicate cleanup).
 //!
 //! Hosts build a [`PolicyCapabilities`] provider once at boot to bundle the
 //! store + blackboard + clock, then pass it to registration closures and
@@ -19,31 +20,38 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::channel::mpsc;
-use nuillu_blackboard::{Blackboard, BlackboardCommand, CorePolicyRecord, PolicyMetaPatch};
+use nuillu_blackboard::{Blackboard, BlackboardCommand, CorePolicyRecord};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_types::{ModuleInstanceId, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod compaction;
 mod policy;
 mod reward;
 
+pub use compaction::{
+    CompactDuplicatePoliciesArgs, CompactDuplicatePoliciesOutput, GetPoliciesArgs,
+    GetPoliciesOutput, PolicyCompactionModule, PolicyCompactionTools, PolicyCompactionToolsCall,
+    PolicyCompactionToolsSelector, PolicyContentView, SearchPoliciesArgs, SearchPoliciesOutput,
+};
 pub use policy::{
     ExistingPolicyConsideration, PolicyConsideration, PolicyConsiderationDecision,
     PolicyConsiderationPayload, PolicyConsiderationSource, PolicyConsiderationWriter, PolicyModule,
     SyntheticPolicyConsideration,
 };
 pub use reward::{
-    ObservedReward, PolicyCandidateCredit, PolicyRewardUpdate, PolicyUpserter, RewardAssessment,
-    RewardMemo, RewardModule,
+    InsertPolicyCandidateDecision, ObservedReward, PolicyCandidateCredit, PolicyRewardSkip,
+    PolicyRewardUpdate, PolicyUpserter, ReinforceExistingPolicyDecision, RewardAssessment,
+    RewardMemo, RewardModule, SyntheticPolicyDedupDecision,
 };
 
 // ---------------------------------------------------------------------------
 // Policy store port + types
 
 /// Content-store for policy entries. Metadata (rank, value, confidence,
-/// reward-token counts, decay, diagnostic access) is mirrored on the
-/// blackboard; this trait owns durable trigger/behavior content and
+/// reward-token counts, decay, reward reinforcement counts) is mirrored on
+/// the blackboard; this trait owns durable trigger/behavior content and
 /// adapter-local trigger embedding/search state.
 #[async_trait(?Send)]
 pub trait PolicyStore {
@@ -238,26 +246,15 @@ impl PolicyConsiderationEvictedInbox {
     }
 }
 
-/// Trigger-similarity search over the primary policy store with diagnostic
-/// access metadata mirrored to the blackboard.
+/// Trigger-similarity search over the primary policy store.
 #[derive(Clone)]
 pub struct PolicySearcher {
     primary_store: Rc<dyn PolicyStore>,
-    blackboard: Blackboard,
-    clock: Rc<dyn Clock>,
 }
 
 impl PolicySearcher {
-    pub(crate) fn new(
-        primary_store: Rc<dyn PolicyStore>,
-        blackboard: Blackboard,
-        clock: Rc<dyn Clock>,
-    ) -> Self {
-        Self {
-            primary_store,
-            blackboard,
-            clock,
-        }
+    pub(crate) fn new(primary_store: Rc<dyn PolicyStore>) -> Self {
+        Self { primary_store }
     }
 
     pub async fn search(
@@ -278,26 +275,6 @@ impl PolicySearcher {
                 hit.policy.rank == PolicyRank::Core || hit.policy.decay_remaining_secs > 0
             })
             .collect::<Vec<_>>();
-        let now = self.clock.now();
-        for hit in &hits {
-            self.blackboard
-                .apply(BlackboardCommand::UpsertPolicyMetadata {
-                    index: hit.policy.index.clone(),
-                    rank_if_new: hit.policy.rank,
-                    decay_if_new_secs: hit.policy.decay_remaining_secs,
-                    patch: PolicyMetaPatch {
-                        rank: Some(hit.policy.rank),
-                        expected_reward: Some(hit.policy.expected_reward),
-                        confidence: Some(hit.policy.confidence),
-                        value: Some(hit.policy.value),
-                        reward_tokens: Some(hit.policy.reward_tokens),
-                        decay_remaining_secs: Some(hit.policy.decay_remaining_secs),
-                        record_access_at: Some(now),
-                        ..Default::default()
-                    },
-                })
-                .await;
-        }
         Ok(hits)
     }
 }
@@ -369,6 +346,188 @@ pub(crate) async fn fanout_policy_put(replicas: &[Rc<dyn PolicyStore>], indexed:
     futures::future::join_all(replica_writes).await;
 }
 
+pub(crate) async fn fanout_policy_delete(replicas: &[Rc<dyn PolicyStore>], index: &PolicyIndex) {
+    let replica_deletes = replicas
+        .iter()
+        .enumerate()
+        .map(|(replica, store)| async move {
+            if let Err(error) = store.delete(index).await {
+                tracing::warn!(replica, ?error, "secondary policy delete failed");
+            }
+        });
+    futures::future::join_all(replica_deletes).await;
+}
+
+/// Conservative duplicate-removal capability for policy maintenance.
+#[derive(Clone)]
+pub struct PolicyCompactor {
+    primary_store: Rc<dyn PolicyStore>,
+    replicas: Vec<Rc<dyn PolicyStore>>,
+    blackboard: Blackboard,
+}
+
+impl PolicyCompactor {
+    pub(crate) fn new(
+        primary_store: Rc<dyn PolicyStore>,
+        replicas: Vec<Rc<dyn PolicyStore>>,
+        blackboard: Blackboard,
+    ) -> Self {
+        Self {
+            primary_store,
+            replicas,
+            blackboard,
+        }
+    }
+
+    pub async fn search(
+        &self,
+        trigger: &str,
+        limit: usize,
+    ) -> Result<Vec<PolicySearchHit>, PortError> {
+        let hits = self
+            .primary_store
+            .search(&PolicyQuery {
+                trigger: trigger.to_owned(),
+                limit,
+            })
+            .await?;
+        Ok(filter_live_policy_hits(hits))
+    }
+
+    pub async fn get(&self, index: &PolicyIndex) -> Result<Option<PolicyRecord>, PortError> {
+        self.primary_store.get(index).await
+    }
+
+    pub async fn get_many(&self, indexes: &[PolicyIndex]) -> Result<Vec<PolicyRecord>, PortError> {
+        let mut out = Vec::new();
+        for index in indexes {
+            if let Some(record) = self.get(index).await? {
+                out.push(record);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn list_compaction_candidates(&self) -> Result<Vec<PolicyRecord>, PortError> {
+        let mut out = Vec::new();
+        for rank in [
+            PolicyRank::Tentative,
+            PolicyRank::Provisional,
+            PolicyRank::Established,
+            PolicyRank::Habit,
+            PolicyRank::Core,
+        ] {
+            out.extend(
+                self.primary_store
+                    .list_by_rank(rank)
+                    .await?
+                    .into_iter()
+                    .filter(|record| {
+                        record.rank == PolicyRank::Core || record.decay_remaining_secs > 0
+                    }),
+            );
+        }
+        out.sort_by(|left, right| left.index.as_str().cmp(right.index.as_str()));
+        Ok(out)
+    }
+
+    pub async fn compact_duplicates(
+        &self,
+        canonical: &PolicyIndex,
+        duplicates: &[PolicyIndex],
+    ) -> Result<PolicyCompactionResult, PortError> {
+        let canonical_record = self
+            .primary_store
+            .get(canonical)
+            .await?
+            .ok_or_else(|| PortError::NotFound(canonical.as_str().to_owned()))?;
+        let mut deleted = Vec::new();
+        let mut skipped = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for duplicate in duplicates {
+            if !seen.insert(duplicate.clone()) {
+                skipped.push(PolicyCompactionSkipped {
+                    index: duplicate.clone(),
+                    reason: "duplicate index was listed more than once".to_owned(),
+                });
+                continue;
+            }
+            if duplicate == canonical {
+                skipped.push(PolicyCompactionSkipped {
+                    index: duplicate.clone(),
+                    reason: "duplicate index matched the canonical policy".to_owned(),
+                });
+                continue;
+            }
+            let Some(record) = self.primary_store.get(duplicate).await? else {
+                skipped.push(PolicyCompactionSkipped {
+                    index: duplicate.clone(),
+                    reason: "policy was not found".to_owned(),
+                });
+                continue;
+            };
+            if record.rank == PolicyRank::Core {
+                skipped.push(PolicyCompactionSkipped {
+                    index: duplicate.clone(),
+                    reason: "core policies cannot be deleted by policy-compaction".to_owned(),
+                });
+                continue;
+            }
+            if policy_rank_strength(record.rank) > policy_rank_strength(canonical_record.rank) {
+                skipped.push(PolicyCompactionSkipped {
+                    index: duplicate.clone(),
+                    reason: "duplicate policy outranks the canonical policy".to_owned(),
+                });
+                continue;
+            }
+            self.primary_store.delete(duplicate).await?;
+            fanout_policy_delete(&self.replicas, duplicate).await;
+            self.blackboard
+                .apply(BlackboardCommand::RemovePolicyMetadata {
+                    index: duplicate.clone(),
+                })
+                .await;
+            deleted.push(duplicate.clone());
+        }
+
+        Ok(PolicyCompactionResult {
+            canonical: canonical_record,
+            deleted,
+            skipped,
+        })
+    }
+}
+
+fn policy_rank_strength(rank: PolicyRank) -> u8 {
+    match rank {
+        PolicyRank::Tentative => 0,
+        PolicyRank::Provisional => 1,
+        PolicyRank::Established => 2,
+        PolicyRank::Habit => 3,
+        PolicyRank::Core => 4,
+    }
+}
+
+fn filter_live_policy_hits(hits: Vec<PolicySearchHit>) -> Vec<PolicySearchHit> {
+    hits.into_iter()
+        .filter(|hit| hit.policy.rank == PolicyRank::Core || hit.policy.decay_remaining_secs > 0)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyCompactionResult {
+    pub canonical: PolicyRecord,
+    pub deleted: Vec<PolicyIndex>,
+    pub skipped: Vec<PolicyCompactionSkipped>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyCompactionSkipped {
+    pub index: PolicyIndex,
+    pub reason: String,
+}
+
 pub(crate) fn core_policy_record(record: PolicyRecord) -> CorePolicyRecord {
     CorePolicyRecord {
         index: record.index,
@@ -426,11 +585,7 @@ impl PolicyCapabilities {
     }
 
     pub fn searcher(&self) -> PolicySearcher {
-        PolicySearcher::new(
-            self.primary_store.clone(),
-            self.blackboard.clone(),
-            self.clock.clone(),
-        )
+        PolicySearcher::new(self.primary_store.clone())
     }
 
     pub fn consideration_writer(&self, owner: ModuleInstanceId) -> PolicyConsiderationWriter {
@@ -447,6 +602,14 @@ impl PolicyCapabilities {
             self.replicas.clone(),
             self.blackboard.clone(),
             self.clock.clone(),
+        )
+    }
+
+    pub fn compactor(&self) -> PolicyCompactor {
+        PolicyCompactor::new(
+            self.primary_store.clone(),
+            self.replicas.clone(),
+            self.blackboard.clone(),
         )
     }
 

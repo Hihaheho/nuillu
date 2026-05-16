@@ -72,7 +72,7 @@ start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence metad
 
 ### Policies
 
-A policy is `(rank, trigger, behavior, expected_reward, confidence, value, reward_tokens, decay, usage_history)`.
+A policy is `(rank, trigger, behavior, expected_reward, confidence, value, reward_tokens, reinforcement_count, decay)`.
 
 - **rank**: tentative, provisional, established, habit, core
 - **trigger**: situation description plus its embedding; the only field used for `PolicySearcher` vector search
@@ -81,8 +81,12 @@ A policy is `(rank, trigger, behavior, expected_reward, confidence, value, rewar
 - **confidence**: scalar in `[0, 1]`; rises when prediction accuracy is high (small `|td_error|`)
 - **value**: scalar in `[-1, 1]`; cumulative commitment, updated by `reward`
 - **reward tokens**: count of TD-settled reinforcement events that credit the policy
+- **reinforcement count**: count of reward-credited TD updates applied to the policy; this is the habit-learning counter, distinct from rank-threshold reward tokens
 - **decay**: remaining time before rank reduction if unrewarded
-- **usage history**: recent access log; diagnostic only — does NOT elevate rank
+
+Retrieval exposure is intentionally not policy metadata: search hits do not strengthen policies and
+do not maintain access counters. Diagnostic trails for policy learning live in reward memos,
+compaction tool results, and runtime traces rather than in access-derived policy state.
 
 Rank rises when `value` crosses a tier threshold with sufficient reward tokens, and falls when
 decay expires without re-reward. Core-ranked policies are loaded at startup like identity memories
@@ -147,7 +151,8 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | interoception | ✓ | ✓ | ✓ | — | ✓ | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveWriter` |
 | homeostatic-controller | — | — | — | — | — | — | `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter` |
 | policy | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyConsiderationWriter` |
-| reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `PolicyConsiderationEvictedInbox`, `InteroceptiveReader`, `PolicyUpserter` |
+| reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `PolicyConsiderationEvictedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyUpserter` |
+| policy-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `PolicyCompactor` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
 | speak-gate | ✓ | ✓ | — | ✓ | — | ✓ | `ActivationGate<SpeakModule>`, `ModuleStatusReader`, `AttentionControlRequestMailbox` |
@@ -168,11 +173,12 @@ Notable absences:
 - The memory module cannot increment remember tokens; that belongs to memory compaction.
 - The memory module cannot elevate memory rank; that belongs to `MemoryStore` on read-path access.
 - The policy module cannot mutate the policy store. It can search existing policies, synthesize candidates, predict current contextual value, write ordinary advice memos, and write structured considerations only through the reward-crate custom capability.
-- The reward module is the only ordinary policy-store writer. It inserts credited synthetic candidates and reinforces existing or newly inserted policies.
+- The reward module is the only ordinary policy insert/reinforce writer. It searches for related policies before saving credited synthetic candidates, then explicitly chooses insert or reinforce at the save boundary.
+- The policy-compaction module is a separate maintenance writer that may delete redundant non-Core duplicate policies. Its canonical policy may be any rank, including Core, but duplicate records must be non-Core and must not outrank the canonical policy. It cannot insert, reinforce, rewrite values, or delete Core policies.
 - The value baseline used by reward is `predicted_expected_reward` inside an evicted `PolicyConsiderationPayload`, not a continuously maintained separate estimator memo.
 - Interoception is the only canonical internal-state estimator. There is no separate emotion module in v1.
 - The homeostatic-controller regulates allocation from interoceptive state; it does not estimate wake pressure, affect, valence, or emotion.
-- `PolicySearcher` is trigger-only; `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never participate in similarity scoring.
+- `PolicySearcher` is trigger-only and pure read; `behavior`, `value`, `expected_reward`, and `confidence` are returned with hits but never participate in similarity scoring.
 - Reward cannot write allocation or attention-control requests.
 - Access does not strengthen policies; reward does not strengthen memories.
 - Predict does not write memory; preservation belongs to surprise requests and the memory module.
@@ -245,7 +251,7 @@ Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `
 
 ### Homeostatic Controller
 
-Regulates allocation from interoceptive state. It reads `InteroceptiveState`, then drives NREM-like memory compaction/association, REM-like recombination, and action caps through `AllocationWriter`. It does not estimate internal state and does not use an LLM; its job is homeostatic regulation, not affect interpretation.
+Regulates allocation from interoceptive state. It reads `InteroceptiveState`, then drives NREM-like memory compaction/association, policy duplicate cleanup, REM-like recombination, and action caps through `AllocationWriter`. It does not estimate internal state and does not use an LLM; its job is homeostatic regulation, not affect interpretation.
 
 ### Policy
 
@@ -253,7 +259,11 @@ Reads other modules' memo logs, the cognition log, allocation guidance, interoce
 
 ### Reward
 
-Closes the TD-0 loop when a structured policy consideration is evicted from the reward-crate custom retained surface. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, controller, recent memo/cognition, and current interoceptive context, collapses the channels to a scalar `observed_scalar`, and computes `td_error = observed_scalar − predicted_expected_reward` per credited candidate. Existing policy candidates are reinforced through `PolicyUpserter::reinforce`. Synthetic candidates with non-zero credit are inserted first and then reinforced through the same path, whether the observed reward is positive or negative. Failed policies therefore remain stored as negative-value / negative-expected-reward records that future policy advice can interpret as avoidance guidance. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not write memory, cognition-log entries, allocation, or attention-control requests.
+Closes the TD-0 loop when a structured policy consideration is evicted from the reward-crate custom retained surface. It aggregates the v1 6-channel `ObservedReward = { external, task, social, cost, risk, novelty }` from surprise, speak-completion, sensory, controller, recent memo/cognition, and current interoceptive context, collapses the channels to a scalar `observed_scalar`, and computes `td_error = observed_scalar − predicted_expected_reward` per credited candidate. Existing policy candidates are reinforced through `PolicyUpserter::reinforce`. Before a credited synthetic candidate is inserted, reward searches related existing policies by trigger and asks an explicit insert-or-reinforce dedup decision over that bounded candidate set. If no candidates are found, or the decision chooses insert, the synthetic policy is inserted and then reinforced through the same path. Failed policies therefore remain stored as negative-value / negative-expected-reward records that future policy advice can interpret as avoidance guidance when they are genuinely new. Rank elevation/demotion is a derived consequence of value crossing tier thresholds with sufficient reward tokens; reward cannot invent rank changes independent of those thresholds. It does not write memory, cognition-log entries, allocation, or attention-control requests.
+
+### Policy Compaction
+
+Fetches policy content and conservatively removes redundant non-Core duplicate policies. Allocation updates wake it to consider compaction guidance. It never inserts, reinforces, rewrites policy values, merges contradictions, or deletes Core policies.
 
 ### Predict
 
@@ -311,9 +321,9 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - Query-memory is independently detachable for ablation.
 - Predict and surprise are independently detachable for ablation.
 - Memory and learning are distinct reinforcement substrates: memory rank elevation is store-internal and access-driven; policy rank elevation is reward-driven and runs only through the reward-owned `PolicyUpserter::reinforce` path.
-- Policy advice and policy persistence are separate roles: `policy` cannot mutate the policy store, and `reward` is the only module that inserts or reinforces policy records.
+- Policy advice and policy persistence are separate roles: `policy` cannot mutate the policy store, `reward` is the only module that inserts or reinforces policy records, and `policy-compaction` can only delete duplicate non-Core records that do not outrank their canonical policy.
 - Value prediction is a contextual baseline inside `PolicyConsiderationPayload`; there is no continuously maintained separate estimator module in v1.
-- Policy vector search is trigger-only: `PolicySearcher` scores similarity against the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys.
+- Policy vector search is trigger-only and pure read: `PolicySearcher` scores similarity against the `trigger` embedding; `behavior`, `value`, `expected_reward`, and `confidence` are never used as search keys, and search exposure does not update policy metadata.
 - TD learning is TD-0 in v1: `td_error = observed_scalar − predicted_expected_reward`; no discount factor, no `next_state` bootstrap, no eligibility traces.
 - `ObservedReward` is fixed at six channels in v1 (external, task, social, cost, risk, novelty); per-policy per-channel storage is a v2 extension.
 - Reward cannot write allocation or attention-control requests.

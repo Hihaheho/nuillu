@@ -54,6 +54,7 @@ memory-recombination
 interoception
 homeostatic-controller
 policy
+policy-compaction
 reward
 predict
 surprise

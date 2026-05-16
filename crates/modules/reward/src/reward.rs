@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
@@ -16,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     IndexedPolicy, NewPolicy, PolicyConsiderationEvicted, PolicyConsiderationEvictedInbox,
-    PolicyConsiderationKey, PolicyConsiderationSource, PolicyRecord, PolicyStore,
-    SyntheticPolicyConsideration, fanout_policy_put,
+    PolicyConsiderationKey, PolicyConsiderationSource, PolicyRecord, PolicySearchHit,
+    PolicySearcher, PolicyStore, SyntheticPolicyConsideration, fanout_policy_put,
 };
 
 const SYSTEM_PROMPT: &str = r#"You are the reward module.
@@ -27,6 +28,13 @@ plausibly affected later behavior or outcome. Use candidate_id values exactly as
 const DEFAULT_POLICY_REINFORCEMENT_CONFIG: &str =
     include_str!("../../../../configs/policy-reinforcement.eure");
 const DEFAULT_SYNTHETIC_POLICY_DECAY_SECS: i64 = 86_400;
+const SYNTHETIC_DEDUP_SEARCH_LIMIT: usize = 8;
+const SYNTHETIC_DEDUP_PROMPT: &str = r#"You are the reward module's policy deduplication boundary.
+Decide whether a credited synthetic policy candidate is already covered by one of the provided
+existing policies. Choose reinforce_existing_policy only when an existing policy's trigger and
+behavior already cover the candidate without contradiction. Choose insert_policy_candidate when the
+candidate is novel, contradictory, materially more specific, or otherwise not clearly covered.
+Use only the existing policy indexes in the provided candidate set."#;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ObservedReward {
@@ -65,6 +73,7 @@ pub struct RewardMemo {
     pub observed_reward: ObservedReward,
     pub observed_scalar: f32,
     pub updates: Vec<PolicyRewardUpdate>,
+    pub skipped_updates: Vec<PolicyRewardSkip>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +88,31 @@ pub struct PolicyRewardUpdate {
     pub reward_tokens_delta: u32,
     pub expected_reward_delta: f32,
     pub confidence_delta: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyRewardSkip {
+    pub candidate_id: String,
+    pub credit: f32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", content = "data", rename_all = "snake_case")]
+pub enum SyntheticPolicyDedupDecision {
+    ReinforceExistingPolicy(ReinforceExistingPolicyDecision),
+    InsertPolicyCandidate(InsertPolicyCandidateDecision),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReinforceExistingPolicyDecision {
+    pub index: PolicyIndex,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InsertPolicyCandidateDecision {
+    pub reason: String,
 }
 
 /// Inserts synthetic policy candidates and applies reward updates to existing
@@ -329,6 +363,7 @@ pub struct RewardModule {
     cognition: CognitionLogReader,
     allocation: AllocationReader,
     interoception: InteroceptiveReader,
+    searcher: PolicySearcher,
     upserter: PolicyUpserter,
     memo: Memo,
     llm: LlmAccess,
@@ -344,6 +379,7 @@ impl RewardModule {
         cognition: CognitionLogReader,
         allocation: AllocationReader,
         interoception: InteroceptiveReader,
+        searcher: PolicySearcher,
         upserter: PolicyUpserter,
         memo: Memo,
         llm: LlmAccess,
@@ -354,6 +390,7 @@ impl RewardModule {
             cognition,
             allocation,
             interoception,
+            searcher,
             upserter,
             memo,
             llm,
@@ -366,6 +403,7 @@ impl RewardModule {
         let assessment = self.assess(&evicted).await?;
         let observed_scalar = self.config.observed_scalar(&assessment.observed_reward);
         let mut updates = Vec::new();
+        let mut skipped_updates = Vec::new();
 
         for candidate in &evicted.payload.considerations {
             let Some(credit) = assessment
@@ -390,23 +428,38 @@ impl RewardModule {
             ) * credit;
             let reward_tokens_delta = u32::from(td_error.abs() <= self.config.settle_band);
 
-            let (policy_index, inserted) = match &candidate.source {
+            let Some((policy_index, inserted)) = (match &candidate.source {
                 PolicyConsiderationSource::Existing(existing) => {
-                    (existing.policy_index.clone(), false)
+                    Some((existing.policy_index.clone(), false))
                 }
                 PolicyConsiderationSource::Synthetic(synthetic) => {
-                    let record = self
-                        .upserter
-                        .insert_candidate(
-                            synthetic,
-                            candidate.predicted_expected_reward,
-                            candidate.confidence_hint,
-                            candidate.predicted_expected_reward,
-                            DEFAULT_SYNTHETIC_POLICY_DECAY_SECS,
-                        )
-                        .await?;
-                    (record.index, true)
+                    match self.resolve_synthetic_policy(candidate, synthetic).await? {
+                        SyntheticPolicyResolution::Existing(index) => Some((index, false)),
+                        SyntheticPolicyResolution::Insert => {
+                            let record = self
+                                .upserter
+                                .insert_candidate(
+                                    synthetic,
+                                    candidate.predicted_expected_reward,
+                                    candidate.confidence_hint,
+                                    candidate.predicted_expected_reward,
+                                    DEFAULT_SYNTHETIC_POLICY_DECAY_SECS,
+                                )
+                                .await?;
+                            Some((record.index, true))
+                        }
+                        SyntheticPolicyResolution::Skip(reason) => {
+                            skipped_updates.push(PolicyRewardSkip {
+                                candidate_id: candidate.candidate_id.clone(),
+                                credit,
+                                reason,
+                            });
+                            None
+                        }
+                    }
                 }
+            }) else {
+                continue;
             };
 
             self.upserter
@@ -437,10 +490,66 @@ impl RewardModule {
             observed_reward: assessment.observed_reward.clone(),
             observed_scalar,
             updates,
+            skipped_updates,
         };
         let plaintext = render_reward_memo(&payload, &assessment);
         self.memo.write(plaintext).await;
         Ok(())
+    }
+
+    async fn resolve_synthetic_policy(
+        &self,
+        candidate: &crate::PolicyConsideration,
+        synthetic: &SyntheticPolicyConsideration,
+    ) -> Result<SyntheticPolicyResolution> {
+        let hits = self
+            .searcher
+            .search(&synthetic.trigger, SYNTHETIC_DEDUP_SEARCH_LIMIT)
+            .await
+            .context("search existing policies for synthetic deduplication")?;
+        if hits.is_empty() {
+            return Ok(SyntheticPolicyResolution::Insert);
+        }
+
+        let decision = self
+            .assess_synthetic_dedup(candidate, synthetic, &hits)
+            .await?;
+        Ok(resolve_synthetic_dedup_decision(&hits, decision))
+    }
+
+    async fn assess_synthetic_dedup(
+        &self,
+        candidate: &crate::PolicyConsideration,
+        synthetic: &SyntheticPolicyConsideration,
+        hits: &[PolicySearchHit],
+    ) -> Result<Option<SyntheticPolicyDedupDecision>> {
+        let mut session = Session::new();
+        session.push_system(SYNTHETIC_DEDUP_PROMPT);
+        session.push_user(format!(
+            "Synthetic policy candidate:\n{}\n\nExisting policy candidates:\n{}",
+            serde_json::to_string(&SyntheticDedupCandidateInput {
+                candidate_id: &candidate.candidate_id,
+                trigger: &synthetic.trigger,
+                behavior: &synthetic.behavior,
+                predicted_expected_reward: candidate.predicted_expected_reward,
+                confidence_hint: candidate.confidence_hint,
+                advice: &candidate.advice,
+                rationale: &candidate.rationale,
+            })
+            .expect("synthetic dedup candidate serialization should not fail"),
+            serde_json::to_string(&render_policy_hit_inputs(hits))
+                .expect("policy hit serialization should not fail"),
+        ));
+        let lutum = self.llm.lutum().await;
+        let result = session
+            .structured_turn::<SyntheticPolicyDedupDecision>(&lutum)
+            .collect()
+            .await
+            .context("policy synthetic dedup structured turn failed")?;
+        match result.semantic {
+            StructuredTurnOutcome::Structured(decision) => Ok(Some(decision)),
+            _ => Ok(None),
+        }
     }
 
     async fn assess(&mut self, evicted: &PolicyConsiderationEvicted) -> Result<RewardAssessment> {
@@ -471,6 +580,81 @@ impl RewardModule {
         };
         Ok(assessment)
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum SyntheticPolicyResolution {
+    Existing(PolicyIndex),
+    Insert,
+    Skip(String),
+}
+
+fn resolve_synthetic_dedup_decision(
+    hits: &[PolicySearchHit],
+    decision: Option<SyntheticPolicyDedupDecision>,
+) -> SyntheticPolicyResolution {
+    let candidate_indexes = hits
+        .iter()
+        .map(|hit| hit.policy.index.clone())
+        .collect::<HashSet<_>>();
+    match decision {
+        Some(SyntheticPolicyDedupDecision::ReinforceExistingPolicy(decision)) => {
+            if candidate_indexes.contains(&decision.index) {
+                SyntheticPolicyResolution::Existing(decision.index)
+            } else {
+                SyntheticPolicyResolution::Skip(format!(
+                    "dedup decision selected policy [{}] outside the provided candidate set",
+                    decision.index
+                ))
+            }
+        }
+        Some(SyntheticPolicyDedupDecision::InsertPolicyCandidate(_)) => {
+            SyntheticPolicyResolution::Insert
+        }
+        None => SyntheticPolicyResolution::Skip(
+            "dedup decision was refused while similar policy candidates existed".to_owned(),
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct SyntheticDedupCandidateInput<'a> {
+    candidate_id: &'a str,
+    trigger: &'a str,
+    behavior: &'a str,
+    predicted_expected_reward: f32,
+    confidence_hint: f32,
+    advice: &'a str,
+    rationale: &'a str,
+}
+
+#[derive(Serialize)]
+struct PolicyHitInput<'a> {
+    policy_index: &'a PolicyIndex,
+    similarity: f32,
+    rank: PolicyRank,
+    trigger: &'a str,
+    behavior: &'a str,
+    expected_reward: f32,
+    confidence: f32,
+    value: f32,
+    reward_tokens: u32,
+}
+
+fn render_policy_hit_inputs(hits: &[PolicySearchHit]) -> Vec<PolicyHitInput<'_>> {
+    hits.iter()
+        .map(|hit| PolicyHitInput {
+            policy_index: &hit.policy.index,
+            similarity: hit.similarity,
+            rank: hit.policy.rank,
+            trigger: &hit.policy.trigger,
+            behavior: &hit.policy.behavior,
+            expected_reward: hit.policy.expected_reward.get(),
+            confidence: hit.policy.confidence.get(),
+            value: hit.policy.value.get(),
+            reward_tokens: hit.policy.reward_tokens,
+        })
+        .collect()
 }
 
 fn confidence_delta(abs_td_error: f32, gamma: f32, scale: f32) -> f32 {
@@ -521,6 +705,18 @@ fn render_reward_memo(memo: &RewardMemo, assessment: &RewardAssessment) -> Strin
                 update.expected_reward_delta,
                 update.confidence_delta,
                 update.reward_tokens_delta,
+            ));
+        }
+    }
+    if !memo.skipped_updates.is_empty() {
+        output.push_str("\nSkipped policy updates:");
+        for skipped in &memo.skipped_updates {
+            output.push_str("\nCandidate [");
+            output.push_str(skipped.candidate_id.as_str());
+            output.push_str(&format!(
+                "]: credit {:.3}; reason: {}",
+                skipped.credit,
+                skipped.reason.trim(),
             ));
         }
     }
@@ -579,6 +775,7 @@ mod tests {
     use nuillu_module::ports::SystemClock;
 
     use super::*;
+    use crate::{PolicyCapabilities, PolicyCompactor, PolicySearchHit};
 
     #[test]
     fn bundled_reinforcement_config_loads() {
@@ -610,10 +807,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn upserter_inserts_negative_synthetic_policy_and_reinforces_it() {
         let store = Rc::new(RecordingPolicyStore::default());
+        let blackboard = Blackboard::default();
         let upserter = PolicyUpserter::new(
             store.clone(),
             Vec::new(),
-            Blackboard::default(),
+            blackboard.clone(),
             Rc::new(SystemClock),
         );
         let candidate = SyntheticPolicyConsideration {
@@ -661,20 +859,224 @@ mod tests {
             store.reinforces.borrow().as_slice(),
             &[(PolicyIndex::new("recording-policy-0"), -0.1, 1, -0.2, 0.03)]
         );
+        let reinforcement_count = blackboard
+            .read(|bb| {
+                bb.policy_metadata()
+                    .get(&PolicyIndex::new("recording-policy-0"))
+                    .map(|metadata| metadata.reinforcement_count)
+            })
+            .await;
+        assert_eq!(reinforcement_count, Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_searcher_search_does_not_mutate_metadata() {
+        let store = Rc::new(RecordingPolicyStore::with_records(vec![record(
+            "existing-policy",
+            "current trigger",
+            "existing behavior",
+            PolicyRank::Tentative,
+        )]));
+        let blackboard = Blackboard::default();
+        let policy_caps = PolicyCapabilities::new(
+            blackboard.clone(),
+            Rc::new(SystemClock),
+            store.clone(),
+            Vec::new(),
+        );
+
+        let hits = policy_caps
+            .searcher()
+            .search("current trigger", 4)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.policy.index.as_str())
+                .collect::<Vec<_>>(),
+            vec!["existing-policy"]
+        );
+        assert!(blackboard.read(|bb| bb.policy_metadata().is_empty()).await);
+    }
+
+    #[test]
+    fn dedup_decision_can_select_only_provided_candidates() {
+        let hits = vec![PolicySearchHit {
+            policy: record(
+                "existing-policy",
+                "weak evidence",
+                "ask for clarification",
+                PolicyRank::Tentative,
+            ),
+            similarity: 0.9,
+        }];
+
+        assert_eq!(
+            resolve_synthetic_dedup_decision(
+                &hits,
+                Some(SyntheticPolicyDedupDecision::ReinforceExistingPolicy(
+                    ReinforceExistingPolicyDecision {
+                        index: PolicyIndex::new("existing-policy"),
+                        reason: "covered".into(),
+                    },
+                )),
+            ),
+            SyntheticPolicyResolution::Existing(PolicyIndex::new("existing-policy"))
+        );
+        assert!(matches!(
+            resolve_synthetic_dedup_decision(
+                &hits,
+                Some(SyntheticPolicyDedupDecision::ReinforceExistingPolicy(
+                    ReinforceExistingPolicyDecision {
+                        index: PolicyIndex::new("outside-policy"),
+                        reason: "invalid".into(),
+                    },
+                )),
+            ),
+            SyntheticPolicyResolution::Skip(reason)
+                if reason.contains("outside the provided candidate set")
+        ));
+        assert_eq!(
+            resolve_synthetic_dedup_decision(
+                &hits,
+                Some(SyntheticPolicyDedupDecision::InsertPolicyCandidate(
+                    InsertPolicyCandidateDecision {
+                        reason: "novel".into(),
+                    },
+                )),
+            ),
+            SyntheticPolicyResolution::Insert
+        );
+        assert!(matches!(
+            resolve_synthetic_dedup_decision(&hits, None),
+            SyntheticPolicyResolution::Skip(reason)
+                if reason.contains("refused")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_compactor_deletes_only_non_core_duplicates_and_removes_metadata() {
+        let duplicate = PolicyIndex::new("duplicate-policy");
+        let core_duplicate = PolicyIndex::new("core-duplicate");
+        let higher_rank_duplicate = PolicyIndex::new("higher-rank-duplicate");
+        let store = Rc::new(RecordingPolicyStore::with_records(vec![
+            record(
+                "canonical-policy",
+                "weak evidence",
+                "ask for clarification",
+                PolicyRank::Established,
+            ),
+            record(
+                duplicate.as_str(),
+                "weak evidence duplicate",
+                "ask for clarification",
+                PolicyRank::Tentative,
+            ),
+            record(
+                core_duplicate.as_str(),
+                "core weak evidence",
+                "ask for clarification",
+                PolicyRank::Core,
+            ),
+            record(
+                higher_rank_duplicate.as_str(),
+                "habit weak evidence",
+                "ask for clarification",
+                PolicyRank::Habit,
+            ),
+        ]));
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::UpsertPolicyMetadata {
+                index: duplicate.clone(),
+                rank_if_new: PolicyRank::Tentative,
+                decay_if_new_secs: 60,
+                patch: PolicyMetaPatch::default(),
+            })
+            .await;
+        let compactor = PolicyCompactor::new(store.clone(), Vec::new(), blackboard.clone());
+
+        let result = compactor
+            .compact_duplicates(
+                &PolicyIndex::new("canonical-policy"),
+                &[
+                    duplicate.clone(),
+                    duplicate.clone(),
+                    core_duplicate.clone(),
+                    higher_rank_duplicate.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.deleted, vec![duplicate.clone()]);
+        assert_eq!(
+            result
+                .skipped
+                .iter()
+                .map(|skipped| (skipped.index.as_str(), skipped.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "duplicate-policy",
+                    "duplicate index was listed more than once"
+                ),
+                (
+                    "core-duplicate",
+                    "core policies cannot be deleted by policy-compaction"
+                ),
+                (
+                    "higher-rank-duplicate",
+                    "duplicate policy outranks the canonical policy"
+                )
+            ]
+        );
+        assert_eq!(store.deletes.borrow().as_slice(), &[duplicate]);
+        assert!(
+            blackboard
+                .read(|bb| !bb
+                    .policy_metadata()
+                    .contains_key(&PolicyIndex::new("duplicate-policy")))
+                .await
+        );
     }
 
     #[derive(Default)]
     struct RecordingPolicyStore {
         inserts: RefCell<Vec<NewPolicy>>,
+        records: RefCell<Vec<PolicyRecord>>,
         reinforces: RefCell<Vec<(PolicyIndex, f32, u32, f32, f32)>>,
+        deletes: RefCell<Vec<PolicyIndex>>,
+    }
+
+    impl RecordingPolicyStore {
+        fn with_records(records: Vec<PolicyRecord>) -> Self {
+            Self {
+                records: RefCell::new(records),
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait(?Send)]
     impl PolicyStore for RecordingPolicyStore {
         async fn insert(&self, policy: NewPolicy) -> std::result::Result<PolicyIndex, PortError> {
             let id = self.inserts.borrow().len();
+            let index = PolicyIndex::new(format!("recording-policy-{id}"));
+            self.records.borrow_mut().push(PolicyRecord {
+                index: index.clone(),
+                trigger: policy.trigger.clone(),
+                behavior: policy.behavior.clone(),
+                rank: policy.rank,
+                expected_reward: policy.expected_reward,
+                confidence: policy.confidence,
+                value: policy.value,
+                reward_tokens: policy.reward_tokens,
+                decay_remaining_secs: policy.decay_remaining_secs,
+            });
             self.inserts.borrow_mut().push(policy);
-            Ok(PolicyIndex::new(format!("recording-policy-{id}")))
+            Ok(index)
         }
 
         async fn put(&self, _policy: IndexedPolicy) -> std::result::Result<(), PortError> {
@@ -683,23 +1085,44 @@ mod tests {
 
         async fn get(
             &self,
-            _index: &PolicyIndex,
+            index: &PolicyIndex,
         ) -> std::result::Result<Option<PolicyRecord>, PortError> {
-            Ok(None)
+            Ok(self
+                .records
+                .borrow()
+                .iter()
+                .find(|record| &record.index == index)
+                .cloned())
         }
 
         async fn list_by_rank(
             &self,
-            _rank: PolicyRank,
+            rank: PolicyRank,
         ) -> std::result::Result<Vec<PolicyRecord>, PortError> {
-            Ok(Vec::new())
+            Ok(self
+                .records
+                .borrow()
+                .iter()
+                .filter(|record| record.rank == rank)
+                .cloned()
+                .collect())
         }
 
         async fn search(
             &self,
-            _q: &crate::PolicyQuery,
+            q: &crate::PolicyQuery,
         ) -> std::result::Result<Vec<crate::PolicySearchHit>, PortError> {
-            Ok(Vec::new())
+            Ok(self
+                .records
+                .borrow()
+                .iter()
+                .take(q.limit)
+                .cloned()
+                .map(|policy| PolicySearchHit {
+                    policy,
+                    similarity: 0.9,
+                })
+                .collect())
         }
 
         async fn reinforce(
@@ -717,21 +1140,51 @@ mod tests {
                 expected_reward_delta,
                 confidence_delta,
             ));
-            Ok(PolicyRecord {
+            let existing = self
+                .records
+                .borrow()
+                .iter()
+                .find(|record| &record.index == index)
+                .cloned();
+            let mut record = existing.unwrap_or_else(|| PolicyRecord {
                 index: index.clone(),
                 trigger: "rushed answer after weak evidence".into(),
                 behavior: "avoid answering until evidence is promoted".into(),
                 rank: PolicyRank::Tentative,
-                expected_reward: SignedUnitF32::clamp(-0.8),
-                confidence: UnitF32::clamp(0.38),
-                value: SignedUnitF32::clamp(-0.7),
-                reward_tokens: reward_tokens_delta,
+                expected_reward: SignedUnitF32::clamp(-0.6),
+                confidence: UnitF32::clamp(0.35),
+                value: SignedUnitF32::clamp(-0.6),
+                reward_tokens: 0,
                 decay_remaining_secs: 123,
-            })
+            });
+            record.expected_reward =
+                SignedUnitF32::clamp(record.expected_reward.get() + expected_reward_delta);
+            record.confidence = UnitF32::clamp(record.confidence.get() + confidence_delta);
+            record.value = SignedUnitF32::clamp(record.value.get() + value_delta);
+            record.reward_tokens = record.reward_tokens.saturating_add(reward_tokens_delta);
+            Ok(record)
         }
 
-        async fn delete(&self, _index: &PolicyIndex) -> std::result::Result<(), PortError> {
+        async fn delete(&self, index: &PolicyIndex) -> std::result::Result<(), PortError> {
+            self.deletes.borrow_mut().push(index.clone());
+            self.records
+                .borrow_mut()
+                .retain(|record| &record.index != index);
             Ok(())
+        }
+    }
+
+    fn record(index: &str, trigger: &str, behavior: &str, rank: PolicyRank) -> PolicyRecord {
+        PolicyRecord {
+            index: PolicyIndex::new(index),
+            trigger: trigger.into(),
+            behavior: behavior.into(),
+            rank,
+            expected_reward: SignedUnitF32::ZERO,
+            confidence: UnitF32::clamp(0.5),
+            value: SignedUnitF32::ZERO,
+            reward_tokens: 0,
+            decay_remaining_secs: 60,
         }
     }
 }

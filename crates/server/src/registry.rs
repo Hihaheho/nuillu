@@ -62,6 +62,7 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
         (builtin::reward(), builtin::policy()),
+        (builtin::policy_compaction(), builtin::reward()),
         (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
@@ -265,6 +266,18 @@ fn register_server_module(
                 )
             })
         }
+        RuntimeModule::PolicyCompaction => {
+            let policy_caps = policy_caps.clone();
+            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+                nuillu_reward::PolicyCompactionModule::new(
+                    caps.allocation_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    policy_caps.compactor(),
+                    caps.llm_access(),
+                )
+            })
+        }
         RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(1.0, 2.0)), move |caps| {
@@ -274,6 +287,7 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
                     caps.interoception_reader(),
+                    policy_caps.searcher(),
                     policy_caps.upserter(),
                     caps.memo(),
                     caps.llm_access(),
@@ -356,6 +370,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::Interoception => (1.0, ModelTier::Cheap),
             RuntimeModule::HomeostaticController => (1.0, ModelTier::Cheap),
             RuntimeModule::Policy => (0.0, ModelTier::Default),
+            RuntimeModule::PolicyCompaction => (0.0, ModelTier::Cheap),
             RuntimeModule::Reward => (0.0, ModelTier::Default),
             RuntimeModule::Predict => (0.0, ModelTier::Cheap),
             RuntimeModule::Surprise => (0.0, ModelTier::Default),
@@ -383,6 +398,7 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
         builtin::memory_compaction(),
         builtin::memory_association(),
         builtin::memory_recombination(),
+        builtin::policy_compaction(),
     ]
 }
 
@@ -398,6 +414,7 @@ fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
         builtin::query_memory(),
         builtin::memory(),
         builtin::policy(),
+        builtin::policy_compaction(),
         builtin::reward(),
         builtin::predict(),
         builtin::surprise(),

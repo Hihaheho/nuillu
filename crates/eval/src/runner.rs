@@ -2860,6 +2860,7 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         (builtin::cognition_gate(), builtin::self_model()),
         (builtin::cognition_gate(), builtin::surprise()),
         (builtin::reward(), builtin::policy()),
+        (builtin::policy_compaction(), builtin::reward()),
         (builtin::memory_compaction(), builtin::memory_association()),
         (
             builtin::memory_recombination(),
@@ -2894,6 +2895,7 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
+        nuillu_types::builtin::policy_compaction(),
     ]
 }
 
@@ -3194,6 +3196,24 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
+        EvalModule::PolicyCompaction => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                replica_hard_cap,
+                {
+                    let policy_caps = policy_caps.clone();
+                    move |caps| {
+                        nuillu_reward::PolicyCompactionModule::new(
+                            caps.allocation_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            policy_caps.compactor(),
+                            caps.llm_access(),
+                        )
+                    }
+                },
+            )
+            .expect("eval module registration should be unique"),
         EvalModule::Reward => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 9.0)),
@@ -3207,6 +3227,7 @@ fn register_eval_module(
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
                             caps.interoception_reader(),
+                            policy_caps.searcher(),
                             policy_caps.upserter(),
                             caps.memo(),
                             caps.llm_access(),
@@ -3320,6 +3341,7 @@ pub(crate) fn full_agent_allocation(
             EvalModule::Interoception => (1.0, ModelTier::Cheap),
             EvalModule::HomeostaticController => (1.0, ModelTier::Cheap),
             EvalModule::Policy => (0.0, ModelTier::Default),
+            EvalModule::PolicyCompaction => (0.0, ModelTier::Cheap),
             EvalModule::Reward => (0.0, ModelTier::Default),
             EvalModule::Predict => (0.0, ModelTier::Cheap),
             EvalModule::Surprise => (0.0, ModelTier::Default),
@@ -3402,6 +3424,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::MemoryRecombination
         | EvalModule::Interoception
         | EvalModule::HomeostaticController
+        | EvalModule::PolicyCompaction
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
         EvalModule::AllocationController => ModelTier::Default,

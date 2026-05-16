@@ -183,6 +183,7 @@ pub mod builtin {
         interoception        => "interoception",
         homeostatic_controller => "homeostatic-controller",
         policy                => "policy",
+        policy_compaction     => "policy-compaction",
         reward                => "reward",
         predict               => "predict",
         surprise              => "surprise",
