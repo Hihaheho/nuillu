@@ -79,6 +79,7 @@ use crate::{
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
+const FULL_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(12);
 const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
 const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
@@ -1076,6 +1077,7 @@ async fn execute_full_agent_case(
                     last_event_count = event_count;
                     idle_ticks = 0;
                 }
+                let idle_for_ms = idle_ticks.saturating_mul(poll_ms);
                 if idle_ticks > 0 && idle_ticks.is_multiple_of(idle_report_every_ticks) {
                     let active_modules =
                         allocation_blackboard.read(active_module_observations).await;
@@ -1088,7 +1090,7 @@ async fn execute_full_agent_case(
                                 "tick": tick,
                                 "events": event_count,
                                 "idle_ticks": idle_ticks,
-                                "idle_for_ms": idle_ticks.saturating_mul(poll_ms),
+                                "idle_for_ms": idle_for_ms,
                                 "tick_ms": poll_ms,
                                 "report_interval_ms": duration_millis_u64(IDLE_REPORT_INTERVAL),
                                 "active_modules": active_modules,
@@ -1096,12 +1098,23 @@ async fn execute_full_agent_case(
                             format!(
                                 "💤 eval idle case={} idle_for_ms={} events={} active=[{}]",
                                 case_id_for_idle,
-                                idle_ticks.saturating_mul(poll_ms),
+                                idle_for_ms,
                                 event_count,
                                 active_summary
                             ),
                         )
                         .expect("full-agent eval failed to write idle event");
+                }
+                if idle_for_ms >= duration_millis_u64(FULL_AGENT_IDLE_TIMEOUT) {
+                    let seconds = idle_for_ms / 1000;
+                    let message =
+                        format!("no runtime events for {seconds}s; agent appears stuck");
+                    step_failure_for_loop
+                        .lock()
+                        .expect("step failure mutex poisoned")
+                        .get_or_insert(message);
+                    events.request_stop("idle-timeout");
+                    break;
                 }
             }
         },
