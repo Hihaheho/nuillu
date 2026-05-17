@@ -27,6 +27,7 @@
 target/
 .env*
 logs/
+llm-logs/
 node_modules/
 dist/
 .tmp/

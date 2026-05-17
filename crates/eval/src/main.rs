@@ -29,6 +29,10 @@ struct Args {
     #[arg(long, default_value = ".tmp/eval")]
     output: PathBuf,
 
+    /// Root directory for per-turn LLM trace files.
+    #[arg(long, default_value = "llm-logs")]
+    llm_log_root: PathBuf,
+
     /// Run id used as the output subdirectory name.
     #[arg(long)]
     run_id: Option<String>,
@@ -146,6 +150,7 @@ fn main() -> anyhow::Result<()> {
     let config = RunnerConfig {
         cases_root: args.cases,
         output_root: args.output,
+        llm_log_root: args.llm_log_root,
         run_id,
         judge_backend,
         cheap_backend,

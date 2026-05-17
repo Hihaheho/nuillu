@@ -69,7 +69,10 @@ pub use channels::{
 };
 pub use cognition::CognitionWriter;
 pub use interoception::InteroceptiveWriter;
-pub use llm::{LlmAccess, LlmLease, LlmRequestMetadata, LlmRequestSource};
+pub use llm::{
+    LlmAccess, LlmBatchDebug, LlmLease, LlmRequestMetadata, LlmRequestSource,
+    current_activation_llm_request_metadata, with_activation_llm_request_metadata,
+};
 pub use memo::{Memo, TypedMemo};
 pub use memory_render::render_memory_for_llm;
 pub use mind_format::{

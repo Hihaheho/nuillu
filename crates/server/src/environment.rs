@@ -13,6 +13,7 @@ use lutum_libsql_adapter::{EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreC
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
+use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
@@ -71,6 +72,7 @@ pub(super) async fn build_server_environment(
                 &config.default_backend,
                 &config.premium_backend,
                 Some(llm_observer),
+                Some(server_llm_log_context(config)),
             )?,
         },
         runtime: CapabilityProviderRuntime {
@@ -183,17 +185,31 @@ pub fn build_tiers(
     default: &LlmBackendConfig,
     premium: &LlmBackendConfig,
     llm_observer: Option<VisualizerLlmObserver>,
+    llm_log_context: Option<LlmLogContext>,
 ) -> anyhow::Result<LutumTiers> {
+    let file_trace_sink = llm_log_context.map(FileLlmTraceSink::new);
     Ok(LutumTiers {
-        cheap: build_lutum(cheap, llm_observer.clone())?,
-        default: build_lutum(default, llm_observer.clone())?,
-        premium: build_lutum(premium, llm_observer)?,
+        cheap: build_lutum_with_file_trace(cheap, llm_observer.clone(), file_trace_sink.clone())?,
+        default: build_lutum_with_file_trace(
+            default,
+            llm_observer.clone(),
+            file_trace_sink.clone(),
+        )?,
+        premium: build_lutum_with_file_trace(premium, llm_observer, file_trace_sink)?,
     })
 }
 
 pub fn build_lutum(
     config: &LlmBackendConfig,
     llm_observer: Option<VisualizerLlmObserver>,
+) -> anyhow::Result<Lutum> {
+    build_lutum_with_file_trace(config, llm_observer, None)
+}
+
+pub fn build_lutum_with_file_trace(
+    config: &LlmBackendConfig,
+    llm_observer: Option<VisualizerLlmObserver>,
+    file_trace_sink: Option<FileLlmTraceSink>,
 ) -> anyhow::Result<Lutum> {
     let adapter = OpenAiAdapter::new(config.token.clone())
         .with_base_url(config.endpoint.clone())
@@ -209,6 +225,9 @@ pub fn build_lutum(
         SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
     )
     .with_extension(RawTelemetryConfig::all());
+    if let Some(sink) = file_trace_sink {
+        lutum.extend_hooks(sink.hook_set());
+    }
     if let Some(observer) = llm_observer {
         lutum.extend_hooks(observer.hook_set());
     }
@@ -218,6 +237,10 @@ pub fn build_lutum(
         }
         None => lutum,
     })
+}
+
+pub fn server_llm_log_context(config: &ServerConfig) -> LlmLogContext {
+    LlmLogContext::new(config.llm_log_root.clone(), vec![config.session_id.clone()])
 }
 
 #[derive(Clone, Copy)]
@@ -355,6 +378,7 @@ impl UtteranceSink for ServerUtteranceSink {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use nuillu_blackboard::{ActivationRatio, Bpm, ModuleConfig, ModulePolicy, linear_ratio_fn};
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
@@ -362,6 +386,39 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_MODULES;
     use crate::registry::full_agent_allocation;
+
+    fn test_backend_config() -> LlmBackendConfig {
+        LlmBackendConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            token: "local".to_string(),
+            model: "model".to_string(),
+            reasoning_effort: None,
+            use_responses_api: false,
+            compaction_input_token_threshold: 16_000,
+        }
+    }
+
+    #[test]
+    fn server_llm_log_context_uses_session_id_namespace() {
+        let config = ServerConfig {
+            state_dir: PathBuf::from(".tmp/server"),
+            session_id: "session-1".to_string(),
+            llm_log_root: PathBuf::from("llm-logs"),
+            cheap_backend: test_backend_config(),
+            default_backend: test_backend_config(),
+            premium_backend: test_backend_config(),
+            model_dir: PathBuf::from("models/potion-base-8M"),
+            embedding_backend: None,
+            max_concurrent_llm_calls: None,
+            disabled_modules: Vec::new(),
+            participants: Vec::new(),
+        };
+
+        let context = server_llm_log_context(&config);
+
+        assert_eq!(context.root, PathBuf::from("llm-logs"));
+        assert_eq!(context.namespace, vec!["session-1"]);
+    }
 
     #[test]
     fn server_allocation_limits_keep_fifth_positive_priority_slot_active() {

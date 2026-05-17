@@ -3403,6 +3403,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuillu-llm-trace-file"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lutum",
+ "nuillu-module",
+ "nuillu-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nuillu-memory"
 version = "0.1.0"
 dependencies = [
@@ -3544,6 +3559,7 @@ dependencies = [
  "nuillu-cognition-gate",
  "nuillu-homeostatic-controller",
  "nuillu-interoception",
+ "nuillu-llm-trace-file",
  "nuillu-memory",
  "nuillu-module",
  "nuillu-openai-embedding-adapter",
@@ -3561,6 +3577,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

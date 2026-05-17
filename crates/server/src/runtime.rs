@@ -91,7 +91,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     let tab_id = VisualizerTabId::new(SERVER_TAB_ID.to_string());
     visualizer.send_event(VisualizerEvent::Log {
         tab_id: tab_id.clone(),
-        message: format!("nuillu-server run_id={}", config.run_id),
+        message: format!("nuillu-server session_id={}", config.session_id),
     });
     let mut ambient = AmbientRows::load(config.state_dir.join("ambient-sensory.json"))?;
     let mut module_settings =

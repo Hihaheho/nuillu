@@ -19,6 +19,7 @@ lutum-libsql-adapter = { workspace = true }
 lutum-model2vec-adapter = { workspace = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
+nuillu-llm-trace-file = { workspace = true }
 nuillu-agent = { workspace = true }
 nuillu-allocation-controller = { workspace = true }
 nuillu-attention-schema = { workspace = true }
@@ -43,6 +44,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

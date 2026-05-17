@@ -5,8 +5,8 @@ use clap::Parser;
 use nuillu_module::DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD;
 use nuillu_server::{
     EmbeddingBackendConfig, EmbeddingRole, LlmBackendConfig, ModelSet, ModelSetRole,
-    ReasoningEffort, RuntimeModule, ServerConfig, default_run_id, install_lutum_trace_subscriber,
-    parse_model_set_file, run_server_with_visualizer,
+    ReasoningEffort, RuntimeModule, ServerConfig, default_server_session_id,
+    install_lutum_trace_subscriber, parse_model_set_file, run_server_with_visualizer,
 };
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
@@ -24,9 +24,17 @@ struct Args {
     #[arg(long, default_value = ".tmp/server")]
     state: PathBuf,
 
-    /// Run id used for server event logs.
-    #[arg(long)]
+    /// Deprecated alias for --session-id.
+    #[arg(long, hide = true)]
     run_id: Option<String>,
+
+    /// Session id used as the LLM trace namespace.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Root directory for per-turn LLM trace files.
+    #[arg(long, default_value = "llm-logs")]
+    llm_log_root: PathBuf,
 
     /// Model set Eure file with per-role backend config.
     #[arg(long)]
@@ -112,13 +120,12 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|model_set| model_set.max_concurrent_llm_calls())
     });
-    let run_id = args
-        .run_id
-        .unwrap_or_else(|| format!("server-{}", default_run_id()));
+    let session_id = resolve_session_id(args.session_id, args.run_id);
 
     run_server_with_visualizer(ServerConfig {
         state_dir: args.state,
-        run_id,
+        session_id,
+        llm_log_root: args.llm_log_root,
         cheap_backend,
         default_backend,
         premium_backend,
@@ -129,6 +136,12 @@ fn main() -> anyhow::Result<()> {
         participants: args.participants,
     })
     .context("run nuillu server")
+}
+
+fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) -> String {
+    session_id
+        .or(run_id_alias)
+        .unwrap_or_else(default_server_session_id)
 }
 
 #[derive(Clone, Copy)]
@@ -321,5 +334,29 @@ mod tests {
         let backend = resolve_backend("cheap", Some(&role), Some(2048), None, None).unwrap();
 
         assert_eq!(backend.compaction_input_token_threshold, 4096);
+    }
+
+    #[test]
+    fn resolve_session_id_prefers_explicit_session_id() {
+        assert_eq!(
+            resolve_session_id(Some("session-1".to_string()), Some("run-1".to_string())),
+            "session-1"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_accepts_run_id_alias() {
+        assert_eq!(
+            resolve_session_id(None, Some("legacy-run".to_string())),
+            "legacy-run"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_generates_server_session_id() {
+        let session_id = resolve_session_id(None, None);
+
+        assert!(session_id.starts_with("server-"));
+        assert!(session_id.len() > "server-20260517T000000Z-".len());
     }
 }

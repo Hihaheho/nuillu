@@ -9,6 +9,7 @@ members = [
     "crates/adapters/libsql",
     "crates/adapters/model2vec",
     "crates/adapters/openai-embedding",
+    "crates/llm-trace-file",
     "crates/modules/*",
     "crates/eval",
     "crates/server",
@@ -68,6 +69,7 @@ lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
 lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }
+nuillu-llm-trace-file = { path = "crates/llm-trace-file" }
 
 nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
 nuillu-allocation-controller = { path = "crates/modules/allocation-controller" }

@@ -89,6 +89,7 @@ pub use nuillu_server::{EmbeddingBackendConfig, LlmBackendConfig};
 pub struct RunnerConfig {
     pub cases_root: PathBuf,
     pub output_root: PathBuf,
+    pub llm_log_root: PathBuf,
     pub run_id: String,
     pub judge_backend: LlmBackendConfig,
     pub cheap_backend: LlmBackendConfig,
@@ -254,8 +255,8 @@ impl VisualizerHook {
 }
 
 use nuillu_server::{
-    VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder, build_lutum,
-    build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
+    LlmLogContext, VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder,
+    build_lutum, build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
     memory_record_view, model_tier_name, module_policy_views,
 };
 
@@ -2694,6 +2695,7 @@ pub(crate) async fn build_eval_environment(
         &config.default_backend,
         &config.premium_backend,
         llm_observer,
+        Some(eval_llm_log_context(config, case_id)),
     )
     .map_err(|error| RunnerError::Driver {
         path: output_dir.to_path_buf(),
@@ -2752,6 +2754,13 @@ pub(crate) async fn build_eval_environment(
         clock,
         utterance_sink,
     })
+}
+
+pub(crate) fn eval_llm_log_context(config: &RunnerConfig, case_id: &str) -> LlmLogContext {
+    LlmLogContext::new(
+        config.llm_log_root.clone(),
+        vec![config.run_id.clone(), case_id.to_string()],
+    )
 }
 
 fn session_compaction_policy(config: &RunnerConfig) -> SessionCompactionPolicy {
@@ -4770,6 +4779,7 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use chrono::TimeZone as _;
@@ -4812,6 +4822,36 @@ mod tests {
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
         }
+    }
+
+    fn test_runner_config(dir: &Path) -> RunnerConfig {
+        RunnerConfig {
+            cases_root: dir.join("eval-cases"),
+            output_root: dir.join("out"),
+            llm_log_root: dir.join("llm-logs"),
+            run_id: "run-1".to_string(),
+            judge_backend: test_backend_config_with_model("judge-model"),
+            cheap_backend: test_backend_config_with_model("cheap-model"),
+            default_backend: test_backend_config_with_model("default-model"),
+            premium_backend: test_backend_config_with_model("premium-model"),
+            model_dir: dir.join("missing-model"),
+            embedding_backend: None,
+            fail_fast: false,
+            max_concurrent_llm_calls: None,
+            case_patterns: Vec::new(),
+            disabled_modules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn eval_llm_log_context_uses_run_and_case_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_runner_config(dir.path());
+
+        let context = eval_llm_log_context(&config, "case-1");
+
+        assert_eq!(context.root, dir.path().join("llm-logs"));
+        assert_eq!(context.namespace, vec!["run-1", "case-1"]);
     }
 
     #[test]
@@ -5009,6 +5049,7 @@ id = "module-query-memory-special-memory"
         let config = RunnerConfig {
             cases_root: dir.path().join("eval-cases"),
             output_root: dir.path().join("out"),
+            llm_log_root: dir.path().join("llm-logs"),
             run_id: "run".to_string(),
             judge_backend: test_backend_config(),
             cheap_backend: test_backend_config(),
@@ -5196,6 +5237,7 @@ limits {{
         let config = RunnerConfig {
             cases_root: dir.path().join("eval-cases"),
             output_root: output_root.clone(),
+            llm_log_root: dir.path().join("llm-logs"),
             run_id: "runtime-failures".to_string(),
             judge_backend: test_backend_config_with_model("judge-model"),
             cheap_backend: test_backend_config_with_model("cheap-model"),

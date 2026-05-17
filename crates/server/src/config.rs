@@ -3,13 +3,15 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::OnceLock};
 use chrono::Utc;
 use nuillu_types::{ModuleId, builtin};
 use tracing_subscriber::layer::SubscriberExt as _;
+use uuid::Uuid;
 
 use crate::model_set::ReasoningEffort;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub state_dir: PathBuf,
-    pub run_id: String,
+    pub session_id: String,
+    pub llm_log_root: PathBuf,
     pub cheap_backend: LlmBackendConfig,
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
@@ -111,6 +113,10 @@ impl RuntimeModule {
 
 pub fn default_run_id() -> String {
     Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+pub fn default_server_session_id() -> String {
+    format!("server-{}-{}", default_run_id(), Uuid::now_v7())
 }
 
 pub fn install_lutum_trace_subscriber() -> anyhow::Result<()> {

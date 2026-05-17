@@ -12,8 +12,8 @@ use nuillu_blackboard::{
 };
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
-    LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies, ModuleRunStatus,
-    SessionCompactionRuntime, ports::Clock,
+    LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies,
+    ModuleRunStatus, SessionCompactionRuntime, ports::Clock, with_activation_llm_request_metadata,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
@@ -1301,11 +1301,12 @@ fn spawn_batch_cooldown(
             let deadline = throttle.not_before;
             let mut next_batch_throttle = None;
             tokio::select! {
-                _ = clock.sleep_until(deadline) => {},
+                biased;
                 _ = activation_increase => {},
                 _ = allocation_change => {
                     next_batch_throttle = Some(throttle);
                 },
+                _ = clock.sleep_until(deadline) => {},
             }
             let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
             TaskMessage::BatchCooldownExpired {
@@ -1435,27 +1436,30 @@ async fn activate_with_retries(
 ) -> (AllocatedModule, Result<(), String>) {
     let module_owner = module.owner().clone();
     let module_tier = runtime.tier_for(&module_owner).await;
-    let cx = ActivateCx::new(
-        catalog,
-        identity_memories,
-        core_policies,
-        SessionCompactionRuntime::new(
-            runtime
-                .session_compaction_lutum()
-                .clone()
-                .with_extension(LlmRequestMetadata {
-                    owner: module_owner,
-                    tier: ModelTier::Cheap,
-                    source: LlmRequestSource::SessionCompaction,
-                }),
-            module_tier,
-            runtime.session_compaction_policy(),
-        ),
-        runtime.clock().now(),
-    );
     let mut retries = 0_u8;
     loop {
         let owner = module.owner().clone();
+        let activation_attempt = u32::from(retries) + 1;
+        let cx = ActivateCx::new(
+            catalog,
+            identity_memories,
+            core_policies,
+            SessionCompactionRuntime::new(
+                runtime
+                    .session_compaction_lutum()
+                    .clone()
+                    .with_extension(LlmRequestMetadata {
+                        owner: module_owner.clone(),
+                        tier: ModelTier::Cheap,
+                        source: LlmRequestSource::SessionCompaction,
+                        activation_attempt: Some(activation_attempt),
+                        batch: Some(LlmBatchDebug::from_batch(batch)),
+                    }),
+                module_tier,
+                runtime.session_compaction_policy(),
+            ),
+            runtime.clock().now(),
+        );
         let activation_span = tracing::info_span!(
             target: "lutum",
             "module_activate",
@@ -1465,10 +1469,12 @@ async fn activate_with_retries(
             replica = owner.replica.get(),
             retry = retries,
         );
-        match module
-            .activate(&cx, batch)
-            .instrument(activation_span)
-            .await
+        match with_activation_llm_request_metadata(
+            activation_attempt,
+            batch,
+            module.activate(&cx, batch).instrument(activation_span),
+        )
+        .await
         {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {
@@ -1519,11 +1525,12 @@ mod tests {
     use nuillu_module::{
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
-        CognitionWriter, LlmRequestMetadata, LlmRequestSource, Memo, Module, ModuleDependencies,
-        ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
+        CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, Memo,
+        Module, ModuleDependencies, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
     };
     use nuillu_types::{
-        MemoryContent, MemoryIndex, ModelTier, ModuleId, ReplicaCapRange, ReplicaIndex, builtin,
+        MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
+        ReplicaIndex, builtin,
     };
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
@@ -1543,6 +1550,10 @@ mod tests {
 
     fn compaction_observer_id() -> ModuleId {
         ModuleId::new("compaction-observer").unwrap()
+    }
+
+    fn llm_metadata_observer_id() -> ModuleId {
+        ModuleId::new("llm-metadata-observer").unwrap()
     }
 
     fn request_question(request: &AttentionControlRequest) -> &str {
@@ -1731,6 +1742,70 @@ mod tests {
         batches: Rc<RefCell<Vec<Vec<String>>>>,
         first_done: Option<oneshot::Sender<()>>,
         second_done: Option<oneshot::Sender<()>>,
+    }
+
+    struct LlmMetadataRetryObserver {
+        attention_control_inbox: AttentionControlRequestInbox,
+        llm: LlmAccess,
+        observations: Rc<RefCell<Vec<LlmMetadataObservation>>>,
+        attempts: Rc<Cell<u8>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct LlmMetadataObservation {
+        module_turn: Option<LlmRequestMetadata>,
+        session_compaction: Option<LlmRequestMetadata>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for LlmMetadataRetryObserver {
+        type Batch = AttentionControlRequest;
+
+        fn id() -> &'static str {
+            "llm-metadata-observer"
+        }
+
+        fn role_description() -> &'static str {
+            "test stub"
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.attention_control_inbox.next_item().await?.body)
+        }
+
+        async fn activate(
+            &mut self,
+            cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            let module_turn = self
+                .llm
+                .lutum()
+                .await
+                .default_extensions()
+                .get::<LlmRequestMetadata>()
+                .cloned();
+            let session_compaction = cx
+                .session_compaction()
+                .lutum()
+                .default_extensions()
+                .get::<LlmRequestMetadata>()
+                .cloned();
+            self.observations.borrow_mut().push(LlmMetadataObservation {
+                module_turn,
+                session_compaction,
+            });
+            let attempt = self.attempts.get().saturating_add(1);
+            self.attempts.set(attempt);
+            if attempt < 2 {
+                anyhow::bail!("retry metadata probe");
+            }
+            if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
     }
 
     #[async_trait(?Send)]
@@ -2765,6 +2840,13 @@ mod tests {
                             ),
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
+                            activation_attempt: Some(1),
+                            batch: Some(nuillu_module::LlmBatchDebug {
+                                batch_type: std::any::type_name::<AttentionControlRequest>()
+                                    .to_string(),
+                                batch_debug: "Query { question: \"ping\", reason: None }"
+                                    .to_string(),
+                            }),
                         })
                     );
                     assert_eq!(observation.module_tier, ModelTier::Premium);
@@ -2775,6 +2857,97 @@ mod tests {
                 })
                 .await
                 .expect("scheduler returned err");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn llm_metadata_includes_activation_attempt_and_batch_for_module_and_compaction() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(llm_metadata_observer_id(), ModuleConfig::default());
+                alloc.set_model_override(llm_metadata_observer_id(), ModelTier::Premium);
+                alloc.set_activation(llm_metadata_observer_id(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_policy(
+                    blackboard,
+                    RuntimePolicy {
+                        session_compaction: SessionCompactionPolicy::new(11, 22, 33),
+                        ..RuntimePolicy::default()
+                    },
+                );
+                let observations = Rc::new(RefCell::new(Vec::new()));
+                let attempts = Rc::new(Cell::new(0_u8));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let observations = Rc::clone(&observations);
+                            let attempts = Rc::clone(&attempts);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| LlmMetadataRetryObserver {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                llm: caps.llm_access(),
+                                observations: Rc::clone(&observations),
+                                attempts: Rc::clone(&attempts),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::query("ping"))
+                        .await
+                        .expect("attention request should route to observer");
+                    done_rx.await.expect("second activation should finish");
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("scheduler returned err");
+
+                let expected_batch = LlmBatchDebug {
+                    batch_type: std::any::type_name::<AttentionControlRequest>().to_string(),
+                    batch_debug: "Query { question: \"ping\", reason: None }".to_string(),
+                };
+                let owner = ModuleInstanceId::new(llm_metadata_observer_id(), ReplicaIndex::ZERO);
+                let observations = observations.borrow();
+                assert_eq!(observations.len(), 2);
+                for (index, observation) in observations.iter().enumerate() {
+                    let attempt = u32::try_from(index + 1).unwrap();
+                    assert_eq!(
+                        observation.module_turn,
+                        Some(LlmRequestMetadata {
+                            owner: owner.clone(),
+                            tier: ModelTier::Premium,
+                            source: LlmRequestSource::ModuleTurn,
+                            activation_attempt: Some(attempt),
+                            batch: Some(expected_batch.clone()),
+                        })
+                    );
+                    assert_eq!(
+                        observation.session_compaction,
+                        Some(LlmRequestMetadata {
+                            owner: owner.clone(),
+                            tier: ModelTier::Cheap,
+                            source: LlmRequestSource::SessionCompaction,
+                            activation_attempt: Some(attempt),
+                            batch: Some(expected_batch.clone()),
+                        })
+                    );
+                }
             })
             .await;
     }

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -11,6 +12,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::LutumTiers;
 use crate::rate_limit::{CapabilityKind, RateLimiter};
 use crate::runtime_events::RuntimeEventEmitter;
+use crate::r#trait::ModuleBatch;
+
+const MAX_LLM_BATCH_DEBUG_CHARS: usize = 20_000;
 
 /// Source of a Lutum request issued by a module-scoped runtime handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +22,21 @@ use crate::runtime_events::RuntimeEventEmitter;
 pub enum LlmRequestSource {
     ModuleTurn,
     SessionCompaction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmBatchDebug {
+    pub batch_type: String,
+    pub batch_debug: String,
+}
+
+impl LlmBatchDebug {
+    pub fn from_batch(batch: &ModuleBatch) -> Self {
+        Self {
+            batch_type: batch.type_name().to_string(),
+            batch_debug: truncated_batch_debug(batch.debug()),
+        }
+    }
 }
 
 /// Per-request metadata attached to [`lutum::RequestExtensions`].
@@ -29,6 +48,50 @@ pub struct LlmRequestMetadata {
     pub owner: ModuleInstanceId,
     pub tier: ModelTier,
     pub source: LlmRequestSource,
+    #[serde(default)]
+    pub activation_attempt: Option<u32>,
+    #[serde(default)]
+    pub batch: Option<LlmBatchDebug>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivationLlmRequestMetadata {
+    activation_attempt: u32,
+    batch: LlmBatchDebug,
+}
+
+tokio::task_local! {
+    static ACTIVATION_LLM_REQUEST_METADATA: ActivationLlmRequestMetadata;
+}
+
+pub async fn with_activation_llm_request_metadata<F, T>(
+    activation_attempt: u32,
+    batch: &ModuleBatch,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    ACTIVATION_LLM_REQUEST_METADATA
+        .scope(
+            ActivationLlmRequestMetadata {
+                activation_attempt,
+                batch: LlmBatchDebug::from_batch(batch),
+            },
+            future,
+        )
+        .await
+}
+
+pub fn current_activation_llm_request_metadata() -> (Option<u32>, Option<LlmBatchDebug>) {
+    ACTIVATION_LLM_REQUEST_METADATA
+        .try_with(|metadata| {
+            (
+                Some(metadata.activation_attempt),
+                Some(metadata.batch.clone()),
+            )
+        })
+        .unwrap_or((None, None))
 }
 
 /// Shared admission control for LLM turns.
@@ -152,13 +215,28 @@ impl LlmAccess {
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
         self.events.llm_accessed(self.owner.clone(), tier).await;
+        let (activation_attempt, batch) = current_activation_llm_request_metadata();
         let lutum = self.tiers.pick(tier).with_extension(LlmRequestMetadata {
             owner: self.owner.clone(),
             tier,
             source: LlmRequestSource::ModuleTurn,
+            activation_attempt,
+            batch,
         });
         LlmLease::new(lutum, permit)
     }
+}
+
+fn truncated_batch_debug(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len().min(MAX_LLM_BATCH_DEBUG_CHARS));
+    for (index, ch) in debug.chars().enumerate() {
+        if index == MAX_LLM_BATCH_DEBUG_CHARS {
+            out.push_str("\n... [truncated]");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -317,6 +395,8 @@ mod tests {
                 owner,
                 tier: ModelTier::Premium,
                 source: LlmRequestSource::ModuleTurn,
+                activation_attempt: None,
+                batch: None,
             })]
         );
     }
