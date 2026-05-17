@@ -4,7 +4,7 @@ now = "2026-05-10T08:21:00+09:00"
 modules = ["sensory", "cognition-gate", "allocation-controller", "query-memory", "speak-gate", "speak"]
 
 limits {
-  max-llm-calls = 22
+  max-llm-calls = 12
 }
 
 participants = ["Pibi", "Koro"]

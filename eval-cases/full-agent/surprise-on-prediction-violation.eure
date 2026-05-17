@@ -14,7 +14,7 @@ modules = [
 ]
 
 limits {
-  max-llm-calls = 30
+  max-llm-calls = 12
 }
 
 participants = ["Koro"]
