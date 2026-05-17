@@ -81,6 +81,16 @@ struct Args {
     #[arg(long)]
     fail_fast: bool,
 
+    /// Run only cases that failed or were invalid in the latest eval report under --output.
+    #[arg(long)]
+    failed_only: bool,
+
+    /// Run only cases that failed or were invalid in the referenced eval report.
+    ///
+    /// Accepts a suite-report.json path, a run directory, or a run id under --output.
+    #[arg(long, value_name = "RUN_ID_OR_PATH")]
+    failed_from: Option<PathBuf>,
+
     /// Maximum concurrent agent LLM calls. Defaults to unlimited.
     #[arg(long, env = "NUILLU_EVAL_MAX_CONCURRENT_LLM_CALLS")]
     max_concurrent_llm_calls: Option<NonZeroUsize>,
@@ -159,6 +169,8 @@ fn main() -> anyhow::Result<()> {
         model_dir: args.model_dir,
         embedding_backend,
         fail_fast: args.fail_fast,
+        failed_only: args.failed_only,
+        failed_from: args.failed_from,
         max_concurrent_llm_calls,
         case_patterns: args.patterns,
         disabled_modules: args.disable_module,

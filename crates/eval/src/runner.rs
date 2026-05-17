@@ -49,7 +49,7 @@ use nuillu_visualizer_protocol::{
     VisualizerClientMessage, VisualizerCommand, VisualizerErrorView, VisualizerEvent,
     VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -99,6 +99,8 @@ pub struct RunnerConfig {
     pub model_dir: PathBuf,
     pub embedding_backend: Option<EmbeddingBackendConfig>,
     pub fail_fast: bool,
+    pub failed_only: bool,
+    pub failed_from: Option<PathBuf>,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
     pub disabled_modules: Vec<EvalModule>,
@@ -294,6 +296,32 @@ pub enum RunnerError {
     TraceSubscriber { message: String },
     #[error("case patterns matched no eval cases: {patterns}")]
     NoCasesMatched { patterns: String },
+    #[error("failed-only requested but no suite-report.json files were found under {path}")]
+    FailedOnlyNoReference { path: PathBuf },
+    #[error("failed-only reference report not found at {path}")]
+    FailedOnlyReferenceNotFound { path: PathBuf },
+    #[error("failed to discover failed-only reference reports under {path}: {source}")]
+    DiscoverFailedOnlyReference {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to read failed-only reference report {path}: {source}")]
+    ReadFailedOnlyReference {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse failed-only reference report {path}: {source}")]
+    ParseFailedOnlyReference {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "failed-only reference case is not present under current cases root: id={id} path={path}"
+    )]
+    FailedOnlyCaseNotFound { id: String, path: String },
     #[error("cannot disable required module '{module}'")]
     DisableRequiredModule { module: &'static str },
     #[error("module cases are not supported with --gui")]
@@ -313,6 +341,31 @@ struct CaseOutputContext<'a> {
     reporter: &'a LiveReporter,
 }
 
+#[derive(Debug, Clone)]
+struct CaseSelection {
+    case_paths: Vec<PathBuf>,
+    failed_from: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CaseIdentity {
+    path: String,
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailedOnlySuiteReport {
+    cases: Vec<FailedOnlyCaseSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailedOnlyCaseSummary {
+    path: String,
+    id: String,
+    passed: bool,
+    invalid: bool,
+}
+
 pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError> {
     let mut hooks = RunnerHooks::none();
     run_suite_with_hooks(config, &mut hooks).await
@@ -321,14 +374,8 @@ pub async fn run_suite(config: &RunnerConfig) -> Result<SuiteReport, RunnerError
 pub(crate) fn visualizer_planned_tabs(
     config: &RunnerConfig,
 ) -> Result<Vec<(VisualizerTabId, String)>, RunnerError> {
-    let mut case_paths =
-        discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
-            path: config.cases_root.clone(),
-            source,
-        })?;
-    case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
-    case_paths = filter_gui_case_paths(case_paths)?;
-    case_paths
+    select_case_paths(config, true)?
+        .case_paths
         .into_iter()
         .map(|path| {
             let case = parse_case_file(&path)?;
@@ -344,18 +391,16 @@ pub async fn run_suite_with_hooks(
 ) -> Result<SuiteReport, RunnerError> {
     install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
-    let mut case_paths =
-        discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
-            path: config.cases_root.clone(),
-            source,
-        })?;
-    case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
-    if hooks.visualizer.is_some() {
-        case_paths = filter_gui_case_paths(case_paths)?;
-    }
+    let selection = select_case_paths(config, hooks.visualizer.is_some())?;
+    let case_paths = selection.case_paths;
     let run_dir = config.output_root.join(&config.run_id);
     let planned_case_count = case_paths.len();
-    let run_report = suite_run_report(config, &run_dir, planned_case_count);
+    let run_report = suite_run_report(
+        config,
+        &run_dir,
+        planned_case_count,
+        selection.failed_from.as_deref(),
+    );
     std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
         path: run_dir.clone(),
         source,
@@ -452,12 +497,15 @@ fn suite_run_report(
     config: &RunnerConfig,
     run_dir: &Path,
     planned_case_count: usize,
+    failed_from: Option<&Path>,
 ) -> SuiteRunReport {
     SuiteRunReport {
         run_id: config.run_id.clone(),
         cases_root: config.cases_root.display().to_string(),
         output_dir: run_dir.display().to_string(),
         case_patterns: config.case_patterns.clone(),
+        failed_only: failed_only_requested(config),
+        failed_from: failed_from.map(|path| path.display().to_string()),
         fail_fast: config.fail_fast,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls.map(NonZeroUsize::get),
         planned_case_count,
@@ -490,6 +538,187 @@ pub async fn run_case_detailed(
     let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
     let mut hooks = RunnerHooks::none();
     run_case_detailed_with_reporter(case_path, config, judge, &reporter, &mut hooks).await
+}
+
+fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelection, RunnerError> {
+    let failed_from = resolve_failed_only_reference(config)?;
+    let failed_cases = failed_from
+        .as_ref()
+        .map(|report_path| read_failed_only_reference(report_path))
+        .transpose()?;
+    if failed_cases.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(CaseSelection {
+            case_paths: Vec::new(),
+            failed_from,
+        });
+    }
+
+    let mut case_paths =
+        discover_case_files(&config.cases_root).map_err(|source| RunnerError::DiscoverCases {
+            path: config.cases_root.clone(),
+            source,
+        })?;
+    if let Some(failed_cases) = failed_cases.as_ref() {
+        case_paths = filter_failed_only_case_paths(case_paths, &failed_cases)?;
+    }
+    if !case_paths.is_empty() || failed_from.is_none() {
+        case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    }
+    if gui_only && (!case_paths.is_empty() || failed_from.is_none()) {
+        case_paths = filter_gui_case_paths(case_paths)?;
+    }
+    Ok(CaseSelection {
+        case_paths,
+        failed_from,
+    })
+}
+
+fn failed_only_requested(config: &RunnerConfig) -> bool {
+    config.failed_only || config.failed_from.is_some()
+}
+
+fn resolve_failed_only_reference(config: &RunnerConfig) -> Result<Option<PathBuf>, RunnerError> {
+    if !failed_only_requested(config) {
+        return Ok(None);
+    }
+
+    let report_path = if let Some(reference) = config.failed_from.as_ref() {
+        resolve_explicit_failed_only_reference(&config.output_root, reference)
+    } else {
+        latest_failed_only_reference(&config.output_root)?
+    };
+    if !report_path.is_file() {
+        return Err(RunnerError::FailedOnlyReferenceNotFound { path: report_path });
+    }
+    Ok(Some(report_path))
+}
+
+fn resolve_explicit_failed_only_reference(output_root: &Path, reference: &Path) -> PathBuf {
+    if reference.is_file() {
+        reference.to_path_buf()
+    } else if reference.is_dir() {
+        reference.join("suite-report.json")
+    } else {
+        output_root.join(reference).join("suite-report.json")
+    }
+}
+
+fn latest_failed_only_reference(output_root: &Path) -> Result<PathBuf, RunnerError> {
+    let entries = std::fs::read_dir(output_root).map_err(|source| match source.kind() {
+        io::ErrorKind::NotFound => RunnerError::FailedOnlyNoReference {
+            path: output_root.to_path_buf(),
+        },
+        _ => RunnerError::DiscoverFailedOnlyReference {
+            path: output_root.to_path_buf(),
+            source,
+        },
+    })?;
+
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.map_err(|source| RunnerError::DiscoverFailedOnlyReference {
+            path: output_root.to_path_buf(),
+            source,
+        })?;
+        let file_type =
+            entry
+                .file_type()
+                .map_err(|source| RunnerError::DiscoverFailedOnlyReference {
+                    path: output_root.to_path_buf(),
+                    source,
+                })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let report_path = entry.path().join("suite-report.json");
+        let metadata = match report_path.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(RunnerError::DiscoverFailedOnlyReference {
+                    path: output_root.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let modified =
+            metadata
+                .modified()
+                .map_err(|source| RunnerError::DiscoverFailedOnlyReference {
+                    path: report_path.clone(),
+                    source,
+                })?;
+        if newest
+            .as_ref()
+            .is_none_or(|(newest_modified, _)| modified > *newest_modified)
+        {
+            newest = Some((modified, report_path));
+        }
+    }
+
+    newest
+        .map(|(_, path)| path)
+        .ok_or_else(|| RunnerError::FailedOnlyNoReference {
+            path: output_root.to_path_buf(),
+        })
+}
+
+fn read_failed_only_reference(path: &Path) -> Result<Vec<CaseIdentity>, RunnerError> {
+    let bytes = std::fs::read(path).map_err(|source| RunnerError::ReadFailedOnlyReference {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let report: FailedOnlySuiteReport =
+        serde_json::from_slice(&bytes).map_err(|source| RunnerError::ParseFailedOnlyReference {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(report
+        .cases
+        .into_iter()
+        .filter(|case| !case.passed || case.invalid)
+        .map(|case| CaseIdentity {
+            path: case.path,
+            id: case.id,
+        })
+        .collect())
+}
+
+fn filter_failed_only_case_paths(
+    case_paths: Vec<PathBuf>,
+    failed_cases: &[CaseIdentity],
+) -> Result<Vec<PathBuf>, RunnerError> {
+    if failed_cases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let target_cases = failed_cases.iter().cloned().collect::<HashSet<_>>();
+    let mut available_cases = HashSet::new();
+    let mut indexed_paths = Vec::with_capacity(case_paths.len());
+    for path in case_paths {
+        let case = parse_case_file(&path)?;
+        let identity = CaseIdentity {
+            path: path.display().to_string(),
+            id: case_id(&path, &case),
+        };
+        available_cases.insert(identity.clone());
+        indexed_paths.push((path, identity));
+    }
+
+    for failed_case in failed_cases {
+        if !available_cases.contains(failed_case) {
+            return Err(RunnerError::FailedOnlyCaseNotFound {
+                id: failed_case.id.clone(),
+                path: failed_case.path.clone(),
+            });
+        }
+    }
+
+    Ok(indexed_paths
+        .into_iter()
+        .filter_map(|(path, identity)| target_cases.contains(&identity).then_some(path))
+        .collect())
 }
 
 fn filter_case_paths(
@@ -1097,18 +1326,14 @@ async fn execute_full_agent_case(
                             }),
                             format!(
                                 "💤 eval idle case={} idle_for_ms={} events={} active=[{}]",
-                                case_id_for_idle,
-                                idle_for_ms,
-                                event_count,
-                                active_summary
+                                case_id_for_idle, idle_for_ms, event_count, active_summary
                             ),
                         )
                         .expect("full-agent eval failed to write idle event");
                 }
                 if idle_for_ms >= duration_millis_u64(FULL_AGENT_IDLE_TIMEOUT) {
                     let seconds = idle_for_ms / 1000;
-                    let message =
-                        format!("no runtime events for {seconds}s; agent appears stuck");
+                    let message = format!("no runtime events for {seconds}s; agent appears stuck");
                     step_failure_for_loop
                         .lock()
                         .expect("step failure mutex poisoned")
@@ -4850,10 +5075,38 @@ mod tests {
             model_dir: dir.join("missing-model"),
             embedding_backend: None,
             fail_fast: false,
+            failed_only: false,
+            failed_from: None,
             max_concurrent_llm_calls: None,
             case_patterns: Vec::new(),
             disabled_modules: Vec::new(),
         }
+    }
+
+    fn write_query_memory_case(root: &Path, name: &str, id: &str) -> PathBuf {
+        let case_dir = root.join("eval-cases/modules/query-memory");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let path = case_dir.join(format!("{name}.eure"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+id = "{id}"
+prompt = "Find memory."
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_suite_report(path: &Path, cases: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({ "cases": cases })).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5071,6 +5324,8 @@ id = "module-query-memory-special-memory"
             model_dir: dir.path().join("models"),
             embedding_backend: None,
             fail_fast: false,
+            failed_only: false,
+            failed_from: None,
             max_concurrent_llm_calls: None,
             case_patterns: vec!["special-memory".to_string()],
             disabled_modules: Vec::new(),
@@ -5081,6 +5336,200 @@ id = "module-query-memory-special-memory"
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].0.as_str(), "module-query-memory-special-memory");
         assert_eq!(tabs[0].1, "module-query-memory-special-memory");
+    }
+
+    #[test]
+    fn failed_only_selects_latest_failed_and_invalid_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let passed = write_query_memory_case(dir.path(), "passed", "module-query-memory-passed");
+        let failed = write_query_memory_case(dir.path(), "failed", "module-query-memory-failed");
+        let invalid = write_query_memory_case(dir.path(), "invalid", "module-query-memory-invalid");
+        let output_root = dir.path().join("out");
+        let old_report = output_root.join("old-run/suite-report.json");
+        write_suite_report(
+            &old_report,
+            serde_json::json!([
+                {
+                    "path": passed.display().to_string(),
+                    "id": "module-query-memory-passed",
+                    "passed": false,
+                    "invalid": false
+                }
+            ]),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let latest_report = output_root.join("latest-run/suite-report.json");
+        write_suite_report(
+            &latest_report,
+            serde_json::json!([
+                {
+                    "path": passed.display().to_string(),
+                    "id": "module-query-memory-passed",
+                    "passed": true,
+                    "invalid": false
+                },
+                {
+                    "path": failed.display().to_string(),
+                    "id": "module-query-memory-failed",
+                    "passed": false,
+                    "invalid": false
+                },
+                {
+                    "path": invalid.display().to_string(),
+                    "id": "module-query-memory-invalid",
+                    "passed": false,
+                    "invalid": true
+                }
+            ]),
+        );
+        let mut config = test_runner_config(dir.path());
+        config.output_root = output_root;
+        config.failed_only = true;
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.failed_from, Some(latest_report));
+        assert_eq!(selection.case_paths, vec![failed, invalid]);
+    }
+
+    #[test]
+    fn failed_from_resolves_run_id_run_dir_and_report_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("out/run-a/suite-report.json");
+        write_suite_report(&report, serde_json::json!([]));
+        let mut config = test_runner_config(dir.path());
+        config.output_root = dir.path().join("out");
+
+        config.failed_from = Some(PathBuf::from("run-a"));
+        assert_eq!(
+            resolve_failed_only_reference(&config).unwrap(),
+            Some(report.clone())
+        );
+
+        config.failed_from = Some(report.parent().unwrap().to_path_buf());
+        assert_eq!(
+            resolve_failed_only_reference(&config).unwrap(),
+            Some(report.clone())
+        );
+
+        config.failed_from = Some(report.clone());
+        assert_eq!(
+            resolve_failed_only_reference(&config).unwrap(),
+            Some(report)
+        );
+    }
+
+    #[test]
+    fn failed_only_patterns_intersect_reference_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_query_memory_case(dir.path(), "first", "module-query-memory-first");
+        let special = write_query_memory_case(dir.path(), "special", "module-query-memory-special");
+        let report = dir.path().join("out/run-a/suite-report.json");
+        write_suite_report(
+            &report,
+            serde_json::json!([
+                {
+                    "path": first.display().to_string(),
+                    "id": "module-query-memory-first",
+                    "passed": false,
+                    "invalid": false
+                },
+                {
+                    "path": special.display().to_string(),
+                    "id": "module-query-memory-special",
+                    "passed": false,
+                    "invalid": true
+                }
+            ]),
+        );
+        let mut config = test_runner_config(dir.path());
+        config.output_root = dir.path().join("out");
+        config.failed_from = Some(PathBuf::from("run-a"));
+        config.case_patterns = vec!["special".to_string()];
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![special]);
+    }
+
+    #[test]
+    fn failed_only_all_passed_reference_selects_no_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let passed = write_query_memory_case(dir.path(), "passed", "module-query-memory-passed");
+        let report = dir.path().join("out/run-a/suite-report.json");
+        write_suite_report(
+            &report,
+            serde_json::json!([
+                {
+                    "path": passed.display().to_string(),
+                    "id": "module-query-memory-passed",
+                    "passed": true,
+                    "invalid": false
+                }
+            ]),
+        );
+        let mut config = test_runner_config(dir.path());
+        config.output_root = dir.path().join("out");
+        config.failed_from = Some(PathBuf::from("run-a"));
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert!(selection.case_paths.is_empty());
+    }
+
+    #[test]
+    fn failed_only_reports_reference_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_runner_config(dir.path());
+        config.failed_only = true;
+        let error = select_case_paths(&config, false).unwrap_err();
+        assert!(matches!(error, RunnerError::FailedOnlyNoReference { .. }));
+
+        let bad_report = dir.path().join("out/bad/suite-report.json");
+        std::fs::create_dir_all(bad_report.parent().unwrap()).unwrap();
+        std::fs::write(&bad_report, "not json").unwrap();
+        config.failed_only = false;
+        config.failed_from = Some(bad_report);
+        let error = select_case_paths(&config, false).unwrap_err();
+        assert!(matches!(
+            error,
+            RunnerError::ParseFailedOnlyReference { .. }
+        ));
+
+        let missing_report = dir.path().join("out/missing-case/suite-report.json");
+        write_suite_report(
+            &missing_report,
+            serde_json::json!([
+                {
+                    "path": "eval-cases/modules/query-memory/missing.eure",
+                    "id": "module-query-memory-missing",
+                    "passed": false,
+                    "invalid": false
+                }
+            ]),
+        );
+        config.failed_from = Some(missing_report);
+        std::fs::create_dir_all(dir.path().join("eval-cases")).unwrap();
+        let error = select_case_paths(&config, false).unwrap_err();
+        assert!(matches!(error, RunnerError::FailedOnlyCaseNotFound { .. }));
+    }
+
+    #[test]
+    fn suite_run_report_records_failed_only_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_runner_config(dir.path());
+        config.failed_from = Some(PathBuf::from("run-a"));
+        let run_dir = dir.path().join("out/rerun");
+        let failed_from = dir.path().join("out/run-a/suite-report.json");
+
+        let report = suite_run_report(&config, &run_dir, 0, Some(&failed_from));
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["failed_only"], serde_json::json!(true));
+        assert_eq!(
+            json["failed_from"],
+            serde_json::json!(failed_from.display().to_string())
+        );
     }
 
     #[test]
@@ -5259,6 +5708,8 @@ limits {{
             model_dir: dir.path().join("missing-model"),
             embedding_backend: None,
             fail_fast: false,
+            failed_only: false,
+            failed_from: None,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),
             disabled_modules: Vec::new(),
@@ -5303,6 +5754,8 @@ limits {{
                 "cases_root": config.cases_root.display().to_string(),
                 "output_dir": run_dir.display().to_string(),
                 "case_patterns": [],
+                "failed_only": false,
+                "failed_from": null,
                 "fail_fast": false,
                 "max_concurrent_llm_calls": 7,
                 "planned_case_count": 2,

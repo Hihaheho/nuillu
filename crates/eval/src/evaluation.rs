@@ -66,6 +66,8 @@ pub struct SuiteRunReport {
     pub cases_root: String,
     pub output_dir: String,
     pub case_patterns: Vec<String>,
+    pub failed_only: bool,
+    pub failed_from: Option<String>,
     pub fail_fast: bool,
     pub max_concurrent_llm_calls: Option<usize>,
     pub planned_case_count: usize,
