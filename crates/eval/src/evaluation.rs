@@ -370,6 +370,14 @@ fn evaluate_deterministic_check(
                 }),
             )
         }
+        Check::JsonPointerNumericInRange {
+            pointer, min, max, ..
+        } => {
+            let json = artifact.as_json();
+            let actual = pointer_number(&json, pointer);
+            let (passed, diagnostic) = numeric_range_outcome(pointer, actual, *min, *max);
+            build_outcome(check, passed, diagnostic)
+        }
         Check::TraceSpan { span_name, .. } => build_outcome(
             check,
             trace.span_exists(span_name),
@@ -561,6 +569,43 @@ pub(crate) fn field_label(field: ArtifactTextField) -> &'static str {
 
 pub(crate) fn pointer_text(value: &serde_json::Value, pointer: &str) -> Option<String> {
     value.pointer(pointer).map(json_value_text)
+}
+
+pub(crate) fn pointer_number(value: &serde_json::Value, pointer: &str) -> Option<f64> {
+    value.pointer(pointer).and_then(|v| v.as_f64())
+}
+
+pub(crate) fn numeric_range_outcome(
+    pointer: &str,
+    actual: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+) -> (bool, Option<String>) {
+    let Some(actual) = actual else {
+        return (
+            false,
+            Some(format!(
+                "JSON pointer {pointer:?} did not resolve to a number"
+            )),
+        );
+    };
+    let above_min = min.is_none_or(|m| actual >= m);
+    let below_max = max.is_none_or(|m| actual <= m);
+    if above_min && below_max {
+        return (true, None);
+    }
+    let range_label = match (min, max) {
+        (Some(min), Some(max)) => format!("[{min}, {max}]"),
+        (Some(min), None) => format!(">= {min}"),
+        (None, Some(max)) => format!("<= {max}"),
+        (None, None) => "any".to_string(),
+    };
+    (
+        false,
+        Some(format!(
+            "expected JSON pointer {pointer:?} to be in range {range_label}, got {actual}"
+        )),
+    )
 }
 
 fn module_scoped_artifact(module: EvalModule, artifact: &CaseArtifact) -> CaseArtifact {

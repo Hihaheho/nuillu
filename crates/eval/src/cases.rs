@@ -721,6 +721,15 @@ pub enum Check {
         pointer: String,
         contains: String,
     },
+    JsonPointerNumericInRange {
+        #[eure(flatten)]
+        common: CheckCommon,
+        pointer: String,
+        #[eure(default)]
+        min: Option<f64>,
+        #[eure(default)]
+        max: Option<f64>,
+    },
     Rubric {
         #[eure(flatten)]
         common: CheckCommon,
@@ -782,6 +791,7 @@ impl Check {
             | Self::ArtifactTextExact { common, .. }
             | Self::JsonPointerEquals { common, .. }
             | Self::JsonPointerContains { common, .. }
+            | Self::JsonPointerNumericInRange { common, .. }
             | Self::Rubric { common, .. }
             | Self::TraceSpan { common, .. }
             | Self::TraceEvent { common, .. }
@@ -795,6 +805,7 @@ impl Check {
             Self::ArtifactTextExact { .. } => "artifact-text-exact",
             Self::JsonPointerEquals { .. } => "json-pointer-equals",
             Self::JsonPointerContains { .. } => "json-pointer-contains",
+            Self::JsonPointerNumericInRange { .. } => "json-pointer-numeric-in-range",
             Self::Rubric { .. } => "rubric",
             Self::TraceSpan { .. } => "trace-span",
             Self::TraceEvent { .. } => "trace-event",
@@ -1104,6 +1115,7 @@ fn is_step_compatible_check(check: &Check) -> bool {
         check,
         Check::JsonPointerEquals { .. }
             | Check::JsonPointerContains { .. }
+            | Check::JsonPointerNumericInRange { .. }
             | Check::ArtifactTextContains { .. }
             | Check::ArtifactTextExact { .. }
     )
@@ -1380,10 +1392,34 @@ fn validate_common(
 }
 
 fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
-    if let Check::JsonPointerEquals { pointer, .. } | Check::JsonPointerContains { pointer, .. } =
-        check
+    if let Check::JsonPointerEquals { pointer, .. }
+    | Check::JsonPointerContains { pointer, .. }
+    | Check::JsonPointerNumericInRange { pointer, .. } = check
     {
         validate_json_pointer(path, pointer)?;
+    }
+
+    if let Check::JsonPointerNumericInRange { min, max, .. } = check {
+        if min.is_none() && max.is_none() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "json-pointer-numeric-in-range check '{}' must set at least one of min or max",
+                    check.display_name()
+                ),
+            });
+        }
+        if let (Some(min), Some(max)) = (min, max) {
+            if min > max {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "json-pointer-numeric-in-range check '{}' has min ({min}) greater than max ({max})",
+                        check.display_name()
+                    ),
+                });
+            }
+        }
     }
 
     if let Check::Rubric {

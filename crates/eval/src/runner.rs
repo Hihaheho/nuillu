@@ -64,7 +64,8 @@ use crate::{
     },
     evaluation::{
         CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, artifact_text,
-        evaluate_case, field_label, normalize_text_block, pointer_text,
+        evaluate_case, field_label, normalize_text_block, numeric_range_outcome, pointer_number,
+        pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     state_dump::{
@@ -2510,6 +2511,13 @@ fn evaluate_step_check(check: &Check, artifact: &CaseArtifact) -> (bool, Option<
                 None => format!("JSON pointer {pointer:?} did not match artifact"),
             });
             (passed, diagnostic)
+        }
+        Check::JsonPointerNumericInRange {
+            pointer, min, max, ..
+        } => {
+            let json = artifact.as_json();
+            let actual = pointer_number(&json, pointer);
+            numeric_range_outcome(pointer, actual, *min, *max)
         }
         Check::ArtifactTextContains {
             field, contains, ..

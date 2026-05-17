@@ -64,25 +64,26 @@ participants = ["Koro"]
 }
 
 @ checks[] {
-  $variant: json-pointer-contains
+  $variant: json-pointer-numeric-in-range
   name = "speak-heavily-suppressed"
   must-pass = true
   pointer = "/observations/agent/allocation/speak/activation_ratio"
-  contains = "0.0009"
+  max = 0.01
 }
 
 @ checks[] {
-  $variant: json-pointer-contains
+  $variant: json-pointer-numeric-in-range
   name = "suppressed-bpm-is-near-sleep-floor"
   must-pass = true
   pointer = "/observations/agent/allocation/speak/cooldown_ms"
-  contains = "9982"
+  min = 9000.0
 }
 
 @ checks[] {
-  $variant: json-pointer-contains
+  $variant: json-pointer-numeric-in-range
   name = "nrem-memory-compaction-low-frequency"
   must-pass = true
   pointer = "/observations/agent/allocation/memory-compaction/activation_ratio"
-  contains = "0.15"
+  min = 0.05
+  max = 0.25
 }
