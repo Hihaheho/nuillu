@@ -9,7 +9,6 @@ modules = [
   "memory",
   "predict",
   "surprise",
-  "speak-gate",
   "speak",
 ]
 

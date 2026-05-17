@@ -38,7 +38,7 @@ use nuillu_module::{
     SessionCompactionPolicy,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
-use nuillu_speak::{SpeakGateMemo, Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
+use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_types::{
     MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
     builtin,
@@ -1788,7 +1788,7 @@ async fn activate_module_case_target(
                 .await
                 .expect("module eval failed to publish AllocationUpdated");
         }
-        ModuleEvalTarget::Speak | ModuleEvalTarget::SpeakGate => {
+        ModuleEvalTarget::Speak => {
             if has_cognition_log_seed {
                 harness
                     .cognition_log_updated_mailbox()
@@ -3242,10 +3242,9 @@ fn validate_disabled_modules(disabled: &[EvalModule]) -> Result<(), RunnerError>
 }
 
 fn module_case_modules(target: ModuleEvalTarget, case: &ModuleCase) -> Vec<EvalModule> {
-    case.modules.clone().unwrap_or_else(|| match target {
-        ModuleEvalTarget::SpeakGate => vec![EvalModule::SpeakGate, EvalModule::Speak],
-        _ => vec![target.module()],
-    })
+    case.modules
+        .clone()
+        .unwrap_or_else(|| vec![target.module()])
 }
 
 pub(crate) fn eval_registry(
@@ -3314,7 +3313,6 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
         .map(EvalModule::module_id)
         .collect::<std::collections::HashSet<_>>();
     let edges = [
-        (builtin::speak_gate(), builtin::cognition_gate()),
         (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_memory()),
@@ -3348,7 +3346,6 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
-        nuillu_types::builtin::speak_gate(),
     ]
 }
 
@@ -3372,7 +3369,6 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::reward(),
         nuillu_types::builtin::predict(),
         nuillu_types::builtin::surprise(),
-        nuillu_types::builtin::speak_gate(),
         nuillu_types::builtin::speak(),
     ]
 }
@@ -3426,8 +3422,8 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        // Gates the speak path; must re-fire fast as memos accumulate so
-        // the cognition log is current by the time speak-gate considers it.
+        // Must re-fire fast as memos accumulate so the cognition log is
+        // current by the time speak considers it.
         EvalModule::CognitionGate => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
@@ -3508,7 +3504,7 @@ fn register_eval_module(
             )
             .expect("eval module registration should be unique"),
         // Memory retrieval is on the critical path between cognition-gate
-        // and speak-gate; needs a quick active pace.
+        // and speak; needs a quick active pace.
         EvalModule::QueryMemory => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 15.0)),
@@ -3748,26 +3744,8 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        // On the critical path: must respond quickly to cognition-log
-        // updates so it can decide to speak before the moment passes.
-        EvalModule::SpeakGate => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                |caps| {
-                    nuillu_speak::SpeakGateModule::new(
-                        caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
-                        caps.cognition_log_reader(),
-                        caps.blackboard_reader(),
-                        caps.attention_control_mailbox(),
-                        caps.typed_memo::<nuillu_speak::SpeakGateMemo>(),
-                        caps.llm_access(),
-                    )
-                },
-            )
-            .expect("eval module registration should be unique"),
-        // Reactive on cognition-log updates after speak-gate allows the
-        // activation. Match speak-gate so the pair stays in sync.
+        // Reactive on cognition-log updates. The target-selection tool
+        // decides whether this activation emits speech or stays silent.
         EvalModule::Speak => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
@@ -3821,7 +3799,6 @@ pub(crate) fn full_agent_allocation(
             EvalModule::Reward => (0.0, ModelTier::Default),
             EvalModule::Predict => (0.0, ModelTier::Cheap),
             EvalModule::Surprise => (0.0, ModelTier::Default),
-            EvalModule::SpeakGate => (1.0, ModelTier::Premium),
             EvalModule::Speak => (0.0, ModelTier::Premium),
         };
         set_allocation_module(&mut allocation, module.module_id(), activation, tier);
@@ -3850,14 +3827,12 @@ fn module_allocation(
     let target_module = target.module();
     for module in modules {
         let is_target = *module == target_module;
-        let is_required_driver =
-            target_module == EvalModule::SpeakGate && *module == EvalModule::Speak;
         let id = module.module_id();
         allocation.set_model_override(id.clone(), eval_module_tier(*module));
         allocation.set(id.clone(), ModuleConfig::default());
         allocation.set_activation(
             id,
-            if is_target || is_required_driver {
+            if is_target {
                 ActivationRatio::ONE
             } else {
                 ActivationRatio::ZERO
@@ -3902,7 +3877,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::HomeostaticController
         | EvalModule::PolicyCompaction
         | EvalModule::Predict => ModelTier::Cheap,
-        EvalModule::SpeakGate | EvalModule::Speak => ModelTier::Premium,
+        EvalModule::Speak => ModelTier::Premium,
         EvalModule::AllocationController => ModelTier::Default,
         EvalModule::AttentionSchema
         | EvalModule::SelfModel
@@ -3929,42 +3904,6 @@ async fn add_observations(
     artifact
         .observations
         .insert("agent".to_string(), observations);
-    add_typed_memo_observations(artifact, blackboard).await;
-}
-
-async fn add_typed_memo_observations(artifact: &mut CaseArtifact, blackboard: &Blackboard) {
-    let speak_gate_owner = ModuleInstanceId::new(builtin::speak_gate(), ReplicaIndex::ZERO);
-    let speak_gate = blackboard
-        .typed_memo_logs::<SpeakGateMemo>(&speak_gate_owner)
-        .await
-        .into_iter()
-        .map(|record| {
-            let mut value = serde_json::to_value(record.data()).unwrap_or_else(|error| {
-                serde_json::json!({
-                    "serialization_error": error.to_string(),
-                })
-            });
-            if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "replica".to_owned(),
-                    serde_json::json!(record.owner.replica.get()),
-                );
-                object.insert("index".to_owned(), serde_json::json!(record.index));
-                object.insert(
-                    "written_at".to_owned(),
-                    serde_json::json!(record.written_at.to_rfc3339()),
-                );
-                object.insert("content".to_owned(), serde_json::json!(record.content));
-            }
-            value
-        })
-        .collect::<Vec<_>>();
-    artifact.observations.insert(
-        "typed_memo_logs".to_owned(),
-        serde_json::json!({
-            "speak-gate": speak_gate,
-        }),
-    );
 }
 
 async fn build_full_agent_last_state_dump(
@@ -5794,52 +5733,6 @@ id = "module-query-memory-special-memory"
     }
 
     #[tokio::test]
-    async fn add_observations_includes_speak_gate_typed_memo_payload() {
-        let blackboard = Blackboard::new();
-        let owner = ModuleInstanceId::new(builtin::speak_gate(), ReplicaIndex::ZERO);
-        blackboard
-            .update_typed_memo(
-                owner,
-                "Speak decision: no need to speak".to_owned(),
-                SpeakGateMemo {
-                    kind: nuillu_speak::SpeakGateMemoKind::NoNeedToSpeak,
-                    rationale: "missing memory evidence".to_owned(),
-                    evidence_gaps: vec![nuillu_speak::EvidenceGap {
-                        source: nuillu_speak::EvidenceGapSource::Memory,
-                        question: "Where is the pebble?".to_owned(),
-                        needed_fact: "blue pebble location".to_owned(),
-                    }],
-                    forced: false,
-                    latest_cognition_index: Some(7),
-                },
-                Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap(),
-            )
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
-        let actions = Rc::new(ActionActivityTracker::new(vec![builtin::speak()]));
-        let utterances =
-            RecordingUtteranceSink::new("test-case".to_owned(), reporter, actions, None);
-        let mut artifact = CaseArtifact::new("");
-
-        add_observations(&mut artifact, &blackboard, &utterances).await;
-        let json = artifact.as_json();
-
-        assert_eq!(
-            pointer_text(
-                &json,
-                "/observations/typed_memo_logs/speak-gate/0/evidence_gaps/0/source",
-            )
-            .as_deref(),
-            Some("memory")
-        );
-        assert_eq!(
-            pointer_text(&json, "/observations/typed_memo_logs/speak-gate/0/forced").as_deref(),
-            Some("false")
-        );
-    }
-
-    #[tokio::test]
     async fn memory_diff_observation_exposes_entries_and_links_structurally() {
         let summary_index = MemoryIndex::new("summary");
         let source_index = MemoryIndex::new("source");
@@ -6570,8 +6463,8 @@ prompt = "What am I attending to?"
             modules_checks: Vec::new(),
             scoring: Default::default(),
         };
-        let modules = full_agent_case_modules(&case, &[EvalModule::SpeakGate]);
-        assert!(!modules.contains(&EvalModule::SpeakGate));
+        let modules = full_agent_case_modules(&case, &[EvalModule::QueryMemory]);
+        assert!(!modules.contains(&EvalModule::QueryMemory));
         assert!(modules.contains(&EvalModule::Speak));
         assert!(modules.contains(&EvalModule::AllocationController));
     }
@@ -6585,7 +6478,7 @@ prompt = "What am I attending to?"
                 RunnerError::DisableRequiredModule { module } if module == required.as_str()
             ));
         }
-        assert!(validate_disabled_modules(&[EvalModule::SpeakGate]).is_ok());
+        assert!(validate_disabled_modules(&[EvalModule::QueryMemory]).is_ok());
     }
 
     #[tokio::test]
@@ -6711,15 +6604,6 @@ prompt = "What am I attending to?"
         assert_eq!(
             allocation.tier_for(&builtin::homeostatic_controller()),
             ModelTier::Cheap
-        );
-
-        assert_eq!(
-            allocation.activation_for(&builtin::speak_gate()),
-            ActivationRatio::ONE
-        );
-        assert_eq!(
-            allocation.tier_for(&builtin::speak_gate()),
-            ModelTier::Premium
         );
 
         assert_eq!(

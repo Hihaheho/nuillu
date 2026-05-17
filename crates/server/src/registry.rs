@@ -54,7 +54,6 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
         .map(RuntimeModule::module_id)
         .collect::<std::collections::HashSet<_>>();
     let edges = [
-        (builtin::speak_gate(), builtin::cognition_gate()),
         (builtin::self_model(), builtin::query_memory()),
         (builtin::cognition_gate(), builtin::sensory()),
         (builtin::cognition_gate(), builtin::query_memory()),
@@ -319,18 +318,6 @@ fn register_server_module(
                 )
             })
         }
-        RuntimeModule::SpeakGate => {
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_speak::SpeakGateModule::new(
-                    caps.activation_gate_for::<nuillu_speak::SpeakModule>(),
-                    caps.cognition_log_reader(),
-                    caps.blackboard_reader(),
-                    caps.attention_control_mailbox(),
-                    caps.typed_memo::<nuillu_speak::SpeakGateMemo>(),
-                    caps.llm_access(),
-                )
-            })
-        }
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), move |caps| {
@@ -374,7 +361,6 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::Reward => (0.0, ModelTier::Default),
             RuntimeModule::Predict => (0.0, ModelTier::Cheap),
             RuntimeModule::Surprise => (0.0, ModelTier::Default),
-            RuntimeModule::SpeakGate => (1.0, ModelTier::Premium),
             RuntimeModule::Speak => (0.0, ModelTier::Premium),
         };
         set_allocation_module(&mut allocation, module.module_id(), activation, tier);
@@ -413,7 +399,6 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
         builtin::reward(),
         builtin::predict(),
         builtin::surprise(),
-        builtin::speak_gate(),
         builtin::speak(),
     ]
 }

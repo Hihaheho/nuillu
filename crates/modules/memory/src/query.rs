@@ -26,7 +26,7 @@ Retrieve memory evidence. Memory is not a fact table and retrieval must not deci
 Use search_memory for ordinary flat memory search. Use fetch_linked_memories only after a
 specific search hit or prior memo makes linked context useful. Linked lookup is explicit; ordinary
 search results are flat and do not include hidden bundles.
-If the question contains allocation guidance or a speak-gate evidence request, search for the concrete
+If the question contains allocation guidance or a speech evidence request, search for the concrete
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
 phrases. Do not search for generic phrases such as "useful memory context" when a concrete guidance
 question is available.

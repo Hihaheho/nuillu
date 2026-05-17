@@ -52,7 +52,6 @@ variants.policy = { = "policy", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
-variants.speak-gate = { = "speak-gate", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
 
 @ $types.memory-rank

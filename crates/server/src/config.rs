@@ -59,7 +59,6 @@ pub enum RuntimeModule {
     Reward,
     Predict,
     Surprise,
-    SpeakGate,
     Speak,
 }
 
@@ -81,7 +80,6 @@ pub const DEFAULT_MODULES: &[RuntimeModule] = &[
     RuntimeModule::Reward,
     RuntimeModule::Predict,
     RuntimeModule::Surprise,
-    RuntimeModule::SpeakGate,
     RuntimeModule::Speak,
 ];
 
@@ -105,7 +103,6 @@ impl RuntimeModule {
             Self::Reward => builtin::reward(),
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
-            Self::SpeakGate => builtin::speak_gate(),
             Self::Speak => builtin::speak(),
         }
     }

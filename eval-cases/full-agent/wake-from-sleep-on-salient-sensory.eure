@@ -8,7 +8,6 @@ modules = [
   "allocation-controller",
   "interoception",
   "homeostatic-controller",
-  "speak-gate",
   "speak",
 ]
 
@@ -44,11 +43,6 @@ participants = ["Koro"]
   activation-ratio = 1.0
 }
 
-@ activate-allocation[] {
-  module = "speak-gate"
-  activation-ratio = 1.0
-}
-
 @ steps[] {
   description = "First wait quietly until interoception enters NREM-like sleep pressure."
   wait-for.$variant: some.interoception
@@ -78,12 +72,4 @@ participants = ["Koro"]
   must-pass = true
   pointer = "/observations/agent/interoception/mode"
   expected = "wake"
-}
-
-@ checks[] {
-  $variant: json-pointer-contains
-  name = "speak-gate-unsuppressed-after-wake"
-  must-pass = true
-  pointer = "/observations/agent/allocation/speak-gate/activation_ratio"
-  contains = "1.0"
 }

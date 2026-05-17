@@ -1,4 +1,4 @@
-/// Schema for eval-cases/modules/{speak,speak-gate}/**/*.eure files.
+/// Schema for eval-cases/modules/speak/**/*.eure files.
 
 $schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
 
@@ -64,7 +64,6 @@ variants.policy = { = "policy", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }
 variants.predict = { = "predict", $variant => "literal" }
 variants.surprise = { = "surprise", $variant => "literal" }
-variants.speak-gate = { = "speak-gate", $variant => "literal" }
 variants.speak = { = "speak", $variant => "literal" }
 
 @ $types.memory-rank

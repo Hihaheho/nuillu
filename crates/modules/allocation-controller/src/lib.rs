@@ -39,12 +39,11 @@ concrete requested work in that module's guidance hint. If you defer or reject a
 activate a module for it. In every case, record the admit/defer/reject judgement and reason in
 `memo`; there is no durable pending request queue outside this controller note.
 
-Speech output is driven by cognition-log updates that pass speak-gate's activation gate, not by
-allocation priority. Speak-gate is always allocated by the host and is not in this priority list —
-do not try to allocate it. Speech is the agent's primary outward action in its world, not a
-chat-style response gated on a user request — keep speak near the top of priority so the agent can
-address peers, answer questions directed at it, and express in-world intent. Dropping speak from
-the priority list is suppressing the agent's voice.
+Speech output is driven by cognition-log updates and by speak's own optional target tool. Speech is
+the agent's primary outward action in its world, not a chat-style response gated on a user request —
+keep speak near the top of priority when speech may be warranted so the agent can address peers,
+answer questions directed at it, and express in-world intent. Dropping speak from the priority list
+is suppressing the agent's voice.
 
 The memo field is a free-form controller note; preserve the reasoning needed by other modules but
 do not encode it as JSON, YAML, a code block, or any fixed schema.
@@ -791,7 +790,7 @@ mod tests {
         let input = controller_request_input(&[
             AttentionControlRequest::query_with_reason(
                 "which route is safe?",
-                "speak-gate requested evidence",
+                "speech needs grounded evidence",
             ),
             AttentionControlRequest::memory(
                 "Remember the north door is blocked.",
@@ -802,7 +801,7 @@ mod tests {
 
         assert_eq!(
             input,
-            "Current attention-control requests:\n- Query: which route is safe? Reason: speak-gate requested evidence\n- High-priority memory: Remember the north door is blocked. Reason: direct safety constraint"
+            "Current attention-control requests:\n- Query: which route is safe? Reason: speech needs grounded evidence\n- High-priority memory: Remember the north door is blocked. Reason: direct safety constraint"
                 .to_owned()
         );
     }

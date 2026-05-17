@@ -12,7 +12,6 @@ modules = [
   "interoception",
   "homeostatic-controller",
   "policy-compaction",
-  "speak-gate",
   "speak",
 ]
 
@@ -48,11 +47,6 @@ participants = ["Koro"]
   activation-ratio = 1.0
 }
 
-@ activate-allocation[] {
-  module = "speak-gate"
-  activation-ratio = 1.0
-}
-
 @ steps[] {
   description = "Wait with no sensory input until interoception reports NREM pressure and low wake arousal."
   wait-for.$variant: some.interoception
@@ -71,9 +65,9 @@ participants = ["Koro"]
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "speak-gate-heavily-suppressed"
+  name = "speak-heavily-suppressed"
   must-pass = true
-  pointer = "/observations/agent/allocation/speak-gate/activation_ratio"
+  pointer = "/observations/agent/allocation/speak/activation_ratio"
   contains = "0.0009"
 }
 
@@ -81,7 +75,7 @@ participants = ["Koro"]
   $variant: json-pointer-contains
   name = "suppressed-bpm-is-near-sleep-floor"
   must-pass = true
-  pointer = "/observations/agent/allocation/speak-gate/cooldown_ms"
+  pointer = "/observations/agent/allocation/speak/cooldown_ms"
   contains = "9982"
 }
 

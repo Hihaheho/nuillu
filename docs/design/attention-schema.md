@@ -124,17 +124,14 @@ Sensory memo -> AllocationController -> allocation proposal
 Memo/Cognition/Allocation updates -> Interoception -> InteroceptiveUpdated
 InteroceptiveUpdated -> HomeostaticController -> allocation cap/drive proposal
 Sensory memo -> CognitionGate -> CognitionLogUpdated -> Speak
-Runtime Speak batch -> SpeakGate ActivationGate -> Speak activation
-SpeakGate -> AttentionControlRequest evidence bids -> AllocationController
 Surprise -> AttentionControlRequest::Memory -> AllocationController
-SpeakGate memo -> AllocationController -> allocation proposal
 CognitionLogUpdated -> QueryMemory/Memory/Policy/Predict/Surprise/AttentionSchema
 Memo/Cognition/Allocation updates -> Policy -> advice memo + custom PolicyConsiderationPayload
 PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyUpserter insert/reinforce
 Policy memo -> AllocationController / CognitionGate (memo-authoritative)
 ```
 
-Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Before Speak activates, the runtime sends the pending Speak batch to active `ActivationGate<Speak>` holders such as SpeakGate. SpeakGate returns allow or suppress; when it suppresses, its decision and missing-evidence notes are durable only in its memo, and that memo update wakes the controller through the ordinary memo path. Speak writes a completion memo after a finished utterance.
+Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Speak decides whether to emit during activation by calling its optional `speak_to` target tool. If it does not call the tool, the activation completes silently. Speak writes a completion memo only after a finished utterance.
 
 ## Capabilities
 
@@ -155,7 +152,6 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | policy-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `PolicyCompactor` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
-| speak-gate | ✓ | ✓ | — | ✓ | — | ✓ | `ActivationGate<SpeakModule>`, `ModuleStatusReader`, `AttentionControlRequestMailbox` |
 | speak | — | ✓ | — | ✓ | ✓ | ✓ | `CognitionLogUpdatedInbox`, `SceneReader`, `UtteranceWriter` |
 
 Notable absences:
@@ -164,7 +160,6 @@ Notable absences:
 - The self-model module handles controller self-model guidance, but has no cognition-log-write, allocation-write, or memory-write path.
 - Query modules receive controller guidance, not self-model requests, and do not perform self-model integration.
 - The sensory module is the app-facing observation boundary; it cannot write cognition-log entries, publish work requests, or emit utterances.
-- The speak-gate module can inspect memo-log history in its session and call evidence lookup tools to decide speech readiness, but cannot emit utterances, write cognition-log entries, change allocation, or write memory.
 - The speak module is the app-facing output boundary; it cannot read blackboard memo logs or allocation guidance, and cannot write cognition-log entries, allocation, memory, or attention-control requests.
 - Only modules granted `CognitionWriter` can append cognition-log entries; current boot wiring grants it to cognition-gate and attention-schema.
 - Cognition-log appends cannot wake the controller directly; the controller wakes on memo updates.
@@ -217,7 +212,7 @@ When sensory memo content is promoted, cognition-gate rounds the detailed memo a
 
 Wakes on memo updates from other modules and controller-only attention-control requests. It reads unread memo-log entries into its persistent session, plus current attention-control bids, memory metadata, cognition log, and current allocation, then writes the next resource allocation for every registered module: `activation_ratio`, natural-language `guidance`, and `tier`.
 
-The controller uses guidance rather than request/response correlation. For example, if speech should wait for query or cognition-gate work, the controller raises the relevant modules and lets SpeakGate keep speech silent until attended evidence is sufficient. Attention-control bids are admitted, deferred, or rejected in the controller memo; deferred bids are not stored in a separate pending queue. Speak itself does not parse allocation guidance.
+The controller uses guidance rather than request/response correlation. For example, if speech should wait for query or cognition-gate work, the controller raises the relevant modules and keeps Speak inactive until attended evidence is sufficient. Attention-control bids are admitted, deferred, or rejected in the controller memo; deferred bids are not stored in a separate pending queue. Speak itself does not parse allocation guidance.
 
 ### Attention Schema
 
@@ -277,28 +272,17 @@ Detects unexpected cognition-log entries by comparing new cognition log entries 
 
 Surprise does not generate predictions. When predict memo-log evidence is absent, surprise acts as a novelty detector over the cognition log: it judges unexpectedness from recent history rather than from explicit predictions.
 
-### SpeakGate
-
-Decides whether a pending Speak activation should run. SpeakGate is triggered by
-`ActivationGate<SpeakModule>` events after Speak has formed a cognition-log update batch and before
-Speak activates. When it wakes, it reads unread memo-log entries into its persistent session, plus
-the cognition log, scheduler-owned module status, and utterance progress, so it can distinguish
-memo-only facts from attended facts. If speech is ready, it allows the activation. If speech should
-wait, it suppresses the activation and writes the wait decision and any missing-evidence notes to
-its memo log. It does not emit utterances, write cognition-log entries, change allocation, or write
-memory. It may call evidence tools that publish attention-control bids for memory and self-model lookup during its
-decision turn.
-
 ### Speak
 
 Emits user-visible utterances. The module is named `speak` rather than `talk` because its role is the action of producing an utterance, not owning the whole conversation.
 
-Speak wakes on cognition-log updates, then activates only after runtime activation gates allow its
-batch. It reads the cognition log, chooses a target from the current scene, records targeted
-utterance progress while streaming, writes the completed targeted utterance to its memo log, and
-emits through `UtteranceWriter` so the application or eval harness can collect the utterance as an
-artifact. It does not read blackboard memo logs, allocation guidance, or module status; readiness
-decisions are delegated to SpeakGate.
+Speak wakes on cognition-log updates when allocation makes it active. It reads the cognition log and
+uses an optional `speak_to` tool whose target argument is constrained by the current scene. Calling
+the tool selects the addressee and starts generation; not calling it means no user-visible utterance
+is needed and the activation completes silently. During generation it records targeted utterance
+progress, writes the completed targeted utterance to its memo log, and emits through
+`UtteranceWriter` so the application or eval harness can collect the utterance as an artifact. It
+does not read blackboard memo logs, allocation guidance, or module status.
 
 Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. Completed utterance memo-log entries wake the controller.
 
@@ -309,7 +293,6 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - The attention controller, attention schema, and self-model modules are separate modules.
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
 - Attention-control messages are internal and controller-only; module-level eval harnesses isolate query/self-model modules by seeding allocation guidance rather than by publishing target-specific request payloads.
-- The speak-gate module may inspect memo-log history in its session to judge readiness, but speech generation itself receives only the cognition log plus the target selected by Speak.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
 - Cognition-gate is the only path from the non-cognitive blackboard to the cognition log; attention-schema writes only attention-experience entries derived from its attention-state integration.
 - Query modules and self-model work are separated by controller guidance and module-specific capabilities.

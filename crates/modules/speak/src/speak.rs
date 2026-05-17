@@ -5,7 +5,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use lutum::{Session, StructuredTurnOutcome, TextTurnEvent};
+use lutum::{Session, StructuredTurnOutcome, TextStepOutcomeWithTools, TextTurnEvent, ToolResult};
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
     SceneReader, UtteranceProgress,
@@ -17,11 +17,15 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 const TARGET_SELECTION_PROMPT: &str = r#"You are the speak module target selector.
-Choose exactly one addressee for the pending utterance from the current cognition-log set. The
-target is constrained to the schema enum: pick the participant the agent is addressing; use "self"
-for self-directed speech/soliloquy; use "everyone" for broadcast speech intended for all present
-participants. Do not invent a name not in the enum, and do not append qualifiers. Return only raw
-JSON for the structured decision; do not wrap it in Markdown or code fences."#;
+Decide whether the current cognition-log set should become a user-visible utterance now. Use only
+the provided cognition context. If speech is needed now, call the speak_to tool exactly once with
+the addressee. If no utterance is needed, if the cognition log does not support a grounded
+utterance, or if the addressee is unclear, call no tool and finish silently.
+
+The target is constrained to the tool schema enum: pick the participant the agent is addressing;
+use "self" for self-directed speech/soliloquy; use "everyone" for broadcast speech intended for all
+present participants. Do not invent a name not in the enum, and do not append qualifiers. Do not use
+assistant text as an output channel."#;
 
 const GENERATION_PROMPT: &str = r#"You are the speak module.
 Generate a concise user-visible utterance addressed to the selected target from the current
@@ -39,8 +43,7 @@ load-bearing safety or peer-model fact that the cognition log makes available. D
 target or redirect the utterance to a different addressee. Do not invent diagnoses, generic
 advice, or facts that are not present in the cognition context.
 
-If this activation was allowed after waiting for missing evidence, the cognition log may still be
-incomplete. In that case, say only what the cognition log supports, make uncertainty explicit when
+If the cognition log is incomplete, say only what it supports, make uncertainty explicit when
 needed, and do not fill gaps from hidden memo, tool, or module state.
 
 If partial_utterance is present, continue that utterance from exactly where it stopped; do not
@@ -72,8 +75,8 @@ Let the speech continue when the new entries:
 Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
 
 tokio::task_local! {
-    /// JSON Schema for `SpeakTargetDecision.target` derived from the live `SceneReader`.
-    /// `.scope`d around each `structured_turn` so the LLM sees the current
+    /// JSON Schema for `SpeakTargetArgs.target` derived from the live `SceneReader`.
+    /// `.scope`d around each target tool turn so the LLM sees the current
     /// host-constrained target enum.
     static SPEECH_TARGET_SCHEMA: Schema;
 }
@@ -83,20 +86,31 @@ fn fallback_speech_target_schema() -> Schema {
         .expect("fallback speech target schema must be a JSON object")
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct SpeakTargetDecision {
-    target: SpeechTarget,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 struct AbortJudgement {
     inform_now: bool,
     rationale: String,
 }
 
+#[lutum::tool_input(name = "speak_to", output = SpeakTargetOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct SpeakTargetArgs {
+    target: SpeechTarget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct SpeakTargetOutput {
+    accepted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+enum SpeakTargetTools {
+    SpeakTo(SpeakTargetArgs),
+}
+
 /// Wire-format string with a JSON Schema dynamically constrained to the
 /// current scene's targets. Stored as `String` so existing serialization,
 /// downstream `Utterance.target` are unchanged.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 struct SpeechTarget(String);
 
@@ -170,6 +184,19 @@ fn format_generation_input(cognition_context: &str, draft: &GenerationDraft) -> 
         cognition_context.trim(),
         draft.target.trim()
     )
+}
+
+fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
+    if target.trim().is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::to_value(schema) else {
+        return false;
+    };
+    let Some(values) = value.get("enum").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    values.iter().any(|value| value.as_str() == Some(target))
 }
 
 fn push_generation_context(
@@ -317,7 +344,9 @@ impl SpeakModule {
     ) -> Result<()> {
         let _update_count = batch.updates.len();
         let mut cognition_context = self.speech_cognition_context().await;
-        let target = self.select_target(cx, &cognition_context).await?;
+        let Some(target) = self.select_target(cx, &cognition_context).await? else {
+            return Ok(());
+        };
         let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), target);
 
         loop {
@@ -332,7 +361,9 @@ impl SpeakModule {
                 }
                 GenerationStreamOutcome::Aborted => {
                     cognition_context = self.speech_cognition_context().await;
-                    let new_target = self.select_target(cx, &cognition_context).await?;
+                    let Some(new_target) = self.select_target(cx, &cognition_context).await? else {
+                        return Ok(());
+                    };
                     draft = GenerationDraft::new(self.utterance.next_generation_id(), new_target);
                 }
             }
@@ -363,7 +394,7 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let mut session = Session::new();
         session.push_system(self.target_prompt(cx));
         session.push_user(format!(
@@ -373,24 +404,44 @@ impl SpeakModule {
 
         let lutum = self.llm.lutum().await;
         let target_schema = self.scene.target_schema();
-        let decision = SPEECH_TARGET_SCHEMA
+        let validation_schema = target_schema.clone();
+        let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
-                let result = session
-                    .structured_turn::<SpeakTargetDecision>(&lutum)
+                session
+                    .text_turn(&lutum)
+                    .tools::<SpeakTargetTools>()
+                    .available_tools([SpeakTargetToolsSelector::SpeakTo])
                     .collect()
                     .await
-                    .context("speak target selection turn failed")?;
-                let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-                    anyhow::bail!("speak target selection turn refused");
-                };
-                Ok::<_, anyhow::Error>(decision)
+                    .context("speak target selection turn failed")
             })
             .await?;
-        let target = decision.target.0.trim().to_owned();
-        if target.is_empty() {
-            anyhow::bail!("speak target selection produced an empty target");
+
+        match outcome {
+            TextStepOutcomeWithTools::Finished(_)
+            | TextStepOutcomeWithTools::FinishedNoOutput(_) => Ok(None),
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let mut selected = None;
+                let mut results: Vec<ToolResult> = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    let SpeakTargetToolsCall::SpeakTo(call) = call;
+                    let target = call.input.target.0.trim().to_owned();
+                    let accepted = selected.is_none()
+                        && is_target_allowed_by_schema(&validation_schema, &target);
+                    if accepted {
+                        selected = Some(target);
+                    }
+                    results.push(
+                        call.complete(SpeakTargetOutput { accepted })
+                            .context("complete speak_to target tool call")?,
+                    );
+                }
+                round
+                    .commit(&mut session, results)
+                    .context("commit speak target tool round")?;
+                Ok(selected)
+            }
         }
-        Ok(target)
     }
 
     async fn stream_generation(
@@ -577,7 +628,7 @@ impl Module for SpeakModule {
     }
 
     fn role_description() -> &'static str {
-        "Emits the agent's spoken utterances into its world after cognition-log updates pass activation gates. It cannot inspect memo logs or query results directly, so missing evidence not promoted to cognition before speak-gate allows activation will lead to guessed speech."
+        "Emits the agent's spoken utterances into its world when activated by allocation and when the cognition log supports speech. It selects an addressee with an optional speak_to tool; if no target tool is called, it stays silent. It cannot inspect memo logs, allocation guidance, or query results directly."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -966,6 +1017,51 @@ mod tests {
         )
     }
 
+    async fn activate_once_with_adapter(
+        adapter: MockLlmAdapter,
+        participants: impl IntoIterator<Item = Participant>,
+        cognition: impl Into<String>,
+    ) -> (Blackboard, Rc<RefCell<Vec<(String, String)>>>) {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set(participants);
+        let now = SystemClock.now();
+        publish_cognition_update(&blackboard, &caps, now, cognition).await;
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+        (blackboard, completed)
+    }
+
+    async fn speak_memo_count(blackboard: &Blackboard) -> usize {
+        blackboard
+            .read(|bb| {
+                bb.recent_memo_logs()
+                    .into_iter()
+                    .filter(|record| record.owner.module == builtin::speak())
+                    .count()
+            })
+            .await
+    }
+
+    async fn speak_progress_exists(blackboard: &Blackboard) -> bool {
+        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        blackboard
+            .read(|bb| bb.utterance_progress_for_instance(&speak_owner).is_some())
+            .await
+    }
+
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
@@ -1003,7 +1099,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn speak_selects_target_from_cognition_log_before_streaming() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(target_decision_scenario("Koro"))
+            .with_text_scenario(target_decision_scenario("Koro"))
             .with_text_scenario(generation_text_scenario("Koro, stay close."));
         let mut allocation = ResourceAllocation::default();
         allocation.set(builtin::speak(), ModuleConfig::default());
@@ -1091,6 +1187,71 @@ mod tests {
             .unwrap();
         assert_eq!(progress.target, "Koro");
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_stays_silent_when_target_tool_is_not_called() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(empty_target_decision_scenario());
+
+        let (blackboard, completed) = activate_once_with_adapter(
+            adapter,
+            [Participant::new("Koro")],
+            "Koro asks whether Nui should say anything.",
+        )
+        .await;
+
+        assert!(completed.borrow().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_ignores_assistant_text_without_target_tool() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(no_target_decision_scenario("Koro, stay close."));
+
+        let (blackboard, completed) = activate_once_with_adapter(
+            adapter,
+            [Participant::new("Koro")],
+            "Koro asks whether Nui should say anything.",
+        )
+        .await;
+
+        assert!(completed.borrow().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_stays_silent_for_empty_target_tool_call() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(target_decision_scenario(""));
+
+        let (blackboard, completed) = activate_once_with_adapter(
+            adapter,
+            [Participant::new("Koro")],
+            "Koro asks whether Nui should say anything.",
+        )
+        .await;
+
+        assert!(completed.borrow().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_stays_silent_for_target_outside_scene_schema() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(target_decision_scenario("Koro"));
+
+        let (blackboard, completed) = activate_once_with_adapter(
+            adapter,
+            [Participant::new("Pibi")],
+            "Pibi asks whether Nui should say anything.",
+        )
+        .await;
+
+        assert!(completed.borrow().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
     }
 
     #[tokio::test(flavor = "current_thread")]

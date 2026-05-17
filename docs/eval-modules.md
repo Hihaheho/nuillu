@@ -36,8 +36,7 @@ eval-cases/modules/<module-name>/<case-name>.eure
 `modules = [...]` is the set of modules to boot for that case. It must include
 the path target and must not contain duplicates. Most module cases should boot
 only the target module. Add another module only when the target's real activation
-depends on it. For example, `speak-gate` cases boot both `speak-gate` and
-`speak` because the gate evaluates a pending speak activation.
+depends on it.
 
 Supported module directory names are the `EvalModule` kebab-case names:
 
@@ -58,7 +57,6 @@ policy-compaction
 reward
 predict
 surprise
-speak-gate
 speak
 ```
 
@@ -137,7 +135,6 @@ The intended artifact boundaries by module family are:
 |---|---|
 | memo-writing modules | target memo |
 | cognition writers | target cognition-log entries |
-| `speak-gate` | target memo |
 | `speak` | completed utterance |
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |

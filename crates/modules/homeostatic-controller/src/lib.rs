@@ -363,10 +363,7 @@ mod tests {
             Some(AllocationEffectLevel::Low)
         );
 
-        let suppressions = suppression_commands(
-            HomeostaticPhase::Compacting,
-            &[builtin::speak_gate(), builtin::speak()],
-        );
+        let suppressions = suppression_commands(HomeostaticPhase::Compacting, &[builtin::speak()]);
         assert_eq!(
             suppression_level_for(&suppressions, &builtin::speak()),
             Some(AllocationEffectLevel::Max)

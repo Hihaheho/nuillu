@@ -238,7 +238,6 @@ pub enum EvalModule {
     Reward,
     Predict,
     Surprise,
-    SpeakGate,
     Speak,
 }
 
@@ -260,7 +259,6 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Reward,
     EvalModule::Predict,
     EvalModule::Surprise,
-    EvalModule::SpeakGate,
     EvalModule::Speak,
 ];
 
@@ -284,7 +282,6 @@ impl EvalModule {
             Self::Reward => "reward",
             Self::Predict => "predict",
             Self::Surprise => "surprise",
-            Self::SpeakGate => "speak-gate",
             Self::Speak => "speak",
         }
     }
@@ -308,7 +305,6 @@ impl EvalModule {
             Self::Reward => builtin::reward(),
             Self::Predict => builtin::predict(),
             Self::Surprise => builtin::surprise(),
-            Self::SpeakGate => builtin::speak_gate(),
             Self::Speak => builtin::speak(),
         }
     }
@@ -350,7 +346,6 @@ pub enum ModuleEvalTarget {
     MemoryCompaction,
     MemoryAssociation,
     MemoryRecombination,
-    SpeakGate,
     Speak,
 }
 
@@ -365,7 +360,6 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
-            Self::SpeakGate => "speak-gate",
             Self::Speak => "speak",
         }
     }
@@ -380,7 +374,6 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
-            Self::SpeakGate => EvalModule::SpeakGate,
             Self::Speak => EvalModule::Speak,
         }
     }
@@ -397,7 +390,6 @@ impl ModuleEvalTarget {
                 "memory-compaction" => Some(Self::MemoryCompaction),
                 "memory-association" => Some(Self::MemoryAssociation),
                 "memory-recombination" => Some(Self::MemoryRecombination),
-                "speak-gate" => Some(Self::SpeakGate),
                 "speak" => Some(Self::Speak),
                 _ => None,
             })
@@ -1732,7 +1724,7 @@ mod tests {
         let quiet = Path::new("../../eval-cases/full-agent/sleep-after-sensory-quiet.eure");
         let quiet = parse_full_agent_case_file(quiet).expect("sleep case should parse");
         assert!(quiet.allow_empty_output);
-        assert_eq!(quiet.activate_allocation.len(), 5);
+        assert_eq!(quiet.activate_allocation.len(), 4);
         assert_eq!(
             quiet.activate_allocation[2].module,
             EvalModule::Interoception
