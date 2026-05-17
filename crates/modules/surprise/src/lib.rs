@@ -156,10 +156,8 @@ impl SurpriseModule {
         {
             let _ = self
                 .attention_control
-                .publish(AttentionControlRequest::memory(
-                    request.content.trim(),
-                    request.importance,
-                    request.reason.trim(),
+                .publish(AttentionControlRequest::new(
+                    render_memory_attention_request(request),
                 ))
                 .await;
         }
@@ -167,6 +165,18 @@ impl SurpriseModule {
         self.memo.write(render_surprise_memo(&assessment)).await;
         Ok(())
     }
+}
+
+fn render_memory_attention_request(request: &SurpriseMemoryRequest) -> String {
+    let priority = match request.importance {
+        MemoryImportance::Normal => "normal-priority memory preservation",
+        MemoryImportance::High => "high-priority memory preservation",
+    };
+    format!(
+        "{priority}: {} Reason: {}",
+        request.content.trim(),
+        request.reason.trim()
+    )
 }
 
 fn render_surprise_memo(assessment: &SurpriseAssessment) -> String {

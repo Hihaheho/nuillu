@@ -1557,17 +1557,11 @@ mod tests {
     }
 
     fn request_question(request: &AttentionControlRequest) -> &str {
-        match request {
-            AttentionControlRequest::Query { question, .. } => question,
-            _ => "",
-        }
+        request.as_str()
     }
 
     fn request_question_owned(request: AttentionControlRequest) -> String {
-        match request {
-            AttentionControlRequest::Query { question, .. } => question,
-            _ => String::new(),
-        }
+        request.into_inner()
     }
 
     struct EchoModule {
@@ -2758,7 +2752,7 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("ping"))
+                        .publish(AttentionControlRequest::new("ping"))
                         .await
                         .expect("attention request should route to echo");
                     let _ = done_rx.await;
@@ -2827,7 +2821,7 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("ping"))
+                        .publish(AttentionControlRequest::new("ping"))
                         .await
                         .expect("attention request should route to observer");
                     let observation = seen_rx.await.expect("metadata observed");
@@ -2844,8 +2838,7 @@ mod tests {
                             batch: Some(nuillu_module::LlmBatchDebug {
                                 batch_type: std::any::type_name::<AttentionControlRequest>()
                                     .to_string(),
-                                batch_debug: "Query { question: \"ping\", reason: None }"
-                                    .to_string(),
+                                batch_debug: "\"ping\"".to_string(),
                             }),
                         })
                     );
@@ -2907,7 +2900,7 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("ping"))
+                        .publish(AttentionControlRequest::new("ping"))
                         .await
                         .expect("attention request should route to observer");
                     done_rx.await.expect("second activation should finish");
@@ -2920,7 +2913,7 @@ mod tests {
 
                 let expected_batch = LlmBatchDebug {
                     batch_type: std::any::type_name::<AttentionControlRequest>().to_string(),
-                    batch_debug: "Query { question: \"ping\", reason: None }".to_string(),
+                    batch_debug: "\"ping\"".to_string(),
                 };
                 let owner = ModuleInstanceId::new(llm_metadata_observer_id(), ReplicaIndex::ZERO);
                 let observations = observations.borrow();
@@ -2995,7 +2988,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=2 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("tick-{i}")))
+                            .publish(AttentionControlRequest::new(format!("tick-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3006,7 +2999,7 @@ mod tests {
                     }
 
                     mailbox
-                        .publish(AttentionControlRequest::query("tick-3"))
+                        .publish(AttentionControlRequest::new("tick-3"))
                         .await
                         .expect("third controller tick should route");
                     wait_for_cell_count(&controller_activations, 3).await;
@@ -3100,7 +3093,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=2 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("period-{i}")))
+                            .publish(AttentionControlRequest::new(format!("period-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3110,7 +3103,7 @@ mod tests {
 
                     for i in 3..=4 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("period-{i}")))
+                            .publish(AttentionControlRequest::new(format!("period-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3170,7 +3163,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=2 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("pre-{i}")))
+                            .publish(AttentionControlRequest::new(format!("pre-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3195,7 +3188,7 @@ mod tests {
 
                     for i in 3..=4 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("post-{i}")))
+                            .publish(AttentionControlRequest::new(format!("post-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3206,7 +3199,7 @@ mod tests {
                     assert_eq!(target_activations.get(), post_reset_baseline);
 
                     mailbox
-                        .publish(AttentionControlRequest::query("post-5"))
+                        .publish(AttentionControlRequest::new("post-5"))
                         .await
                         .expect("third post-reset tick should route");
                     wait_for_cell_count(&controller_activations, 5).await;
@@ -3271,7 +3264,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=2 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("one-shot-{i}")))
+                            .publish(AttentionControlRequest::new(format!("one-shot-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3279,7 +3272,7 @@ mod tests {
                     wait_for_cell_count(&target_activations, 1).await;
 
                     mailbox
-                        .publish(AttentionControlRequest::query("one-shot-3"))
+                        .publish(AttentionControlRequest::new("one-shot-3"))
                         .await
                         .expect("next queued message should not immediately re-open");
                     wait_for_cell_count(&controller_activations, 3).await;
@@ -3289,7 +3282,7 @@ mod tests {
                     assert_eq!(target_activations.get(), 1);
 
                     mailbox
-                        .publish(AttentionControlRequest::query("one-shot-4"))
+                        .publish(AttentionControlRequest::new("one-shot-4"))
                         .await
                         .expect("second period tick should re-open");
                     wait_for_cell_count(&controller_activations, 4).await;
@@ -3353,7 +3346,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=4 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("disabled-{i}")))
+                            .publish(AttentionControlRequest::new(format!("disabled-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3414,7 +3407,7 @@ mod tests {
                 super::run(modules, test_config(), async move {
                     for i in 1..=4 {
                         mailbox
-                            .publish(AttentionControlRequest::query(format!("hard-{i}")))
+                            .publish(AttentionControlRequest::new(format!("hard-{i}")))
                             .await
                             .expect("controller tick should route");
                         wait_for_cell_count(&controller_activations, i).await;
@@ -3538,7 +3531,7 @@ mod tests {
 
         super::run(modules, test_config(), async move {
             mailbox
-                .publish(AttentionControlRequest::query("gated"))
+                .publish(AttentionControlRequest::new("gated"))
                 .await
                 .expect("attention request should route to gated echo");
             if expect_target_activation {
@@ -3746,18 +3739,18 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("first"))
+                        .publish(AttentionControlRequest::new("first"))
                         .await
                         .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(AttentionControlRequest::query("second"))
+                        .publish(AttentionControlRequest::new("second"))
                         .await
                         .expect("second attention request should route");
                     mailbox
-                        .publish(AttentionControlRequest::query("third"))
+                        .publish(AttentionControlRequest::new("third"))
                         .await
                         .expect("third attention request should route");
                     let _ = second_rx.await;
@@ -3826,14 +3819,14 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("first"))
+                        .publish(AttentionControlRequest::new("first"))
                         .await
                         .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(AttentionControlRequest::query("second"))
+                        .publish(AttentionControlRequest::new("second"))
                         .await
                         .expect("second attention request should route");
                     let _ = second_rx.await;
@@ -3900,14 +3893,14 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("first"))
+                        .publish(AttentionControlRequest::new("first"))
                         .await
                         .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     let started = tokio::time::Instant::now();
                     mailbox
-                        .publish(AttentionControlRequest::query("second"))
+                        .publish(AttentionControlRequest::new("second"))
                         .await
                         .expect("second attention request should route");
                     let _ = second_rx.await;
@@ -3966,13 +3959,13 @@ mod tests {
 
                 super::run(modules, test_config(), async move {
                     mailbox
-                        .publish(AttentionControlRequest::query("first"))
+                        .publish(AttentionControlRequest::new("first"))
                         .await
                         .expect("first attention request should route");
                     let _ = first_rx.await;
 
                     mailbox
-                        .publish(AttentionControlRequest::query("second"))
+                        .publish(AttentionControlRequest::new("second"))
                         .await
                         .expect("second attention request should route");
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4290,7 +4283,7 @@ mod tests {
 
                 super::run(modules, test_config(), async {
                     mailbox
-                        .publish(AttentionControlRequest::query("later"))
+                        .publish(AttentionControlRequest::new("later"))
                         .await
                         .expect("inactive replica zero should queue the request");
                     for _ in 0..4 {

@@ -278,63 +278,47 @@ pub enum MemoryImportance {
     High,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AttentionControlRequest {
-    Query {
-        question: String,
-        reason: Option<String>,
-    },
-    SelfModel {
-        question: String,
-        reason: Option<String>,
-    },
-    Memory {
-        content: String,
-        importance: MemoryImportance,
-        reason: String,
-    },
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct AttentionControlRequest {
+    text: String,
 }
 
 impl AttentionControlRequest {
-    pub fn query(question: impl Into<String>) -> Self {
-        Self::Query {
-            question: question.into(),
-            reason: None,
-        }
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
     }
 
-    pub fn query_with_reason(question: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::Query {
-            question: question.into(),
-            reason: Some(reason.into()),
-        }
+    pub fn as_str(&self) -> &str {
+        &self.text
     }
 
-    pub fn self_model(question: impl Into<String>) -> Self {
-        Self::SelfModel {
-            question: question.into(),
-            reason: None,
-        }
+    pub fn into_inner(self) -> String {
+        self.text
     }
+}
 
-    pub fn self_model_with_reason(question: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::SelfModel {
-            question: question.into(),
-            reason: Some(reason.into()),
-        }
+impl From<String> for AttentionControlRequest {
+    fn from(text: String) -> Self {
+        Self::new(text)
     }
+}
 
-    pub fn memory(
-        content: impl Into<String>,
-        importance: MemoryImportance,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::Memory {
-            content: content.into(),
-            importance,
-            reason: reason.into(),
-        }
+impl From<&str> for AttentionControlRequest {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl std::fmt::Display for AttentionControlRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+impl std::fmt::Debug for AttentionControlRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(formatter)
     }
 }
 
@@ -558,7 +542,7 @@ mod tests {
             scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
 
         publisher
-            .publish(AttentionControlRequest::query("find memories about rust"))
+            .publish(AttentionControlRequest::new("find memories about rust"))
             .await
             .expect("attention-control topic should have subscribers");
 
@@ -569,7 +553,7 @@ mod tests {
         assert_eq!(envelope.sender.module, ticker_id());
         assert_eq!(
             envelope.body,
-            AttentionControlRequest::query("find memories about rust")
+            AttentionControlRequest::new("find memories about rust")
         );
     }
 
@@ -600,21 +584,21 @@ mod tests {
             scoped(&caps, builtin::allocation_controller(), 1).attention_control_inbox();
 
         publisher
-            .publish(AttentionControlRequest::query("first"))
+            .publish(AttentionControlRequest::new("first"))
             .await
             .unwrap();
         publisher
-            .publish(AttentionControlRequest::query("second"))
+            .publish(AttentionControlRequest::new("second"))
             .await
             .unwrap();
 
         assert_eq!(
             controller_0.next_item().await.unwrap().body,
-            AttentionControlRequest::query("first")
+            AttentionControlRequest::new("first")
         );
         assert_eq!(
             controller_1.next_item().await.unwrap().body,
-            AttentionControlRequest::query("second")
+            AttentionControlRequest::new("second")
         );
     }
 
@@ -645,13 +629,13 @@ mod tests {
             scoped(&caps, builtin::allocation_controller(), 1).attention_control_inbox();
 
         publisher
-            .publish(AttentionControlRequest::query("active only"))
+            .publish(AttentionControlRequest::new("active only"))
             .await
             .unwrap();
 
         assert_eq!(
             controller_0.next_item().await.unwrap().body,
-            AttentionControlRequest::query("active only")
+            AttentionControlRequest::new("active only")
         );
         assert!(controller_1.take_ready_items().unwrap().items.is_empty());
     }
@@ -678,23 +662,23 @@ mod tests {
             scoped(&caps, builtin::allocation_controller(), 0).attention_control_inbox();
 
         publisher
-            .publish(AttentionControlRequest::query("first"))
+            .publish(AttentionControlRequest::new("first"))
             .await
             .unwrap();
         let started = Instant::now();
         publisher
-            .publish(AttentionControlRequest::query("second"))
+            .publish(AttentionControlRequest::new("second"))
             .await
             .unwrap();
 
         assert!(started.elapsed() >= Duration::from_millis(8));
         assert_eq!(
             controller.next_item().await.unwrap().body,
-            AttentionControlRequest::query("first")
+            AttentionControlRequest::new("first")
         );
         assert_eq!(
             controller.next_item().await.unwrap().body,
-            AttentionControlRequest::query("second")
+            AttentionControlRequest::new("second")
         );
     }
 }

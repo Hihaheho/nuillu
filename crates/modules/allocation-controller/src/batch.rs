@@ -253,7 +253,7 @@ mod tests {
         let delayed_request = async {
             tokio::time::sleep(Duration::from_millis(2)).await;
             requests
-                .publish(AttentionControlRequest::query("Which route is safe?"))
+                .publish(AttentionControlRequest::new("Which route is safe?"))
                 .await
                 .expect("controller request subscriber exists");
         };

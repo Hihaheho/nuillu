@@ -399,40 +399,9 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
     for request in requests {
         output.push('\n');
         output.push_str("- ");
-        match request {
-            AttentionControlRequest::Query { question, reason } => {
-                output.push_str("Query: ");
-                output.push_str(question.trim());
-                push_optional_reason(&mut output, reason.as_deref());
-            }
-            AttentionControlRequest::SelfModel { question, reason } => {
-                output.push_str("Self-model: ");
-                output.push_str(question.trim());
-                push_optional_reason(&mut output, reason.as_deref());
-            }
-            AttentionControlRequest::Memory {
-                content,
-                importance,
-                reason,
-            } => {
-                output.push_str(match importance {
-                    nuillu_module::MemoryImportance::Normal => "Memory: ",
-                    nuillu_module::MemoryImportance::High => "High-priority memory: ",
-                });
-                output.push_str(content.trim());
-                push_optional_reason(&mut output, Some(reason));
-            }
-        }
+        output.push_str(request.as_str().trim());
     }
     output
-}
-
-fn push_optional_reason(output: &mut String, reason: Option<&str>) {
-    let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
-        return;
-    };
-    output.push_str(" Reason: ");
-    output.push_str(reason);
 }
 
 #[async_trait(?Send)]
@@ -788,20 +757,17 @@ mod tests {
     #[test]
     fn controller_request_input_keeps_requests_separate_from_blackboard_context() {
         let input = controller_request_input(&[
-            AttentionControlRequest::query_with_reason(
-                "which route is safe?",
-                "speech needs grounded evidence",
+            AttentionControlRequest::new(
+                "which route is safe? Reason: speech needs grounded evidence",
             ),
-            AttentionControlRequest::memory(
-                "Remember the north door is blocked.",
-                nuillu_module::MemoryImportance::High,
-                "direct safety constraint",
+            AttentionControlRequest::new(
+                "high-priority memory preservation: Remember the north door is blocked. Reason: direct safety constraint",
             ),
         ]);
 
         assert_eq!(
             input,
-            "Current attention-control requests:\n- Query: which route is safe? Reason: speech needs grounded evidence\n- High-priority memory: Remember the north door is blocked. Reason: direct safety constraint"
+            "Current attention-control requests:\n- which route is safe? Reason: speech needs grounded evidence\n- high-priority memory preservation: Remember the north door is blocked. Reason: direct safety constraint"
                 .to_owned()
         );
     }

@@ -38,7 +38,7 @@ External input and output sit at the boundary of cognition:
 - **sensory input** is the only external/app-facing input; it enters through a typed `SensoryInput` channel and is normalized by the sensory module into memo-log entries,
 - **speech output** leaves through a speak/action capability and is mirrored into the speak module's memo log.
 
-`AttentionControlRequest` is the internal typed attention-bid message. It is consumed only by allocation-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
+`AttentionControlRequest` is an internal free-form `String` attention-bid message. Any module granted `AttentionControlRequestMailbox` at boot may publish arbitrary prose to it. Boot wiring consumes it only in allocation-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
 
 Sensory input is split into `OneShot { modality, direction, content, observed_at }` and `AmbientSnapshot { entries, observed_at }`. One-shot input is a discrete stimulus such as a heard utterance, visual event, or custom modality. Ambient snapshots are the complete current enabled background field keyed by row id; omitted rows mean they are no longer active ambient context, not proof that an external condition disappeared.
 
@@ -124,7 +124,7 @@ Sensory memo -> AllocationController -> allocation proposal
 Memo/Cognition/Allocation updates -> Interoception -> InteroceptiveUpdated
 InteroceptiveUpdated -> HomeostaticController -> allocation cap/drive proposal
 Sensory memo -> CognitionGate -> CognitionLogUpdated -> Speak
-Surprise -> AttentionControlRequest::Memory -> AllocationController
+Surprise -> AttentionControlRequest free-form text -> AllocationController
 CognitionLogUpdated -> QueryMemory/Memory/Policy/Predict/Surprise/AttentionSchema
 Memo/Cognition/Allocation updates -> Policy -> advice memo + custom PolicyConsiderationPayload
 PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyUpserter insert/reinforce
@@ -268,7 +268,7 @@ Predictions are written to the predict memo. Predict does not detect whether its
 
 ### Surprise
 
-Detects unexpected cognition-log entries by comparing new cognition log entries against the predict memo (if present) or against recent cognition-log history alone (if predict is absent). Uses an LLM to assess the degree of divergence or novelty with allocation guidance in context, sends an `AttentionControlRequest::Memory` bid when a significant event should be preserved, and records the surprise assessment in its memo.
+Detects unexpected cognition-log entries by comparing new cognition log entries against the predict memo (if present) or against recent cognition-log history alone (if predict is absent). Uses an LLM to assess the degree of divergence or novelty with allocation guidance in context, sends a free-form `AttentionControlRequest` preservation bid when a significant event should be preserved, and records the surprise assessment in its memo.
 
 Surprise does not generate predictions. When predict memo-log evidence is absent, surprise acts as a novelty detector over the cognition log: it judges unexpectedness from recent history rather than from explicit predictions.
 

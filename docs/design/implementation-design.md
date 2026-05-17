@@ -181,10 +181,9 @@ pub struct Envelope<T> {
     pub body: T,
 }
 
-pub enum AttentionControlRequest {
-    Query { question: String, reason: Option<String> },
-    SelfModel { question: String, reason: Option<String> },
-    Memory { content: String, importance: MemoryImportance, reason: String },
+#[serde(transparent)]
+pub struct AttentionControlRequest {
+    text: String,
 }
 pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
 pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
@@ -245,13 +244,9 @@ pub struct InteroceptivePatch {
     pub emotion: Option<String>,
 }
 
-pub enum MemoryImportance {
-    Normal,
-    High,
-}
 ```
 
-Typed topics are backed by per-replica inbox queues and route only to currently active target replicas. Holding a publish capability permits sending on that typed topic; holding an inbox permits subscribing. Payloads are Rust types, not ad-hoc JSON.
+Typed topics are backed by per-replica inbox queues and route only to currently active target replicas. Holding a publish capability permits sending on that typed topic; holding an inbox permits subscribing. Payloads are Rust types, not ad-hoc JSON; `AttentionControlRequest` deliberately uses a transparent newtype around untyped free-form prose.
 
 Delivery policy is per topic:
 
@@ -279,7 +274,7 @@ Delivery policy is per topic:
 
 Examples: `Ryo said "..." 42 seconds ago`, `Ryo said "..." 1 minute 20 seconds ago`, `screen showed "..." 3 hours 40 minutes ago`, `Ryo said "..." 2 days 5 hours ago`. Future timestamps caused by host clock skew should be clamped to `0 seconds ago`.
 
-The sensory module does not publish derived typed work requests. Internal work bids use `AttentionControlRequestMailbox` and are consumed by allocation-controller; app-facing/full-agent eval cases must not use them as external inputs.
+The sensory module does not publish derived work requests. Internal work bids use free-form `AttentionControlRequestMailbox` strings and are consumed by allocation-controller; app-facing/full-agent eval cases must not use them as external inputs.
 
 Speech actions are app-facing port writes rather than channel messages:
 
@@ -656,7 +651,7 @@ Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReade
 
 Activates on each cognition-log update. Uses an LLM to assess whether the updated cognition log is expected or surprising, with allocation guidance in context. When predict memo logs are available in session context, the assessment is framed as divergence from pending predictions. When predict is absent, the assessment is framed as novelty from recent cognition-log history alone. Runtime reads the `significant` and `memory_request` decision fields for preservation side effects, then writes the same assessment information to this replica's free-form memo log.
 
-Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes an `AttentionControlRequest::Memory` bid for allocation-controller rather than writing memory directly.
+Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes a free-form `AttentionControlRequest` bid for allocation-controller rather than writing memory directly.
 
 The v1 surprise threshold is represented by the structured LLM field `significant`; there is no numeric global threshold yet.
 
