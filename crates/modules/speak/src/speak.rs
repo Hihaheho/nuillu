@@ -16,63 +16,16 @@ use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-const TARGET_SELECTION_PROMPT: &str = r#"You are the speak module target selector.
-Decide whether the current cognition-log set should become a user-visible utterance now. Use only
-the provided cognition context. If speech is needed now, call the speak_to tool exactly once with
-the addressee. If no utterance is needed, if the cognition log does not support a grounded
-utterance, or if the addressee is unclear, call no tool and finish silently.
+const TARGET_SELECTION_PROMPT: &str = r#"Decide whether the agent should speak now. If yes, call speak_to with one addressee from the schema. If no, finish without calling any tool.
+Use "self" for self-directed speech and "everyone" for explicit group/broadcast; otherwise pick a participant."#;
 
-The target is constrained to the tool schema enum: pick the participant the agent is addressing;
-use "self" for self-directed speech/soliloquy; use "everyone" for broadcast speech intended for all
-present participants. Do not invent a name not in the enum, and do not append qualifiers. Do not use
-assistant text as an output channel."#;
+const GENERATION_PROMPT: &str = r#"You are speaking as the agent to the listener.
+Use the cognition log. Don't add facts that aren't there."#;
 
-const GENERATION_PROMPT: &str = r#"You are the speak module.
-Generate a concise user-visible utterance addressed to the selected target from the current
-cognition-log set. You cannot inspect blackboard memos or allocation guidance. Use only the
-provided cognition context and target.
+const PARTIAL_CONTINUATION_PROMPT: &str =
+    "Continue the partial utterance from where it stopped.";
 
-Stay in the cognition-log frame: if the cognition log records an in-world or peer-directed
-exchange, respond in that frame; do not switch to external assistant advice.
-
-Address the target directly. Cover the cognition-log facts that are load-bearing for answering the
-target's question or for the target's safety in the current situation — preserve specific,
-actionable details (postural, spatial, behavioral, or other concrete constraints) rather than
-collapsing them into a generic summary. Brevity matters, but never at the cost of dropping a
-load-bearing safety or peer-model fact that the cognition log makes available. Do not change the
-target or redirect the utterance to a different addressee. Do not invent diagnoses, generic
-advice, or facts that are not present in the cognition context.
-
-If the cognition log is incomplete, say only what it supports, make uncertainty explicit when
-needed, and do not fill gaps from hidden memo, tool, or module state.
-
-If partial_utterance is present, continue that utterance from exactly where it stopped; do not
-repeat, rewrite, or replace the already emitted partial text. Do not mention hidden state or
-unavailable module results."#;
-
-const ABORT_JUDGE_PROMPT: &str = r#"You are deciding, on behalf of a cognitive system, whether
-to interrupt a speech that is currently in progress.
-
-Another agent is currently speaking to a target peer. They began speaking from a particular
-state of the agent's conscious workspace, given to you below as cognition_log_at_start. They are
-unaware of newer pieces of awareness that have entered the workspace since they began, given to
-you below as new_cognition_entries.
-
-Your job is to judge whether it is worth interrupting the current speech to share these new
-entries with the speaker, so they can re-plan from the updated awareness — or whether the new
-entries are minor enough that the current speech should be allowed to finish.
-
-Interrupt when the new entries:
-- introduce a fact that contradicts or invalidates what the speaker likely planned to say
-- shift the load-bearing safety, peer-model, or task constraint the speech depends on
-- change who should be addressed or what the most pressing concern is
-
-Let the speech continue when the new entries:
-- restate or elaborate facts already in the starting awareness
-- add minor context that does not affect the core message
-- describe internal cognitive process rather than world-relevant change
-
-Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+const ABORT_JUDGE_PROMPT: &str = r#"A speech is in progress. Set inform_now=true only if the new cognition entries contradict the speech, shift the safety/peer/task constraint, or change who should be addressed."#;
 
 tokio::task_local! {
     /// JSON Schema for `SpeakTargetArgs.target` derived from the live `SceneReader`.
@@ -208,6 +161,7 @@ fn push_generation_context(
     session.push_system(generation_prompt);
     session.push_user(format_generation_input(cognition_context, draft));
     if !draft.accumulated.is_empty() {
+        session.push_system(PARTIAL_CONTINUATION_PROMPT);
         session.push_assistant_text(draft.accumulated.clone());
     }
 }
