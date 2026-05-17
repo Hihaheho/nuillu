@@ -67,6 +67,22 @@ fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> 
             builtin::memory_recombination(),
             builtin::memory_compaction(),
         ),
+        (
+            builtin::memory_compaction(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::memory_association(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::memory_recombination(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::policy_compaction(),
+            builtin::homeostatic_controller(),
+        ),
     ];
     edges
         .into_iter()
@@ -103,7 +119,6 @@ fn register_server_module(
             registry.register_server(policy(1..=1, Bpm::range(6.0, 12.0)), |caps| {
                 nuillu_cognition_gate::CognitionGateModule::new(
                     caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_reader(),
                     caps.cognition_writer(),
@@ -132,7 +147,6 @@ fn register_server_module(
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_reader(),
@@ -145,7 +159,7 @@ fn register_server_module(
         RuntimeModule::SelfModel => {
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
                 nuillu_self_model::SelfModelModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
@@ -158,7 +172,6 @@ fn register_server_module(
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
                 nuillu_memory::QueryMemoryModule::new(
-                    caps.allocation_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
@@ -174,7 +187,6 @@ fn register_server_module(
             registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
                 nuillu_memory::MemoryModule::new(
                     caps.cognition_log_evicted_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.allocation_reader(),
                     caps.memory_metadata_reader(),
                     memory_caps.writer(),
@@ -187,7 +199,7 @@ fn register_server_module(
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_memory::MemoryCompactionModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.interoception_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.compactor(),
@@ -199,7 +211,7 @@ fn register_server_module(
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_memory::MemoryAssociationModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.interoception_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.content_reader(),
@@ -213,7 +225,7 @@ fn register_server_module(
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_memory::MemoryRecombinationModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.interoception_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     memory_caps.retriever(),
@@ -228,7 +240,6 @@ fn register_server_module(
                 nuillu_interoception::InteroceptionModule::new(
                     caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_writer(Vec::new(), suppressed.clone()),
                     caps.interoception_policy(),
@@ -253,7 +264,6 @@ fn register_server_module(
                 nuillu_reward::PolicyModule::new(
                     caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
@@ -269,7 +279,7 @@ fn register_server_module(
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 nuillu_reward::PolicyCompactionModule::new(
-                    caps.allocation_updated_inbox(),
+                    caps.interoception_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     policy_caps.compactor(),

@@ -135,7 +135,6 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     .await;
 
     let sensory = env.caps.host_io().sensory_input_mailbox();
-    let allocation_updates = env.caps.host_io().allocation_updated_mailbox();
     let mut restart_count = 0_u64;
     loop {
         let allocated = server_registry(
@@ -146,14 +145,8 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         )
         .build(&env.caps)
         .await?;
-        apply_persisted_module_settings(
-            &module_settings,
-            visualizer,
-            &tab_id,
-            &env.blackboard,
-            &allocation_updates,
-        )
-        .await;
+        apply_persisted_module_settings(&module_settings, visualizer, &tab_id, &env.blackboard)
+            .await;
 
         let result = run_agent(
             allocated,
@@ -167,7 +160,6 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 &mut ambient,
                 &mut module_settings,
                 &sensory,
-                &allocation_updates,
                 &env,
             ),
         )

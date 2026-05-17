@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Module,
+    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -57,7 +57,7 @@ pub enum CompactionTools {
 
 pub struct MemoryCompactionModule {
     owner: nuillu_types::ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
+    interoception_updates: InteroceptiveUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
@@ -67,7 +67,7 @@ pub struct MemoryCompactionModule {
 
 impl MemoryCompactionModule {
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        interoception_updates: InteroceptiveUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
@@ -76,7 +76,7 @@ impl MemoryCompactionModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("memory-compaction id is valid"),
-            allocation_updates,
+            interoception_updates,
             allocation,
             blackboard,
             compactor,
@@ -256,8 +256,8 @@ impl MemoryCompactionModule {
     }
 
     async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.allocation_updates.next_item().await?;
-        let _ = self.allocation_updates.take_ready_items()?;
+        let _ = self.interoception_updates.next_item().await?;
+        let _ = self.interoception_updates.take_ready_items()?;
         Ok(())
     }
 }
@@ -314,7 +314,7 @@ impl Module for MemoryCompactionModule {
     }
 
     fn role_description() -> &'static str {
-        "Destructively merges redundant memory entries and accumulates remember tokens; wakes on allocation guidance, never on raw memos."
+        "Destructively merges redundant memory entries and accumulates remember tokens; wakes on interoceptive state changes and reads allocation guidance as context."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

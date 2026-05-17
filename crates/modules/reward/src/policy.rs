@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use lutum::{Session, StructuredTurnOutcome};
 use nuillu_module::ports::Clock;
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
+    InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
     format_current_attention_guidance,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
@@ -115,7 +115,6 @@ pub struct PolicyModule {
     owner: ModuleId,
     memo_updates: MemoUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
     allocation: AllocationReader,
@@ -132,7 +131,6 @@ impl PolicyModule {
     pub fn new(
         memo_updates: MemoUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
         allocation: AllocationReader,
@@ -146,7 +144,6 @@ impl PolicyModule {
             owner: ModuleId::new(<Self as Module>::id()).expect("policy id is valid"),
             memo_updates,
             cognition_updates,
-            allocation_updates,
             blackboard,
             cognition,
             allocation,
@@ -417,9 +414,6 @@ impl Module for PolicyModule {
                 result?;
             }
             result = self.cognition_updates.next_item() => {
-                result?;
-            }
-            result = self.allocation_updates.next_item() => {
                 result?;
             }
         }

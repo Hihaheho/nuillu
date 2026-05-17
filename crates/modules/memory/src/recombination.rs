@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess, Module,
-    render_memory_for_llm,
+    AllocationReader, BlackboardReader, CognitionWriter, InteroceptiveUpdatedInbox, LlmAccess,
+    Module, render_memory_for_llm,
 };
 use nuillu_types::{MemoryRank, builtin};
 use schemars::JsonSchema;
@@ -39,7 +39,7 @@ pub enum RecombinationTools {
 
 pub struct MemoryRecombinationModule {
     owner: nuillu_types::ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
+    interoception_updates: InteroceptiveUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: MemoryRetriever,
@@ -49,7 +49,7 @@ pub struct MemoryRecombinationModule {
 
 impl MemoryRecombinationModule {
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        interoception_updates: InteroceptiveUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: MemoryRetriever,
@@ -59,7 +59,7 @@ impl MemoryRecombinationModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("memory-recombination id is valid"),
-            allocation_updates,
+            interoception_updates,
             allocation,
             blackboard,
             memory,
@@ -172,8 +172,8 @@ impl MemoryRecombinationModule {
     }
 
     async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.allocation_updates.next_item().await?;
-        let _ = self.allocation_updates.take_ready_items()?;
+        let _ = self.interoception_updates.next_item().await?;
+        let _ = self.interoception_updates.take_ready_items()?;
         Ok(())
     }
 }
@@ -231,7 +231,7 @@ impl Module for MemoryRecombinationModule {
     }
 
     fn role_description() -> &'static str {
-        "Runs REM-like internal memory recombination on allocation guidance and appends source-tagged dream simulations to cognition without treating them as verified facts."
+        "Runs REM-like internal memory recombination on interoceptive state changes and allocation context, appending source-tagged dream simulations without treating them as verified facts."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

@@ -17,7 +17,6 @@ pub enum TopicKind {
     AttentionControlRequest,
     SensoryInput,
     CognitionLogUpdated,
-    AllocationUpdated,
     InteroceptiveUpdated,
     MemoUpdated,
     MemoLogEvicted,

@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogUpdatedInbox,
-    LlmAccess, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
+    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
     compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
     memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
     seed_persistent_faculty_session,
@@ -192,7 +192,6 @@ pub enum QueryMemoryTools {
 
 pub struct QueryMemoryModule {
     owner: nuillu_types::ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
@@ -209,7 +208,6 @@ pub struct QueryMemoryModule {
 impl QueryMemoryModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
@@ -221,7 +219,6 @@ impl QueryMemoryModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("query-memory id is valid"),
-            allocation_updates,
             cognition_updates,
             allocation,
             blackboard,
@@ -254,24 +251,6 @@ impl QueryMemoryModule {
             cx.now(),
         );
         self.session_seeded = true;
-    }
-
-    #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate_allocation_guidance(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-    ) -> Result<()> {
-        let guidance = self
-            .allocation
-            .snapshot()
-            .await
-            .for_module(&self.owner)
-            .guidance;
-        let questions = guidance_questions(&guidance);
-        if questions.is_empty() {
-            return Ok(());
-        }
-        self.search_with_memory(cx, &questions).await
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -694,23 +673,11 @@ impl QueryMemoryModule {
     }
 
     async fn await_first_batch(&mut self) -> Result<QueryMemoryBatch> {
-        let batch = tokio::select! {
-            update = self.allocation_updates.next_item() => {
-                let _ = update?;
-                QueryMemoryBatch::allocation_update()
-            }
-            update = self.cognition_updates.next_item() => {
-                let _ = update?;
-                QueryMemoryBatch::cognition_log_update()
-            }
-        };
-        Ok(batch)
+        let _ = self.cognition_updates.next_item().await?;
+        Ok(QueryMemoryBatch::cognition_log_update())
     }
 
     fn collect_ready_events_into_batch(&mut self, batch: &mut QueryMemoryBatch) -> Result<()> {
-        if !self.allocation_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_allocation_updated();
-        }
         if !self.cognition_updates.take_ready_items()?.items.is_empty() {
             batch.mark_cognition_updated();
         }
@@ -720,31 +687,18 @@ impl QueryMemoryModule {
 
 #[derive(Debug, Default)]
 pub struct QueryMemoryBatch {
-    pub(crate) allocation_updated: bool,
     pub(crate) cognition_updated: bool,
 }
 
 impl QueryMemoryBatch {
-    fn allocation_update() -> Self {
-        Self {
-            allocation_updated: true,
-            cognition_updated: false,
-        }
-    }
-
     fn cognition_log_update() -> Self {
         Self {
-            allocation_updated: false,
             cognition_updated: true,
         }
     }
 
     fn mark_cognition_updated(&mut self) {
         self.cognition_updated = true;
-    }
-
-    fn mark_allocation_updated(&mut self) {
-        self.allocation_updated = true;
     }
 }
 
@@ -919,7 +873,7 @@ impl Module for QueryMemoryModule {
     }
 
     fn role_description() -> &'static str {
-        "Recalls stored memories by semantic similarity when evidence is not already available: writes query intent and fresh memory evidence to its memo log from allocation guidance or cognition-log updates; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
+        "Recalls stored memories by semantic similarity when cognition-log context needs evidence: writes query intent and fresh memory evidence to its memo log; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -931,21 +885,9 @@ impl Module for QueryMemoryModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if batch.allocation_updated {
-            self.activate_allocation_guidance(cx).await?;
-        }
         if batch.cognition_updated {
             self.activate_cognition_update(cx).await?;
         }
         Ok(())
-    }
-}
-
-fn guidance_questions(guidance: &str) -> Vec<String> {
-    let trimmed = guidance.trim();
-    if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        vec![trimmed.to_owned()]
     }
 }

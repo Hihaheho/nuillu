@@ -9,8 +9,8 @@ use nuillu_blackboard::{
     InteroceptivePatch, InteroceptiveState, MemoLogRecord,
 };
 use nuillu_module::{
-    AllocationUpdatedInbox, AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox,
-    InteroceptionRuntimePolicy, InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module,
+    AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox, InteroceptionRuntimePolicy,
+    InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -77,7 +77,6 @@ pub struct InteroceptionBatch {
 pub struct InteroceptionModule {
     memo_updates: MemoUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
     allocation_writer: AllocationWriter,
     interoception: InteroceptiveWriter,
@@ -93,7 +92,6 @@ impl InteroceptionModule {
     pub fn new(
         memo_updates: MemoUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
         allocation_writer: AllocationWriter,
         policy: InteroceptionRuntimePolicy,
@@ -103,7 +101,6 @@ impl InteroceptionModule {
         Self {
             memo_updates,
             cognition_updates,
-            allocation_updates,
             blackboard,
             allocation_writer,
             policy,
@@ -208,15 +205,10 @@ impl InteroceptionModule {
                 let _ = update?;
                 true
             }
-            update = self.allocation_updates.next_item() => {
-                let _ = update?;
-                true
-            }
             _ = tokio::time::sleep(PERIODIC_WAKEUP) => false,
         };
         affect_candidate |= !self.memo_updates.take_ready_items()?.items.is_empty();
         affect_candidate |= !self.cognition_updates.take_ready_items()?.items.is_empty();
-        affect_candidate |= !self.allocation_updates.take_ready_items()?.items.is_empty();
         Ok(InteroceptionBatch { affect_candidate })
     }
 

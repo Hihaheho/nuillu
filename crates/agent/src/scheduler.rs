@@ -4250,6 +4250,68 @@ mod tests {
     // does not start semantic work for them until allocation makes them active.
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn allocation_change_alone_does_not_create_module_batch() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = echo_id();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let (done_tx, mut done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(modules, test_config(), async {
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+
+                    let mut changed = ResourceAllocation::default();
+                    changed.set(
+                        module_id.clone(),
+                        ModuleConfig {
+                            guidance: "new durable context".into(),
+                        },
+                    );
+                    changed.set_activation(module_id.clone(), ActivationRatio::ONE);
+                    blackboard
+                        .apply(BlackboardCommand::SetAllocation(changed))
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    assert_oneshot_pending(
+                        &mut done_rx,
+                        "allocation changes should not synthesize module work",
+                    );
+                })
+                .await
+                .expect("scheduler returned err");
+
+                let memos = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(memos.is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn inactive_stored_module_runs_queued_work_after_activation() {
         let local = LocalSet::new();
         local

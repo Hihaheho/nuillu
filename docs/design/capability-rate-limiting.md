@@ -83,10 +83,10 @@ pub enum TopicKind {
     AttentionControlRequest,
     SensoryInput,
     CognitionLogUpdated,
-    AllocationUpdated,
     MemoUpdated,
     MemoLogEvicted,
     CognitionLogEvicted,
+    InteroceptiveUpdated,
 }
 
 pub struct RateLimitConfig {
@@ -331,7 +331,7 @@ Useful metrics:
 - cumulative delayed duration,
 - first completed utterance latency,
 - eval rubric score / success,
-- allocation update count,
+- allocation change count,
 - agentic deadlock marker count.
 
 ---
@@ -345,8 +345,8 @@ Bounded mailboxes are a separate runtime policy because overflow semantics diffe
 by topic:
 
 - Wake-only topics (`CognitionLogUpdated`, `MemoUpdated`,
-  `AllocationUpdated`) may coalesce redundant queued wakes because durable state
-  is the source of truth.
+  `InteroceptiveUpdated`) may coalesce redundant queued wakes because durable
+  state is the source of truth.
 - Work-carrying topics (`AttentionControlRequest`, `SensoryInput`,
   `MemoLogEvicted`, `CognitionLogEvicted`) must not silently drop by default
   because the payload is the work.

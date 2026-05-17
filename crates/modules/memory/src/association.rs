@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Module,
+    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
 };
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -84,7 +84,7 @@ pub enum AssociationTools {
 
 pub struct MemoryAssociationModule {
     owner: nuillu_types::ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
+    interoception_updates: InteroceptiveUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     reader: MemoryContentReader,
@@ -97,7 +97,7 @@ pub struct MemoryAssociationModule {
 impl MemoryAssociationModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        interoception_updates: InteroceptiveUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         reader: MemoryContentReader,
@@ -108,7 +108,7 @@ impl MemoryAssociationModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("memory-association id is valid"),
-            allocation_updates,
+            interoception_updates,
             allocation,
             blackboard,
             reader,
@@ -353,8 +353,8 @@ impl MemoryAssociationModule {
     }
 
     async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.allocation_updates.next_item().await?;
-        let _ = self.allocation_updates.take_ready_items()?;
+        let _ = self.interoception_updates.next_item().await?;
+        let _ = self.interoception_updates.take_ready_items()?;
         Ok(())
     }
 }
@@ -401,7 +401,7 @@ impl Module for MemoryAssociationModule {
     }
 
     fn role_description() -> &'static str {
-        "Writes non-destructive memory associations, reflection summaries, and links; wakes on allocation guidance, never on raw memos."
+        "Writes non-destructive memory associations, reflection summaries, and links; wakes on interoceptive state changes and reads allocation guidance as context."
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

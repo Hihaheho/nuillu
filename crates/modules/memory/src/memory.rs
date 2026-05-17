@@ -6,11 +6,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, CognitionLogEntryRecord, CognitionLogEvictedInbox,
-    LlmAccess, MemoryMetadataReader, Module, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
-    format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
-    render_memory_for_llm,
+    AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
+    MemoryMetadataReader, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
+    memory_rank_counts, push_formatted_cognition_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -123,7 +122,6 @@ pub enum MemoryTools {
 pub struct MemoryModule {
     owner: nuillu_types::ModuleId,
     cognition_evictions: CognitionLogEvictedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     allocation: AllocationReader,
     memory_metadata: MemoryMetadataReader,
     memory: MemoryWriter,
@@ -158,7 +156,6 @@ impl MemoryModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cognition_evictions: CognitionLogEvictedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         allocation: AllocationReader,
         memory_metadata: MemoryMetadataReader,
         memory: MemoryWriter,
@@ -168,7 +165,6 @@ impl MemoryModule {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
             cognition_evictions,
-            allocation_updates,
             allocation,
             memory_metadata,
             memory,
@@ -243,7 +239,6 @@ impl MemoryModule {
         self.session.push_ephemeral_system(system_prompt);
         self.session.push_user(format_memory_activation_request(
             &allocation_guidance,
-            batch.allocation_updated,
             batch.cognition_log.len(),
         ));
         if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
@@ -440,19 +435,14 @@ pub(crate) fn memory_tag_from_input(input: MemoryTagInput) -> MemoryTag {
     MemoryTag::operational(input.0)
 }
 
-fn format_memory_activation_request(
-    guidance: &str,
-    allocation_updated: bool,
-    cognition_evicted_count: usize,
-) -> String {
+fn format_memory_activation_request(guidance: &str, cognition_evicted_count: usize) -> String {
     format!(
-        "Memory preservation activation.\nAllocation guidance: {}\nAllocation updated: {}\nEvicted cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed. Memo-log entries are not valid direct memory evidence.",
+        "Memory preservation activation.\nAllocation guidance: {}\nEvicted cognition-log entries: {}\nOrdinary memory writes are short-term; runtime stamps decay and occurrence time.\nExplicit requests are preservation candidates, not commands; deduplication and rejection are allowed. Memo-log entries are not valid direct memory evidence.",
         if guidance.trim().is_empty() {
             "none"
         } else {
             guidance.trim()
         },
-        if allocation_updated { "yes" } else { "no" },
         cognition_evicted_count,
     )
 }
@@ -504,7 +494,6 @@ fn format_related_memory_candidates(candidates: &[RelatedMemoryCandidate]) -> Op
 
 #[derive(Debug, Default)]
 pub struct MemoryBatch {
-    pub(crate) allocation_updated: bool,
     pub(crate) cognition_log: Vec<CognitionLogEntryRecord>,
 }
 
@@ -525,33 +514,21 @@ impl Default for MemoryBatchConfig {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ReadyCounts {
-    allocation_updates: usize,
     cognition_evictions: usize,
 }
 
 impl ReadyCounts {
     fn is_empty(self) -> bool {
-        self.allocation_updates == 0 && self.cognition_evictions == 0
+        self.cognition_evictions == 0
     }
 }
 
 impl MemoryBatch {
-    fn allocation_update() -> Self {
-        Self {
-            allocation_updated: true,
-            ..Self::default()
-        }
-    }
-
     fn cognition_log_eviction(record: CognitionLogEntryRecord) -> Self {
         Self {
             cognition_log: vec![record],
             ..Self::default()
         }
-    }
-
-    fn mark_allocation_updated(&mut self) {
-        self.allocation_updated = true;
     }
 }
 
@@ -564,16 +541,8 @@ impl MemoryModule {
     }
 
     async fn await_first_batch(&mut self) -> Result<MemoryBatch> {
-        let batch = tokio::select! {
-            update = self.allocation_updates.next_item() => {
-                let _ = update?;
-                MemoryBatch::allocation_update()
-            }
-            evicted = self.cognition_evictions.next_item() => {
-                MemoryBatch::cognition_log_eviction(evicted?.body)
-            }
-        };
-        Ok(batch)
+        let evicted = self.cognition_evictions.next_item().await?;
+        Ok(MemoryBatch::cognition_log_eviction(evicted.body))
     }
 
     async fn collect_eviction_burst(&mut self, batch: &mut MemoryBatch) -> Result<()> {
@@ -587,11 +556,6 @@ impl MemoryModule {
 
             let started = Instant::now();
             tokio::select! {
-                update = self.allocation_updates.next_item() => {
-                    let _ = update?;
-                    waited += std::cmp::min(started.elapsed(), wait_for);
-                    let _ = self.collect_ready_events_into_batch(batch)?;
-                }
                 evicted = self.cognition_evictions.next_item() => {
                     batch.cognition_log.push(evicted?.body);
                     waited += std::cmp::min(started.elapsed(), wait_for);
@@ -610,11 +574,6 @@ impl MemoryModule {
     }
 
     fn collect_ready_events_into_batch(&mut self, batch: &mut MemoryBatch) -> Result<ReadyCounts> {
-        let allocation_updates = self.allocation_updates.take_ready_items()?.items.len();
-        if allocation_updates > 0 {
-            batch.mark_allocation_updated();
-        }
-
         let cognition_evictions = self.cognition_evictions.take_ready_items()?;
         let cognition_count = cognition_evictions.items.len();
         batch.cognition_log.extend(
@@ -625,7 +584,6 @@ impl MemoryModule {
         );
 
         Ok(ReadyCounts {
-            allocation_updates,
             cognition_evictions: cognition_count,
         })
     }
@@ -696,7 +654,7 @@ mod tests {
             let batch = self.inner.next_batch().await?;
             self.recorder
                 .borrow_mut()
-                .push((batch.allocation_updated, batch.cognition_log.len()));
+                .push((false, batch.cognition_log.len()));
             Ok(batch)
         }
 
@@ -750,7 +708,6 @@ mod tests {
                 move |caps| RecordingMemory {
                     inner: MemoryModule::new(
                         caps.cognition_log_evicted_inbox(),
-                        caps.allocation_updated_inbox(),
                         caps.allocation_reader(),
                         caps.memory_metadata_reader(),
                         memory_caps.writer(),

@@ -20,8 +20,7 @@ use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEv
 use crate::scene::{SceneReader, SceneRegistry};
 use crate::r#trait::ErasedModule;
 use crate::{
-    AllocationReader, AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox,
-    AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
+    AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     AttentionControlRequestMailbox, BlackboardReader, CognitionLogEvictedInbox,
     CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox,
     CognitionLogUpdatedMailbox, CognitionWriter, InteroceptionRuntimePolicy, InteroceptiveReader,
@@ -47,7 +46,6 @@ struct CapabilityProvidersInner {
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     cognition_log_evictions: Topic<nuillu_blackboard::CognitionLogEntryRecord>,
-    allocation_updates: Topic<AllocationUpdated>,
     interoception_updates: Topic<InteroceptiveUpdated>,
     memo_updates: Topic<MemoUpdated>,
     memo_log_evictions: Topic<nuillu_blackboard::MemoLogRecord>,
@@ -138,13 +136,6 @@ impl CapabilityProviders {
                     blackboard.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::CognitionLogEvicted,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
-                allocation_updates: Topic::new(
-                    blackboard.clone(),
-                    TopicPolicy::Fanout,
-                    TopicKind::AllocationUpdated,
                     rate_limiter.clone(),
                     runtime_events.clone(),
                 ),
@@ -505,13 +496,6 @@ impl HostIo {
             self.root.inner.sensory_input_topic.clone(),
         )
     }
-
-    pub fn allocation_updated_mailbox(&self) -> AllocationUpdatedMailbox {
-        TopicMailbox::new(
-            self.owner.clone(),
-            self.root.inner.allocation_updates.clone(),
-        )
-    }
 }
 
 #[derive(Clone)]
@@ -539,13 +523,6 @@ impl InternalHarnessIo {
         TopicMailbox::new(
             self.owner.clone(),
             self.root.inner.cognition_log_evictions.clone(),
-        )
-    }
-
-    pub fn allocation_updated_mailbox(&self) -> AllocationUpdatedMailbox {
-        TopicMailbox::new(
-            self.owner.clone(),
-            self.root.inner.allocation_updates.clone(),
         )
     }
 
@@ -609,13 +586,6 @@ impl ModuleCapabilityFactory {
         TopicInbox::new_excluding_self(
             self.owner.clone(),
             self.root.inner.cognition_log_evictions.clone(),
-        )
-    }
-
-    pub fn allocation_updated_inbox(&self) -> AllocationUpdatedInbox {
-        TopicInbox::new(
-            self.owner.clone(),
-            self.root.inner.allocation_updates.clone(),
         )
     }
 
@@ -761,10 +731,6 @@ impl ModuleCapabilityFactory {
         AllocationWriter::new(
             self.owner.clone(),
             self.root.inner.blackboard.clone(),
-            AllocationUpdatedMailbox::new(
-                self.owner.clone(),
-                self.root.inner.allocation_updates.clone(),
-            ),
             allowed_target_modules,
             allowed_suppression_modules,
             self.root.inner.runtime_policy.allocation_effects.clone(),
@@ -1565,7 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_writer_publishes_guidance_changes_once() {
+    async fn allocation_writer_records_guidance_changes() {
         let blackboard = Blackboard::default();
         blackboard
             .apply(BlackboardCommand::SetModulePolicies {
@@ -1591,11 +1557,9 @@ mod tests {
                 ],
             })
             .await;
-        let caps = test_caps(blackboard);
+        let caps = test_caps(blackboard.clone());
         let controller = scoped(&caps, builtin::allocation_controller(), 0);
-        let cognition_gate = scoped(&caps, builtin::cognition_gate(), 0);
         let writer = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
-        let mut inbox = cognition_gate.allocation_updated_inbox();
 
         let commands = vec![AllocationCommand::target(
             builtin::cognition_gate(),
@@ -1603,13 +1567,13 @@ mod tests {
             Some("promote current sensory memo into attention".into()),
         )];
 
-        writer.submit(commands.clone()).await;
-        let event = inbox.next_item().await.unwrap();
-        assert_eq!(event.sender.module, builtin::allocation_controller());
-        assert_eq!(event.body, crate::AllocationUpdated);
-
         writer.submit(commands).await;
-        assert!(inbox.take_ready_items().unwrap().items.is_empty());
+
+        let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(
+            allocation.for_module(&builtin::cognition_gate()).guidance,
+            "promote current sensory memo into attention"
+        );
     }
 
     #[tokio::test]

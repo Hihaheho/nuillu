@@ -58,14 +58,13 @@ pub use capabilities::{
     ModuleRegistry, ModuleRegistryError,
 };
 pub use channels::{
-    AllocationUpdated, AllocationUpdatedInbox, AllocationUpdatedMailbox, AmbientSensoryEntry,
-    AttentionControlRequest, AttentionControlRequestInbox, AttentionControlRequestMailbox,
-    CognitionLogEvictedInbox, CognitionLogEvictedMailbox, CognitionLogUpdated,
-    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope, InteroceptiveUpdated,
-    InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, MemoLogEvictedInbox,
-    MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryImportance,
-    ReadyItems, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox,
-    TopicMailbox, TopicRecvError,
+    AmbientSensoryEntry, AttentionControlRequest, AttentionControlRequestInbox,
+    AttentionControlRequestMailbox, CognitionLogEvictedInbox, CognitionLogEvictedMailbox,
+    CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope,
+    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
+    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox,
+    MemoryImportance, ReadyItems, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
+    SensoryModality, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
 pub use interoception::InteroceptiveWriter;

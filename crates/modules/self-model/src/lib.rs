@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader, LlmAccess,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
     Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_session_if_needed, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
@@ -29,7 +29,7 @@ and corrections. Do not invent facts. Return plain text only."#;
 
 pub struct SelfModelModule {
     owner: nuillu_module::ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
+    cognition_updates: CognitionLogUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
@@ -42,7 +42,7 @@ pub struct SelfModelModule {
 
 impl SelfModelModule {
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        cognition_updates: CognitionLogUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
@@ -52,7 +52,7 @@ impl SelfModelModule {
         Self {
             owner: nuillu_module::ModuleId::new(<Self as Module>::id())
                 .expect("self-model id is valid"),
-            allocation_updates,
+            cognition_updates,
             allocation,
             blackboard,
             cognition_log,
@@ -156,7 +156,7 @@ impl Module for SelfModelModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        if batch.allocation_updated {
+        if batch.cognition_updated {
             self.answer_from_guidance(cx).await?;
         }
         Ok(())

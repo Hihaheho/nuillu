@@ -31,11 +31,10 @@ use nuillu_memory::{
 };
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
-    AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
-    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
-    InteroceptionRuntimePolicy, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink,
-    RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox, SensoryModality,
-    SessionCompactionPolicy,
+    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+    CapabilityProviders, CognitionLogUpdated, InternalHarnessIo, InteroceptionRuntimePolicy,
+    ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SceneRegistry,
+    SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
@@ -1165,7 +1164,6 @@ async fn execute_full_agent_case(
 
     let host = env.caps.host_io();
     let sensory = host.sensory_input_mailbox();
-    let allocation_updates = host.allocation_updated_mailbox();
     let inputs = case.inputs.clone();
     let steps = case.steps.clone();
     let activate_allocation = case.activate_allocation.clone();
@@ -1254,7 +1252,6 @@ async fn execute_full_agent_case(
                         visualizer,
                         Some(&sensory),
                         &allocation_blackboard,
-                        &allocation_updates,
                         memory.as_ref(),
                         clock.as_ref(),
                     )
@@ -1488,7 +1485,6 @@ async fn execute_module_case(
     .build(&env.caps)
     .await?;
     let harness = env.caps.internal_harness_io();
-    let allocation_updates = env.caps.host_io().allocation_updated_mailbox();
     let prompt = case.prompt.content.clone();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
@@ -1529,7 +1525,6 @@ async fn execute_module_case(
                         visualizer,
                         None,
                         &blackboard,
-                        &allocation_updates,
                         memory.as_ref(),
                         clock.as_ref(),
                     )
@@ -1692,10 +1687,16 @@ async fn activate_module_case_target(
                     .expect("module eval failed to publish MemoUpdated");
             }
             harness
-                .allocation_updated_mailbox()
-                .publish(AllocationUpdated)
+                .memo_updated_mailbox()
+                .publish(nuillu_module::MemoUpdated {
+                    owner: ModuleInstanceId::new(
+                        ModuleId::new("eval-harness").expect("eval-harness id is valid"),
+                        ReplicaIndex::ZERO,
+                    ),
+                    index: 0,
+                })
                 .await
-                .expect("module eval failed to publish AllocationUpdated");
+                .expect("module eval failed to publish MemoUpdated");
         }
         ModuleEvalTarget::QueryMemory => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
@@ -1706,10 +1707,12 @@ async fn activate_module_case_target(
                 .apply(BlackboardCommand::SetAllocation(allocation))
                 .await;
             harness
-                .allocation_updated_mailbox()
-                .publish(AllocationUpdated)
+                .cognition_log_updated_mailbox()
+                .publish(CognitionLogUpdated::EntryAppended {
+                    source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+                })
                 .await
-                .expect("module eval failed to publish AllocationUpdated");
+                .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::AttentionSchema => {
             for record in memo_seed_records {
@@ -1744,10 +1747,12 @@ async fn activate_module_case_target(
                 .apply(BlackboardCommand::SetAllocation(allocation))
                 .await;
             harness
-                .allocation_updated_mailbox()
-                .publish(AllocationUpdated)
+                .cognition_log_updated_mailbox()
+                .publish(CognitionLogUpdated::EntryAppended {
+                    source: ModuleInstanceId::new(builtin::attention_schema(), ReplicaIndex::ZERO),
+                })
                 .await
-                .expect("module eval failed to publish AllocationUpdated");
+                .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::Memory => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
@@ -1766,11 +1771,6 @@ async fn activate_module_case_target(
                         .expect("module eval failed to publish CognitionLogEvicted");
                 }
             }
-            harness
-                .allocation_updated_mailbox()
-                .publish(AllocationUpdated)
-                .await
-                .expect("module eval failed to publish AllocationUpdated");
         }
         ModuleEvalTarget::MemoryCompaction
         | ModuleEvalTarget::MemoryAssociation
@@ -1783,10 +1783,10 @@ async fn activate_module_case_target(
                 .apply(BlackboardCommand::SetAllocation(allocation))
                 .await;
             harness
-                .allocation_updated_mailbox()
-                .publish(AllocationUpdated)
+                .interoception_updated_mailbox()
+                .publish(nuillu_module::InteroceptiveUpdated)
                 .await
-                .expect("module eval failed to publish AllocationUpdated");
+                .expect("module eval failed to publish InteroceptiveUpdated");
         }
         ModuleEvalTarget::Speak => {
             if has_cognition_log_seed {
@@ -2547,7 +2547,6 @@ async fn handle_visualizer_commands(
     visualizer: &mut VisualizerHook,
     sensory: Option<&SensoryInputMailbox>,
     blackboard: &Blackboard,
-    allocation_updates: &AllocationUpdatedMailbox,
     memory: &dyn MemoryStore,
     clock: &dyn Clock,
 ) -> VisualizerCommandOutcome {
@@ -2698,14 +2697,7 @@ async fn handle_visualizer_commands(
             VisualizerCommand::SetModuleSettings { tab_id, settings }
                 if tab_id.as_str() == case_id =>
             {
-                apply_visualizer_module_settings(
-                    &tab_id,
-                    visualizer,
-                    blackboard,
-                    allocation_updates,
-                    settings,
-                )
-                .await;
+                apply_visualizer_module_settings(&tab_id, visualizer, blackboard, settings).await;
             }
             VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
@@ -2745,7 +2737,6 @@ pub(crate) async fn apply_visualizer_module_settings(
     tab_id: &VisualizerTabId,
     visualizer: &VisualizerHook,
     blackboard: &Blackboard,
-    allocation_updates: &AllocationUpdatedMailbox,
     settings: ModuleSettingsView,
 ) -> bool {
     let update = match build_module_policy_update(blackboard, &settings).await {
@@ -2759,16 +2750,11 @@ pub(crate) async fn apply_visualizer_module_settings(
         }
     };
 
-    let before = blackboard.read(|bb| bb.allocation().clone()).await;
     blackboard
         .apply(BlackboardCommand::SetModulePolicies {
             policies: vec![update],
         })
         .await;
-    let after = blackboard.read(|bb| bb.allocation().clone()).await;
-    if before != after && allocation_updates.publish(AllocationUpdated).await.is_err() {
-        tracing::trace!("visualizer module settings allocation update had no active subscribers");
-    }
     true
 }
 
@@ -3326,6 +3312,22 @@ fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -
             builtin::memory_recombination(),
             builtin::memory_compaction(),
         ),
+        (
+            builtin::memory_compaction(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::memory_association(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::memory_recombination(),
+            builtin::homeostatic_controller(),
+        ),
+        (
+            builtin::policy_compaction(),
+            builtin::homeostatic_controller(),
+        ),
     ];
 
     edges
@@ -3431,7 +3433,6 @@ fn register_eval_module(
                 |caps| {
                     nuillu_cognition_gate::CognitionGateModule::new(
                         caps.memo_updated_inbox(),
-                        caps.allocation_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.allocation_reader(),
                         caps.cognition_writer(),
@@ -3475,7 +3476,6 @@ fn register_eval_module(
                 |caps| {
                     nuillu_attention_schema::AttentionSchemaModule::new(
                         caps.memo_updated_inbox(),
-                        caps.allocation_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.allocation_reader(),
@@ -3486,14 +3486,14 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        // On-demand: fires on controller allocation guidance.
+        // On-demand: fires on cognition-log updates and reads controller guidance as context.
         EvalModule::SelfModel => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                 replica_hard_cap,
                 |caps| {
                     nuillu_self_model::SelfModelModule::new(
-                        caps.allocation_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
@@ -3513,7 +3513,6 @@ fn register_eval_module(
                     let memory_caps = memory_caps.clone();
                     move |caps| {
                         nuillu_memory::QueryMemoryModule::new(
-                            caps.allocation_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
@@ -3536,7 +3535,6 @@ fn register_eval_module(
                     move |caps| {
                         nuillu_memory::MemoryModule::new(
                             caps.cognition_log_evicted_inbox(),
-                            caps.allocation_updated_inbox(),
                             caps.allocation_reader(),
                             caps.memory_metadata_reader(),
                             memory_caps.writer(),
@@ -3547,7 +3545,7 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        // Rare; runs on allocation guidance only.
+        // Rare; runs on interoceptive state changes and reads allocation guidance as context.
         EvalModule::MemoryCompaction => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
@@ -3556,7 +3554,7 @@ fn register_eval_module(
                     let memory_caps = memory_caps.clone();
                     move |caps| {
                         nuillu_memory::MemoryCompactionModule::new(
-                            caps.allocation_updated_inbox(),
+                            caps.interoception_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.compactor(),
@@ -3574,7 +3572,7 @@ fn register_eval_module(
                     let memory_caps = memory_caps.clone();
                     move |caps| {
                         nuillu_memory::MemoryAssociationModule::new(
-                            caps.allocation_updated_inbox(),
+                            caps.interoception_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.content_reader(),
@@ -3594,7 +3592,7 @@ fn register_eval_module(
                     let memory_caps = memory_caps.clone();
                     move |caps| {
                         nuillu_memory::MemoryRecombinationModule::new(
-                            caps.allocation_updated_inbox(),
+                            caps.interoception_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             memory_caps.retriever(),
@@ -3615,7 +3613,6 @@ fn register_eval_module(
                         nuillu_interoception::InteroceptionModule::new(
                             caps.memo_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
-                            caps.allocation_updated_inbox(),
                             caps.blackboard_reader(),
                             caps.allocation_writer(Vec::new(), suppressed.clone()),
                             caps.interoception_policy(),
@@ -3654,7 +3651,6 @@ fn register_eval_module(
                         nuillu_reward::PolicyModule::new(
                             caps.memo_updated_inbox(),
                             caps.cognition_log_updated_inbox(),
-                            caps.allocation_updated_inbox(),
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
                             caps.allocation_reader(),
@@ -3676,7 +3672,7 @@ fn register_eval_module(
                     let policy_caps = policy_caps.clone();
                     move |caps| {
                         nuillu_reward::PolicyCompactionModule::new(
-                            caps.allocation_updated_inbox(),
+                            caps.interoception_updated_inbox(),
                             caps.allocation_reader(),
                             caps.blackboard_reader(),
                             policy_caps.compactor(),
@@ -6324,7 +6320,6 @@ prompt = "What am I attending to?"
                         |caps| {
                             nuillu_attention_schema::AttentionSchemaModule::new(
                                 caps.memo_updated_inbox(),
-                                caps.allocation_updated_inbox(),
                                 caps.cognition_log_updated_inbox(),
                                 caps.blackboard_reader(),
                                 caps.allocation_reader(),

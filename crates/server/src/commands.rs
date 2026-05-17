@@ -4,10 +4,7 @@ use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
 };
 use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation};
-use nuillu_module::{
-    AllocationUpdated, AllocationUpdatedMailbox, AmbientSensoryEntry, SensoryInput,
-    SensoryInputMailbox, SensoryModality,
-};
+use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality};
 use nuillu_types::{MemoryIndex, ModuleId, ReplicaCapRange};
 use nuillu_visualizer_protocol::{
     ModuleSettingsView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
@@ -31,7 +28,6 @@ pub(super) async fn drive_server_until_shutdown(
     ambient: &mut AmbientRows,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
-    allocation_updates: &AllocationUpdatedMailbox,
     env: &ServerEnvironment,
 ) {
     publish_ambient_snapshot(ambient, sensory, visualizer, tab_id, env.clock.as_ref()).await;
@@ -47,7 +43,6 @@ pub(super) async fn drive_server_until_shutdown(
                 ambient,
                 module_settings,
                 sensory,
-                allocation_updates,
                 env,
             )
             .await
@@ -71,7 +66,6 @@ async fn handle_server_visualizer_message(
     ambient: &mut AmbientRows,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
-    allocation_updates: &AllocationUpdatedMailbox,
     env: &ServerEnvironment,
 ) -> bool {
     let command = match message {
@@ -135,15 +129,7 @@ async fn handle_server_visualizer_message(
             module,
             disabled,
         } if command_tab == *tab_id => {
-            set_module_disabled(
-                &module,
-                disabled,
-                visualizer,
-                tab_id,
-                allocation_updates,
-                env,
-            )
-            .await;
+            set_module_disabled(&module, disabled, visualizer, tab_id, env).await;
             false
         }
         VisualizerCommand::SetModuleSettings {
@@ -154,7 +140,6 @@ async fn handle_server_visualizer_message(
                 tab_id,
                 visualizer,
                 &env.blackboard,
-                allocation_updates,
                 settings.clone(),
             )
             .await
@@ -268,7 +253,6 @@ async fn set_module_disabled(
     disabled: bool,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
-    allocation_updates: &AllocationUpdatedMailbox,
     env: &ServerEnvironment,
 ) {
     let module_id = match ModuleId::new(module.to_string()) {
@@ -281,17 +265,12 @@ async fn set_module_disabled(
             return;
         }
     };
-    let before = env.blackboard.read(|bb| bb.allocation().clone()).await;
     env.blackboard
         .apply(BlackboardCommand::SetModuleForcedDisabled {
             module: module_id,
             disabled,
         })
         .await;
-    let after = env.blackboard.read(|bb| bb.allocation().clone()).await;
-    if before != after && allocation_updates.publish(AllocationUpdated).await.is_err() {
-        tracing::trace!("visualizer forced-disable allocation update had no active subscribers");
-    }
 }
 
 async fn persist_and_emit_ambient(
@@ -347,17 +326,9 @@ pub(super) async fn apply_persisted_module_settings(
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
     blackboard: &Blackboard,
-    allocation_updates: &AllocationUpdatedMailbox,
 ) {
     for setting in settings.iter() {
-        apply_visualizer_module_settings(
-            tab_id,
-            visualizer,
-            blackboard,
-            allocation_updates,
-            setting.clone(),
-        )
-        .await;
+        apply_visualizer_module_settings(tab_id, visualizer, blackboard, setting.clone()).await;
     }
 }
 
@@ -365,7 +336,6 @@ async fn apply_visualizer_module_settings(
     tab_id: &VisualizerTabId,
     visualizer: &VisualizerHook,
     blackboard: &Blackboard,
-    allocation_updates: &AllocationUpdatedMailbox,
     settings: ModuleSettingsView,
 ) -> bool {
     let update = match build_module_policy_update(blackboard, &settings).await {
@@ -379,16 +349,11 @@ async fn apply_visualizer_module_settings(
         }
     };
 
-    let before = blackboard.read(|bb| bb.allocation().clone()).await;
     blackboard
         .apply(BlackboardCommand::SetModulePolicies {
             policies: vec![update],
         })
         .await;
-    let after = blackboard.read(|bb| bb.allocation().clone()).await;
-    if before != after && allocation_updates.publish(AllocationUpdated).await.is_err() {
-        tracing::trace!("visualizer module settings allocation update had no active subscribers");
-    }
     true
 }
 

@@ -2,11 +2,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionLogReader,
-    CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
-    format_current_attention_guidance, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
+    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
+    CognitionWriter, LlmAccess, MemoUpdatedInbox, Module, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -68,7 +67,6 @@ pub enum AttentionSchemaTools {
 pub struct AttentionSchemaModule {
     owner: nuillu_types::ModuleId,
     memo_updates: MemoUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
@@ -84,7 +82,6 @@ impl AttentionSchemaModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         memo_updates: MemoUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         cognition_updates: CognitionLogUpdatedInbox,
         blackboard: BlackboardReader,
         allocation: AllocationReader,
@@ -96,7 +93,6 @@ impl AttentionSchemaModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("attention-schema id is valid"),
             memo_updates,
-            allocation_updates,
             cognition_updates,
             blackboard,
             allocation,

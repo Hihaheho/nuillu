@@ -2,13 +2,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Lutum, Session, StructuredTurnOutcome};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, CognitionWriter, LlmAccess,
-    MemoUpdatedInbox, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    SessionCompactionRuntime, TimeDivision, compact_session_if_needed,
-    format_current_attention_guidance, format_faculty_system_prompt, format_memory_trace_inventory,
-    format_stuckness, format_time_division_guidance, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
+    TimeDivision, compact_session_if_needed, format_current_attention_guidance,
+    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
+    format_time_division_guidance, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -102,7 +101,6 @@ pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
 pub struct CognitionGateModule {
     owner: nuillu_types::ModuleId,
     memo_updates: MemoUpdatedInbox,
-    allocation_updates: AllocationUpdatedInbox,
     blackboard: BlackboardReader,
     allocation: AllocationReader,
     cognition: CognitionWriter,
@@ -118,7 +116,6 @@ pub struct CognitionGateModule {
 impl CognitionGateModule {
     pub fn new(
         memo_updates: MemoUpdatedInbox,
-        allocation_updates: AllocationUpdatedInbox,
         blackboard: BlackboardReader,
         allocation: AllocationReader,
         cognition: CognitionWriter,
@@ -129,7 +126,6 @@ impl CognitionGateModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("cognition-gate id is valid"),
             memo_updates,
-            allocation_updates,
             blackboard,
             allocation,
             cognition,
@@ -439,7 +435,6 @@ mod tests {
             .register(test_policy(), move |caps| {
                 *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
                     caps.memo_updated_inbox(),
-                    caps.allocation_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_reader(),
                     caps.cognition_writer(),

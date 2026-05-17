@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AllocationUpdatedInbox, BlackboardReader, LlmAccess, Module,
+    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
 };
 use nuillu_types::{ModuleId, PolicyIndex, PolicyRank};
 use schemars::JsonSchema;
@@ -90,7 +90,7 @@ pub enum PolicyCompactionTools {
 
 pub struct PolicyCompactionModule {
     owner: ModuleId,
-    allocation_updates: AllocationUpdatedInbox,
+    interoception_updates: InteroceptiveUpdatedInbox,
     allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: PolicyCompactor,
@@ -100,7 +100,7 @@ pub struct PolicyCompactionModule {
 
 impl PolicyCompactionModule {
     pub fn new(
-        allocation_updates: AllocationUpdatedInbox,
+        interoception_updates: InteroceptiveUpdatedInbox,
         allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: PolicyCompactor,
@@ -108,7 +108,7 @@ impl PolicyCompactionModule {
     ) -> Self {
         Self {
             owner: ModuleId::new(<Self as Module>::id()).expect("policy-compaction id is valid"),
-            allocation_updates,
+            interoception_updates,
             allocation,
             blackboard,
             compactor,
@@ -307,8 +307,8 @@ impl PolicyCompactionModule {
     }
 
     async fn next_batch(&mut self) -> Result<()> {
-        let _ = self.allocation_updates.next_item().await?;
-        let _ = self.allocation_updates.take_ready_items()?;
+        let _ = self.interoception_updates.next_item().await?;
+        let _ = self.interoception_updates.take_ready_items()?;
         Ok(())
     }
 }

@@ -786,9 +786,8 @@ mod tests {
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
-        AllocationUpdated, CapabilityProviderConfig, CapabilityProviderPorts,
-        CapabilityProviderRuntime, CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy,
-        SessionCompactionPolicy,
+        CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
+        CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
     };
     use nuillu_types::builtin;
     use tokio::task::LocalSet;
@@ -1466,7 +1465,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn allocation_update_alone_does_not_wake_sensory() {
+    async fn allocation_change_alone_does_not_wake_sensory() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -1492,11 +1491,6 @@ mod tests {
                     allocation.set(builtin::sensory(), config);
                     blackboard
                         .apply(BlackboardCommand::SetAllocation(allocation))
-                        .await;
-                    let _ = caps
-                        .internal_harness_io()
-                        .allocation_updated_mailbox()
-                        .publish(AllocationUpdated)
                         .await;
                     tokio::time::sleep(Duration::from_millis(30)).await;
                 })

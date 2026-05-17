@@ -111,22 +111,23 @@ A module can be activated by any inbox capability it holds:
 
 - typed fanout topics, such as external `SensoryInputInbox` or controller-only `AttentionControlRequestInbox`,
 - `MemoUpdatedInbox`, published by memo writes and filtered so a holder does not wake on its own writes,
-- `AllocationUpdatedInbox`, published when effective allocation or guidance changes,
 - `InteroceptiveUpdatedInbox`, published when the canonical internal-state model changes,
 - `CognitionLogUpdatedInbox`, published by cognition-log writes and by the event loop when it records an agentic-deadlock marker, and filtered so a holder does not wake on its own cognition-log writes.
 
-There is no periodic wake mechanism. Allocation guidance is the controller's durable control plane: modules read the current allocation snapshot and decide whether a wake should produce work, defer silently, or only update local state.
+Allocation changes do not publish wake signals. Allocation guidance is the controller's durable control plane: modules read the current allocation snapshot only after another natural activation, then decide whether that activation should produce work, defer silently, or only update local state. Guidance is not a notification, request, or transport path.
 
 Guidance-based allocation flow:
 
 ```text
 Sensory memo -> AllocationController -> allocation proposal
-Memo/Cognition/Allocation updates -> Interoception -> InteroceptiveUpdated
+Memo/Cognition/periodic internal wake -> Interoception -> InteroceptiveUpdated
 InteroceptiveUpdated -> HomeostaticController -> allocation cap/drive proposal
 Sensory memo -> CognitionGate -> CognitionLogUpdated -> Speak
 Surprise -> AttentionControlRequest free-form text -> AllocationController
-CognitionLogUpdated -> QueryMemory/Memory/Policy/Predict/Surprise/AttentionSchema
-Memo/Cognition/Allocation updates -> Policy -> advice memo + custom PolicyConsiderationPayload
+CognitionLogUpdated -> QueryMemory/Policy/Predict/Surprise/AttentionSchema/SelfModel
+CognitionLogEvicted -> Memory
+InteroceptiveUpdated -> MemoryCompaction/MemoryAssociation/MemoryRecombination/PolicyCompaction
+Memo/Cognition updates -> Policy -> advice memo + custom PolicyConsiderationPayload
 PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyUpserter insert/reinforce
 Policy memo -> AllocationController / CognitionGate (memo-authoritative)
 ```
@@ -138,18 +139,18 @@ Cognition-gate does not write a memo. Cognition-log entries wake cognition-log c
 | Module | Read blackboard | Read cognition log | Read allocation | Memo | Clock | LLM | Special capabilities |
 |---|---|---|---|---|---|---|---|
 | sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox` |
-| cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
+| cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
 | allocation-controller | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `InteroceptiveReader`, `AllocationWriter` |
-| attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
-| self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox` |
-| query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `AllocationUpdatedInbox`, `CognitionLogUpdatedInbox`, `MemorySearcher` |
-| memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `AllocationUpdatedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
-| memory-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `MemoryCompactor` |
-| interoception | ✓ | ✓ | ✓ | — | ✓ | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveWriter` |
+| attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
+| self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
+| query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemorySearcher` |
+| memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
+| memory-compaction | ✓ | — | ✓ | — | — | ✓ | `InteroceptiveUpdatedInbox`, `MemoryCompactor` |
 | homeostatic-controller | — | — | — | — | — | — | `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter` |
-| policy | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `AllocationUpdatedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyConsiderationWriter` |
+| interoception | ✓ | ✓ | ✓ | — | ✓ | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `InteroceptiveWriter` |
+| policy | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyConsiderationWriter` |
 | reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `PolicyConsiderationEvictedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyUpserter` |
-| policy-compaction | ✓ | — | ✓ | — | — | ✓ | `AllocationUpdatedInbox`, `PolicyCompactor` |
+| policy-compaction | ✓ | — | ✓ | — | — | ✓ | `InteroceptiveUpdatedInbox`, `PolicyCompactor` |
 | predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
 | speak | — | ✓ | — | ✓ | ✓ | ✓ | `CognitionLogUpdatedInbox`, `SceneReader`, `UtteranceWriter` |
@@ -228,19 +229,19 @@ Stable self-knowledge belongs in memory and can be retrieved by query modules, b
 
 ### Query Memory
 
-Handles memory retrieval (vector-memory/RAG backed in v1). Allocation updates wake it to act on controller guidance; cognition-log updates can also wake it to retrieve memory relevant to the current cognitive surface. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers, describe itself, or query the policy store. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
+Handles memory retrieval (vector-memory/RAG backed in v1). Cognition-log updates wake it to retrieve memory relevant to the current cognitive surface; allocation guidance is read as context during that activation, not as a trigger. Its memo-log entries contain only retrieved memory content, copied from query results; it does not synthesize answers, describe itself, or query the policy store. Reads count as memory access; rank elevation is applied by `MemoryStore` and is not module-visible.
 
 ### Memory
 
-Preserves useful information by inserting memory entries after cognition-log entries are evicted from the retained cognitive surface, or after preservation guidance from allocation-controller. Memo-log entries are non-conscious working traces and must not be stored directly as memory; memory writes must be grounded in cognition-log evidence. The module uses memory metadata for deduplication. Preservation guidance is a candidate, not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
+Preserves useful information by inserting memory entries after cognition-log entries are evicted from the retained cognitive surface. Memo-log entries are non-conscious working traces and must not be stored directly as memory; memory writes must be grounded in cognition-log evidence. The module uses memory metadata for deduplication. Preservation guidance from allocation-controller is durable context during eviction handling, not a wake path and not a write. The memory module may reject, normalize, merge, or deduplicate candidates, and only persists records through its own `insert_memory` tool decision. `insert_memory` exposes only content, kind, concepts, and tags; all ordinary memory-module writes start as `MemoryRank::ShortTerm` with runtime-stamped decay and occurrence time. Its concept and tag inputs are name newtypes serialized as simple string arrays, not id-bearing objects. `MemoryWriter` stamps each persisted record with the current interoceptive affect snapshot: `affect_arousal`, `valence`, and `emotion`. It does not elevate memory rank — access-based rank elevation belongs to `MemoryStore`.
 
 ### Memory Compaction
 
-Fetches related memory contents and merges redundant memories, accumulating remember tokens. Allocation updates wake it to consider compaction guidance. Compaction summaries are also stamped with the current interoceptive affect snapshot at write time.
+Fetches related memory contents and merges redundant memories, accumulating remember tokens. Interoceptive updates wake it; allocation guidance is read as compaction context during that activation. Compaction summaries are also stamped with the current interoceptive affect snapshot at write time.
 
 ### Interoception
 
-Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition, memo, and allocation updates wake it. It preserves deterministic sleep-pressure updates from cognition volume, remember-token relief, elapsed time, and recombination traces, and uses structured LLM output only for the affect fields.
+Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition updates, memo updates, and its module-local periodic wake activate it. It preserves deterministic sleep-pressure updates from cognition volume, remember-token relief, elapsed time, and recombination traces, and uses structured LLM output only for the affect fields.
 
 `wake_arousal` is sleep/wake arousal. `affect_arousal` is emotional activation. `valence` is the signed positive/negative axis in `[-1, 1]`. `emotion` is free text and is not a typed enum. Interoception writes `InteroceptiveState` through `InteroceptiveWriter`; other modules read it through `InteroceptiveReader`.
 
@@ -258,7 +259,7 @@ Closes the TD-0 loop when a structured policy consideration is evicted from the 
 
 ### Policy Compaction
 
-Fetches policy content and conservatively removes redundant non-Core duplicate policies. Allocation updates wake it to consider compaction guidance. It never inserts, reinforces, rewrites policy values, merges contradictions, or deletes Core policies.
+Fetches policy content and conservatively removes redundant non-Core duplicate policies. Interoceptive updates wake it; allocation guidance is read as compaction context during that activation. It never inserts, reinforces, rewrites policy values, merges contradictions, or deletes Core policies.
 
 ### Predict
 
@@ -292,7 +293,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 
 - The attention controller, attention schema, and self-model modules are separate modules.
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
-- Attention-control messages are internal and controller-only; module-level eval harnesses isolate query/self-model modules by seeding allocation guidance rather than by publishing target-specific request payloads.
+- Attention-control messages are internal and controller-only; module-level eval harnesses isolate query/self-model modules by seeding allocation guidance as durable context and then publishing the target module's natural trigger, rather than by publishing target-specific request payloads.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
 - Cognition-gate is the only path from the non-cognitive blackboard to the cognition log; attention-schema writes only attention-experience entries derived from its attention-state integration.
 - Query modules and self-model work are separated by controller guidance and module-specific capabilities.

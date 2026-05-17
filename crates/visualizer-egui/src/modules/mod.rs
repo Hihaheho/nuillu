@@ -1660,7 +1660,7 @@ mod tests {
                 sequence: 0,
                 owner: owner.clone(),
                 batch_type: "nuillu_sensory::SensoryBatch".to_string(),
-                batch_debug: "SensoryBatch { inputs: [], allocation_updated: true }".to_string(),
+                batch_debug: "SensoryBatch { inputs: [] }".to_string(),
             },
         );
         apply_llm_observation(
@@ -1685,7 +1685,7 @@ mod tests {
             module.turns[0].batch,
             Some(ModuleBatchDebugState {
                 batch_type: "nuillu_sensory::SensoryBatch".to_string(),
-                debug: "SensoryBatch { inputs: [], allocation_updated: true }".to_string(),
+                debug: "SensoryBatch { inputs: [] }".to_string(),
             })
         );
     }

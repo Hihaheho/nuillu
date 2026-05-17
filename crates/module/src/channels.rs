@@ -330,9 +330,6 @@ pub enum CognitionLogUpdated {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AllocationUpdated;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InteroceptiveUpdated;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -345,8 +342,6 @@ pub type AttentionControlRequestMailbox = TopicMailbox<AttentionControlRequest>;
 pub type AttentionControlRequestInbox = TopicInbox<AttentionControlRequest>;
 pub type CognitionLogUpdatedMailbox = TopicMailbox<CognitionLogUpdated>;
 pub type CognitionLogUpdatedInbox = TopicInbox<CognitionLogUpdated>;
-pub type AllocationUpdatedMailbox = TopicMailbox<AllocationUpdated>;
-pub type AllocationUpdatedInbox = TopicInbox<AllocationUpdated>;
 pub type InteroceptiveUpdatedMailbox = TopicMailbox<InteroceptiveUpdated>;
 pub type InteroceptiveUpdatedInbox = TopicInbox<InteroceptiveUpdated>;
 pub type MemoUpdatedMailbox = TopicMailbox<MemoUpdated>;

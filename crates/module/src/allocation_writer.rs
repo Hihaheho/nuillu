@@ -6,8 +6,6 @@ use nuillu_blackboard::{
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
 
-use crate::{AllocationUpdated, AllocationUpdatedMailbox};
-
 /// Submit owner-stamped allocation effect commands.
 ///
 /// Capability issuers do not enforce uniqueness: capabilities are non-exclusive.
@@ -16,7 +14,6 @@ use crate::{AllocationUpdated, AllocationUpdatedMailbox};
 pub struct AllocationWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,
-    updates: AllocationUpdatedMailbox,
     allowed_target_modules: Vec<ModuleId>,
     allowed_suppression_modules: Vec<ModuleId>,
     effect_policy: AllocationEffectPolicy,
@@ -26,7 +23,6 @@ impl AllocationWriter {
     pub(crate) fn new(
         owner: ModuleInstanceId,
         blackboard: Blackboard,
-        updates: AllocationUpdatedMailbox,
         allowed_target_modules: Vec<ModuleId>,
         allowed_suppression_modules: Vec<ModuleId>,
         effect_policy: AllocationEffectPolicy,
@@ -34,7 +30,6 @@ impl AllocationWriter {
         Self {
             owner,
             blackboard,
-            updates,
             allowed_target_modules,
             allowed_suppression_modules,
             effect_policy,
@@ -85,7 +80,6 @@ impl AllocationWriter {
             }
         }
 
-        let before = self.blackboard.read(|bb| bb.allocation().clone()).await;
         self.blackboard
             .apply(BlackboardCommand::RecordAllocationEffects {
                 writer: self.owner.clone(),
@@ -93,10 +87,6 @@ impl AllocationWriter {
                 suppressions,
             })
             .await;
-        let after = self.blackboard.read(|bb| bb.allocation().clone()).await;
-        if before != after && self.updates.publish(AllocationUpdated).await.is_err() {
-            tracing::trace!("allocation update had no active subscribers");
-        }
     }
 
     pub fn allowed_target_modules(&self) -> &[ModuleId] {
