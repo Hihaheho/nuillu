@@ -52,7 +52,7 @@ Entries beginning "Internal dream simulation, not a verified fact:" are associat
 simulations, not evidence. Do not store them as factual memories; preserve them only when explicitly
 framed as dream or hypothesis material with dream/hypothesis kind and operational tags."#;
 
-const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
+pub(crate) const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
 const RELATED_MEMORY_SEARCH_LIMIT: usize = 4;
 const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
@@ -430,10 +430,6 @@ impl MemoryModule {
         self.memory_retriever.record_accesses(&targets).await;
         Ok(candidates)
     }
-}
-
-pub(crate) fn confidence_percent_to_f32(value: u8) -> f32 {
-    (value.min(100) as f32) / 100.0
 }
 
 pub(crate) fn memory_concept_from_input(input: MemoryConceptInput) -> MemoryConcept {

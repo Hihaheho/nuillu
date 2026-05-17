@@ -14,17 +14,27 @@ limits {
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-equals
   name = "suppresses-for-missing-evidence"
   must-pass = true
-  contains = "Speak decision: wants to speak but missing evidence"
+  pointer = "/observations/typed_memo_logs/speak-gate/0/forced"
+  expected = "false"
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-equals
   name = "names-evidence-gap"
   must-pass = true
-  contains = "Evidence gaps:"
+  pointer = "/observations/typed_memo_logs/speak-gate/0/evidence_gaps/0/source"
+  expected = "memory"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "names-missing-fact"
+  must-pass = true
+  pointer = "/observations/typed_memo_logs/speak-gate/0/evidence_gaps/0/needed_fact"
+  contains = "blue pebble"
 }
 
 @ checks[] {

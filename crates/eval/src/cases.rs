@@ -117,8 +117,6 @@ pub struct FullAgentCase {
 pub struct ActivateAllocation {
     pub module: EvalModule,
     pub activation_ratio: f64,
-    #[eure(default)]
-    pub guidance: Option<Text>,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -1645,7 +1643,6 @@ mod tests {
         case.activate_allocation = vec![ActivateAllocation {
             module: EvalModule::Interoception,
             activation_ratio: 1.0,
-            guidance: None,
         }];
 
         let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
@@ -1657,7 +1654,6 @@ mod tests {
         case.activate_allocation = vec![ActivateAllocation {
             module: EvalModule::Sensory,
             activation_ratio: 1.2,
-            guidance: None,
         }];
         let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
         assert!(

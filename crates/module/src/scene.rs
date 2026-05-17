@@ -38,13 +38,22 @@ impl<S: Into<String>> From<S> for Participant {
 /// agent's `LocalSet`.
 #[derive(Clone, Debug)]
 pub struct SceneRegistry {
-    inner: Arc<RwLock<Vec<Participant>>>,
+    inner: Arc<RwLock<SceneState>>,
+}
+
+#[derive(Clone, Debug)]
+struct SceneState {
+    participants: Vec<Participant>,
+    include_broadcast_target: bool,
 }
 
 impl SceneRegistry {
     pub fn new(initial: impl IntoIterator<Item = Participant>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(initial.into_iter().collect())),
+            inner: Arc::new(RwLock::new(SceneState {
+                participants: initial.into_iter().collect(),
+                include_broadcast_target: true,
+            })),
         }
     }
 
@@ -57,14 +66,36 @@ impl SceneRegistry {
             .inner
             .write()
             .expect("scene registry lock poisoned on write");
-        *guard = participants.into_iter().collect();
+        guard.participants = participants.into_iter().collect();
+    }
+
+    /// Host-controlled speech target policy. Defaults to `true`.
+    ///
+    /// Eval harnesses can set this to `false` when a case has exactly one
+    /// valid peer target and broadcast speech would only add an invalid
+    /// structured-output option.
+    pub fn set_broadcast_target_enabled(&self, enabled: bool) {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("scene registry lock poisoned on write");
+        guard.include_broadcast_target = enabled;
     }
 
     pub fn snapshot(&self) -> Vec<Participant> {
         self.inner
             .read()
             .expect("scene registry lock poisoned on read")
+            .participants
             .clone()
+    }
+
+    fn target_snapshot(&self) -> (Vec<Participant>, bool) {
+        let guard = self
+            .inner
+            .read()
+            .expect("scene registry lock poisoned on read");
+        (guard.participants.clone(), guard.include_broadcast_target)
     }
 }
 
@@ -93,17 +124,20 @@ impl SceneReader {
         self.scene.snapshot()
     }
 
-    /// JSON Schema for a speech-target value, constrained to
-    /// `[self, everyone, ...participants]` from the current scene snapshot.
+    /// JSON Schema for a speech-target value, constrained to the current
+    /// scene snapshot and host broadcast-target policy.
     ///
     /// Callers should invoke this immediately before constructing the
     /// structured-output schema for an LLM call so the enum reflects the
     /// host's latest scene state.
     pub fn target_schema(&self) -> Schema {
-        let participants = self.scene.snapshot();
-        let mut values: Vec<serde_json::Value> = Vec::with_capacity(participants.len() + 2);
+        let (participants, include_broadcast_target) = self.scene.target_snapshot();
+        let mut values: Vec<serde_json::Value> =
+            Vec::with_capacity(participants.len() + usize::from(include_broadcast_target) + 1);
         values.push(serde_json::Value::String(TARGET_SELF.to_owned()));
-        values.push(serde_json::Value::String(TARGET_EVERYONE.to_owned()));
+        if include_broadcast_target {
+            values.push(serde_json::Value::String(TARGET_EVERYONE.to_owned()));
+        }
         for participant in participants {
             values.push(serde_json::Value::String(participant.name));
         }
@@ -112,5 +146,43 @@ impl SceneReader {
             "enum": values,
         }))
         .expect("speech target schema must be a JSON object")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_value(reader: &SceneReader) -> serde_json::Value {
+        serde_json::to_value(reader.target_schema()).expect("target schema should serialize")
+    }
+
+    #[test]
+    fn target_schema_includes_broadcast_target_by_default() {
+        let scene = SceneRegistry::new([Participant::new("Pibi")]);
+        let reader = SceneReader::new(scene);
+
+        assert_eq!(
+            schema_value(&reader),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["self", "everyone", "Pibi"],
+            })
+        );
+    }
+
+    #[test]
+    fn target_schema_can_exclude_broadcast_target() {
+        let scene = SceneRegistry::new([Participant::new("Pibi")]);
+        scene.set_broadcast_target_enabled(false);
+        let reader = SceneReader::new(scene);
+
+        assert_eq!(
+            schema_value(&reader),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["self", "Pibi"],
+            })
+        );
     }
 }

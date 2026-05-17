@@ -109,8 +109,6 @@ variants.one-shot {
 @ $types.activate-allocation
 module = `$types.eval-module`
 activation-ratio = `float`
-guidance = `text`
-guidance.$optional = true
 
 @ $types.eval-step
 description = `text`

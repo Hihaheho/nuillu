@@ -73,8 +73,8 @@ Return only raw JSON for the structured object; do not wrap it in Markdown or co
 
 tokio::task_local! {
     /// JSON Schema for `SpeakTargetDecision.target` derived from the live `SceneReader`.
-    /// `.scope`d around each `structured_turn` so the LLM sees an enum of
-    /// `[self, everyone, ...participants]`.
+    /// `.scope`d around each `structured_turn` so the LLM sees the current
+    /// host-constrained target enum.
     static SPEECH_TARGET_SCHEMA: Schema;
 }
 

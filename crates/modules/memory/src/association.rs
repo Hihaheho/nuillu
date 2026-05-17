@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{GetMemoriesOutput, MemoryMetadataContext, memory_record_to_view};
 use crate::memory::{
-    MemoryConceptInput, MemoryTagInput, confidence_percent_to_f32, memory_concept_from_input,
+    MemoryConceptInput, MemoryTagInput, SHORT_TERM_MEMORY_DECAY_SECS, memory_concept_from_input,
     memory_tag_from_input,
 };
 use crate::store::{
@@ -24,16 +24,20 @@ associations. Source memories remain live. Use get_association_memories to inspe
 write_association_summary when a reflection memory would help explain a group of source memories,
 and write_memory_links when only direct memory-to-memory relationships are needed. Links can state
 derived_from, updates, corrects, contradicts, supports, or related relationships justified by the
-source memories. Do not delete, rewrite, or compact source memories."#;
+source memories. Do not delete, rewrite, or compact source memories.
+
+Tool input rules:
+- write_association_summary takes source_indexes, summary_content, concepts, and tags only.
+  The runtime chooses rank and decay and automatically writes derived_from links from the summary
+  to every source memory.
+- write_memory_links link objects use from_index, to_index, and relation only. The runtime chooses
+  link strength and confidence."#;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AssociationLinkArgs {
     pub from_index: String,
     pub to_index: String,
     pub relation: MemoryLinkRelation,
-    pub freeform_relation: Option<String>,
-    pub strength_percent: u8,
-    pub confidence_percent: u8,
 }
 
 #[lutum::tool_input(name = "get_association_memories", output = GetMemoriesOutput)]
@@ -47,11 +51,10 @@ pub struct GetAssociationMemoriesArgs {
 pub struct WriteAssociationSummaryArgs {
     pub source_indexes: Vec<String>,
     pub summary_content: String,
-    pub summary_rank: MemoryRank,
-    pub decay_secs: i64,
+    #[serde(default)]
     pub concepts: Vec<MemoryConceptInput>,
+    #[serde(default)]
     pub tags: Vec<MemoryTagInput>,
-    pub links: Vec<AssociationLinkArgs>,
 }
 
 #[lutum::tool_input(name = "write_memory_links", output = WriteMemoryLinksOutput)]
@@ -271,7 +274,7 @@ impl MemoryAssociationModule {
             .insert_entry(
                 NewMemory {
                     content: MemoryContent::new(args.summary_content),
-                    rank: args.summary_rank,
+                    rank: MemoryRank::ShortTerm,
                     occurred_at,
                     kind: MemoryKind::Reflection,
                     concepts: args
@@ -284,23 +287,19 @@ impl MemoryAssociationModule {
                     valence: 0.0,
                     emotion: String::new(),
                 },
-                args.decay_secs,
+                SHORT_TERM_MEMORY_DECAY_SECS,
             )
             .await
             .context("write association summary memory")?;
 
-        let mut links = sources
+        let links = sources
             .iter()
             .map(|source| AssociationLinkArgs {
                 from_index: record.index.to_string(),
                 to_index: source.to_string(),
                 relation: MemoryLinkRelation::DerivedFrom,
-                freeform_relation: None,
-                strength_percent: 100,
-                confidence_percent: 100,
             })
             .collect::<Vec<_>>();
-        links.extend(args.links);
         let links_written = self.upsert_links(links).await?;
 
         Ok(WriteAssociationSummaryOutput {
@@ -327,9 +326,9 @@ impl MemoryAssociationModule {
                     from_memory: MemoryIndex::new(link.from_index),
                     to_memory: MemoryIndex::new(link.to_index),
                     relation: link.relation,
-                    freeform_relation: link.freeform_relation,
-                    strength: confidence_percent_to_f32(link.strength_percent),
-                    confidence: confidence_percent_to_f32(link.confidence_percent),
+                    freeform_relation: None,
+                    strength: 1.0,
+                    confidence: 1.0,
                 })
                 .await
                 .context("upsert association link")?;
@@ -415,5 +414,60 @@ impl Module for MemoryAssociationModule {
         _batch: &Self::Batch,
     ) -> Result<()> {
         MemoryAssociationModule::activate(self, cx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn association_summary_schema_does_not_expose_runtime_metadata_or_links() {
+        let schema = serde_json::to_value(schemars::schema_for!(WriteAssociationSummaryArgs))
+            .expect("association summary schema should serialize");
+
+        assert_eq!(schema.pointer("/properties/summary_rank"), None);
+        assert_eq!(schema.pointer("/properties/decay_secs"), None);
+        assert_eq!(schema.pointer("/properties/occurred_at"), None);
+        assert_eq!(schema.pointer("/properties/links"), None);
+        assert_eq!(
+            schema.pointer("/properties/concepts/items/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/tags/items/type"),
+            Some(&serde_json::json!("string"))
+        );
+    }
+
+    #[test]
+    fn association_link_schema_does_not_expose_runtime_scores() {
+        let schema = serde_json::to_value(schemars::schema_for!(WriteMemoryLinksArgs))
+            .expect("memory link schema should serialize");
+
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/strength_percent"),
+            None
+        );
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/confidence_percent"),
+            None
+        );
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/freeform_relation"),
+            None
+        );
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/from_index/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/to_index/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/AssociationLinkArgs/properties/relation/$ref"),
+            Some(&serde_json::json!("#/$defs/MemoryLinkRelation"))
+        );
     }
 }

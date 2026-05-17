@@ -570,6 +570,11 @@ fn module_scoped_artifact(module: EvalModule, artifact: &CaseArtifact) -> CaseAr
         "module".to_string(),
         serde_json::Value::String(module.as_str().to_string()),
     );
+    for key in ["typed_memo_logs", "memory_diff"] {
+        if let Some(value) = artifact.observations.get(key).cloned() {
+            scoped.observations.insert(key.to_string(), value);
+        }
+    }
     if let Some(agent) = scoped_agent_observation(module, artifact) {
         scoped.observations.insert("agent".to_string(), agent);
     }

@@ -76,6 +76,8 @@ When changing module wiring or adding a module, these must remain true (they're 
 - Use `<project root>/.tmp` for scratch files (the repo's `.gitignore` covers it). Don't write to `/tmp`.
 - Don't use Python for project scripts; prefer shell or Rust.
 - In tests for structured JSON/schema values, prefer one `assert_eq!(actual, expected)` against the whole value. Don't walk a `serde_json::Value` with nested indexing, `find`, and multiple partial assertions when the expected shape is static.
+- In new eval cases, don't use `artifact-text-contains` for invariants that can be read structurally. Prefer `json-pointer-equals` / `json-pointer-contains` against typed observations or memory diffs; reserve rubrics for natural-language quality.
+- Full-agent eval `activate-allocation` seeds activation ratios only; do not write module guidance from full-agent eval bootstrap because guidance is allocation-controller output. Module eval may use explicit guidance fixtures only when the allocation-controller is absent and the target module normally consumes allocation-controller guidance.
 - The `lutum` LLM SDK is a git dependency. The capability layer stops at returning a `Lutum`; each module builds its own `Session` and tool loop — don't add a shared session/agent-loop abstraction in `crates/module`.
 
 ## libSQL migrations

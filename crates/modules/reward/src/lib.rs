@@ -436,11 +436,16 @@ impl PolicyCompactor {
         canonical: &PolicyIndex,
         duplicates: &[PolicyIndex],
     ) -> Result<PolicyCompactionResult, PortError> {
-        let canonical_record = self
-            .primary_store
-            .get(canonical)
-            .await?
-            .ok_or_else(|| PortError::NotFound(canonical.as_str().to_owned()))?;
+        let Some(canonical_record) = self.primary_store.get(canonical).await? else {
+            return Ok(PolicyCompactionResult {
+                canonical: canonical.clone(),
+                deleted: Vec::new(),
+                skipped: vec![PolicyCompactionSkipped {
+                    index: canonical.clone(),
+                    reason: "canonical policy was not found".to_owned(),
+                }],
+            });
+        };
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -492,7 +497,7 @@ impl PolicyCompactor {
         }
 
         Ok(PolicyCompactionResult {
-            canonical: canonical_record,
+            canonical: canonical_record.index,
             deleted,
             skipped,
         })
@@ -517,7 +522,7 @@ fn filter_live_policy_hits(hits: Vec<PolicySearchHit>) -> Vec<PolicySearchHit> {
 
 #[derive(Clone, Debug)]
 pub struct PolicyCompactionResult {
-    pub canonical: PolicyRecord,
+    pub canonical: PolicyIndex,
     pub deleted: Vec<PolicyIndex>,
     pub skipped: Vec<PolicyCompactionSkipped>,
 }
@@ -526,6 +531,34 @@ pub struct PolicyCompactionResult {
 pub struct PolicyCompactionSkipped {
     pub index: PolicyIndex,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod policy_compaction_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_duplicates_reports_missing_canonical_as_skipped() {
+        let store = Rc::new(NoopPolicyStore);
+        let compactor = PolicyCompactor::new(store, Vec::new(), Blackboard::new());
+        let canonical = PolicyIndex::new("policy-compaction");
+        let duplicate = PolicyIndex::new("duplicate-policy");
+
+        let result = compactor
+            .compact_duplicates(&canonical, &[duplicate])
+            .await
+            .expect("missing canonical should not be fatal");
+
+        assert_eq!(result.canonical, canonical);
+        assert!(result.deleted.is_empty());
+        assert_eq!(
+            result.skipped,
+            vec![PolicyCompactionSkipped {
+                index: PolicyIndex::new("policy-compaction"),
+                reason: "canonical policy was not found".to_owned(),
+            }]
+        );
+    }
 }
 
 pub(crate) fn core_policy_record(record: PolicyRecord) -> CorePolicyRecord {

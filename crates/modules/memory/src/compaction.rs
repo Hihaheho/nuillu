@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::{GetMemoriesOutput, MemoryMetadataContext, memory_record_to_view};
 use crate::memory::{
-    MemoryConceptInput, MemoryTagInput, memory_concept_from_input, memory_tag_from_input,
+    MemoryConceptInput, MemoryTagInput, SHORT_TERM_MEMORY_DECAY_SECS, memory_concept_from_input,
+    memory_tag_from_input,
 };
 use crate::store::MemoryCompactor;
 
@@ -20,7 +21,10 @@ consolidation. Compaction output is one replacement summary memory; source memor
 from live retrieval after the replacement is written. Use merge_memories only when multiple source
 memories are redundant enough that preserving them separately adds noise. Do not create
 memory-to-memory links here; non-destructive relationship work belongs to memory-association. Do
-not collapse evidence into a single current fact."#;
+not collapse evidence into a single current fact.
+
+Tool input rules: merge_memories takes source_indexes, merged_content, concepts, and tags only.
+The runtime chooses the merged rank and decay from the source memory metadata."#;
 
 #[lutum::tool_input(name = "get_memories", output = GetMemoriesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -33,9 +37,9 @@ pub struct GetMemoriesArgs {
 pub struct MergeMemoriesArgs {
     pub source_indexes: Vec<String>,
     pub merged_content: String,
-    pub merged_rank: MemoryRank,
-    pub decay_secs: i64,
+    #[serde(default)]
     pub concepts: Vec<MemoryConceptInput>,
+    #[serde(default)]
     pub tags: Vec<MemoryTagInput>,
 }
 
@@ -210,13 +214,14 @@ impl MemoryCompactionModule {
             .map(MemoryIndex::new)
             .collect::<Vec<_>>();
         let source_count = sources.len();
+        let (merged_rank, decay_secs) = self.summary_runtime_metadata(&sources).await;
         let index = self
             .compactor
             .write_summary(
                 &sources,
                 args.merged_content,
-                args.merged_rank,
-                args.decay_secs,
+                merged_rank,
+                decay_secs,
                 args.concepts
                     .into_iter()
                     .map(memory_concept_from_input)
@@ -229,6 +234,25 @@ impl MemoryCompactionModule {
             merged_index: index.to_string(),
             merged_sources: source_count,
         })
+    }
+
+    async fn summary_runtime_metadata(&self, sources: &[MemoryIndex]) -> (MemoryRank, i64) {
+        self.blackboard
+            .read(|bb| {
+                let metadata = bb.memory_metadata();
+                let rank = sources
+                    .iter()
+                    .filter_map(|source| metadata.get(source).map(|item| item.rank))
+                    .max_by_key(|rank| memory_rank_strength(*rank))
+                    .unwrap_or(MemoryRank::ShortTerm);
+                let decay_secs = sources
+                    .iter()
+                    .filter_map(|source| metadata.get(source).map(|item| item.decay_remaining_secs))
+                    .max()
+                    .unwrap_or(SHORT_TERM_MEMORY_DECAY_SECS);
+                (rank, decay_secs)
+            })
+            .await
     }
 
     async fn next_batch(&mut self) -> Result<()> {
@@ -271,6 +295,16 @@ fn format_compaction_context(
     out
 }
 
+fn memory_rank_strength(rank: MemoryRank) -> u8 {
+    match rank {
+        MemoryRank::ShortTerm => 0,
+        MemoryRank::MidTerm => 1,
+        MemoryRank::LongTerm => 2,
+        MemoryRank::Permanent => 3,
+        MemoryRank::Identity => 4,
+    }
+}
+
 #[async_trait(?Send)]
 impl Module for MemoryCompactionModule {
     type Batch = ();
@@ -293,5 +327,28 @@ impl Module for MemoryCompactionModule {
         _batch: &Self::Batch,
     ) -> Result<()> {
         MemoryCompactionModule::activate(self, cx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_memories_schema_does_not_expose_runtime_metadata() {
+        let schema = serde_json::to_value(schemars::schema_for!(MergeMemoriesArgs))
+            .expect("merge memories schema should serialize");
+
+        assert_eq!(schema.pointer("/properties/merged_rank"), None);
+        assert_eq!(schema.pointer("/properties/decay_secs"), None);
+        assert_eq!(schema.pointer("/properties/occurred_at"), None);
+        assert_eq!(
+            schema.pointer("/properties/concepts/items/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/tags/items/type"),
+            Some(&serde_json::json!("string"))
+        );
     }
 }

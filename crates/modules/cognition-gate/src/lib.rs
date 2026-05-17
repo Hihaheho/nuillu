@@ -50,8 +50,9 @@ ABOUT the cognitive process rather than ABOUT the world or the agent's situation
 Mechanical brain plumbing must never reach consciousness. Do not mention modules,
 retrieval, queries, ranks, gates, allocation, attention, or this workspace itself. The
 conscious mind perceives world, body, peers, and recalled experience — not its own
-architecture. In retrieval-style updates, only the recalled content is admissible; the
-search terms and intent are scaffolding and must not be quoted.
+architecture. In retrieval-style updates, promote only remembered content that changes the current
+judgment, including the operative rule or fact; omit search terms, match status, and evidence
+plumbing.
 
 Voice and form.
 Write entries in plain inner-experience prose, as if the agent itself were noticing,

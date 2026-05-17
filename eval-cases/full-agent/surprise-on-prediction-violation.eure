@@ -19,6 +19,26 @@ limits {
 
 participants = ["Koro"]
 
+@ activate-allocation[] {
+  module = "cognition-gate"
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module = "predict"
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module = "surprise"
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module = "memory"
+  activation-ratio = 1.0
+}
+
 @ memories[] {
   rank = "identity"
   content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events."

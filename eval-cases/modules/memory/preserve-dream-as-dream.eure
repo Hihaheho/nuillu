@@ -13,16 +13,18 @@ limits {
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-equals
   name = "stores-dream-kind"
   must-pass = true
-  contains = "kind: Dream"
+  pointer = "/observations/memory_diff/entries/0/kind"
+  expected = "Dream"
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-contains
   name = "keeps-dream-content"
   must-pass = true
+  pointer = "/observations/memory_diff/entries/0/content"
   contains = "blue gate"
 }
 

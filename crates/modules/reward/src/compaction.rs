@@ -271,7 +271,7 @@ impl PolicyCompactionModule {
             .await
             .context("compact duplicate policies")?;
         Ok(CompactDuplicatePoliciesOutput {
-            canonical_index: result.canonical.index.to_string(),
+            canonical_index: result.canonical.to_string(),
             deleted_indexes: result
                 .deleted
                 .into_iter()

@@ -27,31 +27,26 @@ participants = ["Koro"]
 @ activate-allocation[] {
   module = "sensory"
   activation-ratio = 1.0
-  guidance = "GUI activate: keep accepting sensory input even while the agent can fall asleep."
 }
 
 @ activate-allocation[] {
   module = "allocation-controller"
   activation-ratio = 1.0
-  guidance = "GUI activate: keep allocation control available for wake/sleep transitions."
 }
 
 @ activate-allocation[] {
   module = "interoception"
   activation-ratio = 1.0
-  guidance = "GUI activate: monitor quiet duration, salient sensory input, and arousal recovery."
 }
 
 @ activate-allocation[] {
   module = "homeostatic-controller"
   activation-ratio = 1.0
-  guidance = "GUI activate: convert interoceptive sleep pressure into sleep-phase allocation."
 }
 
 @ activate-allocation[] {
   module = "speak-gate"
   activation-ratio = 1.0
-  guidance = "GUI activate: remain available when wake arousal is high, but accept sleep suppression."
 }
 
 @ steps[] {

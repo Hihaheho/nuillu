@@ -9,6 +9,21 @@ limits {
 
 participants = ["Pibi"]
 
+@ activate-allocation[] {
+  module = "cognition-gate"
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module = "query-memory"
+  activation-ratio = 1.0
+}
+
+@ activate-allocation[] {
+  module = "speak"
+  activation-ratio = 1.0
+}
+
 @ memories[] {
   rank = "long-term"
   datetime = "2025-05-09"

@@ -24,17 +24,19 @@ limits {
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-equals
   name = "writes-reflection-kind"
   must-pass = true
-  contains = "kind: Reflection"
+  pointer = "/observations/memory_diff/entries/0/kind"
+  expected = "Reflection"
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
+  $variant: json-pointer-equals
   name = "records-derived-links"
   must-pass = true
-  contains = "derived_from"
+  pointer = "/observations/memory_diff/links/0/relation"
+  expected = "derived_from"
 }
 
 @ checks[] {

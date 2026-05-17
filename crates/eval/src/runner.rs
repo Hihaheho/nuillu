@@ -22,8 +22,8 @@ use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy, ModuleRunStatus, ResourceAllocation,
-    ZeroReplicaWindowPolicy, linear_ratio_fn,
+    CognitionLogEntryRecord, MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy,
+    ModuleRunStatus, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
 use nuillu_memory::{
     LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
@@ -34,10 +34,11 @@ use nuillu_module::{
     AllocationUpdated, AllocationUpdatedMailbox, CapabilityProviderConfig, CapabilityProviderPorts,
     CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
     InteroceptionRuntimePolicy, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink,
-    RuntimePolicy, SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
+    RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox, SensoryModality,
+    SessionCompactionPolicy,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
-use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
+use nuillu_speak::{SpeakGateMemo, Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_types::{
     MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
     builtin,
@@ -1116,11 +1117,14 @@ async fn execute_full_agent_case(
     let case_now = parse_case_now(case.now.as_deref())
         .map_err(anyhow::Error::msg)
         .context("parse full-agent case now")?;
-    let allocation = if gui_deferred_start {
+    let mut allocation = if gui_deferred_start {
         full_agent_gui_initial_allocation(&case.limits, &case_modules)
     } else {
         full_agent_allocation(&case.limits, &case_modules)
     };
+    if !gui_deferred_start && !case.activate_allocation.is_empty() {
+        apply_case_activation_allocation(&mut allocation, &case.activate_allocation);
+    }
     let env = build_eval_environment(
         output_dir,
         config,
@@ -1133,9 +1137,7 @@ async fn execute_full_agent_case(
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
-    env.caps
-        .scene()
-        .set(case.participants.iter().map(Participant::new));
+    seed_eval_scene_participants(env.caps.scene(), &case.participants);
     seed_memories(
         &env.memory_caps,
         env.clock.as_ref(),
@@ -1143,6 +1145,7 @@ async fn execute_full_agent_case(
         &case.memories,
     )
     .await?;
+    let memory_baseline = memory_snapshot(env.memory.as_ref()).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
@@ -1333,7 +1336,10 @@ async fn execute_full_agent_case(
                 }
                 if idle_for_ms >= duration_millis_u64(FULL_AGENT_IDLE_TIMEOUT) {
                     let seconds = idle_for_ms / 1000;
-                    let message = format!("no runtime events for {seconds}s; agent appears stuck");
+                    let event_snapshot = events.snapshot();
+                    let active_modules =
+                        allocation_blackboard.read(active_module_observations).await;
+                    let message = idle_timeout_message(seconds, &event_snapshot, &active_modules);
                     step_failure_for_loop
                         .lock()
                         .expect("step failure mutex poisoned")
@@ -1370,6 +1376,7 @@ async fn execute_full_agent_case(
         CaseArtifact::failed("no utterance produced")
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    add_memory_diff_observation(&mut artifact, &memory_baseline, env.memory.as_ref()).await?;
     if !recorded_step_outcomes.is_empty() {
         artifact.observations.insert(
             "steps".to_string(),
@@ -1431,9 +1438,7 @@ async fn execute_module_case(
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
-    env.caps
-        .scene()
-        .set(case.participants.iter().map(Participant::new));
+    seed_eval_scene_participants(env.caps.scene(), &case.participants);
     seed_memories(
         &env.memory_caps,
         env.clock.as_ref(),
@@ -1447,7 +1452,8 @@ async fn execute_module_case(
         BTreeMap::new()
     };
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
-    seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
+    let cognition_seed_records =
+        seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_page(
@@ -1510,6 +1516,7 @@ async fn execute_module_case(
                     &prompt,
                     &run_target_module,
                     &memo_seed_records,
+                    &cognition_seed_records,
                     has_cognition_log_seed,
                 )
                 .await;
@@ -1541,6 +1548,7 @@ async fn execute_module_case(
                             &prompt,
                             &run_target_module,
                             &memo_seed_records,
+                            &cognition_seed_records,
                             has_cognition_log_seed,
                         )
                         .await;
@@ -1633,6 +1641,9 @@ async fn execute_module_case(
         CaseArtifact::new(output)
     };
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
+    if module_target_uses_memory_store_artifact(target) {
+        add_memory_diff_observation(&mut artifact, &memory_baseline, env.memory.as_ref()).await?;
+    }
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_page(
@@ -1658,6 +1669,7 @@ async fn activate_module_case_target(
     prompt: &str,
     run_target_module: &ModuleId,
     memo_seed_records: &[MemoLogRecord],
+    cognition_seed_records: &[CognitionLogEntryRecord],
     has_cognition_log_seed: bool,
 ) {
     match target {
@@ -1746,16 +1758,13 @@ async fn activate_module_case_target(
                 .apply(BlackboardCommand::SetAllocation(allocation))
                 .await;
             if has_cognition_log_seed {
-                harness
-                    .cognition_log_updated_mailbox()
-                    .publish(CognitionLogUpdated::EntryAppended {
-                        source: ModuleInstanceId::new(
-                            builtin::cognition_gate(),
-                            ReplicaIndex::ZERO,
-                        ),
-                    })
-                    .await
-                    .expect("module eval failed to publish CognitionLogUpdated");
+                for record in cognition_seed_records {
+                    harness
+                        .cognition_log_evicted_mailbox()
+                        .publish(record.clone())
+                        .await
+                        .expect("module eval failed to publish CognitionLogEvicted");
+                }
             }
             harness
                 .allocation_updated_mailbox()
@@ -1971,6 +1980,84 @@ async fn render_memory_store_artifact(
     out
 }
 
+async fn add_memory_diff_observation(
+    artifact: &mut CaseArtifact,
+    baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+) -> Result<()> {
+    let diff = memory_diff_observation(baseline, memory).await;
+    let value = serde_json::to_value(diff).context("serialize memory diff observation")?;
+    artifact
+        .observations
+        .insert("memory_diff".to_owned(), value);
+    Ok(())
+}
+
+async fn memory_diff_observation(
+    baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+) -> MemoryDiffObservation {
+    let records = memory_diff_records(baseline, memory).await;
+    let indexes = records
+        .iter()
+        .map(|record| record.index.clone())
+        .collect::<Vec<_>>();
+    let links = if indexes.is_empty() {
+        Vec::new()
+    } else {
+        memory
+            .linked(&LinkedMemoryQuery {
+                memory_indexes: indexes,
+                relation_filter: Vec::new(),
+                direction: MemoryLinkDirection::Both,
+                limit: 128,
+            })
+            .await
+            .unwrap_or_default()
+    };
+
+    MemoryDiffObservation {
+        entries: records
+            .into_iter()
+            .map(|record| MemoryDiffEntryObservation {
+                index: record.index.to_string(),
+                kind: format!("{:?}", record.kind),
+                rank: format!("{:?}", record.rank),
+                content: record.content.as_str().to_owned(),
+            })
+            .collect(),
+        links: links
+            .into_iter()
+            .map(|linked| MemoryDiffLinkObservation {
+                from: linked.link.from_memory.to_string(),
+                to: linked.link.to_memory.to_string(),
+                relation: memory_link_relation_label(linked.link.relation).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryDiffObservation {
+    entries: Vec<MemoryDiffEntryObservation>,
+    links: Vec<MemoryDiffLinkObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryDiffEntryObservation {
+    index: String,
+    kind: String,
+    rank: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryDiffLinkObservation {
+    from: String,
+    to: String,
+    relation: String,
+}
+
 fn render_memory_record_artifact(record: &MemoryRecord) -> String {
     let concepts = if record.concepts.is_empty() {
         "none".to_owned()
@@ -2052,24 +2139,14 @@ async fn activate_gui_start_modules(
             &mut allocation,
             builtin::allocation_controller(),
             ActivationRatio::ONE,
-            Some("GUI start: process the sensory input and allocate the next active faculties."),
         );
-        apply_gui_activation(
-            &mut allocation,
-            builtin::sensory(),
-            ActivationRatio::ONE,
-            Some("GUI start: normalize the queued sensory input."),
-        );
+        apply_gui_activation(&mut allocation, builtin::sensory(), ActivationRatio::ONE);
     } else {
         for activation in activate_allocation {
             apply_gui_activation(
                 &mut allocation,
                 activation.module.module_id(),
                 ActivationRatio::from_f64(activation.activation_ratio),
-                activation
-                    .guidance
-                    .as_ref()
-                    .map(|guidance| guidance.content.as_str()),
             );
         }
     }
@@ -2079,18 +2156,30 @@ async fn activate_gui_start_modules(
         .await;
 }
 
+fn apply_case_activation_allocation(
+    allocation: &mut ResourceAllocation,
+    activate_allocation: &[ActivateAllocation],
+) {
+    for activation in activate_allocation {
+        apply_gui_activation(
+            allocation,
+            activation.module.module_id(),
+            ActivationRatio::from_f64(activation.activation_ratio),
+        );
+    }
+}
+
 fn apply_gui_activation(
     allocation: &mut ResourceAllocation,
     module: ModuleId,
     activation: ActivationRatio,
-    guidance: Option<&str>,
 ) {
-    if let Some(guidance) = guidance {
-        let mut config = allocation.for_module(&module);
-        config.guidance = guidance.trim().to_owned();
-        allocation.set(module.clone(), config);
-    }
     allocation.set_activation(module, activation);
+}
+
+fn seed_eval_scene_participants(scene: &SceneRegistry, participants: &[String]) {
+    scene.set(participants.iter().map(Participant::new));
+    scene.set_broadcast_target_enabled(participants.len() != 1);
 }
 
 async fn publish_full_agent_inputs(
@@ -3111,20 +3200,23 @@ async fn seed_cognition_log(
     blackboard: &Blackboard,
     clock: &dyn Clock,
     seeds: &[crate::cases::CognitionLogSeed],
-) {
+) -> Vec<CognitionLogEntryRecord> {
     let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
     let now = clock.now();
+    let mut records = Vec::with_capacity(seeds.len());
     for seed in seeds {
-        blackboard
-            .apply(BlackboardCommand::AppendCognitionLog {
-                source: stream.clone(),
-                entry: CognitionLogEntry {
+        let appended = blackboard
+            .append_cognition_log(
+                stream.clone(),
+                CognitionLogEntry {
                     at: now - ChronoDuration::seconds(seed.seconds_ago),
                     text: seed.text.content.clone(),
                 },
-            })
+            )
             .await;
+        records.push(appended.record);
     }
+    records
 }
 
 fn full_agent_case_modules(case: &FullAgentCase, disabled: &[EvalModule]) -> Vec<EvalModule> {
@@ -3837,6 +3929,42 @@ async fn add_observations(
     artifact
         .observations
         .insert("agent".to_string(), observations);
+    add_typed_memo_observations(artifact, blackboard).await;
+}
+
+async fn add_typed_memo_observations(artifact: &mut CaseArtifact, blackboard: &Blackboard) {
+    let speak_gate_owner = ModuleInstanceId::new(builtin::speak_gate(), ReplicaIndex::ZERO);
+    let speak_gate = blackboard
+        .typed_memo_logs::<SpeakGateMemo>(&speak_gate_owner)
+        .await
+        .into_iter()
+        .map(|record| {
+            let mut value = serde_json::to_value(record.data()).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "serialization_error": error.to_string(),
+                })
+            });
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "replica".to_owned(),
+                    serde_json::json!(record.owner.replica.get()),
+                );
+                object.insert("index".to_owned(), serde_json::json!(record.index));
+                object.insert(
+                    "written_at".to_owned(),
+                    serde_json::json!(record.written_at.to_rfc3339()),
+                );
+                object.insert("content".to_owned(), serde_json::json!(record.content));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    artifact.observations.insert(
+        "typed_memo_logs".to_owned(),
+        serde_json::json!({
+            "speak-gate": speak_gate,
+        }),
+    );
 }
 
 async fn build_full_agent_last_state_dump(
@@ -4454,6 +4582,83 @@ fn active_modules_live_summary(active_modules: &[ActiveModuleObservation]) -> St
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn idle_timeout_message(
+    seconds: u64,
+    events: &[RuntimeEvent],
+    active_modules: &[ActiveModuleObservation],
+) -> String {
+    let last_event = events
+        .last()
+        .map(runtime_event_summary)
+        .unwrap_or_else(|| "none".to_owned());
+    let last_llm = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            RuntimeEvent::LlmAccessed {
+                sequence,
+                call,
+                owner,
+                tier,
+            } => Some(format!(
+                "seq={sequence} call={call} owner={owner} tier={tier:?}"
+            )),
+            _ => None,
+        })
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "no runtime events for {seconds}s; agent appears stuck; last_event={last_event}; last_llm={last_llm}; active=[{}]",
+        active_modules_live_summary(active_modules)
+    )
+}
+
+fn runtime_event_summary(event: &RuntimeEvent) -> String {
+    match event {
+        RuntimeEvent::LlmAccessed {
+            sequence,
+            call,
+            owner,
+            tier,
+        } => format!("seq={sequence} llm_accessed call={call} owner={owner} tier={tier:?}"),
+        RuntimeEvent::MemoUpdated {
+            sequence,
+            owner,
+            char_count,
+        } => format!("seq={sequence} memo_updated owner={owner} chars={char_count}"),
+        RuntimeEvent::RateLimitDelayed {
+            sequence,
+            owner,
+            capability,
+            delayed_for,
+        } => format!(
+            "seq={sequence} rate_limit_delayed owner={owner} capability={capability:?} delayed_for_ms={}",
+            duration_millis_u64(*delayed_for)
+        ),
+        RuntimeEvent::ModuleBatchThrottled {
+            sequence,
+            owner,
+            delayed_for,
+        } => format!(
+            "seq={sequence} module_batch_throttled owner={owner} delayed_for_ms={}",
+            duration_millis_u64(*delayed_for)
+        ),
+        RuntimeEvent::ModuleBatchReady {
+            sequence,
+            owner,
+            batch_type,
+            ..
+        } => format!("seq={sequence} module_batch_ready owner={owner} batch={batch_type}"),
+        RuntimeEvent::ModuleTaskFailed {
+            sequence,
+            owner,
+            phase,
+            message,
+        } => format!(
+            "seq={sequence} module_task_failed owner={owner} phase={phase} message={message}"
+        ),
+    }
 }
 
 fn ticks_for_interval(interval: Duration, tick_ms: u64) -> u64 {
@@ -5588,6 +5793,202 @@ id = "module-query-memory-special-memory"
         assert!(!actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW));
     }
 
+    #[tokio::test]
+    async fn add_observations_includes_speak_gate_typed_memo_payload() {
+        let blackboard = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::speak_gate(), ReplicaIndex::ZERO);
+        blackboard
+            .update_typed_memo(
+                owner,
+                "Speak decision: no need to speak".to_owned(),
+                SpeakGateMemo {
+                    kind: nuillu_speak::SpeakGateMemoKind::NoNeedToSpeak,
+                    rationale: "missing memory evidence".to_owned(),
+                    evidence_gaps: vec![nuillu_speak::EvidenceGap {
+                        source: nuillu_speak::EvidenceGapSource::Memory,
+                        question: "Where is the pebble?".to_owned(),
+                        needed_fact: "blue pebble location".to_owned(),
+                    }],
+                    forced: false,
+                    latest_cognition_index: Some(7),
+                },
+                Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap(),
+            )
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let actions = Rc::new(ActionActivityTracker::new(vec![builtin::speak()]));
+        let utterances =
+            RecordingUtteranceSink::new("test-case".to_owned(), reporter, actions, None);
+        let mut artifact = CaseArtifact::new("");
+
+        add_observations(&mut artifact, &blackboard, &utterances).await;
+        let json = artifact.as_json();
+
+        assert_eq!(
+            pointer_text(
+                &json,
+                "/observations/typed_memo_logs/speak-gate/0/evidence_gaps/0/source",
+            )
+            .as_deref(),
+            Some("memory")
+        );
+        assert_eq!(
+            pointer_text(&json, "/observations/typed_memo_logs/speak-gate/0/forced").as_deref(),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_diff_observation_exposes_entries_and_links_structurally() {
+        let summary_index = MemoryIndex::new("summary");
+        let source_index = MemoryIndex::new("source");
+        let now = Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap();
+        let summary = MemoryRecord {
+            index: summary_index.clone(),
+            content: nuillu_types::MemoryContent::new("Koro food boundary summary."),
+            rank: MemoryRank::ShortTerm,
+            occurred_at: None,
+            stored_at: now,
+            kind: nuillu_memory::MemoryKind::Reflection,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
+        };
+        let store = StaticMemoryStore {
+            records: vec![summary],
+            links: vec![nuillu_memory::MemoryLink {
+                from_memory: summary_index,
+                to_memory: source_index,
+                relation: MemoryLinkRelation::DerivedFrom,
+                freeform_relation: None,
+                strength: 1.0,
+                confidence: 1.0,
+                updated_at: now,
+            }],
+        };
+
+        let diff = memory_diff_observation(&BTreeMap::new(), &store).await;
+        let value = serde_json::to_value(diff).unwrap();
+
+        assert_eq!(
+            pointer_text(&value, "/entries/0/kind").as_deref(),
+            Some("Reflection")
+        );
+        assert_eq!(
+            pointer_text(&value, "/links/0/relation").as_deref(),
+            Some("derived_from")
+        );
+    }
+
+    struct StaticMemoryStore {
+        records: Vec<MemoryRecord>,
+        links: Vec<nuillu_memory::MemoryLink>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MemoryStore for StaticMemoryStore {
+        async fn insert(
+            &self,
+            _mem: nuillu_memory::NewMemory,
+            _stored_at: DateTime<Utc>,
+        ) -> std::result::Result<MemoryRecord, PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+
+        async fn put(
+            &self,
+            _mem: nuillu_memory::IndexedMemory,
+        ) -> std::result::Result<MemoryRecord, PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+
+        async fn compact(
+            &self,
+            _mem: nuillu_memory::NewMemory,
+            _sources: &[MemoryIndex],
+            _stored_at: DateTime<Utc>,
+        ) -> std::result::Result<MemoryRecord, PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+
+        async fn put_compacted(
+            &self,
+            _mem: nuillu_memory::IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> std::result::Result<MemoryRecord, PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+
+        async fn get(
+            &self,
+            index: &MemoryIndex,
+        ) -> std::result::Result<Option<MemoryRecord>, PortError> {
+            Ok(self
+                .records
+                .iter()
+                .find(|record| &record.index == index)
+                .cloned())
+        }
+
+        async fn list_by_rank(
+            &self,
+            rank: MemoryRank,
+        ) -> std::result::Result<Vec<MemoryRecord>, PortError> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|record| record.rank == rank)
+                .cloned()
+                .collect())
+        }
+
+        async fn search(
+            &self,
+            _q: &MemoryQuery,
+        ) -> std::result::Result<Vec<MemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn linked(
+            &self,
+            q: &LinkedMemoryQuery,
+        ) -> std::result::Result<Vec<nuillu_memory::LinkedMemoryRecord>, PortError> {
+            Ok(self
+                .links
+                .iter()
+                .filter(|link| {
+                    q.memory_indexes.contains(&link.from_memory)
+                        || q.memory_indexes.contains(&link.to_memory)
+                })
+                .filter_map(|link| {
+                    self.records
+                        .iter()
+                        .find(|record| record.index == link.from_memory)
+                        .cloned()
+                        .map(|record| nuillu_memory::LinkedMemoryRecord {
+                            record,
+                            link: link.clone(),
+                        })
+                })
+                .collect())
+        }
+
+        async fn upsert_link(
+            &self,
+            _link: nuillu_memory::NewMemoryLink,
+            _updated_at: DateTime<Utc>,
+        ) -> std::result::Result<nuillu_memory::MemoryLink, PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+
+        async fn delete(&self, _index: &MemoryIndex) -> std::result::Result<(), PortError> {
+            unimplemented!("static test store does not support writes")
+        }
+    }
+
     #[test]
     fn action_tracker_waits_for_silence_window_after_action_completion() {
         let tracker = ActionActivityTracker::new(vec![builtin::speak()]);
@@ -6405,12 +6806,10 @@ prompt = "What am I attending to?"
             ActivateAllocation {
                 module: EvalModule::Interoception,
                 activation_ratio: 1.0,
-                guidance: Some(eure::value::Text::plaintext("watch arousal")),
             },
             ActivateAllocation {
                 module: EvalModule::HomeostaticController,
                 activation_ratio: 0.5,
-                guidance: None,
             },
         ];
 
@@ -6423,7 +6822,7 @@ prompt = "What am I attending to?"
         );
         assert_eq!(
             allocation.for_module(&builtin::interoception()).guidance,
-            "watch arousal"
+            ""
         );
         assert_eq!(
             allocation.activation_for(&builtin::homeostatic_controller()),
