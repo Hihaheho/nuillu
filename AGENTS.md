@@ -16,6 +16,7 @@ cargo nextest run -p nuillu-agent --test two_module_loop   # one integration fil
 cargo nextest run -p nuillu-agent --test two_module_loop -- attention_writer_is_exclusive
 cargo clippy --workspace --all-targets
 cargo fmt
+eure check --all # validate eure files against the schemas
 ```
 
 Async tests use `#[tokio::test(flavor = "current_thread")]` and a `tokio::task::LocalSet` because the runtime is `?Send` / `spawn_local`-based — keep that pattern when adding tests that exercise `nuillu_agent::run` or modules holding `LlmAccess`.
