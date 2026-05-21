@@ -188,6 +188,10 @@ fn parses_added_speak_and_self_model_module_cases() {
             "../../eval-cases/modules/self-model/applies-retrieved-self-ability.eure",
             EvalModule::SelfModel,
         ),
+        (
+            "../../eval-cases/modules/sensory/writes-peer-food-guarding.eure",
+            EvalModule::Sensory,
+        ),
     ];
 
     for (path, expected_module) in cases {
@@ -199,6 +203,59 @@ fn parses_added_speak_and_self_model_module_cases() {
         assert_eq!(target.module(), expected_module);
         assert!(!case.checks.is_empty(), "{path} should define checks");
     }
+}
+
+#[test]
+fn parses_sensory_module_case_inputs_and_rejects_empty_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/sensory");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("writes-peer-food-guarding.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "module-sensory-writes-peer-food-guarding"
+modules = ["sensory"]
+prompt = "Watch ambient observations."
+
+@ inputs[] {
+  $variant: seen
+  appearance = "Koro is standing in front of the food bowl."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Koro"
+  content = "Koro growls."
+}
+"#,
+    )
+    .unwrap();
+
+    let case = parse_case_file(&path).unwrap();
+    let EvalCase::Module { target, case } = case else {
+        panic!("expected module case");
+    };
+    assert_eq!(target.module(), EvalModule::Sensory);
+    assert_eq!(case.inputs.len(), 2);
+
+    let missing_inputs = case_dir.join("missing-inputs.eure");
+    std::fs::write(
+        &missing_inputs,
+        r#"
+id = "missing-inputs"
+modules = ["sensory"]
+prompt = "Watch ambient observations."
+"#,
+    )
+    .unwrap();
+
+    let err = parse_case_file(&missing_inputs).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("sensory module case must include at least one input"),
+        "{err}"
+    );
 }
 
 #[test]

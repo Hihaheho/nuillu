@@ -2030,7 +2030,10 @@ async fn execute_module_case(
     .build(&env.caps)
     .await?;
     let harness = env.caps.internal_harness_io();
+    let sensory = env.caps.host_io().sensory_input_mailbox();
     let prompt = case.prompt.content.clone();
+    let case_inputs = case.inputs.clone();
+    let case_id_for_activation = case_id.to_string();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
     let blackboard = env.blackboard.clone();
@@ -2059,6 +2062,10 @@ async fn execute_module_case(
                     &memo_seed_records,
                     &cognition_seed_records,
                     has_cognition_log_seed,
+                    &case_id_for_activation,
+                    &case_inputs,
+                    &sensory,
+                    clock.as_ref(),
                 )
                 .await;
             }
@@ -2090,6 +2097,10 @@ async fn execute_module_case(
                             &memo_seed_records,
                             &cognition_seed_records,
                             has_cognition_log_seed,
+                            &case_id_for_activation,
+                            &case_inputs,
+                            &sensory,
+                            clock.as_ref(),
                         )
                         .await;
                         started = true;
@@ -2212,8 +2223,22 @@ async fn activate_module_case_target(
     memo_seed_records: &[MemoLogRecord],
     cognition_seed_records: &[CognitionLogEntryRecord],
     has_cognition_log_seed: bool,
+    case_id: &str,
+    inputs: &[FullAgentInput],
+    sensory: &SensoryInputMailbox,
+    clock: &dyn Clock,
 ) {
     match target {
+        ModuleEvalTarget::Sensory => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            publish_full_agent_inputs(case_id, inputs, sensory, clock, None).await;
+        }
         ModuleEvalTarget::CognitionGate => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);

@@ -22,6 +22,10 @@ schema = "schemas/eval-query-memory-case.schema.eure"
 globs = ["eval-cases/modules/cognition-gate/**/*.eure"]
 schema = "schemas/eval-cognition-gate-case.schema.eure"
 
+@ targets.eval-sensory-cases
+globs = ["eval-cases/modules/sensory/**/*.eure"]
+schema = "schemas/eval-sensory-case.schema.eure"
+
 @ targets.eval-speak-cases
 globs = ["eval-cases/modules/speak/**/*.eure"]
 schema = "schemas/eval-speak-case.schema.eure"
@@ -56,6 +60,7 @@ default-targets = [
   "eval-full-agent-cases",
   "eval-query-memory-cases",
   "eval-cognition-gate-cases",
+  "eval-sensory-cases",
   "eval-speak-cases",
   "eval-memory-cases",
   "eval-memory-compaction-cases",

@@ -198,6 +198,8 @@ pub struct ModuleCase {
     #[eure(default)]
     pub cognition_log: Vec<CognitionLogSeed>,
     #[eure(default)]
+    pub inputs: Vec<FullAgentInput>,
+    #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
@@ -325,6 +327,7 @@ impl FullAgentCase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleEvalTarget {
+    Sensory,
     CognitionGate,
     QueryMemory,
     AttentionSchema,
@@ -339,6 +342,7 @@ pub enum ModuleEvalTarget {
 impl ModuleEvalTarget {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
             Self::QueryMemory => "query-memory",
             Self::AttentionSchema => "attention-schema",
@@ -353,6 +357,7 @@ impl ModuleEvalTarget {
 
     pub fn module(self) -> EvalModule {
         match self {
+            Self::Sensory => EvalModule::Sensory,
             Self::CognitionGate => EvalModule::CognitionGate,
             Self::QueryMemory => EvalModule::QueryMemory,
             Self::AttentionSchema => EvalModule::AttentionSchema,
@@ -369,6 +374,7 @@ impl ModuleEvalTarget {
         path.components()
             .filter_map(|component| component.as_os_str().to_str())
             .find_map(|part| match part {
+                "sensory" => Some(Self::Sensory),
                 "cognition-gate" => Some(Self::CognitionGate),
                 "query-memory" => Some(Self::QueryMemory),
                 "attention-schema" => Some(Self::AttentionSchema),
@@ -1132,6 +1138,9 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             });
         }
     }
+    for (index, input) in case.inputs.iter().enumerate() {
+        validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
+    }
     validate_modules(path, case.modules.as_deref())?;
     validate_common(
         path,
@@ -1148,6 +1157,12 @@ fn validate_module_case_target(
     target: ModuleEvalTarget,
     case: &ModuleCase,
 ) -> Result<(), CaseFileError> {
+    if target == ModuleEvalTarget::Sensory && case.inputs.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "sensory module case must include at least one input".to_string(),
+        });
+    }
     let Some(modules) = case.modules.as_deref() else {
         return Ok(());
     };

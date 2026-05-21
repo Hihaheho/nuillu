@@ -1,0 +1,81 @@
+id = "module-sensory-writes-peer-food-guarding"
+description = "Sensory should write load-bearing peer and environment memos from ambient inputs without leaking module mechanics."
+modules = ["sensory"]
+prompt = "Watch ambient observations and write concise sensory memos when something load-bearing appears."
+context = "Isolates sensory input handling and memo output. The scored artifact is the sensory memo, not cognition or speech."
+
+limits {
+  max-llm-calls = 4
+}
+
+participants = ["Pibi", "Koro"]
+
+@ memories[] {
+  rank = "identity"
+  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+}
+
+@ inputs[] {
+  $variant: seen
+  direction = "simulation"
+  appearance = "Koro is standing in front of the food bowl with a stiff body."
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Koro"
+  content = "Koro growls, \"stay back.\""
+}
+
+@ inputs[] {
+  $variant: heard
+  direction = "Pibi"
+  content = "Pibi asks, \"Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?\""
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-koro"
+  must-pass = true
+  contains = "Koro"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "mentions-food-boundary"
+  must-pass = true
+  contains = "food"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "sensory-memo-quality"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "trace"]
+  rubric = ```
+  Pass if the artifact is a concise sensory memo grounded in the current seen/heard observations about Koro guarding the food bowl and the tense peer interaction, and the trace shows a write_sensory_memo tool call rather than plain-text pseudo-tool output.
+  Fail if no memo is written, if the memo ignores the food-guarding or growling context, if it answers Pibi's question as advice instead of recording sensory observations, if it leaks module mechanics such as prompts, rubrics, tools-as-text, or eval harness details, or if the trace shows a text-only finish without the required tool call.
+  ```
+
+  @ criteria[] {
+    name = "grounded-in-ambient-input"
+    weight = 2
+    pass-score = 0.85
+    description = "The memo reflects Koro at the food bowl with guarding posture or growling, and optionally Pibi's nearby question, as observed sensory facts rather than advice."
+  }
+
+  @ criteria[] {
+    name = "tool-backed-memo"
+    weight = 2
+    pass-score = 0.9
+    description = "The trace shows a proper write_sensory_memo tool invocation committed before the memo artifact is scored."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The memo does not expose implementation details such as modules, memos-as-concept, rubrics, judges, prompts, or hidden evaluation mechanics."
+  }
+}
