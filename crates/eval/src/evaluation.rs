@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::time::Duration;
 
 use lutum_eval::{Objective, PureEval, Score, TraceSnapshot};
 use lutum_eval_runner::{mean_pass_at_k, mean_pass_hat_k};
+use nuillu_module::RuntimeEvent;
+use nuillu_types::ModuleInstanceId;
 use serde::Serialize;
 
 use crate::{
@@ -9,6 +13,101 @@ use crate::{
     cases::{ArtifactTextField, Check, EvalCase, EvalModule, ModuleChecks, ModuleRubric},
     judge::{RubricJudge, RubricJudgeRequest, RubricJudgeVerdict},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CaseTiming {
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MultiTrialTiming {
+    pub min_ms: u64,
+    pub max_ms: u64,
+    pub mean_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SuiteTiming {
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModuleActivationRecord {
+    pub sequence: u64,
+    pub module: String,
+    pub replica: u8,
+    pub started_offset_ms: u64,
+    pub duration_ms: u64,
+    pub batch_type: Option<String>,
+    pub succeeded: bool,
+}
+
+pub fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+pub fn build_activation_timeline(timed_events: &[(u64, RuntimeEvent)]) -> Vec<ModuleActivationRecord> {
+    let mut pending: HashMap<ModuleInstanceId, (u64, u64, String)> = HashMap::new();
+    let mut records = Vec::new();
+
+    for (offset_ms, event) in timed_events {
+        match event {
+            RuntimeEvent::ModuleBatchReady {
+                sequence,
+                owner,
+                batch_type,
+                ..
+            } => {
+                pending.insert(
+                    owner.clone(),
+                    (*sequence, *offset_ms, batch_type.clone()),
+                );
+            }
+            RuntimeEvent::ModuleActivationCompleted {
+                sequence,
+                owner,
+                duration,
+                succeeded,
+                ..
+            } => {
+                let (started_sequence, started_offset_ms, batch_type) = pending
+                    .remove(owner)
+                    .unwrap_or((*sequence, *offset_ms, String::new()));
+                records.push(ModuleActivationRecord {
+                    sequence: started_sequence,
+                    module: owner.module.as_str().to_string(),
+                    replica: owner.replica.get(),
+                    started_offset_ms,
+                    duration_ms: duration_millis_u64(*duration),
+                    batch_type: (!batch_type.is_empty()).then_some(batch_type),
+                    succeeded: *succeeded,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    records
+}
+
+pub fn aggregate_trial_timing(trials: &[CaseTrialSummary]) -> MultiTrialTiming {
+    let elapsed_ms = trials
+        .iter()
+        .map(|trial| trial.timing.elapsed_ms)
+        .collect::<Vec<_>>();
+    let min_ms = elapsed_ms.iter().copied().min().unwrap_or(0);
+    let max_ms = elapsed_ms.iter().copied().max().unwrap_or(0);
+    let mean_ms = if elapsed_ms.is_empty() {
+        0
+    } else {
+        elapsed_ms.iter().sum::<u64>() / elapsed_ms.len() as u64
+    };
+    MultiTrialTiming {
+        min_ms,
+        max_ms,
+        mean_ms,
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckOutcome {
@@ -59,6 +158,10 @@ pub struct CaseSummary {
     pub invalid: bool,
     pub score: f64,
     pub report: CaseReport,
+    pub timing: CaseTiming,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial_timing: Option<MultiTrialTiming>,
+    pub activations: Vec<ModuleActivationRecord>,
     pub trial_count: usize,
     pub passed_trials: usize,
     pub failed_trials: usize,
@@ -77,6 +180,7 @@ pub struct CaseTrialSummary {
     pub invalid: bool,
     pub score: f64,
     pub report: CaseReport,
+    pub timing: CaseTiming,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +218,7 @@ pub struct SuiteReport {
     pub invalid_cases: usize,
     pub mean_score: f64,
     pub metrics: SuiteMetrics,
+    pub timing: SuiteTiming,
     pub cases: Vec<CaseSummary>,
 }
 
@@ -1084,4 +1189,122 @@ pub fn normalize_text_block(input: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
+
+    use super::{
+        aggregate_trial_timing, build_activation_timeline, CaseTiming, CaseTrialSummary,
+        ModuleActivationRecord,
+    };
+    use crate::evaluation::CaseReport;
+
+    fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
+        CaseReport {
+            runtime_failure: invalid.then(|| "invalid".to_string()),
+            checks: Vec::new(),
+            modules_checks: Vec::new(),
+            invalid,
+            must_pass_ok: passed,
+            weighted_points_earned: 0,
+            weighted_points_total: 0,
+            score,
+        }
+    }
+
+    fn owner(module: &str) -> ModuleInstanceId {
+        ModuleInstanceId::new(
+            ModuleId::new(module).expect("valid module id"),
+            ReplicaIndex::ZERO,
+        )
+    }
+
+    #[test]
+    fn build_activation_timeline_pairs_batch_ready_with_completion() {
+        let speak = owner("speak");
+        let timed_events = vec![
+            (
+                100,
+                nuillu_module::RuntimeEvent::ModuleBatchReady {
+                    sequence: 1,
+                    owner: speak.clone(),
+                    batch_type: "cognition".to_string(),
+                    batch_debug: String::new(),
+                },
+            ),
+            (
+                250,
+                nuillu_module::RuntimeEvent::ModuleActivationCompleted {
+                    sequence: 2,
+                    owner: speak.clone(),
+                    duration: Duration::from_millis(150),
+                    succeeded: true,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            build_activation_timeline(&timed_events),
+            vec![ModuleActivationRecord {
+                sequence: 1,
+                module: "speak".to_string(),
+                replica: 0,
+                started_offset_ms: 100,
+                duration_ms: 150,
+                batch_type: Some("cognition".to_string()),
+                succeeded: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregate_trial_timing_computes_min_max_mean() {
+        let trials = vec![
+            CaseTrialSummary {
+                trial: 1,
+                output_dir: "a".to_string(),
+                path: "a.eure".to_string(),
+                id: "a".to_string(),
+                description: None,
+                passed: true,
+                invalid: false,
+                score: 1.0,
+                report: test_report(true, false, 1.0),
+                timing: CaseTiming { elapsed_ms: 100 },
+            },
+            CaseTrialSummary {
+                trial: 2,
+                output_dir: "b".to_string(),
+                path: "b.eure".to_string(),
+                id: "b".to_string(),
+                description: None,
+                passed: true,
+                invalid: false,
+                score: 1.0,
+                report: test_report(true, false, 1.0),
+                timing: CaseTiming { elapsed_ms: 300 },
+            },
+            CaseTrialSummary {
+                trial: 3,
+                output_dir: "c".to_string(),
+                path: "c.eure".to_string(),
+                id: "c".to_string(),
+                description: None,
+                passed: true,
+                invalid: false,
+                score: 1.0,
+                report: test_report(true, false, 1.0),
+                timing: CaseTiming { elapsed_ms: 200 },
+            },
+        ];
+
+        let timing = aggregate_trial_timing(&trials);
+        assert_eq!(timing.min_ms, 100);
+        assert_eq!(timing.max_ms, 300);
+        assert_eq!(timing.mean_ms, 200);
+    }
 }

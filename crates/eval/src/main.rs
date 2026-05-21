@@ -206,11 +206,12 @@ fn main() -> anyhow::Result<()> {
     let report = runtime.block_on(run_suite(&config))?;
     let metrics = format_cli_metrics(&report.metrics);
     println!(
-        "cases={} passed={} failed={} invalid={}{} output={}",
+        "cases={} passed={} failed={} invalid={} elapsed_ms={}{} output={}",
         report.case_count,
         report.passed_cases,
         report.failed_cases,
         report.invalid_cases,
+        report.timing.elapsed_ms,
         metrics,
         config.output_root.join(&config.run_id).display()
     );

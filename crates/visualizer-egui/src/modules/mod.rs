@@ -200,6 +200,7 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 debug: batch_debug.clone(),
             });
         }
+        RuntimeEvent::ModuleActivationCompleted { .. } => {}
         RuntimeEvent::ModuleTaskFailed {
             owner,
             phase,

@@ -320,6 +320,18 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
                 batch_type,
                 batch_debug.chars().count()
             ),
+            RuntimeEvent::ModuleActivationCompleted {
+                owner,
+                duration,
+                succeeded,
+                ..
+            } => eprintln!(
+                "nuillu-server module-activation-completed tab={} owner={} duration_ms={} succeeded={}",
+                self.tab_id,
+                owner,
+                duration.as_millis(),
+                succeeded
+            ),
             RuntimeEvent::ModuleTaskFailed {
                 owner,
                 phase,

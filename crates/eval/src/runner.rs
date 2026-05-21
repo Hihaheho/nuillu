@@ -64,9 +64,10 @@ use crate::{
         wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
-        CaseReport, CaseSummary, CaseTrialSummary, SuiteMetrics, SuiteModelNames, SuiteReport,
-        SuiteRunReport, artifact_text, evaluate_case, field_label, normalize_text_block,
-        numeric_range_outcome, pointer_number, pointer_text,
+        aggregate_trial_timing, build_activation_timeline, CaseReport, CaseSummary, CaseTiming,
+        CaseTrialSummary, ModuleActivationRecord, SuiteMetrics, SuiteModelNames,
+        SuiteReport, SuiteRunReport, SuiteTiming, artifact_text, evaluate_case, field_label,
+        normalize_text_block, numeric_range_outcome, pointer_number, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     state_dump::{
@@ -345,6 +346,7 @@ pub enum RunnerError {
 struct CaseExecution {
     artifact: CaseArtifact,
     events: Vec<RuntimeEvent>,
+    activations: Vec<ModuleActivationRecord>,
 }
 
 struct CaseOutputContext<'a> {
@@ -405,6 +407,7 @@ pub async fn run_suite_with_hooks(
     config: &RunnerConfig,
     hooks: &mut RunnerHooks,
 ) -> Result<SuiteReport, RunnerError> {
+    let suite_started = Instant::now();
     install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
     if hooks.visualizer.is_some() && config.trials.get() > 1 {
@@ -479,7 +482,10 @@ pub async fn run_suite_with_hooks(
         }
     }
 
-    let report = aggregate_suite(run_report, cases);
+    let mut report = aggregate_suite(run_report, cases);
+    report.timing = SuiteTiming {
+        elapsed_ms: duration_millis_u64(suite_started.elapsed()),
+    };
     let suite_path = run_dir.join("suite-report.json");
     write_json_file(&suite_path, &report)?;
     eprintln!("\n════════════════════════════════════════════════════════════");
@@ -493,14 +499,16 @@ pub async fn run_suite_with_hooks(
             "invalid_cases": report.invalid_cases,
             "mean_score": report.mean_score,
             "metrics": report.metrics,
+            "elapsed_ms": report.timing.elapsed_ms,
         }),
         format!(
-            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3}{}",
+            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3} elapsed_ms={}{}",
             config.run_id,
             report.passed_cases,
             report.failed_cases,
             report.invalid_cases,
             report.mean_score,
+            report.timing.elapsed_ms,
             format_suite_metrics_inline(&report.metrics)
         ),
     )?;
@@ -918,6 +926,7 @@ async fn run_case_detailed_with_reporter(
     emit_visualizer_open_tab(hooks, &id);
 
     let trial_count = config.trials.get();
+    let case_started = Instant::now();
     if trial_count == 1 {
         let output = run_case_trial_with_timeout(
             case_path,
@@ -979,7 +988,13 @@ async fn run_case_detailed_with_reporter(
         .iter()
         .map(|output| output.events.len())
         .sum::<usize>();
-    let summary = aggregate_case_summary(case_path, &case, &id, &trial_outputs);
+    let summary = aggregate_case_summary(
+        case_path,
+        &case,
+        &id,
+        &trial_outputs,
+        duration_millis_u64(case_started.elapsed()),
+    );
     write_json_file(&output_dir.join("report.json"), &summary)?;
     emit_case_finished(reporter, &summary, event_count)?;
 
@@ -1029,7 +1044,8 @@ async fn run_case_trial_with_timeout(
         source,
     })?;
 
-    match tokio::time::timeout(
+    let started = Instant::now();
+    let output = match tokio::time::timeout(
         EVAL_CASE_TIMEOUT,
         run_case_detailed_body(
             case_path,
@@ -1046,7 +1062,7 @@ async fn run_case_trial_with_timeout(
     )
     .await
     {
-        Ok(output) => output,
+        Ok(result) => result?,
         Err(_) => {
             let message = format!("eval case timed out after {}s", EVAL_CASE_TIMEOUT.as_secs());
             emit_visualizer_error(
@@ -1076,9 +1092,19 @@ async fn run_case_trial_with_timeout(
                 message,
                 empty_trace_snapshot(),
                 RawTraceSnapshot::default(),
-            )
+            )?
         }
+    };
+    Ok(apply_trial_timing(output, started))
+}
+
+fn apply_trial_timing(mut output: CaseRunOutput, started: Instant) -> CaseRunOutput {
+    let elapsed_ms = duration_millis_u64(started.elapsed());
+    output.summary.timing = CaseTiming { elapsed_ms };
+    if let Some(trial) = output.summary.trials.first_mut() {
+        trial.timing = CaseTiming { elapsed_ms };
     }
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1165,8 +1191,10 @@ async fn run_case_detailed_body(
     };
     let artifact = execution.artifact;
     let events = execution.events;
+    let activations = execution.activations;
     let report = evaluate_case(case, &trace, &artifact, judge).await;
-    let summary = case_summary_from_report(case_path, case, id, output_dir, trial_number, report);
+    let summary =
+        case_summary_from_report(case_path, case, id, output_dir, trial_number, report, activations);
 
     write_json_file(&output_dir.join("artifact.json"), &artifact)?;
     write_json_file(&output_dir.join("report.json"), &summary)?;
@@ -1218,6 +1246,7 @@ fn write_runtime_failure_case_output(
         ctx.output_dir,
         ctx.trial_number,
         report,
+        Vec::new(),
     );
 
     write_json_file(&ctx.output_dir.join("artifact.json"), &artifact)?;
@@ -1259,11 +1288,13 @@ fn case_summary_from_report(
     output_dir: &Path,
     trial_number: usize,
     report: CaseReport,
+    activations: Vec<ModuleActivationRecord>,
 ) -> CaseSummary {
     let description = case_description(case);
     let passed = report.passed();
     let invalid = report.invalid;
     let score = report.score;
+    let timing = CaseTiming { elapsed_ms: 0 };
     let trial = CaseTrialSummary {
         trial: trial_number,
         output_dir: output_dir.display().to_string(),
@@ -1274,6 +1305,7 @@ fn case_summary_from_report(
         invalid,
         score,
         report: report.clone(),
+        timing: timing.clone(),
     };
 
     CaseSummary {
@@ -1284,6 +1316,9 @@ fn case_summary_from_report(
         invalid,
         score,
         report,
+        timing,
+        trial_timing: None,
+        activations,
         trial_count: 1,
         passed_trials: usize::from(passed),
         failed_trials: usize::from(!passed && !invalid),
@@ -1297,6 +1332,7 @@ fn aggregate_case_summary(
     case: &EvalCase,
     id: &str,
     trial_outputs: &[CaseRunOutput],
+    elapsed_ms: u64,
 ) -> CaseSummary {
     let trial_count = trial_outputs.len();
     let passed_trials = trial_outputs
@@ -1340,9 +1376,11 @@ fn aggregate_case_summary(
                     invalid: output.summary.invalid,
                     score: output.summary.score,
                     report: output.summary.report.clone(),
+                    timing: output.summary.timing.clone(),
                 })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let trial_timing = (trial_count > 1).then(|| aggregate_trial_timing(&trials));
 
     CaseSummary {
         path: case_path.display().to_string(),
@@ -1352,6 +1390,9 @@ fn aggregate_case_summary(
         invalid,
         score,
         report,
+        timing: CaseTiming { elapsed_ms },
+        trial_timing,
+        activations: Vec::new(),
         trial_count,
         passed_trials,
         failed_trials,
@@ -1421,18 +1462,24 @@ fn emit_case_finished(
     };
     let case_finished_message = if let Some(runtime_failure) = &summary.report.runtime_failure {
         format!(
-            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} events={} failure={}",
+            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} elapsed_ms={} events={} failure={}",
             summary.id,
             summary.passed,
             summary.invalid,
             summary.score,
+            summary.timing.elapsed_ms,
             event_count,
             runtime_failure
         )
     } else {
         format!(
-            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} events={}",
-            summary.id, summary.passed, summary.invalid, summary.score, event_count
+            "{status_icon} eval case end id={} passed={} invalid={} score={:.3} elapsed_ms={} events={}",
+            summary.id,
+            summary.passed,
+            summary.invalid,
+            summary.score,
+            summary.timing.elapsed_ms,
+            event_count
         )
     };
     reporter.emit(
@@ -1443,6 +1490,7 @@ fn emit_case_finished(
             "passed": summary.passed,
             "invalid": summary.invalid,
             "score": summary.score,
+            "elapsed_ms": summary.timing.elapsed_ms,
             "runtime_failure": summary.report.runtime_failure.as_deref(),
             "events": event_count,
         }),
@@ -1471,12 +1519,19 @@ fn emit_trial_finished(
             "passed": summary.passed,
             "invalid": summary.invalid,
             "score": summary.score,
+            "elapsed_ms": summary.timing.elapsed_ms,
             "runtime_failure": summary.report.runtime_failure.as_deref(),
             "events": event_count,
         }),
         format!(
-            "{status_icon} eval trial end id={} runtime_id={} passed={} invalid={} score={:.3} events={}",
-            summary.id, runtime_id, summary.passed, summary.invalid, summary.score, event_count
+            "{status_icon} eval trial end id={} runtime_id={} passed={} invalid={} score={:.3} elapsed_ms={} events={}",
+            summary.id,
+            runtime_id,
+            summary.passed,
+            summary.invalid,
+            summary.score,
+            summary.timing.elapsed_ms,
+            event_count
         ),
     )
 }
@@ -1654,6 +1709,7 @@ async fn execute_full_agent_case(
     let step_outcomes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let step_failure_for_loop = step_failure.clone();
     let step_outcomes_for_loop = step_outcomes.clone();
+    let live_reporter_for_loop = live_reporter.clone();
 
     run_agent(
         modules,
@@ -1686,6 +1742,7 @@ async fn execute_full_agent_case(
                     events.as_ref(),
                     clock.as_ref(),
                     visualizer.as_deref(),
+                    &live_reporter_for_loop,
                     &step_failure_for_loop,
                     &step_outcomes_for_loop,
                 )
@@ -1751,6 +1808,7 @@ async fn execute_full_agent_case(
                             events.as_ref(),
                             clock.as_ref(),
                             Some(visualizer),
+                            &live_reporter_for_loop,
                             &step_failure_for_loop,
                             &step_outcomes_for_loop,
                         )
@@ -1886,7 +1944,11 @@ async fn execute_full_agent_case(
         )
         .await;
     }
-    Ok(CaseExecution { artifact, events })
+    Ok(CaseExecution {
+        artifact,
+        events,
+        activations: env.events.activation_timeline(),
+    })
 }
 
 fn step_outcomes_all_ok(outcomes: &[serde_json::Value]) -> bool {
@@ -2137,6 +2199,7 @@ async fn execute_module_case(
     Ok(CaseExecution {
         artifact,
         events: env.events.snapshot(),
+        activations: env.events.activation_timeline(),
     })
 }
 
@@ -2725,6 +2788,7 @@ async fn run_input_phase(
     events: &RecordingRuntimeEventSink,
     clock: &dyn Clock,
     visualizer: Option<&VisualizerHook>,
+    reporter: &LiveReporter,
     step_failure: &Arc<Mutex<Option<String>>>,
     step_outcomes: &Arc<Mutex<Vec<serde_json::Value>>>,
 ) {
@@ -2733,6 +2797,7 @@ async fn run_input_phase(
         return;
     }
     for (index, step) in steps.iter().enumerate() {
+        let step_started = Instant::now();
         if index > 0 {
             let settle_modules = step_settle_modules(step.wait_for.as_ref());
             match wait_for_step_modules_to_settle(
@@ -2815,6 +2880,10 @@ async fn run_input_phase(
             serde_json::Value::String(status.to_string()),
         );
         outcome.insert(
+            "elapsed_ms".to_string(),
+            serde_json::Value::from(duration_millis_u64(step_started.elapsed())),
+        );
+        outcome.insert(
             "checks".to_string(),
             serde_json::Value::Array(check_results),
         );
@@ -2822,6 +2891,19 @@ async fn run_input_phase(
             .lock()
             .expect("step outcomes mutex poisoned")
             .push(serde_json::Value::Object(outcome));
+        let step_elapsed_ms = duration_millis_u64(step_started.elapsed());
+        let _ = reporter.emit(
+            Some(case_id),
+            "step_finished",
+            serde_json::json!({
+                "index": index,
+                "status": status,
+                "elapsed_ms": step_elapsed_ms,
+            }),
+            format!(
+                "eval step end id={case_id} index={index} elapsed_ms={step_elapsed_ms} status={status}"
+            ),
+        );
 
         match wait_outcome {
             WaitOutcome::Met => {}
@@ -5135,6 +5217,15 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
             batch_type,
             ..
         } => format!("seq={sequence} module_batch_ready owner={owner} batch={batch_type}"),
+        RuntimeEvent::ModuleActivationCompleted {
+            sequence,
+            owner,
+            duration,
+            succeeded,
+        } => format!(
+            "seq={sequence} module_activation_completed owner={owner} duration_ms={} succeeded={succeeded}",
+            duration_millis_u64(*duration)
+        ),
         RuntimeEvent::ModuleTaskFailed {
             sequence,
             owner,
@@ -5489,6 +5580,8 @@ impl UtteranceSink for RecordingUtteranceSink {
 #[derive(Debug)]
 pub(crate) struct RecordingRuntimeEventSink {
     events: Mutex<Vec<RuntimeEvent>>,
+    timed_events: Mutex<Vec<(u64, RuntimeEvent)>>,
+    case_started: Instant,
     progress_events: AtomicUsize,
     llm_in_flight: AtomicUsize,
     stop: AtomicBool,
@@ -5507,6 +5600,8 @@ impl RecordingRuntimeEventSink {
     ) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
+            timed_events: Mutex::new(Vec::new()),
+            case_started: Instant::now(),
             progress_events: AtomicUsize::new(0),
             llm_in_flight: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -5522,6 +5617,14 @@ impl RecordingRuntimeEventSink {
             .lock()
             .expect("runtime event lock poisoned")
             .clone()
+    }
+
+    fn activation_timeline(&self) -> Vec<ModuleActivationRecord> {
+        let timed_events = self
+            .timed_events
+            .lock()
+            .expect("timed runtime event lock poisoned");
+        build_activation_timeline(&timed_events)
     }
 
     fn stop_requested(&self) -> bool {
@@ -5568,7 +5671,8 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         | RuntimeEvent::ModuleTaskFailed { .. } => true,
         RuntimeEvent::RateLimitDelayed { .. }
         | RuntimeEvent::ModuleBatchThrottled { .. }
-        | RuntimeEvent::ModuleBatchReady { .. } => false,
+        | RuntimeEvent::ModuleBatchReady { .. }
+        | RuntimeEvent::ModuleActivationCompleted { .. } => false,
     }
 }
 
@@ -5583,6 +5687,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::RateLimitDelayed { .. } => false,
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
             RuntimeEvent::ModuleBatchReady { .. } => false,
+            RuntimeEvent::ModuleActivationCompleted { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
         };
         match &event {
@@ -5659,6 +5764,19 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 batch_type,
                 batch_debug.chars().count()
             ),
+            RuntimeEvent::ModuleActivationCompleted {
+                owner,
+                duration,
+                succeeded,
+                ..
+            } => format!(
+                "{} module-activation-completed {} owner={} duration_ms={} succeeded={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                duration.as_millis(),
+                succeeded
+            ),
             RuntimeEvent::ModuleTaskFailed {
                 owner,
                 phase,
@@ -5677,6 +5795,11 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             .lock()
             .map_err(|_| PortError::Backend("runtime event lock poisoned".into()))?
             .push(event.clone());
+        let offset_ms = duration_millis_u64(self.case_started.elapsed());
+        self.timed_events
+            .lock()
+            .map_err(|_| PortError::Backend("timed runtime event lock poisoned".into()))?
+            .push((offset_ms, event.clone()));
         if runtime_event_counts_as_eval_progress(&event) {
             self.progress_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -5746,6 +5869,7 @@ fn aggregate_suite(run: SuiteRunReport, cases: Vec<CaseSummary>) -> SuiteReport 
         invalid_cases,
         mean_score,
         metrics,
+        timing: SuiteTiming { elapsed_ms: 0 },
         cases,
     }
 }
@@ -5928,6 +6052,9 @@ mod tests {
             invalid,
             score,
             report,
+            timing: CaseTiming { elapsed_ms: 0 },
+            trial_timing: None,
+            activations: Vec::new(),
             trial_count,
             passed_trials,
             failed_trials: trial_count.saturating_sub(passed_trials + invalid_trials),
@@ -5952,6 +6079,9 @@ mod tests {
             invalid,
             score,
             report: report.clone(),
+            timing: CaseTiming { elapsed_ms: 0 },
+            trial_timing: None,
+            activations: Vec::new(),
             trial_count: 1,
             passed_trials: usize::from(passed),
             failed_trials: usize::from(!passed && !invalid),
@@ -5966,6 +6096,7 @@ mod tests {
                 invalid,
                 score,
                 report,
+                timing: CaseTiming { elapsed_ms: 0 },
             }],
         };
         CaseRunOutput {
@@ -6126,6 +6257,7 @@ id = "{id}"
                 test_case_run_output("case-id", 1, true, false, 1.0),
                 test_case_run_output("case-id", 2, true, false, 0.8),
             ],
+            0,
         );
         assert!(all_pass.passed);
         assert!(!all_pass.invalid);
@@ -6143,6 +6275,7 @@ id = "{id}"
                 test_case_run_output("case-id", 1, true, false, 1.0),
                 test_case_run_output("case-id", 2, false, false, 0.2),
             ],
+            0,
         );
         assert!(!some_fail.passed);
         assert!(!some_fail.invalid);
@@ -6158,12 +6291,35 @@ id = "{id}"
                 test_case_run_output("case-id", 1, true, false, 1.0),
                 test_case_run_output("case-id", 2, false, true, 0.0),
             ],
+            0,
         );
         assert!(!invalid.passed);
         assert!(invalid.invalid);
         assert_eq!(invalid.passed_trials, 1);
         assert_eq!(invalid.failed_trials, 0);
         assert_eq!(invalid.invalid_trials, 1);
+    }
+
+    #[test]
+    fn aggregate_case_summary_records_trial_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_path = write_query_memory_case(dir.path(), "case", "case-id");
+        let case = parse_case_file(&case_path).unwrap();
+
+        let mut first = test_case_run_output("case-id", 1, true, false, 1.0);
+        first.summary.timing = CaseTiming { elapsed_ms: 100 };
+        first.summary.trials[0].timing = CaseTiming { elapsed_ms: 100 };
+        let mut second = test_case_run_output("case-id", 2, true, false, 0.8);
+        second.summary.timing = CaseTiming { elapsed_ms: 300 };
+        second.summary.trials[0].timing = CaseTiming { elapsed_ms: 300 };
+
+        let summary = aggregate_case_summary(&case_path, &case, "case-id", &[first, second], 450);
+
+        assert_eq!(summary.timing.elapsed_ms, 450);
+        let trial_timing = summary.trial_timing.expect("trial timing");
+        assert_eq!(trial_timing.min_ms, 100);
+        assert_eq!(trial_timing.max_ms, 300);
+        assert_eq!(trial_timing.mean_ms, 200);
     }
 
     #[test]
@@ -7175,6 +7331,35 @@ id = "module-query-memory-special-memory"
         assert!(jsonl.contains("\"kind\":\"runtime_event\""));
         assert!(jsonl.contains("\"kind\":\"stop_requested\""));
         assert_eq!(jsonl.matches("\"kind\":\"stop_requested\"").count(), 1);
+    }
+
+    #[test]
+    fn recording_runtime_event_sink_builds_activation_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+
+        sink.on_event(RuntimeEvent::ModuleBatchReady {
+            sequence: 0,
+            owner: owner.clone(),
+            batch_type: "cognition".to_string(),
+            batch_debug: String::new(),
+        })
+        .unwrap();
+        sink.on_event(RuntimeEvent::ModuleActivationCompleted {
+            sequence: 1,
+            owner,
+            duration: Duration::from_millis(42),
+            succeeded: true,
+        })
+        .unwrap();
+
+        let activations = sink.activation_timeline();
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].module, "speak");
+        assert_eq!(activations[0].duration_ms, 42);
+        assert!(activations[0].succeeded);
     }
 
     #[test]

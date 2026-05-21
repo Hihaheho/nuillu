@@ -800,7 +800,13 @@ async fn handle_task_message(
             pending_kicks,
             activation_elapsed,
             result,
-        } => match result {
+        } => {
+            runtime.record_module_activation_completed(
+                owners[index].clone(),
+                activation_elapsed,
+                result.is_ok(),
+            );
+            match result {
             Ok(()) => {
                 notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                 kick_inboxes[index] = Some(kick_inbox);
@@ -862,6 +868,7 @@ async fn handle_task_message(
                     message,
                 })
             }
+        }
         },
         TaskMessage::ActivationGate {
             index,

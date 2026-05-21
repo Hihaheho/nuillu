@@ -48,6 +48,12 @@ pub enum RuntimeEvent {
         batch_type: String,
         batch_debug: String,
     },
+    ModuleActivationCompleted {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        duration: Duration,
+        succeeded: bool,
+    },
     ModuleTaskFailed {
         sequence: u64,
         owner: ModuleInstanceId,
@@ -146,6 +152,20 @@ impl RuntimeEventEmitter {
             owner,
             batch_type,
             batch_debug,
+        });
+    }
+
+    pub(crate) fn module_activation_completed(
+        &self,
+        owner: ModuleInstanceId,
+        duration: Duration,
+        succeeded: bool,
+    ) {
+        self.emit(|sequence| RuntimeEvent::ModuleActivationCompleted {
+            sequence,
+            owner,
+            duration,
+            succeeded,
         });
     }
 

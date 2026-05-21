@@ -438,6 +438,16 @@ impl AgentRuntimeControl {
         self.runtime_events.module_batch_ready(owner, batch);
     }
 
+    pub fn record_module_activation_completed(
+        &self,
+        owner: ModuleInstanceId,
+        duration: Duration,
+        succeeded: bool,
+    ) {
+        self.runtime_events
+            .module_activation_completed(owner, duration, succeeded);
+    }
+
     pub fn record_module_task_failed(
         &self,
         owner: ModuleInstanceId,
