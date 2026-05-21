@@ -128,6 +128,13 @@ A module can be activated by any inbox capability it holds:
 
 Allocation changes do not publish wake signals. Allocation guidance is the controller's durable control plane: modules read the current allocation snapshot only after another natural activation, then decide whether that activation should produce work, defer silently, or only update local state. Guidance is not a notification, request, or transport path.
 
+The allocation model is **tonic availability plus inhibitory control**. The boot/base allocation is
+background cortical availability: a module remains generally available unless a controller or
+homeostatic cap suppresses it. Controller targets add salience and drive through higher activation
+ratio, guidance, and model tier. Suppression is separate: it should be expressed by explicit caps or
+low activation proposals, not by treating an omitted controller target as `Off`. This keeps
+allocation closer to basal-ganglia/thalamic gating than to a brittle all-or-nothing priority list.
+
 Guidance-based allocation flow:
 
 ```text
@@ -242,7 +249,7 @@ The attention schema is not a self-model and does not answer self-model guidance
 
 Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, self-related knowledge that query modules surface from memory, and self-model guidance from allocation-controller. It writes self-model / self-report output to its memo log.
 
-Stable self-knowledge belongs in memory and can be retrieved by query modules, but a live self-model is not just memory retrieval. The self-model module turns long-lived self facts, current attention, active task context, uncertainty, and recent module outputs into a current first-person state. In v1, object/world models remain distributed through sensory, query, predict, and surprise memo logs; a dedicated `world-model` can be added later if those fragments need a single owner.
+Stable self-knowledge belongs in memory and can be retrieved by query modules, but a live self-model is not just memory retrieval. The self-model module turns long-lived self facts, current attention, active task context, uncertainty, and recent module outputs into a current first-person state. A future narrow body/self-knowledge lane may surface bounded self-model facts such as body affordances and identity traits without granting broad direct memory access. In v1, object/world models remain distributed through sensory, query, predict, and surprise memo logs; a dedicated `world-model` can be added later if those fragments need a single owner.
 
 ### Query Memory
 

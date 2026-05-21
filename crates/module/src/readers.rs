@@ -206,7 +206,7 @@ impl AllocationReader {
                 },
                 "priority": {
                     "type": "array",
-                    "description": "Modules to activate, in descending priority order. Modules omitted from this list receive zero activation. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                    "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                     "items": priority_items,
                 },
             },
@@ -311,7 +311,7 @@ mod tests {
                     },
                     "priority": {
                         "type": "array",
-                        "description": "Modules to activate, in descending priority order. Modules omitted from this list receive zero activation. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                        "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
                         "items": {
                             "type": "object",
                             "additionalProperties": false,

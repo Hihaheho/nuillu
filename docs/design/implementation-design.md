@@ -160,6 +160,11 @@ Allocation-controller replicas do not directly replace the effective allocation.
 
 If there are no active controller proposals for a module, the effective allocation falls back to the boot/base allocation for that module and is still clamped to its cap range. If there is only one active controller replica, effective allocation is equivalent to that replica's clamped proposal.
 
+Conceptually, allocation uses tonic availability plus inhibitory control. Boot/base allocation is
+the background availability floor. Controller proposals add salience and drive. Homeostatic and
+controller suppression are explicit caps or low activation proposals. An omitted module in a
+controller proposal therefore falls back to base allocation; omission is not an implicit `Off`.
+
 The allocation-controller structured-output schema is generated from the module registry at activation time. It enumerates registered module ids and exposes only:
 
 - `activation_ratio`: JSON number in `0.0..=1.0`,
@@ -563,7 +568,7 @@ Capabilities: `CognitionLogUpdatedInbox`, `AllocationReader`, `BlackboardReader`
 
 Maintains a current self-description by integrating attention-schema cognition-log entries, relevant module memo logs, self-related knowledge that query modules surface from memory, and the allocation-controller guidance that requested self-model work. Output is appended to this replica's memo log, which is memo-authoritative for self-model answers.
 
-Stable self-knowledge belongs in memory and is surfaced through query-module memo logs; the self-model module is the dynamic integration layer over that knowledge, current attention, active task context, uncertainty, and recent module outputs. v1 should avoid granting broad direct memory search to self-model unless a later narrow self-knowledge capability is introduced; if `BlackboardReader` proves too wide for this role, introduce a narrower memo-log/context reader before implementation. Object/world models remain distributed through sensory, query, predict, and surprise memo logs in v1; add a dedicated `world-model` only if those fragments need one owner.
+Stable self-knowledge belongs in memory and is surfaced through query-module memo logs; the self-model module is the dynamic integration layer over that knowledge, current attention, active task context, uncertainty, and recent module outputs. v1 should avoid granting broad direct memory search to self-model; if bounded self facts such as identity traits and body affordances need a direct lane later, introduce a narrow body/self-knowledge capability instead. If `BlackboardReader` proves too wide for this role, introduce a narrower memo-log/context reader before implementation. Object/world models remain distributed through sensory, query, predict, and surprise memo logs in v1; add a dedicated `world-model` only if those fragments need one owner.
 
 ### Query Memory
 
