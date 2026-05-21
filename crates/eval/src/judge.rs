@@ -288,7 +288,10 @@ fn render_named_json_values(
         .map(|(label, value)| {
             let reduced = cap_json_value(&value);
             let rendered = pretty_json_value(&reduced);
-            format!("{label}:\n{}", truncate_text(&rendered, MAX_RENDERED_SECTION_CHARS))
+            format!(
+                "{label}:\n{}",
+                truncate_text(&rendered, MAX_RENDERED_SECTION_CHARS)
+            )
         })
         .collect::<Vec<_>>();
     if rendered.is_empty() {
@@ -378,7 +381,9 @@ fn render_trace_summary(trace: &TraceSnapshot) -> String {
         lines.push(format!("- omitted {omitted_spans} low-signal spans"));
     }
     if omitted_events > 0 {
-        lines.push(format!("- omitted {omitted_events} low-signal trace events"));
+        lines.push(format!(
+            "- omitted {omitted_events} low-signal trace events"
+        ));
     }
     if lines.len() == 1 && omitted_spans == 0 && omitted_events == 0 {
         "(empty trace)".to_string()

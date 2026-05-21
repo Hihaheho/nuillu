@@ -64,10 +64,10 @@ use crate::{
         wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
-        aggregate_trial_timing, build_activation_timeline, CaseReport, CaseSummary, CaseTiming,
-        CaseTrialSummary, ModuleActivationRecord, SuiteMetrics, SuiteModelNames,
-        SuiteReport, SuiteRunReport, SuiteTiming, artifact_text, evaluate_case, field_label,
-        normalize_text_block, numeric_range_outcome, pointer_number, pointer_text,
+        CaseReport, CaseSummary, CaseTiming, CaseTrialSummary, ModuleActivationRecord,
+        SuiteMetrics, SuiteModelNames, SuiteReport, SuiteRunReport, SuiteTiming,
+        aggregate_trial_timing, artifact_text, build_activation_timeline, evaluate_case,
+        field_label, normalize_text_block, numeric_range_outcome, pointer_number, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     state_dump::{
@@ -815,10 +815,7 @@ fn filter_case_paths(
     Ok(matched)
 }
 
-fn filter_exclude_full_agent_case_paths(
-    case_paths: Vec<PathBuf>,
-    exclude: bool,
-) -> Vec<PathBuf> {
+fn filter_exclude_full_agent_case_paths(case_paths: Vec<PathBuf>, exclude: bool) -> Vec<PathBuf> {
     if !exclude {
         return case_paths;
     }
@@ -1193,8 +1190,15 @@ async fn run_case_detailed_body(
     let events = execution.events;
     let activations = execution.activations;
     let report = evaluate_case(case, &trace, &artifact, judge).await;
-    let summary =
-        case_summary_from_report(case_path, case, id, output_dir, trial_number, report, activations);
+    let summary = case_summary_from_report(
+        case_path,
+        case,
+        id,
+        output_dir,
+        trial_number,
+        report,
+        activations,
+    );
 
     write_json_file(&output_dir.join("artifact.json"), &artifact)?;
     write_json_file(&output_dir.join("report.json"), &summary)?;
@@ -2477,13 +2481,8 @@ async fn last_memo_log_content_for_module(
         .await
 }
 
-async fn allocation_changed(
-    blackboard: &Blackboard,
-    baseline: &ResourceAllocation,
-) -> bool {
-    blackboard
-        .read(|bb| bb.allocation() != baseline)
-        .await
+async fn allocation_changed(blackboard: &Blackboard, baseline: &ResourceAllocation) -> bool {
+    blackboard.read(|bb| bb.allocation() != baseline).await
 }
 
 async fn allocation_controller_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {

@@ -46,7 +46,9 @@ pub fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-pub fn build_activation_timeline(timed_events: &[(u64, RuntimeEvent)]) -> Vec<ModuleActivationRecord> {
+pub fn build_activation_timeline(
+    timed_events: &[(u64, RuntimeEvent)],
+) -> Vec<ModuleActivationRecord> {
     let mut pending: HashMap<ModuleInstanceId, (u64, u64, String)> = HashMap::new();
     let mut records = Vec::new();
 
@@ -58,10 +60,7 @@ pub fn build_activation_timeline(timed_events: &[(u64, RuntimeEvent)]) -> Vec<Mo
                 batch_type,
                 ..
             } => {
-                pending.insert(
-                    owner.clone(),
-                    (*sequence, *offset_ms, batch_type.clone()),
-                );
+                pending.insert(owner.clone(), (*sequence, *offset_ms, batch_type.clone()));
             }
             RuntimeEvent::ModuleActivationCompleted {
                 sequence,
@@ -1198,8 +1197,8 @@ mod tests {
     use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
 
     use super::{
-        aggregate_trial_timing, build_activation_timeline, CaseTiming, CaseTrialSummary,
-        ModuleActivationRecord,
+        CaseTiming, CaseTrialSummary, ModuleActivationRecord, aggregate_trial_timing,
+        build_activation_timeline,
     };
     use crate::evaluation::CaseReport;
 

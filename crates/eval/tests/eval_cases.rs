@@ -301,9 +301,7 @@ prompt = "Assess surprise."
         "{err}"
     );
 
-    let allocation_dir = dir
-        .path()
-        .join("eval-cases/modules/allocation-controller");
+    let allocation_dir = dir.path().join("eval-cases/modules/allocation-controller");
     std::fs::create_dir_all(&allocation_dir).unwrap();
     let missing_memos = allocation_dir.join("missing-memos.eure");
     std::fs::write(
@@ -317,9 +315,8 @@ prompt = "Assign priorities."
     .unwrap();
     let err = parse_case_file(&missing_memos).unwrap_err();
     assert!(
-        err.to_string().contains(
-            "allocation-controller module case must include at least one memo seed"
-        ),
+        err.to_string()
+            .contains("allocation-controller module case must include at least one memo seed"),
         "{err}"
     );
 }

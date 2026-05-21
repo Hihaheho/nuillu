@@ -807,69 +807,69 @@ async fn handle_task_message(
                 result.is_ok(),
             );
             match result {
-            Ok(()) => {
-                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
-                kick_inboxes[index] = Some(kick_inbox);
-                let now = runtime.clock().now();
-                let next_batch_throttle = runtime
-                    .module_batch_throttle_baseline(&owners[index])
-                    .await
-                    .and_then(|(interval, activation_threshold)| {
-                        let remaining = interval.saturating_sub(activation_elapsed);
-                        if remaining.is_zero() {
-                            None
-                        } else {
-                            chrono::Duration::from_std(remaining)
-                                .ok()
-                                .map(|d| NextBatchThrottle {
-                                    baseline: now
-                                        - ChronoDuration::from_std(activation_elapsed)
-                                            .unwrap_or_default(),
-                                    not_before: now + d,
-                                    activation_threshold,
+                Ok(()) => {
+                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                    kick_inboxes[index] = Some(kick_inbox);
+                    let now = runtime.clock().now();
+                    let next_batch_throttle = runtime
+                        .module_batch_throttle_baseline(&owners[index])
+                        .await
+                        .and_then(|(interval, activation_threshold)| {
+                            let remaining = interval.saturating_sub(activation_elapsed);
+                            if remaining.is_zero() {
+                                None
+                            } else {
+                                chrono::Duration::from_std(remaining).ok().map(|d| {
+                                    NextBatchThrottle {
+                                        baseline: now
+                                            - ChronoDuration::from_std(activation_elapsed)
+                                                .unwrap_or_default(),
+                                        not_before: now + d,
+                                        activation_threshold,
+                                    }
                                 })
-                        }
-                    });
-                states[index] = ModuleState::Stored {
-                    module,
-                    next_batch_throttle,
-                };
-                zero_windows.finish(&owners[index]);
-                if owners[index].module == builtin::allocation_controller() {
-                    let opened = zero_windows.record_controller_activation(runtime).await;
-                    wake_zero_window_modules(
-                        opened,
-                        replica_zero_index_by_role,
-                        zero_window_wakers,
-                    );
+                            }
+                        });
+                    states[index] = ModuleState::Stored {
+                        module,
+                        next_batch_throttle,
+                    };
+                    zero_windows.finish(&owners[index]);
+                    if owners[index].module == builtin::allocation_controller() {
+                        let opened = zero_windows.record_controller_activation(runtime).await;
+                        wake_zero_window_modules(
+                            opened,
+                            replica_zero_index_by_role,
+                            zero_window_wakers,
+                        );
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            Err(message) => {
-                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
-                kick_inboxes[index] = Some(kick_inbox);
-                runtime
-                    .record_module_status(
+                Err(message) => {
+                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                    kick_inboxes[index] = Some(kick_inbox);
+                    runtime
+                        .record_module_status(
+                            owners[index].clone(),
+                            ModuleRunStatus::Failed {
+                                phase: "activate".to_string(),
+                                message: message.clone(),
+                            },
+                        )
+                        .await;
+                    runtime.record_module_task_failed(
                         owners[index].clone(),
-                        ModuleRunStatus::Failed {
-                            phase: "activate".to_string(),
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
-                runtime.record_module_task_failed(
-                    owners[index].clone(),
-                    "activate",
-                    message.clone(),
-                );
-                Err(SchedulerError::ModuleTaskFailed {
-                    owner: owners[index].clone(),
-                    phase: "activate",
-                    message,
-                })
+                        "activate",
+                        message.clone(),
+                    );
+                    Err(SchedulerError::ModuleTaskFailed {
+                        owner: owners[index].clone(),
+                        phase: "activate",
+                        message,
+                    })
+                }
             }
         }
-        },
         TaskMessage::ActivationGate {
             index,
             module,
