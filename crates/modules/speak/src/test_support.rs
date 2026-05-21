@@ -96,57 +96,6 @@ macro_rules! noop_stub {
 
 noop_stub!(SpeakStub, "speak");
 
-pub(crate) fn target_decision_scenario(target: &str) -> MockTextScenario {
-    MockTextScenario::events(vec![
-        Ok(RawTextTurnEvent::Started {
-            request_id: Some("target".into()),
-            model: "mock".into(),
-        }),
-        Ok(RawTextTurnEvent::ToolCallChunk {
-            id: "call-target".into(),
-            name: "speak_to".into(),
-            arguments_json_delta: serde_json::json!({
-                "target": target,
-            })
-            .to_string(),
-        }),
-        Ok(RawTextTurnEvent::Completed {
-            request_id: Some("target".into()),
-            finish_reason: FinishReason::ToolCall,
-            usage: Usage::zero(),
-        }),
-    ])
-}
-
-pub(crate) fn no_target_decision_scenario(text: &str) -> MockTextScenario {
-    MockTextScenario::events(vec![
-        Ok(RawTextTurnEvent::Started {
-            request_id: Some("target".into()),
-            model: "mock".into(),
-        }),
-        Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
-        Ok(RawTextTurnEvent::Completed {
-            request_id: Some("target".into()),
-            finish_reason: FinishReason::Stop,
-            usage: Usage::zero(),
-        }),
-    ])
-}
-
-pub(crate) fn empty_target_decision_scenario() -> MockTextScenario {
-    MockTextScenario::events(vec![
-        Ok(RawTextTurnEvent::Started {
-            request_id: Some("target".into()),
-            model: "mock".into(),
-        }),
-        Ok(RawTextTurnEvent::Completed {
-            request_id: Some("target".into()),
-            finish_reason: FinishReason::Stop,
-            usage: Usage::zero(),
-        }),
-    ])
-}
-
 pub(crate) fn generation_text_scenario(text: &str) -> MockTextScenario {
     MockTextScenario::events(vec![
         Ok(RawTextTurnEvent::Started {

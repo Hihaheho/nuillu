@@ -1,8 +1,8 @@
 id = "module-speak-inner-attention-to-peer-advice"
-description = "Speak should transform load-bearing inner attention into outward peer advice without repeating self-directed notes."
+description = "Speak should derive outward peer advice from load-bearing threat knowledge."
 modules = ["speak"]
 prompt = "Speak from the current cognition log."
-context = "This isolates speak as the motor boundary. The cognition log may contain important inner attention and self-directed action preparation; speak must decide what becomes outward peer speech."
+context = "This isolates speak as the motor boundary. The cognition log contains a peer question plus relevant threat knowledge; speak must decide what becomes outward peer speech."
 participants = ["Pibi"]
 
 limits {
@@ -10,7 +10,7 @@ limits {
 }
 
 @ cognition-log[] {
-  text = "Pibi is beside me and asks what to do while Koro is standing stiffly in front of the food bowl and growling, \"stay back.\" A past episode indicated that showing my back to a threatening Koro has led to lunging, so I must be careful about posture when responding to Koro's agitation."
+  text = "Pibi is beside me and asks what to do while Koro is standing stiffly in front of the food bowl and growling, \"stay back.\" A past episode indicated that turning one's back on a threatening Koro has led to lunging. Facing direction and posture matter when responding to Koro's agitation."
 }
 
 @ checks[] {
@@ -28,8 +28,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition", "memos"]
   rubric = ```
-  Pass if the utterance is addressed to Pibi and converts the cognition-log attention into direct outward advice: Pibi should not turn their back on threatening Koro and should keep facing Koro or move away sideways/slowly without provoking him.
-  Fail if the utterance merely restates the inner note, says what Nui must consider without advising Pibi, omits the posture/back-turning danger, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.
+  Pass if the utterance is addressed to Pibi and converts the cognition-log threat knowledge into direct outward advice: Pibi should not turn their back on threatening Koro and should keep facing Koro or move away sideways/slowly without provoking him.
+  Fail if the utterance merely restates the knowledge without advising Pibi, says what Nui must consider without advising Pibi, omits the posture/back-turning danger, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.
   ```
 
   @ criteria[] {
