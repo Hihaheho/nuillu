@@ -2000,7 +2000,6 @@ async fn execute_module_case(
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     let cognition_seed_records =
         seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
-    let allocation_baseline = env.blackboard.read(|bb| bb.allocation().clone()).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_page(
@@ -2019,6 +2018,8 @@ async fn execute_module_case(
 
     let gui_deferred_start = hooks.visualizer.is_some();
     let target_module = module_id_for_target(target);
+    let cognition_baseline_for_target =
+        cognition_output_for_module(&env.blackboard, &target_module).await;
     let shutdown_target_module = target_module.clone();
     let run_target_module = target_module.clone();
     let modules = eval_registry(
@@ -2045,7 +2046,7 @@ async fn execute_module_case(
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
     let memory_baseline_for_loop = memory_baseline.clone();
-    let allocation_baseline_for_loop = allocation_baseline.clone();
+    let cognition_baseline_for_loop = cognition_baseline_for_target.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
     let mut visualizer = hooks.visualizer.as_mut();
@@ -2125,9 +2126,16 @@ async fn execute_module_case(
                 }
                 let target_done = match target {
                     ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
-                        !cognition_output_for_module(&blackboard, &shutdown_target_module)
-                            .await
-                            .is_empty()
+                        cognition_eval_has_new_output(
+                            &cognition_output_for_module(&blackboard, &shutdown_target_module)
+                                .await,
+                            &cognition_baseline_for_loop,
+                        ) || module_activation_finished(
+                            &blackboard,
+                            events.as_ref(),
+                            &shutdown_target_module,
+                        )
+                        .await
                     }
                     ModuleEvalTarget::MemoryRecombination => {
                         !cognition_output_for_module(&blackboard, &shutdown_target_module)
@@ -2158,7 +2166,12 @@ async fn execute_module_case(
                         last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                             .await
                             .is_some()
-                            || allocation_changed(&blackboard, &allocation_baseline_for_loop).await
+                            || module_activation_finished(
+                                &blackboard,
+                                events.as_ref(),
+                                &shutdown_target_module,
+                            )
+                            .await
                     }
                     _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                         .await
@@ -2442,6 +2455,10 @@ async fn activate_module_case_target(
     }
 }
 
+fn cognition_eval_has_new_output(current: &str, baseline: &str) -> bool {
+    current != baseline
+}
+
 async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId) -> String {
     blackboard
         .read(|bb| {
@@ -2479,10 +2496,6 @@ async fn last_memo_log_content_for_module(
                 .map(|record| record.content)
         })
         .await
-}
-
-async fn allocation_changed(blackboard: &Blackboard, baseline: &ResourceAllocation) -> bool {
-    blackboard.read(|bb| bb.allocation() != baseline).await
 }
 
 async fn allocation_controller_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {
@@ -8072,6 +8085,71 @@ prompt = "What am I attending to?"
         assert_eq!(record.entries[0].at, now - ChronoDuration::seconds(30));
         assert_eq!(record.entries[1].text, "Current cognition-log topic");
         assert_eq!(record.entries[1].at, now);
+    }
+
+    #[tokio::test]
+    async fn cognition_gate_eval_waits_for_output_beyond_seed_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cognition-seed-baseline.eure");
+        std::fs::write(
+            &path,
+            r#"
+id = "cognition-seed-baseline"
+prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
+
+@ cognition-log[] {
+  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
+}
+"#,
+        )
+        .unwrap();
+        let case = crate::cases::parse_module_case_file(&path).unwrap();
+        let blackboard = Blackboard::default();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+
+        seed_cognition_log(&blackboard, &FixedClock(now), &case.cognition_log).await;
+
+        let baseline = cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await;
+        assert!(!baseline.is_empty());
+        assert!(!cognition_eval_has_new_output(
+            &cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await,
+            &baseline,
+        ));
+
+        blackboard
+            .append_cognition_log(
+                ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+                CognitionLogEntry {
+                    at: now,
+                    text: "Approach Koro slowly from the side when he guards food.".to_string(),
+                },
+            )
+            .await;
+
+        assert!(cognition_eval_has_new_output(
+            &cognition_output_for_module(&blackboard, &builtin::cognition_gate()).await,
+            &baseline,
+        ));
+    }
+
+    #[tokio::test]
+    async fn allocation_controller_eval_bootstrap_guidance_is_not_completion() {
+        let blackboard = Blackboard::default();
+        let controller = builtin::allocation_controller();
+
+        let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+        let mut config = allocation.for_module(&controller);
+        config.guidance = "Assign activation priorities for the current memo batch.".to_string();
+        allocation.set(controller.clone(), config);
+        blackboard
+            .apply(BlackboardCommand::SetAllocation(allocation))
+            .await;
+
+        assert!(
+            last_memo_log_content_for_module(&blackboard, &controller)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
