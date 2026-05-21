@@ -2,6 +2,10 @@
 
 $schema = "https://eure.dev/v0.1.7/schemas/eure-config.schema.eure"
 
+@ targets.devlog
+globs = ["docs/devlog/**/*.eure"]
+schema = "https://eure.dev/v0.1.9/schemas/article.schema.eure"
+
 @ targets.eval-full-agent-cases
 globs = ["eval-cases/full-agent/**/*.eure"]
 schema = "schemas/eval-full-agent-case.schema.eure"
@@ -48,6 +52,7 @@ schema = "schemas/eval-model-set.schema.eure"
 
 @ cli
 default-targets = [
+  "devlog",
   "eval-full-agent-cases",
   "eval-query-memory-cases",
   "eval-cognition-gate-cases",

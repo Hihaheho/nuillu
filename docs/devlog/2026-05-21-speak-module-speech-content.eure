@@ -1,0 +1,120 @@
+$frontmatter {
+  title: speak module の責務境界を speech_content に寄せる
+  description: speak module の eval 不安定性を、prompt ではなくコンテキスト設計とタスク境界の問題として整理し、ShouldSpeak と speech_content に収束させた記録。
+  tags = ["nuillu", "speak", "eval", "agent-design"]
+}
+
+"#": speak module の責務境界を speech_content に寄せる
+
+"lead" = ```markdown
+今回の speak module の失敗は、単に「もっと強い prompt を書けば直る」種類のものではなかった。eval 上では、発話対象の選択、認知ログから発話内容への変換、実際の utterance rendering が一続きの認知タスクとして混ざっていた。
+
+その結果、LLM は局所的には妥当な判断をしていても、module 境界としては不安定だった。特に「誰に話すか」と「その相手に何を言うべきか」を別々の turn に分けると、後段の generation が raw cognition log からもう一度意味を組み立て直す必要があり、評価ケースごとに失敗の形が変わった。
+```
+
+"toc".$toc = true
+
+@ "symptom" {
+  "##": 何が不安定だったか
+
+  "body" = ```markdown
+baseline の eval run `20260521T090142Z` は 3 cases 中 0 pass だった。失敗は、文体や禁止語の漏れというより、発話に必要な認知変換がどこで行われるべきかが曖昧なことから来ていた。
+
+典型的には次のような問題だった。
+
+- target selection は合っていても、generation が重要な cognition log fact を使わない
+- 内向きの注意や一人称の思考を、相手向けの助言へ変換できない
+- evidence がないケースで、unknown と visible absence を保った発話にならない
+- generation prompt が増えるほど、発話 module が policy planner のように振る舞い始める
+
+これは speak が「発話 motor boundary」なのか、「行動推奨を導く planner」なのかが曖昧だったということでもある。
+```
+}
+
+@ "speech-plan" {
+  "##": SpeechPlanDecision が広げた問題
+
+  "body" = ```markdown
+最初の改善案では、`SpeechPlanDecision` を導入し、`should_speak`、`target`、`listener_need`、`required_grounding`、`outward_instruction`、`forbidden_claims`、`rationale` などを一つの structured planning turn に集めた。
+
+これは baseline よりは改善した。target selection と発話方針が同じ turn に入ったため、直接の peer utterance や missing evidence のケースでは安定性が上がった。
+
+ただし、設計としてはまだ問題が残った。発話に必要な重要情報を書く場所が複数あり、generation 側はそれらを再合成しなければならなかった。`required_grounding` に事実があり、`outward_instruction` に言い方があり、`forbidden_claims` に禁止事項があり、さらに `rationale` にも重要な判断根拠が入り得る。これは構造化されているようで、実際には責務が分散している。
+
+特に `rationale` は危なかった。発話に必要な情報が rationale に逃げると、renderer はそれを言うべき内容として扱うのか、内部説明として無視すべきなのか判断しなければならない。speak module に渡す中間表現としては、これは余計な認知負荷だった。
+```
+}
+
+@ "should-speak" {
+  "##": ShouldSpeak と speech_content
+
+  "body" = ```markdown
+最終的には、planning を複雑にするのではなく、tool call を小さくした。
+
+`ShouldSpeak` は、発話するときだけ呼ばれる。呼ばれなければ silent completion になる。`should_speak: bool` や optional target を持たせるのではなく、tool call の有無を発話有無の判断にした。
+```
+
+  "rust" = ```rust
+struct ShouldSpeakArgs {
+    target: SpeechTarget,
+    speech_content: String,
+}
+```
+
+  "body-2" = ```markdown
+ここで重要なのは `speech_content` の意味である。これは hidden reasoning でも generic summary でもない。cognition log を発話向けに情報変換したもので、target に向けて残すべき load-bearing fact、answer、warning、advice、unknown、visible absence を入れる場所にした。
+
+この形にすると、責務がかなり明確になる。
+
+- `ShouldSpeak` turn は、話すべき相手と、相手向けに変換済みの内容を決める
+- generation turn は、accepted tool call を一つの concise in-world utterance として render する
+- cognition log は grounding として残すが、generation がもう一度 planning し直す場所ではない
+- target schema は SceneReader 由来の dynamic schema をそのまま使い、許可されない target は silent に落とす
+
+つまり、speak は policy を作る module ではなく、認知ログから outward utterance への境界を担当する module として扱う。
+```
+}
+
+@ "eval-boundary" {
+  "##": Eval fixture の境界
+
+  "body" = ```markdown
+最後に残った不安定さは、implementation より eval setup 側の境界にあった。inner attention to peer advice のケースでは、cognition log が一人称の内向き action prep に寄っていた。
+
+その形だと、speak module は「自分はどう振る舞うべきか」から「Pibi に何を助言すべきか」を導く必要がある。これは発話変換だけでなく、知識から advice を導く planning を含む。speak の eval としては少し重すぎる。
+
+そこで fixture は、speech-ready な文を入れるのではなく、advice を導くための知識を入れる形に変えた。具体的には、Pibi の質問と、Koro が threatening なときに背を向けると lunging につながったという過去知識を cognition log に置いた。主語を `I` に寄せず、発話 module が使うべき knowledge として提示した。
+
+この変更後、該当ケース単体の run `20260521T110520Z` は 1 case / 3 trials すべて pass した。
+```
+
+  "results" = ```markdown
+| run | scope | result | note |
+|---|---:|---:|---|
+| `20260521T090142Z` | 3 cases | 0 / 3 | baseline。target selection と generation が分離しており、内容変換が不安定 |
+| `20260521T104046Z` | 3 cases, 3 trials | mean score 0.889 | `ShouldSpeak` 系で改善。ただし inner advice case がまだ揺れる |
+| `20260521T105227Z` / `20260521T105402Z` | 3 cases, 3 trials | mean score 0.778 | `speech_content` への収束後も fixture 境界の影響が残る |
+| `20260521T110520Z` | 1 case, 3 trials | 1 / 1 | inner advice fixture を knowledge seed に変更後、単体で pass |
+```
+}
+
+@ "takeaways" {
+  "##": 残した判断
+
+  "body" = ```markdown
+今回の結論は、speak module の能力を増やすことではなく、LLM に渡すタスクを小さくすることだった。
+
+`speech_content` は、発話に必要な情報を一箇所に集めるためのフィールドである。ここに入っていない重要情報を generation が拾い直す設計にすると、また raw cognition log の再解釈に戻ってしまう。
+
+一方で、eval fixture 側も module 境界に合わせる必要がある。speak を評価するなら、speech-ready な答えを渡しすぎてもいけないし、逆に policy planning や行動選択まで要求してもいけない。今回の inner advice case では、知識から advice を導ける程度の cognition log にするのがちょうどよかった。
+
+今の形では、speak は次の責務に絞られている。
+
+- 話す必要がなければ tool を呼ばず silent completion する
+- 話すなら、SceneReader が許可する target を選ぶ
+- cognition log を target 向けの `speech_content` に変換する
+- generation は `speech_content` を発話として render するだけにする
+
+この境界はまだ最終設計ではないが、少なくとも今回の eval では「prompt を足して抑え込む」よりも、LLM に渡す中間表現を単純化する方が効いた。
+```
+}
