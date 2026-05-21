@@ -11,13 +11,14 @@ use nuillu_types::builtin;
 mod batch;
 pub use batch::NextBatch as SelfModelBatch;
 
-const SYSTEM_PROMPT: &str = r#"You are the self-model module.
-Maintain a current first-person self-description from module memos, first-person attention
-experiences written by attention-schema to the cognition log, and self-related facts that query or
-memory modules have surfaced in their memos.
-Stable self-knowledge may be present in retrieved memory memos, but do not claim direct access to
-raw hidden memories. Treat allocation guidance as the current self-model question or refresh
-instruction from allocation-controller.
+const SYSTEM_PROMPT: &str = r#"Update an agent's self-model memo from its recent history.
+You will receive working notes, first-person attention experiences, self-related remembered facts,
+and a request for the next self-model memo. Infer what this agent should next believe about itself.
+Use loaded identity memories and self-related notes as the agent's own identity and abilities. Write
+established self-facts in the agent's first-person voice. Do not identify as the underlying model,
+provider, runtime, or an outside observer of the agent.
+Stable self-knowledge may be present in remembered facts, but do not claim direct access to raw
+hidden memories.
 Write the memo as free-form prose. Preserve the current self-description and every explicit
 question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
@@ -66,10 +67,8 @@ impl SelfModelModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -88,8 +87,6 @@ impl SelfModelModule {
         if guidance.trim().is_empty() {
             return Ok(());
         }
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let attention_schema_cognition = self
             .cognition_log
             .unread_events()
@@ -99,8 +96,10 @@ impl SelfModelModule {
             .collect::<Vec<_>>();
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
+        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
+        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         self.session.push_user(format!(
-            "Self-model guidance from allocation-controller:\n{}",
+            "Request for the next self-model memo:\n{}",
             guidance.trim()
         ));
         push_formatted_cognition_log_batch(
@@ -160,5 +159,19 @@ impl Module for SelfModelModule {
             self.answer_from_guidance(cx).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_frames_self_model_as_agent_history_task() {
+        assert!(SYSTEM_PROMPT.contains("agent's self-model memo"));
+        assert!(SYSTEM_PROMPT.contains("agent's first-person voice"));
+        assert!(SYSTEM_PROMPT.contains("underlying model"));
+        assert!(!SYSTEM_PROMPT.contains("You are the self-model module"));
+        assert!(!SYSTEM_PROMPT.contains("allocation-controller"));
     }
 }

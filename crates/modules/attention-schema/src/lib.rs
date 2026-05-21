@@ -65,7 +65,6 @@ pub enum AttentionSchemaTools {
 }
 
 pub struct AttentionSchemaModule {
-    owner: nuillu_types::ModuleId,
     memo_updates: MemoUpdatedInbox,
     cognition_updates: CognitionLogUpdatedInbox,
     blackboard: BlackboardReader,
@@ -90,8 +89,6 @@ impl AttentionSchemaModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("attention-schema id is valid"),
             memo_updates,
             cognition_updates,
             blackboard,
@@ -107,10 +104,8 @@ impl AttentionSchemaModule {
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.model_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 MODEL_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),

@@ -57,7 +57,6 @@ pub struct SurpriseMemoryRequest {
 }
 
 pub struct SurpriseModule {
-    owner: nuillu_types::ModuleId,
     updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
     allocation: AllocationReader,
@@ -82,8 +81,6 @@ impl SurpriseModule {
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("surprise id is valid"),
             updates,
             cognition_log,
             allocation,
@@ -99,10 +96,8 @@ impl SurpriseModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),

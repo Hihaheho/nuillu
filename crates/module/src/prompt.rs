@@ -33,8 +33,9 @@ pub fn format_system_prompt(
 }
 
 /// Build a system prompt with stable identity/policy context but without the
-/// peer module catalog. Use this for outward-facing motor/action modules where
-/// exposing internal module structure encourages process-talk.
+/// peer module catalog. Use this when a module already receives the needed
+/// sibling output through activation context, or when exposing internal module
+/// structure encourages process-talk.
 pub fn format_identity_system_prompt(
     base: &str,
     identity_memories: &[IdentityMemoryRecord],
