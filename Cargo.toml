@@ -35,6 +35,7 @@ dbg_macro = "warn"
 lutum = { git = "https://github.com/Hihaheho/lutum" }
 lutum-protocol = { git = "https://github.com/Hihaheho/lutum" }
 lutum-eval = { git = "https://github.com/Hihaheho/lutum" }
+lutum-eval-runner = { git = "https://github.com/Hihaheho/lutum" }
 lutum-openai = { git = "https://github.com/Hihaheho/lutum" }
 lutum-trace = { git = "https://github.com/Hihaheho/lutum" }
 

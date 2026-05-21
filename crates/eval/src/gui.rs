@@ -17,6 +17,10 @@ use crate::{
 };
 
 pub fn run_suite_with_visualizer(config: RunnerConfig) -> anyhow::Result<()> {
+    if config.trials.get() > 1 {
+        anyhow::bail!("--gui does not support --trials > 1");
+    }
+
     let planned_tabs = visualizer_planned_tabs(&config)?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind visualizer RPC listener")?;
     let addr = listener

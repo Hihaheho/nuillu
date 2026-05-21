@@ -95,6 +95,10 @@ struct Args {
     #[arg(long, env = "NUILLU_EVAL_MAX_CONCURRENT_LLM_CALLS")]
     max_concurrent_llm_calls: Option<NonZeroUsize>,
 
+    /// Number of independent trials to run per selected case.
+    #[arg(long, default_value = "1")]
+    trials: NonZeroUsize,
+
     /// Run the reusable egui visualizer while the eval suite executes.
     #[arg(long)]
     gui: bool,
@@ -176,6 +180,7 @@ fn main() -> anyhow::Result<()> {
         failed_only: args.failed_only,
         failed_from: args.failed_from,
         max_concurrent_llm_calls,
+        trials: args.trials,
         case_patterns: args.patterns,
         module_filters: args.module_filter,
         disabled_modules: args.disable_module,
@@ -190,15 +195,34 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("build eval tokio runtime")?;
     let report = runtime.block_on(run_suite(&config))?;
+    let metrics = format_cli_metrics(&report.metrics);
     println!(
-        "cases={} passed={} failed={} invalid={} output={}",
+        "cases={} passed={} failed={} invalid={}{} output={}",
         report.case_count,
         report.passed_cases,
         report.failed_cases,
         report.invalid_cases,
+        metrics,
         config.output_root.join(&config.run_id).display()
     );
     Ok(())
+}
+
+fn format_cli_metrics(metrics: &nuillu_eval::SuiteMetrics) -> String {
+    let pass_at = metrics
+        .pass_at
+        .iter()
+        .map(|metric| format!("pass@{}={:.3}", metric.k, metric.value));
+    let pass_hat = metrics
+        .pass_hat
+        .iter()
+        .map(|metric| format!("pass^{}={:.3}", metric.k, metric.value));
+    let values = pass_at.chain(pass_hat).collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", values.join(" "))
+    }
 }
 
 #[derive(Clone, Copy)]

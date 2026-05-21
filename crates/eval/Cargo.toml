@@ -18,6 +18,7 @@ eure-document = { workspace = true }
 eure-fmt = { workspace = true }
 lutum = { workspace = true }
 lutum-eval = { workspace = true }
+lutum-eval-runner = { workspace = true }
 lutum-in-memory-adapter = { workspace = true }
 lutum-libsql-adapter = { workspace = true }
 lutum-model2vec-adapter = { workspace = true }

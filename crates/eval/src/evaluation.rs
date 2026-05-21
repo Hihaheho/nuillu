@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 
 use lutum_eval::{Objective, PureEval, Score, TraceSnapshot};
+use lutum_eval_runner::{mean_pass_at_k, mean_pass_hat_k};
 use serde::Serialize;
 
 use crate::{
@@ -58,6 +59,24 @@ pub struct CaseSummary {
     pub invalid: bool,
     pub score: f64,
     pub report: CaseReport,
+    pub trial_count: usize,
+    pub passed_trials: usize,
+    pub failed_trials: usize,
+    pub invalid_trials: usize,
+    pub trials: Vec<CaseTrialSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CaseTrialSummary {
+    pub trial: usize,
+    pub output_dir: String,
+    pub path: String,
+    pub id: String,
+    pub description: Option<String>,
+    pub passed: bool,
+    pub invalid: bool,
+    pub score: f64,
+    pub report: CaseReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +89,7 @@ pub struct SuiteRunReport {
     pub failed_from: Option<String>,
     pub fail_fast: bool,
     pub max_concurrent_llm_calls: Option<usize>,
+    pub trials: usize,
     pub planned_case_count: usize,
     pub models: SuiteModelNames,
     pub module_filters: Vec<String>,
@@ -92,7 +112,50 @@ pub struct SuiteReport {
     pub failed_cases: usize,
     pub invalid_cases: usize,
     pub mean_score: f64,
+    pub metrics: SuiteMetrics,
     pub cases: Vec<CaseSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SuiteMetrics {
+    pub pass_at: Vec<KMetricReport>,
+    pub pass_hat: Vec<KMetricReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KMetricReport {
+    pub k: usize,
+    pub value: f64,
+}
+
+impl SuiteMetrics {
+    pub fn from_case_counts(cases: &[CaseSummary]) -> Self {
+        let Some(max_k) = cases.iter().map(|case| case.trial_count).min() else {
+            return Self::default();
+        };
+        if max_k == 0 {
+            return Self::default();
+        }
+
+        let counts = cases
+            .iter()
+            .map(|case| (case.trial_count as u64, case.passed_trials as u64))
+            .collect::<Vec<_>>();
+        Self {
+            pass_at: (1..=max_k)
+                .map(|k| KMetricReport {
+                    k,
+                    value: mean_pass_at_k(&counts, k as u64),
+                })
+                .collect(),
+            pass_hat: (1..=max_k)
+                .map(|k| KMetricReport {
+                    k,
+                    value: mean_pass_hat_k(&counts, k as u64),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl CaseReport {

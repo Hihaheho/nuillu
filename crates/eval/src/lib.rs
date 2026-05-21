@@ -22,9 +22,9 @@ pub use cases::{
     parse_full_agent_case_file, parse_module_case_file,
 };
 pub use evaluation::{
-    CaseEval, CaseObjective, CaseReport, CaseSummary, CheckOutcome, ModuleChecksReport,
-    ModuleRubricOutcome, SuiteModelNames, SuiteReport, SuiteRunReport, evaluate_case,
-    normalize_text_block,
+    CaseEval, CaseObjective, CaseReport, CaseSummary, CaseTrialSummary, CheckOutcome,
+    KMetricReport, ModuleChecksReport, ModuleRubricOutcome, SuiteMetrics, SuiteModelNames,
+    SuiteReport, SuiteRunReport, evaluate_case, normalize_text_block,
 };
 pub use judge::{
     JudgeOptions, LlmRubricJudge, RubricJudge, RubricJudgeError, RubricJudgeRequest,

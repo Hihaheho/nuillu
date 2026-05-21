@@ -2884,6 +2884,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lutum-eval-runner"
+version = "0.1.0"
+source = "git+https://github.com/Hihaheho/lutum#1dffea8a657f328905032b1e4ee348af2367bbf6"
+dependencies = [
+ "futures",
+ "tokio",
+]
+
+[[package]]
 name = "lutum-in-memory-adapter"
 version = "0.1.0"
 dependencies = [
@@ -3328,6 +3337,7 @@ dependencies = [
  "futures",
  "lutum",
  "lutum-eval",
+ "lutum-eval-runner",
  "lutum-in-memory-adapter",
  "lutum-libsql-adapter",
  "lutum-model2vec-adapter",

@@ -64,9 +64,9 @@ use crate::{
         wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
-        CaseReport, CaseSummary, SuiteModelNames, SuiteReport, SuiteRunReport, artifact_text,
-        evaluate_case, field_label, normalize_text_block, numeric_range_outcome, pointer_number,
-        pointer_text,
+        CaseReport, CaseSummary, CaseTrialSummary, SuiteMetrics, SuiteModelNames, SuiteReport,
+        SuiteRunReport, artifact_text, evaluate_case, field_label, normalize_text_block,
+        numeric_range_outcome, pointer_number, pointer_text,
     },
     judge::{LlmRubricJudge, RubricJudge},
     state_dump::{
@@ -107,6 +107,7 @@ pub struct RunnerConfig {
     pub failed_only: bool,
     pub failed_from: Option<PathBuf>,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
+    pub trials: NonZeroUsize,
     pub case_patterns: Vec<String>,
     pub module_filters: Vec<EvalModule>,
     pub disabled_modules: Vec<EvalModule>,
@@ -334,6 +335,8 @@ pub enum RunnerError {
     DisableRequiredModule { module: &'static str },
     #[error("module cases are not supported with --gui")]
     GuiModuleCasesUnsupported,
+    #[error("--gui does not support --trials > 1 (got {trials})")]
+    GuiTrialsUnsupported { trials: usize },
 }
 
 struct CaseExecution {
@@ -346,6 +349,8 @@ struct CaseOutputContext<'a> {
     output_dir: &'a Path,
     case: &'a EvalCase,
     id: &'a str,
+    runtime_id: &'a str,
+    trial_number: usize,
     reporter: &'a LiveReporter,
 }
 
@@ -399,6 +404,11 @@ pub async fn run_suite_with_hooks(
 ) -> Result<SuiteReport, RunnerError> {
     install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
+    if hooks.visualizer.is_some() && config.trials.get() > 1 {
+        return Err(RunnerError::GuiTrialsUnsupported {
+            trials: config.trials.get(),
+        });
+    }
     let selection = select_case_paths(config, hooks.visualizer.is_some())?;
     let case_paths = selection.case_paths;
     let run_dir = config.output_root.join(&config.run_id);
@@ -427,11 +437,13 @@ pub async fn run_suite_with_hooks(
                 "premium": backend_report(&config.premium_backend),
             },
             "max_concurrent_llm_calls": config.max_concurrent_llm_calls.map(NonZeroUsize::get),
+            "trials": config.trials.get(),
         }),
         format!(
-            "🚀 eval suite start run={} cases={} output={}",
+            "🚀 eval suite start run={} cases={} trials={} output={}",
             config.run_id,
             case_paths.len(),
+            config.trials.get(),
             run_dir.display()
         ),
     )?;
@@ -474,14 +486,16 @@ pub async fn run_suite_with_hooks(
             "failed_cases": report.failed_cases,
             "invalid_cases": report.invalid_cases,
             "mean_score": report.mean_score,
+            "metrics": report.metrics,
         }),
         format!(
-            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3}",
+            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3}{}",
             config.run_id,
             report.passed_cases,
             report.failed_cases,
             report.invalid_cases,
-            report.mean_score
+            report.mean_score,
+            format_suite_metrics_inline(&report.metrics)
         ),
     )?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -516,6 +530,7 @@ fn suite_run_report(
         failed_from: failed_from.map(|path| path.display().to_string()),
         fail_fast: config.fail_fast,
         max_concurrent_llm_calls: config.max_concurrent_llm_calls.map(NonZeroUsize::get),
+        trials: config.trials.get(),
         planned_case_count,
         models: SuiteModelNames {
             judge: config.judge_backend.model.clone(),
@@ -867,15 +882,129 @@ async fn run_case_detailed_with_reporter(
         serde_json::json!({
             "path": case_path.display().to_string(),
             "output_dir": output_dir.display().to_string(),
+            "trials": config.trials.get(),
         }),
         format!(
-            "▶️  eval case start id={} path={} output={}",
+            "▶️  eval case start id={} path={} trials={} output={}",
             id,
             case_path.display(),
+            config.trials.get(),
             output_dir.display()
         ),
     )?;
     emit_visualizer_open_tab(hooks, &id);
+
+    let trial_count = config.trials.get();
+    if trial_count == 1 {
+        let output = run_case_trial_with_timeout(
+            case_path,
+            config,
+            judge,
+            reporter,
+            hooks,
+            &case,
+            &id,
+            &id,
+            &output_dir,
+            1,
+        )
+        .await?;
+        emit_case_finished(reporter, &output.summary, output.events.len())?;
+        emit_visualizer_case_status(hooks, &output.summary);
+        return Ok(output);
+    }
+
+    let mut trial_outputs = Vec::with_capacity(trial_count);
+    for trial_number in 1..=trial_count {
+        let runtime_id = trial_runtime_id(&id, trial_number);
+        let trial_output_dir = output_dir.join(trial_dir_name(trial_number));
+        reporter.emit(
+            Some(&runtime_id),
+            "trial_started",
+            serde_json::json!({
+                "path": case_path.display().to_string(),
+                "output_dir": trial_output_dir.display().to_string(),
+                "trial": trial_number,
+                "trials": trial_count,
+            }),
+            format!(
+                "▶️  eval trial start id={} trial={}/{} output={}",
+                id,
+                trial_number,
+                trial_count,
+                trial_output_dir.display()
+            ),
+        )?;
+        let output = run_case_trial_with_timeout(
+            case_path,
+            config,
+            judge,
+            reporter,
+            hooks,
+            &case,
+            &id,
+            &runtime_id,
+            &trial_output_dir,
+            trial_number,
+        )
+        .await?;
+        emit_trial_finished(reporter, &runtime_id, &output.summary, output.events.len())?;
+        trial_outputs.push(output);
+    }
+
+    let event_count = trial_outputs
+        .iter()
+        .map(|output| output.events.len())
+        .sum::<usize>();
+    let summary = aggregate_case_summary(case_path, &case, &id, &trial_outputs);
+    write_json_file(&output_dir.join("report.json"), &summary)?;
+    emit_case_finished(reporter, &summary, event_count)?;
+
+    let artifact = trial_outputs
+        .first()
+        .map(|output| output.artifact.clone())
+        .unwrap_or_default();
+    let events = trial_outputs
+        .iter()
+        .flat_map(|output| output.events.clone())
+        .collect::<Vec<_>>();
+    let trace = trial_outputs
+        .first()
+        .map(|output| output.trace.clone())
+        .unwrap_or_else(empty_trace_snapshot);
+    let raw_trace = trial_outputs
+        .first()
+        .map(|output| output.raw_trace.clone())
+        .unwrap_or_default();
+
+    Ok(CaseRunOutput {
+        case_path: case_path.to_path_buf(),
+        output_dir,
+        summary,
+        artifact,
+        events,
+        trace,
+        raw_trace,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_case_trial_with_timeout(
+    case_path: &Path,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+    reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
+    case: &EvalCase,
+    id: &str,
+    runtime_id: &str,
+    output_dir: &Path,
+    trial_number: usize,
+) -> Result<CaseRunOutput, RunnerError> {
+    std::fs::create_dir_all(output_dir).map_err(|source| RunnerError::WriteOutput {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
 
     match tokio::time::timeout(
         EVAL_CASE_TIMEOUT,
@@ -885,9 +1014,11 @@ async fn run_case_detailed_with_reporter(
             judge,
             reporter,
             hooks,
-            &case,
-            &id,
-            &output_dir,
+            case,
+            id,
+            runtime_id,
+            output_dir,
+            trial_number,
         ),
     )
     .await
@@ -895,7 +1026,14 @@ async fn run_case_detailed_with_reporter(
         Ok(output) => output,
         Err(_) => {
             let message = format!("eval case timed out after {}s", EVAL_CASE_TIMEOUT.as_secs());
-            emit_visualizer_error(hooks, &id, "eval", "case-timeout", None, message.clone());
+            emit_visualizer_error(
+                hooks,
+                runtime_id,
+                "eval",
+                "case-timeout",
+                None,
+                message.clone(),
+            );
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.to_string()),
@@ -905,9 +1043,11 @@ async fn run_case_detailed_with_reporter(
             write_runtime_failure_case_output(
                 CaseOutputContext {
                     case_path,
-                    output_dir: &output_dir,
-                    case: &case,
-                    id: &id,
+                    output_dir,
+                    case,
+                    id,
+                    runtime_id,
+                    trial_number,
                     reporter,
                 },
                 message,
@@ -927,12 +1067,16 @@ async fn run_case_detailed_body(
     hooks: &mut RunnerHooks,
     case: &EvalCase,
     id: &str,
+    runtime_id: &str,
     output_dir: &Path,
+    trial_number: usize,
 ) -> Result<CaseRunOutput, RunnerError> {
     let local = LocalSet::new();
     let capture = lutum_trace::capture_raw(
-        AssertUnwindSafe(execute_case(case, config, output_dir, id, reporter, hooks))
-            .catch_unwind(),
+        AssertUnwindSafe(execute_case(
+            case, config, output_dir, runtime_id, reporter, hooks,
+        ))
+        .catch_unwind(),
     );
     let collected = local.run_until(capture).await;
 
@@ -942,7 +1086,14 @@ async fn run_case_detailed_body(
         Ok(Ok(execution)) => execution,
         Ok(Err(error)) => {
             let message = error.to_string();
-            emit_visualizer_error(hooks, &id, "eval", "execute_case", None, message.clone());
+            emit_visualizer_error(
+                hooks,
+                runtime_id,
+                "eval",
+                "execute_case",
+                None,
+                message.clone(),
+            );
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.to_string()),
@@ -955,6 +1106,8 @@ async fn run_case_detailed_body(
                     output_dir,
                     case,
                     id,
+                    runtime_id,
+                    trial_number,
                     reporter,
                 },
                 message,
@@ -964,7 +1117,7 @@ async fn run_case_detailed_body(
         }
         Err(payload) => {
             let message = format!("panic: {}", panic_payload_message(payload.as_ref()));
-            emit_visualizer_error(hooks, &id, "eval", "panic", None, message.clone());
+            emit_visualizer_error(hooks, runtime_id, "eval", "panic", None, message.clone());
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
                     tab_id: VisualizerTabId::new(id.to_string()),
@@ -977,6 +1130,8 @@ async fn run_case_detailed_body(
                     output_dir,
                     case,
                     id,
+                    runtime_id,
+                    trial_number,
                     reporter,
                 },
                 message,
@@ -988,17 +1143,7 @@ async fn run_case_detailed_body(
     let artifact = execution.artifact;
     let events = execution.events;
     let report = evaluate_case(case, &trace, &artifact, judge).await;
-    let summary = CaseSummary {
-        path: case_path.display().to_string(),
-        id: id.to_string(),
-        description: case
-            .description()
-            .map(|text| normalize_text_block(&text.content)),
-        passed: report.passed(),
-        invalid: report.invalid,
-        score: report.score,
-        report,
-    };
+    let summary = case_summary_from_report(case_path, case, id, output_dir, trial_number, report);
 
     write_json_file(&output_dir.join("artifact.json"), &artifact)?;
     write_json_file(&output_dir.join("report.json"), &summary)?;
@@ -1014,9 +1159,6 @@ async fn run_case_detailed_body(
             &raw_trace_snapshot_json(&raw_trace),
         )?;
     }
-    emit_case_finished(reporter, &summary, events.len())?;
-    emit_visualizer_case_status(hooks, &summary);
-
     Ok(CaseRunOutput {
         case_path: case_path.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
@@ -1046,18 +1188,14 @@ fn write_runtime_failure_case_output(
         weighted_points_total: 0,
         score: 0.0,
     };
-    let summary = CaseSummary {
-        path: ctx.case_path.display().to_string(),
-        id: ctx.id.to_string(),
-        description: ctx
-            .case
-            .description()
-            .map(|text| normalize_text_block(&text.content)),
-        passed: false,
-        invalid: true,
-        score: 0.0,
+    let summary = case_summary_from_report(
+        ctx.case_path,
+        ctx.case,
+        ctx.id,
+        ctx.output_dir,
+        ctx.trial_number,
         report,
-    };
+    );
 
     write_json_file(&ctx.output_dir.join("artifact.json"), &artifact)?;
     write_json_file(&ctx.output_dir.join("report.json"), &summary)?;
@@ -1071,7 +1209,7 @@ fn write_runtime_failure_case_output(
         &raw_trace_snapshot_json(&raw_trace),
     )?;
     ctx.reporter.emit(
-        Some(&summary.id),
+        Some(ctx.runtime_id),
         "case_error",
         serde_json::json!({
             "path": summary.path.as_str(),
@@ -1079,7 +1217,6 @@ fn write_runtime_failure_case_output(
         }),
         format!("eval case error id={} error={}", summary.id, message),
     )?;
-    emit_case_finished(ctx.reporter, &summary, events.len())?;
 
     Ok(CaseRunOutput {
         case_path: ctx.case_path.to_path_buf(),
@@ -1090,6 +1227,154 @@ fn write_runtime_failure_case_output(
         trace,
         raw_trace,
     })
+}
+
+fn case_summary_from_report(
+    case_path: &Path,
+    case: &EvalCase,
+    id: &str,
+    output_dir: &Path,
+    trial_number: usize,
+    report: CaseReport,
+) -> CaseSummary {
+    let description = case_description(case);
+    let passed = report.passed();
+    let invalid = report.invalid;
+    let score = report.score;
+    let trial = CaseTrialSummary {
+        trial: trial_number,
+        output_dir: output_dir.display().to_string(),
+        path: case_path.display().to_string(),
+        id: id.to_string(),
+        description: description.clone(),
+        passed,
+        invalid,
+        score,
+        report: report.clone(),
+    };
+
+    CaseSummary {
+        path: case_path.display().to_string(),
+        id: id.to_string(),
+        description,
+        passed,
+        invalid,
+        score,
+        report,
+        trial_count: 1,
+        passed_trials: usize::from(passed),
+        failed_trials: usize::from(!passed && !invalid),
+        invalid_trials: usize::from(invalid),
+        trials: vec![trial],
+    }
+}
+
+fn aggregate_case_summary(
+    case_path: &Path,
+    case: &EvalCase,
+    id: &str,
+    trial_outputs: &[CaseRunOutput],
+) -> CaseSummary {
+    let trial_count = trial_outputs.len();
+    let passed_trials = trial_outputs
+        .iter()
+        .filter(|output| output.summary.passed)
+        .count();
+    let invalid_trials = trial_outputs
+        .iter()
+        .filter(|output| output.summary.invalid)
+        .count();
+    let failed_trials = trial_count.saturating_sub(passed_trials + invalid_trials);
+    let passed = trial_count > 0 && passed_trials == trial_count;
+    let invalid = invalid_trials > 0;
+    let score = if trial_outputs.is_empty() {
+        0.0
+    } else {
+        trial_outputs
+            .iter()
+            .map(|output| output.summary.score)
+            .sum::<f64>()
+            / trial_outputs.len() as f64
+    };
+    let report = aggregate_case_report(trial_outputs, passed, invalid, score);
+    let description = case_description(case);
+    let trials = trial_outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            output
+                .summary
+                .trials
+                .first()
+                .cloned()
+                .unwrap_or_else(|| CaseTrialSummary {
+                    trial: index + 1,
+                    output_dir: output.output_dir.display().to_string(),
+                    path: output.summary.path.clone(),
+                    id: output.summary.id.clone(),
+                    description: output.summary.description.clone(),
+                    passed: output.summary.passed,
+                    invalid: output.summary.invalid,
+                    score: output.summary.score,
+                    report: output.summary.report.clone(),
+                })
+        })
+        .collect();
+
+    CaseSummary {
+        path: case_path.display().to_string(),
+        id: id.to_string(),
+        description,
+        passed,
+        invalid,
+        score,
+        report,
+        trial_count,
+        passed_trials,
+        failed_trials,
+        invalid_trials,
+        trials,
+    }
+}
+
+fn aggregate_case_report(
+    trial_outputs: &[CaseRunOutput],
+    passed: bool,
+    invalid: bool,
+    score: f64,
+) -> CaseReport {
+    let runtime_failure_count = trial_outputs
+        .iter()
+        .filter(|output| output.summary.report.runtime_failure.is_some())
+        .count();
+    CaseReport {
+        runtime_failure: (runtime_failure_count > 0).then(|| {
+            format!(
+                "{runtime_failure_count} trial(s) had runtime failures out of {}",
+                trial_outputs.len()
+            )
+        }),
+        checks: Vec::new(),
+        modules_checks: Vec::new(),
+        invalid,
+        must_pass_ok: passed,
+        weighted_points_earned: 0,
+        weighted_points_total: 0,
+        score,
+    }
+}
+
+fn case_description(case: &EvalCase) -> Option<String> {
+    case.description()
+        .map(|text| normalize_text_block(&text.content))
+}
+
+fn trial_runtime_id(id: &str, trial_number: usize) -> String {
+    format!("{id}/{}", trial_dir_name(trial_number))
+}
+
+fn trial_dir_name(trial_number: usize) -> String {
+    format!("trial-{trial_number:03}")
 }
 
 fn empty_trace_snapshot() -> TraceSnapshot {
@@ -1140,6 +1425,54 @@ fn emit_case_finished(
         }),
         case_finished_message,
     )
+}
+
+fn emit_trial_finished(
+    reporter: &LiveReporter,
+    runtime_id: &str,
+    summary: &CaseSummary,
+    event_count: usize,
+) -> Result<(), RunnerError> {
+    let status_icon = if summary.invalid {
+        "💥"
+    } else if summary.passed {
+        "✅"
+    } else {
+        "❌"
+    };
+    reporter.emit(
+        Some(runtime_id),
+        "trial_finished",
+        serde_json::json!({
+            "path": summary.path.as_str(),
+            "passed": summary.passed,
+            "invalid": summary.invalid,
+            "score": summary.score,
+            "runtime_failure": summary.report.runtime_failure.as_deref(),
+            "events": event_count,
+        }),
+        format!(
+            "{status_icon} eval trial end id={} runtime_id={} passed={} invalid={} score={:.3} events={}",
+            summary.id, runtime_id, summary.passed, summary.invalid, summary.score, event_count
+        ),
+    )
+}
+
+fn format_suite_metrics_inline(metrics: &SuiteMetrics) -> String {
+    let pass_at = metrics
+        .pass_at
+        .iter()
+        .map(|metric| format!("pass@{}={:.3}", metric.k, metric.value));
+    let pass_hat = metrics
+        .pass_hat
+        .iter()
+        .map(|metric| format!("pass^{}={:.3}", metric.k, metric.value));
+    let values = pass_at.chain(pass_hat).collect::<Vec<_>>();
+    if values.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", values.join(" "))
+    }
 }
 
 fn emit_visualizer_case_status(hooks: &RunnerHooks, summary: &CaseSummary) {
@@ -4999,11 +5332,7 @@ fn full_agent_ready_to_score_at(
     step_driven_case: bool,
     now: Instant,
 ) -> bool {
-    if !settle.runtime_silence_elapsed_at(
-        FULL_AGENT_RUNTIME_SILENCE_WINDOW,
-        llm_in_flight,
-        now,
-    ) {
+    if !settle.runtime_silence_elapsed_at(FULL_AGENT_RUNTIME_SILENCE_WINDOW, llm_in_flight, now) {
         return false;
     }
     actions.silence_window_elapsed_at(FULL_AGENT_ACTION_SILENCE_WINDOW, now)
@@ -5384,6 +5713,7 @@ fn aggregate_suite(run: SuiteRunReport, cases: Vec<CaseSummary>) -> SuiteReport 
     } else {
         cases.iter().map(|case| case.score).sum::<f64>() / cases.len() as f64
     };
+    let metrics = SuiteMetrics::from_case_counts(&cases);
 
     SuiteReport {
         run,
@@ -5392,6 +5722,7 @@ fn aggregate_suite(run: SuiteRunReport, cases: Vec<CaseSummary>) -> SuiteReport 
         failed_cases,
         invalid_cases,
         mean_score,
+        metrics,
         cases,
     }
 }
@@ -5452,6 +5783,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use crate::evaluation::KMetricReport;
     use chrono::TimeZone as _;
     use lutum::{
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
@@ -5510,9 +5842,129 @@ mod tests {
             failed_only: false,
             failed_from: None,
             max_concurrent_llm_calls: None,
+            trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
+        }
+    }
+
+    fn test_suite_run_report(trials: usize) -> SuiteRunReport {
+        SuiteRunReport {
+            run_id: "run".to_string(),
+            cases_root: "eval-cases".to_string(),
+            output_dir: "out/run".to_string(),
+            case_patterns: Vec::new(),
+            failed_only: false,
+            failed_from: None,
+            fail_fast: false,
+            max_concurrent_llm_calls: None,
+            trials,
+            planned_case_count: 0,
+            models: SuiteModelNames {
+                judge: "judge".to_string(),
+                cheap: "cheap".to_string(),
+                default: "default".to_string(),
+                premium: "premium".to_string(),
+            },
+            module_filters: Vec::new(),
+            disabled_modules: Vec::new(),
+        }
+    }
+
+    fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
+        CaseReport {
+            runtime_failure: invalid.then(|| "invalid".to_string()),
+            checks: Vec::new(),
+            modules_checks: Vec::new(),
+            invalid,
+            must_pass_ok: passed,
+            weighted_points_earned: 0,
+            weighted_points_total: 0,
+            score,
+        }
+    }
+
+    fn test_case_summary(
+        id: &str,
+        trial_count: usize,
+        passed_trials: usize,
+        invalid_trials: usize,
+        score: f64,
+    ) -> CaseSummary {
+        let passed = passed_trials == trial_count;
+        let invalid = invalid_trials > 0;
+        let report = test_report(passed, invalid, score);
+        CaseSummary {
+            path: format!("{id}.eure"),
+            id: id.to_string(),
+            description: None,
+            passed,
+            invalid,
+            score,
+            report,
+            trial_count,
+            passed_trials,
+            failed_trials: trial_count.saturating_sub(passed_trials + invalid_trials),
+            invalid_trials,
+            trials: Vec::new(),
+        }
+    }
+
+    fn test_case_run_output(
+        id: &str,
+        trial: usize,
+        passed: bool,
+        invalid: bool,
+        score: f64,
+    ) -> CaseRunOutput {
+        let report = test_report(passed, invalid, score);
+        let summary = CaseSummary {
+            path: format!("{id}.eure"),
+            id: id.to_string(),
+            description: None,
+            passed,
+            invalid,
+            score,
+            report: report.clone(),
+            trial_count: 1,
+            passed_trials: usize::from(passed),
+            failed_trials: usize::from(!passed && !invalid),
+            invalid_trials: usize::from(invalid),
+            trials: vec![CaseTrialSummary {
+                trial,
+                output_dir: format!("out/{id}/{}", trial_dir_name(trial)),
+                path: format!("{id}.eure"),
+                id: id.to_string(),
+                description: None,
+                passed,
+                invalid,
+                score,
+                report,
+            }],
+        };
+        CaseRunOutput {
+            case_path: PathBuf::from(format!("{id}.eure")),
+            output_dir: PathBuf::from(format!("out/{id}/{}", trial_dir_name(trial))),
+            summary,
+            artifact: CaseArtifact::new(""),
+            events: Vec::new(),
+            trace: empty_trace_snapshot(),
+            raw_trace: RawTraceSnapshot::default(),
+        }
+    }
+
+    fn assert_metric_values(actual: &[KMetricReport], expected: &[(usize, f64)]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, (k, value)) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.k, *k);
+            assert!(
+                (actual.value - value).abs() < 1e-12,
+                "k={} expected {} got {}",
+                k,
+                value,
+                actual.value
+            );
         }
     }
 
@@ -5613,6 +6065,80 @@ id = "{id}"
 
         assert_eq!(context.root, dir.path().join("llm-logs"));
         assert_eq!(context.namespace, vec!["run-1", "case-1"]);
+    }
+
+    #[test]
+    fn aggregate_suite_computes_trial_metrics_from_case_counts() {
+        let report = aggregate_suite(
+            test_suite_run_report(3),
+            vec![
+                test_case_summary("case-one", 3, 2, 0, 0.8),
+                test_case_summary("case-two", 3, 1, 0, 0.4),
+            ],
+        );
+
+        assert_metric_values(
+            &report.metrics.pass_at,
+            &[(1, 0.5), (2, 5.0 / 6.0), (3, 1.0)],
+        );
+        assert_metric_values(
+            &report.metrics.pass_hat,
+            &[(1, 0.5), (2, 1.0 / 6.0), (3, 0.0)],
+        );
+    }
+
+    #[test]
+    fn aggregate_case_summary_requires_all_trials_to_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_path = write_query_memory_case(dir.path(), "case", "case-id");
+        let case = parse_case_file(&case_path).unwrap();
+
+        let all_pass = aggregate_case_summary(
+            &case_path,
+            &case,
+            "case-id",
+            &[
+                test_case_run_output("case-id", 1, true, false, 1.0),
+                test_case_run_output("case-id", 2, true, false, 0.8),
+            ],
+        );
+        assert!(all_pass.passed);
+        assert!(!all_pass.invalid);
+        assert_eq!(all_pass.trial_count, 2);
+        assert_eq!(all_pass.passed_trials, 2);
+        assert_eq!(all_pass.failed_trials, 0);
+        assert_eq!(all_pass.invalid_trials, 0);
+        assert_eq!(all_pass.trials.len(), 2);
+
+        let some_fail = aggregate_case_summary(
+            &case_path,
+            &case,
+            "case-id",
+            &[
+                test_case_run_output("case-id", 1, true, false, 1.0),
+                test_case_run_output("case-id", 2, false, false, 0.2),
+            ],
+        );
+        assert!(!some_fail.passed);
+        assert!(!some_fail.invalid);
+        assert_eq!(some_fail.passed_trials, 1);
+        assert_eq!(some_fail.failed_trials, 1);
+        assert_eq!(some_fail.invalid_trials, 0);
+
+        let invalid = aggregate_case_summary(
+            &case_path,
+            &case,
+            "case-id",
+            &[
+                test_case_run_output("case-id", 1, true, false, 1.0),
+                test_case_run_output("case-id", 2, false, true, 0.0),
+            ],
+        );
+        assert!(!invalid.passed);
+        assert!(invalid.invalid);
+        assert_eq!(invalid.passed_trials, 1);
+        assert_eq!(invalid.failed_trials, 0);
+        assert_eq!(invalid.invalid_trials, 1);
     }
 
     #[test]
@@ -5926,6 +6452,7 @@ id = "module-query-memory-special-memory"
             failed_only: false,
             failed_from: None,
             max_concurrent_llm_calls: None,
+            trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: vec!["special-memory".to_string()],
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -6799,6 +7326,7 @@ limits {{
             failed_only: false,
             failed_from: None,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
+            trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -6816,6 +7344,7 @@ limits {{
         assert_eq!(report.run.case_patterns, Vec::<String>::new());
         assert!(!report.run.fail_fast);
         assert_eq!(report.run.max_concurrent_llm_calls, Some(7));
+        assert_eq!(report.run.trials, 1);
         assert_eq!(report.run.planned_case_count, 2);
         assert_eq!(report.run.models.judge, "judge-model");
         assert_eq!(report.run.models.cheap, "cheap-model");
@@ -6831,7 +7360,14 @@ limits {{
                 && case.score == 0.0
                 && case.report.runtime_failure.is_some()
                 && case.report.checks.is_empty()
+                && case.trial_count == 1
+                && case.passed_trials == 0
+                && case.failed_trials == 0
+                && case.invalid_trials == 1
+                && case.trials.len() == 1
         }));
+        assert_metric_values(&report.metrics.pass_at, &[(1, 0.0)]);
+        assert_metric_values(&report.metrics.pass_hat, &[(1, 0.0)]);
 
         assert!(run_dir.join("suite-report.json").exists());
         let suite_json: serde_json::Value =
@@ -6848,6 +7384,7 @@ limits {{
                 "failed_from": null,
                 "fail_fast": false,
                 "max_concurrent_llm_calls": 7,
+                "trials": 1,
                 "planned_case_count": 2,
                 "models": {
                     "judge": "judge-model",
@@ -6864,11 +7401,86 @@ limits {{
             assert!(output_dir.join("report.json").exists());
             assert!(output_dir.join("artifact.json").exists());
             assert!(output_dir.join("raw-trace.json").exists());
+            assert!(!output_dir.join("trial-001").exists());
             let events: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(output_dir.join("events.json")).unwrap())
                     .unwrap();
             assert_eq!(events, serde_json::json!([]));
         }
+    }
+
+    #[tokio::test]
+    async fn run_suite_records_multiple_trials_per_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-memory");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        std::fs::write(
+            case_dir.join("runtime-failure.eure"),
+            r#"
+id = "runtime-failure"
+prompt = "Who are you?"
+
+limits {
+  max-llm-calls = 1
+}
+"#,
+        )
+        .unwrap();
+
+        let output_root = dir.path().join("out");
+        let mut config = test_runner_config(dir.path());
+        config.output_root = output_root.clone();
+        config.run_id = "multi-trial".to_string();
+        config.max_concurrent_llm_calls = NonZeroUsize::new(7);
+        config.trials = NonZeroUsize::new(2).unwrap();
+
+        let report = run_suite(&config).await.unwrap();
+
+        assert_eq!(report.run.trials, 2);
+        assert_eq!(report.case_count, 1);
+        assert_eq!(report.invalid_cases, 1);
+        assert_metric_values(&report.metrics.pass_at, &[(1, 0.0), (2, 0.0)]);
+        assert_metric_values(&report.metrics.pass_hat, &[(1, 0.0), (2, 0.0)]);
+
+        let summary = &report.cases[0];
+        assert_eq!(summary.trial_count, 2);
+        assert_eq!(summary.passed_trials, 0);
+        assert_eq!(summary.failed_trials, 0);
+        assert_eq!(summary.invalid_trials, 2);
+        assert_eq!(summary.trials.len(), 2);
+
+        let output_dir = output_root
+            .join("multi-trial")
+            .join(sanitize_id(&summary.id));
+        assert!(output_dir.join("report.json").exists());
+        assert!(!output_dir.join("artifact.json").exists());
+        for trial in ["trial-001", "trial-002"] {
+            let trial_dir = output_dir.join(trial);
+            assert!(trial_dir.join("report.json").exists());
+            assert!(trial_dir.join("artifact.json").exists());
+            assert!(trial_dir.join("raw-trace.json").exists());
+        }
+
+        let suite_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output_dir.parent().unwrap().join("suite-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(suite_json["run"]["trials"], serde_json::json!(2));
+        assert_eq!(suite_json["cases"][0]["trial_count"], serde_json::json!(2));
+        assert_eq!(
+            suite_json["metrics"]["pass_at"],
+            serde_json::json!([
+                {"k": 1, "value": 0.0},
+                {"k": 2, "value": 0.0},
+            ])
+        );
+        assert_eq!(
+            suite_json["metrics"]["pass_hat"],
+            serde_json::json!([
+                {"k": 1, "value": 0.0},
+                {"k": 2, "value": 0.0},
+            ])
+        );
     }
 
     #[tokio::test]
