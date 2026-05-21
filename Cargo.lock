@@ -1602,8 +1602,7 @@ dependencies = [
 [[package]]
 name = "eure"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f389a4c7a63cbd42e728e266f6280e35a22d02ca62bfd4eaa1fb76b9113fb35b"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "annotate-snippets",
  "anyhow",
@@ -1627,8 +1626,7 @@ dependencies = [
 [[package]]
 name = "eure-codegen-ir"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04857e2a6cec8cb391980d7a076cc19189db4f94b257ad11ff9175f93174844a"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "bon",
  "indexmap",
@@ -1639,8 +1637,7 @@ dependencies = [
 [[package]]
 name = "eure-document"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "361a6db8a0788c39e6103b8ad99daf5ee72bdb5398c785f7247faebf147d7386"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "indexmap",
  "num-bigint",
@@ -1652,8 +1649,7 @@ dependencies = [
 [[package]]
 name = "eure-env"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "343c58fd96324017a6f6c4e2e1581549eac814c50b1e56721137996354569c7f"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "chrono",
  "eros",
@@ -1671,8 +1667,7 @@ dependencies = [
 [[package]]
 name = "eure-fmt"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ab4dadcc9739b1994af259f0d32c439a59cb1da463a39ef794fafdda508ce16"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "eure-document",
  "eure-tree",
@@ -1681,8 +1676,7 @@ dependencies = [
 [[package]]
 name = "eure-macros"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aaa2d8709154d088a8cc02f1850888f38e55bad394143bd3ac88fbd4769916d"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "convert_case 0.10.0",
  "darling 0.23.0",
@@ -1696,8 +1690,7 @@ dependencies = [
 [[package]]
 name = "eure-parol"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5c5ff026124d501a07926716984740f8682b5322dd3d136c5bf670642644de2"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "anyhow",
  "eure-tree",
@@ -1710,8 +1703,7 @@ dependencies = [
 [[package]]
 name = "eure-schema"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bb56cb642dd0679db7b498accab8de9510b938776d1c77853e982cccbbac2e8"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "ahash",
  "convert_case 0.9.0",
@@ -1729,8 +1721,7 @@ dependencies = [
 [[package]]
 name = "eure-tree"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9d5a97ffb4dd8b0404a74b5f47b7de4ac090b3585b9f261246b0fa68aeafb81"
+source = "git+https://github.com/Hihaheho/eure#cb76968a8831b532c11f9d6a37ef5a35261c5f38"
 dependencies = [
  "ahash",
  "bon",
