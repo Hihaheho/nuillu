@@ -111,6 +111,7 @@ pub struct RunnerConfig {
     pub case_patterns: Vec<String>,
     pub module_filters: Vec<EvalModule>,
     pub disabled_modules: Vec<EvalModule>,
+    pub exclude_full_agent: bool,
 }
 
 /// Modules that may never be disabled via `RunnerConfig::disabled_modules` —
@@ -335,6 +336,8 @@ pub enum RunnerError {
     DisableRequiredModule { module: &'static str },
     #[error("module cases are not supported with --gui")]
     GuiModuleCasesUnsupported,
+    #[error("--gui requires full-agent cases; do not combine with --no-full-agent")]
+    GuiExcludeFullAgent,
     #[error("--gui does not support --trials > 1 (got {trials})")]
     GuiTrialsUnsupported { trials: usize },
 }
@@ -408,6 +411,9 @@ pub async fn run_suite_with_hooks(
         return Err(RunnerError::GuiTrialsUnsupported {
             trials: config.trials.get(),
         });
+    }
+    if hooks.visualizer.is_some() && config.exclude_full_agent {
+        return Err(RunnerError::GuiExcludeFullAgent);
     }
     let selection = select_case_paths(config, hooks.visualizer.is_some())?;
     let case_paths = selection.case_paths;
@@ -548,6 +554,7 @@ fn suite_run_report(
             .iter()
             .map(|module| module.as_str().to_string())
             .collect(),
+        exclude_full_agent: config.exclude_full_agent,
     }
 }
 
@@ -591,6 +598,9 @@ fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelect
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    }
+    if !case_paths.is_empty() || failed_from.is_none() {
+        case_paths = filter_exclude_full_agent_case_paths(case_paths, config.exclude_full_agent);
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_module_case_paths(case_paths, &config.module_filters)?;
@@ -795,6 +805,19 @@ fn filter_case_paths(
         });
     }
     Ok(matched)
+}
+
+fn filter_exclude_full_agent_case_paths(
+    case_paths: Vec<PathBuf>,
+    exclude: bool,
+) -> Vec<PathBuf> {
+    if !exclude {
+        return case_paths;
+    }
+    case_paths
+        .into_iter()
+        .filter(|path| !is_full_agent_case_path(path))
+        .collect()
 }
 
 fn filter_module_case_paths(
@@ -5846,6 +5869,7 @@ mod tests {
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
+            exclude_full_agent: false,
         }
     }
 
@@ -5869,6 +5893,7 @@ mod tests {
             },
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
+            exclude_full_agent: false,
         }
     }
 
@@ -6376,6 +6401,70 @@ prompt = "Second?"
     }
 
     #[test]
+    fn exclude_full_agent_drops_full_agent_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_speak = write_full_agent_case(
+            dir.path(),
+            "full-speak",
+            "full-agent-speak",
+            Some(&[EvalModule::Sensory, EvalModule::Speak]),
+        );
+        let speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "speak-target",
+            "module-speak-target",
+            &[EvalModule::Speak],
+        );
+        let memory = write_module_case(
+            dir.path(),
+            EvalModule::Memory,
+            "memory-target",
+            "module-memory-target",
+            &[EvalModule::Memory],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.exclude_full_agent = true;
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![memory, speak]);
+        assert!(!selection.case_paths.contains(&full_speak));
+    }
+
+    #[test]
+    fn exclude_full_agent_intersects_module_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let _full_speak = write_full_agent_case(
+            dir.path(),
+            "full-speak",
+            "full-agent-speak",
+            Some(&[EvalModule::Sensory, EvalModule::Speak]),
+        );
+        let speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "speak-target",
+            "module-speak-target",
+            &[EvalModule::Speak],
+        );
+        let _memory = write_module_case(
+            dir.path(),
+            EvalModule::Memory,
+            "memory-target",
+            "module-memory-target",
+            &[EvalModule::Memory],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.exclude_full_agent = true;
+        config.module_filters = vec![EvalModule::Speak];
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![speak]);
+    }
+
+    #[test]
     fn module_filters_intersect_case_patterns() {
         let dir = tempfile::tempdir().unwrap();
         let special_speak = write_module_case(
@@ -6456,6 +6545,7 @@ id = "module-query-memory-special-memory"
             case_patterns: vec!["special-memory".to_string()],
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
+            exclude_full_agent: false,
         };
 
         let tabs = visualizer_planned_tabs(&config).unwrap();
@@ -7330,6 +7420,7 @@ limits {{
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
+            exclude_full_agent: false,
         };
 
         let report = run_suite(&config).await.unwrap();
@@ -7394,6 +7485,7 @@ limits {{
                 },
                 "module_filters": [],
                 "disabled_modules": [],
+                "exclude_full_agent": false,
             })
         );
         for summary in &report.cases {

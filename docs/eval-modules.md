@@ -312,6 +312,7 @@ Run the narrow checks first:
 ```bash
 eure check <target-name> --quiet
 cargo nextest run -p nuillu-eval
+cargo run -p nuillu-eval -- --no-full-agent
 ```
 
 If broader workspace tests fail because another agent has in-progress changes,

@@ -103,6 +103,10 @@ struct Args {
     #[arg(long)]
     gui: bool,
 
+    /// Skip full-agent cases; run only module eval cases under eval-cases/modules.
+    #[arg(long)]
+    no_full_agent: bool,
+
     /// Run only cases associated with these modules (repeatable).
     #[arg(long = "module", value_enum, value_name = "MODULE")]
     module_filter: Vec<EvalModule>,
@@ -165,6 +169,10 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|model_set| model_set.max_concurrent_llm_calls())
     });
+    if args.gui && args.no_full_agent {
+        anyhow::bail!("--gui requires full-agent cases; do not combine with --no-full-agent");
+    }
+
     let config = RunnerConfig {
         cases_root: args.cases,
         output_root: args.output,
@@ -184,6 +192,7 @@ fn main() -> anyhow::Result<()> {
         case_patterns: args.patterns,
         module_filters: args.module_filter,
         disabled_modules: args.disable_module,
+        exclude_full_agent: args.no_full_agent,
     };
 
     if args.gui {
