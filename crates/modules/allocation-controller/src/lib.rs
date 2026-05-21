@@ -13,7 +13,7 @@ use nuillu_module::{
     memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
     seed_persistent_faculty_session,
 };
-use nuillu_types::{ModuleId, builtin};
+use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -27,11 +27,11 @@ modules deserve activation right now.
 Output shape: a `memo` (free-form controller note for the shared memo surface) plus a `priority`
 array. The array lists modules to activate in descending priority order, each entry pairing a
 `module_id` (must be a registered module) with a `hint` — one concise sentence saying why that
-module needs activation now. Modules you omit receive zero activation; their typed mailboxes still
-flow through inactive replica-zero queues. The allocation-controller itself is preserved at its
-current activation so the control plane cannot disable itself. Position in the array maps to the
-host-configured activation table; positions beyond the table fall to zero, so prioritise tightly.
-Do not invent module ids and do not duplicate ids.
+module needs extra activation now. Omitted modules fall back to the host/base allocation: the
+priority list adds salience drive, it is not a complete allow-list and not an inhibition list.
+Separate suppression caps, when granted by the host, are the inhibition path. Position in the array
+maps to the host-configured activation table; positions beyond the table fall to zero, so prioritise
+tightly. Do not invent module ids and do not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
@@ -322,22 +322,7 @@ fn apply_decision(
     decision: AllocationDecision,
 ) -> AppliedDecision {
     let _ = current;
-    let controller_id = builtin::allocation_controller();
     let mut commands = Vec::new();
-
-    // Controller's baseline: zero out every registered target module. Entries
-    // listed in `priority` overwrite below; everything else stays detached
-    // until new evidence or guidance makes it useful.
-    for id in registered {
-        if id == &controller_id {
-            continue;
-        }
-        commands.push(AllocationCommand::target(
-            id.clone(),
-            AllocationEffectLevel::Off,
-            None,
-        ));
-    }
 
     for (rank, entry) in decision.priority.into_iter().enumerate() {
         let Ok(id) = ModuleId::new(entry.module_id) else {
@@ -650,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_decision_assigns_levels_by_rank_and_zeroes_unlisted() {
+    fn apply_decision_assigns_levels_by_rank_and_leaves_unlisted_unopinionated() {
         let mut registered = std::collections::HashSet::new();
         registered.insert(builtin::speak());
         registered.insert(builtin::sensory());
@@ -658,8 +643,8 @@ mod tests {
 
         let mut current = ResourceAllocation::default();
         current.set_activation_table(vec![ActivationRatio::ONE, ActivationRatio::from_f64(0.5)]);
-        // Stale activation that the controller should clear because the module
-        // is not in the new priority list.
+        // Existing activation should remain a base/allocation concern when the
+        // controller has no current target opinion for the module.
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
         let applied = apply_decision(
@@ -700,13 +685,7 @@ mod tests {
         );
         let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
         assert_eq!(sensory.level, AllocationEffectLevel::Normal);
-        // Cognition-gate was registered but absent from priority, so it is off.
-        assert_eq!(
-            last_target(&applied.commands, &builtin::cognition_gate())
-                .unwrap()
-                .level,
-            AllocationEffectLevel::Off
-        );
+        assert!(last_target(&applied.commands, &builtin::cognition_gate()).is_none());
     }
 
     #[test]
@@ -746,12 +725,7 @@ mod tests {
                 .level,
             AllocationEffectLevel::Max
         );
-        assert_eq!(
-            last_target(&applied.commands, &builtin::cognition_gate())
-                .unwrap()
-                .level,
-            AllocationEffectLevel::Off
-        );
+        assert!(last_target(&applied.commands, &builtin::cognition_gate()).is_none());
     }
 
     #[test]
