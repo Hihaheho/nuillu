@@ -273,12 +273,6 @@ impl<T: Clone> TopicInbox<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum MemoryImportance {
-    Normal,
-    High,
-}
-
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AttentionControlRequest {

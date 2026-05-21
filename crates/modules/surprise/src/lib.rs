@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, MemoryImportance, Module,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
-    format_current_attention_guidance, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,12 +18,16 @@ Detect unexpected cognition-log entries. If predict memo log entries are present
 assessment as divergence from pending predictions. If no predict memo log is present, judge novelty against recent
 cognition-log history. Do not generate forward predictions.
 
+Predict and other faculty notes arrive as system context. New cognition-log entries are appended
+to the session above. Assess each batch using the user instruction for this activation.
 If the cognition fits pending predictions or recent history, finish without calling tools.
 If the cognition diverges enough that the event should be preserved in memory, call
 preserve_unexpected_event exactly once with the assessment and preservation details."#;
 
 const EXPECTED_SURPRISE_MEMO: &str =
     "Surprise assessment: expected\nNo memory preservation requested.";
+
+const ACTIVATION_INPUT: &str = "Assess whether the new cognition is surprising relative to pending predictions and recent history.";
 
 const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's persistent session history.
@@ -37,26 +41,28 @@ fn format_surprise_context(allocation: &nuillu_module::ResourceAllocation) -> Op
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum SurpriseLevel {
-    Low,
-    Moderate,
-    High,
-}
+const HIGH_SURPRISE_THRESHOLD: f32 = 0.75;
 
 #[lutum::tool_input(
     name = "preserve_unexpected_event",
     output = PreserveUnexpectedEventOutput
 )]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PreserveUnexpectedEventArgs {
-    pub summary: String,
-    pub surprise_level: SurpriseLevel,
-    pub rationale: String,
     pub content: String,
-    pub importance: MemoryImportance,
+    pub surprise: f32,
     pub reason: String,
 }
+
+impl PartialEq for PreserveUnexpectedEventArgs {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+            && self.surprise.to_bits() == other.surprise.to_bits()
+            && self.reason == other.reason
+    }
+}
+
+impl Eq for PreserveUnexpectedEventArgs {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PreserveUnexpectedEventOutput {
@@ -140,14 +146,13 @@ impl SurpriseModule {
         let unread_cognition = self.cognition_log.unread_events().await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
+        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
         let allocation = self.allocation.snapshot().await;
 
-        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
         if let Some(context) = format_surprise_context(&allocation) {
             self.session.push_ephemeral_system(context);
         }
-        self.session
-            .push_ephemeral_developer("Assess whether the new cognition is surprising.");
+        self.session.push_ephemeral_user(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
         let outcome = self
@@ -170,7 +175,9 @@ impl SurpriseModule {
                 for call in round.tool_calls.iter().cloned() {
                     let SurpriseToolsCall::PreserveUnexpectedEvent(call) = call;
                     if memo.is_none() {
-                        memo = Some(render_surprise_memo(&call.input));
+                        if let Some(args) = normalize_preserve_args(call.input.clone()) {
+                            memo = Some(render_surprise_memo(&args));
+                        }
                     }
                     let output = self.preserve_unexpected_event(call.input.clone()).await;
                     results.push(
@@ -206,10 +213,9 @@ impl SurpriseModule {
         &self,
         args: PreserveUnexpectedEventArgs,
     ) -> PreserveUnexpectedEventOutput {
-        let content = args.content.trim();
-        if content.is_empty() {
+        let Some(args) = normalize_preserve_args(args) else {
             return PreserveUnexpectedEventOutput { preserved: false };
-        }
+        };
         let _ = self
             .attention_control
             .publish(AttentionControlRequest::new(
@@ -220,27 +226,44 @@ impl SurpriseModule {
     }
 }
 
+fn normalize_preserve_args(
+    args: PreserveUnexpectedEventArgs,
+) -> Option<PreserveUnexpectedEventArgs> {
+    let content = args.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    if !args.surprise.is_finite() {
+        return None;
+    }
+    Some(PreserveUnexpectedEventArgs {
+        content: content.to_owned(),
+        surprise: args.surprise.clamp(0.0, 1.0),
+        reason: args.reason.trim().to_owned(),
+    })
+}
+
+fn memory_preservation_priority(surprise: f32) -> &'static str {
+    if surprise >= HIGH_SURPRISE_THRESHOLD {
+        "high-priority memory preservation"
+    } else {
+        "normal-priority memory preservation"
+    }
+}
+
 fn render_memory_attention_request(args: &PreserveUnexpectedEventArgs) -> String {
-    let priority = match args.importance {
-        MemoryImportance::Normal => "normal-priority memory preservation",
-        MemoryImportance::High => "high-priority memory preservation",
-    };
     format!(
-        "{priority}: {} Reason: {}",
-        args.content.trim(),
-        args.reason.trim()
+        "{}: {} Reason: {}",
+        memory_preservation_priority(args.surprise),
+        args.content,
+        args.reason,
     )
 }
 
 fn render_surprise_memo(args: &PreserveUnexpectedEventArgs) -> String {
     format!(
-        "Surprise assessment: unexpected\nSummary: {}\nSurprise level: {:?}\nRationale: {}\nMemory preservation request:\nContent: {}\nImportance: {:?}\nReason: {}",
-        args.summary.trim(),
-        args.surprise_level,
-        args.rationale.trim(),
-        args.content.trim(),
-        args.importance,
-        args.reason.trim(),
+        "Surprise assessment: unexpected\nSurprise: {:.2}\nMemory preservation request:\nContent: {}\nReason: {}",
+        args.surprise, args.content, args.reason,
     )
 }
 
@@ -491,15 +514,50 @@ mod tests {
     #[test]
     fn preserve_tool_renders_preservation_memo() {
         let memo = render_surprise_memo(&PreserveUnexpectedEventArgs {
-            summary: "Koro growled.".into(),
-            surprise_level: SurpriseLevel::High,
-            rationale: "Violated calm-eating prediction.".into(),
             content: "Koro snapped up and growled toward the doorway.".into(),
-            importance: MemoryImportance::High,
-            reason: "Safety-relevant divergence.".into(),
+            surprise: 0.9,
+            reason: "Violated calm-eating prediction.".into(),
         });
-        assert!(memo.contains("Surprise assessment: unexpected"));
-        assert!(memo.contains("Memory preservation request:"));
+        assert_eq!(
+            memo,
+            "Surprise assessment: unexpected\nSurprise: 0.90\nMemory preservation request:\nContent: Koro snapped up and growled toward the doorway.\nReason: Violated calm-eating prediction."
+        );
+    }
+
+    #[test]
+    fn normalize_preserve_args_clamps_surprise_and_rejects_empty_content() {
+        assert!(
+            normalize_preserve_args(PreserveUnexpectedEventArgs {
+                content: "   ".into(),
+                surprise: 0.5,
+                reason: "x".into(),
+            })
+            .is_none()
+        );
+        assert_eq!(
+            normalize_preserve_args(PreserveUnexpectedEventArgs {
+                content: "event".into(),
+                surprise: 1.5,
+                reason: "  note  ".into(),
+            }),
+            Some(PreserveUnexpectedEventArgs {
+                content: "event".into(),
+                surprise: 1.0,
+                reason: "note".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn memory_preservation_priority_uses_surprise_threshold() {
+        assert_eq!(
+            memory_preservation_priority(0.74),
+            "normal-priority memory preservation"
+        );
+        assert_eq!(
+            memory_preservation_priority(0.75),
+            "high-priority memory preservation"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -520,12 +578,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn activate_preserves_unexpected_event_via_tool() {
         let args = PreserveUnexpectedEventArgs {
-            summary: "Koro growled.".into(),
-            surprise_level: SurpriseLevel::High,
-            rationale: "Violated calm-eating prediction.".into(),
             content: "Koro snapped up and growled toward the doorway.".into(),
-            importance: MemoryImportance::High,
-            reason: "Safety-relevant divergence.".into(),
+            surprise: 0.9,
+            reason: "Violated calm-eating prediction.".into(),
         };
         let adapter =
             Arc::new(MockLlmAdapter::new().with_text_scenario(preserve_scenario(&args, 1)));
