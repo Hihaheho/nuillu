@@ -18,12 +18,15 @@ use tokio::time::Instant;
 
 const SYSTEM_PROMPT: &str = r#"You are the sensory module.
 You receive batches of raw observations from the environment and decide whether anything is notable
-enough to write as sensory memo-log output. Use the deterministic salience features as guidance;
-repeated low-change stimuli should usually be ignored or summarized only when the summary is useful.
-Use tools for every decision: call write_sensory_memo for durable sensory memo-log output, or
-ignore_observations when nothing should be written. Do not use final assistant text as an output
-channel. Do not write JSON, YAML, Markdown code fences, headings, or implementation details in memo
-text. Do not write to the cognition log, memory, or emit utterances."#;
+enough to write as sensory memo-log output. Each activation delivers new observations as a user
+message; respond only through the provided tools. Use the deterministic salience features as
+guidance; repeated low-change stimuli should usually be ignored or summarized only when the summary
+is useful. Use tools for every decision: call write_sensory_memo for durable sensory memo-log
+output, or ignore_observations when nothing should be written. Do not use final assistant text as
+an output channel. Do not write JSON, YAML, Markdown code fences, headings, or implementation
+details in memo text. Do not write to the cognition log, memory, or emit utterances."#;
+
+const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
 
 const COMPACTED_SENSORY_SESSION_PREFIX: &str = "Compacted sensory session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the sensory module's persistent session history.
@@ -280,9 +283,8 @@ impl SensoryModule {
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation.for_module(&self.owner).guidance;
         self.session
-            .push_assistant_text(format_sensory_ledger(&observations));
-        self.session
-            .push_ephemeral_assistant_text(format_current_ambient_context(
+            .push_ephemeral_user(format_sensory_turn_user_message(
+                &observations,
                 &self.ambient_entries,
                 now,
             ));
@@ -290,7 +292,7 @@ impl SensoryModule {
             .push_ephemeral_developer(format_sensory_decision_context(&guidance));
 
         let lutum = self.llm.lutum().await;
-        let outcome = self
+        let turn = self
             .session
             .text_turn(&lutum)
             .tools::<SensoryTools>()
@@ -298,10 +300,14 @@ impl SensoryModule {
                 SensoryToolsSelector::WriteSensoryMemo,
                 SensoryToolsSelector::IgnoreObservations,
             ])
-            .require_any_tool()
-            .collect()
-            .await
-            .context("sensory text turn failed")?;
+            .require_any_tool();
+        let outcome = match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect()).await {
+            Ok(result) => result.context("sensory text turn failed")?,
+            Err(_) => anyhow::bail!(
+                "sensory LLM turn timed out after {}s",
+                SENSORY_LLM_TURN_TIMEOUT.as_secs()
+            ),
+        };
 
         match outcome {
             TextStepOutcomeWithTools::NeedsTools(round) => {
@@ -328,19 +334,21 @@ impl SensoryModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit sensory tool round")?;
+                self.persist_sensory_ledger(&observations);
                 self.compact_if_needed(input_tokens, cx.session_compaction())
                     .await;
             }
-            TextStepOutcomeWithTools::Finished(result) => {
-                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction())
-                    .await;
-            }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                self.compact_if_needed(result.usage.input_tokens, cx.session_compaction())
-                    .await;
+            TextStepOutcomeWithTools::Finished(_)
+            | TextStepOutcomeWithTools::FinishedNoOutput(_) => {
+                anyhow::bail!("sensory text turn finished without required tool calls");
             }
         }
         Ok(())
+    }
+
+    fn persist_sensory_ledger(&mut self, observations: &[PreparedSensoryObservation]) {
+        self.session
+            .push_assistant_text(format_sensory_ledger(observations));
     }
 
     fn prepare_input_observations(
@@ -725,9 +733,21 @@ fn format_current_ambient_context(
     out
 }
 
+fn format_sensory_turn_user_message(
+    observations: &[PreparedSensoryObservation],
+    ambient_entries: &BTreeMap<String, AmbientSensoryEntry>,
+    now: DateTime<Utc>,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        format_sensory_ledger(observations),
+        format_current_ambient_context(ambient_entries, now),
+    )
+}
+
 fn format_sensory_decision_context(guidance: &str) -> String {
     let mut out = String::from(
-        "Evaluate the persisted sensory ledger entries using the current ambient field as background context.",
+        "Evaluate the new observation batch using the ambient field as background context.",
     );
     out.push_str("\nCurrent sensory guidance: ");
     let guidance = guidance.trim();
@@ -981,11 +1001,19 @@ mod tests {
         modules: nuillu_module::AllocatedModules,
         body: F,
     ) {
+        run_modules_with_retries(modules, 2, body).await;
+    }
+
+    async fn run_modules_with_retries<F: std::future::Future<Output = ()>>(
+        modules: nuillu_module::AllocatedModules,
+        activate_retries: u8,
+        body: F,
+    ) {
         nuillu_agent::run(
             modules,
             nuillu_agent::AgentEventLoopConfig {
                 idle_threshold: Duration::from_millis(50),
-                activate_retries: 2,
+                activate_retries,
             },
             body,
         )
@@ -1087,6 +1115,38 @@ mod tests {
             serde_json::from_str::<SensoryModality>("\"thermal\"").unwrap(),
             SensoryModality::Other("thermal".to_string())
         );
+    }
+
+    #[test]
+    fn sensory_turn_user_message_separates_ledger_and_ambient() {
+        let observations = vec![PreparedSensoryObservation {
+            kind: SensoryObservationKind::OneShot,
+            modality: SensoryModality::Audition,
+            ambient_id: None,
+            direction: Some("Pibi".to_string()),
+            content: "Pibi asks a question.".to_string(),
+            observed_at: reference_now(),
+            relative_age: "0 seconds ago".to_string(),
+            salience: SalienceFeatures {
+                signature: "one-shot:audition:pibi:pibi asks a question.".to_string(),
+                repeated: false,
+                repetition_count: 1,
+                seconds_since_previous: None,
+                user_directed: false,
+                novelty_score: 0.85,
+                salience_score: 0.85,
+            },
+        }];
+        let text =
+            format_sensory_turn_user_message(&observations, &BTreeMap::new(), reference_now());
+
+        assert!(text.contains("New sensory session ledger entries:"));
+        assert!(text.contains("Current ambient sensory field at"));
+        assert!(
+            text.find("New sensory session ledger entries:")
+                < text.find("Current ambient sensory field at")
+        );
+        assert!(text.contains("salience_score=0.85\n\nCurrent ambient sensory field at"));
     }
 
     #[test]
@@ -1362,8 +1422,63 @@ mod tests {
                     ephemeral_indices
                         .iter()
                         .all(|indices| indices.len() == 2),
-                    "each sensory LLM turn should carry ambient context and decision context as ephemeral items"
+                    "each sensory LLM turn should carry observation batch and decision context as ephemeral items"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_finish_is_rejected_without_memo() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(text_scenario("write_sensory_memo without using tools", 0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                let result = nuillu_agent::run(
+                    modules,
+                    nuillu_agent::AgentEventLoopConfig {
+                        idle_threshold: Duration::from_millis(50),
+                        activate_retries: 0,
+                    },
+                    async {
+                        sensory
+                            .publish(heard("unexpected plain text path"))
+                            .await
+                            .expect("sensory subscriber exists");
+                        for _ in 0..50 {
+                            if !recorder.batches.borrow().is_empty() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    },
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "plain text finish should fail sensory activation"
+                );
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(logs.is_empty());
+                assert_eq!(recorder.batches.borrow().as_slice(), &[1]);
             })
             .await;
     }
