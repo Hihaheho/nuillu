@@ -214,7 +214,7 @@ pub fn render_full_agent_last_state_eure(
     let document = constructor.finish();
     let source = LayoutPlan::auto(document)?.emit();
     let formatted = format_source_document(&source);
-    let editable = EditableDocument::parse(&formatted)?;
+    let editable = EditableDocument::parse(&formatted, "last-state.eure")?;
     Ok(editable.render())
 }
 
@@ -304,6 +304,6 @@ mod tests {
         let rendered = render_full_agent_last_state_eure(dump).unwrap();
         assert!(rendered.contains("case"));
         assert!(rendered.contains("memory"));
-        EditableDocument::parse(&rendered).unwrap();
+        EditableDocument::parse(&rendered, "last-state.eure").unwrap();
     }
 }
