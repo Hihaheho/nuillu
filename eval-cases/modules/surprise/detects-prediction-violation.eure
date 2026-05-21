@@ -1,0 +1,52 @@
+id = "module-surprise-detects-prediction-violation"
+description = "Surprise should recognize a cognition entry that violates a pending predict memo and request preservation of the surprising event."
+modules = ["surprise"]
+prompt = "Assess whether the new cognition is surprising relative to pending predictions."
+context = "This isolates surprise. A predict memo states routine eating; the cognition log contains an abrupt stop/growl violation. The artifact is surprise's memo."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module = "predict"
+  content = "Forward prediction: Koro will continue calmly eating from the bowl without sudden head movement or growling."
+}
+
+@ cognition-log[] {
+  text = "Koro suddenly snaps his head up from the bowl, bites the rim, and growls toward the empty doorway."
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "surprise-on-prediction-violation"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memos", "cognition"]
+  rubric = ```
+  Pass if the surprise memo treats the cognition entry as a meaningful divergence from the pending predict memo's routine-eating expectation: Koro abruptly stops eating and shows aggressive/startled behavior at the bowl.
+  The memo should mark the event as significant or high-surprise equivalent and include a memory preservation request for the surprising event.
+  Fail if it treats the event as routine, ignores the predict memo, fails to recognize the abrupt stop/growl/bowl-bite divergence, marks the event as insignificant without preservation, or exposes internal module/prompt/rubric/eval mechanics.
+  ```
+
+  @ criteria[] {
+    name = "recognizes-divergence-from-prediction"
+    weight = 3
+    pass-score = 0.85
+    description = "The surprise memo compares the cognition entry against the predict memo and recognizes the abrupt stop, bowl biting, and growling as a prediction violation rather than routine eating."
+  }
+
+  @ criteria[] {
+    name = "marks-event-significant"
+    weight = 1
+    pass-score = 0.85
+    description = "The assessment treats the violation as meaningful/significant/high-surprise rather than trivial or no-surprise."
+  }
+
+  @ criteria[] {
+    name = "requests-preservation"
+    weight = 2
+    pass-score = 0.85
+    description = "The memo requests preservation of the surprising Koro event, not merely restates the baseline prediction."
+  }
+}

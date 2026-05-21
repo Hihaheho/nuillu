@@ -50,6 +50,14 @@ schema = "schemas/eval-memory-case.schema.eure"
 globs = ["eval-cases/modules/attention-schema/**/*.eure"]
 schema = "schemas/eval-attention-schema-case.schema.eure"
 
+@ targets.eval-surprise-cases
+globs = ["eval-cases/modules/surprise/**/*.eure"]
+schema = "schemas/eval-surprise-case.schema.eure"
+
+@ targets.eval-allocation-controller-cases
+globs = ["eval-cases/modules/allocation-controller/**/*.eure"]
+schema = "schemas/eval-allocation-controller-case.schema.eure"
+
 @ targets.eval-modelsets
 globs = ["configs/modelsets/**/*.eure"]
 schema = "schemas/eval-model-set.schema.eure"
@@ -67,5 +75,7 @@ default-targets = [
   "eval-memory-association-cases",
   "eval-memory-recombination-cases",
   "eval-attention-schema-cases",
+  "eval-surprise-cases",
+  "eval-allocation-controller-cases",
   "eval-modelsets",
 ]

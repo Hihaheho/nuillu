@@ -336,6 +336,8 @@ pub enum ModuleEvalTarget {
     MemoryCompaction,
     MemoryAssociation,
     MemoryRecombination,
+    AllocationController,
+    Surprise,
     Speak,
 }
 
@@ -351,6 +353,8 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
+            Self::AllocationController => "allocation-controller",
+            Self::Surprise => "surprise",
             Self::Speak => "speak",
         }
     }
@@ -366,6 +370,8 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
+            Self::AllocationController => EvalModule::AllocationController,
+            Self::Surprise => EvalModule::Surprise,
             Self::Speak => EvalModule::Speak,
         }
     }
@@ -383,6 +389,8 @@ impl ModuleEvalTarget {
                 "memory-compaction" => Some(Self::MemoryCompaction),
                 "memory-association" => Some(Self::MemoryAssociation),
                 "memory-recombination" => Some(Self::MemoryRecombination),
+                "allocation-controller" => Some(Self::AllocationController),
+                "surprise" => Some(Self::Surprise),
                 "speak" => Some(Self::Speak),
                 _ => None,
             })
@@ -1161,6 +1169,33 @@ fn validate_module_case_target(
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "sensory module case must include at least one input".to_string(),
+        });
+    }
+    if target == ModuleEvalTarget::Surprise {
+        if case.cognition_log.is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: "surprise module case must include at least one cognition-log seed"
+                    .to_string(),
+            });
+        }
+        if !case
+            .memos
+            .iter()
+            .any(|memo| memo.module.as_str() == "predict")
+        {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: "surprise module case must include at least one predict memo seed"
+                    .to_string(),
+            });
+        }
+    }
+    if target == ModuleEvalTarget::AllocationController && case.memos.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "allocation-controller module case must include at least one memo seed"
+                .to_string(),
         });
     }
     let Some(modules) = case.modules.as_deref() else {

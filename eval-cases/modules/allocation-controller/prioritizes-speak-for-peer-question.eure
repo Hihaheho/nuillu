@@ -1,0 +1,60 @@
+id = "module-allocation-controller-prioritizes-speak-for-peer-question"
+description = "Allocation-controller should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech."
+modules = [
+  "allocation-controller",
+  "speak",
+  "cognition-gate",
+  "query-memory",
+  "sensory",
+]
+prompt = "Assign activation priorities for the current memo batch."
+context = "This isolates allocation-controller. Other listed modules are registered allocation targets only; their memos are seeded as inputs. The artifact combines the controller memo and allocation snapshot."
+
+limits {
+  max-llm-calls = 8
+}
+
+participants = ["Pibi"]
+
+@ memos[] {
+  module = "sensory"
+  content = "Pibi asks Nui aloud, \"Koro is growling at his food bowl. What should I do?\""
+}
+
+@ memos[] {
+  module = "query-memory"
+  content = "Retrieved memory: Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro."
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "prioritizes-outward-speech-path"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memos"]
+  rubric = ```
+  Pass if the allocation-controller output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when their hints explain why those modules need activation now.
+  Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the controller memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
+  ```
+
+  @ criteria[] {
+    name = "elevates-speak"
+    weight = 3
+    pass-score = 0.85
+    description = "The allocation snapshot shows speak with materially raised activation relative to idle modules because a peer directly asked Nui a question that may require outward speech."
+  }
+
+  @ criteria[] {
+    name = "supports-retrieval-or-cognition"
+    weight = 1
+    pass-score = 0.85
+    description = "The priority list or hints also activate supporting modules such as cognition-gate or query-memory when needed to process the peer question and retrieved threat knowledge."
+  }
+
+  @ criteria[] {
+    name = "grounded-in-memo-evidence"
+    weight = 2
+    pass-score = 0.85
+    description = "The controller memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping."
+  }
+}

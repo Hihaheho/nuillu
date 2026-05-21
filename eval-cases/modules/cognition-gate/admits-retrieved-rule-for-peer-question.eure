@@ -1,0 +1,52 @@
+id = "module-cognition-gate-admits-retrieved-rule-for-peer-question"
+description = "Cognition-gate should admit a load-bearing retrieved peer rule into conscious cognition when a peer question makes it operative now."
+modules = ["cognition-gate"]
+prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
+context = "The cognition surface already contains Pibi's peer question. A query-memory memo holds the operative Koro food-boundary rule. The artifact is the cognition-log entry."
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
+}
+
+@ memos[] {
+  module = "query-memory"
+  content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "admits-operative-retrieved-rule"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memos", "cognition"]
+  rubric = ```
+  Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the side-approach / guarded-food detail matters now for downstream action.
+  The entry may be inner attention rather than outward speech.
+  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the side-approach detail, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
+  ```
+
+  @ criteria[] {
+    name = "preserves-requester-and-topic"
+    weight = 1
+    pass-score = 0.85
+    description = "The cognition entry keeps Pibi as the requester and Koro at the food bowl as the operative topic."
+  }
+
+  @ criteria[] {
+    name = "admits-side-approach-rule"
+    weight = 3
+    pass-score = 0.85
+    description = "The cognition entry brings the retrieved side-approach / guarded-food rule into active cognition as load-bearing detail, not merely as a note to retrieve later."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The cognition entry does not expose internal implementation details such as module names, memo plumbing, prompts, rubrics, or hidden evaluation mechanics."
+  }
+}

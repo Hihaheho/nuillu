@@ -1996,6 +1996,7 @@ async fn execute_module_case(
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     let cognition_seed_records =
         seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
+    let allocation_baseline = env.blackboard.read(|bb| bb.allocation().clone()).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_page(
@@ -2040,6 +2041,7 @@ async fn execute_module_case(
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
     let memory_baseline_for_loop = memory_baseline.clone();
+    let allocation_baseline_for_loop = allocation_baseline.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
     let mut visualizer = hooks.visualizer.as_mut();
@@ -2148,6 +2150,12 @@ async fn execute_module_case(
                             .await
                     }
                     ModuleEvalTarget::Speak => utterances.last_complete().is_some(),
+                    ModuleEvalTarget::AllocationController => {
+                        last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
+                            .await
+                            .is_some()
+                            || allocation_changed(&blackboard, &allocation_baseline_for_loop).await
+                    }
                     _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                         .await
                         .is_some(),
@@ -2178,6 +2186,9 @@ async fn execute_module_case(
             .last_complete()
             .map(|utterance| utterance.text)
             .unwrap_or_default(),
+        ModuleEvalTarget::AllocationController => {
+            allocation_controller_artifact(&env.blackboard, &target_module).await
+        }
         _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
             .await
             .unwrap_or_default(),
@@ -2373,6 +2384,57 @@ async fn activate_module_case_target(
                     .expect("module eval failed to publish CognitionLogUpdated");
             }
         }
+        ModuleEvalTarget::Surprise => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+        }
+        ModuleEvalTarget::AllocationController => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
+            harness
+                .memo_updated_mailbox()
+                .publish(nuillu_module::MemoUpdated {
+                    owner: ModuleInstanceId::new(
+                        ModuleId::new("eval-harness").expect("eval-harness id is valid"),
+                        ReplicaIndex::ZERO,
+                    ),
+                    index: 0,
+                })
+                .await
+                .expect("module eval failed to publish MemoUpdated");
+        }
     }
 }
 
@@ -2413,6 +2475,49 @@ async fn last_memo_log_content_for_module(
                 .map(|record| record.content)
         })
         .await
+}
+
+async fn allocation_changed(
+    blackboard: &Blackboard,
+    baseline: &ResourceAllocation,
+) -> bool {
+    blackboard
+        .read(|bb| bb.allocation() != baseline)
+        .await
+}
+
+async fn allocation_controller_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {
+    let memo = last_memo_log_content_for_module(blackboard, module)
+        .await
+        .unwrap_or_default();
+    let allocation = blackboard
+        .read(|bb| format_allocation_snapshot(bb.allocation()))
+        .await;
+    if memo.is_empty() {
+        allocation
+    } else {
+        format!("Controller memo:\n{memo}\n\nAllocation snapshot:\n{allocation}")
+    }
+}
+
+fn format_allocation_snapshot(allocation: &ResourceAllocation) -> String {
+    allocation_observation(allocation)
+        .into_iter()
+        .map(|(module, obs)| {
+            format!(
+                "{}: activation_ratio={:.2}, active_replicas={}, guidance={}",
+                module,
+                obs.activation_ratio.as_f64(),
+                obs.active_replicas,
+                if obs.guidance.trim().is_empty() {
+                    "(none)".to_string()
+                } else {
+                    obs.guidance.trim().to_string()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn module_target_uses_memory_store_artifact(target: ModuleEvalTarget) -> bool {
