@@ -267,14 +267,19 @@ impl ServerRuntimeEventSink {
     }
 }
 
-#[async_trait(?Send)]
 impl RuntimeEventSink for ServerRuntimeEventSink {
-    async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+    fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
         match &event {
             RuntimeEvent::LlmAccessed {
                 call, owner, tier, ..
             } => eprintln!(
                 "nuillu-server llm-accessed tab={} call={} owner={} tier={:?}",
+                self.tab_id, call, owner, tier
+            ),
+            RuntimeEvent::LlmCompleted {
+                call, owner, tier, ..
+            } => eprintln!(
+                "nuillu-server llm-completed tab={} call={} owner={} tier={:?}",
                 self.tab_id, call, owner, tier
             ),
             RuntimeEvent::MemoUpdated {

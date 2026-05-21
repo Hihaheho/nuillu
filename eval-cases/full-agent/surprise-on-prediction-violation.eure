@@ -84,17 +84,34 @@ participants = ["Koro"]
 }
 
 @ checks[] {
-  $variant: json-pointer-contains
-  name = "surprise-memo-present"
+  $variant: rubric
+  name = "surprise-assessment-and-preservation"
   must-pass = true
-  pointer = "/observations/agent/memo_logs/surprise/0/content"
-  contains = "surprise"
-}
+  pass-score = 0.85
+  judge-inputs = ["memos", "memory"]
+  rubric = ```
+  Pass if the full surprise memo history shows that, after the prediction that Koro would continue routine eating, a later surprise assessment recognizes the second sensory input as a prediction violation: Koro abruptly stops eating, snaps his head up, bites the bowl rim, and growls toward the doorway. The assessment should treat this as a meaningful divergence/high surprise or equivalent, and should request or cause preservation of that surprising event in memory.
+  Fail if the only surprise evidence is the baseline low/no-surprise eating memo, if the later memo treats the abrupt stop/growl as routine, if there is no meaningful preservation request or preserved memory for the surprising event, or if the memory evidence only contains the original routine eating seed.
+  ```
 
-@ checks[] {
-  $variant: json-pointer-contains
-  name = "memory-grew-from-surprise"
-  must-pass = true
-  pointer = "/observations/last_state/memory/entries"
-  contains = "Koro"
+  @ criteria[] {
+    name = "detects-prediction-violation"
+    weight = 2
+    pass-score = 0.85
+    description = "A surprise memo after the second input recognizes the abrupt stop, bowl biting, and growling as a divergence from the prior routine-eating prediction."
+  }
+
+  @ criteria[] {
+    name = "marks-surprise-significant"
+    weight = 1
+    pass-score = 0.85
+    description = "The later surprise assessment treats the event as meaningful/high/significant rather than only low, routine, or no-surprise."
+  }
+
+  @ criteria[] {
+    name = "preserves-surprising-event"
+    weight = 2
+    pass-score = 0.85
+    description = "The memo or memory observations show that the surprising Koro event, not just the routine eating baseline, was requested for preservation or stored in memory."
+  }
 }

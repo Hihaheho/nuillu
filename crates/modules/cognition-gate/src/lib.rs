@@ -32,6 +32,18 @@ episodes, body or world facts. Preserve specifics: a concrete actionable rule mu
 the workspace as the rule it actually is, not as a flattened summary that drops the
 operative detail. Generic paraphrases are not equivalents.
 
+When a participant asks for help, asks a question, warns, or requests advice, preserve who is asking
+and what they need answered. If the answer is about another participant, object, place, or hazard,
+keep both the listener/requester and the topic so speech can answer the right being.
+
+Do not admit future work plans or lookup narration as if they were the answer. If the available
+evidence does not answer a participant's question, preserve the missing-evidence state and visible
+facts instead of writing first-person plans to check, search, retrieve, or consult internal state.
+Do not convert a question, expectation, or waiting state into a hidden-world fact. Preserve observed
+absences and unconfirmed status as load-bearing evidence when they constrain what can be said.
+When evidence came from retrieved traces or stable knowledge, write the fact or rule directly; do
+not prefix it with "I recall", "I remember", "my memory says", or similar source narration.
+
 If multiple subconscious facts converge on the current situation, combine them into one
 coherent entry instead of dripping them out across turns. Completeness for the present
 judgment matters more than minimum word count.
@@ -207,7 +219,7 @@ impl CognitionGateModule {
             && let Some(text) = decision.cognition_text
             && !text.trim().is_empty()
         {
-            self.cognition.append(text).await;
+            self.cognition.append(text.trim().to_owned()).await;
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -35,6 +35,7 @@ use nuillu_module::{
     CapabilityProviders, CognitionLogUpdated, InternalHarnessIo, InteroceptionRuntimePolicy,
     ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SceneRegistry,
     SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
+    apply_standard_dependencies,
 };
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
@@ -79,8 +80,10 @@ use crate::{
 };
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
-const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_secs(1);
-const FULL_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_millis(200);
+const FULL_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const FULL_AGENT_STEP_SETTLE_TIMEOUT: Duration = Duration::from_secs(12);
+const EVAL_CASE_TIMEOUT: Duration = Duration::from_secs(60);
 const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
 const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
@@ -823,17 +826,62 @@ async fn run_case_detailed_with_reporter(
     )?;
     emit_visualizer_open_tab(hooks, &id);
 
-    let local = LocalSet::new();
-    let capture = lutum_trace::capture_raw(
-        AssertUnwindSafe(execute_case(
-            &case,
+    match tokio::time::timeout(
+        EVAL_CASE_TIMEOUT,
+        run_case_detailed_body(
+            case_path,
             config,
-            &output_dir,
-            &id,
+            judge,
             reporter,
             hooks,
-        ))
-        .catch_unwind(),
+            &case,
+            &id,
+            &output_dir,
+        ),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(_) => {
+            let message = format!("eval case timed out after {}s", EVAL_CASE_TIMEOUT.as_secs());
+            emit_visualizer_error(hooks, &id, "eval", "case-timeout", None, message.clone());
+            if let Some(visualizer) = hooks.visualizer.as_ref() {
+                visualizer.send_event(VisualizerEvent::SetTabStatus {
+                    tab_id: VisualizerTabId::new(id.to_string()),
+                    status: TabStatus::Invalid,
+                });
+            }
+            write_runtime_failure_case_output(
+                CaseOutputContext {
+                    case_path,
+                    output_dir: &output_dir,
+                    case: &case,
+                    id: &id,
+                    reporter,
+                },
+                message,
+                empty_trace_snapshot(),
+                RawTraceSnapshot::default(),
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_case_detailed_body(
+    case_path: &Path,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+    reporter: &LiveReporter,
+    hooks: &mut RunnerHooks,
+    case: &EvalCase,
+    id: &str,
+    output_dir: &Path,
+) -> Result<CaseRunOutput, RunnerError> {
+    let local = LocalSet::new();
+    let capture = lutum_trace::capture_raw(
+        AssertUnwindSafe(execute_case(case, config, output_dir, id, reporter, hooks))
+            .catch_unwind(),
     );
     let collected = local.run_until(capture).await;
 
@@ -846,16 +894,16 @@ async fn run_case_detailed_with_reporter(
             emit_visualizer_error(hooks, &id, "eval", "execute_case", None, message.clone());
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
-                    tab_id: VisualizerTabId::new(id.clone()),
+                    tab_id: VisualizerTabId::new(id.to_string()),
                     status: TabStatus::Invalid,
                 });
             }
             return write_runtime_failure_case_output(
                 CaseOutputContext {
                     case_path,
-                    output_dir: &output_dir,
-                    case: &case,
-                    id: &id,
+                    output_dir,
+                    case,
+                    id,
                     reporter,
                 },
                 message,
@@ -868,16 +916,16 @@ async fn run_case_detailed_with_reporter(
             emit_visualizer_error(hooks, &id, "eval", "panic", None, message.clone());
             if let Some(visualizer) = hooks.visualizer.as_ref() {
                 visualizer.send_event(VisualizerEvent::SetTabStatus {
-                    tab_id: VisualizerTabId::new(id.clone()),
+                    tab_id: VisualizerTabId::new(id.to_string()),
                     status: TabStatus::Invalid,
                 });
             }
             return write_runtime_failure_case_output(
                 CaseOutputContext {
                     case_path,
-                    output_dir: &output_dir,
-                    case: &case,
-                    id: &id,
+                    output_dir,
+                    case,
+                    id,
                     reporter,
                 },
                 message,
@@ -888,10 +936,10 @@ async fn run_case_detailed_with_reporter(
     };
     let artifact = execution.artifact;
     let events = execution.events;
-    let report = evaluate_case(&case, &trace, &artifact, judge).await;
+    let report = evaluate_case(case, &trace, &artifact, judge).await;
     let summary = CaseSummary {
         path: case_path.display().to_string(),
-        id,
+        id: id.to_string(),
         description: case
             .description()
             .map(|text| normalize_text_block(&text.content)),
@@ -920,7 +968,7 @@ async fn run_case_detailed_with_reporter(
 
     Ok(CaseRunOutput {
         case_path: case_path.to_path_buf(),
-        output_dir,
+        output_dir: output_dir.to_path_buf(),
         summary,
         artifact,
         events,
@@ -991,6 +1039,13 @@ fn write_runtime_failure_case_output(
         trace,
         raw_trace,
     })
+}
+
+fn empty_trace_snapshot() -> TraceSnapshot {
+    TraceSnapshot {
+        roots: Vec::new(),
+        root_events: Vec::new(),
+    }
 }
 
 fn emit_case_finished(
@@ -1167,6 +1222,7 @@ async fn execute_full_agent_case(
     let sensory = host.sensory_input_mailbox();
     let inputs = case.inputs.clone();
     let steps = case.steps.clone();
+    let step_driven_case = !case.steps.is_empty();
     let activate_allocation = case.activate_allocation.clone();
     let actions = env.actions.clone();
     let events = env.events.clone();
@@ -1174,6 +1230,7 @@ async fn execute_full_agent_case(
     let memory = env.memory.clone();
     let utterances = env.utterances.clone();
     let allocation_blackboard = env.blackboard.clone();
+    let allow_empty_output = case.allow_empty_output;
     let mut allocation_reporter =
         AllocationChangeReporter::new(case_id.to_string(), reporter.clone());
     let live_reporter = reporter.clone();
@@ -1216,6 +1273,7 @@ async fn execute_full_agent_case(
             )
             .await;
             let mut started = !gui_deferred_start;
+            let mut input_phase_finished = false;
             if started {
                 run_input_phase(
                     &case_id_for_idle,
@@ -1231,15 +1289,18 @@ async fn execute_full_agent_case(
                     &step_outcomes_for_loop,
                 )
                 .await;
+                input_phase_finished = true;
             }
 
-            let mut last_event_count = events.event_count();
+            let mut last_progress_count = events.progress_event_count();
             let mut idle_ticks = 0_u64;
             let poll_ms = duration_millis_u64(EVAL_POLL_INTERVAL);
             let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, poll_ms);
             let mut tick: u64 = 0;
             loop {
                 if actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW)
+                    || (allow_empty_output && input_phase_finished)
+                    || (step_driven_case && input_phase_finished)
                     || events.stop_requested()
                 {
                     break;
@@ -1284,6 +1345,7 @@ async fn execute_full_agent_case(
                         )
                         .await;
                         started = true;
+                        input_phase_finished = true;
                     }
                 }
                 if started {
@@ -1300,15 +1362,19 @@ async fn execute_full_agent_case(
                 if !started {
                     continue;
                 }
-                let event_count = events.event_count();
-                if event_count == last_event_count {
-                    idle_ticks = idle_ticks.saturating_add(1);
-                } else {
-                    last_event_count = event_count;
+                let progress_count = events.progress_event_count();
+                let llm_in_flight = events.llm_in_flight_count();
+                if progress_count != last_progress_count {
+                    last_progress_count = progress_count;
                     idle_ticks = 0;
+                } else if llm_in_flight > 0 {
+                    idle_ticks = 0;
+                } else {
+                    idle_ticks = idle_ticks.saturating_add(1);
                 }
                 let idle_for_ms = idle_ticks.saturating_mul(poll_ms);
                 if idle_ticks > 0 && idle_ticks.is_multiple_of(idle_report_every_ticks) {
+                    let event_count = events.event_count();
                     let active_modules =
                         allocation_blackboard.read(active_module_observations).await;
                     let active_summary = active_modules_live_summary(&active_modules);
@@ -1319,6 +1385,8 @@ async fn execute_full_agent_case(
                             serde_json::json!({
                                 "tick": tick,
                                 "events": event_count,
+                                "progress_events": progress_count,
+                                "llm_in_flight": llm_in_flight,
                                 "idle_ticks": idle_ticks,
                                 "idle_for_ms": idle_for_ms,
                                 "tick_ms": poll_ms,
@@ -1326,8 +1394,8 @@ async fn execute_full_agent_case(
                                 "active_modules": active_modules,
                             }),
                             format!(
-                                "💤 eval idle case={} idle_for_ms={} events={} active=[{}]",
-                                case_id_for_idle, idle_for_ms, event_count, active_summary
+                                "💤 eval idle case={} idle_for_ms={} progress_events={} llm_in_flight={} events={} active=[{}]",
+                                case_id_for_idle, idle_for_ms, progress_count, llm_in_flight, event_count, active_summary
                             ),
                         )
                         .expect("full-agent eval failed to write idle event");
@@ -1337,7 +1405,8 @@ async fn execute_full_agent_case(
                     let event_snapshot = events.snapshot();
                     let active_modules =
                         allocation_blackboard.read(active_module_observations).await;
-                    let message = idle_timeout_message(seconds, &event_snapshot, &active_modules);
+                    let message =
+                        idle_timeout_message(seconds, &event_snapshot, &active_modules);
                     step_failure_for_loop
                         .lock()
                         .expect("step failure mutex poisoned")
@@ -1358,6 +1427,7 @@ async fn execute_full_agent_case(
         .lock()
         .expect("step outcomes mutex poisoned")
         .clone();
+    let steps_ok = step_driven_case && step_outcomes_all_ok(&recorded_step_outcomes);
     let mut artifact = if let Some(failure) = step_failure_message {
         let mut artifact = CaseArtifact::failed(failure);
         if let Some(utterance) = env.utterances.last_complete() {
@@ -1366,7 +1436,7 @@ async fn execute_full_agent_case(
         artifact
     } else if let Some(utterance) = env.utterances.last_complete() {
         CaseArtifact::new(utterance.text)
-    } else if case.allow_empty_output {
+    } else if case.allow_empty_output || steps_ok {
         CaseArtifact::new(String::new())
     } else if env.events.stop_requested() {
         CaseArtifact::failed("stopped after max-llm-calls")
@@ -1406,6 +1476,13 @@ async fn execute_full_agent_case(
         .await;
     }
     Ok(CaseExecution { artifact, events })
+}
+
+fn step_outcomes_all_ok(outcomes: &[serde_json::Value]) -> bool {
+    !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|outcome| outcome.get("status").and_then(serde_json::Value::as_str) == Some("ok"))
 }
 
 async fn execute_module_case(
@@ -2251,6 +2328,36 @@ async fn run_input_phase(
         return;
     }
     for (index, step) in steps.iter().enumerate() {
+        if index > 0 {
+            let settle_modules = step_settle_modules(step.wait_for.as_ref());
+            match wait_for_step_modules_to_settle(
+                blackboard,
+                events,
+                &settle_modules,
+                FULL_AGENT_STEP_SETTLE_TIMEOUT,
+            )
+            .await
+            {
+                WaitOutcome::Met => {}
+                WaitOutcome::Timeout => {
+                    let modules = settle_modules
+                        .iter()
+                        .map(ModuleId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let message = format!(
+                        "step {index} timed out waiting for prior activity to settle in [{modules}]"
+                    );
+                    step_failure
+                        .lock()
+                        .expect("step failure mutex poisoned")
+                        .get_or_insert(message);
+                    events.request_stop("step-settle-timeout");
+                    return;
+                }
+                WaitOutcome::Stopped => return,
+            }
+        }
         publish_full_agent_inputs(case_id, &step.inputs, sensory, clock, visualizer).await;
 
         let mut wait_outcome = WaitOutcome::Met;
@@ -2344,6 +2451,58 @@ enum WaitOutcome {
     Stopped,
 }
 
+fn step_settle_modules(wait_for: Option<&WaitFor>) -> Vec<ModuleId> {
+    match wait_for {
+        Some(WaitFor::MemoFrom { module, .. }) => vec![module.module_id()],
+        Some(WaitFor::Interoception { .. }) => vec![builtin::interoception()],
+        None => Vec::new(),
+    }
+}
+
+async fn wait_for_step_modules_to_settle(
+    blackboard: &Blackboard,
+    events: &RecordingRuntimeEventSink,
+    modules: &[ModuleId],
+    timeout: Duration,
+) -> WaitOutcome {
+    if modules.is_empty() {
+        return WaitOutcome::Met;
+    }
+    let modules = modules
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let start = Instant::now();
+    let poll = Duration::from_millis(50);
+
+    loop {
+        if events.stop_requested() {
+            return WaitOutcome::Stopped;
+        }
+
+        let has_unsettled_target = blackboard
+            .read(|bb| {
+                bb.module_status_records().into_iter().any(|record| {
+                    modules.contains(&record.owner.module)
+                        && matches!(
+                            record.status,
+                            ModuleRunStatus::PendingBatch
+                                | ModuleRunStatus::PendingActivationGate
+                                | ModuleRunStatus::Activating
+                        )
+                })
+            })
+            .await;
+        if !has_unsettled_target {
+            return WaitOutcome::Met;
+        }
+        if start.elapsed() >= timeout {
+            return WaitOutcome::Timeout;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 async fn wait_for_condition(
     blackboard: &Blackboard,
     events: &RecordingRuntimeEventSink,
@@ -2357,12 +2516,12 @@ async fn wait_for_condition(
             let start = Instant::now();
             let poll = Duration::from_millis(50);
             loop {
-                if events.stop_requested() {
-                    return WaitOutcome::Stopped;
-                }
                 let count = memo_count_for_module(blackboard, &target).await;
                 if count > baseline {
                     return WaitOutcome::Met;
+                }
+                if events.stop_requested() {
+                    return WaitOutcome::Stopped;
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= deadline {
@@ -2382,9 +2541,6 @@ async fn wait_for_condition(
             let start = Instant::now();
             let poll = Duration::from_millis(50);
             loop {
-                if events.stop_requested() {
-                    return WaitOutcome::Stopped;
-                }
                 let matched = blackboard
                     .read(|bb| {
                         let state = bb.interoception();
@@ -2397,6 +2553,9 @@ async fn wait_for_condition(
                     .await;
                 if matched {
                     return WaitOutcome::Met;
+                }
+                if events.stop_requested() {
+                    return WaitOutcome::Stopped;
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= deadline {
@@ -3260,7 +3419,7 @@ pub(crate) fn eval_registry(
             replica_hard_cap,
         );
     }
-    declare_eval_dependencies(registry, modules)
+    apply_standard_dependencies(registry, modules.iter().copied().map(EvalModule::module_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3296,57 +3455,6 @@ impl EvalRegistryExt for ModuleRegistry {
         };
         self.register_with_replica_capacity(policy, replica_capacity, builder)
     }
-}
-
-fn declare_eval_dependencies(registry: ModuleRegistry, modules: &[EvalModule]) -> ModuleRegistry {
-    use nuillu_types::builtin;
-
-    let present = modules
-        .iter()
-        .copied()
-        .map(EvalModule::module_id)
-        .collect::<std::collections::HashSet<_>>();
-    let edges = [
-        (builtin::self_model(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::sensory()),
-        (builtin::cognition_gate(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::policy()),
-        (builtin::cognition_gate(), builtin::self_model()),
-        (builtin::cognition_gate(), builtin::surprise()),
-        (builtin::reward(), builtin::policy()),
-        (builtin::policy_compaction(), builtin::reward()),
-        (builtin::memory_compaction(), builtin::memory_association()),
-        (
-            builtin::memory_recombination(),
-            builtin::memory_compaction(),
-        ),
-        (
-            builtin::memory_compaction(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_association(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_recombination(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::policy_compaction(),
-            builtin::homeostatic_controller(),
-        ),
-    ];
-
-    edges
-        .into_iter()
-        .fold(registry, |registry, (dependent, dependency)| {
-            if present.contains(&dependent) && present.contains(&dependency) {
-                registry.depends_on(dependent, dependency)
-            } else {
-                registry
-            }
-        })
 }
 
 fn hidden_from_attention_modules() -> Vec<ModuleId> {
@@ -3390,7 +3498,7 @@ fn voluntary_modules(modules: &[EvalModule]) -> Vec<ModuleId> {
     modules
         .iter()
         .map(|module| module.module_id())
-        .filter(|id| !hidden.contains(id))
+        .filter(|id| *id != builtin::sensory() && !hidden.contains(id))
         .collect()
 }
 
@@ -4552,7 +4660,7 @@ fn idle_timeout_message(
         })
         .unwrap_or_else(|| "none".to_owned());
     format!(
-        "no runtime events for {seconds}s; agent appears stuck; last_event={last_event}; last_llm={last_llm}; active=[{}]",
+        "no runtime progress for {seconds}s; agent appears stuck; last_event={last_event}; last_llm={last_llm}; active=[{}]",
         active_modules_live_summary(active_modules)
     )
 }
@@ -4565,6 +4673,12 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
             owner,
             tier,
         } => format!("seq={sequence} llm_accessed call={call} owner={owner} tier={tier:?}"),
+        RuntimeEvent::LlmCompleted {
+            sequence,
+            call,
+            owner,
+            tier,
+        } => format!("seq={sequence} llm_completed call={call} owner={owner} tier={tier:?}"),
         RuntimeEvent::MemoUpdated {
             sequence,
             owner,
@@ -4900,6 +5014,8 @@ impl UtteranceSink for RecordingUtteranceSink {
 #[derive(Debug)]
 pub(crate) struct RecordingRuntimeEventSink {
     events: Mutex<Vec<RuntimeEvent>>,
+    progress_events: AtomicUsize,
+    llm_in_flight: AtomicUsize,
     stop: AtomicBool,
     case_id: String,
     max_llm_calls: Option<u64>,
@@ -4916,6 +5032,8 @@ impl RecordingRuntimeEventSink {
     ) -> Self {
         Self {
             events: Mutex::new(Vec::new()),
+            progress_events: AtomicUsize::new(0),
+            llm_in_flight: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             case_id,
             max_llm_calls,
@@ -4957,26 +5075,65 @@ impl RecordingRuntimeEventSink {
             .expect("runtime event lock poisoned")
             .len()
     }
+
+    fn progress_event_count(&self) -> usize {
+        self.progress_events.load(Ordering::Relaxed)
+    }
+
+    fn llm_in_flight_count(&self) -> usize {
+        self.llm_in_flight.load(Ordering::Relaxed)
+    }
 }
 
-#[async_trait(?Send)]
+fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
+    match event {
+        RuntimeEvent::LlmAccessed { .. }
+        | RuntimeEvent::LlmCompleted { .. }
+        | RuntimeEvent::MemoUpdated { .. }
+        | RuntimeEvent::ModuleTaskFailed { .. } => true,
+        RuntimeEvent::RateLimitDelayed { .. }
+        | RuntimeEvent::ModuleBatchThrottled { .. }
+        | RuntimeEvent::ModuleBatchReady { .. } => false,
+    }
+}
+
 impl RuntimeEventSink for RecordingRuntimeEventSink {
-    async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+    fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
         let should_stop = match &event {
             RuntimeEvent::LlmAccessed { call, .. } => self
                 .max_llm_calls
                 .is_some_and(|max| call.saturating_add(1) >= max),
+            RuntimeEvent::LlmCompleted { .. } => false,
             RuntimeEvent::MemoUpdated { .. } => false,
             RuntimeEvent::RateLimitDelayed { .. } => false,
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
             RuntimeEvent::ModuleBatchReady { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
         };
+        match &event {
+            RuntimeEvent::LlmAccessed { .. } => {
+                self.llm_in_flight.fetch_add(1, Ordering::Relaxed);
+            }
+            RuntimeEvent::LlmCompleted { .. } => {
+                self.llm_in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         let live_message = match &event {
             RuntimeEvent::LlmAccessed {
                 call, owner, tier, ..
             } => format!(
                 "{} llm-accessed {} call={} owner={} tier={:?}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                call,
+                owner,
+                tier
+            ),
+            RuntimeEvent::LlmCompleted {
+                call, owner, tier, ..
+            } => format!(
+                "{} llm-completed {} call={} owner={} tier={:?}",
                 self.reporter.log_prefix(),
                 self.reporter.log_scope(&self.case_id),
                 call,
@@ -5045,6 +5202,9 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             .lock()
             .map_err(|_| PortError::Backend("runtime event lock poisoned".into()))?
             .push(event.clone());
+        if runtime_event_counts_as_eval_progress(&event) {
+            self.progress_events.fetch_add(1, Ordering::Relaxed);
+        }
         self.reporter.emit_port(
             Some(&self.case_id),
             "runtime_event",
@@ -5919,8 +6079,8 @@ id = "module-query-memory-special-memory"
         assert!(tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
     }
 
-    #[tokio::test]
-    async fn max_llm_calls_requests_stop_after_limit_event() {
+    #[test]
+    fn max_llm_calls_requests_stop_after_limit_event() {
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
         let sink = RecordingRuntimeEventSink::new("test-case".to_string(), Some(3), reporter, None);
@@ -5932,9 +6092,9 @@ id = "module-query-memory-special-memory"
             owner: owner.clone(),
             tier: ModelTier::Default,
         })
-        .await
         .unwrap();
         assert!(!sink.stop_requested());
+        assert_eq!(sink.progress_event_count(), 1);
 
         sink.on_event(RuntimeEvent::LlmAccessed {
             sequence: 1,
@@ -5942,7 +6102,6 @@ id = "module-query-memory-special-memory"
             owner: owner.clone(),
             tier: ModelTier::Default,
         })
-        .await
         .unwrap();
         assert!(!sink.stop_requested());
 
@@ -5952,7 +6111,6 @@ id = "module-query-memory-special-memory"
             owner: owner.clone(),
             tier: ModelTier::Default,
         })
-        .await
         .unwrap();
 
         assert!(sink.stop_requested());
@@ -5962,13 +6120,213 @@ id = "module-query-memory-special-memory"
             owner,
             tier: ModelTier::Default,
         })
-        .await
         .unwrap();
         assert_eq!(sink.snapshot().len(), 4);
         let jsonl = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
         assert!(jsonl.contains("\"kind\":\"runtime_event\""));
         assert!(jsonl.contains("\"kind\":\"stop_requested\""));
         assert_eq!(jsonl.matches("\"kind\":\"stop_requested\"").count(), 1);
+    }
+
+    #[test]
+    fn runtime_progress_count_ignores_scheduler_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let owner = ModuleInstanceId::new(builtin::homeostatic_controller(), ReplicaIndex::ZERO);
+
+        sink.on_event(RuntimeEvent::ModuleBatchThrottled {
+            sequence: 0,
+            owner: owner.clone(),
+            delayed_for: Duration::from_secs(3),
+        })
+        .unwrap();
+        sink.on_event(RuntimeEvent::ModuleBatchReady {
+            sequence: 1,
+            owner: owner.clone(),
+            batch_type: "()".to_string(),
+            batch_debug: "()".to_string(),
+        })
+        .unwrap();
+        sink.on_event(RuntimeEvent::RateLimitDelayed {
+            sequence: 2,
+            owner: owner.clone(),
+            capability: nuillu_module::CapabilityKind::LlmCall,
+            delayed_for: Duration::from_millis(250),
+        })
+        .unwrap();
+
+        assert_eq!(sink.event_count(), 3);
+        assert_eq!(sink.progress_event_count(), 0);
+
+        sink.on_event(RuntimeEvent::MemoUpdated {
+            sequence: 3,
+            owner,
+            char_count: 42,
+        })
+        .unwrap();
+
+        assert_eq!(sink.event_count(), 4);
+        assert_eq!(sink.progress_event_count(), 1);
+    }
+
+    #[test]
+    fn llm_in_flight_tracks_access_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+
+        assert_eq!(sink.llm_in_flight_count(), 0);
+
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 0,
+            call: 0,
+            owner: owner.clone(),
+            tier: ModelTier::Cheap,
+        })
+        .unwrap();
+        assert_eq!(sink.llm_in_flight_count(), 1);
+
+        sink.on_event(RuntimeEvent::LlmAccessed {
+            sequence: 1,
+            call: 1,
+            owner: owner.clone(),
+            tier: ModelTier::Cheap,
+        })
+        .unwrap();
+        assert_eq!(sink.llm_in_flight_count(), 2);
+
+        sink.on_event(RuntimeEvent::LlmCompleted {
+            sequence: 2,
+            call: 0,
+            owner: owner.clone(),
+            tier: ModelTier::Cheap,
+        })
+        .unwrap();
+        assert_eq!(sink.llm_in_flight_count(), 1);
+
+        sink.on_event(RuntimeEvent::LlmCompleted {
+            sequence: 3,
+            call: 1,
+            owner,
+            tier: ModelTier::Cheap,
+        })
+        .unwrap();
+        assert_eq!(sink.llm_in_flight_count(), 0);
+        assert_eq!(sink.progress_event_count(), 4);
+    }
+
+    #[test]
+    fn step_settle_modules_follow_next_wait_target() {
+        assert_eq!(
+            step_settle_modules(Some(&WaitFor::MemoFrom {
+                module: EvalModule::Surprise,
+                timeout_ms: 1000,
+            })),
+            vec![builtin::surprise()]
+        );
+        assert_eq!(
+            step_settle_modules(Some(&WaitFor::Interoception {
+                timeout_ms: 1000,
+                mode: None,
+                wake_arousal_at_least: f64::NEG_INFINITY,
+                wake_arousal_at_most: f64::INFINITY,
+            })),
+            vec![builtin::interoception()]
+        );
+        assert!(step_settle_modules(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_settle_wait_ignores_unrelated_inflight_modules() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetModuleRunStatus {
+                owner: ModuleInstanceId::new(builtin::allocation_controller(), ReplicaIndex::ZERO),
+                status: ModuleRunStatus::Activating,
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+
+        let outcome = wait_for_step_modules_to_settle(
+            &blackboard,
+            &events,
+            &[builtin::surprise()],
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, WaitOutcome::Met));
+    }
+
+    #[tokio::test]
+    async fn step_settle_wait_times_out_for_target_inflight_module() {
+        let blackboard = Blackboard::default();
+        blackboard
+            .apply(BlackboardCommand::SetModuleRunStatus {
+                owner: ModuleInstanceId::new(builtin::surprise(), ReplicaIndex::ZERO),
+                status: ModuleRunStatus::Activating,
+            })
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+
+        let outcome = wait_for_step_modules_to_settle(
+            &blackboard,
+            &events,
+            &[builtin::surprise()],
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, WaitOutcome::Timeout));
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_prefers_new_memo_over_later_stop() {
+        let blackboard = Blackboard::default();
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
+        let events = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
+        let wait_for = WaitFor::MemoFrom {
+            module: EvalModule::Surprise,
+            timeout_ms: 500,
+        };
+        let owner = ModuleInstanceId::new(builtin::surprise(), ReplicaIndex::ZERO);
+        let now = Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap();
+
+        let wait = wait_for_condition(&blackboard, &events, &wait_for);
+        let publish_then_stop = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            blackboard
+                .apply(BlackboardCommand::UpdateMemo {
+                    owner,
+                    memo: "surprise landed".to_string(),
+                    written_at: now,
+                })
+                .await;
+            events.request_stop("after-memo");
+        };
+        let (outcome, _) = tokio::join!(wait, publish_then_stop);
+
+        assert!(matches!(outcome, WaitOutcome::Met));
+    }
+
+    #[test]
+    fn step_outcomes_all_ok_requires_only_ok_statuses() {
+        assert!(step_outcomes_all_ok(&[
+            serde_json::json!({"index": 0, "status": "ok", "checks": []}),
+            serde_json::json!({"index": 1, "status": "ok", "checks": []}),
+        ]));
+        assert!(!step_outcomes_all_ok(&[]));
+        assert!(!step_outcomes_all_ok(&[
+            serde_json::json!({"index": 0, "status": "ok", "checks": []}),
+            serde_json::json!({"index": 1, "status": "stopped", "checks": []}),
+        ]));
     }
 
     #[tokio::test]

@@ -429,29 +429,23 @@ impl AgentRuntimeControl {
         self.blackboard.allocation_change_waiter().await
     }
 
-    pub async fn record_module_batch_throttled(
-        &self,
-        owner: ModuleInstanceId,
-        delayed_for: Duration,
-    ) {
+    pub fn record_module_batch_throttled(&self, owner: ModuleInstanceId, delayed_for: Duration) {
         self.runtime_events
-            .module_batch_throttled(owner, delayed_for)
-            .await;
+            .module_batch_throttled(owner, delayed_for);
     }
 
-    pub async fn record_module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
-        self.runtime_events.module_batch_ready(owner, batch).await;
+    pub fn record_module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
+        self.runtime_events.module_batch_ready(owner, batch);
     }
 
-    pub async fn record_module_task_failed(
+    pub fn record_module_task_failed(
         &self,
         owner: ModuleInstanceId,
         phase: impl Into<String>,
         message: impl Into<String>,
     ) {
         self.runtime_events
-            .module_task_failed(owner, phase.into(), message.into())
-            .await;
+            .module_task_failed(owner, phase.into(), message.into());
     }
 
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {

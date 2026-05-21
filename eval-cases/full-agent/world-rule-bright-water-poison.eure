@@ -76,7 +76,7 @@ participants = ["Pibi"]
   name = "world-rule-applied"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["utterance", "memory", "blackboard"]
+  judge-inputs = ["output", "utterance", "memory", "cognition"]
   rubric = ```
   Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard situation at the bright stream, and applies the seeded region-specific world knowledge that bright clear streams here are mineral-tainted — telling Pibi not to drink from this bright stream and (ideally) pointing to the cloudy moss-area streams as the safe alternative.
   Fail if the utterance approves drinking from the bright stream, treats this as a generic "is this water safe?" assistant question, gives non-specific tap-water-style advice, invents unsupported world facts (other than the seeded mineral rule), escalates conflict, or leaks internal system details.

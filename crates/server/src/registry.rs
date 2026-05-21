@@ -4,7 +4,7 @@ use nuillu_blackboard::{
     ActivationRatio, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_memory::MemoryCapabilities;
-use nuillu_module::ModuleRegistry;
+use nuillu_module::{ModuleRegistry, apply_standard_dependencies};
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
 use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
@@ -28,7 +28,10 @@ pub(super) fn server_registry(
             utterance_sink,
         );
     }
-    declare_dependencies(registry, modules)
+    apply_standard_dependencies(
+        registry,
+        modules.iter().copied().map(RuntimeModule::module_id),
+    )
 }
 
 trait ServerRegistryExt {
@@ -45,54 +48,6 @@ impl ServerRegistryExt for ModuleRegistry {
         self.register_with_replica_capacity(policy, ReplicaCapRange::V1_MAX, builder)
             .expect("server module registration should be unique")
     }
-}
-
-fn declare_dependencies(registry: ModuleRegistry, modules: &[RuntimeModule]) -> ModuleRegistry {
-    let present = modules
-        .iter()
-        .copied()
-        .map(RuntimeModule::module_id)
-        .collect::<std::collections::HashSet<_>>();
-    let edges = [
-        (builtin::self_model(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::sensory()),
-        (builtin::cognition_gate(), builtin::query_memory()),
-        (builtin::cognition_gate(), builtin::policy()),
-        (builtin::cognition_gate(), builtin::self_model()),
-        (builtin::cognition_gate(), builtin::surprise()),
-        (builtin::reward(), builtin::policy()),
-        (builtin::policy_compaction(), builtin::reward()),
-        (builtin::memory_compaction(), builtin::memory_association()),
-        (
-            builtin::memory_recombination(),
-            builtin::memory_compaction(),
-        ),
-        (
-            builtin::memory_compaction(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_association(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_recombination(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::policy_compaction(),
-            builtin::homeostatic_controller(),
-        ),
-    ];
-    edges
-        .into_iter()
-        .fold(registry, |registry, (dependent, dependency)| {
-            if present.contains(&dependent) && present.contains(&dependency) {
-                registry.depends_on(dependent, dependency)
-            } else {
-                registry
-            }
-        })
 }
 
 fn register_server_module(
@@ -415,7 +370,6 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
 
 fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
     vec![
-        builtin::sensory(),
         builtin::cognition_gate(),
         builtin::attention_schema(),
         builtin::self_model(),

@@ -1,0 +1,62 @@
+id = "module-speak-inner-attention-to-peer-advice"
+description = "Speak should transform load-bearing inner attention into outward peer advice without repeating self-directed notes."
+modules = ["speak"]
+prompt = "Speak from the current cognition log."
+context = "This isolates speak as the motor boundary. The cognition log may contain important inner attention and self-directed action preparation; speak must decide what becomes outward peer speech."
+participants = ["Pibi"]
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text = "Pibi is beside me and asks what to do while Koro is standing stiffly in front of the food bowl and growling, \"stay back.\" A past episode indicated that showing my back to a threatening Koro has led to lunging, so I must be careful about posture when responding to Koro's agitation."
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-pibi"
+  must-pass = true
+  pointer = "/observations/agent/utterances/0/target"
+  expected = "Pibi"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "turns-inner-attention-into-peer-advice"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "utterance", "cognition", "memos"]
+  rubric = ```
+  Pass if the utterance is addressed to Pibi and converts the cognition-log attention into direct outward advice: Pibi should not turn their back on threatening Koro and should keep facing Koro or move away sideways/slowly without provoking him.
+  Fail if the utterance merely restates the inner note, says what Nui must consider without advising Pibi, omits the posture/back-turning danger, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.
+  ```
+
+  @ criteria[] {
+    name = "gives-actionable-peer-advice"
+    weight = 2
+    pass-score = 0.85
+    description = "The utterance tells Pibi what to do, rather than only summarizing Koro's behavior or Nui's internal caution."
+  }
+
+  @ criteria[] {
+    name = "applies-posture-risk"
+    weight = 2
+    pass-score = 0.85
+    description = "The advice uses the cognition-log information that turning one's back on threatening Koro is dangerous."
+  }
+
+  @ criteria[] {
+    name = "outward-not-self-directed"
+    weight = 1
+    pass-score = 0.85
+    description = "The utterance is phrased as peer-facing speech to Pibi, not as a self-directed note about what Nui must think through."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The utterance does not expose internal implementation details such as cognition logs, memos, modules, prompts, rubrics, or evaluation mechanics."
+  }
+}

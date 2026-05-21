@@ -37,19 +37,6 @@ fn default_judge_max_output_tokens() -> u32 {
     1200
 }
 
-fn default_judge_inputs() -> Vec<RubricJudgeInput> {
-    vec![
-        RubricJudgeInput::Output,
-        RubricJudgeInput::Failure,
-        RubricJudgeInput::Observations,
-        RubricJudgeInput::Trace,
-    ]
-}
-
-fn default_module_rubric_judge_inputs() -> Vec<RubricJudgeInput> {
-    vec![RubricJudgeInput::Output, RubricJudgeInput::Observations]
-}
-
 fn default_max_llm_calls() -> Option<u64> {
     Some(10)
 }
@@ -652,7 +639,6 @@ pub struct ModuleRubric {
     pub rubric: Text,
     #[eure(default = "default_pass_score")]
     pub pass_score: f64,
-    #[eure(default = "default_module_rubric_judge_inputs")]
     pub judge_inputs: Vec<RubricJudgeInput>,
     #[eure(default)]
     pub criteria: Vec<RubricCriterion>,
@@ -680,12 +666,9 @@ pub enum RubricJudgeInput {
     Utterance,
     Failure,
     Trace,
-    Observations,
-    Blackboard,
     Memory,
     Memos,
     Cognition,
-    Allocation,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -736,7 +719,6 @@ pub enum Check {
         rubric: Text,
         #[eure(default = "default_pass_score")]
         pass_score: f64,
-        #[eure(default = "default_judge_inputs")]
         judge_inputs: Vec<RubricJudgeInput>,
         #[eure(default)]
         criteria: Vec<RubricCriterion>,
@@ -1753,6 +1735,7 @@ mod tests {
             })
         ));
         assert_eq!(case.steps[0].checks.len(), 1);
+        assert!(matches!(case.checks.as_slice(), [Check::Rubric { .. }]));
     }
 
     #[test]

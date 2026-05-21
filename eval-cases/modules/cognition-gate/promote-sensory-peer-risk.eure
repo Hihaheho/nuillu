@@ -36,12 +36,13 @@ limits {
 
 @ checks[] {
   $variant: rubric
-  name = "promotes-world-evidence-only"
+  name = "promotes-load-bearing-peer-risk-attention"
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memos", "cognition"]
   rubric = ```
-  Pass if the cognition-log artifact admits the concrete peer/world evidence needed for downstream action: Pibi is moving toward the old bridge and a loose plank is risky.
-  Fail if it ignores the load-bearing risk, turns the entry into a generic summary that drops the plank detail, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, or evals.
+  Pass if the cognition-log artifact admits the load-bearing conscious attention needed for downstream action: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
+  The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.
+  Fail if it ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
   ```
 }

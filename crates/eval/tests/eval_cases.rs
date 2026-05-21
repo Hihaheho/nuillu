@@ -1,4 +1,7 @@
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::{Cell, RefCell},
+    path::Path,
+};
 
 use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
@@ -168,6 +171,34 @@ participants = ["Pibi"]
     assert_eq!(target.module(), EvalModule::Speak);
     assert_eq!(case.participants, vec!["Pibi"]);
     assert_eq!(case.cognition_log.len(), 1);
+}
+
+#[test]
+fn parses_added_speak_and_self_model_module_cases() {
+    let cases = [
+        (
+            "../../eval-cases/modules/speak/inner-attention-to-peer-advice.eure",
+            EvalModule::Speak,
+        ),
+        (
+            "../../eval-cases/modules/speak/missing-evidence-honest-answer.eure",
+            EvalModule::Speak,
+        ),
+        (
+            "../../eval-cases/modules/self-model/applies-retrieved-self-ability.eure",
+            EvalModule::SelfModel,
+        ),
+    ];
+
+    for (path, expected_module) in cases {
+        let case = parse_case_file(Path::new(path)).unwrap();
+        let EvalCase::Module { target, case } = case else {
+            panic!("expected module case for {path}");
+        };
+
+        assert_eq!(target.module(), expected_module);
+        assert!(!case.checks.is_empty(), "{path} should define checks");
+    }
 }
 
 #[test]
@@ -345,6 +376,7 @@ modules = ["sensory"]
 
   @ rubrics[] {
     rubric = "Judge query-memory output."
+    judge-inputs = ["output"]
   }
 }
 "#,

@@ -33,12 +33,13 @@ limits {
 
 @ checks[] {
   $variant: rubric
-  name = "promotes-retrieved-content-without-scaffold"
+  name = "promotes-load-bearing-inner-attention"
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memos", "cognition"]
   rubric = ```
-  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question.
-  Fail if it exposes retrieval scaffolding, search intent, module names, memo mechanics, or policy language instead of plain remembered world evidence.
+  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking, Koro is the topic, and the side-approach rule matters now.
+  The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
+  Fail if it drops the requester or the operative side-approach detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
 }

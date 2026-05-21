@@ -700,7 +700,7 @@ mod tests {
         );
         let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
         assert_eq!(sensory.level, AllocationEffectLevel::Normal);
-        // Cognition-gate was registered but absent from priority — zero.
+        // Cognition-gate was registered but absent from priority, so it is off.
         assert_eq!(
             last_target(&applied.commands, &builtin::cognition_gate())
                 .unwrap()

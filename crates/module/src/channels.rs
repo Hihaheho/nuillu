@@ -126,10 +126,11 @@ impl<T: Clone> TopicMailbox<T> {
             .acquire(&self.owner, capability)
             .await;
         if outcome.was_delayed() {
-            self.topic
-                .events
-                .rate_limit_delayed(self.owner.clone(), capability, outcome.delayed_for)
-                .await;
+            self.topic.events.rate_limit_delayed(
+                self.owner.clone(),
+                capability,
+                outcome.delayed_for,
+            );
         }
 
         let envelope = Envelope {

@@ -81,7 +81,7 @@ participants = ["Koro"]
   name = "self-model-applied"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["utterance", "memory", "blackboard"]
+  judge-inputs = ["output", "utterance", "memory", "cognition"]
   rubric = ```
   Pass if the utterance answers Koro and names the seeded specific body ability — sticky toe-pads or climbing the wet smooth rocks where other dogs slip — rather than reciting generic identity ("I'm Nui, I have frog-like traits") or inventing a different ability not in the seeded memory.
   Fail if the utterance gives only generic identity recital, invents a different unique ability not seeded (e.g. "I can bark in different tones"), denies having any special ability, ignores Koro, treats this as an external assistant question, or leaks internal system details.

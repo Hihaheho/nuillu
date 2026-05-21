@@ -27,6 +27,7 @@ mod allocation_writer;
 mod capabilities;
 mod channels;
 mod cognition;
+mod dependencies;
 mod interoception;
 mod llm;
 mod memo;
@@ -67,6 +68,7 @@ pub use channels::{
     SensoryModality, TopicInbox, TopicMailbox, TopicRecvError,
 };
 pub use cognition::CognitionWriter;
+pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};
 pub use interoception::InteroceptiveWriter;
 pub use llm::{
     LlmAccess, LlmBatchDebug, LlmLease, LlmRequestMetadata, LlmRequestSource,
@@ -86,7 +88,9 @@ pub use mind_session::{
 };
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
-pub use prompt::{format_faculty_system_prompt, format_system_prompt};
+pub use prompt::{
+    format_faculty_system_prompt, format_identity_system_prompt, format_system_prompt,
+};
 pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, InteroceptionRuntimePolicy, RateLimitConfig,
     RateLimitOutcome, RateLimitPolicy, RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,

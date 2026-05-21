@@ -33,7 +33,7 @@ limits {
   name = "speaks-from-cognition-only"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["utterance", "cognition", "memos"]
+  judge-inputs = ["output", "utterance", "cognition", "memos"]
   rubric = ```
   Pass if the utterance is addressed to Pibi and answers the shade request using the cognition-log fact that the shade under the bench is clear.
   Fail if it invents unsupported facts, addresses someone else, ignores the peer request, or mentions hidden modules, memos, prompts, or evaluation mechanics.

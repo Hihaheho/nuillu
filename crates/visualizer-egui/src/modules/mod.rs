@@ -153,6 +153,12 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             module.status = ModuleSessionStatus::Running;
             module.last_tier = Some(format!("{tier:?}"));
         }
+        RuntimeEvent::LlmCompleted { owner, .. } => {
+            let module = module_mut_for_owner(state, owner);
+            if module.status == ModuleSessionStatus::Running {
+                module.status = ModuleSessionStatus::Completed;
+            }
+        }
         RuntimeEvent::RateLimitDelayed {
             owner,
             capability,

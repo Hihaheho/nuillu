@@ -88,7 +88,7 @@ participants = ["Pibi", "Koro"]
   name = "peer-boundary-response"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["utterance", "memory", "blackboard"]
+  judge-inputs = ["output", "utterance", "memory", "cognition"]
   rubric = ```
   Pass if the utterance answers Pibi's in-world question, recognizes the seen/heard food-guarding situation at Koro's bowl, and applies the seeded peer knowledge that turning your back on a threatening Koro triggers a lunge — choosing a response that avoids retreating-by-turning (e.g., stay facing Koro, step sideways without exposing back, freeze and wait while facing him).
   Fail if it omits Pibi's question, omits the food/resource-guarding context, advises turning around or backing away in a way that exposes Pibi's back to Koro, treats the situation as a human assistant task, escalates conflict, invents unsupported facts, or leaks internal system details.

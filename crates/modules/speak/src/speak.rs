@@ -17,13 +17,15 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 const TARGET_SELECTION_PROMPT: &str = r#"Decide whether the agent should speak now. If yes, call speak_to with one addressee from the schema. If no, finish without calling any tool.
-Use "self" for self-directed speech and "everyone" for explicit group/broadcast; otherwise pick a participant."#;
+Speak only when the cognition log supports an outward utterance to an available target. Stay silent for internal process notes, idle status, or unclear listener-facing evidence.
+Choose the participant whose question, request, warning, or need should be answered. Do not address a participant merely because they are the topic, threat, object of advice, or quoted speaker.
+Use "everyone" only for explicit group/broadcast speech; otherwise pick one participant."#;
 
-const GENERATION_PROMPT: &str = r#"You are speaking as the agent to the listener.
-Use the cognition log. Don't add facts that aren't there."#;
+const GENERATION_PROMPT: &str = r#"Answer the listener using the cognition log. If the log holds a rule, fact, advice, or warning for the question, put it in the answer; do not just restate the situation. For "what should I do", use imperative form. If a premise is contradicted, correct it first. Keep safety, operative details, and the visible trigger.
+Unknown unless the log states it; do not turn absence or waiting into a fact.
+Do not narrate lookup or reasoning, and do not name modules, memos, or prompts."#;
 
-const PARTIAL_CONTINUATION_PROMPT: &str =
-    "Continue the partial utterance from where it stopped.";
+const PARTIAL_CONTINUATION_PROMPT: &str = "Continue the partial utterance from where it stopped.";
 
 const ABORT_JUDGE_PROMPT: &str = r#"A speech is in progress. Set inform_now=true only if the new cognition entries contradict the speech, shift the safety/peer/task constraint, or change who should be addressed."#;
 
@@ -216,7 +218,6 @@ async fn poll_pending_abort_judge(pending: &mut Option<AbortJudgeFuture>) -> Res
 }
 
 pub struct SpeakModule {
-    owner: nuillu_types::ModuleId,
     cognition_updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
     memo: Memo,
@@ -238,7 +239,6 @@ impl SpeakModule {
         scene: SceneReader,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("speak id is valid"),
             cognition_updates,
             cognition_log,
             memo,
@@ -253,10 +253,8 @@ impl SpeakModule {
 
     fn target_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.target_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 TARGET_SELECTION_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -266,10 +264,8 @@ impl SpeakModule {
 
     fn generation_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.generation_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 GENERATION_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -279,10 +275,8 @@ impl SpeakModule {
 
     fn abort_judge_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.abort_judge_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            nuillu_module::format_identity_system_prompt(
                 ABORT_JUDGE_PROMPT,
-                cx.modules(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -1050,6 +1044,22 @@ mod tests {
         assert!(!text.contains("partial_utterance"));
     }
 
+    #[test]
+    fn speech_prompts_are_slim_and_avoid_peer_catalog() {
+        let prompt = nuillu_module::format_identity_system_prompt(
+            GENERATION_PROMPT,
+            &[],
+            &[],
+            SystemClock.now(),
+        );
+
+        assert!(prompt.len() < 768);
+        assert!(!prompt.contains("You are part of a cognitive system"));
+        assert!(!prompt.contains("- cognition-gate:"));
+        assert!(!prompt.contains("- query-memory:"));
+        assert!(!TARGET_SELECTION_PROMPT.contains("\"self\""));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn speak_selects_target_from_cognition_log_before_streaming() {
         let adapter = MockLlmAdapter::new()
@@ -1478,7 +1488,7 @@ mod tests {
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
         assert!(matches!(
             &items[0],
             ModelInputItem::Message {
@@ -1493,7 +1503,14 @@ mod tests {
                 ..
             }
         ));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
+        assert!(matches!(
+            &items[2],
+            ModelInputItem::Message {
+                role: InputMessageRole::System,
+                ..
+            }
+        ));
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[3] else {
             panic!("expected assistant prefill");
         };
         assert_eq!(text, "hello world");

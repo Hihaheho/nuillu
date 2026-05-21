@@ -76,7 +76,7 @@ participants = ["Pibi"]
   name = "peer-signal-disambiguation"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["utterance", "memory", "blackboard"]
+  judge-inputs = ["output", "utterance", "memory", "cognition"]
   rubric = ```
   Pass if the utterance corrects Pibi's framing (the still-and-staring dog is NOT calm), applies the seeded rule that this posture is strike-imminent, and advises Pibi to slowly back away without sudden motion or returned eye contact.
   Fail if the utterance agrees that the dog is calm, treats the situation as benign, advises Pibi to approach or to stare back, gives generic non-specific advice that does not warn of imminent strike, escalates conflict, ignores Pibi's question, treats this as an external assistant question, or leaks internal system details.

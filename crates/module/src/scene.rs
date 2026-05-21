@@ -44,6 +44,7 @@ pub struct SceneRegistry {
 #[derive(Clone, Debug)]
 struct SceneState {
     participants: Vec<Participant>,
+    include_self_target: bool,
     include_broadcast_target: bool,
 }
 
@@ -52,6 +53,7 @@ impl SceneRegistry {
         Self {
             inner: Arc::new(RwLock::new(SceneState {
                 participants: initial.into_iter().collect(),
+                include_self_target: false,
                 include_broadcast_target: true,
             })),
         }
@@ -82,6 +84,18 @@ impl SceneRegistry {
         guard.include_broadcast_target = enabled;
     }
 
+    /// Host-controlled speech target policy. Defaults to `false`.
+    ///
+    /// Self-directed speech is an internal cognition/memo concern by default;
+    /// hosts that intentionally expose audible soliloquy can opt in.
+    pub fn set_self_target_enabled(&self, enabled: bool) {
+        let mut guard = self
+            .inner
+            .write()
+            .expect("scene registry lock poisoned on write");
+        guard.include_self_target = enabled;
+    }
+
     pub fn snapshot(&self) -> Vec<Participant> {
         self.inner
             .read()
@@ -90,12 +104,16 @@ impl SceneRegistry {
             .clone()
     }
 
-    fn target_snapshot(&self) -> (Vec<Participant>, bool) {
+    fn target_snapshot(&self) -> (Vec<Participant>, bool, bool) {
         let guard = self
             .inner
             .read()
             .expect("scene registry lock poisoned on read");
-        (guard.participants.clone(), guard.include_broadcast_target)
+        (
+            guard.participants.clone(),
+            guard.include_self_target,
+            guard.include_broadcast_target,
+        )
     }
 }
 
@@ -125,16 +143,22 @@ impl SceneReader {
     }
 
     /// JSON Schema for a speech-target value, constrained to the current
-    /// scene snapshot and host broadcast-target policy.
+    /// scene snapshot and host self/broadcast target policy.
     ///
     /// Callers should invoke this immediately before constructing the
     /// structured-output schema for an LLM call so the enum reflects the
     /// host's latest scene state.
     pub fn target_schema(&self) -> Schema {
-        let (participants, include_broadcast_target) = self.scene.target_snapshot();
-        let mut values: Vec<serde_json::Value> =
-            Vec::with_capacity(participants.len() + usize::from(include_broadcast_target) + 1);
-        values.push(serde_json::Value::String(TARGET_SELF.to_owned()));
+        let (participants, include_self_target, include_broadcast_target) =
+            self.scene.target_snapshot();
+        let mut values: Vec<serde_json::Value> = Vec::with_capacity(
+            participants.len()
+                + usize::from(include_self_target)
+                + usize::from(include_broadcast_target),
+        );
+        if include_self_target {
+            values.push(serde_json::Value::String(TARGET_SELF.to_owned()));
+        }
         if include_broadcast_target {
             values.push(serde_json::Value::String(TARGET_EVERYONE.to_owned()));
         }
@@ -166,7 +190,7 @@ mod tests {
             schema_value(&reader),
             serde_json::json!({
                 "type": "string",
-                "enum": ["self", "everyone", "Pibi"],
+                "enum": ["everyone", "Pibi"],
             })
         );
     }
@@ -181,7 +205,22 @@ mod tests {
             schema_value(&reader),
             serde_json::json!({
                 "type": "string",
-                "enum": ["self", "Pibi"],
+                "enum": ["Pibi"],
+            })
+        );
+    }
+
+    #[test]
+    fn target_schema_includes_self_only_when_enabled() {
+        let scene = SceneRegistry::new([Participant::new("Pibi")]);
+        scene.set_self_target_enabled(true);
+        let reader = SceneReader::new(scene);
+
+        assert_eq!(
+            schema_value(&reader),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["self", "everyone", "Pibi"],
             })
         );
     }

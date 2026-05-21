@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use nuillu_types::{ModelTier, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +15,12 @@ use crate::r#trait::ModuleBatch;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     LlmAccessed {
+        sequence: u64,
+        call: u64,
+        owner: ModuleInstanceId,
+        tier: ModelTier,
+    },
+    LlmCompleted {
         sequence: u64,
         call: u64,
         owner: ModuleInstanceId,
@@ -51,17 +56,15 @@ pub enum RuntimeEvent {
     },
 }
 
-#[async_trait(?Send)]
 pub trait RuntimeEventSink {
-    async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError>;
+    fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError>;
 }
 
 #[derive(Debug, Default)]
 pub struct NoopRuntimeEventSink;
 
-#[async_trait(?Send)]
 impl RuntimeEventSink for NoopRuntimeEventSink {
-    async fn on_event(&self, _event: RuntimeEvent) -> Result<(), PortError> {
+    fn on_event(&self, _event: RuntimeEvent) -> Result<(), PortError> {
         Ok(())
     }
 }
@@ -82,27 +85,36 @@ impl RuntimeEventEmitter {
         }
     }
 
-    pub(crate) async fn llm_accessed(&self, owner: ModuleInstanceId, tier: ModelTier) {
+    pub(crate) fn llm_accessed(&self, owner: ModuleInstanceId, tier: ModelTier) -> u64 {
         let call = self.next_llm_call.fetch_add(1, Ordering::Relaxed);
+        let owner_for_event = owner.clone();
         self.emit(|sequence| RuntimeEvent::LlmAccessed {
+            sequence,
+            call,
+            owner: owner_for_event,
+            tier,
+        });
+        call
+    }
+
+    pub(crate) fn llm_completed(&self, owner: ModuleInstanceId, tier: ModelTier, call: u64) {
+        self.emit(|sequence| RuntimeEvent::LlmCompleted {
             sequence,
             call,
             owner,
             tier,
-        })
-        .await;
+        });
     }
 
-    pub(crate) async fn memo_updated(&self, owner: ModuleInstanceId, char_count: usize) {
+    pub(crate) fn memo_updated(&self, owner: ModuleInstanceId, char_count: usize) {
         self.emit(|sequence| RuntimeEvent::MemoUpdated {
             sequence,
             owner,
             char_count,
-        })
-        .await;
+        });
     }
 
-    pub(crate) async fn rate_limit_delayed(
+    pub(crate) fn rate_limit_delayed(
         &self,
         owner: ModuleInstanceId,
         capability: CapabilityKind,
@@ -113,24 +125,18 @@ impl RuntimeEventEmitter {
             owner,
             capability,
             delayed_for,
-        })
-        .await;
+        });
     }
 
-    pub(crate) async fn module_batch_throttled(
-        &self,
-        owner: ModuleInstanceId,
-        delayed_for: Duration,
-    ) {
+    pub(crate) fn module_batch_throttled(&self, owner: ModuleInstanceId, delayed_for: Duration) {
         self.emit(|sequence| RuntimeEvent::ModuleBatchThrottled {
             sequence,
             owner,
             delayed_for,
-        })
-        .await;
+        });
     }
 
-    pub(crate) async fn module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
+    pub(crate) fn module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
         let LlmBatchDebug {
             batch_type,
             batch_debug,
@@ -140,11 +146,10 @@ impl RuntimeEventEmitter {
             owner,
             batch_type,
             batch_debug,
-        })
-        .await;
+        });
     }
 
-    pub(crate) async fn module_task_failed(
+    pub(crate) fn module_task_failed(
         &self,
         owner: ModuleInstanceId,
         phase: String,
@@ -155,13 +160,12 @@ impl RuntimeEventEmitter {
             owner,
             phase,
             message,
-        })
-        .await;
+        });
     }
 
-    async fn emit(&self, build: impl FnOnce(u64) -> RuntimeEvent) {
+    fn emit(&self, build: impl FnOnce(u64) -> RuntimeEvent) {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self.sink.on_event(build(sequence)).await {
+        if let Err(error) = self.sink.on_event(build(sequence)) {
             tracing::warn!(?error, "runtime event sink failed");
         }
     }

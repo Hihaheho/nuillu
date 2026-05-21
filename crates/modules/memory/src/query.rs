@@ -488,6 +488,7 @@ impl QueryMemoryModule {
                         return Ok(());
                     }
                     let mut tool_results: Vec<ToolResult> = Vec::new();
+                    let mut wrote_retrieval_memo = false;
                     for call in round.tool_calls.iter().cloned() {
                         match call {
                             QueryMemoryToolsCall::SearchMemory(call) => {
@@ -532,6 +533,7 @@ impl QueryMemoryModule {
                                     )
                                     .await
                                     .context("run write_retrieval_memo tool")?;
+                                wrote_retrieval_memo |= output.written;
                                 tool_results.push(
                                     call.complete(output)
                                         .context("complete write_retrieval_memo tool call")?,
@@ -553,6 +555,9 @@ impl QueryMemoryModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
+                    if wrote_retrieval_memo {
+                        return Ok(());
+                    }
                 }
             }
         }

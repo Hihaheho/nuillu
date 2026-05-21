@@ -129,9 +129,7 @@ impl MemoCore {
     }
 
     async fn publish_update(&self, index: u64, char_count: usize) {
-        self.events
-            .memo_updated(self.owner.clone(), char_count)
-            .await;
+        self.events.memo_updated(self.owner.clone(), char_count);
         if self
             .updates
             .publish(MemoUpdated {

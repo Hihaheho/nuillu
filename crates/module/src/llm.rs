@@ -121,18 +121,33 @@ impl LlmConcurrencyLimiter {
 
 /// A [`Lutum`] handle plus any runtime admission permit held for its use.
 ///
-/// Dropping this value releases the concurrent-call slot. It dereferences to
-/// [`Lutum`] so module code can bind the value and pass `&lutum`.
+/// Dropping this value releases the concurrent-call slot and emits an
+/// [`RuntimeEvent::LlmCompleted`] paired with the [`RuntimeEvent::LlmAccessed`]
+/// that was issued when this lease was acquired. It dereferences to [`Lutum`]
+/// so module code can bind the value and pass `&lutum`.
 pub struct LlmLease {
     lutum: Lutum,
     _permit: Option<OwnedSemaphorePermit>,
+    completion: Option<LlmLeaseCompletion>,
+}
+
+struct LlmLeaseCompletion {
+    events: RuntimeEventEmitter,
+    owner: ModuleInstanceId,
+    tier: ModelTier,
+    call: u64,
 }
 
 impl LlmLease {
-    fn new(lutum: Lutum, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(
+        lutum: Lutum,
+        permit: Option<OwnedSemaphorePermit>,
+        completion: LlmLeaseCompletion,
+    ) -> Self {
         Self {
             lutum,
             _permit: permit,
+            completion: Some(completion),
         }
     }
 
@@ -146,6 +161,16 @@ impl Deref for LlmLease {
 
     fn deref(&self) -> &Self::Target {
         &self.lutum
+    }
+}
+
+impl Drop for LlmLease {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion
+                .events
+                .llm_completed(completion.owner, completion.tier, completion.call);
+        }
     }
 }
 
@@ -200,13 +225,11 @@ impl LlmAccess {
             .acquire(&self.owner, CapabilityKind::LlmCall)
             .await;
         if outcome.was_delayed() {
-            self.events
-                .rate_limit_delayed(
-                    self.owner.clone(),
-                    CapabilityKind::LlmCall,
-                    outcome.delayed_for,
-                )
-                .await;
+            self.events.rate_limit_delayed(
+                self.owner.clone(),
+                CapabilityKind::LlmCall,
+                outcome.delayed_for,
+            );
         }
         let permit = self.concurrency_limiter.acquire().await;
 
@@ -214,7 +237,7 @@ impl LlmAccess {
             .blackboard
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
-        self.events.llm_accessed(self.owner.clone(), tier).await;
+        let call = self.events.llm_accessed(self.owner.clone(), tier);
         let (activation_attempt, batch) = current_activation_llm_request_metadata();
         let lutum = self.tiers.pick(tier).with_extension(LlmRequestMetadata {
             owner: self.owner.clone(),
@@ -223,7 +246,16 @@ impl LlmAccess {
             activation_attempt,
             batch,
         });
-        LlmLease::new(lutum, permit)
+        LlmLease::new(
+            lutum,
+            permit,
+            LlmLeaseCompletion {
+                events: self.events.clone(),
+                owner: self.owner.clone(),
+                tier,
+                call,
+            },
+        )
     }
 }
 
@@ -245,7 +277,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use lutum::{
         FinishReason, Lutum, LutumHooksSet, MockLlmAdapter, MockTextScenario, ModelInput,
         ModelInputHookContext, OnModelInput, RawTextTurnEvent, SharedPoolBudgetManager,
@@ -265,9 +296,8 @@ mod tests {
         events: Mutex<Vec<RuntimeEvent>>,
     }
 
-    #[async_trait(?Send)]
     impl RuntimeEventSink for RecordingSink {
-        async fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+        fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
             self.events.lock().expect("event lock poisoned").push(event);
             Ok(())
         }
@@ -325,8 +355,20 @@ mod tests {
                     owner: owner.clone(),
                     tier: ModelTier::Premium,
                 },
-                RuntimeEvent::LlmAccessed {
+                RuntimeEvent::LlmCompleted {
                     sequence: 1,
+                    call: 0,
+                    owner: owner.clone(),
+                    tier: ModelTier::Premium,
+                },
+                RuntimeEvent::LlmAccessed {
+                    sequence: 2,
+                    call: 1,
+                    owner: owner.clone(),
+                    tier: ModelTier::Premium,
+                },
+                RuntimeEvent::LlmCompleted {
+                    sequence: 3,
                     call: 1,
                     owner,
                     tier: ModelTier::Premium,
@@ -436,7 +478,7 @@ mod tests {
         let _ = access.lutum().await;
 
         let actual = sink.events.lock().expect("event lock poisoned").clone();
-        assert_eq!(actual.len(), 3);
+        assert_eq!(actual.len(), 5);
         assert!(matches!(
             actual[0],
             RuntimeEvent::LlmAccessed {
@@ -446,18 +488,34 @@ mod tests {
             }
         ));
         assert!(matches!(
-            &actual[1],
-            RuntimeEvent::RateLimitDelayed {
+            actual[1],
+            RuntimeEvent::LlmCompleted {
                 sequence: 1,
+                call: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &actual[2],
+            RuntimeEvent::RateLimitDelayed {
+                sequence: 2,
                 owner: delayed_owner,
                 capability: CapabilityKind::LlmCall,
                 delayed_for,
             } if delayed_owner == &owner && *delayed_for > Duration::ZERO
         ));
         assert!(matches!(
-            actual[2],
+            actual[3],
             RuntimeEvent::LlmAccessed {
-                sequence: 2,
+                sequence: 3,
+                call: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            actual[4],
+            RuntimeEvent::LlmCompleted {
+                sequence: 4,
                 call: 1,
                 ..
             }

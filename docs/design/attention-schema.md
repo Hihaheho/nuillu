@@ -38,6 +38,18 @@ External input and output sit at the boundary of cognition:
 - **sensory input** is the only external/app-facing input; it enters through a typed `SensoryInput` channel and is normalized by the sensory module into memo-log entries,
 - **speech output** leaves through a speak/action capability and is mirrored into the speak module's memo log.
 
+Overt speech is modeled as a motor/action gate, not as another cognitive memo. The `speak` module
+may emit only from the admitted cognition log; it does not read memo logs directly and does not
+search for hidden evidence at utterance time. Self-directed or rehearsal-like verbal thought belongs
+inside cognition-log entries and memo traces until an explicit host policy opts into audible
+self-targeted speech.
+
+This keeps a thalamic/basal-ganglia-style output boundary: evidence producers can bid, retrieve, and
+write working traces, cognition-gate admits the settled subset to the conscious surface, and the
+speech action path waits for that evidence to settle before choosing an overt utterance. The output
+gate should suppress speech when the surface only contains internal process state, stale evidence, or
+insufficient grounding.
+
 `AttentionControlRequest` is an internal free-form `String` attention-bid message. Any module granted `AttentionControlRequestMailbox` at boot may publish arbitrary prose to it. Boot wiring consumes it only in allocation-controller, which admits, defers, or rejects the bid by writing allocation guidance and a controller memo. Module-level eval harnesses seed allocation guidance directly to isolate query modules or the self-model module. Full-agent/app-facing cases must enter through `SensoryInput`.
 
 Sensory input is split into `OneShot { modality, direction, content, observed_at }` and `AmbientSnapshot { entries, observed_at }`. One-shot input is a discrete stimulus such as a heard utterance, visual event, or custom modality. Ambient snapshots are the complete current enabled background field keyed by row id; omitted rows mean they are no longer active ambient context, not proof that an external condition disappeared.
@@ -133,6 +145,11 @@ Policy memo -> AllocationController / CognitionGate (memo-authoritative)
 ```
 
 Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Speak decides whether to emit during activation by calling its optional `speak_to` target tool. If it does not call the tool, the activation completes silently. Speak writes a completion memo only after a finished utterance.
+
+Boot-time dependency edges provide the output gate's settling behavior without giving `speak` new
+read privileges. When active, evidence producers such as query-memory, self-model, surprise, and the
+cognition-gate are allowed to flush before `speak` runs, so overt speech reflects the current
+admitted surface rather than racing ahead of late evidence memos.
 
 ## Capabilities
 
@@ -285,7 +302,9 @@ progress, writes the completed targeted utterance to its memo log, and emits thr
 `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact. It
 does not read blackboard memo logs, allocation guidance, or module status.
 
-Speak is not a planner or router. It does not publish query or self-model work, and it does not make resource-allocation decisions. Completed utterance memo-log entries wake the controller.
+Speak is not a planner, router, or inner-speech module. It does not publish query or self-model work,
+and it does not make resource-allocation decisions. Completed utterance memo-log entries wake the
+controller.
 
 ## Invariants
 

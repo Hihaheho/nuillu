@@ -196,16 +196,14 @@ fn render_judge_input_section(
             section("Primary artifact output", render_artifact_output(request))
         }
         RubricJudgeInput::Utterance => section(
-            "Utterance",
-            render_artifact_output(request)
-                + "\n\nRecorded utterances JSON:\n"
-                + &render_observation_paths(
-                    &request.artifact,
-                    &[
-                        ("last_state.utterances", &["last_state", "utterances"]),
-                        ("agent.utterances", &["agent", "utterances"]),
-                    ],
-                ),
+            "Recorded utterances JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[
+                    ("last_state.utterances", &["last_state", "utterances"]),
+                    ("agent.utterances", &["agent", "utterances"]),
+                ],
+            ),
         ),
         RubricJudgeInput::Failure => section(
             "Artifact failure",
@@ -216,18 +214,6 @@ fn render_judge_input_section(
                 .unwrap_or_else(|| "(none)".to_string()),
         ),
         RubricJudgeInput::Trace => section("Trace summary", render_trace_summary(trace)),
-        RubricJudgeInput::Observations => section(
-            "Artifact observations JSON",
-            pretty_json_value(
-                &serde_json::to_value(&request.artifact.observations).unwrap_or_else(
-                    |error| serde_json::json!({ "serialization_error": error.to_string() }),
-                ),
-            ),
-        ),
-        RubricJudgeInput::Blackboard => section(
-            "Blackboard JSON",
-            render_blackboard_input(&request.artifact),
-        ),
         RubricJudgeInput::Memory => section(
             "Memory JSON",
             render_observation_paths(
@@ -264,10 +250,6 @@ fn render_judge_input_section(
                 ],
             ),
         ),
-        RubricJudgeInput::Allocation => section(
-            "Allocation JSON",
-            render_allocation_input(&request.artifact),
-        ),
     }
 }
 
@@ -281,56 +263,6 @@ fn render_artifact_output(request: &RubricJudgeRequest) -> String {
     } else {
         request.artifact.output.clone()
     }
-}
-
-fn render_blackboard_input(artifact: &CaseArtifact) -> String {
-    let last_state_blackboard = observation_path(artifact, &["last_state", "blackboard"])
-        .map(|value| ("last_state.blackboard".to_string(), value.clone()));
-    let agent_blackboard =
-        agent_blackboard_observation(artifact).map(|value| ("agent.blackboard".to_string(), value));
-    render_named_json_values(
-        [last_state_blackboard, agent_blackboard]
-            .into_iter()
-            .flatten(),
-    )
-}
-
-fn render_allocation_input(artifact: &CaseArtifact) -> String {
-    let last_state_allocation =
-        observation_path(artifact, &["last_state", "blackboard"]).map(|bb| {
-            let mut map = serde_json::Map::new();
-            for key in [
-                "base_allocation",
-                "allocation",
-                "allocation_proposals",
-                "replica_caps",
-            ] {
-                if let Some(value) = bb.get(key) {
-                    map.insert(key.to_string(), value.clone());
-                }
-            }
-            (
-                "last_state.blackboard.allocation".to_string(),
-                serde_json::Value::Object(map),
-            )
-        });
-    let agent_allocation = observation_path(artifact, &["agent"]).map(|agent| {
-        let mut map = serde_json::Map::new();
-        for key in ["allocation", "allocation_proposals", "replica_caps"] {
-            if let Some(value) = agent.get(key) {
-                map.insert(key.to_string(), value.clone());
-            }
-        }
-        (
-            "agent.allocation".to_string(),
-            serde_json::Value::Object(map),
-        )
-    });
-    render_named_json_values(
-        [last_state_allocation, agent_allocation]
-            .into_iter()
-            .flatten(),
-    )
 }
 
 fn render_observation_paths(artifact: &CaseArtifact, paths: &[(&str, &[&str])]) -> String {
@@ -363,24 +295,6 @@ fn observation_path<'a>(
         current = current.get(*part)?;
     }
     Some(current)
-}
-
-fn agent_blackboard_observation(artifact: &CaseArtifact) -> Option<serde_json::Value> {
-    let agent = observation_path(artifact, &["agent"])?.as_object()?;
-    let mut map = serde_json::Map::new();
-    for key in [
-        "memo_logs",
-        "cognition_logs",
-        "allocation",
-        "allocation_proposals",
-        "replica_caps",
-        "memory_metadata",
-    ] {
-        if let Some(value) = agent.get(key) {
-            map.insert(key.to_string(), value.clone());
-        }
-    }
-    Some(serde_json::Value::Object(map))
 }
 
 fn pretty_json_value(value: &serde_json::Value) -> String {

@@ -22,33 +22,27 @@ pub fn format_system_prompt(
     let peers = sorted_peer_lines(catalog, owner);
     let mut prompt = base.to_owned();
     append_peer_section(&mut prompt, &peers);
-    if !identity_memories.is_empty() {
-        prompt.push_str(if peers.is_empty() { "\n\n" } else { "\n" });
-        prompt.push_str("Identity memory loaded at agent startup:\n");
-        for memory in identity_memories {
-            prompt.push_str("- [");
-            prompt.push_str(memory.index.as_str());
-            prompt.push_str("] ");
-            prompt.push_str(&render_memory_for_llm(
-                memory.content.as_str(),
-                memory.occurred_at,
-                now,
-            ));
-            prompt.push('\n');
-        }
-    }
-    if !core_policies.is_empty() {
-        prompt.push_str("\n\nCore policies loaded at agent startup:\n");
-        for policy in core_policies {
-            prompt.push_str("- [");
-            prompt.push_str(policy.index.as_str());
-            prompt.push_str("] When ");
-            prompt.push_str(policy.trigger.trim());
-            prompt.push_str(", do: ");
-            prompt.push_str(policy.behavior.trim());
-            prompt.push('\n');
-        }
-    }
+    append_identity_and_policy_sections(
+        &mut prompt,
+        !peers.is_empty(),
+        identity_memories,
+        core_policies,
+        now,
+    );
+    prompt
+}
+
+/// Build a system prompt with stable identity/policy context but without the
+/// peer module catalog. Use this for outward-facing motor/action modules where
+/// exposing internal module structure encourages process-talk.
+pub fn format_identity_system_prompt(
+    base: &str,
+    identity_memories: &[IdentityMemoryRecord],
+    core_policies: &[CorePolicyRecord],
+    now: DateTime<Utc>,
+) -> String {
+    let mut prompt = base.to_owned();
+    append_identity_and_policy_sections(&mut prompt, false, identity_memories, core_policies, now);
     prompt
 }
 
@@ -84,6 +78,42 @@ fn append_peer_section(prompt: &mut String, peers: &[String]) {
     prompt.push_str("\n\nYou are part of a cognitive system. Other modules in this brain:\n");
     prompt.push_str(&peers.join("\n"));
     prompt.push('\n');
+}
+
+fn append_identity_and_policy_sections(
+    prompt: &mut String,
+    follows_peer_section: bool,
+    identity_memories: &[IdentityMemoryRecord],
+    core_policies: &[CorePolicyRecord],
+    now: DateTime<Utc>,
+) {
+    if !identity_memories.is_empty() {
+        prompt.push_str(if follows_peer_section { "\n" } else { "\n\n" });
+        prompt.push_str("Identity memory loaded at agent startup:\n");
+        for memory in identity_memories {
+            prompt.push_str("- [");
+            prompt.push_str(memory.index.as_str());
+            prompt.push_str("] ");
+            prompt.push_str(&render_memory_for_llm(
+                memory.content.as_str(),
+                memory.occurred_at,
+                now,
+            ));
+            prompt.push('\n');
+        }
+    }
+    if !core_policies.is_empty() {
+        prompt.push_str("\n\nCore policies loaded at agent startup:\n");
+        for policy in core_policies {
+            prompt.push_str("- [");
+            prompt.push_str(policy.index.as_str());
+            prompt.push_str("] When ");
+            prompt.push_str(policy.trigger.trim());
+            prompt.push_str(", do: ");
+            prompt.push_str(policy.behavior.trim());
+            prompt.push('\n');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +170,22 @@ mod tests {
             prompt,
             "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
         );
+    }
+
+    #[test]
+    fn identity_system_prompt_omits_peer_catalog() {
+        let memories = vec![IdentityMemoryRecord {
+            index: nuillu_types::MemoryIndex::new("memory-1"),
+            content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
+            occurred_at: None,
+        }];
+        let prompt = format_identity_system_prompt("BASE", &memories, &[], test_now());
+
+        assert_eq!(
+            prompt,
+            "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
+        );
+        assert!(!prompt.contains("You are part of a cognitive system"));
     }
 
     #[test]

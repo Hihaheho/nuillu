@@ -564,9 +564,7 @@ async fn refresh_active_and_schedule(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
-                    runtime
-                        .record_module_batch_ready(owners[index].clone(), &batch)
-                        .await;
+                    runtime.record_module_batch_ready(owners[index].clone(), &batch);
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
                     let core_policies = runtime.core_policies().await;
@@ -681,9 +679,7 @@ async fn handle_task_message(
             delayed_for,
             next_batch_throttle,
         } => {
-            runtime
-                .record_module_batch_throttled(owners[index].clone(), delayed_for)
-                .await;
+            runtime.record_module_batch_throttled(owners[index].clone(), delayed_for);
             kick_inboxes[index] = Some(kick_inbox);
             states[index] = ModuleState::Stored {
                 module,
@@ -712,6 +708,8 @@ async fn handle_task_message(
                         states,
                         kick_handles,
                         dependency_targets,
+                        &owners,
+                        zero_windows,
                         config,
                         parent,
                         subscriber,
@@ -744,9 +742,11 @@ async fn handle_task_message(
                         },
                     )
                     .await;
-                runtime
-                    .record_module_task_failed(owners[index].clone(), "next_batch", message.clone())
-                    .await;
+                runtime.record_module_task_failed(
+                    owners[index].clone(),
+                    "next_batch",
+                    message.clone(),
+                );
                 Err(SchedulerError::ModuleTaskFailed {
                     owner: owners[index].clone(),
                     phase: "next_batch",
@@ -851,9 +851,11 @@ async fn handle_task_message(
                         },
                     )
                     .await;
-                runtime
-                    .record_module_task_failed(owners[index].clone(), "activate", message.clone())
-                    .await;
+                runtime.record_module_task_failed(
+                    owners[index].clone(),
+                    "activate",
+                    message.clone(),
+                );
                 Err(SchedulerError::ModuleTaskFailed {
                     owner: owners[index].clone(),
                     phase: "activate",
@@ -874,9 +876,7 @@ async fn handle_task_message(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
-                    runtime
-                        .record_module_batch_ready(owners[index].clone(), &batch)
-                        .await;
+                    runtime.record_module_batch_ready(owners[index].clone(), &batch);
                     states[index] = ModuleState::Activating;
                     let catalog = runtime.module_catalog();
                     let identity_memories = runtime.identity_memories().await;
@@ -985,17 +985,23 @@ async fn spawn_dependency_flush_or_activate(
     states: &mut [ModuleState],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
+    owners: &[ModuleInstanceId],
+    zero_windows: &mut ZeroReplicaWindows,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) -> ActivationScheduling {
     let completions = collect_dependency_flush_completions(
+        runtime,
         index,
         &owner,
         states,
         kick_handles,
         dependency_targets,
-    );
+        owners,
+        zero_windows,
+    )
+    .await;
     if completions.is_empty() {
         spawn_activation_gate_or_activate(
             runtime,
@@ -1030,16 +1036,22 @@ async fn spawn_dependency_flush_or_activate(
     }
 }
 
-fn collect_dependency_flush_completions(
+async fn collect_dependency_flush_completions(
+    runtime: &AgentRuntimeControl,
     dependent_index: usize,
     sender: &ModuleInstanceId,
     states: &mut [ModuleState],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
+    owners: &[ModuleInstanceId],
+    zero_windows: &mut ZeroReplicaWindows,
 ) -> Vec<tokio::sync::oneshot::Receiver<()>> {
     let mut completions = Vec::new();
     for target_index in dependency_targets.target_indexes(&sender.module) {
         if target_index == dependent_index {
+            continue;
+        }
+        if !scheduling_active(runtime, zero_windows, &owners[target_index]).await {
             continue;
         }
         match &mut states[target_index] {
@@ -1115,9 +1127,7 @@ async fn spawn_activation_gate_or_activate(
         runtime
             .record_module_status(owner.clone(), ModuleRunStatus::Activating)
             .await;
-        runtime
-            .record_module_batch_ready(owner.clone(), &batch)
-            .await;
+        runtime.record_module_batch_ready(owner.clone(), &batch);
         let catalog = runtime.module_catalog();
         let identity_memories = runtime.identity_memories().await;
         let core_policies = runtime.core_policies().await;
@@ -4586,7 +4596,9 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let (_, modules, dependencies) = modules.into_parts_with_dependencies();
+                let (runtime, modules, dependencies) = modules.into_parts_with_dependencies();
+                let mut zero_windows =
+                    super::ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
                 let owners = modules
                     .iter()
                     .map(|module| module.owner().clone())
@@ -4624,12 +4636,16 @@ mod tests {
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
                 let completions = super::collect_dependency_flush_completions(
+                    &runtime,
                     dependent_index,
                     &owners[dependent_index],
                     &mut states,
                     &kick_handles,
                     &dependency_targets,
-                );
+                    &owners,
+                    &mut zero_windows,
+                )
+                .await;
 
                 assert!(
                     completions.is_empty(),
@@ -4643,6 +4659,107 @@ mod tests {
                         .now_or_never()
                         .is_none(),
                     "stored dependency target should not receive a kick"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn inactive_dependency_targets_are_skipped_before_state_kick() {
+        use futures::FutureExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(SilentDependencyA::id()).unwrap();
+                let dependent_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(dependency_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ZERO);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| SilentDependencyA,
+                    )
+                    .unwrap()
+                    .register(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| ImmediateDependentModule {
+                            batch_sent: false,
+                            on_done: None,
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id.clone(), dependency_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, modules, dependencies) = modules.into_parts_with_dependencies();
+                let mut zero_windows =
+                    super::ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
+                let owners = modules
+                    .iter()
+                    .map(|module| module.owner().clone())
+                    .collect::<Vec<_>>();
+                let dependency_index = owners
+                    .iter()
+                    .position(|owner| owner.module == dependency_id)
+                    .unwrap();
+                let dependent_index = owners
+                    .iter()
+                    .position(|owner| owner.module == dependent_id)
+                    .unwrap();
+                assert!(
+                    !runtime.is_active(&owners[dependency_index]).await,
+                    "test setup must keep the dependency outside the active scheduling set"
+                );
+
+                let mut states = Vec::with_capacity(owners.len());
+                let mut kick_handles = Vec::with_capacity(owners.len());
+                let mut dependency_kick_inbox = None;
+                for (index, _owner) in owners.iter().enumerate() {
+                    let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                    kick_handles.push(kick_handle);
+                    if index == dependency_index {
+                        dependency_kick_inbox = Some(kick_inbox);
+                    }
+                    states.push(super::ModuleState::Awaiting);
+                }
+
+                let mut target_indexes_by_role = HashMap::new();
+                target_indexes_by_role.insert(dependency_id, vec![dependency_index]);
+                let dependency_targets = super::DependencyTargets {
+                    dependencies: Arc::new(dependencies),
+                    target_indexes_by_role: Arc::new(target_indexes_by_role),
+                };
+                let completions = super::collect_dependency_flush_completions(
+                    &runtime,
+                    dependent_index,
+                    &owners[dependent_index],
+                    &mut states,
+                    &kick_handles,
+                    &dependency_targets,
+                    &owners,
+                    &mut zero_windows,
+                )
+                .await;
+
+                assert!(
+                    completions.is_empty(),
+                    "inactive dependency target should not block the dependent"
+                );
+                assert!(
+                    dependency_kick_inbox
+                        .as_mut()
+                        .unwrap()
+                        .next()
+                        .now_or_never()
+                        .is_none(),
+                    "inactive dependency target should not receive a flush kick"
                 );
             })
             .await;
@@ -4956,10 +5073,20 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let (_, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let (runtime, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let mut zero_windows =
+                    super::ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
+                let owners = modules
+                    .iter()
+                    .map(|module| module.owner().clone())
+                    .collect::<Vec<_>>();
                 let dependent_index = modules
                     .iter()
                     .position(|module| module.owner().module == dependent_id)
+                    .unwrap();
+                let dependency_index = modules
+                    .iter()
+                    .position(|module| module.owner().module == dependency_id)
                     .unwrap();
                 let mut dependent = modules.remove(dependent_index);
                 let dependent_owner = dependent.owner().clone();
@@ -4968,24 +5095,41 @@ mod tests {
                     dependency_id,
                     nuillu_types::ReplicaIndex::ZERO,
                 );
-                let (dependent_kick_inbox, dependent_kick_handle) = crate::kicks::KickInbox::new();
-                let (mut dependency_kick_inbox, dependency_kick_handle) =
-                    crate::kicks::KickInbox::new();
+                let mut dependent_kick_inbox = None;
+                let mut dependent_kick_handle = None;
+                let mut dependency_kick_inbox = None;
+                let mut kick_handles = Vec::with_capacity(owners.len());
+                for index in 0..owners.len() {
+                    let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                    if index == dependent_index {
+                        dependent_kick_inbox = Some(kick_inbox);
+                        dependent_kick_handle = Some(kick_handle.clone());
+                    } else if index == dependency_index {
+                        dependency_kick_inbox = Some(kick_inbox);
+                    }
+                    kick_handles.push(kick_handle);
+                }
                 let mut target_indexes_by_role = HashMap::new();
-                target_indexes_by_role.insert(dependency_owner.module.clone(), vec![1]);
+                target_indexes_by_role
+                    .insert(dependency_owner.module.clone(), vec![dependency_index]);
                 let dependency_targets = super::DependencyTargets {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
-                let mut states = vec![super::ModuleState::Awaiting, super::ModuleState::Awaiting];
-                let kick_handles = vec![dependent_kick_handle.clone(), dependency_kick_handle];
+                let mut states = (0..owners.len())
+                    .map(|_| super::ModuleState::Awaiting)
+                    .collect::<Vec<_>>();
                 let completions = super::collect_dependency_flush_completions(
-                    0,
+                    &runtime,
+                    dependent_index,
                     &dependent_owner,
                     &mut states,
                     &kick_handles,
                     &dependency_targets,
-                );
+                    &owners,
+                    &mut zero_windows,
+                )
+                .await;
                 assert_eq!(completions.len(), 1);
                 let mut tasks = futures::stream::FuturesUnordered::new();
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -4993,9 +5137,9 @@ mod tests {
 
                 super::spawn_dependency_flush_wait(
                     &mut tasks,
-                    0,
+                    dependent_index,
                     dependent,
-                    dependent_kick_inbox,
+                    dependent_kick_inbox.unwrap(),
                     Vec::new(),
                     batch,
                     completions,
@@ -5003,10 +5147,12 @@ mod tests {
                     &subscriber,
                 );
                 let dependency_kick = dependency_kick_inbox
+                    .as_mut()
+                    .unwrap()
                     .next()
                     .await
                     .expect("dependent should kick its dependency");
-                let dependent_completion = dependent_kick_handle.send(dependency_owner);
+                let dependent_completion = dependent_kick_handle.unwrap().send(dependency_owner);
                 dependency_kick.notify_finish();
 
                 let message = tasks
