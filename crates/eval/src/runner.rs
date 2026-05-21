@@ -81,6 +81,7 @@ use crate::{
 
 const IDLE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const FULL_AGENT_ACTION_SILENCE_WINDOW: Duration = Duration::from_millis(200);
+const FULL_AGENT_RUNTIME_SILENCE_WINDOW: Duration = Duration::from_millis(200);
 const FULL_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const FULL_AGENT_STEP_SETTLE_TIMEOUT: Duration = Duration::from_secs(12);
 const EVAL_CASE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1292,16 +1293,26 @@ async fn execute_full_agent_case(
                 input_phase_finished = true;
             }
 
-            let mut last_progress_count = events.progress_event_count();
+            let initial_progress_count = events.progress_event_count();
+            let mut settle = FullAgentSettleTracker::new(initial_progress_count, Instant::now());
+            let mut last_progress_count = initial_progress_count;
             let mut idle_ticks = 0_u64;
             let poll_ms = duration_millis_u64(EVAL_POLL_INTERVAL);
             let idle_report_every_ticks = ticks_for_interval(IDLE_REPORT_INTERVAL, poll_ms);
             let mut tick: u64 = 0;
             loop {
-                if actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW)
-                    || (allow_empty_output && input_phase_finished)
-                    || (step_driven_case && input_phase_finished)
-                    || events.stop_requested()
+                let now = Instant::now();
+                settle.observe_progress_count(events.progress_event_count(), now);
+                if events.stop_requested()
+                    || full_agent_ready_to_score_at(
+                        &actions,
+                        &settle,
+                        events.llm_in_flight_count(),
+                        input_phase_finished,
+                        allow_empty_output,
+                        step_driven_case,
+                        now,
+                    )
                 {
                     break;
                 }
@@ -4871,10 +4882,6 @@ impl ActionActivityTracker {
         }
     }
 
-    fn silence_window_elapsed(&self, window: Duration) -> bool {
-        self.silence_window_elapsed_at(window, Instant::now())
-    }
-
     fn silence_window_elapsed_at(&self, window: Duration, now: Instant) -> bool {
         let last_completed_at = *self
             .last_completed_at
@@ -4885,6 +4892,61 @@ impl ActionActivityTracker {
                 .is_some_and(|elapsed| elapsed >= window)
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct FullAgentSettleTracker {
+    last_progress_count: usize,
+    last_progress_at: Instant,
+}
+
+impl FullAgentSettleTracker {
+    fn new(progress_count: usize, now: Instant) -> Self {
+        Self {
+            last_progress_count: progress_count,
+            last_progress_at: now,
+        }
+    }
+
+    fn observe_progress_count(&mut self, progress_count: usize, now: Instant) {
+        if progress_count == self.last_progress_count {
+            return;
+        }
+        self.last_progress_count = progress_count;
+        self.last_progress_at = now;
+    }
+
+    fn runtime_silence_elapsed_at(
+        &self,
+        window: Duration,
+        llm_in_flight: usize,
+        now: Instant,
+    ) -> bool {
+        llm_in_flight == 0
+            && now
+                .checked_duration_since(self.last_progress_at)
+                .is_some_and(|elapsed| elapsed >= window)
+    }
+}
+
+fn full_agent_ready_to_score_at(
+    actions: &ActionActivityTracker,
+    settle: &FullAgentSettleTracker,
+    llm_in_flight: usize,
+    input_phase_finished: bool,
+    allow_empty_output: bool,
+    step_driven_case: bool,
+    now: Instant,
+) -> bool {
+    if !settle.runtime_silence_elapsed_at(
+        FULL_AGENT_RUNTIME_SILENCE_WINDOW,
+        llm_in_flight,
+        now,
+    ) {
+        return false;
+    }
+    actions.silence_window_elapsed_at(FULL_AGENT_ACTION_SILENCE_WINDOW, now)
+        || (input_phase_finished && (allow_empty_output || step_driven_case))
 }
 
 #[derive(Clone)]
@@ -5893,7 +5955,9 @@ id = "module-query-memory-special-memory"
 
         assert_eq!(sink.snapshot().len(), 2);
         assert_eq!(sink.last_complete().unwrap().text, "second");
-        assert!(!actions.silence_window_elapsed(FULL_AGENT_ACTION_SILENCE_WINDOW));
+        assert!(
+            !actions.silence_window_elapsed_at(FULL_AGENT_ACTION_SILENCE_WINDOW, Instant::now())
+        );
     }
 
     #[tokio::test]
@@ -6077,6 +6141,72 @@ id = "module-query-memory-special-memory"
         tracker.record_completed_at(&builtin::speak(), completed_at);
         tracker.record_completed_at(&builtin::query_memory(), after_window);
         assert!(tracker.silence_window_elapsed_at(Duration::from_secs(1), after_window));
+    }
+
+    #[test]
+    fn full_agent_settle_waits_for_runtime_after_action_silence() {
+        let actions = ActionActivityTracker::new(vec![builtin::speak()]);
+        let now = Instant::now();
+        actions.record_completed_at(&builtin::speak(), now);
+        let mut settle = FullAgentSettleTracker::new(0, now);
+
+        let after_action_silence = now + FULL_AGENT_ACTION_SILENCE_WINDOW;
+        assert!(!full_agent_ready_to_score_at(
+            &actions,
+            &settle,
+            1,
+            true,
+            false,
+            false,
+            after_action_silence,
+        ));
+
+        let late_progress = after_action_silence + Duration::from_millis(50);
+        settle.observe_progress_count(1, late_progress);
+        assert!(!full_agent_ready_to_score_at(
+            &actions,
+            &settle,
+            0,
+            true,
+            false,
+            false,
+            late_progress + Duration::from_millis(199),
+        ));
+        assert!(full_agent_ready_to_score_at(
+            &actions,
+            &settle,
+            0,
+            true,
+            false,
+            false,
+            late_progress + FULL_AGENT_RUNTIME_SILENCE_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn full_agent_settle_waits_for_runtime_silence_without_action_output() {
+        let actions = ActionActivityTracker::new(vec![builtin::speak()]);
+        let now = Instant::now();
+        let settle = FullAgentSettleTracker::new(0, now);
+
+        assert!(!full_agent_ready_to_score_at(
+            &actions,
+            &settle,
+            0,
+            true,
+            true,
+            false,
+            now + Duration::from_millis(199),
+        ));
+        assert!(full_agent_ready_to_score_at(
+            &actions,
+            &settle,
+            0,
+            true,
+            true,
+            false,
+            now + FULL_AGENT_RUNTIME_SILENCE_WINDOW,
+        ));
     }
 
     #[test]
