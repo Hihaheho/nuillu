@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
@@ -24,14 +24,16 @@ You wake on memo updates and internal attention-control requests. Use blackboard
 control requests, the cognition log, the current allocation, and the registry schema to decide which
 modules deserve activation right now.
 
-Output shape: a `memo` (free-form controller note for the shared memo surface) plus a `priority`
-array. The array lists modules to activate in descending priority order, each entry pairing a
-`module_id` (must be a registered module) with a `hint` — one concise sentence saying why that
-module needs extra activation now. Omitted modules fall back to the host/base allocation: the
-priority list adds salience drive, it is not a complete allow-list and not an inhibition list.
-Separate suppression caps, when granted by the host, are the inhibition path. Position in the array
-maps to the host-configured activation table; positions beyond the table fall to zero, so prioritise
-tightly. Do not invent module ids and do not duplicate ids.
+Use exactly one tool per activation:
+- leave_allocation_unchanged when the current memo batch does not warrant changing activation priorities.
+- reprioritize_modules when one or more modules need extra activation now. The priority array lists
+  modules in descending priority order, each entry pairing a module_id (must be a registered module)
+  with a hint — one concise sentence saying why that module needs extra activation now. Omitted
+  modules fall back to the host/base allocation: the priority list adds salience drive, it is not a
+  complete allow-list and not an inhibition list. Separate suppression caps, when granted by the
+  host, are the inhibition path. Position in the array maps to the host-configured activation table;
+  positions beyond the table fall to zero, so prioritise tightly. Do not invent module ids and do
+  not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
@@ -45,9 +47,8 @@ keep speak near the top of priority when speech may be warranted so the agent ca
 answer questions directed at it, and express in-world intent. Dropping speak from the priority list
 is suppressing the agent's voice.
 
-The memo field is a free-form controller note; preserve the reasoning needed by other modules but
-do not encode it as JSON, YAML, a code block, or any fixed schema.
-Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+Each tool carries a free-form controller memo; preserve the reasoning needed by other modules but do
+not encode it as JSON, YAML, a code block, or any fixed schema."#;
 
 const COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX: &str =
     "Compacted allocation-controller session history:";
@@ -108,38 +109,100 @@ fn visible_modules(
 }
 
 tokio::task_local! {
-    static CONTROLLER_DECISION_SCHEMA: Schema;
+    /// JSON Schema for `PriorityEntry.module_id` derived from the live
+    /// allocation target registry. Scoped around each controller turn so the
+    /// LLM sees the current host-constrained module enum.
+    static MODULE_TARGET_ID_SCHEMA: Schema;
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AllocationDecision {
-    pub memo: String,
-    pub priority: Vec<PriorityEntry>,
+fn fallback_module_target_id_schema() -> Schema {
+    Schema::try_from(serde_json::json!({ "type": "string" }))
+        .expect("fallback module target id schema must be a JSON object")
 }
 
-impl JsonSchema for AllocationDecision {
+fn module_target_id_schema(allowed_modules: &[ModuleId]) -> Schema {
+    let mut ids = allowed_modules.to_vec();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    ids.dedup();
+    let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
+    if module_ids.is_empty() {
+        fallback_module_target_id_schema()
+    } else {
+        Schema::try_from(serde_json::json!({ "type": "string", "enum": module_ids }))
+            .expect("module target id schema must be a JSON object")
+    }
+}
+
+/// Wire-format string with a JSON Schema dynamically constrained to the
+/// current allocation target registry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModuleTargetId(String);
+
+impl<S: Into<String>> From<S> for ModuleTargetId {
+    fn from(value: S) -> Self {
+        Self(value.into())
+    }
+}
+
+impl ModuleTargetId {
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl JsonSchema for ModuleTargetId {
     fn inline_schema() -> bool {
         true
     }
 
     fn schema_name() -> Cow<'static, str> {
-        "AllocationDecision".into()
+        "ModuleTargetId".into()
     }
 
     fn schema_id() -> Cow<'static, str> {
-        "nuillu_allocation_controller::AllocationDecision.dynamic".into()
+        "nuillu_allocation_controller::ModuleTargetId.dynamic".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        CONTROLLER_DECISION_SCHEMA
+        MODULE_TARGET_ID_SCHEMA
             .try_with(Clone::clone)
-            .unwrap_or_else(|_| fallback_allocation_decision_schema())
+            .unwrap_or_else(|_| fallback_module_target_id_schema())
     }
 }
 
+#[lutum::tool_input(name = "leave_allocation_unchanged", output = LeaveAllocationUnchangedOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LeaveAllocationUnchangedArgs {
+    pub memo: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LeaveAllocationUnchangedOutput {
+    pub unchanged: bool,
+}
+
+#[lutum::tool_input(name = "reprioritize_modules", output = ReprioritizeModulesOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReprioritizeModulesArgs {
+    pub memo: String,
+    pub priority: Vec<PriorityEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReprioritizeModulesOutput {
+    pub reprioritized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+pub enum AllocationControllerTools {
+    LeaveAllocationUnchanged(LeaveAllocationUnchangedArgs),
+    ReprioritizeModules(ReprioritizeModulesArgs),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PriorityEntry {
-    pub module_id: String,
+    pub module_id: ModuleTargetId,
     pub hint: String,
 }
 
@@ -251,12 +314,7 @@ impl AllocationControllerModule {
         let current = self.allocation_reader.snapshot().await;
         let interoception = self.interoception.snapshot().await;
         let allowed_modules = self.allocation_writer.allowed_target_modules().to_vec();
-        let controller_schema = self
-            .allocation_reader
-            .controller_schema_json(&allowed_modules)
-            .await;
-        let output_schema =
-            Schema::try_from(controller_schema.clone()).context("controller schema is invalid")?;
+        let module_target_schema = module_target_id_schema(&allowed_modules);
         let registered = allowed_modules
             .iter()
             .cloned()
@@ -277,20 +335,67 @@ impl AllocationControllerModule {
             .push_ephemeral_developer(controller_request_input(requests));
 
         let lutum = self.llm.lutum().await;
-        let result = CONTROLLER_DECISION_SCHEMA
-            .scope(output_schema, async {
+        let outcome = MODULE_TARGET_ID_SCHEMA
+            .scope(module_target_schema, async {
                 self.session
-                    .structured_turn::<AllocationDecision>(&lutum)
+                    .text_turn(&lutum)
+                    .tools::<AllocationControllerTools>()
+                    .available_tools([
+                        AllocationControllerToolsSelector::LeaveAllocationUnchanged,
+                        AllocationControllerToolsSelector::ReprioritizeModules,
+                    ])
+                    .require_any_tool()
                     .collect()
                     .await
             })
             .await
-            .context("allocation-controller structured turn failed")?;
-        let input_tokens = result.usage.input_tokens;
+            .context("allocation-controller tool turn failed")?;
 
-        let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-            anyhow::bail!("allocation-controller structured turn refused");
+        let mut applied: Option<AppliedDecision> = None;
+        let input_tokens = match outcome {
+            // `require_any_tool()` should prevent a finish-without-tools outcome.
+            TextStepOutcomeWithTools::Finished(_)
+            | TextStepOutcomeWithTools::FinishedNoOutput(_) => {
+                anyhow::bail!("allocation-controller finished without required tool call");
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let input_tokens = round.usage.input_tokens;
+                let mut results: Vec<ToolResult> = Vec::new();
+                // The LLM may return multiple tool calls; adopt the first decision only.
+                for call in round.tool_calls.iter().cloned() {
+                    match call {
+                        AllocationControllerToolsCall::LeaveAllocationUnchanged(call) => {
+                            if applied.is_none() {
+                                applied = Some(apply_no_change(call.input.memo.clone()));
+                            }
+                            results.push(
+                                call.complete(LeaveAllocationUnchangedOutput { unchanged: true })
+                                    .context("complete leave_allocation_unchanged tool call")?,
+                            );
+                        }
+                        AllocationControllerToolsCall::ReprioritizeModules(call) => {
+                            if applied.is_none() {
+                                applied = Some(apply_reprioritize(&registered, call.input.clone()));
+                            }
+                            results.push(
+                                call.complete(ReprioritizeModulesOutput {
+                                    reprioritized: true,
+                                })
+                                .context("complete reprioritize_modules tool call")?,
+                            );
+                        }
+                    }
+                }
+                round
+                    .commit(&mut self.session, results)
+                    .context("commit allocation-controller tool round")?;
+                input_tokens
+            }
         };
+        let applied = applied.context("allocation-controller tool turn produced no decision")?;
+        if applied.memo.is_empty() {
+            anyhow::bail!("allocation-controller tool turn produced an empty memo");
+        }
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
@@ -303,10 +408,8 @@ impl AllocationControllerModule {
         )
         .await;
 
-        let next = apply_decision(current, &registered, decision);
-
-        self.memo.write(next.memo.clone()).await;
-        self.allocation_writer.submit(next.commands).await;
+        self.memo.write(applied.memo.clone()).await;
+        self.allocation_writer.submit(applied.commands).await;
         Ok(())
     }
 }
@@ -316,16 +419,21 @@ struct AppliedDecision {
     commands: Vec<AllocationCommand>,
 }
 
-fn apply_decision(
-    current: nuillu_blackboard::ResourceAllocation,
+fn apply_no_change(memo: String) -> AppliedDecision {
+    AppliedDecision {
+        memo,
+        commands: Vec::new(),
+    }
+}
+
+fn apply_reprioritize(
     registered: &std::collections::HashSet<ModuleId>,
-    decision: AllocationDecision,
+    decision: ReprioritizeModulesArgs,
 ) -> AppliedDecision {
-    let _ = current;
     let mut commands = Vec::new();
 
     for (rank, entry) in decision.priority.into_iter().enumerate() {
-        let Ok(id) = ModuleId::new(entry.module_id) else {
+        let Ok(id) = ModuleId::new(entry.module_id.as_str()) else {
             tracing::warn!("allocation-controller ignored invalid module id");
             continue;
         };
@@ -355,24 +463,6 @@ fn priority_level(rank: usize) -> AllocationEffectLevel {
         4 => AllocationEffectLevel::Minimal,
         _ => AllocationEffectLevel::Off,
     }
-}
-
-fn fallback_allocation_decision_schema() -> Schema {
-    Schema::try_from(serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "memo": {
-                "type": "string",
-            },
-            "priority": {
-                "type": "array",
-                "items": false,
-            },
-        },
-        "required": ["memo", "priority"],
-    }))
-    .expect("fallback allocation decision schema must be a JSON object")
 }
 
 fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
@@ -426,7 +516,7 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
         ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
-        MockLlmAdapter, MockStructuredScenario, ModelInputItem, RawStructuredTurnEvent,
+        MockLlmAdapter, MockTextScenario, ModelInputItem, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
@@ -440,19 +530,19 @@ mod tests {
     #[derive(Clone)]
     struct CapturingAdapter {
         inner: MockLlmAdapter,
-        structured_inputs: Arc<Mutex<Vec<lutum::ModelInput>>>,
+        text_inputs: Arc<Mutex<Vec<lutum::ModelInput>>>,
     }
 
     impl CapturingAdapter {
         fn new(inner: MockLlmAdapter) -> Self {
             Self {
                 inner,
-                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn structured_inputs(&self) -> Vec<lutum::ModelInput> {
-            self.structured_inputs.lock().unwrap().clone()
+        fn text_inputs(&self) -> Vec<lutum::ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
         }
     }
 
@@ -463,6 +553,7 @@ mod tests {
             input: lutum::ModelInput,
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
             self.inner.text_turn(input, turn).await
         }
 
@@ -471,7 +562,6 @@ mod tests {
             input: lutum::ModelInput,
             turn: AdapterStructuredTurn,
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
-            self.structured_inputs.lock().unwrap().push(input.clone());
             self.inner.structured_turn(input, turn).await
         }
     }
@@ -601,28 +691,46 @@ mod tests {
         }
     }
 
-    fn decision_scenario(input_tokens: u64, memo: &str) -> MockStructuredScenario {
-        MockStructuredScenario::events(vec![
-            Ok(RawStructuredTurnEvent::Started {
-                request_id: Some("allocation-controller-finished".into()),
+    fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("allocation-controller-tool".into()),
                 model: "mock".into(),
             }),
-            Ok(RawStructuredTurnEvent::StructuredOutputChunk {
-                json_delta: serde_json::json!({
-                    "memo": memo,
-                    "priority": [],
-                })
-                .to_string(),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-allocation-controller".into(),
+                name: name.into(),
+                arguments_json_delta: arguments_json,
             }),
-            Ok(RawStructuredTurnEvent::Completed {
-                request_id: Some("allocation-controller-finished".into()),
-                finish_reason: FinishReason::Stop,
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("allocation-controller-tool".into()),
+                finish_reason: FinishReason::ToolCall,
                 usage: Usage {
                     input_tokens,
                     ..Usage::zero()
                 },
             }),
         ])
+    }
+
+    fn leave_unchanged_scenario(input_tokens: u64, memo: &str) -> MockTextScenario {
+        tool_scenario(
+            "leave_allocation_unchanged",
+            serde_json::json!({ "memo": memo }).to_string(),
+            input_tokens,
+        )
+    }
+
+    fn reprioritize_scenario(
+        input_tokens: u64,
+        memo: &str,
+        priority: serde_json::Value,
+    ) -> MockTextScenario {
+        tool_scenario(
+            "reprioritize_modules",
+            serde_json::json!({ "memo": memo, "priority": priority }).to_string(),
+            input_tokens,
+        )
     }
 
     fn last_target<'a>(
@@ -647,10 +755,9 @@ mod tests {
         // controller has no current target opinion for the module.
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
-        let applied = apply_decision(
-            current,
+        let applied = apply_reprioritize(
             &registered,
-            AllocationDecision {
+            ReprioritizeModulesArgs {
                 memo: "checked".into(),
                 priority: vec![
                     PriorityEntry {
@@ -706,10 +813,9 @@ mod tests {
         );
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
-        let applied = apply_decision(
-            current,
+        let applied = apply_reprioritize(
             &registered,
-            AllocationDecision {
+            ReprioritizeModulesArgs {
                 memo: "checked".into(),
                 priority: vec![PriorityEntry {
                     module_id: "sensory".into(),
@@ -749,8 +855,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(decision_scenario(1, "first controller note"))
-            .with_structured_scenario(decision_scenario(1, "second controller note"));
+            .with_text_scenario(leave_unchanged_scenario(1, "first controller note"))
+            .with_text_scenario(leave_unchanged_scenario(1, "second controller note"));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -790,7 +896,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inputs = observed.structured_inputs();
+        let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
 
         let first_items = inputs[0].items();
@@ -846,8 +952,11 @@ mod tests {
             };
             (0..turn.item_count()).any(|index| {
                 turn.item_at(index)
-                    .and_then(|item| item.as_text())
-                    .is_some_and(|text| text.contains("first controller note"))
+                    .and_then(|item| item.as_tool_call())
+                    .is_some_and(|call| {
+                        call.name.as_str() == "leave_allocation_unchanged"
+                            && call.arguments.get().contains("first controller note")
+                    })
             })
         }));
         assert!(
@@ -890,8 +999,11 @@ mod tests {
             };
             (0..turn.item_count()).any(|index| {
                 turn.item_at(index)
-                    .and_then(|item| item.as_text())
-                    .is_some_and(|text| text.contains("first controller note"))
+                    .and_then(|item| item.as_tool_call())
+                    .is_some_and(|call| {
+                        call.name.as_str() == "leave_allocation_unchanged"
+                            && call.arguments.get().contains("first controller note")
+                    })
             })
         }));
         assert!(!session_after_second.iter().any(|item| matches!(

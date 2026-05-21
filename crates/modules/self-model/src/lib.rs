@@ -5,6 +5,7 @@ use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
     Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_session_if_needed, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::builtin;
 
@@ -39,6 +40,7 @@ pub struct SelfModelModule {
     session: Session,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
+    session_seeded: bool,
 }
 
 impl SelfModelModule {
@@ -62,7 +64,22 @@ impl SelfModelModule {
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
+            session_seeded: false,
         }
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let system_prompt = self.system_prompt(cx).to_owned();
+        seed_persistent_faculty_session(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+        self.session_seeded = true;
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -94,8 +111,7 @@ impl SelfModelModule {
             .into_iter()
             .filter(|record| record.source.module == builtin::attention_schema())
             .collect::<Vec<_>>();
-        let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
+        self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         self.session.push_user(format!(
@@ -120,7 +136,7 @@ impl SelfModelModule {
             result.usage.input_tokens,
             cx.session_compaction(),
             self.session_compaction,
-            SessionCompactionProtectedPrefix::None,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
             COMPACTED_SELF_MODEL_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,

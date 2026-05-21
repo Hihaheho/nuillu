@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Lutum, Session, StructuredTurnOutcome};
+use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
     SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
@@ -68,9 +68,8 @@ plumbing.
 Voice and form.
 Write entries in plain inner-experience prose, as if the agent itself were noticing,
 recalling, or realizing. Use the supplied time tags for past observations. If nothing is
-currently load-bearing, set append_cognition=false; silence is the default.
-
-Return only raw JSON for the structured object; do not wrap it in Markdown or code fences."#;
+currently load-bearing, finish without calling tools. Silence is the default. When
+load-bearing facts should enter conscious cognition, call append_cognition exactly once."#;
 
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the cognition-gate module's persistent session history.
@@ -102,10 +101,20 @@ fn format_cognition_gate_context(
     sections.join("\n\n")
 }
 
+#[lutum::tool_input(name = "append_cognition", output = AppendCognitionOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppendCognitionArgs {
+    pub cognition_text: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct CognitionGateDecision {
-    pub append_cognition: bool,
-    pub cognition_text: Option<String>,
+pub struct AppendCognitionOutput {
+    pub appended: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+pub enum CognitionGateTools {
+    AppendCognition(AppendCognitionArgs),
 }
 
 pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
@@ -211,16 +220,8 @@ impl CognitionGateModule {
         self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
-        let decision = self
-            .run_decision_turn(&lutum, cx.session_compaction())
+        self.run_decision_turn(&lutum, cx.session_compaction())
             .await?;
-
-        if decision.append_cognition
-            && let Some(text) = decision.cognition_text
-            && !text.trim().is_empty()
-        {
-            self.cognition.append(text.trim().to_owned()).await;
-        }
         Ok(())
     }
 
@@ -228,17 +229,35 @@ impl CognitionGateModule {
         &mut self,
         lutum: &Lutum,
         compaction: &SessionCompactionRuntime,
-    ) -> Result<CognitionGateDecision> {
-        let result = self
+    ) -> Result<()> {
+        let outcome = self
             .session
-            .structured_turn::<CognitionGateDecision>(lutum)
+            .text_turn(lutum)
+            .tools::<CognitionGateTools>()
+            .available_tools([CognitionGateToolsSelector::AppendCognition])
             .collect()
             .await
-            .context("cognition-gate structured turn failed")?;
-        let input_tokens = result.usage.input_tokens;
+            .context("cognition-gate decision turn failed")?;
 
-        let StructuredTurnOutcome::Structured(decision) = result.semantic else {
-            anyhow::bail!("cognition-gate structured turn refused");
+        let input_tokens = match outcome {
+            TextStepOutcomeWithTools::Finished(result) => result.usage.input_tokens,
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => result.usage.input_tokens,
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let input_tokens = round.usage.input_tokens;
+                let mut results: Vec<ToolResult> = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    let CognitionGateToolsCall::AppendCognition(call) = call;
+                    let output = self.append_cognition(call.input.clone()).await;
+                    results.push(
+                        call.complete(output)
+                            .context("complete append_cognition tool call")?,
+                    );
+                }
+                round
+                    .commit(&mut self.session, results)
+                    .context("commit cognition-gate tool round")?;
+                input_tokens
+            }
         };
         compact_session_if_needed(
             &mut self.session,
@@ -251,7 +270,16 @@ impl CognitionGateModule {
             SESSION_COMPACTION_PROMPT,
         )
         .await;
-        Ok(decision)
+        Ok(())
+    }
+
+    async fn append_cognition(&self, args: AppendCognitionArgs) -> AppendCognitionOutput {
+        let text = args.cognition_text.trim();
+        if text.is_empty() {
+            return AppendCognitionOutput { appended: false };
+        }
+        self.cognition.append(text.to_owned()).await;
+        AppendCognitionOutput { appended: true }
     }
 }
 
@@ -289,9 +317,8 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
         ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        MessageContent, MockLlmAdapter, MockStructuredScenario, MockTextScenario, ModelInput,
-        ModelInputItem, RawStructuredTurnEvent, RawTextTurnEvent, SharedPoolBudgetManager,
-        SharedPoolBudgetOptions, TurnAdapter, Usage,
+        MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, Bpm, IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
@@ -309,19 +336,19 @@ mod tests {
     #[derive(Clone)]
     struct CapturingAdapter {
         inner: MockLlmAdapter,
-        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
     }
 
     impl CapturingAdapter {
         fn new(inner: MockLlmAdapter) -> Self {
             Self {
                 inner,
-                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn structured_inputs(&self) -> Vec<ModelInput> {
-            self.structured_inputs.lock().unwrap().clone()
+        fn text_inputs(&self) -> Vec<ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
         }
     }
 
@@ -332,6 +359,7 @@ mod tests {
             input: ModelInput,
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
             self.inner.text_turn(input, turn).await
         }
 
@@ -340,7 +368,6 @@ mod tests {
             input: ModelInput,
             turn: AdapterStructuredTurn,
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
-            self.structured_inputs.lock().unwrap().push(input.clone());
             self.inner.structured_turn(input, turn).await
         }
     }
@@ -471,36 +498,52 @@ mod tests {
         }
     }
 
-    fn structured_usage(input_tokens: u64) -> Usage {
+    fn text_usage(input_tokens: u64) -> Usage {
         Usage {
             input_tokens,
             ..Usage::zero()
         }
     }
 
-    fn finished_decision_scenario(
-        input_tokens: u64,
-        append_cognition: bool,
-        cognition_text: Option<&str>,
-    ) -> MockStructuredScenario {
-        MockStructuredScenario::events(vec![
-            Ok(RawStructuredTurnEvent::Started {
-                request_id: Some("cognition-gate-finished".into()),
+    fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("cognition-gate-tool".into()),
                 model: "mock".into(),
             }),
-            Ok(RawStructuredTurnEvent::StructuredOutputChunk {
-                json_delta: serde_json::json!({
-                    "append_cognition": append_cognition,
-                    "cognition_text": cognition_text,
-                })
-                .to_string(),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-cognition-gate".into(),
+                name: name.into(),
+                arguments_json_delta: arguments_json,
             }),
-            Ok(RawStructuredTurnEvent::Completed {
-                request_id: Some("cognition-gate-finished".into()),
-                finish_reason: FinishReason::Stop,
-                usage: structured_usage(input_tokens),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("cognition-gate-tool".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: text_usage(input_tokens),
             }),
         ])
+    }
+
+    fn silent_scenario(input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("cognition-gate-silent".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("cognition-gate-silent".into()),
+                finish_reason: FinishReason::Stop,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn append_cognition_scenario(cognition_text: &str, input_tokens: u64) -> MockTextScenario {
+        tool_scenario(
+            "append_cognition",
+            serde_json::json!({ "cognition_text": cognition_text }).to_string(),
+            input_tokens,
+        )
     }
 
     fn summary_text_scenario(summary: &str) -> MockTextScenario {
@@ -555,7 +598,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn high_input_finished_decision_compacts_session_prefix() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(finished_decision_scenario(16_001, false, None))
+            .with_text_scenario(silent_scenario(16_001))
             .with_text_scenario(summary_text_scenario(
                 "old cognition gate history summarized",
             ));
@@ -565,13 +608,11 @@ mod tests {
         }
 
         let lutum = fixture.gate.llm.lutum().await;
-        let decision = fixture
+        fixture
             .gate
             .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
-
-        assert!(!decision.append_cognition);
         let items = fixture.gate.session.input().items();
         let ModelInputItem::Assistant(AssistantInputItem::Text(summary)) = &items[0] else {
             panic!("expected compacted assistant message");
@@ -602,7 +643,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn threshold_input_finished_decision_does_not_compact() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(finished_decision_scenario(16_000, false, None))
+            .with_text_scenario(silent_scenario(16_000))
             .with_text_scenario(summary_text_scenario("unexpected summary"));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         for index in 0..10 {
@@ -610,13 +651,11 @@ mod tests {
         }
 
         let lutum = fixture.gate.llm.lutum().await;
-        let decision = fixture
+        fixture
             .gate
             .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
-
-        assert!(!decision.append_cognition);
         let items = fixture.gate.session.input().items();
         let ModelInputItem::Message { role, content } = &items[0] else {
             panic!("expected original first history item");
@@ -640,8 +679,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_persists_memo_system_notes_and_drops_ephemeral_decision_context() {
-        let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(finished_decision_scenario(1, false, None));
+        let adapter = MockLlmAdapter::new().with_text_scenario(silent_scenario(1));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         fixture.source_memo.write("sensory memo A").await;
 
@@ -687,26 +725,27 @@ mod tests {
         assert!(memo_note.contains("sensory memo A"));
         assert!(!memo_note.contains("new_memo_log_item"));
 
-        assert!(
-            matches!(items[2], ModelInputItem::Turn(_)),
-            "expected decision turn to persist"
-        );
         assert_eq!(
             items.len(),
-            3,
-            "ephemeral cognition-gate context must not persist"
+            2,
+            "silent decision (no tool call) must not persist a turn"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::Turn(_))),
+            "ephemeral cognition-gate context and silent finish must not persist turns"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(finished_decision_scenario(
+            .with_text_scenario(append_cognition_scenario(
+                "The agent noticed the north door is blocked.",
                 1,
-                true,
-                Some("The agent noticed the north door is blocked."),
             ))
-            .with_structured_scenario(finished_decision_scenario(1, false, None));
+            .with_text_scenario(silent_scenario(1));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -733,7 +772,7 @@ mod tests {
         fixture.source_memo.write("sensory memo B").await;
         fixture.gate.activate(&cx).await.unwrap();
 
-        let inputs = observed.structured_inputs();
+        let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
 
         let first_items = inputs[0].items();
@@ -801,8 +840,8 @@ mod tests {
             };
             (0..turn.item_count()).any(|index| {
                 turn.item_at(index)
-                    .and_then(|item| item.as_text())
-                    .is_some_and(|text| text.contains("append_cognition"))
+                    .and_then(|item| item.as_tool_call())
+                    .is_some_and(|call| call.name.as_str() == "append_cognition")
             })
         }));
         assert!(second_items.iter().any(|item| matches!(
@@ -847,13 +886,12 @@ mod tests {
                         if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
                 )
         )));
-        assert_eq!(fixture.gate.session.list_turns().count(), 2);
+        assert_eq!(fixture.gate.session.list_turns().count(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_seeds_identity_memories_as_assistant_text() {
-        let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(finished_decision_scenario(1, false, None));
+        let adapter = MockLlmAdapter::new().with_text_scenario(silent_scenario(1));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
 
         let lutum = fixture.gate.llm.lutum().await;
