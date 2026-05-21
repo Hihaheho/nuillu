@@ -1188,19 +1188,13 @@ async fn execute_full_agent_case(
         &case.limits,
         action_module_ids(&case_modules),
         case_now,
+        &case.memories,
         case_id,
         reporter,
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
     seed_eval_scene_participants(env.caps.scene(), &case.participants);
-    seed_memories(
-        &env.memory_caps,
-        env.clock.as_ref(),
-        case_now,
-        &case.memories,
-    )
-    .await?;
     let memory_baseline = memory_snapshot(env.memory.as_ref()).await?;
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -1519,19 +1513,13 @@ async fn execute_module_case(
         &case.limits,
         action_module_ids(&case_modules),
         case_now,
+        &case.memories,
         case_id,
         reporter,
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
     )
     .await?;
     seed_eval_scene_participants(env.caps.scene(), &case.participants);
-    seed_memories(
-        &env.memory_caps,
-        env.clock.as_ref(),
-        case_now,
-        &case.memories,
-    )
-    .await?;
     let memory_baseline = if module_target_uses_memory_store_artifact(target) {
         memory_snapshot(env.memory.as_ref()).await?
     } else {
@@ -3153,6 +3141,7 @@ pub(crate) async fn build_eval_environment(
     limits: &EvalLimits,
     action_modules: Vec<ModuleId>,
     case_now: Option<DateTime<FixedOffset>>,
+    memory_seeds: &[crate::cases::MemorySeed],
     case_id: &str,
     reporter: &LiveReporter,
     visualizer: Option<VisualizerEventSink>,
@@ -3178,6 +3167,27 @@ pub(crate) async fn build_eval_environment(
     let agent_store = connect_agent_store(output_dir, config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
+    let memory_caps = MemoryCapabilities::new(
+        blackboard.clone(),
+        clock.clone(),
+        memory.clone(),
+        Vec::new(),
+    );
+    let policy_caps = PolicyCapabilities::new(
+        blackboard.clone(),
+        clock.clone(),
+        policy_store.clone(),
+        Vec::new(),
+    );
+    seed_and_bootstrap_eval_startup_context(
+        &memory_caps,
+        &policy_caps,
+        clock.as_ref(),
+        case_now,
+        memory_seeds,
+    )
+    .await?;
+
     let llm_observer = visualizer
         .clone()
         .map(|sender| VisualizerLlmObserver::new(case_id.to_string(), sender));
@@ -3212,24 +3222,6 @@ pub(crate) async fn build_eval_environment(
             policy: runtime_policy,
         },
     });
-
-    let memory_caps = MemoryCapabilities::new(
-        blackboard.clone(),
-        clock.clone(),
-        memory.clone(),
-        Vec::new(),
-    );
-    memory_caps
-        .bootstrap_identity_memories()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to load identity memories: {err}"))?;
-
-    let policy_caps =
-        PolicyCapabilities::new(blackboard.clone(), clock.clone(), policy_store, Vec::new());
-    policy_caps
-        .bootstrap_core_policies()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to load core policies: {err}"))?;
 
     let utterance_sink: Rc<dyn UtteranceSink> = utterances.clone();
 
@@ -3319,6 +3311,25 @@ async fn seed_memories(
             .await
             .context("seed eval memory")?;
     }
+    Ok(())
+}
+
+async fn seed_and_bootstrap_eval_startup_context(
+    memory_caps: &MemoryCapabilities,
+    policy_caps: &PolicyCapabilities,
+    clock: &dyn Clock,
+    case_now: Option<DateTime<FixedOffset>>,
+    memories: &[crate::cases::MemorySeed],
+) -> Result<()> {
+    seed_memories(memory_caps, clock, case_now, memories).await?;
+    memory_caps
+        .bootstrap_identity_memories()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to load identity memories: {err}"))?;
+    policy_caps
+        .bootstrap_core_policies()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to load core policies: {err}"))?;
     Ok(())
 }
 
@@ -5387,6 +5398,7 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -5979,7 +5991,7 @@ id = "module-query-memory-special-memory"
             emotion: String::new(),
         };
         let store = StaticMemoryStore {
-            records: vec![summary],
+            records: RefCell::new(vec![summary]),
             links: vec![nuillu_memory::MemoryLink {
                 from_memory: summary_index,
                 to_memory: source_index,
@@ -6004,8 +6016,62 @@ id = "module-query-memory-special-memory"
         );
     }
 
+    #[tokio::test]
+    async fn seed_and_bootstrap_eval_startup_context_seeds_before_identity_bootstrap() {
+        let blackboard = Blackboard::default();
+        let clock: Rc<dyn Clock> = Rc::new(FixedClock(
+            Utc.with_ymd_and_hms(2026, 5, 21, 0, 0, 0).unwrap(),
+        ));
+        let memory_caps = MemoryCapabilities::new(
+            blackboard.clone(),
+            clock.clone(),
+            Rc::new(StaticMemoryStore {
+                records: RefCell::new(Vec::new()),
+                links: Vec::new(),
+            }),
+            Vec::new(),
+        );
+        let policy_caps = PolicyCapabilities::new(
+            blackboard.clone(),
+            clock.clone(),
+            Rc::new(nuillu_reward::NoopPolicyStore),
+            Vec::new(),
+        );
+        let memories = vec![
+            crate::cases::MemorySeed {
+                rank: crate::cases::MemorySeedRank::Identity,
+                decay_secs: 86_400,
+                datetime: None,
+                seconds_ago: None,
+                content: eure::value::Text::plaintext("I am Nui."),
+            },
+            crate::cases::MemorySeed {
+                rank: crate::cases::MemorySeedRank::ShortTerm,
+                decay_secs: 86_400,
+                datetime: None,
+                seconds_ago: None,
+                content: eure::value::Text::plaintext("Ordinary memory."),
+            },
+        ];
+
+        seed_and_bootstrap_eval_startup_context(
+            &memory_caps,
+            &policy_caps,
+            clock.as_ref(),
+            None,
+            &memories,
+        )
+        .await
+        .unwrap();
+
+        let identity_memories = blackboard.read(|bb| bb.identity_memories().to_vec()).await;
+        assert_eq!(identity_memories.len(), 1);
+        assert_eq!(identity_memories[0].index.as_str(), "seed-1");
+        assert_eq!(identity_memories[0].content.as_str(), "I am Nui.");
+    }
+
     struct StaticMemoryStore {
-        records: Vec<MemoryRecord>,
+        records: RefCell<Vec<MemoryRecord>>,
         links: Vec<nuillu_memory::MemoryLink>,
     }
 
@@ -6013,10 +6079,25 @@ id = "module-query-memory-special-memory"
     impl MemoryStore for StaticMemoryStore {
         async fn insert(
             &self,
-            _mem: nuillu_memory::NewMemory,
-            _stored_at: DateTime<Utc>,
+            mem: nuillu_memory::NewMemory,
+            stored_at: DateTime<Utc>,
         ) -> std::result::Result<MemoryRecord, PortError> {
-            unimplemented!("static test store does not support writes")
+            let index = MemoryIndex::new(format!("seed-{}", self.records.borrow().len() + 1));
+            let record = MemoryRecord {
+                index,
+                content: mem.content,
+                rank: mem.rank,
+                occurred_at: mem.occurred_at,
+                stored_at,
+                kind: mem.kind,
+                concepts: mem.concepts,
+                tags: mem.tags,
+                affect_arousal: mem.affect_arousal,
+                valence: mem.valence,
+                emotion: mem.emotion,
+            };
+            self.records.borrow_mut().push(record.clone());
+            Ok(record)
         }
 
         async fn put(
@@ -6049,6 +6130,7 @@ id = "module-query-memory-special-memory"
         ) -> std::result::Result<Option<MemoryRecord>, PortError> {
             Ok(self
                 .records
+                .borrow()
                 .iter()
                 .find(|record| &record.index == index)
                 .cloned())
@@ -6060,6 +6142,7 @@ id = "module-query-memory-special-memory"
         ) -> std::result::Result<Vec<MemoryRecord>, PortError> {
             Ok(self
                 .records
+                .borrow()
                 .iter()
                 .filter(|record| record.rank == rank)
                 .cloned()
@@ -6086,6 +6169,7 @@ id = "module-query-memory-special-memory"
                 })
                 .filter_map(|link| {
                     self.records
+                        .borrow()
                         .iter()
                         .find(|record| record.index == link.from_memory)
                         .cloned()
