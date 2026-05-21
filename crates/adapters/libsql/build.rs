@@ -11,15 +11,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let current_dir = manifest_dir.join("migrations/current");
     let bridge_dir = manifest_dir.join("migrations/bridge");
-    rerun_if_changed(&current_dir);
-    rerun_if_changed(&bridge_dir);
 
     let released_path = current_dir.join("released.eure");
     let dev_path = current_dir.join("dev.eure");
     let bridge_path = bridge_dir.join("bridge.eure");
     rerun_if_changed(&released_path);
     rerun_if_changed(&dev_path);
-    rerun_if_changed(&bridge_path);
+    rerun_if_optional_file_changed(&bridge_path);
 
     let released: ReleasedManifest = read_eure(&released_path)?;
     let dev: DevManifest = read_eure(&dev_path)?;
@@ -90,15 +88,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         out.push_str("const CURRENT_BRIDGE_MIGRATION: Option<BridgeMigration> = None;\n");
     }
 
-    fs::write(
-        PathBuf::from(std::env::var("OUT_DIR")?).join("libsql_migrations.rs"),
-        out,
+    write_if_changed(
+        &PathBuf::from(std::env::var("OUT_DIR")?).join("libsql_migrations.rs"),
+        &out,
     )?;
     Ok(())
 }
 
 fn rerun_if_changed(path: &Path) {
     println!("cargo::rerun-if-changed={}", path.display());
+}
+
+fn rerun_if_optional_file_changed(path: &Path) {
+    if path.exists() {
+        rerun_if_changed(path);
+    } else if let Some(parent) = path.parent() {
+        rerun_if_changed(parent);
+    }
+}
+
+fn write_if_changed(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
+    if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+        return Ok(());
+    }
+    fs::write(path, contents)?;
+    Ok(())
 }
 
 fn read_eure<T>(path: &Path) -> Result<T, Box<dyn Error>>
