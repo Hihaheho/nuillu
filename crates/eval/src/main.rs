@@ -99,6 +99,10 @@ struct Args {
     #[arg(long)]
     gui: bool,
 
+    /// Run only cases associated with these modules (repeatable).
+    #[arg(long = "module", value_enum, value_name = "MODULE")]
+    module_filter: Vec<EvalModule>,
+
     /// Modules to drop from the full-agent wiring (repeatable). Useful for
     /// isolating module-level effects, e.g. `--disable-module query-memory`.
     /// Required modules (allocation-controller, sensory, speak) cannot be disabled.
@@ -173,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         failed_from: args.failed_from,
         max_concurrent_llm_calls,
         case_patterns: args.patterns,
+        module_filters: args.module_filter,
         disabled_modules: args.disable_module,
     };
 

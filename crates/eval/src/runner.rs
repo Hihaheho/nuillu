@@ -108,6 +108,7 @@ pub struct RunnerConfig {
     pub failed_from: Option<PathBuf>,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub case_patterns: Vec<String>,
+    pub module_filters: Vec<EvalModule>,
     pub disabled_modules: Vec<EvalModule>,
 }
 
@@ -301,6 +302,8 @@ pub enum RunnerError {
     TraceSubscriber { message: String },
     #[error("case patterns matched no eval cases: {patterns}")]
     NoCasesMatched { patterns: String },
+    #[error("module filters matched no eval cases: {modules}")]
+    NoModuleCasesMatched { modules: String },
     #[error("failed-only requested but no suite-report.json files were found under {path}")]
     FailedOnlyNoReference { path: PathBuf },
     #[error("failed-only reference report not found at {path}")]
@@ -520,6 +523,11 @@ fn suite_run_report(
             default: config.default_backend.model.clone(),
             premium: config.premium_backend.model.clone(),
         },
+        module_filters: config
+            .module_filters
+            .iter()
+            .map(|module| module.as_str().to_string())
+            .collect(),
         disabled_modules: config
             .disabled_modules
             .iter()
@@ -568,6 +576,9 @@ fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelect
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_case_paths(case_paths, &config.case_patterns)?;
+    }
+    if !case_paths.is_empty() || failed_from.is_none() {
+        case_paths = filter_module_case_paths(case_paths, &config.module_filters)?;
     }
     if gui_only && (!case_paths.is_empty() || failed_from.is_none()) {
         case_paths = filter_gui_case_paths(case_paths)?;
@@ -769,6 +780,45 @@ fn filter_case_paths(
         });
     }
     Ok(matched)
+}
+
+fn filter_module_case_paths(
+    case_paths: Vec<PathBuf>,
+    modules: &[EvalModule],
+) -> Result<Vec<PathBuf>, RunnerError> {
+    if modules.is_empty() {
+        return Ok(case_paths);
+    }
+
+    let filters = modules.iter().copied().collect::<HashSet<_>>();
+    let mut matched = Vec::new();
+    for path in case_paths {
+        let case = parse_case_file(&path)?;
+        if case_matches_module_filter(&case, &filters) {
+            matched.push(path);
+        }
+    }
+
+    if matched.is_empty() {
+        return Err(RunnerError::NoModuleCasesMatched {
+            modules: modules
+                .iter()
+                .map(|module| module.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    Ok(matched)
+}
+
+fn case_matches_module_filter(case: &EvalCase, modules: &HashSet<EvalModule>) -> bool {
+    match case {
+        EvalCase::FullAgent(case) => case
+            .effective_modules()
+            .iter()
+            .any(|module| modules.contains(module)),
+        EvalCase::Module { target, .. } => modules.contains(&target.module()),
+    }
 }
 
 fn filter_gui_case_paths(case_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, RunnerError> {
@@ -5461,6 +5511,7 @@ mod tests {
             failed_from: None,
             max_concurrent_llm_calls: None,
             case_patterns: Vec::new(),
+            module_filters: Vec::new(),
             disabled_modules: Vec::new(),
         }
     }
@@ -5480,6 +5531,68 @@ prompt = "Find memory."
         )
         .unwrap();
         path
+    }
+
+    fn write_module_case(
+        root: &Path,
+        target: EvalModule,
+        name: &str,
+        id: &str,
+        modules: &[EvalModule],
+    ) -> PathBuf {
+        let case_dir = root.join("eval-cases/modules").join(target.as_str());
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let path = case_dir.join(format!("{name}.eure"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+id = "{id}"
+modules = [{modules}]
+prompt = "Run module."
+"#,
+                modules = module_list(modules),
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_full_agent_case(
+        root: &Path,
+        name: &str,
+        id: &str,
+        modules: Option<&[EvalModule]>,
+    ) -> PathBuf {
+        let case_dir = root.join("eval-cases/full-agent");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let path = case_dir.join(format!("{name}.eure"));
+        let modules = modules
+            .map(|modules| format!("modules = [{}]\n", module_list(modules)))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+id = "{id}"
+{modules}
+@ inputs[] {{
+  $variant: heard
+  content = "Hello?"
+}}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn module_list(modules: &[EvalModule]) -> String {
+        modules
+            .iter()
+            .map(|module| format!(r#""{}""#, module.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn write_suite_report(path: &Path, cases: serde_json::Value) {
@@ -5666,6 +5779,110 @@ prompt = "Second?"
     }
 
     #[test]
+    fn module_filters_select_full_agent_membership_or_module_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_speak = write_full_agent_case(
+            dir.path(),
+            "full-speak",
+            "full-agent-speak",
+            Some(&[EvalModule::Sensory, EvalModule::Speak]),
+        );
+        let full_cognition_gate = write_full_agent_case(
+            dir.path(),
+            "full-cognition-gate",
+            "full-agent-cognition-gate",
+            Some(&[EvalModule::Sensory, EvalModule::CognitionGate]),
+        );
+        let full_default = write_full_agent_case(
+            dir.path(),
+            "full-default",
+            "full-agent-default-modules",
+            None,
+        );
+        let _full_unrelated = write_full_agent_case(
+            dir.path(),
+            "full-query-memory",
+            "full-agent-query-memory",
+            Some(&[EvalModule::Sensory, EvalModule::QueryMemory]),
+        );
+        let speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "speak-target",
+            "module-speak-target",
+            &[EvalModule::Speak],
+        );
+        let cognition_gate = write_module_case(
+            dir.path(),
+            EvalModule::CognitionGate,
+            "cognition-gate-target",
+            "module-cognition-gate-target",
+            &[EvalModule::CognitionGate],
+        );
+        let _query_memory_with_speak_support = write_module_case(
+            dir.path(),
+            EvalModule::QueryMemory,
+            "query-memory-with-speak-support",
+            "module-query-memory-with-speak-support",
+            &[EvalModule::QueryMemory, EvalModule::Speak],
+        );
+        let _memory = write_module_case(
+            dir.path(),
+            EvalModule::Memory,
+            "memory-target",
+            "module-memory-target",
+            &[EvalModule::Memory],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.module_filters = vec![EvalModule::Speak, EvalModule::CognitionGate];
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        let mut expected = vec![
+            full_cognition_gate,
+            full_default,
+            full_speak,
+            cognition_gate,
+            speak,
+        ];
+        expected.sort();
+        assert_eq!(selection.case_paths, expected);
+    }
+
+    #[test]
+    fn module_filters_intersect_case_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let special_speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "special-speak",
+            "module-speak-special",
+            &[EvalModule::Speak],
+        );
+        let _plain_speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "plain-speak",
+            "module-speak-plain",
+            &[EvalModule::Speak],
+        );
+        let _special_memory = write_module_case(
+            dir.path(),
+            EvalModule::Memory,
+            "special-memory",
+            "module-memory-special",
+            &[EvalModule::Memory],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.case_patterns = vec!["special".to_string()];
+        config.module_filters = vec![EvalModule::Speak];
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![special_speak]);
+    }
+
+    #[test]
     fn visualizer_planned_tabs_use_filtered_case_ids() {
         let dir = tempfile::tempdir().unwrap();
         let case_dir = dir.path().join("eval-cases/full-agent");
@@ -5710,6 +5927,7 @@ id = "module-query-memory-special-memory"
             failed_from: None,
             max_concurrent_llm_calls: None,
             case_patterns: vec!["special-memory".to_string()],
+            module_filters: Vec::new(),
             disabled_modules: Vec::new(),
         };
 
@@ -6582,6 +6800,7 @@ limits {{
             failed_from: None,
             max_concurrent_llm_calls: NonZeroUsize::new(7),
             case_patterns: Vec::new(),
+            module_filters: Vec::new(),
             disabled_modules: Vec::new(),
         };
 
@@ -6602,6 +6821,7 @@ limits {{
         assert_eq!(report.run.models.cheap, "cheap-model");
         assert_eq!(report.run.models.default, "default-model");
         assert_eq!(report.run.models.premium, "premium-model");
+        assert_eq!(report.run.module_filters, Vec::<String>::new());
         assert_eq!(report.case_count, 2);
         assert_eq!(report.passed_cases, 0);
         assert_eq!(report.invalid_cases, 2);
@@ -6635,6 +6855,7 @@ limits {{
                     "default": "default-model",
                     "premium": "premium-model",
                 },
+                "module_filters": [],
                 "disabled_modules": [],
             })
         );
