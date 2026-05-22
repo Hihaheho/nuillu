@@ -566,6 +566,61 @@ impl MemoryWriter {
         Ok(record.index)
     }
 
+    pub async fn put_seeded_with_occurred_at(
+        &self,
+        index: MemoryIndex,
+        content: String,
+        rank: MemoryRank,
+        decay_secs: i64,
+        occurred_at: Option<DateTime<Utc>>,
+    ) -> Result<MemoryIndex, PortError> {
+        let mut new = NewMemory::statement(MemoryContent::new(content), rank, occurred_at);
+        self.stamp_interoception(&mut new).await;
+        let now = self.clock.now();
+        let record = MemoryRecord {
+            index: index.clone(),
+            content: new.content,
+            rank: new.rank,
+            occurred_at: new.occurred_at,
+            stored_at: now,
+            kind: new.kind,
+            concepts: new.concepts,
+            tags: new.tags,
+            affect_arousal: new.affect_arousal,
+            valence: new.valence,
+            emotion: new.emotion,
+        };
+        let indexed = IndexedMemory::from_record(record);
+        let record = self.primary_store.put(indexed).await?;
+
+        let replica_writes = self.replicas.iter().enumerate().map(|(replica, store)| {
+            let indexed = IndexedMemory::from_record(record.clone());
+            async move {
+                if let Err(error) = store.put(indexed).await {
+                    tracing::warn!(replica, ?error, "secondary memory put failed");
+                }
+            }
+        });
+        futures::future::join_all(replica_writes).await;
+
+        self.blackboard
+            .apply(BlackboardCommand::UpsertMemoryMetadata {
+                index: record.index.clone(),
+                rank_if_new: rank,
+                occurred_at_if_new: occurred_at,
+                decay_if_new_secs: decay_secs,
+                now,
+                patch: MemoryMetaPatch {
+                    rank: Some(rank),
+                    occurred_at: Some(occurred_at),
+                    decay_remaining_secs: Some(decay_secs),
+                    ..Default::default()
+                },
+            })
+            .await;
+        Ok(record.index)
+    }
+
     pub async fn insert_entry(
         &self,
         new: NewMemory,

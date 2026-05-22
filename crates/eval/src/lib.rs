@@ -16,10 +16,10 @@ pub mod trace_json;
 pub use artifact::CaseArtifact;
 pub use cases::{
     ArtifactTextField, CaseFileError, CaseScoring, Check, CheckCommon, CognitionLogSeed, EvalCase,
-    EvalLimits, EvalModule, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemoSeed, MemorySeed,
-    MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks, ModuleEvalTarget, ModuleRubric,
-    RubricCriterion, RubricJudgeInput, discover_case_files, parse_case_file,
-    parse_full_agent_case_file, parse_module_case_file,
+    EvalLimits, EvalModule, FullAgentCase, FullAgentCaseFile, FullAgentInput, MemoSeed,
+    MemoryLinkSeed, MemorySeed, MemorySeedRank, ModuleCase, ModuleCaseFile, ModuleChecks,
+    ModuleEvalTarget, ModuleRubric, PolicySeed, PolicySeedRank, RubricCriterion, RubricJudgeInput,
+    discover_case_files, parse_case_file, parse_full_agent_case_file, parse_module_case_file,
 };
 pub use evaluation::{
     CaseEval, CaseObjective, CaseReport, CaseSummary, CaseTiming, CaseTrialSummary, CheckOutcome,

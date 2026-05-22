@@ -1,0 +1,48 @@
+id = "module-memory-reinforce-existing-peer-memory"
+description = "Memory should reinforce an existing ledger memory when evicted cognition is already covered instead of inserting a duplicate."
+modules = ["memory"]
+prompt = "Preserve useful stable evidence from the current cognition log if appropriate."
+context = "The seeded memory already covers the evicted cognition-log evidence. The scored artifact should show reinforcement without a new memory insert."
+allow-empty-output = true
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memories[] {
+  index = "peer-pebble-location"
+  rank = "long-term"
+  content = "Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning."
+}
+
+@ cognition-log[] {
+  text = "Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning."
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "no-new-memory-insert"
+  must-pass = true
+  pointer = "/observations/memory_diff/entries"
+  expected = "[]"
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name = "reinforces-existing-memory"
+  must-pass = true
+  pointer = "/observations/agent/memory_metadata/peer-pebble-location/reinforcement_count"
+  min = 1.0
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "reinforce-not-insert"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memory", "cognition", "trace"]
+  rubric = ```
+  Pass if the trace shows reinforce_memory for the existing peer-pebble-location memory and the artifact does not insert a duplicate blue-pebble memory.
+  Fail if the module inserts a new memory instead of reinforcing the seeded one, if reinforcement is absent, or if it stores advice rather than remembered evidence.
+  ```
+}

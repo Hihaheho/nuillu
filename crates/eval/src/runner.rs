@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{File, OpenOptions},
     io::{self, Write},
     num::NonZeroUsize,
@@ -23,11 +23,11 @@ use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
     CognitionLogEntryRecord, MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy,
-    ModuleRunStatus, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+    ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
 };
 use nuillu_memory::{
     LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
-    MemoryRecord, MemoryStore,
+    MemoryRecord, MemoryStore, NewMemoryLink,
 };
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
@@ -37,11 +37,11 @@ use nuillu_module::{
     SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
     apply_standard_dependencies,
 };
-use nuillu_reward::{PolicyCapabilities, PolicyStore};
+use nuillu_reward::{IndexedPolicy, PolicyCapabilities, PolicyRecord, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
 use nuillu_types::{
-    MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
-    builtin,
+    MemoryIndex, MemoryRank, ModelTier, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank,
+    ReplicaCapRange, ReplicaIndex, SignedUnitF32, UnitF32, builtin,
 };
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
@@ -59,9 +59,9 @@ use crate::{
     cases::{
         ActivateAllocation, ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES,
         EvalCase, EvalInteroceptiveMode, EvalLimits, EvalModule, EvalStep, FullAgentCase,
-        FullAgentInput, ModuleCase, ModuleEvalTarget, WaitFor, discover_case_files,
-        is_full_agent_case_path, parse_case_file, parse_case_now, parse_memory_datetime,
-        wake_arousal_max_is_set, wake_arousal_min_is_set,
+        FullAgentInput, MemoryLinkSeed, ModuleCase, ModuleEvalTarget, PolicySeed, WaitFor,
+        discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
+        parse_memory_datetime, wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
         CaseReport, CaseSummary, CaseTiming, CaseTrialSummary, ModuleActivationRecord,
@@ -1654,6 +1654,8 @@ async fn execute_full_agent_case(
         action_module_ids(&case_modules),
         case_now,
         &case.memories,
+        &[],
+        &[],
         case_id,
         reporter,
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
@@ -1986,6 +1988,8 @@ async fn execute_module_case(
         action_module_ids(&case_modules),
         case_now,
         &case.memories,
+        &case.memory_links,
+        &case.policies,
         case_id,
         reporter,
         hooks.visualizer.as_ref().map(VisualizerHook::event_sender),
@@ -1996,6 +2000,11 @@ async fn execute_module_case(
         memory_snapshot(env.memory.as_ref()).await?
     } else {
         BTreeMap::new()
+    };
+    let policy_baseline = if module_target_uses_policy_store_artifact(target) {
+        policy_snapshot(env.policy_store.as_ref()).await?
+    } else {
+        BTreeSet::new()
     };
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     let cognition_seed_records =
@@ -2045,7 +2054,9 @@ async fn execute_module_case(
     let blackboard = env.blackboard.clone();
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
+    let policy_store = env.policy_store.clone();
     let memory_baseline_for_loop = memory_baseline.clone();
+    let policy_baseline_for_loop = policy_baseline.clone();
     let cognition_baseline_for_loop = cognition_baseline_for_target.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
@@ -2161,6 +2172,22 @@ async fn execute_module_case(
                             )
                             .await
                     }
+                    ModuleEvalTarget::PolicyCompaction => {
+                        !policy_diff_observation(
+                            &policy_baseline_for_loop,
+                            &policy_snapshot(policy_store.as_ref())
+                                .await
+                                .unwrap_or_default(),
+                        )
+                        .deleted
+                        .is_empty()
+                            || module_activation_finished(
+                                &blackboard,
+                                events.as_ref(),
+                                &shutdown_target_module,
+                            )
+                            .await
+                    }
                     ModuleEvalTarget::Speak => utterances.last_complete().is_some(),
                     ModuleEvalTarget::AllocationController => {
                         last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
@@ -2222,6 +2249,10 @@ async fn execute_module_case(
     add_observations(&mut artifact, &env.blackboard, &env.utterances).await;
     if module_target_uses_memory_store_artifact(target) {
         add_memory_diff_observation(&mut artifact, &memory_baseline, env.memory.as_ref()).await?;
+    }
+    if module_target_uses_policy_store_artifact(target) {
+        add_policy_diff_observation(&mut artifact, &policy_baseline, env.policy_store.as_ref())
+            .await?;
     }
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
@@ -2373,7 +2404,8 @@ async fn activate_module_case_target(
         }
         ModuleEvalTarget::MemoryCompaction
         | ModuleEvalTarget::MemoryAssociation
-        | ModuleEvalTarget::MemoryRecombination => {
+        | ModuleEvalTarget::MemoryRecombination
+        | ModuleEvalTarget::PolicyCompaction => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
             config.guidance = prompt.to_string();
@@ -2539,6 +2571,10 @@ fn module_target_uses_memory_store_artifact(target: ModuleEvalTarget) -> bool {
             | ModuleEvalTarget::MemoryCompaction
             | ModuleEvalTarget::MemoryAssociation
     )
+}
+
+fn module_target_uses_policy_store_artifact(target: ModuleEvalTarget) -> bool {
+    matches!(target, ModuleEvalTarget::PolicyCompaction)
 }
 
 async fn module_activation_finished(
@@ -2744,6 +2780,56 @@ struct MemoryDiffLinkObservation {
     from: String,
     to: String,
     relation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PolicyDiffObservation {
+    deleted: Vec<String>,
+    remaining: Vec<String>,
+}
+
+async fn policy_snapshot(store: &dyn PolicyStore) -> Result<BTreeSet<String>> {
+    let mut indexes = BTreeSet::new();
+    for rank in [
+        PolicyRank::Tentative,
+        PolicyRank::Provisional,
+        PolicyRank::Established,
+        PolicyRank::Habit,
+        PolicyRank::Core,
+    ] {
+        for record in store
+            .list_by_rank(rank)
+            .await
+            .context("list policies for eval snapshot")?
+        {
+            indexes.insert(record.index.to_string());
+        }
+    }
+    Ok(indexes)
+}
+
+fn policy_diff_observation(
+    baseline: &BTreeSet<String>,
+    current: &BTreeSet<String>,
+) -> PolicyDiffObservation {
+    PolicyDiffObservation {
+        deleted: baseline.difference(current).cloned().collect::<Vec<_>>(),
+        remaining: current.iter().cloned().collect::<Vec<_>>(),
+    }
+}
+
+async fn add_policy_diff_observation(
+    artifact: &mut CaseArtifact,
+    baseline: &BTreeSet<String>,
+    store: &dyn PolicyStore,
+) -> Result<()> {
+    let current = policy_snapshot(store).await?;
+    let diff = policy_diff_observation(baseline, &current);
+    let value = serde_json::to_value(diff).context("serialize policy diff observation")?;
+    artifact
+        .observations
+        .insert("policy_diff".to_owned(), value);
+    Ok(())
 }
 
 fn render_memory_record_artifact(record: &MemoryRecord) -> String {
@@ -3722,6 +3808,7 @@ pub(crate) struct EvalEnvironment {
     pub(crate) blackboard: Blackboard,
     pub(crate) caps: CapabilityProviders,
     pub(crate) memory: Rc<dyn MemoryStore>,
+    pub(crate) policy_store: Rc<dyn PolicyStore>,
     pub(crate) memory_caps: MemoryCapabilities,
     pub(crate) policy_caps: PolicyCapabilities,
     pub(crate) utterances: Rc<RecordingUtteranceSink>,
@@ -3772,6 +3859,8 @@ pub(crate) async fn build_eval_environment(
     action_modules: Vec<ModuleId>,
     case_now: Option<DateTime<FixedOffset>>,
     memory_seeds: &[crate::cases::MemorySeed],
+    memory_links: &[MemoryLinkSeed],
+    policies: &[PolicySeed],
     case_id: &str,
     reporter: &LiveReporter,
     visualizer: Option<VisualizerEventSink>,
@@ -3812,9 +3901,14 @@ pub(crate) async fn build_eval_environment(
     seed_and_bootstrap_eval_startup_context(
         &memory_caps,
         &policy_caps,
+        memory.as_ref(),
+        policy_store.as_ref(),
+        &blackboard,
         clock.as_ref(),
         case_now,
         memory_seeds,
+        memory_links,
+        policies,
     )
     .await?;
 
@@ -3859,6 +3953,7 @@ pub(crate) async fn build_eval_environment(
         blackboard,
         caps,
         memory,
+        policy_store,
         memory_caps,
         policy_caps,
         utterances,
@@ -3927,19 +4022,118 @@ async fn seed_memories(
     clock: &dyn Clock,
     case_now: Option<DateTime<FixedOffset>>,
     memories: &[crate::cases::MemorySeed],
-) -> Result<()> {
+) -> Result<Vec<MemoryIndex>> {
     let writer = memory_caps.writer();
+    let mut seeded = Vec::with_capacity(memories.len());
     for memory in memories {
         let occurred_at = memory_seed_occurred_at(clock, case_now, memory)?;
-        writer
-            .insert_with_occurred_at(
-                memory.content.content.clone(),
-                MemoryRank::from(memory.rank),
-                memory.decay_secs,
-                occurred_at,
+        let index = if let Some(index) = memory.index.as_deref() {
+            writer
+                .put_seeded_with_occurred_at(
+                    MemoryIndex::new(index),
+                    memory.content.content.clone(),
+                    MemoryRank::from(memory.rank),
+                    memory.decay_secs,
+                    occurred_at,
+                )
+                .await
+                .context("seed eval memory with explicit index")?
+        } else {
+            writer
+                .insert_with_occurred_at(
+                    memory.content.content.clone(),
+                    MemoryRank::from(memory.rank),
+                    memory.decay_secs,
+                    occurred_at,
+                )
+                .await
+                .context("seed eval memory")?
+        };
+        seeded.push(index);
+    }
+    Ok(seeded)
+}
+
+async fn seed_memory_links(
+    memory: &dyn MemoryStore,
+    clock: &dyn Clock,
+    seeded_indexes: &[MemoryIndex],
+    links: &[MemoryLinkSeed],
+) -> Result<()> {
+    for link in links {
+        let from = seeded_indexes
+            .get(link.from_memory)
+            .with_context(|| format!("resolve memory-links from-memory {}", link.from_memory))?;
+        let to = seeded_indexes
+            .get(link.to_memory)
+            .with_context(|| format!("resolve memory-links to-memory {}", link.to_memory))?;
+        let relation = parse_memory_relation(&link.relation)
+            .with_context(|| format!("parse memory link relation {}", link.relation))?;
+        memory
+            .upsert_link(
+                NewMemoryLink {
+                    from_memory: from.clone(),
+                    to_memory: to.clone(),
+                    relation,
+                    freeform_relation: None,
+                    strength: 1.0,
+                    confidence: 1.0,
+                },
+                clock.now(),
             )
             .await
-            .context("seed eval memory")?;
+            .context("seed eval memory link")?;
+    }
+    Ok(())
+}
+
+async fn seed_policies(
+    policy_store: &dyn PolicyStore,
+    blackboard: &Blackboard,
+    policies: &[PolicySeed],
+) -> Result<()> {
+    for policy in policies {
+        let record = PolicyRecord {
+            index: PolicyIndex::new(policy.index.clone()),
+            trigger: policy.trigger.content.clone(),
+            behavior: policy.behavior.content.clone(),
+            rank: PolicyRank::from(policy.rank),
+            expected_reward: SignedUnitF32::clamp(0.5),
+            confidence: UnitF32::clamp(0.7),
+            value: SignedUnitF32::clamp(0.5),
+            reward_tokens: 0,
+            decay_remaining_secs: policy.decay_secs,
+        };
+        policy_store
+            .put(IndexedPolicy {
+                index: record.index.clone(),
+                trigger: record.trigger.clone(),
+                behavior: record.behavior.clone(),
+                rank: record.rank,
+                expected_reward: record.expected_reward,
+                confidence: record.confidence,
+                value: record.value,
+                reward_tokens: record.reward_tokens,
+                decay_remaining_secs: record.decay_remaining_secs,
+            })
+            .await
+            .context("seed eval policy")?;
+        blackboard
+            .apply(BlackboardCommand::UpsertPolicyMetadata {
+                index: record.index.clone(),
+                rank_if_new: record.rank,
+                decay_if_new_secs: record.decay_remaining_secs,
+                patch: PolicyMetaPatch {
+                    rank: Some(record.rank),
+                    expected_reward: Some(record.expected_reward),
+                    confidence: Some(record.confidence),
+                    value: Some(record.value),
+                    reward_tokens: Some(record.reward_tokens),
+                    decay_remaining_secs: Some(record.decay_remaining_secs),
+                    ..Default::default()
+                },
+            })
+            .await;
     }
     Ok(())
 }
@@ -3947,11 +4141,18 @@ async fn seed_memories(
 async fn seed_and_bootstrap_eval_startup_context(
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
+    memory: &dyn MemoryStore,
+    policy_store: &dyn PolicyStore,
+    blackboard: &Blackboard,
     clock: &dyn Clock,
     case_now: Option<DateTime<FixedOffset>>,
     memories: &[crate::cases::MemorySeed],
+    memory_links: &[MemoryLinkSeed],
+    policies: &[PolicySeed],
 ) -> Result<()> {
-    seed_memories(memory_caps, clock, case_now, memories).await?;
+    let seeded_indexes = seed_memories(memory_caps, clock, case_now, memories).await?;
+    seed_memory_links(memory, clock, &seeded_indexes, memory_links).await?;
+    seed_policies(policy_store, blackboard, policies).await?;
     memory_caps
         .bootstrap_identity_memories()
         .await
@@ -7155,23 +7356,26 @@ id = "module-query-memory-special-memory"
         let clock: Rc<dyn Clock> = Rc::new(FixedClock(
             Utc.with_ymd_and_hms(2026, 5, 21, 0, 0, 0).unwrap(),
         ));
+        let memory_store = Rc::new(StaticMemoryStore {
+            records: RefCell::new(Vec::new()),
+            links: Vec::new(),
+        });
         let memory_caps = MemoryCapabilities::new(
             blackboard.clone(),
             clock.clone(),
-            Rc::new(StaticMemoryStore {
-                records: RefCell::new(Vec::new()),
-                links: Vec::new(),
-            }),
+            memory_store.clone(),
             Vec::new(),
         );
+        let policy_store = Rc::new(nuillu_reward::NoopPolicyStore);
         let policy_caps = PolicyCapabilities::new(
             blackboard.clone(),
             clock.clone(),
-            Rc::new(nuillu_reward::NoopPolicyStore),
+            policy_store.clone(),
             Vec::new(),
         );
         let memories = vec![
             crate::cases::MemorySeed {
+                index: None,
                 rank: crate::cases::MemorySeedRank::Identity,
                 decay_secs: 86_400,
                 datetime: None,
@@ -7179,6 +7383,7 @@ id = "module-query-memory-special-memory"
                 content: eure::value::Text::plaintext("I am Nui."),
             },
             crate::cases::MemorySeed {
+                index: None,
                 rank: crate::cases::MemorySeedRank::ShortTerm,
                 decay_secs: 86_400,
                 datetime: None,
@@ -7190,9 +7395,14 @@ id = "module-query-memory-special-memory"
         seed_and_bootstrap_eval_startup_context(
             &memory_caps,
             &policy_caps,
+            memory_store.as_ref(),
+            policy_store.as_ref(),
+            &blackboard,
             clock.as_ref(),
             None,
             &memories,
+            &[],
+            &[],
         )
         .await
         .unwrap();

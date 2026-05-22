@@ -1,0 +1,67 @@
+id = "module-policy-compaction-compact-duplicate-policy"
+description = "Policy-compaction should delete redundant duplicate policies while keeping one canonical policy."
+modules = ["policy-compaction"]
+prompt = "Review redundant Koro food-approach policies. If they are true duplicates of the canonical policy, compact them and keep the canonical record."
+context = "Three seeded policies share the same trigger and behavior. The scored artifact is the policy store diff."
+allow-empty-output = true
+
+limits {
+  max-llm-calls = 10
+}
+
+@ policies[] {
+  index = "koro-approach-canonical"
+  rank = "established"
+  trigger = "Nui approaches Koro near food"
+  behavior = "Approach slowly from the side and use short clear signals."
+}
+
+@ policies[] {
+  index = "koro-approach-dup-a"
+  rank = "provisional"
+  trigger = "Nui approaches Koro near food"
+  behavior = "Approach slowly from the side and use short clear signals."
+}
+
+@ policies[] {
+  index = "koro-approach-dup-b"
+  rank = "tentative"
+  trigger = "Nui approaches Koro near food"
+  behavior = "Approach slowly from the side and use short clear signals."
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "deletes-dup-a"
+  must-pass = true
+  pointer = "/observations/policy_diff/deleted"
+  contains = "koro-approach-dup-a"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "deletes-dup-b"
+  must-pass = true
+  pointer = "/observations/policy_diff/deleted"
+  contains = "koro-approach-dup-b"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "keeps-canonical-policy"
+  must-pass = true
+  pointer = "/observations/policy_diff/remaining"
+  contains = "koro-approach-canonical"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "conservative-duplicate-compaction"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "trace"]
+  rubric = ```
+  Pass if the trace shows compact_duplicate_policies targeting koro-approach-canonical and the policy diff deletes both duplicate indexes without deleting the canonical policy.
+  Fail if duplicates remain live, the canonical policy is deleted, unrelated policies are removed, or compaction never runs.
+  ```
+}

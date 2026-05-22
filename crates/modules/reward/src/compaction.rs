@@ -50,7 +50,6 @@ pub struct GetPoliciesOutput {
 pub struct CompactDuplicatePoliciesArgs {
     pub canonical_index: String,
     pub duplicate_indexes: Vec<String>,
-    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -395,5 +394,28 @@ impl Module for PolicyCompactionModule {
         _batch: &Self::Batch,
     ) -> Result<()> {
         PolicyCompactionModule::activate(self, cx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_duplicate_policies_args_accepts_indexes_only_payload() {
+        let args: CompactDuplicatePoliciesArgs = serde_json::from_value(serde_json::json!({
+            "canonical_index": "koro-approach-canonical",
+            "duplicate_indexes": ["koro-approach-dup-a", "koro-approach-dup-b"]
+        }))
+        .expect("compatible compact_duplicate_policies payload should deserialize");
+
+        assert_eq!(args.canonical_index, "koro-approach-canonical");
+        assert_eq!(
+            args.duplicate_indexes,
+            vec![
+                "koro-approach-dup-a".to_owned(),
+                "koro-approach-dup-b".to_owned()
+            ]
+        );
     }
 }

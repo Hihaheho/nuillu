@@ -1,4 +1,4 @@
-/// Schema for eval-cases/modules/query-memory/**/*.eure files.
+/// Schema for eval-cases/modules/policy-compaction/**/*.eure files.
 
 $import = {
   common => "./eval-common.schema.eure"
@@ -15,6 +15,9 @@ id.$optional = true
 description = `text`
 description.$optional = true
 
+now = `text`
+now.$optional = true
+
 modules = [`$types.common.eval-module`]
 modules.$optional = true
 
@@ -26,14 +29,11 @@ prompt {
 context = `text`
 context.$optional = true
 
-memories = [`$types.common.memory-seed`]
-memories.$optional = true
+allow-empty-output = `boolean`
+allow-empty-output.$optional = true
 
-memory-links = [`$types.common.memory-link-seed`]
-memory-links.$optional = true
-
-attention-stream = [`$types.common.attention-seed`]
-attention-stream.$optional = true
+policies = [`$types.common.policy-seed`]
+policies.$optional = true
 
 limits = `$types.common.eval-limits`
 limits.$optional = true

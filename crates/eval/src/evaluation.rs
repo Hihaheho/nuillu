@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::time::Duration;
 
-use lutum_eval::{Objective, PureEval, Score, TraceSnapshot};
+use lutum_eval::{EventRecord, FieldValue, Objective, PureEval, Score, TraceSnapshot};
 use lutum_eval_runner::{mean_pass_at_k, mean_pass_hat_k};
 use nuillu_module::RuntimeEvent;
 use nuillu_types::ModuleInstanceId;
@@ -555,16 +555,13 @@ fn evaluate_deterministic_check(
         Check::TraceEvent {
             message_contains, ..
         } => {
-            let passed = trace.events_matching(|event| {
-                event
-                    .message()
-                    .is_some_and(|message| message.contains(message_contains))
-            });
+            let passed = trace
+                .events_matching(|event| trace_event_contains(event, message_contains));
             build_outcome(
                 check,
                 !passed.is_empty(),
                 passed.is_empty().then(|| {
-                    format!("expected trace event message containing {message_contains:?}")
+                    format!("expected trace event containing {message_contains:?}")
                 }),
             )
         }
@@ -578,6 +575,47 @@ fn evaluate_deterministic_check(
             )
         }
         Check::Rubric { .. } => unreachable!("rubric checks are evaluated asynchronously"),
+    }
+}
+
+fn trace_event_contains(event: &EventRecord, needle: &str) -> bool {
+    if event
+        .message()
+        .is_some_and(|message| message.contains(needle))
+    {
+        return true;
+    }
+
+    match event.message.as_deref() {
+        Some("llm_output") => event
+            .field("output")
+            .and_then(trace_field_value_str)
+            .is_some_and(|output| output.contains(needle)),
+        Some("llm_input_transcript") => event
+            .field("transcript")
+            .and_then(trace_field_value_str)
+            .is_some_and(|transcript| transcript_contains_tool_evidence(transcript, needle)),
+        _ => event.fields.iter().any(|(key, value)| {
+            key != "transcript"
+                && matches!(value, FieldValue::Str(text) if text.contains(needle))
+        }),
+    }
+}
+
+fn transcript_contains_tool_evidence(transcript: &str, needle: &str) -> bool {
+    if transcript.contains(&format!("<tool_call name={needle}")) {
+        return true;
+    }
+
+    transcript.lines().any(|line| {
+        line.starts_with("[tool_result name=") && line.contains(&format!("name={needle}"))
+    })
+}
+
+fn trace_field_value_str(value: &FieldValue) -> Option<&str> {
+    match value {
+        FieldValue::Str(text) => Some(text.as_str()),
+        _ => None,
     }
 }
 
@@ -1305,5 +1343,70 @@ mod tests {
         assert_eq!(timing.min_ms, 100);
         assert_eq!(timing.max_ms, 300);
         assert_eq!(timing.mean_ms, 200);
+    }
+
+    #[test]
+    fn trace_event_check_matches_tool_calls_in_event_fields() {
+        use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
+
+        use crate::cases::Check;
+        use super::{evaluate_deterministic_check, trace_event_contains};
+
+        let trace = TraceSnapshot {
+            roots: vec![SpanNode {
+                name: "llm_turn".to_string(),
+                target: "lutum".to_string(),
+                level: "INFO".to_string(),
+                fields: Vec::new(),
+                events: vec![EventRecord {
+                    target: "lutum".to_string(),
+                    level: "DEBUG".to_string(),
+                    message: Some("llm_output".to_string()),
+                    fields: vec![(
+                        "output".to_string(),
+                        FieldValue::Str(
+                            "<tool_call name=fetch_linked_memories>{\"memory_indexes\":[\"koro-approach-primary\"]}</tool_call>"
+                                .to_string(),
+                        ),
+                    )],
+                }],
+                children: Vec::new(),
+            }],
+            root_events: Vec::new(),
+        };
+
+        assert!(trace_event_contains(
+            &trace.roots[0].events[0],
+            "fetch_linked_memories"
+        ));
+
+        let prompt_only = EventRecord {
+            target: "lutum".to_string(),
+            level: "DEBUG".to_string(),
+            message: Some("llm_input_transcript".to_string()),
+            fields: vec![(
+                "transcript".to_string(),
+                FieldValue::Str(
+                    "[System]\nUse fetch_linked_memories only after a specific search hit.\n[User]\nQuestion"
+                        .to_string(),
+                ),
+            )],
+        };
+        assert!(!trace_event_contains(&prompt_only, "fetch_linked_memories"));
+
+        let check = Check::TraceEvent {
+            common: crate::cases::CheckCommon {
+                name: Some("calls-fetch-linked-memories".to_string()),
+                must_pass: true,
+                weight: 1,
+            },
+            message_contains: "fetch_linked_memories".to_string(),
+        };
+        let outcome = evaluate_deterministic_check(
+            &check,
+            &trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(outcome.passed);
     }
 }

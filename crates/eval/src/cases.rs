@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Datelike as _, FixedOffset, NaiveDate, TimeZone as _, Utc};
 use eure::{FromEure, value::Text};
-use nuillu_types::{MemoryRank, ModuleId, builtin};
+use nuillu_types::{MemoryRank, ModuleId, PolicyRank, builtin};
 use thiserror::Error;
 
 fn default_weight() -> i64 {
@@ -19,6 +19,14 @@ fn default_memory_rank() -> MemorySeedRank {
 
 fn default_memory_decay_secs() -> i64 {
     86_400
+}
+
+fn default_policy_rank() -> PolicySeedRank {
+    PolicySeedRank::Established
+}
+
+fn default_policy_decay_secs() -> i64 {
+    2_592_000
 }
 
 fn default_seed_seconds_ago() -> i64 {
@@ -194,6 +202,10 @@ pub struct ModuleCase {
     #[eure(default)]
     pub memories: Vec<MemorySeed>,
     #[eure(default)]
+    pub memory_links: Vec<MemoryLinkSeed>,
+    #[eure(default)]
+    pub policies: Vec<PolicySeed>,
+    #[eure(default)]
     pub memos: Vec<MemoSeed>,
     #[eure(default)]
     pub cognition_log: Vec<CognitionLogSeed>,
@@ -336,6 +348,7 @@ pub enum ModuleEvalTarget {
     MemoryCompaction,
     MemoryAssociation,
     MemoryRecombination,
+    PolicyCompaction,
     AllocationController,
     Surprise,
     Speak,
@@ -353,6 +366,7 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
+            Self::PolicyCompaction => "policy-compaction",
             Self::AllocationController => "allocation-controller",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
@@ -370,6 +384,7 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
+            Self::PolicyCompaction => EvalModule::PolicyCompaction,
             Self::AllocationController => EvalModule::AllocationController,
             Self::Surprise => EvalModule::Surprise,
             Self::Speak => EvalModule::Speak,
@@ -389,6 +404,7 @@ impl ModuleEvalTarget {
                 "memory-compaction" => Some(Self::MemoryCompaction),
                 "memory-association" => Some(Self::MemoryAssociation),
                 "memory-recombination" => Some(Self::MemoryRecombination),
+                "policy-compaction" => Some(Self::PolicyCompaction),
                 "allocation-controller" => Some(Self::AllocationController),
                 "surprise" => Some(Self::Surprise),
                 "speak" => Some(Self::Speak),
@@ -425,6 +441,20 @@ impl EvalCase {
         match self {
             Self::FullAgent(case) => &case.memories,
             Self::Module { case, .. } => &case.memories,
+        }
+    }
+
+    pub fn memory_links(&self) -> &[MemoryLinkSeed] {
+        match self {
+            Self::FullAgent(_) => &[],
+            Self::Module { case, .. } => &case.memory_links,
+        }
+    }
+
+    pub fn policies(&self) -> &[PolicySeed] {
+        match self {
+            Self::FullAgent(_) => &[],
+            Self::Module { case, .. } => &case.policies,
         }
     }
 
@@ -574,6 +604,8 @@ impl EvalInteroceptiveMode {
 #[derive(Debug, Clone, FromEure)]
 #[eure(crate = ::eure::document, rename_all = "kebab-case")]
 pub struct MemorySeed {
+    #[eure(default)]
+    pub index: Option<String>,
     #[eure(default = "default_memory_rank")]
     pub rank: MemorySeedRank,
     #[eure(default = "default_memory_decay_secs")]
@@ -583,6 +615,26 @@ pub struct MemorySeed {
     #[eure(default)]
     pub seconds_ago: Option<i64>,
     pub content: Text,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct MemoryLinkSeed {
+    pub from_memory: usize,
+    pub to_memory: usize,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct PolicySeed {
+    pub index: String,
+    #[eure(default = "default_policy_rank")]
+    pub rank: PolicySeedRank,
+    #[eure(default = "default_policy_decay_secs")]
+    pub decay_secs: i64,
+    pub trigger: Text,
+    pub behavior: Text,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -622,6 +674,28 @@ impl From<MemorySeedRank> for MemoryRank {
             MemorySeedRank::LongTerm => Self::LongTerm,
             MemorySeedRank::Permanent => Self::Permanent,
             MemorySeedRank::Identity => Self::Identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub enum PolicySeedRank {
+    Tentative,
+    Provisional,
+    Established,
+    Habit,
+    Core,
+}
+
+impl From<PolicySeedRank> for PolicyRank {
+    fn from(rank: PolicySeedRank) -> Self {
+        match rank {
+            PolicySeedRank::Tentative => Self::Tentative,
+            PolicySeedRank::Provisional => Self::Provisional,
+            PolicySeedRank::Established => Self::Established,
+            PolicySeedRank::Habit => Self::Habit,
+            PolicySeedRank::Core => Self::Core,
         }
     }
 }
@@ -1019,6 +1093,8 @@ fn validate_full_agent_case(path: &Path, case: &FullAgentCase) -> Result<(), Cas
         path,
         case.now.as_deref(),
         &case.memories,
+        &[],
+        &[],
         &case.memos,
         &case.limits,
         &case.checks,
@@ -1154,6 +1230,8 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
         path,
         case.now.as_deref(),
         &case.memories,
+        &case.memory_links,
+        &case.policies,
         &case.memos,
         &case.limits,
         &case.checks,
@@ -1195,6 +1273,13 @@ fn validate_module_case_target(
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "allocation-controller module case must include at least one memo seed"
+                .to_string(),
+        });
+    }
+    if target == ModuleEvalTarget::PolicyCompaction && case.policies.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "policy-compaction module case must include at least one policy seed"
                 .to_string(),
         });
     }
@@ -1337,6 +1422,8 @@ fn validate_common(
     path: &Path,
     now: Option<&str>,
     memories: &[MemorySeed],
+    memory_links: &[MemoryLinkSeed],
+    policies: &[PolicySeed],
     memos: &[MemoSeed],
     limits: &EvalLimits,
     checks: &[Check],
@@ -1387,6 +1474,72 @@ fn validate_common(
                 }
             })?;
         }
+        if let Some(explicit_index) = &memory.index {
+            if explicit_index.trim().is_empty() {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!("memories[{index}].index must not be empty"),
+                });
+            }
+        }
+    }
+
+    for (index, link) in memory_links.iter().enumerate() {
+        if link.from_memory >= memories.len() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "memory-links[{index}].from-memory {} is out of range for {} seeded memories",
+                    link.from_memory,
+                    memories.len()
+                ),
+            });
+        }
+        if link.to_memory >= memories.len() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "memory-links[{index}].to-memory {} is out of range for {} seeded memories",
+                    link.to_memory,
+                    memories.len()
+                ),
+            });
+        }
+        if !is_valid_memory_link_relation(&link.relation) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "memory-links[{index}].relation must be one of related, supports, contradicts, updates, corrects, derived_from"
+                ),
+            });
+        }
+    }
+
+    for (index, policy) in policies.iter().enumerate() {
+        if policy.index.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("policies[{index}].index must not be empty"),
+            });
+        }
+        if policy.trigger.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("policies[{index}].trigger must not be empty"),
+            });
+        }
+        if policy.behavior.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("policies[{index}].behavior must not be empty"),
+            });
+        }
+        if policy.decay_secs < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("policies[{index}].decay-secs must not be negative"),
+            });
+        }
     }
 
     for (index, memo) in memos.iter().enumerate() {
@@ -1421,6 +1574,19 @@ fn validate_common(
     }
 
     Ok(())
+}
+
+fn is_valid_memory_link_relation(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "related"
+            | "supports"
+            | "contradicts"
+            | "updates"
+            | "corrects"
+            | "derived_from"
+            | "derived-from"
+    )
 }
 
 fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
@@ -1868,6 +2034,7 @@ mod tests {
     #[test]
     fn memory_seed_rejects_datetime_and_seconds_ago_together() {
         let memory = MemorySeed {
+            index: None,
             rank: MemorySeedRank::Permanent,
             decay_secs: 0,
             datetime: Some("2025-05-10".to_string()),
@@ -1879,6 +2046,8 @@ mod tests {
             Path::new("case.eure"),
             Some("2026-05-10T08:21:00+09:00"),
             &[memory],
+            &[],
+            &[],
             &[],
             &EvalLimits::default(),
             &[],

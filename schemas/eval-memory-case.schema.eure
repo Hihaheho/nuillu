@@ -38,6 +38,9 @@ participants.$optional = true
 memories = [`$types.common.memory-seed`]
 memories.$optional = true
 
+memory-links = [`$types.common.memory-link-seed`]
+memory-links.$optional = true
+
 memos = [`$types.common.memo-seed`]
 memos.$optional = true
 

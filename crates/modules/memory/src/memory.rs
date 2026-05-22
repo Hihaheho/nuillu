@@ -103,7 +103,6 @@ pub struct InsertMemoryOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReinforceMemoryArgs {
     pub index: MemoryIndex,
-    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -785,6 +784,16 @@ mod tests {
                 MemoryTag::operational("context_binding"),
             ]
         );
+    }
+
+    #[test]
+    fn reinforce_memory_args_accepts_index_only_payload() {
+        let args: ReinforceMemoryArgs = serde_json::from_value(serde_json::json!({
+            "index": "peer-pebble-location"
+        }))
+        .expect("compatible reinforce_memory payload should deserialize");
+
+        assert_eq!(args.index.as_str(), "peer-pebble-location");
     }
 
     #[tokio::test]

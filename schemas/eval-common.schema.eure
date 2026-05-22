@@ -32,6 +32,8 @@ variants.permanent = { = "permanent", $variant => "literal" }
 variants.identity = { = "identity", $variant => "literal" }
 
 @ $types.memory-seed
+index = `text`
+index.$optional = true
 rank = `$types.memory-rank`
 rank.$optional = true
 decay-secs = `integer`
@@ -41,6 +43,34 @@ datetime.$optional = true
 seconds-ago = `integer`
 seconds-ago.$optional = true
 content {
+  $variant: text
+  min-length = 1
+}
+
+@ $types.memory-link-seed
+from-memory = `integer`
+to-memory = `integer`
+relation = `text`
+
+@ $types.policy-rank
+$variant: union
+variants.tentative = { = "tentative", $variant => "literal" }
+variants.provisional = { = "provisional", $variant => "literal" }
+variants.established = { = "established", $variant => "literal" }
+variants.habit = { = "habit", $variant => "literal" }
+variants.core = { = "core", $variant => "literal" }
+
+@ $types.policy-seed
+index = `text`
+rank = `$types.policy-rank`
+rank.$optional = true
+decay-secs = `integer`
+decay-secs.$optional = true
+trigger {
+  $variant: text
+  min-length = 1
+}
+behavior {
   $variant: text
   min-length = 1
 }

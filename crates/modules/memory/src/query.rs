@@ -17,14 +17,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::{
     LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryContentReader, MemoryKind,
-    MemoryLink, MemoryLinkDirection, MemoryLinkRelation, MemoryRetriever, MemoryTag,
-    MemoryUsageTarget,
+    MemoryLink, MemoryLinkDirection, MemoryRetriever, MemoryTag, MemoryUsageTarget,
 };
 
 const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
 Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
-Use search_memory for ordinary flat memory search. Use fetch_linked_memories only after a
-specific search hit or prior memo makes linked context useful. Linked lookup is explicit; ordinary
+Use search_memory for ordinary flat memory search. Search hits report linked_neighbor_count;
+when that count is greater than zero and linked context may help the question, call
+fetch_linked_memories for that hit index before writing the memo. Pass only the seed memory indexes;
+the runtime applies default link direction, relation filter, and limit. Linked lookup is explicit; ordinary
 search results are flat and do not include hidden bundles.
 If the question contains allocation guidance or a speech evidence request, search for the concrete
 requested facts, proper nouns, species/body/peer/world terms, route rules, and the needed_fact
@@ -35,8 +36,9 @@ distinct questions or evidence requests. Prefer multiple targeted searches in on
 generic searches or later follow-up turns.
 If the requested facts are already covered by prior query-memory memo logs, previous tool results,
 or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
-When retrieved evidence is useful, call write_retrieval_memo exactly once with only the hit indexes
-that should enter query-memory's memo. Search hits are candidates, not automatic memo content.
+When retrieved evidence is useful, call write_retrieval_memo exactly once. Put flat search hit
+indexes in hit_indexes and fetch_linked_memories results in linked_hit_indexes. Search hits are
+candidates, not automatic memo content.
 You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do
 not produce user-facing answers, decide final truth, explain results from outside tool output, or
 use a final answer as a data channel."#;
@@ -86,15 +88,15 @@ pub struct QueryMemoryHit {
     pub affect_arousal: f32,
     pub valence: f32,
     pub emotion: String,
+    pub linked_neighbor_count: usize,
 }
+
+const DEFAULT_LINKED_MEMORY_LIMIT: usize = 16;
 
 #[lutum::tool_input(name = "fetch_linked_memories", output = FetchLinkedMemoriesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FetchLinkedMemoriesArgs {
     pub memory_indexes: Vec<MemoryIndex>,
-    pub relation_filter: Vec<MemoryLinkRelation>,
-    pub direction: MemoryLinkDirection,
-    pub limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -618,28 +620,35 @@ impl QueryMemoryModule {
             .map(MemoryUsageTarget::from)
             .collect::<Vec<_>>();
         self.memory.record_accesses(&targets).await;
-        Ok(SearchMemoryOutput {
-            hits: records
-                .into_iter()
-                .map(|record| QueryMemoryHit {
-                    index: record.index,
-                    content: render_memory_for_llm(
-                        record.content.as_str(),
-                        record.occurred_at,
-                        now,
-                    ),
-                    rank: record.rank,
-                    occurred_at: record.occurred_at,
-                    stored_at: record.stored_at,
-                    kind: record.kind,
-                    concepts: record.concepts,
-                    tags: record.tags,
-                    affect_arousal: record.affect_arousal,
-                    valence: record.valence,
-                    emotion: record.emotion,
+        let mut hits = Vec::with_capacity(records.len());
+        for record in records {
+            let linked_neighbor_count = self
+                .linked_memory
+                .linked(&LinkedMemoryQuery {
+                    memory_indexes: vec![record.index.clone()],
+                    relation_filter: Vec::new(),
+                    direction: MemoryLinkDirection::Both,
+                    limit: DEFAULT_LINKED_MEMORY_LIMIT,
                 })
-                .collect(),
-        })
+                .await
+                .context("count linked memory neighbors for search hit")?
+                .len();
+            hits.push(QueryMemoryHit {
+                index: record.index,
+                content: render_memory_for_llm(record.content.as_str(), record.occurred_at, now),
+                rank: record.rank,
+                occurred_at: record.occurred_at,
+                stored_at: record.stored_at,
+                kind: record.kind,
+                concepts: record.concepts,
+                tags: record.tags,
+                affect_arousal: record.affect_arousal,
+                valence: record.valence,
+                emotion: record.emotion,
+                linked_neighbor_count,
+            });
+        }
+        Ok(SearchMemoryOutput { hits })
     }
 
     async fn fetch_linked_memories(
@@ -647,14 +656,13 @@ impl QueryMemoryModule {
         args: FetchLinkedMemoriesArgs,
         now: DateTime<Utc>,
     ) -> Result<FetchLinkedMemoriesOutput> {
-        let limit = args.limit.clamp(1, 16);
         let records = self
             .linked_memory
             .linked(&LinkedMemoryQuery {
                 memory_indexes: args.memory_indexes,
-                relation_filter: args.relation_filter,
-                direction: args.direction,
-                limit,
+                relation_filter: Vec::new(),
+                direction: MemoryLinkDirection::Both,
+                limit: DEFAULT_LINKED_MEMORY_LIMIT,
             })
             .await
             .context("fetch linked memory")?;
@@ -894,5 +902,21 @@ impl Module for QueryMemoryModule {
             self.activate_cognition_update(cx).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_linked_memories_args_accepts_memory_indexes_only_payload() {
+        let args: FetchLinkedMemoriesArgs = serde_json::from_value(serde_json::json!({
+            "memory_indexes": ["koro-approach-primary"]
+        }))
+        .expect("compatible fetch_linked_memories payload should deserialize");
+
+        assert_eq!(args.memory_indexes.len(), 1);
+        assert_eq!(args.memory_indexes[0].as_str(), "koro-approach-primary");
     }
 }
