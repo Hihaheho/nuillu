@@ -93,3 +93,9 @@ When changing module wiring or adding a module, these must remain true (they're 
 - Released migrations, the current snapshot, and the previous-major bridge migration are release artifacts. Generate or update them with the Rust release tool in `lutum-libsql-adapter`; don't hand-edit them during ordinary feature work.
 - Migration SQL must be safe to run more than once: use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, guarded column additions/backfills, and data updates that tolerate already-migrated rows.
 - A major release keeps exactly one bridge migration from the previous major's terminal version to `v<current-major>.0`. Older/non-terminal major upgrades should fail clearly rather than attempting best-effort repair.
+
+## Evaluation
+
+If the task is running eval run with `eval.local.eure` for the model set.
+
+`cargo run -p nuillu-eval -- --model-set configs/modelsets/eval.local.eure <options>`
