@@ -1,0 +1,79 @@
+id = "module-query-memory-retrieve-linked-peer-rule"
+description = "Query-memory should expand a flat search hit through linked memories and memo linked evidence."
+modules = ["query-memory"]
+prompt = "How should Nui approach Koro near food?"
+context = "Flat search should hit koro-approach-primary among the Koro-food memories; koro-signal-drill-linked is reachable only through fetch_linked_memories on that primary hit."
+
+limits {
+  max-llm-calls = 12
+}
+
+@ memories[] {
+  index = "koro-approach-primary"
+  rank = "permanent"
+  content = "Koro guards food, but relaxes when approached slowly from the side. Linked memories hold short-signal guidance for this approach."
+}
+
+@ memories[] {
+  index = "koro-signal-drill-linked"
+  rank = "long-term"
+  content = "During dawn greeting drills, Pibi coached Nui to use short clear signals before touching a resting elder's shoulder."
+}
+
+@ memories[] {
+  index = "koro-food-fern-wait"
+  rank = "long-term"
+  content = "Koro shares food only after Nui waits at the fern line."
+}
+
+@ memories[] {
+  index = "koro-food-circle-announce"
+  rank = "long-term"
+  content = "Nui must announce herself before entering Koro's feeding circle."
+}
+
+@ memories[] {
+  index = "koro-food-rock-offer"
+  rank = "long-term"
+  content = "The feeding rock marks where Koro accepts offered fruit."
+}
+
+@ memories[] {
+  index = "koro-food-distance-crest"
+  rank = "long-term"
+  content = "Koro lowers his crest when Nui keeps two body-lengths back near stored food."
+}
+
+@ memory-links[] {
+  from-memory = 0
+  to-memory = 1
+  relation = "supports"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieves-side-approach"
+  must-pass = true
+  contains = "approached slowly from the side"
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name = "retrieves-linked-drill-guidance"
+  must-pass = true
+  contains = "resting elder's shoulder"
+}
+
+@ checks[] {
+  $variant: trace-event
+  name = "calls-fetch-linked-memories"
+  must-pass = true
+  message-contains = "fetch_linked_memories>{\"memory_indexes\":"
+}
+
+@ checks[] {
+  $variant: trace-event
+  name = "memos-linked-signal-index"
+  must-pass = true
+  message-contains = "linked_hit_indexes\":[\"koro-signal-drill-linked\"]"
+}
