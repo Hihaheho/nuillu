@@ -1,29 +1,21 @@
 name = "mixed-eval"
 
-judge {
-  endpoint = "http://localhost:11434/v1"
-  token = "local"
-  model = "gpt-oss:20b"
+models {
+  judge-local {
+    endpoint = "http://localhost:11434/v1"
+    token = "local"
+    model = "gpt-oss:20b"
+  }
+
+  gemma4-e2b {
+    endpoint = "http://localhost:11434/v1"
+    token = "local"
+    model = "gemma4:e2b"
+    reasoning-effort = "none"
+  }
 }
 
-cheap {
-  endpoint = "http://localhost:11434/v1"
-  token = "local"
-  model = "gemma4:e2b"
-  reasoning-effort = "none"
-}
-
-default {
-  endpoint = "http://localhost:11434/v1"
-  token = "local"
-  model = "gemma4:e2b"
-  reasoning-effort = "none"
-}
-
-premium {
-  endpoint = "http://localhost:11434/v1"
-  // token-env = "OPENROUTER_API_KEY"
-  token = "local"
-  model = "gemma4:e2b"
-  reasoning-effort = "none"
-}
+judge-model = "judge-local"
+cheap-model = "gemma4-e2b"
+default-model = "gemma4-e2b"
+premium-model = "gemma4-e2b"

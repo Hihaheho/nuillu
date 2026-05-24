@@ -932,11 +932,7 @@ mod tests {
             blackboard,
             cognition_log_port: Rc::new(NoopCognitionLogRepository),
             clock: Rc::new(SystemClock),
-            tiers: LutumTiers {
-                cheap: lutum.clone(),
-                default: lutum.clone(),
-                premium: lutum,
-            },
+            tiers: LutumTiers::from_shared_lutum(lutum),
         })
     }
 
@@ -1039,6 +1035,7 @@ mod tests {
             &[],
             nuillu_module::SessionCompactionRuntime::new(
                 compaction_lutum.lutum().clone(),
+                nuillu_module::LlmConcurrencyLimiter::new(None),
                 nuillu_types::ModelTier::Cheap,
                 nuillu_module::SessionCompactionPolicy::default(),
             ),
@@ -1230,6 +1227,7 @@ mod tests {
             &[],
             nuillu_module::SessionCompactionRuntime::new(
                 compaction_lutum.lutum().clone(),
+                nuillu_module::LlmConcurrencyLimiter::new(None),
                 nuillu_types::ModelTier::Cheap,
                 nuillu_module::SessionCompactionPolicy::default(),
             ),

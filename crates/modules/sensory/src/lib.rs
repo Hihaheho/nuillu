@@ -941,11 +941,7 @@ mod tests {
                 blackboard: blackboard.clone(),
                 cognition_log_port: Rc::new(NoopCognitionLogRepository),
                 clock: Rc::new(SystemClock),
-                tiers: LutumTiers {
-                    cheap: lutum.clone(),
-                    default: lutum.clone(),
-                    premium: lutum,
-                },
+                tiers: LutumTiers::from_shared_lutum(lutum),
             },
             runtime: CapabilityProviderRuntime {
                 policy,

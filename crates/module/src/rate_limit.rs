@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -155,7 +154,6 @@ pub struct RuntimePolicy {
     pub interoception: InteroceptionRuntimePolicy,
     pub memo_retained_per_owner: usize,
     pub cognition_log_retained_entries: usize,
-    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub session_compaction: SessionCompactionPolicy,
 }
 
@@ -168,7 +166,6 @@ impl Default for RuntimePolicy {
             interoception: InteroceptionRuntimePolicy::default(),
             memo_retained_per_owner: 8,
             cognition_log_retained_entries: 16,
-            max_concurrent_llm_calls: None,
             session_compaction: SessionCompactionPolicy::default(),
         }
     }

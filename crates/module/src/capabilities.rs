@@ -13,11 +13,11 @@ use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, Repli
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
-use crate::llm::LlmConcurrencyLimiter;
 use crate::ports::{Clock, CognitionLogRepository};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::scene::{SceneReader, SceneRegistry};
+use crate::tiers::{LlmTierHandle, LutumTiers};
 use crate::r#trait::ErasedModule;
 use crate::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
@@ -25,8 +25,8 @@ use crate::{
     CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox,
     CognitionLogUpdatedMailbox, CognitionWriter, InteroceptionRuntimePolicy, InteroceptiveReader,
     InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
-    InteroceptiveWriter, LlmAccess, LutumTiers, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox,
-    MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
+    InteroceptiveWriter, LlmAccess, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated,
+    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
     ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
     SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
 };
@@ -57,7 +57,6 @@ struct CapabilityProvidersInner {
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
-    llm_concurrency_limiter: LlmConcurrencyLimiter,
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
 }
@@ -115,7 +114,6 @@ impl CapabilityProviders {
         let CapabilityProviderRuntime { event_sink, policy } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
-        let llm_concurrency_limiter = LlmConcurrencyLimiter::new(policy.max_concurrent_llm_calls);
         Self {
             inner: Rc::new(CapabilityProvidersInner {
                 attention_control_requests: Topic::new(
@@ -175,7 +173,6 @@ impl CapabilityProviders {
                 tiers,
                 runtime_events,
                 rate_limiter,
-                llm_concurrency_limiter,
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
             }),
@@ -250,7 +247,7 @@ impl CapabilityProviders {
                 self.inner.cognition_log_updates.clone(),
             ),
             clock: self.inner.clock.clone(),
-            session_compaction_lutum: self.inner.tiers.cheap.clone(),
+            session_compaction: self.inner.tiers.cheap.clone(),
             session_compaction_policy: self.inner.runtime_policy.session_compaction,
             runtime_events: self.inner.runtime_events.clone(),
             activation_gates: self.inner.activation_gates.clone(),
@@ -311,7 +308,7 @@ pub struct AgentRuntimeControl {
     blackboard: Blackboard,
     cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Rc<dyn Clock>,
-    session_compaction_lutum: Lutum,
+    session_compaction: LlmTierHandle,
     session_compaction_policy: SessionCompactionPolicy,
     runtime_events: RuntimeEventEmitter,
     activation_gates: ActivationGateHub,
@@ -328,8 +325,12 @@ impl AgentRuntimeControl {
         self.clock.clone()
     }
 
+    pub fn session_compaction_handle(&self) -> &LlmTierHandle {
+        &self.session_compaction
+    }
+
     pub fn session_compaction_lutum(&self) -> &Lutum {
-        &self.session_compaction_lutum
+        &self.session_compaction.lutum
     }
 
     pub fn session_compaction_policy(&self) -> SessionCompactionPolicy {
@@ -676,7 +677,6 @@ impl ModuleCapabilityFactory {
             self.root.inner.blackboard.clone(),
             self.root.inner.runtime_events.clone(),
             self.root.inner.rate_limiter.clone(),
-            self.root.inner.llm_concurrency_limiter.clone(),
         )
     }
 
@@ -1247,11 +1247,7 @@ mod tests {
             blackboard,
             cognition_log_port,
             clock: Rc::new(SystemClock),
-            tiers: LutumTiers {
-                cheap: lutum.clone(),
-                default: lutum.clone(),
-                premium: lutum,
-            },
+            tiers: LutumTiers::from_shared_lutum(lutum),
         })
     }
 

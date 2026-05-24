@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -191,7 +191,7 @@ pub struct SuiteRunReport {
     pub failed_only: bool,
     pub failed_from: Option<String>,
     pub fail_fast: bool,
-    pub max_concurrent_llm_calls: Option<usize>,
+    pub model_concurrency: BTreeMap<String, Option<usize>>,
     pub trials: usize,
     pub planned_case_count: usize,
     pub models: SuiteModelNames,
@@ -555,14 +555,14 @@ fn evaluate_deterministic_check(
         Check::TraceEvent {
             message_contains, ..
         } => {
-            let passed = trace
-                .events_matching(|event| trace_event_contains(event, message_contains));
+            let passed =
+                trace.events_matching(|event| trace_event_contains(event, message_contains));
             build_outcome(
                 check,
                 !passed.is_empty(),
-                passed.is_empty().then(|| {
-                    format!("expected trace event containing {message_contains:?}")
-                }),
+                passed
+                    .is_empty()
+                    .then(|| format!("expected trace event containing {message_contains:?}")),
             )
         }
         Check::TraceSpansOrdered { names, .. } => {
@@ -596,8 +596,7 @@ fn trace_event_contains(event: &EventRecord, needle: &str) -> bool {
             .and_then(trace_field_value_str)
             .is_some_and(|transcript| transcript_contains_tool_evidence(transcript, needle)),
         _ => event.fields.iter().any(|(key, value)| {
-            key != "transcript"
-                && matches!(value, FieldValue::Str(text) if text.contains(needle))
+            key != "transcript" && matches!(value, FieldValue::Str(text) if text.contains(needle))
         }),
     }
 }
@@ -1349,8 +1348,8 @@ mod tests {
     fn trace_event_check_matches_tool_calls_in_event_fields() {
         use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
 
-        use crate::cases::Check;
         use super::{evaluate_deterministic_check, trace_event_contains};
+        use crate::cases::Check;
 
         let trace = TraceSnapshot {
             roots: vec![SpanNode {
@@ -1402,11 +1401,8 @@ mod tests {
             },
             message_contains: "fetch_linked_memories".to_string(),
         };
-        let outcome = evaluate_deterministic_check(
-            &check,
-            &trace,
-            &crate::artifact::CaseArtifact::new(""),
-        );
+        let outcome =
+            evaluate_deterministic_check(&check, &trace, &crate::artifact::CaseArtifact::new(""));
         assert!(outcome.passed);
     }
 }

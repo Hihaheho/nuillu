@@ -1463,7 +1463,8 @@ async fn activate_with_retries(
             core_policies,
             SessionCompactionRuntime::new(
                 runtime
-                    .session_compaction_lutum()
+                    .session_compaction_handle()
+                    .lutum
                     .clone()
                     .with_extension(LlmRequestMetadata {
                         owner: module_owner.clone(),
@@ -1472,6 +1473,7 @@ async fn activate_with_retries(
                         activation_attempt: Some(activation_attempt),
                         batch: Some(LlmBatchDebug::from_batch(batch)),
                     }),
+                runtime.session_compaction_handle().concurrency.clone(),
                 module_tier,
                 runtime.session_compaction_policy(),
             ),

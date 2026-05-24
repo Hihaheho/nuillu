@@ -75,13 +75,19 @@ impl Default for JudgeOptions {
 #[derive(Clone)]
 pub struct LlmRubricJudge {
     llm: Lutum,
+    concurrency: nuillu_module::LlmConcurrencyLimiter,
     options: JudgeOptions,
 }
 
 impl LlmRubricJudge {
     pub fn new(llm: Lutum) -> Self {
+        Self::with_concurrency(llm, nuillu_module::LlmConcurrencyLimiter::new(None))
+    }
+
+    pub fn with_concurrency(llm: Lutum, concurrency: nuillu_module::LlmConcurrencyLimiter) -> Self {
         Self {
             llm,
+            concurrency,
             options: JudgeOptions::default(),
         }
     }
@@ -126,6 +132,7 @@ impl RubricJudge for LlmRubricJudge {
             eval = eval.temperature(temperature);
         }
 
+        let _permit = self.concurrency.acquire().await;
         let mut verdict = eval
             .evaluate(&self.llm, trace, &request)
             .await

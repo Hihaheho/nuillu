@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use lutum::{AssistantInputItem, InputMessageRole, Lutum, ModelInput, ModelInputItem, Session};
 use nuillu_types::ModelTier;
 
+use crate::llm::LlmConcurrencyLimiter;
+
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
 
@@ -20,6 +22,7 @@ pub struct SessionCompactionPolicy {
 #[derive(Clone)]
 pub struct SessionCompactionRuntime {
     lutum: Lutum,
+    concurrency: LlmConcurrencyLimiter,
     module_tier: ModelTier,
     policy: SessionCompactionPolicy,
 }
@@ -73,9 +76,15 @@ impl Default for SessionCompactionPolicy {
 }
 
 impl SessionCompactionRuntime {
-    pub fn new(lutum: Lutum, module_tier: ModelTier, policy: SessionCompactionPolicy) -> Self {
+    pub fn new(
+        lutum: Lutum,
+        concurrency: LlmConcurrencyLimiter,
+        module_tier: ModelTier,
+        policy: SessionCompactionPolicy,
+    ) -> Self {
         Self {
             lutum,
+            concurrency,
             module_tier,
             policy,
         }
@@ -83,6 +92,10 @@ impl SessionCompactionRuntime {
 
     pub fn lutum(&self) -> &Lutum {
         &self.lutum
+    }
+
+    pub fn concurrency(&self) -> &LlmConcurrencyLimiter {
+        &self.concurrency
     }
 
     pub fn module_tier(&self) -> ModelTier {
@@ -126,6 +139,7 @@ pub async fn compact_session_if_needed(
     if input_tokens <= threshold {
         return;
     }
+    let _permit = runtime.concurrency().acquire().await;
     if let Err(error) = compact_session(
         session,
         runtime.lutum(),
@@ -300,6 +314,7 @@ mod tests {
     ) -> SessionCompactionRuntime {
         SessionCompactionRuntime::new(
             lutum,
+            LlmConcurrencyLimiter::new(None),
             module_tier,
             SessionCompactionPolicy::new(threshold, threshold, threshold),
         )

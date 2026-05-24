@@ -326,8 +326,9 @@ mod tests {
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
-        SessionCompactionPolicy, SessionCompactionRuntime, session_compaction_cutoff,
+        CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers, Memo,
+        ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
+        session_compaction_cutoff,
     };
     use nuillu_types::{ModelTier, builtin};
 
@@ -385,11 +386,7 @@ mod tests {
             blackboard,
             cognition_log_port: Rc::new(NoopCognitionLogRepository),
             clock: Rc::new(SystemClock),
-            tiers: LutumTiers {
-                cheap: lutum.clone(),
-                default: lutum.clone(),
-                premium: lutum,
-            },
+            tiers: LutumTiers::from_shared_lutum(lutum),
         })
     }
 
@@ -566,6 +563,7 @@ mod tests {
     fn compaction_runtime(lutum: &Lutum) -> SessionCompactionRuntime {
         SessionCompactionRuntime::new(
             lutum.clone(),
+            LlmConcurrencyLimiter::new(None),
             ModelTier::Cheap,
             SessionCompactionPolicy::default(),
         )

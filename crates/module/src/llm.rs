@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
 use nuillu_types::{ModelTier, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::Id as TaskId;
 
 use crate::LutumTiers;
 use crate::rate_limit::{CapabilityKind, RateLimiter};
@@ -94,28 +96,124 @@ pub fn current_activation_llm_request_metadata() -> (Option<u32>, Option<LlmBatc
         .unwrap_or((None, None))
 }
 
-/// Shared admission control for LLM turns.
+type HeldConcurrencyKey = (TaskId, usize);
+
+struct HeldConcurrencyPermit {
+    count: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn held_concurrency_permits() -> &'static Mutex<HashMap<HeldConcurrencyKey, HeldConcurrencyPermit>>
+{
+    static HELD: OnceLock<Mutex<HashMap<HeldConcurrencyKey, HeldConcurrencyPermit>>> =
+        OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Permit returned by [`LlmConcurrencyLimiter`].
+///
+/// Permits are reentrant within the current Tokio task. This lets a module
+/// finish a model turn, keep the leased `Lutum` value in scope, and then run
+/// session compaction through the same model limiter without self-deadlocking.
+pub struct LlmConcurrencyPermit {
+    held: LlmConcurrencyPermitHeld,
+}
+
+enum LlmConcurrencyPermitHeld {
+    Task(HeldConcurrencyKey),
+    Unscoped {
+        _permit: Option<OwnedSemaphorePermit>,
+    },
+}
+
+impl LlmConcurrencyPermit {
+    fn task_scoped(key: HeldConcurrencyKey) -> Self {
+        Self {
+            held: LlmConcurrencyPermitHeld::Task(key),
+        }
+    }
+
+    fn unscoped(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            held: LlmConcurrencyPermitHeld::Unscoped {
+                _permit: Some(permit),
+            },
+        }
+    }
+}
+
+impl Drop for LlmConcurrencyPermit {
+    fn drop(&mut self) {
+        let LlmConcurrencyPermitHeld::Task(key) = &self.held else {
+            return;
+        };
+        let mut held = held_concurrency_permits()
+            .lock()
+            .expect("LLM concurrency permit map mutex poisoned");
+        let Some(entry) = held.get_mut(key) else {
+            debug_assert!(false, "LLM concurrency permit missing from task map");
+            return;
+        };
+        if entry.count > 1 {
+            entry.count -= 1;
+        } else {
+            held.remove(key);
+        }
+    }
+}
+
+/// Shared admission control for LLM turns scoped to one model definition.
 #[derive(Clone)]
-pub(crate) struct LlmConcurrencyLimiter {
+pub struct LlmConcurrencyLimiter {
+    max_concurrent_calls: Option<NonZeroUsize>,
     semaphore: Option<Arc<Semaphore>>,
 }
 
 impl LlmConcurrencyLimiter {
-    pub(crate) fn new(max_concurrent_calls: Option<NonZeroUsize>) -> Self {
+    pub fn new(max_concurrent_calls: Option<NonZeroUsize>) -> Self {
         Self {
+            max_concurrent_calls,
             semaphore: max_concurrent_calls.map(|max| Arc::new(Semaphore::new(max.get()))),
         }
     }
 
-    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+    pub fn max_concurrent_calls(&self) -> Option<NonZeroUsize> {
+        self.max_concurrent_calls
+    }
+
+    pub async fn acquire(&self) -> Option<LlmConcurrencyPermit> {
         let semaphore = self.semaphore.as_ref()?;
-        Some(
-            semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("LLM concurrency semaphore is never closed"),
-        )
+        let task_key =
+            tokio::task::try_id().map(|task_id| (task_id, Arc::as_ptr(semaphore) as usize));
+        if let Some(key) = task_key {
+            let mut held = held_concurrency_permits()
+                .lock()
+                .expect("LLM concurrency permit map mutex poisoned");
+            if let Some(entry) = held.get_mut(&key) {
+                entry.count += 1;
+                return Some(LlmConcurrencyPermit::task_scoped(key));
+            }
+        }
+
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("LLM concurrency semaphore is never closed");
+        let Some(key) = task_key else {
+            return Some(LlmConcurrencyPermit::unscoped(permit));
+        };
+        held_concurrency_permits()
+            .lock()
+            .expect("LLM concurrency permit map mutex poisoned")
+            .insert(
+                key,
+                HeldConcurrencyPermit {
+                    count: 1,
+                    _permit: permit,
+                },
+            );
+        Some(LlmConcurrencyPermit::task_scoped(key))
     }
 }
 
@@ -127,7 +225,7 @@ impl LlmConcurrencyLimiter {
 /// so module code can bind the value and pass `&lutum`.
 pub struct LlmLease {
     lutum: Lutum,
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<LlmConcurrencyPermit>,
     completion: Option<LlmLeaseCompletion>,
 }
 
@@ -141,7 +239,7 @@ struct LlmLeaseCompletion {
 impl LlmLease {
     fn new(
         lutum: Lutum,
-        permit: Option<OwnedSemaphorePermit>,
+        permit: Option<LlmConcurrencyPermit>,
         completion: LlmLeaseCompletion,
     ) -> Self {
         Self {
@@ -193,7 +291,6 @@ pub struct LlmAccess {
     blackboard: Blackboard,
     events: RuntimeEventEmitter,
     rate_limiter: RateLimiter,
-    concurrency_limiter: LlmConcurrencyLimiter,
 }
 
 impl LlmAccess {
@@ -203,7 +300,6 @@ impl LlmAccess {
         blackboard: Blackboard,
         events: RuntimeEventEmitter,
         rate_limiter: RateLimiter,
-        concurrency_limiter: LlmConcurrencyLimiter,
     ) -> Self {
         Self {
             owner,
@@ -211,7 +307,6 @@ impl LlmAccess {
             blackboard,
             events,
             rate_limiter,
-            concurrency_limiter,
         }
     }
 
@@ -231,15 +326,16 @@ impl LlmAccess {
                 outcome.delayed_for,
             );
         }
-        let permit = self.concurrency_limiter.acquire().await;
 
         let tier = self
             .blackboard
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
+        let handle = self.tiers.pick_handle(tier);
+        let permit = handle.concurrency.acquire().await;
         let call = self.events.llm_accessed(self.owner.clone(), tier);
         let (activation_attempt, batch) = current_activation_llm_request_metadata();
-        let lutum = self.tiers.pick(tier).with_extension(LlmRequestMetadata {
+        let lutum = handle.lutum.clone().with_extension(LlmRequestMetadata {
             owner: self.owner.clone(),
             tier,
             source: LlmRequestSource::ModuleTurn,
@@ -326,11 +422,7 @@ mod tests {
         let adapter = Arc::new(MockLlmAdapter::new());
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        let tiers = crate::LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
-        };
+        let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
         let access = LlmAccess::new(
@@ -339,7 +431,6 @@ mod tests {
             blackboard,
             events,
             RateLimiter::disabled(),
-            LlmConcurrencyLimiter::new(None),
         );
 
         let _ = access.lutum().await;
@@ -408,11 +499,7 @@ mod tests {
             LutumHooksSet::new()
                 .with_on_model_input(RecordingModelInputHook { seen: seen.clone() }),
         );
-        let tiers = crate::LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
-        };
+        let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink);
         let access = LlmAccess::new(
@@ -421,7 +508,6 @@ mod tests {
             blackboard,
             events,
             RateLimiter::disabled(),
-            LlmConcurrencyLimiter::new(None),
         );
 
         let lutum = access.lutum().await;
@@ -450,11 +536,7 @@ mod tests {
         let adapter = Arc::new(MockLlmAdapter::new());
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
-        let tiers = crate::LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
-        };
+        let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
         let limiter = RateLimiter::new(
@@ -465,14 +547,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let access = LlmAccess::new(
-            owner.clone(),
-            tiers,
-            blackboard,
-            events,
-            limiter,
-            LlmConcurrencyLimiter::new(None),
-        );
+        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events, limiter);
 
         let _ = access.lutum().await;
         let _ = access.lutum().await;
@@ -523,34 +598,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lutum_waits_for_concurrency_permit_until_prior_lease_is_dropped() {
-        let blackboard = Blackboard::default();
-        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-        let adapter = Arc::new(MockLlmAdapter::new());
-        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-        let lutum = Lutum::new(adapter, budget);
-        let tiers = crate::LutumTiers {
-            cheap: lutum.clone(),
-            default: lutum.clone(),
-            premium: lutum,
-        };
-        let sink = Rc::new(RecordingSink::default());
-        let events = RuntimeEventEmitter::new(sink);
-        let access = LlmAccess::new(
-            owner,
-            tiers,
-            blackboard,
-            events,
-            RateLimiter::disabled(),
-            LlmConcurrencyLimiter::new(Some(std::num::NonZeroUsize::new(1).unwrap())),
+    async fn concurrency_limiter_is_reentrant_within_current_task() {
+        let limiter = LlmConcurrencyLimiter::new(Some(std::num::NonZeroUsize::new(1).unwrap()));
+
+        tokio::spawn(async move {
+            let first = limiter.acquire().await;
+            let second = tokio::time::timeout(Duration::from_millis(5), limiter.acquire()).await;
+            assert!(second.is_ok());
+
+            drop(second);
+            drop(first);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrency_limiter_waits_for_permit_held_by_another_task() {
+        let limiter = LlmConcurrencyLimiter::new(Some(std::num::NonZeroUsize::new(1).unwrap()));
+
+        let first = limiter.acquire().await;
+        let second = tokio::spawn({
+            let limiter = limiter.clone();
+            async move { limiter.acquire().await }
+        });
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut second)
+                .await
+                .is_err()
         );
 
-        let first = access.lutum().await;
-        let second = tokio::time::timeout(Duration::from_millis(5), access.lutum()).await;
-        assert!(second.is_err());
-
         drop(first);
-        let second = tokio::time::timeout(Duration::from_millis(50), access.lutum()).await;
-        assert!(second.is_ok());
+        let second = tokio::time::timeout(Duration::from_millis(50), &mut second).await;
+        assert!(matches!(second, Ok(Ok(Some(_)))));
     }
 }

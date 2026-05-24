@@ -32,8 +32,9 @@ pub use judge::{
     RubricJudgeVerdict, RubricJudgeVerdictCriterion, render_judge_input,
 };
 pub use nuillu_server::model_set::{
-    EmbeddingRole, ModelSet, ModelSetError, ModelSetFile, ModelSetRole, ReasoningEffort,
-    parse_model_set_file,
+    EmbeddingRole, ModelDefinition, ModelSet, ModelSetError, ModelSetFile, ReasoningEffort,
+    ResolvedLlmBackends, TierBinding, model_concurrency_from_backends, parse_model_set_file,
+    resolve_llm_backends, resolve_token_fields,
 };
 pub use runner::{
     CaseRunOutput, EmbeddingBackendConfig, LlmBackendConfig, RunnerConfig, RunnerError,

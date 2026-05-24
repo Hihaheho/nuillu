@@ -17,19 +17,20 @@ pub struct ServerConfig {
     pub premium_backend: LlmBackendConfig,
     pub model_dir: PathBuf,
     pub embedding_backend: Option<EmbeddingBackendConfig>,
-    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
     pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LlmBackendConfig {
+    pub model_key: String,
     pub endpoint: String,
     pub token: String,
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub use_responses_api: bool,
     pub compaction_input_token_threshold: u64,
+    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Clone)]

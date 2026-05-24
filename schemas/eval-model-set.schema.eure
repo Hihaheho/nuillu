@@ -8,23 +8,40 @@ name.$optional = true
 compaction-input-token-threshold = `integer`
 compaction-input-token-threshold.$optional = true
 
-max-concurrent-llm-calls = `integer`
-max-concurrent-llm-calls.$optional = true
+models = `$types.models-map`
+models.$optional = true
 
-judge = `$types.model-role`
+judge-model = `text`
+judge-model.$optional = true
+
+cheap-model = `text`
+cheap-model.$optional = true
+
+default-model = `text`
+default-model.$optional = true
+
+premium-model = `text`
+premium-model.$optional = true
+
+judge = `$types.tier-binding`
 judge.$optional = true
 
-cheap = `$types.model-role`
+cheap = `$types.tier-binding`
 cheap.$optional = true
 
-default = `$types.model-role`
+default = `$types.tier-binding`
 default.$optional = true
 
-premium = `$types.model-role`
+premium = `$types.tier-binding`
 premium.$optional = true
 
 embedding = `$types.embedding-role`
 embedding.$optional = true
+
+@ $types.models-map
+$variant: map
+key = `text`
+value = `$types.model-definition`
 
 @ $types.reasoning-effort
 $variant: union
@@ -35,7 +52,7 @@ variants.medium = { = "medium", $variant => "literal" }
 variants.high = { = "high", $variant => "literal" }
 variants.xhigh = { = "xhigh", $variant => "literal" }
 
-@ $types.model-role
+@ $types.model-definition
 endpoint = `text`
 endpoint.$optional = true
 base-url = `text`
@@ -50,6 +67,13 @@ reasoning-effort = `$types.reasoning-effort`
 reasoning-effort.$optional = true
 use-responses-api = `boolean`
 use-responses-api.$optional = true
+max-concurrent-llm-calls = `integer`
+max-concurrent-llm-calls.$optional = true
+
+@ $types.tier-binding
+model = `text`
+reasoning-effort = `$types.reasoning-effort`
+reasoning-effort.$optional = true
 compaction-input-token-threshold = `integer`
 compaction-input-token-threshold.$optional = true
 

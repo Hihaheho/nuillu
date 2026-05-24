@@ -18,8 +18,8 @@ use nuillu_memory::{MemoryCapabilities, MemoryStore};
 use nuillu_module::ports::{Clock, Embedder, PortError, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, LutumTiers, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
-    SessionCompactionPolicy,
+    CapabilityProviders, LlmConcurrencyPool, LlmTierHandle, LutumTiers, RuntimeEvent,
+    RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy,
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
@@ -62,6 +62,7 @@ pub(super) async fn build_server_environment(
     let agent_store = connect_agent_store(config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
+    let llm_concurrency_pool = LlmConcurrencyPool::default();
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
@@ -71,6 +72,7 @@ pub(super) async fn build_server_environment(
                 &config.cheap_backend,
                 &config.default_backend,
                 &config.premium_backend,
+                &llm_concurrency_pool,
                 Some(llm_observer),
                 Some(server_llm_log_context(config)),
             )?,
@@ -115,7 +117,6 @@ fn server_runtime_policy(config: &ServerConfig) -> RuntimePolicy {
         allocation_limits: server_allocation_limits(),
         memo_retained_per_owner: 8,
         cognition_log_retained_entries: 16,
-        max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         session_compaction: session_compaction_policy(config),
         ..RuntimePolicy::default()
     }
@@ -184,19 +185,40 @@ pub fn build_tiers(
     cheap: &LlmBackendConfig,
     default: &LlmBackendConfig,
     premium: &LlmBackendConfig,
+    pool: &LlmConcurrencyPool,
     llm_observer: Option<VisualizerLlmObserver>,
     llm_log_context: Option<LlmLogContext>,
 ) -> anyhow::Result<LutumTiers> {
     let file_trace_sink = llm_log_context.map(FileLlmTraceSink::new);
     Ok(LutumTiers {
-        cheap: build_lutum_with_file_trace(cheap, llm_observer.clone(), file_trace_sink.clone())?,
-        default: build_lutum_with_file_trace(
-            default,
-            llm_observer.clone(),
-            file_trace_sink.clone(),
-        )?,
-        premium: build_lutum_with_file_trace(premium, llm_observer, file_trace_sink)?,
+        cheap: build_tier_handle(cheap, pool, llm_observer.clone(), file_trace_sink.clone())?,
+        default: build_tier_handle(default, pool, llm_observer.clone(), file_trace_sink.clone())?,
+        premium: build_tier_handle(premium, pool, llm_observer, file_trace_sink)?,
     })
+}
+
+fn build_tier_handle(
+    config: &LlmBackendConfig,
+    pool: &LlmConcurrencyPool,
+    llm_observer: Option<VisualizerLlmObserver>,
+    file_trace_sink: Option<FileLlmTraceSink>,
+) -> anyhow::Result<LlmTierHandle> {
+    let lutum = build_lutum_with_file_trace(config, llm_observer, file_trace_sink)?;
+    let concurrency = pool.limiter_for(&config.model_key, config.max_concurrent_llm_calls);
+    Ok(LlmTierHandle::new(
+        lutum,
+        concurrency,
+        config.model_key.clone(),
+    ))
+}
+
+pub fn build_model_handle(
+    config: &LlmBackendConfig,
+    pool: &LlmConcurrencyPool,
+    llm_observer: Option<VisualizerLlmObserver>,
+    file_trace_sink: Option<FileLlmTraceSink>,
+) -> anyhow::Result<LlmTierHandle> {
+    build_tier_handle(config, pool, llm_observer, file_trace_sink)
 }
 
 pub fn build_lutum(
@@ -406,12 +428,14 @@ mod tests {
 
     fn test_backend_config() -> LlmBackendConfig {
         LlmBackendConfig {
+            model_key: "model".to_string(),
             endpoint: "http://localhost:11434/v1".to_string(),
             token: "local".to_string(),
             model: "model".to_string(),
             reasoning_effort: None,
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
+            max_concurrent_llm_calls: None,
         }
     }
 
@@ -426,7 +450,6 @@ mod tests {
             premium_backend: test_backend_config(),
             model_dir: PathBuf::from("models/potion-base-8M"),
             embedding_backend: None,
-            max_concurrent_llm_calls: None,
             disabled_modules: Vec::new(),
             participants: Vec::new(),
         };

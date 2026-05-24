@@ -33,8 +33,8 @@ use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
     CapabilityProviders, CognitionLogUpdated, InternalHarnessIo, InteroceptionRuntimePolicy,
-    ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy, SceneRegistry,
-    SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
+    LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
+    SceneRegistry, SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
     apply_standard_dependencies,
 };
 use nuillu_reward::{IndexedPolicy, PolicyCapabilities, PolicyRecord, PolicyStore};
@@ -90,7 +90,9 @@ const EVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
 const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 
-pub use nuillu_server::{EmbeddingBackendConfig, LlmBackendConfig};
+pub use nuillu_server::{
+    EmbeddingBackendConfig, LlmBackendConfig, model_concurrency_from_backends,
+};
 
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -107,7 +109,8 @@ pub struct RunnerConfig {
     pub fail_fast: bool,
     pub failed_only: bool,
     pub failed_from: Option<PathBuf>,
-    pub max_concurrent_llm_calls: Option<NonZeroUsize>,
+    pub model_concurrency: BTreeMap<String, Option<NonZeroUsize>>,
+    pub llm_concurrency_pool: LlmConcurrencyPool,
     pub trials: NonZeroUsize,
     pub case_patterns: Vec<String>,
     pub module_filters: Vec<EvalModule>,
@@ -268,8 +271,8 @@ impl VisualizerHook {
 
 use nuillu_server::{
     LlmLogContext, VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder,
-    build_lutum, build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
-    memory_record_view, model_tier_name, module_policy_views,
+    build_model_handle, build_tiers, duration_millis_u64, linked_memory_record_view,
+    memory_rank_name, memory_record_view, model_tier_name, module_policy_views,
 };
 
 #[derive(Debug, Clone)]
@@ -445,7 +448,9 @@ pub async fn run_suite_with_hooks(
                 "default": backend_report(&config.default_backend),
                 "premium": backend_report(&config.premium_backend),
             },
-            "max_concurrent_llm_calls": config.max_concurrent_llm_calls.map(NonZeroUsize::get),
+            "model_concurrency": config.model_concurrency.iter().map(|(model, limit)| {
+                (model.clone(), limit.map(NonZeroUsize::get))
+            }).collect::<BTreeMap<_, _>>(),
             "trials": config.trials.get(),
         }),
         format!(
@@ -457,12 +462,17 @@ pub async fn run_suite_with_hooks(
         ),
     )?;
 
-    let judge_llm =
-        build_lutum(&config.judge_backend, None).map_err(|error| RunnerError::Driver {
-            path: config.cases_root.clone(),
-            message: error.to_string(),
-        })?;
-    let judge = LlmRubricJudge::new(judge_llm);
+    let judge_handle = build_model_handle(
+        &config.judge_backend,
+        &config.llm_concurrency_pool,
+        None,
+        None,
+    )
+    .map_err(|error| RunnerError::Driver {
+        path: config.cases_root.clone(),
+        message: error.to_string(),
+    })?;
+    let judge = LlmRubricJudge::with_concurrency(judge_handle.lutum, judge_handle.concurrency);
 
     let mut cases = Vec::new();
     for path in case_paths {
@@ -543,7 +553,11 @@ fn suite_run_report(
         failed_only: failed_only_requested(config),
         failed_from: failed_from.map(|path| path.display().to_string()),
         fail_fast: config.fail_fast,
-        max_concurrent_llm_calls: config.max_concurrent_llm_calls.map(NonZeroUsize::get),
+        model_concurrency: config
+            .model_concurrency
+            .iter()
+            .map(|(model, limit)| (model.clone(), limit.map(NonZeroUsize::get)))
+            .collect(),
         trials: config.trials.get(),
         planned_case_count,
         models: SuiteModelNames {
@@ -3919,6 +3933,7 @@ pub(crate) async fn build_eval_environment(
         &config.cheap_backend,
         &config.default_backend,
         &config.premium_backend,
+        &config.llm_concurrency_pool,
         llm_observer,
         Some(eval_llm_log_context(config, case_id)),
     )
@@ -3929,7 +3944,6 @@ pub(crate) async fn build_eval_environment(
     let runtime_policy = RuntimePolicy {
         memo_retained_per_owner: EVAL_MEMO_RETAINED_PER_OWNER,
         cognition_log_retained_entries: EVAL_COGNITION_LOG_RETAINED_ENTRIES,
-        max_concurrent_llm_calls: config.max_concurrent_llm_calls,
         session_compaction: session_compaction_policy(config),
         interoception: interoception_runtime_policy(limits),
         ..RuntimePolicy::default()
@@ -6282,7 +6296,7 @@ mod tests {
     use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, MemoryMetaPatch};
     use nuillu_memory::NoopMemoryStore;
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
-    use nuillu_module::{LutumTiers, MemoUpdated};
+    use nuillu_module::{LlmConcurrencyPool, LutumTiers, MemoUpdated};
     use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
@@ -6307,13 +6321,24 @@ mod tests {
 
     fn test_backend_config_with_model(model: &str) -> LlmBackendConfig {
         LlmBackendConfig {
+            model_key: model.to_string(),
             endpoint: "http://localhost:11434/v1".to_string(),
             token: "local".to_string(),
             model: model.to_string(),
             reasoning_effort: None,
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
+            max_concurrent_llm_calls: None,
         }
+    }
+
+    fn test_model_concurrency() -> BTreeMap<String, Option<NonZeroUsize>> {
+        BTreeMap::from([
+            ("judge-model".to_string(), None),
+            ("cheap-model".to_string(), None),
+            ("default-model".to_string(), None),
+            ("premium-model".to_string(), None),
+        ])
     }
 
     fn test_runner_config(dir: &Path) -> RunnerConfig {
@@ -6331,7 +6356,8 @@ mod tests {
             fail_fast: false,
             failed_only: false,
             failed_from: None,
-            max_concurrent_llm_calls: None,
+            model_concurrency: test_model_concurrency(),
+            llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
@@ -6349,7 +6375,7 @@ mod tests {
             failed_only: false,
             failed_from: None,
             fail_fast: false,
-            max_concurrent_llm_calls: None,
+            model_concurrency: BTreeMap::new(),
             trials,
             planned_case_count: 0,
             models: SuiteModelNames {
@@ -6748,11 +6774,7 @@ id = "{id}"
             blackboard,
             cognition_log_port: Rc::new(NoopCognitionLogRepository),
             clock: Rc::new(SystemClock),
-            tiers: LutumTiers {
-                cheap: lutum.clone(),
-                default: lutum.clone(),
-                premium: lutum,
-            },
+            tiers: LutumTiers::from_shared_lutum(lutum),
         })
     }
 
@@ -7039,7 +7061,8 @@ id = "module-query-memory-special-memory"
             fail_fast: false,
             failed_only: false,
             failed_from: None,
-            max_concurrent_llm_calls: None,
+            model_concurrency: test_model_concurrency(),
+            llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: vec!["special-memory".to_string()],
             module_filters: Vec::new(),
@@ -7938,13 +7961,15 @@ limits {{
         }
 
         let output_root = dir.path().join("out");
+        let mut cheap_backend = test_backend_config_with_model("cheap-model");
+        cheap_backend.max_concurrent_llm_calls = NonZeroUsize::new(7);
         let config = RunnerConfig {
             cases_root: dir.path().join("eval-cases"),
             output_root: output_root.clone(),
             llm_log_root: dir.path().join("llm-logs"),
             run_id: "runtime-failures".to_string(),
             judge_backend: test_backend_config_with_model("judge-model"),
-            cheap_backend: test_backend_config_with_model("cheap-model"),
+            cheap_backend,
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
             model_dir: dir.path().join("missing-model"),
@@ -7952,7 +7977,17 @@ limits {{
             fail_fast: false,
             failed_only: false,
             failed_from: None,
-            max_concurrent_llm_calls: NonZeroUsize::new(7),
+            model_concurrency: model_concurrency_from_backends([
+                test_backend_config_with_model("judge-model"),
+                {
+                    let mut cheap = test_backend_config_with_model("cheap-model");
+                    cheap.max_concurrent_llm_calls = NonZeroUsize::new(7);
+                    cheap
+                },
+                test_backend_config_with_model("default-model"),
+                test_backend_config_with_model("premium-model"),
+            ]),
+            llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
@@ -7971,7 +8006,10 @@ limits {{
         assert_eq!(report.run.output_dir, run_dir.display().to_string());
         assert_eq!(report.run.case_patterns, Vec::<String>::new());
         assert!(!report.run.fail_fast);
-        assert_eq!(report.run.max_concurrent_llm_calls, Some(7));
+        assert_eq!(
+            report.run.model_concurrency.get("cheap-model"),
+            Some(&Some(7))
+        );
         assert_eq!(report.run.trials, 1);
         assert_eq!(report.run.planned_case_count, 2);
         assert_eq!(report.run.models.judge, "judge-model");
@@ -8011,7 +8049,12 @@ limits {{
                 "failed_only": false,
                 "failed_from": null,
                 "fail_fast": false,
-                "max_concurrent_llm_calls": 7,
+                "model_concurrency": {
+                    "cheap-model": 7,
+                    "default-model": null,
+                    "judge-model": null,
+                    "premium-model": null,
+                },
                 "trials": 1,
                 "planned_case_count": 2,
                 "models": {
@@ -8060,7 +8103,8 @@ limits {
         let mut config = test_runner_config(dir.path());
         config.output_root = output_root.clone();
         config.run_id = "multi-trial".to_string();
-        config.max_concurrent_llm_calls = NonZeroUsize::new(7);
+        config.model_concurrency =
+            BTreeMap::from([("cheap-model".to_string(), NonZeroUsize::new(7))]);
         config.trials = NonZeroUsize::new(2).unwrap();
 
         let report = run_suite(&config).await.unwrap();

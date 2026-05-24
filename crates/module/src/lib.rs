@@ -71,8 +71,9 @@ pub use cognition::CognitionWriter;
 pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};
 pub use interoception::InteroceptiveWriter;
 pub use llm::{
-    LlmAccess, LlmBatchDebug, LlmLease, LlmRequestMetadata, LlmRequestSource,
-    current_activation_llm_request_metadata, with_activation_llm_request_metadata,
+    LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmLease, LlmRequestMetadata,
+    LlmRequestSource, current_activation_llm_request_metadata,
+    with_activation_llm_request_metadata,
 };
 pub use memo::{Memo, TypedMemo};
 pub use memory_render::render_memory_for_llm;
@@ -107,6 +108,6 @@ pub use session_compaction::{
     SessionCompactionRuntime, compact_session, compact_session_if_needed,
     session_compaction_cutoff,
 };
-pub use tiers::LutumTiers;
+pub use tiers::{LlmConcurrencyPool, LlmTierHandle, LutumTiers};
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
