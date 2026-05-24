@@ -8,10 +8,10 @@ use std::{
 
 use lutum::{
     AssistantInputItem, CompletionEvent, ErasedStructuredCompletionEvent,
-    ErasedStructuredTurnEvent, ErasedTextTurnEvent, InputMessageRole, ItemView, LutumHooksSet,
-    LutumStreamEvent, MessageContent, ModelInputHookContext, ModelInputItem, OnModelInput,
-    OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext, TurnRole, TurnView,
-    Usage,
+    ErasedStructuredTurnEvent, ErasedTextTurnEvent, Image, InputMessageRole, ItemView,
+    LutumHooksSet, LutumStreamEvent, MessageContent, ModelInputHookContext, ModelInputItem,
+    OnModelInput, OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext,
+    TurnRole, TurnView, Usage,
 };
 use nuillu_module::{LlmRequestMetadata, LlmRequestSource};
 use nuillu_visualizer_protocol::{
@@ -428,11 +428,11 @@ fn model_input_views(items: &[ModelInputItem]) -> Vec<LlmInputItemView> {
         match item {
             ModelInputItem::Message { role, content } => {
                 for content in content.as_slice() {
-                    let MessageContent::Text(text) = content;
+                    let (kind, content) = message_content_view(content);
                     output.push(LlmInputItemView {
                         role: input_role_label(*role).to_string(),
-                        kind: "text".to_string(),
-                        content: text.clone(),
+                        kind: kind.to_string(),
+                        content,
                         ephemeral: false,
                         source: None,
                     });
@@ -443,7 +443,7 @@ fn model_input_views(items: &[ModelInputItem]) -> Vec<LlmInputItemView> {
                 output.push(LlmInputItemView {
                     role: "assistant".to_string(),
                     kind: kind.to_string(),
-                    content: content.to_string(),
+                    content,
                     ephemeral: false,
                     source: None,
                 });
@@ -524,11 +524,28 @@ fn input_item(
     }
 }
 
-fn assistant_input_view(item: &AssistantInputItem) -> (&'static str, &str) {
+fn message_content_view(content: &MessageContent) -> (&'static str, String) {
+    match content {
+        MessageContent::Text(text) => ("text", text.clone()),
+        MessageContent::Image(image) => ("image", image_trace_content(image)),
+    }
+}
+
+fn assistant_input_view(item: &AssistantInputItem) -> (&'static str, String) {
     match item {
-        AssistantInputItem::Text(text) => ("text", text.as_str()),
-        AssistantInputItem::Reasoning(text) => ("reasoning", text.as_str()),
-        AssistantInputItem::Refusal(text) => ("refusal", text.as_str()),
+        AssistantInputItem::Text(text) => ("text", text.clone()),
+        AssistantInputItem::Image(image) => ("image", image_trace_content(image)),
+        AssistantInputItem::Reasoning(text) => ("reasoning", text.clone()),
+        AssistantInputItem::Refusal(text) => ("refusal", text.clone()),
+    }
+}
+
+fn image_trace_content(image: &Image) -> String {
+    match image {
+        Image::Base64 { data, media_type } => {
+            format!("base64 image media_type={media_type} bytes={}", data.len())
+        }
+        Image::Uri(uri) => uri.to_string(),
     }
 }
 
