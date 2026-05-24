@@ -2359,6 +2359,13 @@ async fn activate_module_case_target(
                 .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::AttentionSchema => {
+            let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+            let mut config = allocation.for_module(run_target_module);
+            config.guidance = prompt.to_string();
+            allocation.set(run_target_module.clone(), config);
+            blackboard
+                .apply(BlackboardCommand::SetAllocation(allocation))
+                .await;
             for record in memo_seed_records {
                 harness
                     .memo_updated_mailbox()
@@ -6803,12 +6810,17 @@ id = "{id}"
                 request_id: Some("attention-schema-noop".into()),
                 model: "mock".into(),
             }),
-            Ok(RawTextTurnEvent::TextDelta {
-                delta: "no new attention experience".into(),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "leave-attention-unchanged".into(),
+                name: "leave_attention_unchanged".into(),
+                arguments_json_delta: serde_json::json!({
+                    "reason": "no new attention experience"
+                })
+                .to_string(),
             }),
             Ok(RawTextTurnEvent::Completed {
                 request_id: Some("attention-schema".into()),
-                finish_reason: FinishReason::Stop,
+                finish_reason: FinishReason::ToolCall,
                 usage: Usage::zero(),
             }),
         ])
@@ -8444,7 +8456,7 @@ prompt = "What am I attending to?"
     }
 
     #[tokio::test]
-    async fn attention_schema_appends_attention_experience_and_skips_no_tool_wakes() {
+    async fn attention_schema_appends_attention_experience_and_skips_noop_wakes() {
         let local = LocalSet::new();
         local
             .run_until(async {

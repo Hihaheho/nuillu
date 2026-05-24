@@ -6,6 +6,7 @@ use nuillu_module::{
     CognitionWriter, LlmAccess, MemoUpdatedInbox, Module, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,10 +19,15 @@ Maintain the current state of attention from memo-log history, current resource 
 cognition log. Memo logs are durable module output; the cognition log is admitted cognitive evidence.
 
 Assume the agent is a non-physical experiencer: it can direct attention to any target, physical or
-non-physical, and it can freely control that attention. When a current attention state should become
-part of cognitive processing, call append_attention_experience. Use the tool only for a new,
-claimable, cognitively useful experience of attention. If there is no new attention experience to
-add, finish without calling tools.
+non-physical, and it can freely control that attention.
+
+Use exactly one tool per activation:
+- append_attention_experience when a new, claimable, cognitively useful attention state should
+  become part of cognitive processing.
+- leave_attention_unchanged when there is no new claimable, cognitively useful attention
+  experience to add.
+
+Do not use final assistant text as an output channel.
 
 The plaintext field is the exact cognition-log entry to append. Write it as subjective experience:
 use "I" as the subject whenever possible, use an experiential verb, and describe the attention as an
@@ -59,9 +65,24 @@ pub struct AppendAttentionExperienceOutput {
     pub appended: bool,
 }
 
+#[lutum::tool_input(
+    name = "leave_attention_unchanged",
+    output = LeaveAttentionUnchangedOutput
+)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LeaveAttentionUnchangedArgs {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LeaveAttentionUnchangedOutput {
+    pub unchanged: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum AttentionSchemaTools {
     AppendAttentionExperience(AppendAttentionExperienceArgs),
+    LeaveAttentionUnchanged(LeaveAttentionUnchangedArgs),
 }
 
 pub struct AttentionSchemaModule {
@@ -75,6 +96,7 @@ pub struct AttentionSchemaModule {
     session: Session,
     session_compaction: SessionCompactionConfig,
     model_prompt: std::sync::OnceLock<String>,
+    session_seeded: bool,
 }
 
 impl AttentionSchemaModule {
@@ -99,7 +121,22 @@ impl AttentionSchemaModule {
             session: Session::new(),
             session_compaction: SessionCompactionConfig::default(),
             model_prompt: std::sync::OnceLock::new(),
+            session_seeded: false,
         }
+    }
+
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        if self.session_seeded {
+            return;
+        }
+        let model_prompt = self.model_prompt(cx).to_owned();
+        seed_persistent_faculty_session(
+            &mut self.session,
+            model_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+        self.session_seeded = true;
     }
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -115,13 +152,13 @@ impl AttentionSchemaModule {
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn update_model(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
+        self.ensure_session_seeded(cx);
+
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
         push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let unread_cognition_log = self.cognition_log.unread_events().await;
         let allocation = self.allocation.snapshot().await;
 
-        let prompt = self.model_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(prompt);
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition_log, cx.now());
         if let Some(context) = format_attention_schema_context(&allocation) {
             self.session.push_ephemeral_system(context);
@@ -134,7 +171,11 @@ impl AttentionSchemaModule {
             .session
             .text_turn(&lutum)
             .tools::<AttentionSchemaTools>()
-            .available_tools([AttentionSchemaToolsSelector::AppendAttentionExperience])
+            .available_tools([
+                AttentionSchemaToolsSelector::AppendAttentionExperience,
+                AttentionSchemaToolsSelector::LeaveAttentionUnchanged,
+            ])
+            .require_any_tool()
             .collect()
             .await
             .context("attention-schema attention experience turn failed")?;
@@ -146,13 +187,13 @@ impl AttentionSchemaModule {
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
-                    SessionCompactionProtectedPrefix::None,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                     Self::id(),
                     COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
                 )
                 .await;
-                return Ok(());
+                anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                 compact_session_if_needed(
@@ -160,13 +201,13 @@ impl AttentionSchemaModule {
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
-                    SessionCompactionProtectedPrefix::None,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                     Self::id(),
                     COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
                     SESSION_COMPACTION_PROMPT,
                 )
                 .await;
-                return Ok(());
+                anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
@@ -174,15 +215,25 @@ impl AttentionSchemaModule {
 
         let mut results: Vec<ToolResult> = Vec::new();
         for call in round.tool_calls.iter().cloned() {
-            let AttentionSchemaToolsCall::AppendAttentionExperience(call) = call;
-            let output = self
-                .append_attention_experience(call.input.clone())
-                .await
-                .context("run append_attention_experience tool")?;
-            results.push(
-                call.complete(output)
-                    .context("complete append_attention_experience tool call")?,
-            );
+            match call {
+                AttentionSchemaToolsCall::AppendAttentionExperience(call) => {
+                    let output = self
+                        .append_attention_experience(call.input.clone())
+                        .await
+                        .context("run append_attention_experience tool")?;
+                    results.push(
+                        call.complete(output)
+                            .context("complete append_attention_experience tool call")?,
+                    );
+                }
+                AttentionSchemaToolsCall::LeaveAttentionUnchanged(call) => {
+                    let output = self.leave_attention_unchanged(call.input.clone());
+                    results.push(
+                        call.complete(output)
+                            .context("complete leave_attention_unchanged tool call")?,
+                    );
+                }
+            }
         }
         round
             .commit(&mut self.session, results)
@@ -192,7 +243,7 @@ impl AttentionSchemaModule {
             input_tokens,
             cx.session_compaction(),
             self.session_compaction,
-            SessionCompactionProtectedPrefix::None,
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             Self::id(),
             COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
             SESSION_COMPACTION_PROMPT,
@@ -211,6 +262,13 @@ impl AttentionSchemaModule {
         }
         self.cognition.append(plaintext.to_owned()).await;
         Ok(AppendAttentionExperienceOutput { appended: true })
+    }
+
+    fn leave_attention_unchanged(
+        &self,
+        _args: LeaveAttentionUnchangedArgs,
+    ) -> LeaveAttentionUnchangedOutput {
+        LeaveAttentionUnchangedOutput { unchanged: true }
     }
 }
 
