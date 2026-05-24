@@ -280,8 +280,14 @@ impl Module for AttentionSchemaModule {
         "attention-schema"
     }
 
-    fn role_description() -> &'static str {
-        "Writes first-person attention experience entries to the cognition log when memo, allocation, and cognition-log context warrant a new claimable attention state."
+    fn peer_context() -> Option<&'static str> {
+        Some("Attention-schema forms a first-person model of what is currently held in attention.")
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise attention-schema when the current brain state suggests a meaningful shift in attention or a new first-person attention experience. Keep it low when attention has not meaningfully changed.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

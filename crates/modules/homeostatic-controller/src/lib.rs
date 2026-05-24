@@ -216,8 +216,12 @@ impl Module for HomeostaticControllerModule {
         "homeostatic-controller"
     }
 
-    fn role_description() -> &'static str {
-        "Autonomic finite-state controller that drives sleep-like memory compaction/recombination and caps action modules during sleep pressure without using an LLM."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        None
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

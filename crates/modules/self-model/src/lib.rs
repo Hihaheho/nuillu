@@ -158,8 +158,16 @@ impl Module for SelfModelModule {
         "self-model"
     }
 
-    fn role_description() -> &'static str {
-        "Integrates attention-schema cognition-log entries, peer module memo logs, and retrieved self-knowledge into current first-person self evidence in its memo log; cognition-gate must promote useful self-model facts before speech uses them."
+    fn peer_context() -> Option<&'static str> {
+        Some(
+            "Self-model forms the current first-person sense of identity, agency, intention, capability, and affective self-state.",
+        )
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise self-model when identity, agency, intention, capability, or felt self-state is at issue. Keep it low for plain external facts or responses that do not need self-understanding.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

@@ -142,8 +142,12 @@ mod tests {
             AllocationControllerModule::id()
         }
 
-        fn role_description() -> &'static str {
-            AllocationControllerModule::role_description()
+        fn peer_context() -> Option<&'static str> {
+            AllocationControllerModule::peer_context()
+        }
+
+        fn allocation_hint() -> Option<&'static str> {
+            AllocationControllerModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {

@@ -89,7 +89,7 @@ impl MemoryCompactionModule {
         self.system_prompt.get_or_init(|| {
             nuillu_module::format_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
+                cx.peer_contexts(),
                 &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
@@ -313,8 +313,14 @@ impl Module for MemoryCompactionModule {
         "memory-compaction"
     }
 
-    fn role_description() -> &'static str {
-        "Destructively merges redundant memory entries and accumulates remember tokens; wakes on interoceptive state changes and reads allocation guidance as context."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise memory-compaction during NREM-like maintenance when memories should be consolidated or redundant memory content should be reduced. Keep it low during active perception, speech, direct recall, or when there is no consolidation pressure.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

@@ -565,7 +565,8 @@ async fn refresh_active_and_schedule(
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
                     runtime.record_module_batch_ready(owners[index].clone(), &batch);
-                    let catalog = runtime.module_catalog();
+                    let peer_contexts = runtime.peer_contexts();
+                    let allocation_hints = runtime.allocation_hints();
                     let identity_memories = runtime.identity_memories().await;
                     let core_policies = runtime.core_policies().await;
                     spawn_activate(
@@ -577,7 +578,8 @@ async fn refresh_active_and_schedule(
                         batch,
                         config,
                         runtime.clone(),
-                        catalog,
+                        peer_contexts,
+                        allocation_hints,
                         identity_memories,
                         core_policies,
                         parent,
@@ -885,7 +887,8 @@ async fn handle_task_message(
                         .await;
                     runtime.record_module_batch_ready(owners[index].clone(), &batch);
                     states[index] = ModuleState::Activating;
-                    let catalog = runtime.module_catalog();
+                    let peer_contexts = runtime.peer_contexts();
+                    let allocation_hints = runtime.allocation_hints();
                     let identity_memories = runtime.identity_memories().await;
                     let core_policies = runtime.core_policies().await;
                     spawn_activate(
@@ -897,7 +900,8 @@ async fn handle_task_message(
                         batch,
                         config,
                         runtime.clone(),
-                        catalog,
+                        peer_contexts,
+                        allocation_hints,
                         identity_memories,
                         core_policies,
                         parent,
@@ -1135,7 +1139,8 @@ async fn spawn_activation_gate_or_activate(
             .record_module_status(owner.clone(), ModuleRunStatus::Activating)
             .await;
         runtime.record_module_batch_ready(owner.clone(), &batch);
-        let catalog = runtime.module_catalog();
+        let peer_contexts = runtime.peer_contexts();
+        let allocation_hints = runtime.allocation_hints();
         let identity_memories = runtime.identity_memories().await;
         let core_policies = runtime.core_policies().await;
         spawn_activate(
@@ -1147,7 +1152,8 @@ async fn spawn_activation_gate_or_activate(
             batch,
             config,
             runtime.clone(),
-            catalog,
+            peer_contexts,
+            allocation_hints,
             identity_memories,
             core_policies,
             parent,
@@ -1378,7 +1384,8 @@ fn spawn_activate(
     batch: ModuleBatch,
     config: AgentEventLoopConfig,
     runtime: AgentRuntimeControl,
-    catalog: Vec<(ModuleId, &'static str)>,
+    peer_contexts: Vec<(ModuleId, &'static str)>,
+    allocation_hints: Vec<(ModuleId, &'static str)>,
     identity_memories: Vec<IdentityMemoryRecord>,
     core_policies: Vec<CorePolicyRecord>,
     parent: &tracing::Span,
@@ -1390,7 +1397,8 @@ fn spawn_activate(
             let (module, result) = activate_with_retries(
                 module,
                 &runtime,
-                &catalog,
+                &peer_contexts,
+                &allocation_hints,
                 &identity_memories,
                 &core_policies,
                 &batch,
@@ -1445,7 +1453,8 @@ async fn collect_activation_gate_votes(
 async fn activate_with_retries(
     mut module: AllocatedModule,
     runtime: &AgentRuntimeControl,
-    catalog: &[(ModuleId, &'static str)],
+    peer_contexts: &[(ModuleId, &'static str)],
+    allocation_hints: &[(ModuleId, &'static str)],
     identity_memories: &[IdentityMemoryRecord],
     core_policies: &[CorePolicyRecord],
     batch: &ModuleBatch,
@@ -1458,7 +1467,8 @@ async fn activate_with_retries(
         let owner = module.owner().clone();
         let activation_attempt = u32::from(retries) + 1;
         let cx = ActivateCx::new(
-            catalog,
+            peer_contexts,
+            allocation_hints,
             identity_memories,
             core_policies,
             SessionCompactionRuntime::new(
@@ -1597,8 +1607,8 @@ mod tests {
             "echo"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1633,8 +1643,8 @@ mod tests {
             "allocation-controller"
         }
 
-        fn role_description() -> &'static str {
-            "test attention controller"
+        fn peer_context() -> Option<&'static str> {
+            Some("test attention controller")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1668,8 +1678,8 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test zero-replica target"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test zero-replica target")
                 }
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1720,8 +1730,8 @@ mod tests {
             "compaction-observer"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1779,8 +1789,8 @@ mod tests {
             "llm-metadata-observer"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1829,8 +1839,8 @@ mod tests {
             "batch-recorder"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1885,8 +1895,8 @@ mod tests {
             "gated-echo"
         }
 
-        fn role_description() -> &'static str {
-            "test gated target"
+        fn peer_context() -> Option<&'static str> {
+            Some("test gated target")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1926,8 +1936,8 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test activation gate"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test activation gate")
                 }
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1970,8 +1980,8 @@ mod tests {
             "timed-batch-recorder"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2032,8 +2042,8 @@ mod tests {
             "cognition-gate"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2072,8 +2082,8 @@ mod tests {
             "retry"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2117,8 +2127,8 @@ mod tests {
             "always-fail"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2153,8 +2163,8 @@ mod tests {
             "identity-cx-observer"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2202,8 +2212,8 @@ mod tests {
             "deadlock-observer"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2234,8 +2244,8 @@ mod tests {
             "status-awaiting"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2263,8 +2273,8 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test silent dependency"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test silent dependency")
                 }
 
                 async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2300,8 +2310,8 @@ mod tests {
             "status-pending"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2337,8 +2347,8 @@ mod tests {
             "status-activating"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2379,8 +2389,8 @@ mod tests {
             "pending-dependency"
         }
 
-        fn role_description() -> &'static str {
-            "test dependency"
+        fn peer_context() -> Option<&'static str> {
+            Some("test dependency")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2419,8 +2429,8 @@ mod tests {
             "immediate-dependent"
         }
 
-        fn role_description() -> &'static str {
-            "test dependent"
+        fn peer_context() -> Option<&'static str> {
+            Some("test dependent")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2457,8 +2467,8 @@ mod tests {
             "released-dependent"
         }
 
-        fn role_description() -> &'static str {
-            "test dependent"
+        fn peer_context() -> Option<&'static str> {
+            Some("test dependent")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2495,8 +2505,8 @@ mod tests {
             "gated-kick-target"
         }
 
-        fn role_description() -> &'static str {
-            "test gated dependency"
+        fn peer_context() -> Option<&'static str> {
+            Some("test gated dependency")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2532,8 +2542,8 @@ mod tests {
             "blocking-allow-gate"
         }
 
-        fn role_description() -> &'static str {
-            "test blocking activation gate"
+        fn peer_context() -> Option<&'static str> {
+            Some("test blocking activation gate")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2570,8 +2580,8 @@ mod tests {
             "gate-kick-dependent"
         }
 
-        fn role_description() -> &'static str {
-            "test dependent"
+        fn peer_context() -> Option<&'static str> {
+            Some("test dependent")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2610,8 +2620,8 @@ mod tests {
             "failing-batch"
         }
 
-        fn role_description() -> &'static str {
-            "test failing batch"
+        fn peer_context() -> Option<&'static str> {
+            Some("test failing batch")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -2644,8 +2654,8 @@ mod tests {
             "failing-activate-after-release"
         }
 
-        fn role_description() -> &'static str {
-            "test failing activation"
+        fn peer_context() -> Option<&'static str> {
+            Some("test failing activation")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -5302,7 +5312,8 @@ mod tests {
                     batch,
                     test_config(),
                     runtime.clone(),
-                    runtime.module_catalog(),
+                    runtime.peer_contexts(),
+                    runtime.allocation_hints(),
                     runtime.identity_memories().await,
                     runtime.core_policies().await,
                     &parent,

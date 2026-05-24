@@ -237,7 +237,11 @@ impl QueryMemoryModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_faculty_system_prompt(
+                SYSTEM_PROMPT,
+                cx.peer_contexts(),
+                &self.owner,
+            )
         })
     }
 
@@ -885,8 +889,14 @@ impl Module for QueryMemoryModule {
         "query-memory"
     }
 
-    fn role_description() -> &'static str {
-        "Recalls stored memories by semantic similarity when cognition-log context needs evidence: writes query intent and fresh memory evidence to its memo log; cognition-gate must promote useful hits before speech uses them; never synthesizes answers."
+    fn peer_context() -> Option<&'static str> {
+        Some("Query-memory brings relevant remembered experience into the current cognitive state.")
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise query-memory when current cognition needs remembered context, past experience, identity facts, or learned background. Keep it low when the needed context is already present or the next step is interpretation rather than recall.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

@@ -731,8 +731,14 @@ impl Module for RewardModule {
         "reward"
     }
 
-    fn role_description() -> &'static str {
-        "Assesses evicted policy considerations and consolidates rewarded or failed policy candidates."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise reward when recent action or policy guidance has outcome evidence that should update future behavior. Keep it low before any outcome is visible or when the context has no policy-relevant consequence.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

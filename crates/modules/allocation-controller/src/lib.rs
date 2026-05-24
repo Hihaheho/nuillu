@@ -9,9 +9,9 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox,
     Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
     compact_session_if_needed, format_available_faculties, format_current_attention_guidance,
-    format_faculty_system_prompt, format_memo_log_batch, format_memory_trace_inventory,
-    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    format_memo_log_batch, format_memory_trace_inventory, format_stuckness, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -108,6 +108,28 @@ fn visible_modules(
         .collect()
 }
 
+fn format_allocation_controller_system_prompt(
+    base: &str,
+    allocation_hints: &[(ModuleId, &'static str)],
+    owner: &ModuleId,
+) -> String {
+    let mut targets = allocation_hints
+        .iter()
+        .filter(|(id, _)| id != owner)
+        .map(|(id, hint)| format!("- {}: {}", id, hint))
+        .collect::<Vec<_>>();
+    targets.sort();
+    if targets.is_empty() {
+        return base.to_owned();
+    }
+
+    let mut prompt = base.to_owned();
+    prompt.push_str("\n\nAllocation target hints for modules this controller may activate:\n");
+    prompt.push_str(&targets.join("\n"));
+    prompt.push('\n');
+    prompt
+}
+
 tokio::task_local! {
     /// JSON Schema for `PriorityEntry.module_id` derived from the live
     /// allocation target registry. Scoped around each controller turn so the
@@ -116,7 +138,7 @@ tokio::task_local! {
 }
 
 fn fallback_module_target_id_schema() -> Schema {
-    Schema::try_from(serde_json::json!({ "type": "string" }))
+    Schema::try_from(serde_json::json!({ "type": "string", "pattern": "a^" }))
         .expect("fallback module target id schema must be a JSON object")
 }
 
@@ -268,10 +290,10 @@ impl AllocationControllerModule {
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
             let visible_modules = visible_modules(
-                cx.modules(),
+                cx.allocation_hints(),
                 self.allocation_writer.allowed_target_modules(),
             );
-            format_faculty_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
+            format_allocation_controller_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
         })
     }
 
@@ -315,14 +337,18 @@ impl AllocationControllerModule {
         let current = self.allocation_reader.snapshot().await;
         let interoception = self.interoception.snapshot().await;
         let allowed_modules = self.allocation_writer.allowed_target_modules().to_vec();
-        let module_target_schema = module_target_id_schema(&allowed_modules);
-        let registered = allowed_modules
+        let visible_modules = visible_modules(cx.allocation_hints(), &allowed_modules);
+        let visible_targets = visible_modules
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let module_target_schema = module_target_id_schema(&visible_targets);
+        let registered = visible_targets
             .iter()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
         let mut visible_current = current.clone();
         visible_current.retain_modules(&registered);
-        let visible_modules = visible_modules(cx.modules(), &allowed_modules);
 
         self.session
             .push_ephemeral_system(format_allocation_controller_context(
@@ -520,8 +546,12 @@ impl Module for AllocationControllerModule {
         "allocation-controller"
     }
 
-    fn role_description() -> &'static str {
-        "Allocates resources across modules — emits command-style activation targets from a priority-ordered list of modules, each with a one-line hint, on memo updates. Tier is host-fixed; target levels come from priority position."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        None
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -559,6 +589,20 @@ mod tests {
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
+
+    #[test]
+    fn visible_modules_uses_allocation_hint_catalog() {
+        let hints = vec![
+            (builtin::cognition_gate(), "gate hint"),
+            (builtin::speak(), "speak hint"),
+        ];
+        let allowed = vec![builtin::speak(), builtin::sensory()];
+
+        assert_eq!(
+            visible_modules(&hints, &allowed),
+            vec![(builtin::speak(), "speak hint")]
+        );
+    }
 
     #[derive(Clone)]
     struct CapturingAdapter {
@@ -646,8 +690,12 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test stub"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test stub")
+                }
+
+                fn allocation_hint() -> Option<&'static str> {
+                    Some("test allocation target")
                 }
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -960,13 +1008,11 @@ mod tests {
         let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.controller.llm.lutum().await;
-        let modules = vec![
-            (
-                builtin::allocation_controller(),
-                AllocationControllerModule::role_description(),
-            ),
-            (builtin::sensory(), "test stub"),
-        ];
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let allocation_hints = vec![(
+            builtin::sensory(),
+            "Allocate sensory for test observations; do not allocate it when no test input exists.",
+        )];
         let identity_memories = Vec::new();
         let compaction = nuillu_module::SessionCompactionRuntime::new(
             lutum.lutum().clone(),
@@ -975,7 +1021,8 @@ mod tests {
             nuillu_module::SessionCompactionPolicy::default(),
         );
         let cx = nuillu_module::ActivateCx::new(
-            &modules,
+            &peer_contexts,
+            &allocation_hints,
             &identity_memories,
             &[],
             compaction.clone(),

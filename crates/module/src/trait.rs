@@ -13,10 +13,11 @@ use crate::SessionCompactionRuntime;
 /// Read-only context passed to `Module::activate` carrying agent-wide
 /// information that is shared across all modules. **Capabilities are
 /// per-module and owner-stamped — they do not belong here.** Use this for
-/// agent-global state that any module may consult, such as the registered
-/// module catalog used to build peer-aware system prompts.
+/// agent-global state that any module may consult, such as registered peer
+/// contexts and allocation hints used to build module prompts.
 pub struct ActivateCx<'a> {
-    modules: &'a [(ModuleId, &'static str)],
+    peer_contexts: &'a [(ModuleId, &'static str)],
+    allocation_hints: &'a [(ModuleId, &'static str)],
     identity_memories: &'a [IdentityMemoryRecord],
     core_policies: &'a [CorePolicyRecord],
     session_compaction: SessionCompactionRuntime,
@@ -25,14 +26,16 @@ pub struct ActivateCx<'a> {
 
 impl<'a> ActivateCx<'a> {
     pub fn new(
-        modules: &'a [(ModuleId, &'static str)],
+        peer_contexts: &'a [(ModuleId, &'static str)],
+        allocation_hints: &'a [(ModuleId, &'static str)],
         identity_memories: &'a [IdentityMemoryRecord],
         core_policies: &'a [CorePolicyRecord],
         session_compaction: SessionCompactionRuntime,
         now: DateTime<Utc>,
     ) -> Self {
         Self {
-            modules,
+            peer_contexts,
+            allocation_hints,
             identity_memories,
             core_policies,
             session_compaction,
@@ -40,9 +43,16 @@ impl<'a> ActivateCx<'a> {
         }
     }
 
-    /// All modules registered in the agent: `(id, role_description)`.
-    pub fn modules(&self) -> &[(ModuleId, &'static str)] {
-        self.modules
+    /// Peer-context entries for modules that should be described in sibling
+    /// system prompts: `(id, peer_context)`.
+    pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
+        self.peer_contexts
+    }
+
+    /// Allocation hints for modules that the allocation controller may target:
+    /// `(id, allocation_hint)`.
+    pub fn allocation_hints(&self) -> &[(ModuleId, &'static str)] {
+        self.allocation_hints
     }
 
     /// Boot-time identity memory snapshot loaded from the primary memory
@@ -85,11 +95,21 @@ pub trait Module {
     where
         Self: Sized;
 
-    /// One-sentence description of this module's role, used in system prompts
-    /// of peer modules so each module knows what its siblings do.
-    fn role_description() -> &'static str
+    /// Context about this module shown in peer module system prompts. Return
+    /// `None` to keep this module out of peer-context catalogs.
+    fn peer_context() -> Option<&'static str>
     where
         Self: Sized;
+
+    /// Hint shown to the allocation controller when this module is eligible as
+    /// an allocation target. Return `None` to keep this module out of the
+    /// allocation target catalog.
+    fn allocation_hint() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
 
     async fn next_batch(&mut self) -> Result<Self::Batch>;
     async fn activate(&mut self, cx: &ActivateCx<'_>, batch: &Self::Batch) -> Result<()>;

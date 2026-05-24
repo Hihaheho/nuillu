@@ -166,8 +166,9 @@ impl CognitionGateModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt
-            .get_or_init(|| format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner))
+        self.system_prompt.get_or_init(|| {
+            format_faculty_system_prompt(SYSTEM_PROMPT, cx.peer_contexts(), &self.owner)
+        })
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
@@ -291,8 +292,14 @@ impl Module for CognitionGateModule {
         "cognition-gate"
     }
 
-    fn role_description() -> &'static str {
-        "Promotes durable module memo-log evidence into the cognition log: appends concise, relevant, novel, changed, or controller-requested facts so downstream modules can act on them."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise cognition-gate when fresh non-conscious brain state may deserve admission to the cognition log. Keep it low for stale repeats, background noise, or material that should remain outside conscious cognition.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -419,8 +426,12 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test stub"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test stub")
+                }
+
+                fn allocation_hint() -> Option<&'static str> {
+                    Some("test allocation target")
                 }
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -682,16 +693,11 @@ mod tests {
         fixture.source_memo.write("sensory memo A").await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let modules = vec![
-            (
-                builtin::cognition_gate(),
-                CognitionGateModule::role_description(),
-            ),
-            (builtin::sensory(), "test stub"),
-        ];
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &modules,
+            &peer_contexts,
+            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -749,16 +755,11 @@ mod tests {
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let modules = vec![
-            (
-                builtin::cognition_gate(),
-                CognitionGateModule::role_description(),
-            ),
-            (builtin::sensory(), "test stub"),
-        ];
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
         let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
         let cx = nuillu_module::ActivateCx::new(
-            &modules,
+            &peer_contexts,
+            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),
@@ -893,20 +894,15 @@ mod tests {
         let mut fixture = gate_fixture_with_adapter(adapter).await;
 
         let lutum = fixture.gate.llm.lutum().await;
-        let modules = vec![
-            (
-                builtin::cognition_gate(),
-                CognitionGateModule::role_description(),
-            ),
-            (builtin::sensory(), "test stub"),
-        ];
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
         let identity_memories = vec![IdentityMemoryRecord {
             index: nuillu_types::MemoryIndex::new("identity-1"),
             content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
             occurred_at: None,
         }];
         let cx = nuillu_module::ActivateCx::new(
-            &modules,
+            &peer_contexts,
+            &[],
             &identity_memories,
             &[],
             compaction_runtime(&lutum),

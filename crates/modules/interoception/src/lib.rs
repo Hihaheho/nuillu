@@ -387,8 +387,12 @@ impl Module for InteroceptionModule {
         "interoception"
     }
 
-    fn role_description() -> &'static str {
-        "Updates the agent's interoceptive state: homeostatic sleep pressure, wake arousal, affect arousal, valence, and untyped emotion text."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        None
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

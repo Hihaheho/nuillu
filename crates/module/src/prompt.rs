@@ -4,13 +4,14 @@ use nuillu_types::ModuleId;
 
 use crate::render_memory_for_llm;
 
-/// Build a system prompt that prepends a one-line description of every other
+/// Build a system prompt that prepends peer-context entries for every other
 /// module registered in the agent. The owner module is excluded so each
 /// module's prompt only lists its peers.
 ///
-/// The catalog is post-boot static state (`Blackboard::module_catalog`) so
-/// the produced string is stable across activations and friendly to LLM
-/// prompt caching as long as `base` is also stable.
+/// The peer context catalog is post-boot static state
+/// (`Blackboard::peer_contexts`) so the produced string is stable across
+/// activations and friendly to LLM prompt caching as long as `base` is also
+/// stable.
 pub fn format_system_prompt(
     base: &str,
     catalog: &[(ModuleId, &'static str)],
@@ -33,7 +34,7 @@ pub fn format_system_prompt(
 }
 
 /// Build a system prompt with stable identity/policy context but without the
-/// peer module catalog. Use this when a module already receives the needed
+/// peer context catalog. Use this when a module already receives the needed
 /// sibling output through activation context, or when exposing internal module
 /// structure encourages process-talk.
 pub fn format_identity_system_prompt(
@@ -48,7 +49,7 @@ pub fn format_identity_system_prompt(
 }
 
 /// Build the stable, cache-friendly system prompt for one faculty. This
-/// contains role and peer-structure context only; dynamic memory and
+/// contains peer-structure context only; dynamic memory and
 /// blackboard state should be supplied through session seed or ephemeral
 /// activation context.
 pub fn format_faculty_system_prompt(

@@ -186,7 +186,7 @@ impl MemoryModule {
         self.system_prompt.get_or_init(|| {
             nuillu_module::format_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
+                cx.peer_contexts(),
                 &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
@@ -596,8 +596,14 @@ impl Module for MemoryModule {
         "memory"
     }
 
-    fn role_description() -> &'static str {
-        "Preserves useful information by inserting normalized, deduplicated memory entries from evicted cognition-log evidence and allocation-controller preservation guidance."
+    fn peer_context() -> Option<&'static str> {
+        Some("Memory preserves important admitted cognition for later recall.")
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise memory when current cognition contains a stable fact, identity-relevant detail, or preservation-worthy event. Keep it low for passing observations, already-covered facts, direct recall, or association without a new durable fact.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -645,8 +651,12 @@ mod tests {
             MemoryModule::id()
         }
 
-        fn role_description() -> &'static str {
-            MemoryModule::role_description()
+        fn peer_context() -> Option<&'static str> {
+            MemoryModule::peer_context()
+        }
+
+        fn allocation_hint() -> Option<&'static str> {
+            MemoryModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {

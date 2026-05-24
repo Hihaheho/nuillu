@@ -82,7 +82,7 @@ impl PredictModule {
         self.system_prompt.get_or_init(|| {
             nuillu_module::format_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
+                cx.peer_contexts(),
                 &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
@@ -144,8 +144,16 @@ impl Module for PredictModule {
         "predict"
     }
 
-    fn role_description() -> &'static str {
-        "Generates forward predictions about current cognition-log subjects on each cognition-log update and writes them to its memo."
+    fn peer_context() -> Option<&'static str> {
+        Some(
+            "Predict forms expectations about what may happen next from the current cognitive state.",
+        )
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise predict when current cognition needs an expectation about likely next states or what would count as surprising. Keep it low for static facts, resolved outcomes, or recall-only work.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

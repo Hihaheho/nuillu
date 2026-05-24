@@ -275,8 +275,16 @@ impl Module for SurpriseModule {
         "surprise"
     }
 
-    fn role_description() -> &'static str {
-        "Detects unexpected cognition-log entries by comparing new entries against predict's memo or recent cognition-log history; can request memory preservation."
+    fn peer_context() -> Option<&'static str> {
+        Some(
+            "Surprise detects when current cognition departs from expectation or recent continuity.",
+        )
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise surprise when new cognition may violate expectation, break recent continuity, or deserve preservation because of novelty or significance. Keep it low for routine expected updates or when no expectation is available.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -353,8 +361,8 @@ mod tests {
                     $id
                 }
 
-                fn role_description() -> &'static str {
-                    "test stub"
+                fn peer_context() -> Option<&'static str> {
+                    Some("test stub")
                 }
 
                 async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -481,6 +489,7 @@ mod tests {
     async fn activate_cx(module: &SurpriseModule) -> nuillu_module::ActivateCx<'static> {
         let lutum = module.llm.lutum().await;
         nuillu_module::ActivateCx::new(
+            &[],
             &[],
             &[],
             &[],

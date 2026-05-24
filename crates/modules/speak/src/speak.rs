@@ -611,8 +611,14 @@ impl Module for SpeakModule {
         "speak"
     }
 
-    fn role_description() -> &'static str {
-        "Emits the agent's spoken utterances into its world when activated by allocation and when the cognition log supports speech. It calls an optional should_speak tool to choose an addressee and utterance focus; if no tool is called, it stays silent. It cannot inspect memo logs, allocation guidance, or query results directly."
+    fn peer_context() -> Option<&'static str> {
+        Some("Speak is the outward expression path for admitted cognition.")
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise speak when admitted cognition is grounded enough for an outward utterance, answer, address, or expression of intent. Keep it low when evidence is unsettled, no addressee or focus is clear, or silence is better.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -1033,6 +1039,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             nuillu_module::SessionCompactionRuntime::new(
                 compaction_lutum.lutum().clone(),
                 nuillu_module::LlmConcurrencyLimiter::new(None),
@@ -1223,6 +1230,7 @@ mod tests {
         let clock = SystemClock;
         let cx = nuillu_module::ActivateCx::new(
             &catalog,
+            &[],
             &identity_memories,
             &[],
             nuillu_module::SessionCompactionRuntime::new(

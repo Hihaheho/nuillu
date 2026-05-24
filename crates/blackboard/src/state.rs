@@ -23,10 +23,10 @@ const DEFAULT_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 /// allocation snapshot. This is a cheap cloneable handle; locking is an
 /// implementation detail hidden behind its methods.
 ///
-/// `module_catalog` lives outside the inner lock as a write-once
-/// `OnceLock<Vec<(ModuleId, &'static str)>>`: it is populated by
-/// `ModuleRegistry::build` before any module is constructed and never
-/// changes afterwards, so module constructors can read it synchronously
+/// `peer_contexts` and `allocation_hints` live outside the inner lock as
+/// write-once `OnceLock<Vec<(ModuleId, &'static str)>>` values: they are
+/// populated by `ModuleRegistry::build` before any module is constructed and
+/// never change afterwards, so module constructors can read them synchronously
 /// without taking the async lock.
 #[derive(Debug, Clone)]
 pub struct Blackboard {
@@ -34,7 +34,8 @@ pub struct Blackboard {
     activation_waiters: Arc<Mutex<Vec<ActivationWaiter>>>,
     activation_increase_waiters: Arc<Mutex<Vec<ActivationIncreaseWaiter>>>,
     allocation_change_waiters: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
-    module_catalog: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
+    peer_contexts: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
+    allocation_hints: Arc<OnceLock<Vec<(ModuleId, &'static str)>>>,
 }
 
 /// Inner blackboard state. Public so read closures in other crates can
@@ -249,7 +250,8 @@ impl Blackboard {
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
-            module_catalog: Arc::new(OnceLock::new()),
+            peer_contexts: Arc::new(OnceLock::new()),
+            allocation_hints: Arc::new(OnceLock::new()),
         }
     }
 
@@ -264,23 +266,38 @@ impl Blackboard {
             activation_waiters: Arc::new(Mutex::new(Vec::new())),
             activation_increase_waiters: Arc::new(Mutex::new(Vec::new())),
             allocation_change_waiters: Arc::new(Mutex::new(Vec::new())),
-            module_catalog: Arc::new(OnceLock::new()),
+            peer_contexts: Arc::new(OnceLock::new()),
+            allocation_hints: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Install the registered-module catalog. Idempotent on first call;
-    /// subsequent calls are silently ignored to keep the post-boot snapshot
-    /// stable for prompt caching.
-    pub fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
-        let _ = self.module_catalog.set(catalog);
+    /// Install the registered-module peer context and allocation hint catalogs.
+    /// Idempotent on first call; subsequent calls are silently ignored to keep
+    /// the post-boot snapshot stable for prompt caching.
+    pub fn set_module_contexts(
+        &self,
+        peer_contexts: Vec<(ModuleId, &'static str)>,
+        allocation_hints: Vec<(ModuleId, &'static str)>,
+    ) {
+        let _ = self.peer_contexts.set(peer_contexts);
+        let _ = self.allocation_hints.set(allocation_hints);
     }
 
-    /// Read the registered-module catalog. Returns an empty slice before the
-    /// catalog is installed, which lets tests that skip registry boot still
-    /// build modules; the system prompt simply omits the peer list in that
-    /// case.
-    pub fn module_catalog(&self) -> &[(ModuleId, &'static str)] {
-        self.module_catalog
+    /// Read the registered-module peer context catalog. Returns an empty slice
+    /// before the catalog is installed, which lets tests that skip registry
+    /// boot still build modules; the system prompt simply omits the peer list
+    /// in that case.
+    pub fn peer_contexts(&self) -> &[(ModuleId, &'static str)] {
+        self.peer_contexts
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Read the registered-module allocation hint catalog. Returns an empty
+    /// slice before the catalog is installed.
+    pub fn allocation_hints(&self) -> &[(ModuleId, &'static str)] {
+        self.allocation_hints
             .get()
             .map(|v| v.as_slice())
             .unwrap_or(&[])

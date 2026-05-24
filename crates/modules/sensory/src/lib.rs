@@ -213,7 +213,11 @@ impl SensoryModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_faculty_system_prompt(SYSTEM_PROMPT, cx.modules(), &self.owner)
+            nuillu_module::format_faculty_system_prompt(
+                SYSTEM_PROMPT,
+                cx.peer_contexts(),
+                &self.owner,
+            )
         })
     }
 
@@ -768,8 +772,12 @@ impl Module for SensoryModule {
         "sensory"
     }
 
-    fn role_description() -> &'static str {
-        "Pre-attentive filter for the agent's senses: receives sights, sounds, and other external observations from the world, scores their salience, and writes selected normalized observations to its memo."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        None
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -837,8 +845,12 @@ mod tests {
             SensoryModule::id()
         }
 
-        fn role_description() -> &'static str {
-            SensoryModule::role_description()
+        fn peer_context() -> Option<&'static str> {
+            SensoryModule::peer_context()
+        }
+
+        fn allocation_hint() -> Option<&'static str> {
+            SensoryModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {

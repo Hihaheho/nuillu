@@ -404,8 +404,14 @@ impl Module for PolicyModule {
         "policy"
     }
 
-    fn role_description() -> &'static str {
-        "Reads policy records, synthesizes policy candidates, predicts context value, and writes policy advice."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise policy when current cognition needs behavioral guidance, a reusable response pattern, or value-based tradeoff judgment. Keep it low for plain recall, sensory filtering, memory maintenance, or already-settled action.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

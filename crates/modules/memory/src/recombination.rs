@@ -117,7 +117,7 @@ impl MemoryRecombinationModule {
         let mut session = Session::new();
         session.push_system(nuillu_module::format_system_prompt(
             SYSTEM_PROMPT,
-            cx.modules(),
+            cx.peer_contexts(),
             &self.owner,
             cx.identity_memories(),
             cx.core_policies(),
@@ -230,8 +230,14 @@ impl Module for MemoryRecombinationModule {
         "memory-recombination"
     }
 
-    fn role_description() -> &'static str {
-        "Runs REM-like internal memory recombination on interoceptive state changes and allocation context, appending source-tagged dream simulations without treating them as verified facts."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise memory-recombination during REM-like exploratory phases when memory fragments can be safely combined into imaginative simulations. Keep it low for factual recall, direct answers, urgent action, or when unverified imagery would disturb current cognition.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

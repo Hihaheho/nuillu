@@ -210,8 +210,14 @@ impl CapabilityProviders {
             .await;
     }
 
-    pub(crate) fn set_module_catalog(&self, catalog: Vec<(ModuleId, &'static str)>) {
-        self.inner.blackboard.set_module_catalog(catalog);
+    pub(crate) fn set_module_contexts(
+        &self,
+        peer_contexts: Vec<(ModuleId, &'static str)>,
+        allocation_hints: Vec<(ModuleId, &'static str)>,
+    ) {
+        self.inner
+            .blackboard
+            .set_module_contexts(peer_contexts, allocation_hints);
     }
 
     pub(crate) async fn apply_runtime_policy(&self) {
@@ -343,10 +349,18 @@ impl AgentRuntimeControl {
             .await
     }
 
-    /// Snapshot of the registered-module catalog. Cheap synchronous read; the
-    /// scheduler turns this into an [`ActivateCx`] for each `activate` call.
-    pub fn module_catalog(&self) -> Vec<(ModuleId, &'static str)> {
-        self.blackboard.module_catalog().to_vec()
+    /// Snapshot of the registered-module peer-context catalog. Cheap
+    /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
+    /// each `activate` call.
+    pub fn peer_contexts(&self) -> Vec<(ModuleId, &'static str)> {
+        self.blackboard.peer_contexts().to_vec()
+    }
+
+    /// Snapshot of the registered-module allocation-hint catalog. Cheap
+    /// synchronous read; the scheduler turns this into an [`ActivateCx`] for
+    /// each `activate` call.
+    pub fn allocation_hints(&self) -> Vec<(ModuleId, &'static str)> {
+        self.blackboard.allocation_hints().to_vec()
     }
 
     pub async fn identity_memories(&self) -> Vec<nuillu_blackboard::IdentityMemoryRecord> {
@@ -879,7 +893,8 @@ impl fmt::Debug for ModuleRegistry {
 
 struct ModuleRegistration {
     module: ModuleId,
-    role_description: &'static str,
+    peer_context: Option<&'static str>,
+    allocation_hint: Option<&'static str>,
     policy: ModulePolicy,
     replica_capacity: u8,
     builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
@@ -889,7 +904,8 @@ impl fmt::Debug for ModuleRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ModuleRegistration")
             .field("module", &self.module)
-            .field("role_description", &self.role_description)
+            .field("peer_context", &self.peer_context)
+            .field("allocation_hint", &self.allocation_hint)
             .field("policy", &self.policy)
             .field("replica_capacity", &self.replica_capacity)
             .finish_non_exhaustive()
@@ -928,7 +944,8 @@ impl ModuleRegistry {
     }
 
     /// Register a module type with its boot-time policy. The module's identity
-    /// comes from [`Module::id`] / [`Module::role_description`].
+    /// and prompt/allocation catalogs come from [`Module::id`],
+    /// [`Module::peer_context`], and [`Module::allocation_hint`].
     pub fn register<B>(
         mut self,
         policy: ModulePolicy,
@@ -938,7 +955,8 @@ impl ModuleRegistry {
         B: ModuleRegisterer + 'static,
     {
         let module = ModuleId::new(<B::Module as Module>::id())?;
-        let role_description = <B::Module as Module>::role_description();
+        let peer_context = <B::Module as Module>::peer_context();
+        let allocation_hint = <B::Module as Module>::allocation_hint();
         if self
             .registrations
             .iter()
@@ -949,7 +967,8 @@ impl ModuleRegistry {
         let replica_capacity = policy.max_active_replicas();
         self.registrations.push(ModuleRegistration {
             module,
-            role_description,
+            peer_context,
+            allocation_hint,
             policy,
             replica_capacity,
             builder: Box::new(move |caps| Box::new(builder(caps))),
@@ -967,7 +986,8 @@ impl ModuleRegistry {
         B: ModuleRegisterer + 'static,
     {
         let module = ModuleId::new(<B::Module as Module>::id())?;
-        let role_description = <B::Module as Module>::role_description();
+        let peer_context = <B::Module as Module>::peer_context();
+        let allocation_hint = <B::Module as Module>::allocation_hint();
         if self
             .registrations
             .iter()
@@ -991,7 +1011,8 @@ impl ModuleRegistry {
         }
         self.registrations.push(ModuleRegistration {
             module,
-            role_description,
+            peer_context,
+            allocation_hint,
             policy,
             replica_capacity,
             builder: Box::new(move |caps| Box::new(builder(caps))),
@@ -1020,13 +1041,25 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
-        // Install the post-boot module catalog before any module is constructed
-        // so module constructors can read peers from `caps.module_catalog()`
+        // Install the post-boot module catalogs before any module is constructed
+        // so module constructors can read peers from `caps.peer_contexts()`
         // synchronously when they assemble their system prompts.
-        caps.set_module_catalog(
+        caps.set_module_contexts(
             self.registrations
                 .iter()
-                .map(|registration| (registration.module.clone(), registration.role_description))
+                .filter_map(|registration| {
+                    registration
+                        .peer_context
+                        .map(|context| (registration.module.clone(), context))
+                })
+                .collect(),
+            self.registrations
+                .iter()
+                .filter_map(|registration| {
+                    registration
+                        .allocation_hint
+                        .map(|hint| (registration.module.clone(), hint))
+                })
                 .collect(),
         );
 
@@ -1261,8 +1294,8 @@ mod tests {
             "noop"
         }
 
-        fn role_description() -> &'static str {
-            "test stub"
+        fn peer_context() -> Option<&'static str> {
+            Some("test stub")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
@@ -1280,6 +1313,41 @@ mod tests {
 
     fn noop_builder(_: ModuleCapabilityFactory) -> NoopModule {
         NoopModule
+    }
+
+    struct AllocationHintOnlyModule;
+
+    #[async_trait(?Send)]
+    impl Module for AllocationHintOnlyModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "allocation-hint-only"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            None
+        }
+
+        fn allocation_hint() -> Option<&'static str> {
+            Some("test allocation hint")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(())
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &crate::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn allocation_hint_only_builder(_: ModuleCapabilityFactory) -> AllocationHintOnlyModule {
+        AllocationHintOnlyModule
     }
 
     #[test]
@@ -1326,6 +1394,32 @@ mod tests {
             .await;
         assert_eq!(soft_max, 1);
         assert_eq!(capacity, 2);
+    }
+
+    #[tokio::test]
+    async fn build_installs_separate_peer_and_allocation_catalogs() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        ModuleRegistry::new()
+            .register(test_policy(0..=0), noop_builder)
+            .unwrap()
+            .register(test_policy(0..=0), allocation_hint_only_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let noop = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
+        let allocation_only = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+
+        assert_eq!(
+            blackboard.peer_contexts().to_vec(),
+            vec![(noop, "test stub")]
+        );
+        assert_eq!(
+            blackboard.allocation_hints().to_vec(),
+            vec![(allocation_only, "test allocation hint")]
+        );
     }
 
     #[tokio::test]

@@ -71,8 +71,8 @@ macro_rules! noop_stub {
                 $id
             }
 
-            fn role_description() -> &'static str {
-                "test stub"
+            fn peer_context() -> Option<&'static str> {
+                Some("test stub")
             }
 
             async fn next_batch(&mut self) -> Result<Self::Batch> {

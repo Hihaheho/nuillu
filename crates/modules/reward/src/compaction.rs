@@ -120,7 +120,7 @@ impl PolicyCompactionModule {
         self.system_prompt.get_or_init(|| {
             nuillu_module::format_system_prompt(
                 SYSTEM_PROMPT,
-                cx.modules(),
+                cx.peer_contexts(),
                 &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
@@ -380,8 +380,14 @@ impl Module for PolicyCompactionModule {
         "policy-compaction"
     }
 
-    fn role_description() -> &'static str {
-        "Conservatively deletes redundant non-Core policy duplicates without inserting, reinforcing, or rewriting policies."
+    fn peer_context() -> Option<&'static str> {
+        None
+    }
+
+    fn allocation_hint() -> Option<&'static str> {
+        Some(
+            "Raise policy-compaction during maintenance when learned policies may contain redundant non-Core patterns. Keep it low when new guidance, outcome learning, or Core policy preservation is the issue.",
+        )
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {

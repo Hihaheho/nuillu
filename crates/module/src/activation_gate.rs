@@ -192,8 +192,8 @@ mod tests {
             "gate-target"
         }
 
-        fn role_description() -> &'static str {
-            "test target"
+        fn peer_context() -> Option<&'static str> {
+            Some("test target")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
