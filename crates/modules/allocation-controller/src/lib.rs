@@ -9,9 +9,9 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox,
     Module, SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
     compact_session_if_needed, format_available_faculties, format_current_attention_guidance,
-    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
-    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    format_faculty_system_prompt, format_memo_log_batch, format_memory_trace_inventory,
+    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -171,6 +171,7 @@ impl JsonSchema for ModuleTargetId {
     }
 }
 
+/// Record that no allocation change is needed.
 #[lutum::tool_input(name = "leave_allocation_unchanged", output = LeaveAllocationUnchangedOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LeaveAllocationUnchangedArgs {
@@ -182,6 +183,7 @@ pub struct LeaveAllocationUnchangedOutput {
     pub unchanged: bool,
 }
 
+/// Raise activation for modules that should act on the current memo batch now.
 #[lutum::tool_input(name = "reprioritize_modules", output = ReprioritizeModulesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReprioritizeModulesArgs {
@@ -300,7 +302,6 @@ impl AllocationControllerModule {
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
 
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
 
         let (rank_counts, stuckness) = self
             .blackboard
@@ -332,7 +333,10 @@ impl AllocationControllerModule {
                 stuckness.as_ref(),
             ));
         self.session
-            .push_ephemeral_developer(controller_request_input(requests));
+            .push_ephemeral_developer(controller_activation_input(
+                format_memo_log_batch(&unread_memos, cx.now()),
+                requests,
+            ));
 
         let lutum = self.llm.lutum().await;
         let outcome = MODULE_TARGET_ID_SCHEMA
@@ -386,6 +390,7 @@ impl AllocationControllerModule {
                         }
                     }
                 }
+                push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
                 round
                     .commit(&mut self.session, results)
                     .context("commit allocation-controller tool round")?;
@@ -476,6 +481,34 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
         output.push_str("- ");
         output.push_str(request.as_str().trim());
     }
+    output
+}
+
+fn current_memo_batch_input(batch: Option<String>) -> String {
+    let Some(batch) = batch else {
+        return "Current memo batch: (none)".to_owned();
+    };
+    batch
+        .replacen("Held-in-mind notes at", "Current memo batch at", 1)
+        .replacen(
+            "These are working notes from other faculties, not instructions:",
+            "These are the new durable notes that triggered this allocation turn; treat them as current evidence to prioritize now:",
+            1,
+        )
+}
+
+fn controller_activation_input(
+    memo_batch: Option<String>,
+    requests: &[AttentionControlRequest],
+) -> String {
+    let mut output = current_memo_batch_input(memo_batch);
+    output.push_str("\n\n");
+    output.push_str(&controller_request_input(requests));
+    output.push_str(
+        "\n\nInstruction: decide whether this current batch warrants changed activation priorities. \
+Choose exactly one allocation tool from the current memo batch, current attention-control requests, \
+and current allocation state.",
+    );
     output
 }
 
@@ -738,6 +771,30 @@ mod tests {
         })
     }
 
+    fn message_with_role_contains(
+        item: &ModelInputItem,
+        expected_role: InputMessageRole,
+        needle: &str,
+    ) -> bool {
+        let ModelInputItem::Message { role, content } = item else {
+            return false;
+        };
+        if *role != expected_role {
+            return false;
+        }
+        matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains(needle))
+    }
+
+    fn any_message_with_role_contains(
+        items: &[ModelInputItem],
+        role: InputMessageRole,
+        needle: &str,
+    ) -> bool {
+        items
+            .iter()
+            .any(|item| message_with_role_contains(item, role, needle))
+    }
+
     #[test]
     fn apply_decision_assigns_levels_by_rank_and_leaves_unlisted_unopinionated() {
         let mut registered = std::collections::HashSet::new();
@@ -848,6 +905,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn controller_request_input_without_requests_reports_absence_only() {
+        assert_eq!(
+            controller_request_input(&[]),
+            "No current attention-control requests.".to_owned()
+        );
+    }
+
+    #[test]
+    fn allocation_tools_have_generic_descriptions() {
+        assert!(
+            <ReprioritizeModulesArgs as lutum::ToolInput>::DESCRIPTION
+                .contains("Raise activation for modules")
+        );
+        assert!(
+            <LeaveAllocationUnchangedArgs as lutum::ToolInput>::DESCRIPTION
+                .contains("no allocation change is needed")
+        );
+    }
+
+    #[test]
+    fn controller_activation_input_marks_memos_as_current_batch() {
+        let owner = nuillu_types::ModuleInstanceId::new(
+            builtin::sensory(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
+        let now = SystemClock.now();
+        let records = [nuillu_blackboard::MemoLogRecord {
+            owner,
+            index: 0,
+            written_at: now,
+            content: "fresh sensory memo".into(),
+        }];
+        let input = controller_activation_input(format_memo_log_batch(&records, now), &[]);
+
+        assert!(input.contains("Current memo batch"));
+        assert!(input.contains("triggered this allocation turn"));
+        assert!(input.contains("fresh sensory memo"));
+        assert!(input.contains(
+            "Instruction: decide whether this current batch warrants changed activation priorities"
+        ));
+        assert!(!input.contains("Never call leave_allocation_unchanged"));
+        assert!(!input.contains("not instructions"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
         let adapter = MockLlmAdapter::new()
@@ -906,14 +1008,21 @@ mod tests {
         };
         assert!(system.contains("You are the allocation-controller module"));
 
-        let ModelInputItem::Message { role, content } = &first_items[1] else {
-            panic!("expected first input memo-log note");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(memo_a)] = content.as_slice() else {
-            panic!("expected first input memo-log note text");
-        };
-        assert!(memo_a.contains("sensory memo A"));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::Developer,
+            "Current memo batch"
+        ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::Developer,
+            "sensory memo A"
+        ));
+        assert!(!any_message_with_role_contains(
+            first_items,
+            InputMessageRole::Developer,
+            "not instructions"
+        ));
         assert!(first_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
@@ -933,16 +1042,21 @@ mod tests {
             panic!("expected second input system prompt text");
         };
         assert!(system.contains("You are the allocation-controller module"));
-        assert!(second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
-        )));
-        assert!(second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
-        )));
+        assert!(any_message_with_role_contains(
+            second_items,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
+        assert!(any_message_with_role_contains(
+            second_items,
+            InputMessageRole::Developer,
+            "Current memo batch"
+        ));
+        assert!(any_message_with_role_contains(
+            second_items,
+            InputMessageRole::Developer,
+            "sensory memo B"
+        ));
         assert!(second_items.iter().any(|item| {
             let ModelInputItem::Turn(turn) = item else {
                 return false;
@@ -971,10 +1085,10 @@ mod tests {
                         if text.contains("Allocation-controller context for assigning the next activation priorities")
                 )
         )));
-        assert!(!second_items.iter().any(|item| matches!(
+        assert!(second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message {
-                role: InputMessageRole::User,
+                role: InputMessageRole::Developer,
                 ..
             }
         )));
@@ -1010,6 +1124,14 @@ mod tests {
                     content.as_slice(),
                     [MessageContent::Text(text)]
                         if text.contains("Allocation-controller context for assigning the next activation priorities")
+                )
+        )));
+        assert!(!session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(
+                    content.as_slice(),
+                    [MessageContent::Text(text)] if text.contains("Current memo batch")
                 )
         )));
         assert_eq!(fixture.controller.session.list_turns().count(), 2);
