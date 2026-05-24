@@ -99,3 +99,5 @@ When changing module wiring or adding a module, these must remain true (they're 
 If the task is running eval run with `eval.local.eure` for the model set.
 
 `cargo run -p nuillu-eval -- --model-set configs/modelsets/eval.local.eure <options>`
+
+Do not add eval-case-specific prompt text, examples, tool descriptions, or production guidance to make a failing eval pass. Prompt/module changes motivated by eval failures must be justified as case-agnostic product behavior or context-structure fixes; do not encode fixture names, scenario-specific success criteria, or rubric phrasing into runtime prompts.
