@@ -19,10 +19,18 @@ assessment as divergence from pending predictions. If no predict memo log is pre
 cognition-log history. Do not generate forward predictions.
 
 Predict and other faculty notes arrive as system context. New cognition-log entries are appended
-to the session above. Assess each batch using the user instruction for this activation.
-If the cognition fits pending predictions or recent history, finish without calling tools.
-If the cognition diverges enough that the event should be preserved in memory, call
-preserve_unexpected_event exactly once with the assessment and preservation details."#;
+to the session above. Assess each batch using the developer instruction for this activation.
+
+Use exactly one tool per activation:
+- preserve_unexpected_event when new cognition diverges from a pending prediction, breaks recent
+  continuity in a meaningful way, or is novel enough to deserve memory preservation.
+- mark_expected_event when new cognition fits pending predictions or recent history and does not
+  deserve preservation.
+
+When predict memo-log entries are present, compare the new cognition against those pending
+predictions before choosing. A direct contradiction of a predicted state or action is significant
+surprise and should be preserved. Do not generate forward predictions. Do not use final assistant
+text as an output channel."#;
 
 const EXPECTED_SURPRISE_MEMO: &str =
     "Surprise assessment: expected\nNo memory preservation requested.";
@@ -69,9 +77,21 @@ pub struct PreserveUnexpectedEventOutput {
     pub preserved: bool,
 }
 
+#[lutum::tool_input(name = "mark_expected_event", output = MarkExpectedEventOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MarkExpectedEventArgs {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MarkExpectedEventOutput {
+    pub recorded: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum SurpriseTools {
     PreserveUnexpectedEvent(PreserveUnexpectedEventArgs),
+    MarkExpectedEvent(MarkExpectedEventArgs),
 }
 
 pub struct SurpriseModule {
@@ -152,45 +172,93 @@ impl SurpriseModule {
         if let Some(context) = format_surprise_context(&allocation) {
             self.session.push_ephemeral_system(context);
         }
-        self.session.push_ephemeral_user(ACTIVATION_INPUT);
+        self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
         let outcome = self
             .session
             .text_turn(&lutum)
             .tools::<SurpriseTools>()
-            .available_tools([SurpriseToolsSelector::PreserveUnexpectedEvent])
+            .available_tools([
+                SurpriseToolsSelector::PreserveUnexpectedEvent,
+                SurpriseToolsSelector::MarkExpectedEvent,
+            ])
+            .require_any_tool()
             .collect()
             .await
             .context("surprise assessment turn failed")?;
 
+        let round = match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                compact_session_if_needed(
+                    &mut self.session,
+                    result.usage.input_tokens,
+                    cx.session_compaction(),
+                    self.session_compaction,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                    Self::id(),
+                    COMPACTED_SURPRISE_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
+                anyhow::bail!("surprise finished without required tool call");
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                compact_session_if_needed(
+                    &mut self.session,
+                    result.usage.input_tokens,
+                    cx.session_compaction(),
+                    self.session_compaction,
+                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                    Self::id(),
+                    COMPACTED_SURPRISE_SESSION_PREFIX,
+                    SESSION_COMPACTION_PROMPT,
+                )
+                .await;
+                anyhow::bail!("surprise finished without required tool call");
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => round,
+        };
+        let input_tokens = round.usage.input_tokens;
         let mut memo: Option<String> = None;
-        let input_tokens = match outcome {
-            TextStepOutcomeWithTools::Finished(result) => result.usage.input_tokens,
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => result.usage.input_tokens,
-            TextStepOutcomeWithTools::NeedsTools(round) => {
-                let input_tokens = round.usage.input_tokens;
-                let mut results: Vec<ToolResult> = Vec::new();
-                // The LLM may return multiple tool calls; adopt the first memo only.
-                for call in round.tool_calls.iter().cloned() {
-                    let SurpriseToolsCall::PreserveUnexpectedEvent(call) = call;
-                    if memo.is_none() {
+        let mut results: Vec<ToolResult> = Vec::new();
+        // The LLM may return multiple tool calls; adopt the first valid decision only.
+        for call in round.tool_calls.iter().cloned() {
+            match call {
+                SurpriseToolsCall::PreserveUnexpectedEvent(call) => {
+                    let first_decision = memo.is_none();
+                    if first_decision {
                         if let Some(args) = normalize_preserve_args(call.input.clone()) {
                             memo = Some(render_surprise_memo(&args));
                         }
                     }
-                    let output = self.preserve_unexpected_event(call.input.clone()).await;
+                    let output = if first_decision {
+                        self.preserve_unexpected_event(call.input.clone()).await
+                    } else {
+                        PreserveUnexpectedEventOutput { preserved: false }
+                    };
                     results.push(
                         call.complete(output)
                             .context("complete preserve_unexpected_event tool call")?,
                     );
                 }
-                round
-                    .commit(&mut self.session, results)
-                    .context("commit surprise tool round")?;
-                input_tokens
+                SurpriseToolsCall::MarkExpectedEvent(call) => {
+                    let first_decision = memo.is_none();
+                    if first_decision {
+                        memo = Some(render_expected_memo(&call.input));
+                    }
+                    results.push(
+                        call.complete(MarkExpectedEventOutput {
+                            recorded: first_decision,
+                        })
+                        .context("complete mark_expected_event tool call")?,
+                    );
+                }
             }
-        };
+        }
+        round
+            .commit(&mut self.session, results)
+            .context("commit surprise tool round")?;
         compact_session_if_needed(
             &mut self.session,
             input_tokens,
@@ -203,9 +271,10 @@ impl SurpriseModule {
         )
         .await;
 
-        self.memo
-            .write(memo.unwrap_or_else(|| EXPECTED_SURPRISE_MEMO.to_owned()))
-            .await;
+        let Some(memo) = memo else {
+            anyhow::bail!("surprise finished without a valid tool decision");
+        };
+        self.memo.write(memo).await;
         Ok(())
     }
 
@@ -265,6 +334,14 @@ fn render_surprise_memo(args: &PreserveUnexpectedEventArgs) -> String {
         "Surprise assessment: unexpected\nSurprise: {:.2}\nMemory preservation request:\nContent: {}\nReason: {}",
         args.surprise, args.content, args.reason,
     )
+}
+
+fn render_expected_memo(args: &MarkExpectedEventArgs) -> String {
+    let reason = args.reason.trim();
+    if reason.is_empty() {
+        return EXPECTED_SURPRISE_MEMO.to_owned();
+    }
+    format!("{EXPECTED_SURPRISE_MEMO}\nReason: {reason}")
 }
 
 #[async_trait(?Send)]
@@ -463,6 +540,26 @@ mod tests {
         ])
     }
 
+    fn expected_scenario(args: &MarkExpectedEventArgs, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("surprise-expected".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-expected".into(),
+                name: "mark_expected_event".into(),
+                arguments_json_delta: serde_json::to_string(args)
+                    .expect("tool args must serialize"),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("surprise-expected".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
     fn preserve_scenario(
         args: &PreserveUnexpectedEventArgs,
         input_tokens: u64,
@@ -531,6 +628,20 @@ mod tests {
     }
 
     #[test]
+    fn expected_tool_renders_expected_memo() {
+        assert_eq!(
+            render_expected_memo(&MarkExpectedEventArgs {
+                reason: "  Fits calm-eating prediction.  ".into(),
+            }),
+            "Surprise assessment: expected\nNo memory preservation requested.\nReason: Fits calm-eating prediction."
+        );
+        assert_eq!(
+            render_expected_memo(&MarkExpectedEventArgs { reason: " ".into() }),
+            EXPECTED_SURPRISE_MEMO
+        );
+    }
+
+    #[test]
     fn normalize_preserve_args_clamps_surprise_and_rejects_empty_content() {
         assert!(
             normalize_preserve_args(PreserveUnexpectedEventArgs {
@@ -567,8 +678,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activate_writes_expected_memo_when_no_tool_called() {
-        let adapter = Arc::new(MockLlmAdapter::new().with_text_scenario(silent_scenario(1)));
+    async fn activate_writes_expected_memo_via_tool() {
+        let args = MarkExpectedEventArgs {
+            reason: "Fits pending prediction.".into(),
+        };
+        let adapter =
+            Arc::new(MockLlmAdapter::new().with_text_scenario(expected_scenario(&args, 1)));
         let mut fixture = surprise_fixture(adapter).await;
         seed_surprise_inputs(&fixture.blackboard).await;
 
@@ -577,7 +692,22 @@ mod tests {
 
         assert_eq!(
             latest_surprise_memo(&fixture.blackboard).await,
-            EXPECTED_SURPRISE_MEMO
+            "Surprise assessment: expected\nNo memory preservation requested.\nReason: Fits pending prediction."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_errors_when_no_tool_called() {
+        let adapter = Arc::new(MockLlmAdapter::new().with_text_scenario(silent_scenario(1)));
+        let mut fixture = surprise_fixture(adapter).await;
+        seed_surprise_inputs(&fixture.blackboard).await;
+
+        let cx = activate_cx(&fixture.module).await;
+        let err = fixture.module.activate(&cx).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("surprise finished without required tool call")
         );
     }
 
