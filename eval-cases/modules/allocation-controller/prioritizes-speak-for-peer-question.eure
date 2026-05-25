@@ -18,12 +18,25 @@ participants = ["Pibi"]
 
 @ memos[] {
   module = "sensory"
-  content = "Pibi asks Nui aloud, \"Koro is growling at his food bowl. What should I do?\""
+  content = ```
+Observed simulation: Koro is standing in front of the food bowl with a stiff body. Audition from Koro: growls, "stay back." Audition from Pibi: "Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?"
+```
 }
 
 @ memos[] {
   module = "query-memory"
-  content = "Retrieved memory: Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro."
+  content = ```
+Query intent:
+- The query asks for context about Koro and appropriate action regarding the interaction.
+
+Search queries:
+- Koro context and appropriate action
+
+Retrieved memory evidence:
+<one-year-ago occurred-at="2025-05-09T15:00:00Z">
+Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro.
+</one-year-ago>
+```
 }
 
 @ checks[] {

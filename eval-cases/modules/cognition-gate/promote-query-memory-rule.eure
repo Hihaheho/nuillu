@@ -1,27 +1,38 @@
 id = "module-cognition-gate-promote-query-memory-rule"
-description = "Cognition-gate should promote retrieved memory content when it is load-bearing for the current cognition surface."
+description = "Cognition-gate should promote retrieved real-world memory content when it is load-bearing for the current cognition surface."
 modules = ["cognition-gate"]
 prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The existing cognition surface contains the peer situation. A query-memory memo contains the remembered rule. The artifact should be the admitted cognition entry."
+context = "The existing cognition surface contains the peer question. A query-memory memo uses the production retrieval format and contains the remembered world rule. The artifact should be the admitted cognition entry."
 
 limits {
   max-llm-calls = 8
 }
 
 @ cognition-log[] {
-  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
+  text = "Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, \"This stream looks fresh -- is it okay to drink here?\""
 }
 
 @ memos[] {
   module = "query-memory"
-  content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+  content = ```
+Query intent:
+- Find stable memory that clarifies this cognition-log context: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
+
+Search queries:
+- Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
+
+Retrieved memory evidence:
+<one-year-ago occurred-at="2025-05-09T15:00:00Z">
+In this valley, bright clear-looking streams are tainted with stinging minerals; they hurt the mouth and stomach. The cloudy slow streams that come from the moss area are the safe ones to drink.
+</one-year-ago>
+```
 }
 
 @ checks[] {
   $variant: artifact-text-contains
   name = "promotes-memory-subject"
   must-pass = true
-  contains = "Koro"
+  contains = "stream"
 }
 
 @ checks[] {
@@ -31,23 +42,23 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking, Koro is the topic, and the slowly-from-the-side / side-approach rule matters now.
+  Pass if the artifact brings the remembered valley stream rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking about the bright stream, and the bright-clear-stream / stinging-minerals rule matters now.
   The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
-  Fail if it drops the requester or the operative slowly-from-the-side / side-approach detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, includes only the word "beside" from "beside a food bowl" without the approach rule, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
+  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats that the stream looks fresh, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {
     name = "preserves-requester-and-topic"
     weight = 1
     pass-score = 0.85
-    description = "The cognition entry keeps Pibi as the requester and Koro at the food bowl as the operative topic."
+    description = "The cognition entry keeps Pibi as the requester and the bright stream as the operative topic."
   }
 
   @ criteria[] {
-    name = "admits-slow-side-approach"
+    name = "admits-tainted-stream-rule"
     weight = 3
     pass-score = 0.9
-    description = "The cognition entry must admit the retrieved approach rule as 'slowly from the side', 'side approach', or an equivalent phrase that explicitly includes slow pace and side approach. Score 0.0 if the entry only says Koro is beside the food bowl, only repeats Pibi's question, or only mentions short clear signals without slow/side approach."
+    description = "The cognition entry must admit the retrieved world rule that bright clear streams in this valley are tainted with stinging minerals, hurt the mouth/stomach, or that cloudy moss-area streams are the safe alternative. Score 0.0 if the entry only repeats Pibi's question or only says the water looks fresh."
   }
 
   @ criteria[] {

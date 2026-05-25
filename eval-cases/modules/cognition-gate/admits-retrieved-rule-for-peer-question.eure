@@ -1,20 +1,35 @@
 id = "module-cognition-gate-admits-retrieved-rule-for-peer-question"
-description = "Cognition-gate should admit a load-bearing retrieved peer rule into conscious cognition when a peer question makes it operative now."
+description = "Cognition-gate should admit a load-bearing retrieved peer rule from a real query-memory memo into conscious cognition when a peer question makes it operative now."
 modules = ["cognition-gate"]
 prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The cognition surface already contains Pibi's peer question. A query-memory memo holds the operative Koro food-boundary rule. The artifact is the cognition-log entry."
+context = "The cognition surface already contains Pibi's peer question. A query-memory memo uses the production retrieval format and holds the operative Koro food-boundary rule. The artifact is the cognition-log entry."
 
 limits {
   max-llm-calls = 8
 }
 
 @ cognition-log[] {
-  text = "Pibi asks how to approach Koro while Koro is standing beside a food bowl."
+  text = "Koro is standing in front of the food bowl with a stiff body. Koro is growling and saying, \"stay back.\" Pibi is asking what I know about Koro that matters and what I should do."
 }
 
 @ memos[] {
   module = "query-memory"
-  content = "Koro guards food, but relaxes when approached slowly from the side. Nui should use short clear signals with Koro."
+  content = ```
+Query intent:
+- The query asks for context about Koro and appropriate action regarding the interaction.
+
+Search queries:
+- Koro context and appropriate action
+
+Retrieved memory evidence:
+<one-year-ago occurred-at="2025-05-09T15:00:00Z">
+Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro.
+</one-year-ago>
+
+<one-year-ago occurred-at="2025-05-09T15:00:00Z">
+Once Pibi snapped when I approached and tried to start talking while they were angry. Don't pressure or startle an angry Pibi; if Pibi asks for help, answer briefly and calmly from a safe distance.
+</one-year-ago>
+```
 }
 
 @ checks[] {
@@ -24,23 +39,23 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the slowly-from-the-side / side-approach / guarded-food detail matters now for downstream action.
+  Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the don't-show-your-back / stay-facing-Koro detail matters now for downstream action.
   The entry may be inner attention rather than outward speech.
-  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the slowly-from-the-side / side-approach detail, includes only the word "beside" from "beside a food bowl" without the approach rule, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
+  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the don't-show-your-back / stay-facing-Koro detail, promotes only unrelated Pibi temperament evidence, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {
     name = "preserves-requester-and-topic"
     weight = 1
     pass-score = 0.85
-    description = "The cognition entry keeps Pibi as the requester and Koro at the food bowl as the operative topic."
+    description = "The cognition entry keeps Pibi as the requester and Koro guarding or threatening at the food bowl as the operative topic."
   }
 
   @ criteria[] {
-    name = "admits-side-approach-rule"
+    name = "admits-no-back-turn-rule"
     weight = 3
     pass-score = 0.9
-    description = "The cognition entry brings the retrieved approach rule into active cognition as 'slowly from the side', 'side approach', or an equivalent phrase that explicitly includes slow pace and side approach. Score 0.0 if the entry only says Koro is beside the food bowl, only repeats Pibi's question, or only mentions short clear signals without slow/side approach."
+    description = "The cognition entry brings the retrieved threat rule into active cognition as not showing Pibi's back, staying facing Koro, keeping Koro in view, or an equivalent posture constraint. Score 0.0 if the entry only repeats Pibi's question, only summarizes Koro growling, or only promotes unrelated Pibi temperament evidence."
   }
 
   @ criteria[] {

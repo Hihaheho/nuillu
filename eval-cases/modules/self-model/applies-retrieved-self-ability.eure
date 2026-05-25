@@ -1,8 +1,8 @@
 id = "module-self-model-applies-retrieved-self-ability"
-description = "Self-model should integrate retrieved self-ability evidence with current context into a concrete first-person self memo."
+description = "Self-model should integrate retrieved self-ability evidence from real memo formats with current context into a concrete first-person self memo."
 modules = ["self-model"]
 prompt = "Answer the current self-related question with concrete self evidence from available memo logs."
-context = "This isolates self-model. Query-memory has surfaced a stable self-ability and sensory has supplied the current wet-rock context; the artifact output is self-model's memo."
+context = "This isolates self-model. Query-memory has surfaced a stable self-ability using the production retrieval memo format and sensory has supplied the current wet-rock context; the artifact output is self-model's memo."
 
 limits {
   max-llm-calls = 8
@@ -15,7 +15,20 @@ limits {
 
 @ memos[] {
   module = "query-memory"
-  content = "Nui has sticky toe-pads that grip wet smooth rocks, so Nui can climb up the wet rocks at the stream edge where other dogs slip and fall."
+  content = ```
+Query intent:
+- The context of Nui's capabilities might need retrieval to answer Koro's question.
+
+Search queries:
+- Nui's capabilities
+
+Retrieved memory evidence:
+I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals.
+
+<one-year-ago occurred-at="2025-05-09T15:00:00Z">
+Nui has sticky toe-pads that grip wet smooth rocks, so Nui can climb up the wet rocks at the stream edge where other dogs slip and fall.
+</one-year-ago>
+```
 }
 
 @ checks[] {
@@ -26,7 +39,7 @@ limits {
   judge-inputs = ["output", "memo-contents"]
   rubric = ```
   Pass if the self-model memo forms a concrete first-person self fact from the available memo evidence: Nui has sticky toe-pads and can climb or grip wet smooth rocks at the stream edge, unlike Koro/dogs who slip.
-  Fail if the memo gives only a vague ability claim, ignores the sticky toe-pad/wet-rock evidence, treats the evidence as external retrieval process rather than self-knowledge, invents an unrelated ability, or writes an outward utterance instead of a self-model memo.
+  Fail if the memo gives only a vague ability claim, ignores the sticky toe-pad/wet-rock evidence, copies retrieval/search plumbing instead of forming self-knowledge, invents an unrelated ability, or writes an outward utterance instead of a self-model memo.
   ```
 
   @ criteria[] {
