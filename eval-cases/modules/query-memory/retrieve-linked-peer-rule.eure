@@ -65,15 +65,18 @@ limits {
 }
 
 @ checks[] {
-  $variant: trace-event
+  $variant: trace-tool-call
   name = "calls-fetch-linked-memories"
   must-pass = true
-  message-contains = "fetch_linked_memories>{\"memory_indexes\":"
+  tool-name = "fetch_linked_memories"
 }
 
 @ checks[] {
-  $variant: trace-event
+  $variant: trace-tool-call
   name = "memos-linked-signal-index"
   must-pass = true
-  message-contains = "linked_hit_indexes\":[\"koro-signal-drill-linked\"]"
+  tool-name = "write_retrieval_memo"
+  args-json-contains = ```
+  {"linked_hit_indexes": ["koro-signal-drill-linked"]}
+  ```
 }

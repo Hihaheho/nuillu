@@ -479,6 +479,7 @@ impl QueryMemoryModule {
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let input_tokens = round.usage.input_tokens;
+                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     if round.tool_calls.is_empty() {
                         compact_session_if_needed(
                             &mut self.session,

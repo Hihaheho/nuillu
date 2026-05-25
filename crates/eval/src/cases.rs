@@ -821,6 +821,13 @@ pub enum Check {
         common: CheckCommon,
         message_contains: String,
     },
+    TraceToolCall {
+        #[eure(flatten)]
+        common: CheckCommon,
+        tool_name: String,
+        #[eure(default)]
+        args_json_contains: Option<Text>,
+    },
     TraceSpansOrdered {
         #[eure(flatten)]
         common: CheckCommon,
@@ -865,6 +872,7 @@ impl Check {
             | Self::Rubric { common, .. }
             | Self::TraceSpan { common, .. }
             | Self::TraceEvent { common, .. }
+            | Self::TraceToolCall { common, .. }
             | Self::TraceSpansOrdered { common, .. } => common,
         }
     }
@@ -879,6 +887,7 @@ impl Check {
             Self::Rubric { .. } => "rubric",
             Self::TraceSpan { .. } => "trace-span",
             Self::TraceEvent { .. } => "trace-event",
+            Self::TraceToolCall { .. } => "trace-tool-call",
             Self::TraceSpansOrdered { .. } => "trace-spans-ordered",
         }
     }
@@ -1648,6 +1657,31 @@ fn validate_check(path: &Path, check: &Check) -> Result<(), CaseFileError> {
                 ),
             });
         }
+        Check::TraceToolCall { tool_name, .. } if tool_name.trim().is_empty() => {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "trace-tool-call check '{}' has an empty tool name",
+                    check.display_name()
+                ),
+            });
+        }
+        Check::TraceToolCall {
+            args_json_contains: Some(args_json_contains),
+            ..
+        } => {
+            if let Err(error) =
+                serde_json::from_str::<serde_json::Value>(&args_json_contains.content)
+            {
+                return Err(CaseFileError::Validation {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "trace-tool-call check '{}' has invalid args-json-contains JSON: {error}",
+                        check.display_name()
+                    ),
+                });
+            }
+        }
         Check::TraceSpansOrdered { names, .. } if names.is_empty() => {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1927,6 +1961,35 @@ mod tests {
         let error = validate_full_agent_case(Path::new("case.eure"), &case).unwrap_err();
         assert!(
             matches!(error, CaseFileError::Validation { message, .. } if message.contains("trace-span cannot run mid-step"))
+        );
+    }
+
+    #[test]
+    fn validate_check_rejects_invalid_trace_tool_call_args_json_contains() {
+        let check = Check::TraceToolCall {
+            common: CheckCommon {
+                name: Some("bad-tool-args".to_string()),
+                must_pass: true,
+                weight: 1,
+            },
+            tool_name: "write_retrieval_memo".to_string(),
+            args_json_contains: Some(Text::plaintext("{not-json")),
+        };
+
+        let error = validate_common(
+            Path::new("case.eure"),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &EvalLimits::default(),
+            &[check],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CaseFileError::Validation { message, .. } if message.contains("invalid args-json-contains JSON"))
         );
     }
 

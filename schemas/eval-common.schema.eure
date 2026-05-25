@@ -205,6 +205,13 @@ variants.trace-event {
   message-contains = `text`
 }
 
+variants.trace-tool-call {
+  $flatten = [`$types.check-common`]
+  tool-name = `text`
+  args-json-contains = `text`
+  args-json-contains.$optional = true
+}
+
 variants.trace-spans-ordered {
   $flatten = [`$types.check-common`]
   names = [`text`]

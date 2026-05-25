@@ -214,6 +214,7 @@ impl AttentionSchemaModule {
         let input_tokens = round.usage.input_tokens;
 
         let mut results: Vec<ToolResult> = Vec::new();
+        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         for call in round.tool_calls.iter().cloned() {
             match call {
                 AttentionSchemaToolsCall::AppendAttentionExperience(call) => {

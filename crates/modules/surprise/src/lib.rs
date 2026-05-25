@@ -222,6 +222,7 @@ impl SurpriseModule {
         let input_tokens = round.usage.input_tokens;
         let mut memo: Option<String> = None;
         let mut results: Vec<ToolResult> = Vec::new();
+        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         // The LLM may return multiple tool calls; adopt the first valid decision only.
         for call in round.tool_calls.iter().cloned() {
             match call {

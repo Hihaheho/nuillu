@@ -391,6 +391,7 @@ impl AllocationControllerModule {
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let input_tokens = round.usage.input_tokens;
                 let mut results: Vec<ToolResult> = Vec::new();
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 // The LLM may return multiple tool calls; adopt the first decision only.
                 for call in round.tool_calls.iter().cloned() {
                     match call {

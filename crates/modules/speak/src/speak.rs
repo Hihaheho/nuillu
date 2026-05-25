@@ -408,6 +408,7 @@ impl SpeakModule {
             return Ok(None);
         };
 
+        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         let mut selected = None;
         for call in round.tool_calls.iter().cloned() {
             let SpeakToolsCall::ShouldSpeak(call) = call;

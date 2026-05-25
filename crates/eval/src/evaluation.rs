@@ -7,6 +7,7 @@ use lutum_eval_runner::{mean_pass_at_k, mean_pass_hat_k};
 use nuillu_module::RuntimeEvent;
 use nuillu_types::ModuleInstanceId;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     artifact::CaseArtifact,
@@ -565,6 +566,44 @@ fn evaluate_deterministic_check(
                     .then(|| format!("expected trace event containing {message_contains:?}")),
             )
         }
+        Check::TraceToolCall {
+            tool_name,
+            args_json_contains,
+            ..
+        } => {
+            let expected_args = match args_json_contains {
+                Some(args_json_contains) => {
+                    match serde_json::from_str::<Value>(&args_json_contains.content) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            return build_error_outcome(
+                                check,
+                                format!("invalid args-json-contains JSON: {error}"),
+                            );
+                        }
+                    }
+                }
+                None => None,
+            };
+            let calls = trace_tool_calls(trace);
+            let passed = calls.iter().any(|call| {
+                call.name == *tool_name
+                    && expected_args
+                        .as_ref()
+                        .is_none_or(|expected| json_contains(&call.args, expected))
+            });
+            build_outcome(
+                check,
+                passed,
+                (!passed).then(|| {
+                    if expected_args.is_some() {
+                        format!("expected trace tool call {tool_name:?} with matching arguments")
+                    } else {
+                        format!("expected trace tool call {tool_name:?}")
+                    }
+                }),
+            )
+        }
         Check::TraceSpansOrdered { names, .. } => {
             let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
             let passed = trace.spans_ordered(&refs);
@@ -575,6 +614,50 @@ fn evaluate_deterministic_check(
             )
         }
         Check::Rubric { .. } => unreachable!("rubric checks are evaluated asynchronously"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TraceToolCallObserved {
+    name: String,
+    args: Value,
+}
+
+fn trace_tool_calls(trace: &TraceSnapshot) -> Vec<TraceToolCallObserved> {
+    trace
+        .all_events()
+        .filter_map(trace_tool_call_from_event)
+        .collect()
+}
+
+fn trace_tool_call_from_event(event: &EventRecord) -> Option<TraceToolCallObserved> {
+    if event.message.as_deref() != Some("tool_call") {
+        return None;
+    }
+    let name = event
+        .field("tool_name")
+        .and_then(trace_field_value_str)?
+        .to_owned();
+    let args = event
+        .field("args_json")
+        .and_then(trace_field_value_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())?;
+    Some(TraceToolCallObserved { name, args })
+}
+
+fn json_contains(actual: &Value, expected: &Value) -> bool {
+    match (actual, expected) {
+        (Value::Object(actual), Value::Object(expected)) => expected.iter().all(|(key, value)| {
+            actual
+                .get(key)
+                .is_some_and(|actual_value| json_contains(actual_value, value))
+        }),
+        (Value::Array(actual), Value::Array(expected)) => expected.iter().all(|expected_value| {
+            actual
+                .iter()
+                .any(|actual_value| json_contains(actual_value, expected_value))
+        }),
+        _ => actual == expected,
     }
 }
 
@@ -1404,5 +1487,197 @@ mod tests {
         let outcome =
             evaluate_deterministic_check(&check, &trace, &crate::artifact::CaseArtifact::new(""));
         assert!(outcome.passed);
+    }
+
+    #[test]
+    fn trace_tool_call_json_contains_matches_object_subset_unordered_arrays_and_extra_args() {
+        let actual = serde_json::json!({
+            "hit_indexes": ["koro-approach-primary"],
+            "linked_hit_indexes": [
+                "koro-signal-drill-linked",
+                "koro-food-fern-wait"
+            ],
+            "extra": true
+        });
+        let expected = serde_json::json!({
+            "linked_hit_indexes": [
+                "koro-food-fern-wait",
+                "koro-signal-drill-linked"
+            ]
+        });
+
+        assert!(super::json_contains(&actual, &expected));
+    }
+
+    #[test]
+    fn trace_tool_call_json_contains_rejects_wrong_scalar_value() {
+        let actual = serde_json::json!({
+            "linked_hit_indexes": ["koro-signal-drill-linked"]
+        });
+        let expected = serde_json::json!({
+            "linked_hit_indexes": ["wrong-index"]
+        });
+
+        assert!(!super::json_contains(&actual, &expected));
+    }
+
+    #[test]
+    fn trace_tool_call_check_uses_structured_tool_events_only() {
+        use lutum_eval::{EventRecord, FieldValue, SpanNode, TraceSnapshot};
+
+        use super::evaluate_deterministic_check;
+        use crate::cases::{Check, CheckCommon};
+
+        let prompt_only_trace = TraceSnapshot {
+            roots: vec![SpanNode {
+                name: "llm_turn".to_string(),
+                target: "lutum".to_string(),
+                level: "INFO".to_string(),
+                fields: Vec::new(),
+                events: vec![EventRecord {
+                    target: "lutum".to_string(),
+                    level: "DEBUG".to_string(),
+                    message: Some("llm_input_transcript".to_string()),
+                    fields: vec![(
+                        "transcript".to_string(),
+                        FieldValue::Str(
+                            "Use write_retrieval_memo after linked retrieval.".to_string(),
+                        ),
+                    )],
+                }],
+                children: Vec::new(),
+            }],
+            root_events: Vec::new(),
+        };
+        let name_only = Check::TraceToolCall {
+            common: CheckCommon {
+                name: Some("calls-fetch-linked-memories".to_string()),
+                must_pass: true,
+                weight: 1,
+            },
+            tool_name: "fetch_linked_memories".to_string(),
+            args_json_contains: None,
+        };
+        let prompt_only = evaluate_deterministic_check(
+            &name_only,
+            &prompt_only_trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(!prompt_only.passed);
+
+        let trace = TraceSnapshot {
+            roots: vec![SpanNode {
+                name: "module".to_string(),
+                target: "nuillu".to_string(),
+                level: "INFO".to_string(),
+                fields: Vec::new(),
+                events: vec![
+                    EventRecord {
+                        target: "lutum".to_string(),
+                        level: "DEBUG".to_string(),
+                        message: Some("tool_call".to_string()),
+                        fields: vec![
+                            (
+                                "tool_name".to_string(),
+                                FieldValue::Str("fetch_linked_memories".to_string()),
+                            ),
+                            (
+                                "args_json".to_string(),
+                                FieldValue::Str(
+                                    r#"{"memory_indexes":["koro-approach-primary"]}"#.to_string(),
+                                ),
+                            ),
+                            (
+                                "tool_call_id".to_string(),
+                                FieldValue::Str("call-fetch".to_string()),
+                            ),
+                        ],
+                    },
+                    EventRecord {
+                        target: "lutum".to_string(),
+                        level: "DEBUG".to_string(),
+                        message: Some("tool_call".to_string()),
+                        fields: vec![
+                            (
+                                "tool_name".to_string(),
+                                FieldValue::Str("write_retrieval_memo".to_string()),
+                            ),
+                            (
+                                "args_json".to_string(),
+                                FieldValue::Str(
+                                    r#"{"hit_indexes":["koro-approach-primary"],"linked_hit_indexes":["koro-signal-drill-linked"]}"#
+                                        .to_string(),
+                                ),
+                            ),
+                            (
+                                "tool_call_id".to_string(),
+                                FieldValue::Str("call-write".to_string()),
+                            ),
+                        ],
+                    },
+                ],
+                children: Vec::new(),
+            }],
+            root_events: Vec::new(),
+        };
+
+        let name_only = evaluate_deterministic_check(
+            &name_only,
+            &trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(name_only.passed);
+
+        let matching_args = Check::TraceToolCall {
+            common: CheckCommon {
+                name: Some("memos-linked-signal-index".to_string()),
+                must_pass: true,
+                weight: 1,
+            },
+            tool_name: "write_retrieval_memo".to_string(),
+            args_json_contains: Some(eure::value::Text::plaintext(
+                r#"{"linked_hit_indexes":["koro-signal-drill-linked"]}"#,
+            )),
+        };
+        let matching_args = evaluate_deterministic_check(
+            &matching_args,
+            &trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(matching_args.passed);
+
+        let wrong_tool = Check::TraceToolCall {
+            common: CheckCommon {
+                name: None,
+                must_pass: true,
+                weight: 1,
+            },
+            tool_name: "missing_tool".to_string(),
+            args_json_contains: None,
+        };
+        let wrong_tool = evaluate_deterministic_check(
+            &wrong_tool,
+            &trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(!wrong_tool.passed);
+
+        let wrong_arg = Check::TraceToolCall {
+            common: CheckCommon {
+                name: None,
+                must_pass: true,
+                weight: 1,
+            },
+            tool_name: "write_retrieval_memo".to_string(),
+            args_json_contains: Some(eure::value::Text::plaintext(
+                r#"{"linked_hit_indexes":["wrong-index"]}"#,
+            )),
+        };
+        let wrong_arg = evaluate_deterministic_check(
+            &wrong_arg,
+            &trace,
+            &crate::artifact::CaseArtifact::new(""),
+        );
+        assert!(!wrong_arg.passed);
     }
 }

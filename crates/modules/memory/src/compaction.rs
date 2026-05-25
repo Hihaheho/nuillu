@@ -157,6 +157,7 @@ impl MemoryCompactionModule {
                 TextStepOutcomeWithTools::FinishedNoOutput(_) => return Ok(()),
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let mut results: Vec<ToolResult> = Vec::new();
+                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     for call in round.tool_calls.iter().cloned() {
                         match call {
                             CompactionToolsCall::GetMemories(call) => {

@@ -246,6 +246,7 @@ impl CognitionGateModule {
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let input_tokens = round.usage.input_tokens;
                 let mut results: Vec<ToolResult> = Vec::new();
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 for call in round.tool_calls.iter().cloned() {
                     let CognitionGateToolsCall::AppendCognition(call) = call;
                     let output = self.append_cognition(call.input.clone()).await;

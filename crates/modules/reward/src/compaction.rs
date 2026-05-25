@@ -175,6 +175,7 @@ impl PolicyCompactionModule {
                 TextStepOutcomeWithTools::Finished(_) => return Ok(()),
                 TextStepOutcomeWithTools::FinishedNoOutput(_) => return Ok(()),
                 TextStepOutcomeWithTools::NeedsTools(round) => {
+                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     if round.tool_calls.is_empty() {
                         tracing::warn!("policy-compaction requested tools without tool calls");
                         return Ok(());

@@ -138,6 +138,7 @@ impl MemoryRecombinationModule {
             return Ok(());
         };
         let mut results = Vec::<ToolResult>::new();
+        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         for call in round.tool_calls.iter().cloned() {
             let RecombinationToolsCall::AppendRecombination(call) = call;
             let output = self
