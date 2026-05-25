@@ -66,8 +66,12 @@ struct Args {
     gui: bool,
 
     /// Skip full-agent cases; run only module eval cases under eval-cases/modules.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "full_agent_only")]
     no_full_agent: bool,
+
+    /// Run only full-agent eval cases under eval-cases/full-agent.
+    #[arg(long)]
+    full_agent_only: bool,
 
     /// Run only cases associated with these modules (repeatable).
     #[arg(long = "module", value_enum, value_name = "MODULE")]
@@ -125,6 +129,7 @@ fn main() -> anyhow::Result<()> {
         module_filters: args.module_filter,
         disabled_modules: args.disable_module,
         exclude_full_agent: args.no_full_agent,
+        full_agent_only: args.full_agent_only,
     };
 
     if args.gui {

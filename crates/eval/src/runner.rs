@@ -116,6 +116,7 @@ pub struct RunnerConfig {
     pub module_filters: Vec<EvalModule>,
     pub disabled_modules: Vec<EvalModule>,
     pub exclude_full_agent: bool,
+    pub full_agent_only: bool,
 }
 
 /// Modules that may never be disabled via `RunnerConfig::disabled_modules` —
@@ -344,6 +345,8 @@ pub enum RunnerError {
     GuiExcludeFullAgent,
     #[error("--gui does not support --trials > 1 (got {trials})")]
     GuiTrialsUnsupported { trials: usize },
+    #[error("--full-agent-only cannot be combined with --no-full-agent")]
+    ConflictingFullAgentFilters,
 }
 
 struct CaseExecution {
@@ -577,6 +580,7 @@ fn suite_run_report(
             .map(|module| module.as_str().to_string())
             .collect(),
         exclude_full_agent: config.exclude_full_agent,
+        full_agent_only: config.full_agent_only,
     }
 }
 
@@ -598,6 +602,10 @@ pub async fn run_case_detailed(
 }
 
 fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelection, RunnerError> {
+    if config.exclude_full_agent && config.full_agent_only {
+        return Err(RunnerError::ConflictingFullAgentFilters);
+    }
+
     let failed_from = resolve_failed_only_reference(config)?;
     let failed_cases = failed_from
         .as_ref()
@@ -623,6 +631,9 @@ fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelect
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_exclude_full_agent_case_paths(case_paths, config.exclude_full_agent);
+    }
+    if !case_paths.is_empty() || failed_from.is_none() {
+        case_paths = filter_full_agent_only_case_paths(case_paths, config.full_agent_only);
     }
     if !case_paths.is_empty() || failed_from.is_none() {
         case_paths = filter_module_case_paths(case_paths, &config.module_filters)?;
@@ -836,6 +847,19 @@ fn filter_exclude_full_agent_case_paths(case_paths: Vec<PathBuf>, exclude: bool)
     case_paths
         .into_iter()
         .filter(|path| !is_full_agent_case_path(path))
+        .collect()
+}
+
+fn filter_full_agent_only_case_paths(
+    case_paths: Vec<PathBuf>,
+    full_agent_only: bool,
+) -> Vec<PathBuf> {
+    if !full_agent_only {
+        return case_paths;
+    }
+    case_paths
+        .into_iter()
+        .filter(|path| is_full_agent_case_path(path))
         .collect()
 }
 
@@ -6403,6 +6427,7 @@ mod tests {
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
             exclude_full_agent: false,
+            full_agent_only: false,
         }
     }
 
@@ -6427,6 +6452,7 @@ mod tests {
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
             exclude_full_agent: false,
+            full_agent_only: false,
         }
     }
 
@@ -7031,6 +7057,80 @@ prompt = "Second?"
     }
 
     #[test]
+    fn full_agent_only_drops_module_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_speak = write_full_agent_case(
+            dir.path(),
+            "full-speak",
+            "full-agent-speak",
+            Some(&[EvalModule::Sensory, EvalModule::Speak]),
+        );
+        let _speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "speak-target",
+            "module-speak-target",
+            &[EvalModule::Speak],
+        );
+        let _memory = write_module_case(
+            dir.path(),
+            EvalModule::Memory,
+            "memory-target",
+            "module-memory-target",
+            &[EvalModule::Memory],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.full_agent_only = true;
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![full_speak]);
+    }
+
+    #[test]
+    fn full_agent_only_intersects_module_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_speak = write_full_agent_case(
+            dir.path(),
+            "full-speak",
+            "full-agent-speak",
+            Some(&[EvalModule::Sensory, EvalModule::Speak]),
+        );
+        let _full_memory = write_full_agent_case(
+            dir.path(),
+            "full-memory",
+            "full-agent-memory",
+            Some(&[EvalModule::Memory]),
+        );
+        let _speak = write_module_case(
+            dir.path(),
+            EvalModule::Speak,
+            "speak-target",
+            "module-speak-target",
+            &[EvalModule::Speak],
+        );
+        let mut config = test_runner_config(dir.path());
+        config.full_agent_only = true;
+        config.module_filters = vec![EvalModule::Speak];
+
+        let selection = select_case_paths(&config, false).unwrap();
+
+        assert_eq!(selection.case_paths, vec![full_speak]);
+    }
+
+    #[test]
+    fn full_agent_case_filters_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_runner_config(dir.path());
+        config.exclude_full_agent = true;
+        config.full_agent_only = true;
+
+        let error = select_case_paths(&config, false).unwrap_err();
+
+        assert!(matches!(error, RunnerError::ConflictingFullAgentFilters));
+    }
+
+    #[test]
     fn module_filters_intersect_case_patterns() {
         let dir = tempfile::tempdir().unwrap();
         let special_speak = write_module_case(
@@ -7113,6 +7213,7 @@ id = "module-query-memory-special-memory"
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
             exclude_full_agent: false,
+            full_agent_only: false,
         };
 
         let tabs = visualizer_planned_tabs(&config).unwrap();
@@ -8070,6 +8171,7 @@ limits {{
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
             exclude_full_agent: false,
+            full_agent_only: false,
         };
 
         let report = run_suite(&config).await.unwrap();
@@ -8143,6 +8245,7 @@ limits {{
                 "module_filters": [],
                 "disabled_modules": [],
                 "exclude_full_agent": false,
+                "full_agent_only": false,
             })
         );
         for summary in &report.cases {

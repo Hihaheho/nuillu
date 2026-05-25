@@ -199,6 +199,7 @@ pub struct SuiteRunReport {
     pub module_filters: Vec<String>,
     pub disabled_modules: Vec<String>,
     pub exclude_full_agent: bool,
+    pub full_agent_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
