@@ -5,9 +5,10 @@ use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
     SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
     TimeDivision, compact_session_if_needed, format_current_attention_guidance,
-    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
-    format_time_division_guidance, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch, seed_persistent_faculty_session,
+    format_faculty_system_prompt, format_memo_log_batch, format_memory_trace_inventory,
+    format_stuckness, format_time_division_guidance, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,9 @@ decision — specific safety constraints, peer-model rules, sensory details, rec
 episodes, body or world facts. Preserve specifics: a concrete actionable rule must enter
 the workspace as the rule it actually is, not as a flattened summary that drops the
 operative detail. Generic paraphrases are not equivalents.
+Never call append_cognition for a mere restatement or tense-shifted paraphrase of what is already
+conscious. If you append, the entry must add new load-bearing evidence from the non-conscious inputs
+or combine that evidence with the current conscious situation.
 
 When a participant asks for help, asks a question, warns, or requests advice, preserve who is asking
 and what they need answered. If the answer is about another participant, object, place, or hazard,
@@ -104,6 +108,8 @@ fn format_cognition_gate_context(
 #[lutum::tool_input(name = "append_cognition", output = AppendCognitionOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppendCognitionArgs {
+    /// Plain inner-experience text that adds new load-bearing evidence to the current cognition log.
+    /// Do not use this field to restate or lightly paraphrase cognition that is already present.
     pub cognition_text: String,
 }
 
@@ -199,7 +205,9 @@ impl CognitionGateModule {
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
 
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
+        if let Some(memo_notes) = format_memo_log_batch(&unread_memos, cx.now()) {
+            self.session.push_ephemeral_user(memo_notes);
+        }
 
         let (rank_counts, stuckness) = self
             .blackboard
@@ -211,18 +219,21 @@ impl CognitionGateModule {
             })
             .await;
         let allocation = self.allocation.snapshot().await;
-        self.session
-            .push_ephemeral_system(format_cognition_gate_context(
-                &rank_counts,
-                &allocation,
-                &self.time_division,
-                stuckness.as_ref(),
-            ));
+        let context = format_cognition_gate_context(
+            &rank_counts,
+            &allocation,
+            &self.time_division,
+            stuckness.as_ref(),
+        );
+        self.session.push_ephemeral_system(context);
         self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
-        self.run_decision_turn(&lutum, cx.session_compaction())
-            .await?;
+        let result = self
+            .run_decision_turn(&lutum, cx.session_compaction())
+            .await;
+        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
+        result?;
         Ok(())
     }
 
@@ -325,7 +336,7 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
         ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
+        MessageContent, MockError, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
@@ -581,6 +592,37 @@ mod tests {
         )
     }
 
+    fn has_message_with_role_containing(
+        items: &[ModelInputItem],
+        expected_role: InputMessageRole,
+        needle: &str,
+    ) -> bool {
+        items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { role, content }
+                if role == &expected_role
+                    && matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains(needle))
+        ))
+    }
+
+    fn message_texts_with_role(
+        items: &[ModelInputItem],
+        expected_role: InputMessageRole,
+    ) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message { role, content } if role == &expected_role => {
+                    let [MessageContent::Text(text)] = content.as_slice() else {
+                        panic!("expected one text content item");
+                    };
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
@@ -688,9 +730,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_persists_memo_system_notes_and_drops_ephemeral_decision_context() {
+    async fn activation_sends_new_memos_as_ephemeral_user_and_persists_after_turn() {
         let adapter = MockLlmAdapter::new().with_text_scenario(silent_scenario(1));
-        let mut fixture = gate_fixture_with_adapter(adapter).await;
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
         fixture.source_memo.write("sensory memo A").await;
 
         let lutum = fixture.gate.llm.lutum().await;
@@ -706,6 +750,31 @@ mod tests {
         );
 
         fixture.gate.activate(&cx).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 1);
+        let request_items = inputs[0].items();
+        let user_messages = message_texts_with_role(request_items, InputMessageRole::User);
+        assert_eq!(user_messages.len(), 1);
+        let memo_input = user_messages[0];
+        assert!(memo_input.contains("sensory memo A"));
+        assert!(!memo_input.contains(
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!memo_input.contains(ACTIVATION_INPUT));
+        let developer_messages =
+            message_texts_with_role(request_items, InputMessageRole::Developer);
+        assert_eq!(developer_messages, vec![ACTIVATION_INPUT]);
+        assert!(has_message_with_role_containing(
+            request_items,
+            InputMessageRole::System,
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!has_message_with_role_containing(
+            request_items,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
 
         let items = fixture.gate.session.input().items();
         let ModelInputItem::Message { role, content } = &items[0] else {
@@ -741,6 +810,49 @@ mod tests {
                 .any(|item| matches!(item, ModelInputItem::Turn(_))),
             "ephemeral cognition-gate context and silent finish must not persist turns"
         );
+        assert!(!has_message_with_role_containing(
+            items,
+            InputMessageRole::User,
+            "sensory memo A"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_persists_new_memos_after_failed_turn() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(MockTextScenario::start_error(
+            MockError::Synthetic {
+                message: "synthetic failure".into(),
+            },
+        ));
+        let mut fixture = gate_fixture_with_adapter(adapter).await;
+        fixture.source_memo.write("sensory memo A").await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &peer_contexts,
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+
+        let err = fixture.gate.activate(&cx).await.unwrap_err();
+        assert!(err.to_string().contains("decision turn failed"));
+
+        let items = fixture.gate.session.input().items();
+        assert!(has_message_with_role_containing(
+            items,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
+        assert!(!has_message_with_role_containing(
+            items,
+            InputMessageRole::User,
+            "sensory memo A"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -785,14 +897,27 @@ mod tests {
         };
         assert!(system.contains("You are the cognition-gate module"));
 
-        let ModelInputItem::Message { role, content } = &first_items[1] else {
-            panic!("expected first input memo-log note");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(memo_a)] = content.as_slice() else {
-            panic!("expected first input memo-log note text");
-        };
-        assert!(memo_a.contains("sensory memo A"));
+        let first_user_messages = message_texts_with_role(first_items, InputMessageRole::User);
+        assert_eq!(first_user_messages.len(), 1);
+        assert!(first_user_messages[0].contains("sensory memo A"));
+        assert!(!first_user_messages[0].contains(
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!first_user_messages[0].contains(ACTIVATION_INPUT));
+        assert_eq!(
+            message_texts_with_role(first_items, InputMessageRole::Developer),
+            vec![ACTIVATION_INPUT]
+        );
+        assert!(has_message_with_role_containing(
+            first_items,
+            InputMessageRole::System,
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!has_message_with_role_containing(
+            first_items,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
         assert!(first_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
@@ -812,16 +937,32 @@ mod tests {
             panic!("expected second input system prompt text");
         };
         assert!(system.contains("You are the cognition-gate module"));
-        assert!(second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
-        )));
-        assert!(second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
-        )));
+        assert!(has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
+        let second_user_messages = message_texts_with_role(second_items, InputMessageRole::User);
+        assert_eq!(second_user_messages.len(), 1);
+        assert!(second_user_messages[0].contains("sensory memo B"));
+        assert!(!second_user_messages[0].contains(
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!second_user_messages[0].contains(ACTIVATION_INPUT));
+        assert_eq!(
+            message_texts_with_role(second_items, InputMessageRole::Developer),
+            vec![ACTIVATION_INPUT]
+        );
+        assert!(has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "sensory memo B"
+        ));
         assert!(second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
@@ -853,25 +994,23 @@ mod tests {
                         if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
                 )
         )));
-        assert!(!second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message {
-                role: InputMessageRole::User,
-                ..
-            }
-        )));
 
         let session_after_second = fixture.gate.session.input().items();
-        assert!(session_after_second.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo A"))
-        )));
-        assert!(session_after_second.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
-        )));
+        assert!(has_message_with_role_containing(
+            session_after_second,
+            InputMessageRole::System,
+            "sensory memo A"
+        ));
+        assert!(has_message_with_role_containing(
+            session_after_second,
+            InputMessageRole::System,
+            "sensory memo B"
+        ));
+        assert!(!has_message_with_role_containing(
+            session_after_second,
+            InputMessageRole::User,
+            "sensory memo B"
+        ));
         assert!(session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
