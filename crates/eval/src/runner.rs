@@ -2202,7 +2202,15 @@ async fn execute_module_case(
                             )
                             .await
                     }
-                    ModuleEvalTarget::Speak => utterances.last_complete().is_some(),
+                    ModuleEvalTarget::Speak => {
+                        utterances.last_complete().is_some()
+                            || module_activation_finished(
+                                &blackboard,
+                                events.as_ref(),
+                                &shutdown_target_module,
+                            )
+                            .await
+                    }
                     ModuleEvalTarget::AllocationController => {
                         last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                             .await
@@ -2664,6 +2672,20 @@ async fn memory_diff_records(
         .collect()
 }
 
+async fn memory_deleted_indexes(
+    baseline: &BTreeMap<String, MemoryRecord>,
+    memory: &dyn MemoryStore,
+) -> Vec<String> {
+    let Ok(current) = memory_snapshot(memory).await else {
+        return Vec::new();
+    };
+    baseline
+        .keys()
+        .filter(|index| !current.contains_key(*index))
+        .cloned()
+        .collect()
+}
+
 fn memory_record_materially_changed(previous: &MemoryRecord, current: &MemoryRecord) -> bool {
     previous.content.as_str() != current.content.as_str()
         || previous.rank != current.rank
@@ -2681,7 +2703,8 @@ async fn render_memory_store_artifact(
     memory: &dyn MemoryStore,
 ) -> String {
     let records = memory_diff_records(baseline, memory).await;
-    if records.is_empty() {
+    let deleted = memory_deleted_indexes(baseline, memory).await;
+    if records.is_empty() && deleted.is_empty() {
         return String::new();
     }
 
@@ -2722,6 +2745,13 @@ async fn render_memory_store_artifact(
         }
     }
 
+    if !deleted.is_empty() {
+        out.push_str("\n\nDeleted memories:");
+        for index in deleted {
+            out.push_str(&format!("\n- {index}"));
+        }
+    }
+
     out
 }
 
@@ -2743,6 +2773,7 @@ async fn memory_diff_observation(
     memory: &dyn MemoryStore,
 ) -> MemoryDiffObservation {
     let records = memory_diff_records(baseline, memory).await;
+    let deleted = memory_deleted_indexes(baseline, memory).await;
     let indexes = records
         .iter()
         .map(|record| record.index.clone())
@@ -2779,6 +2810,7 @@ async fn memory_diff_observation(
                 relation: memory_link_relation_label(linked.link.relation).to_owned(),
             })
             .collect(),
+        deleted,
     }
 }
 
@@ -2786,6 +2818,7 @@ async fn memory_diff_observation(
 struct MemoryDiffObservation {
     entries: Vec<MemoryDiffEntryObservation>,
     links: Vec<MemoryDiffLinkObservation>,
+    deleted: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7382,6 +7415,38 @@ id = "module-query-memory-special-memory"
         assert_eq!(
             pointer_text(&value, "/links/0/relation").as_deref(),
             Some("derived_from")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_diff_observation_exposes_deleted_baseline_records() {
+        let deleted_index = MemoryIndex::new("source");
+        let now = Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap();
+        let deleted = MemoryRecord {
+            index: deleted_index.clone(),
+            content: nuillu_types::MemoryContent::new("Redundant source memory."),
+            rank: MemoryRank::ShortTerm,
+            occurred_at: None,
+            stored_at: now,
+            kind: nuillu_memory::MemoryKind::Episode,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
+        };
+        let baseline = BTreeMap::from([(deleted_index.to_string(), deleted)]);
+        let store = StaticMemoryStore {
+            records: RefCell::new(Vec::new()),
+            links: Vec::new(),
+        };
+
+        let diff = memory_diff_observation(&baseline, &store).await;
+        let value = serde_json::to_value(diff).unwrap();
+
+        assert_eq!(
+            pointer_text(&value, "/deleted/0").as_deref(),
+            Some("source")
         );
     }
 

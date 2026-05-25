@@ -28,8 +28,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition", "memos"]
   rubric = ```
-  Pass if the utterance is addressed to Pibi and converts the cognition-log threat knowledge into direct outward advice: Pibi should not turn their back on threatening Koro and should keep facing Koro or move away sideways/slowly without provoking him.
-  Fail if the utterance merely restates the knowledge without advising Pibi, says what Nui must consider without advising Pibi, omits the posture/back-turning danger, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.
+  Pass if the utterance is addressed to Pibi and converts the cognition-log threat knowledge into direct outward advice: Pibi should keep distance and manage posture around threatening Koro, such as not turning their back, keeping Koro in view, facing Koro, or moving away sideways/slowly without provoking him.
+  Fail if the utterance merely restates the knowledge without advising Pibi, says what Nui must consider without advising Pibi, omits both distance and posture guidance, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.
   ```
 
   @ criteria[] {
@@ -43,7 +43,7 @@ limits {
     name = "applies-posture-risk"
     weight = 2
     pass-score = 0.85
-    description = "The advice uses the cognition-log information that turning one's back on threatening Koro is dangerous."
+    description = "The advice uses the posture-risk evidence, either by warning not to turn away or by telling Pibi to keep facing Koro, keep Koro in view, or move away sideways/slowly."
   }
 
   @ criteria[] {
