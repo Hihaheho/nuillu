@@ -26,11 +26,11 @@ For self-directed cognition, transform only the listener-relevant implication in
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
-const GENERATION_PROMPT: &str = r#"Render the accepted should_speak tool call as one concise in-world utterance to the selected target.
-speech_content is already the speech-facing transformation of the cognition log. Render that transformed information; do not redo target selection or add a new plan.
+const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
+The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
 Preserve its answer polarity, addressee-facing perspective, direct warnings, advice, uncertainty, and visible-absence evidence.
 Use the cognition log only to keep wording grounded. Do not add facts, turn an answer back into a question, turn listener-facing substance into a self-directed note, weaken direct content into vague caution, or merely restate the situation.
-Do not mention tools, fields, lookup, reasoning, modules, memos, prompts, rubrics, or evaluation mechanics."#;
+Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
 
 const PARTIAL_CONTINUATION_PROMPT: &str = "Continue the partial utterance from where it stopped.";
 
@@ -158,24 +158,16 @@ fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> Strin
     )
 }
 
-fn render_should_speak_call(args: &ShouldSpeakArgs, accepted_target: &str) -> String {
-    format!(
-        "target: {}\nspeech_content: {}",
-        accepted_target.trim(),
-        args.speech_content.trim()
-    )
-}
-
 fn format_generation_input(
     cognition_context: &str,
     args: &ShouldSpeakArgs,
     draft: &GenerationDraft,
 ) -> String {
     format!(
-        "Current cognition log:\n{}\n\nSpeech target: {}\n\nAccepted should_speak tool call:\n{}",
+        "Current cognition log:\n{}\n\nSpeak to: {}\n\nSubstance to express:\n{}",
         cognition_context.trim(),
         draft.target.trim(),
-        render_should_speak_call(args, &draft.target)
+        args.speech_content.trim()
     )
 }
 
@@ -1126,10 +1118,13 @@ mod tests {
             panic!("expected one text content item");
         };
         assert!(text.contains("Current cognition log:\nnone"));
-        assert!(text.contains("Speech target: Koro"));
-        assert!(
-            text.contains("speech_content: Tell Koro to stay close because Koro asks for help.")
-        );
+        assert!(text.contains("Speak to: Koro"));
+        assert!(text.contains("Substance to express:"));
+        assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
+        assert!(!text.contains("should_speak"));
+        assert!(!text.contains("tool call"));
+        assert!(!text.contains("speech_content"));
+        assert!(!text.contains("target:"));
         assert!(!text.contains("rationale"));
         assert!(!text.contains("allocation"));
         assert!(!text.contains("partial_utterance"));
@@ -1159,6 +1154,9 @@ mod tests {
         );
 
         assert!(prompt.len() < 1100);
+        assert!(!prompt.contains("should_speak"));
+        assert!(!prompt.contains("tool call"));
+        assert!(!prompt.contains("speech_content"));
         assert!(!prompt.contains("You are part of a cognitive system"));
         assert!(!prompt.contains("- cognition-gate:"));
         assert!(!prompt.contains("- query-memory:"));
