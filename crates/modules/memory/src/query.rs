@@ -48,6 +48,12 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's
 Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, memory
 search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
 future retrieval should remember. Do not invent facts. Return plain text only."#;
+const TOOL_RESULT_CONTINUATION_PROMPT: &str = r#"Continue memory retrieval from the tool results above.
+If a search hit may answer the request and has linked_neighbor_count greater than zero, call
+fetch_linked_memories for the seed hit before writing a memo.
+If retrieved evidence is useful, call write_retrieval_memo with the selected flat hit_indexes and
+linked_hit_indexes. If the tool results do not contain useful evidence and no targeted search
+remains, finish without assistant text."#;
 
 fn format_memory_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -178,7 +184,7 @@ pub struct QueryMemoryMemoLinkedHit {
     pub link: MemoryLink,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct QueryMemoryRetrieval {
     searches: Vec<QueryMemoryMemoSearch>,
     hits: Vec<QueryMemoryHit>,
@@ -205,6 +211,7 @@ pub struct QueryMemoryModule {
     session_seeded: bool,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
+    pending_retrieval: QueryMemoryRetrieval,
 }
 
 impl QueryMemoryModule {
@@ -232,6 +239,7 @@ impl QueryMemoryModule {
             session_seeded: false,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
+            pending_retrieval: QueryMemoryRetrieval::default(),
         }
     }
 
@@ -431,7 +439,7 @@ impl QueryMemoryModule {
         self.session
             .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
-        let mut retrieval = QueryMemoryRetrieval::default();
+        let mut retrieval = self.pending_retrieval.clone();
         let mut memo_written = false;
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
@@ -461,6 +469,7 @@ impl QueryMemoryModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
+                    self.pending_retrieval = retrieval;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
@@ -475,6 +484,7 @@ impl QueryMemoryModule {
                         SESSION_COMPACTION_PROMPT,
                     )
                     .await;
+                    self.pending_retrieval = retrieval;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
@@ -492,6 +502,7 @@ impl QueryMemoryModule {
                             SESSION_COMPACTION_PROMPT,
                         )
                         .await;
+                        self.pending_retrieval = retrieval;
                         return Ok(());
                     }
                     let mut tool_results: Vec<ToolResult> = Vec::new();
@@ -563,11 +574,16 @@ impl QueryMemoryModule {
                     )
                     .await;
                     if wrote_retrieval_memo {
+                        self.pending_retrieval = QueryMemoryRetrieval::default();
                         return Ok(());
                     }
+                    self.pending_retrieval = retrieval.clone();
+                    self.session
+                        .push_ephemeral_user(TOOL_RESULT_CONTINUATION_PROMPT);
                 }
             }
         }
+        self.pending_retrieval = retrieval;
         Ok(())
     }
 
