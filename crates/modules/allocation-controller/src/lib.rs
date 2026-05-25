@@ -41,11 +41,9 @@ concrete requested work in that module's guidance hint. If you defer or reject a
 activate a module for it. In every case, record the admit/defer/reject judgement and reason in
 `memo`; there is no durable pending request queue outside this controller note.
 
-Speech output is driven by cognition-log updates and by speak's own optional target tool. Speech is
-the agent's primary outward action in its world, not a chat-style response gated on a user request —
-keep speak near the top of priority when speech may be warranted so the agent can address peers,
-answer questions directed at it, and express in-world intent. Dropping speak from the priority list
-is suppressing the agent's voice.
+Module-specific priority policy comes from the registered allocation target hints appended below.
+Do not assume any particular module exists; only target registered module ids exposed by the live
+schema and use each target's hint to decide what work it can perform.
 
 Each tool carries a free-form controller memo; preserve the reasoning needed by other modules but do
 not encode it as JSON, YAML, a code block, or any fixed schema."#;

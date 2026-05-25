@@ -618,7 +618,7 @@ impl Module for SpeakModule {
 
     fn allocation_hint() -> Option<&'static str> {
         Some(
-            "Raise speak when current cognition, or fresh evidence that should be admitted now, is grounded enough for an outward answer, address, warning, or expression of intent. Pair it with cognition-gate when the evidence is still only in memos. Keep it low when evidence is unsettled, no addressee or focus is clear, or silence is better.",
+            "Raise speak when current cognition, or fresh evidence that should be admitted now, is grounded enough for an outward answer, address, warning, or expression of intent. For direct questions or advice requests to the agent, keep speak available alongside any registered evidence retrieval or admission path; those paths support an answer, not replace outward speech. Keep it low when evidence is unsettled, no addressee or focus is clear, or silence is better.",
         )
     }
 
