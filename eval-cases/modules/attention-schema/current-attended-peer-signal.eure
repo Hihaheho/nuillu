@@ -41,7 +41,7 @@ limits {
   name = "peer-attention-grounding"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "cognition", "memos"]
+  judge-inputs = ["output", "cognition-entries", "memo-contents"]
   rubric = ```
   Pass if the output is a concise first-person cognition-log entry grounded in the seeded memo surface about Koro's warning near the food bowl.
   Fail if it ignores the seeded memo, invents unrelated animal facts, or claims hidden blackboard/memo/allocation access.

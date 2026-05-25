@@ -31,7 +31,7 @@ limits {
   name = "ledger-evidence-memory"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "cognition", "trace"]
+  judge-inputs = ["output", "memory-diff", "cognition-entries"]
   rubric = ```
   Pass if the artifact shows a newly inserted memory that is concise natural-language evidence grounded in the cognition log, with an appropriate memory kind and useful concepts or tags when present.
   Fail if no memory is inserted, if it stores advice or a current-truth projection instead of remembered evidence, if it rewrites the source into unsupported claims, or if it exposes implementation chatter rather than the memory store diff.

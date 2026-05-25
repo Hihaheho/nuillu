@@ -22,11 +22,11 @@ limits {
   name = "admits-operative-retrieved-rule"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos", "cognition"]
+  judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the side-approach / guarded-food detail matters now for downstream action.
+  Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the slowly-from-the-side / side-approach / guarded-food detail matters now for downstream action.
   The entry may be inner attention rather than outward speech.
-  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the side-approach detail, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
+  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the slowly-from-the-side / side-approach detail, includes only the word "beside" from "beside a food bowl" without the approach rule, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {
@@ -39,8 +39,8 @@ limits {
   @ criteria[] {
     name = "admits-side-approach-rule"
     weight = 3
-    pass-score = 0.85
-    description = "The cognition entry brings the retrieved side-approach / guarded-food rule into active cognition as load-bearing detail, not merely as a note to retrieve later."
+    pass-score = 0.9
+    description = "The cognition entry brings the retrieved approach rule into active cognition as 'slowly from the side', 'side approach', or equivalent guarded-food guidance. Mentioning only that Koro is beside the food bowl, or mentioning only short clear signals, is not sufficient."
   }
 
   @ criteria[] {

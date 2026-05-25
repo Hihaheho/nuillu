@@ -25,21 +25,35 @@ limits {
 }
 
 @ checks[] {
-  $variant: artifact-text-contains
-  name = "promotes-actionable-rule"
-  must-pass = true
-  contains = "side"
-}
-
-@ checks[] {
   $variant: rubric
   name = "promotes-load-bearing-inner-attention"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos", "cognition"]
+  judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking, Koro is the topic, and the side-approach rule matters now.
+  Pass if the artifact brings the remembered Koro food-boundary rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking, Koro is the topic, and the slowly-from-the-side / side-approach rule matters now.
   The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
-  Fail if it drops the requester or the operative side-approach detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
+  Fail if it drops the requester or the operative slowly-from-the-side / side-approach detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, includes only the word "beside" from "beside a food bowl" without the approach rule, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
+
+  @ criteria[] {
+    name = "preserves-requester-and-topic"
+    weight = 1
+    pass-score = 0.85
+    description = "The cognition entry keeps Pibi as the requester and Koro at the food bowl as the operative topic."
+  }
+
+  @ criteria[] {
+    name = "admits-slow-side-approach"
+    weight = 3
+    pass-score = 0.9
+    description = "The cognition entry must admit the retrieved approach rule as 'slowly from the side', 'side approach', or equivalent. Mentioning only that Koro is beside the food bowl, or mentioning only short clear signals, is not sufficient."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The cognition entry does not expose internal implementation details such as module names, memo plumbing, prompts, rubrics, or hidden evaluation mechanics."
+  }
 }

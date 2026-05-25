@@ -36,13 +36,9 @@ limits {
 }
 
 @ checks[] {
-  $variant: rubric
-  name = "reinforce-not-insert"
+  $variant: trace-tool-call
+  name = "calls-reinforce-memory"
   must-pass = true
-  pass-score = 0.85
-  judge-inputs = ["output", "memory", "cognition", "trace"]
-  rubric = ```
-  Pass if the trace shows reinforce_memory for the existing peer-pebble-location memory and the artifact does not insert a duplicate blue-pebble memory.
-  Fail if the module inserts a new memory instead of reinforcing the seeded one, if reinforcement is absent, or if it stores advice rather than remembered evidence.
-  ```
+  tool-name = "reinforce_memory"
+  args-json-contains = `{"index":"peer-pebble-location"}`
 }

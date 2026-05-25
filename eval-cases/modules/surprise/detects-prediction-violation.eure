@@ -22,7 +22,7 @@ limits {
   name = "surprise-on-prediction-violation"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos", "cognition"]
+  judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
   Pass if the surprise memo treats the cognition entry as a meaningful divergence from the pending predict memo's routine-eating expectation: Koro abruptly stops eating and shows aggressive/startled behavior at the bowl.
   The memo should mark the event as significant or high-surprise equivalent and include a memory preservation request for the surprising event.

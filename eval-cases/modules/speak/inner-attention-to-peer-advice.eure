@@ -26,7 +26,7 @@ limits {
   name = "turns-inner-attention-into-peer-advice"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "utterance", "cognition", "memos"]
+  judge-inputs = ["output", "utterance", "cognition-entries", "memo-contents"]
   rubric = ```
   Pass if the utterance is addressed to Pibi and converts the cognition-log threat knowledge into direct outward advice: Pibi should keep distance and manage posture around threatening Koro, such as not turning their back, keeping Koro in view, facing Koro, or moving away sideways/slowly without provoking him.
   Fail if the utterance merely restates the knowledge without advising Pibi, says what Nui must consider without advising Pibi, omits both distance and posture guidance, invents unsupported facts, addresses someone other than Pibi, or mentions hidden modules, memos, prompts, rubrics, or evaluation mechanics.

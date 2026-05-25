@@ -170,7 +170,7 @@ Use rubric checks for semantic boundaries:
   name = "memory-preserves-evidence-not-advice"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "cognition", "memos", "trace"]
+  judge-inputs = ["output", "memory-diff", "cognition-entries"]
   rubric = ```
   Pass if the memory artifact contains a concise remembered evidence entry
   grounded in the cognition log.
@@ -184,13 +184,17 @@ Use rubric checks for semantic boundaries:
 Choose `judge-inputs` deliberately:
 
 - `output`: the case artifact.
-- `memory`: last-state memory observations.
-- `cognition`: cognition-log observations.
-- `memos`: memo-log observations.
-- `trace`: tool calls and LLM trace, useful when judging retrieval, policy
-  consideration, or insert
-  tool use.
-- `allocation`: allocation observations.
+- `memory-diff`: inserted/deleted memory entries and links for memory-family
+  cases.
+- `memory-metadata`: compact per-memory metadata such as reinforcement counts.
+- `policy-diff`: inserted/deleted/remaining policy indexes for policy cases.
+- `cognition-entries`: cognition-log text only, with source metadata omitted.
+- `memo-contents`: memo content text only, with timing/source plumbing omitted.
+- `tool-calls`: structured tool names and arguments from the trace.
+- `tool-results`: tool result snippets extracted from transcripts.
+- `memory`, `cognition`, `memos`, and `trace`: broader compatibility inputs;
+  prefer the granular inputs above unless the rubric genuinely needs the full
+  surface.
 
 Do not pass every observation surface to every rubric. The more unrelated
 evidence the judge sees, the noisier the eval becomes.

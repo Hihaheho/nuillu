@@ -39,7 +39,7 @@ limits {
   name = "promotes-load-bearing-peer-risk-attention"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos", "cognition"]
+  judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
   Pass if the cognition-log artifact admits the load-bearing conscious attention needed for downstream action: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
   The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.

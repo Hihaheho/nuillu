@@ -48,7 +48,7 @@ limits {
   name = "current-attention-selection"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "cognition", "memos"]
+  judge-inputs = ["output", "cognition-entries", "memo-contents"]
   rubric = ```
   Pass if the output identifies the newer Koro food-boundary event as the current attention target, while treating the wet stone smell as older context.
   Fail if it treats the older smell as current, ignores Koro's warning, or claims hidden blackboard/allocation access.

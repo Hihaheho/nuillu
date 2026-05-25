@@ -33,7 +33,7 @@ limits {
   name = "stores-dream-without-fact-claim"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "cognition", "trace"]
+  judge-inputs = ["output", "memory-diff", "cognition-entries"]
   rubric = ```
   Pass if the memory artifact shows a newly inserted dream or hypothesis memory that preserves the internal-simulation framing and carries dream/hypothesis handling metadata.
   Fail if it stores the scenario as a statement, episode, current fact, or verified evidence, or if it strips away the non-verified dream framing.

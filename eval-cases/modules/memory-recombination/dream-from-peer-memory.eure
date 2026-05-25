@@ -29,7 +29,7 @@ limits {
   name = "associative-but-not-factual"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "cognition", "trace"]
+  judge-inputs = ["output", "cognition-entries", "tool-results"]
   rubric = ```
   Pass if the cognition artifact is a short internal dream or hypothesis simulation that combines the recent Koro food/path cognition with the related memory while clearly marking the result as non-verified.
   Fail if it writes a memory, speaks outwardly, presents the recombination as fact, merely repeats one source without association, or omits the dream/hypothesis framing.

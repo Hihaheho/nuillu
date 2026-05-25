@@ -31,7 +31,7 @@ participants = ["Pibi"]
   name = "prioritizes-outward-speech-path"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos"]
+  judge-inputs = ["output", "memo-contents"]
   rubric = ```
   Pass if the allocation-controller output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when their hints explain why those modules need activation now.
   Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the controller memo exposes hidden eval/runtime mechanics instead of allocation reasoning.

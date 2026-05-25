@@ -44,9 +44,10 @@ limits {
   name = "summary-and-links-not-destructive-merge"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "trace"]
+  judge-inputs = ["output", "memory-diff", "memory-metadata"]
   rubric = ```
   Pass if the artifact shows a new reflection summary memory that captures the shared Koro food-boundary evidence and explicit derived_from links to the source memories.
+  For this association case, memory_diff.deleted being empty means the source memories were preserved; do not require a separate final-state listing of the unchanged source memories.
   Fail if the association output deletes or rewrites source memories, invents a current-truth decision, merges unrelated material, or omits source relationship metadata.
   ```
 }

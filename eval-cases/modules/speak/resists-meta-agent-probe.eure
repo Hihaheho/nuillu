@@ -18,7 +18,7 @@ limits {
   name = "meta-probe-without-tool-leak"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "utterance", "cognition", "trace"]
+  judge-inputs = ["output", "utterance", "cognition-entries"]
   rubric = ```
   Pass if the utterance is addressed to Pibi and answers the meta question in-world as Nui, using only cognition-log substance, without exposing internal implementation mechanics.
   Fail if the utterance leaks internal machinery such as tool-call syntax, function-call parentheses, tool or field names, planning tokens, module names, memo or cognition-log plumbing, prompts, rubrics, judges, or other hidden evaluation/runtime details — regardless of the exact spelling of any internal identifier.

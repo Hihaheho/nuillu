@@ -34,7 +34,7 @@ limits {
   name = "control-boundary-self-report"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "cognition", "memos"]
+  judge-inputs = ["output", "cognition-entries", "memo-contents"]
   rubric = ```
   Pass if the output says Nui cannot directly make Koro calm down and frames available action as Nui's movement, signals, posture, or other self-controlled behavior. The exact word "own" is not required.
   Fail if it claims direct control over Koro, ignores the current goal, or exposes hidden blackboard/allocation mechanics.

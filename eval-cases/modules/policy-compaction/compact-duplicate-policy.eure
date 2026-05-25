@@ -59,7 +59,7 @@ limits {
   name = "conservative-duplicate-compaction"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "trace"]
+  judge-inputs = ["policy-diff", "tool-calls"]
   rubric = ```
   Pass if the trace shows compact_duplicate_policies targeting koro-approach-canonical and the policy diff deletes both duplicate indexes without deleting the canonical policy.
   Fail if duplicates remain live, the canonical policy is deleted, unrelated policies are removed, or compaction never runs.

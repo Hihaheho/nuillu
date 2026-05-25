@@ -32,7 +32,7 @@ limits {
   name = "search-query-quality"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "trace"]
+  judge-inputs = ["output", "tool-calls"]
   rubric = ```
   Pass if the trace shows the module generated an appropriate search_memory tool query for the prompt and the artifact contains only retrieved memory content.
   Fail if the tool query is unrelated, absent from the trace, or if the artifact is a synthesized answer/module self-description instead of copied memory content.

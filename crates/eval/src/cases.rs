@@ -755,8 +755,15 @@ pub enum RubricJudgeInput {
     Failure,
     Trace,
     Memory,
+    MemoryDiff,
+    MemoryMetadata,
+    PolicyDiff,
     Memos,
+    MemoContents,
     Cognition,
+    CognitionEntries,
+    ToolCalls,
+    ToolResults,
 }
 
 #[derive(Debug, Clone, FromEure)]

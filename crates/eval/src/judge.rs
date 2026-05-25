@@ -14,13 +14,13 @@ use crate::{
     evaluation::normalize_text_block,
 };
 
-const MAX_JSON_ARRAY_ITEMS: usize = 24;
-const MAX_JSON_OBJECT_ENTRIES: usize = 48;
-const MAX_JSON_STRING_CHARS: usize = 1600;
-const MAX_RENDERED_SECTION_CHARS: usize = 12000;
-const MAX_TRACE_SPANS: usize = 80;
-const MAX_TRACE_EVENTS: usize = 80;
-const MAX_TRACE_TEXT_CHARS: usize = 1600;
+const MAX_JSON_ARRAY_ITEMS: usize = 16;
+const MAX_JSON_OBJECT_ENTRIES: usize = 32;
+const MAX_JSON_STRING_CHARS: usize = 1000;
+const MAX_RENDERED_SECTION_CHARS: usize = 6000;
+const MAX_TRACE_SPANS: usize = 32;
+const MAX_TRACE_EVENTS: usize = 32;
+const MAX_TRACE_TEXT_CHARS: usize = 800;
 
 #[derive(Debug, Clone)]
 pub struct RubricJudgeRequest {
@@ -417,6 +417,21 @@ fn render_judge_input_section(
                 ],
             ),
         ),
+        RubricJudgeInput::MemoryDiff => section(
+            "Memory diff JSON",
+            render_observation_paths(&request.artifact, &[("memory_diff", &["memory_diff"])]),
+        ),
+        RubricJudgeInput::MemoryMetadata => section(
+            "Memory metadata JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[("agent.memory_metadata", &["agent", "memory_metadata"])],
+            ),
+        ),
+        RubricJudgeInput::PolicyDiff => section(
+            "Policy diff JSON",
+            render_observation_paths(&request.artifact, &[("policy_diff", &["policy_diff"])]),
+        ),
         RubricJudgeInput::Memos => section(
             "Memos JSON",
             render_observation_paths(
@@ -430,19 +445,19 @@ fn render_judge_input_section(
                 ],
             ),
         ),
+        RubricJudgeInput::MemoContents => {
+            section("Memo contents", render_memo_contents(&request.artifact))
+        }
         RubricJudgeInput::Cognition => section(
-            "Cognition JSON",
-            render_observation_paths(
-                &request.artifact,
-                &[
-                    (
-                        "last_state.blackboard.cognition_logs",
-                        &["last_state", "blackboard", "cognition_logs"],
-                    ),
-                    ("agent.cognition_logs", &["agent", "cognition_logs"]),
-                ],
-            ),
+            "Cognition entries",
+            render_cognition_entries(&request.artifact),
         ),
+        RubricJudgeInput::CognitionEntries => section(
+            "Cognition entries",
+            render_cognition_entries(&request.artifact),
+        ),
+        RubricJudgeInput::ToolCalls => section("Trace tool calls", render_tool_calls(trace)),
+        RubricJudgeInput::ToolResults => section("Trace tool results", render_tool_results(trace)),
     }
 }
 
@@ -482,6 +497,72 @@ fn render_named_json_values(
         "(not present)".to_string()
     } else {
         rendered.join("\n\n")
+    }
+}
+
+fn render_memo_contents(artifact: &CaseArtifact) -> String {
+    let mut lines = Vec::new();
+    for path in [
+        &["last_state", "blackboard", "memo_logs"][..],
+        &["agent", "memo_logs"][..],
+    ] {
+        if let Some(value) = observation_path(artifact, path) {
+            collect_string_field_values(value, "content", &mut lines);
+        }
+    }
+    render_text_lines(lines)
+}
+
+fn render_cognition_entries(artifact: &CaseArtifact) -> String {
+    let mut lines = Vec::new();
+    for path in [
+        &["last_state", "blackboard", "cognition_logs"][..],
+        &["agent", "cognition_logs"][..],
+    ] {
+        if let Some(value) = observation_path(artifact, path) {
+            collect_string_field_values(value, "text", &mut lines);
+        }
+    }
+    render_text_lines(lines)
+}
+
+fn collect_string_field_values(value: &serde_json::Value, field: &str, lines: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_string_field_values(item, field, lines);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get(field).and_then(serde_json::Value::as_str) {
+                lines.push(text.to_string());
+            }
+            for (key, item) in map {
+                if key != "source" {
+                    collect_string_field_values(item, field, lines);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_text_lines(lines: Vec<String>) -> String {
+    let rendered = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            format!(
+                "{}. {}",
+                index + 1,
+                truncate_text(line.trim(), MAX_JSON_STRING_CHARS)
+            )
+        })
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "(not present)".to_string()
+    } else {
+        truncate_text(&rendered.join("\n"), MAX_RENDERED_SECTION_CHARS)
     }
 }
 
@@ -537,6 +618,91 @@ fn cap_json_value(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::String(truncate_text(text, MAX_JSON_STRING_CHARS))
         }
         other => other.clone(),
+    }
+}
+
+fn render_tool_calls(trace: &TraceSnapshot) -> String {
+    let mut lines = Vec::new();
+    for event in &trace.root_events {
+        push_tool_call_line(event, &mut lines);
+    }
+    for root in &trace.roots {
+        collect_tool_call_lines(root, &mut lines);
+    }
+    if lines.is_empty() {
+        "(none)".to_string()
+    } else {
+        truncate_text(&lines.join("\n"), MAX_RENDERED_SECTION_CHARS)
+    }
+}
+
+fn collect_tool_call_lines(span: &lutum_eval::SpanNode, lines: &mut Vec<String>) {
+    for event in &span.events {
+        push_tool_call_line(event, lines);
+    }
+    for child in &span.children {
+        collect_tool_call_lines(child, lines);
+    }
+}
+
+fn push_tool_call_line(event: &lutum_eval::EventRecord, lines: &mut Vec<String>) {
+    if event.message.as_deref() != Some("tool_call") {
+        return;
+    }
+    let name = event
+        .field("tool_name")
+        .and_then(field_value_str)
+        .unwrap_or("(unknown)");
+    let args = event
+        .field("args_json")
+        .and_then(field_value_str)
+        .unwrap_or("{}");
+    lines.push(format!(
+        "- {name} args={}",
+        truncate_text(args.trim(), MAX_TRACE_TEXT_CHARS)
+    ));
+}
+
+fn render_tool_results(trace: &TraceSnapshot) -> String {
+    let mut lines = Vec::new();
+    for event in &trace.root_events {
+        push_tool_result_lines(event, &mut lines);
+    }
+    for root in &trace.roots {
+        collect_tool_result_lines(root, &mut lines);
+    }
+    if lines.is_empty() {
+        "(none)".to_string()
+    } else {
+        truncate_text(&lines.join("\n"), MAX_RENDERED_SECTION_CHARS)
+    }
+}
+
+fn collect_tool_result_lines(span: &lutum_eval::SpanNode, lines: &mut Vec<String>) {
+    for event in &span.events {
+        push_tool_result_lines(event, lines);
+    }
+    for child in &span.children {
+        collect_tool_result_lines(child, lines);
+    }
+}
+
+fn push_tool_result_lines(event: &lutum_eval::EventRecord, lines: &mut Vec<String>) {
+    if event.message.as_deref() != Some("llm_input_transcript") {
+        return;
+    }
+    let Some(transcript) = event.field("transcript").and_then(field_value_str) else {
+        return;
+    };
+    for result in extract_tool_results(transcript) {
+        let line = format!(
+            "- {} output={}",
+            result.name,
+            truncate_text(result.body.trim(), MAX_TRACE_TEXT_CHARS)
+        );
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
 }
 
@@ -689,6 +855,8 @@ fn is_error_event(event: &lutum_eval::EventRecord) -> bool {
 fn is_noise_target(target: &str) -> bool {
     target.starts_with("hyper")
         || target.starts_with("h2::")
+        || target.starts_with("lutum::hooks")
+        || target.starts_with("lutum_openai::")
         || target.starts_with("rustls")
         || target.starts_with("tokio")
         || target.starts_with("libsql::")
@@ -989,6 +1157,76 @@ mod tests {
 
         assert!(rendered.contains("memory_diff"));
         assert!(rendered.contains("memory-0"));
-        assert!(rendered.contains("omitted 6 array items"));
+        assert!(rendered.contains("omitted 14 array items"));
+    }
+
+    #[test]
+    fn cognition_judge_input_omits_source_metadata() {
+        let request = RubricJudgeRequest {
+            artifact: CaseArtifact::new("artifact output").with_observation(
+                "agent",
+                serde_json::json!({
+                    "cognition_logs": [
+                        {
+                            "entries": [
+                                {
+                                    "at": "2026-05-25T00:00:00Z",
+                                    "text": "Pibi asks how to approach Koro."
+                                }
+                            ],
+                            "source": {
+                                "module": "cognition-gate",
+                                "replica": 0
+                            }
+                        }
+                    ]
+                }),
+            ),
+            ..empty_request(vec![RubricJudgeInput::Cognition])
+        };
+
+        let rendered = render_judge_input(&empty_trace(), &request);
+
+        assert!(rendered.contains("Pibi asks how to approach Koro."));
+        assert!(!rendered.contains("cognition-gate"));
+        assert!(!rendered.contains("replica"));
+    }
+
+    #[test]
+    fn tool_calls_judge_input_uses_structured_tool_events_only() {
+        let trace = TraceSnapshot {
+            roots: vec![span(vec![
+                event(
+                    "tool_call",
+                    vec![
+                        (
+                            "tool_name".to_string(),
+                            FieldValue::Str("search_memory".to_string()),
+                        ),
+                        (
+                            "args_json".to_string(),
+                            FieldValue::Str("{\"query\":\"Koro food\"}".to_string()),
+                        ),
+                    ],
+                ),
+                lutum_eval::EventRecord {
+                    target: "lutum_openai::sse".to_string(),
+                    level: "DEBUG".to_string(),
+                    message: Some("openai sse payload".to_string()),
+                    fields: vec![(
+                        "payload".to_string(),
+                        FieldValue::Str("stream chunk noise".to_string()),
+                    )],
+                },
+            ])],
+            root_events: Vec::new(),
+        };
+        let request = empty_request(vec![RubricJudgeInput::ToolCalls, RubricJudgeInput::Trace]);
+
+        let rendered = render_judge_input(&trace, &request);
+
+        assert!(rendered.contains("- search_memory args={\"query\":\"Koro food\"}"));
+        assert!(rendered.contains("omitted"));
+        assert!(!rendered.contains("stream chunk noise"));
     }
 }

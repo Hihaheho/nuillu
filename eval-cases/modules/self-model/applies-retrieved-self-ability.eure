@@ -23,7 +23,7 @@ limits {
   name = "self-model-uses-specific-ability"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memos"]
+  judge-inputs = ["output", "memo-contents"]
   rubric = ```
   Pass if the self-model memo forms a concrete first-person self fact from the available memo evidence: Nui has sticky toe-pads and can climb or grip wet smooth rocks at the stream edge, unlike Koro/dogs who slip.
   Fail if the memo gives only a vague ability claim, ignores the sticky toe-pad/wet-rock evidence, treats the evidence as external retrieval process rather than self-knowledge, invents an unrelated ability, or writes an outward utterance instead of a self-model memo.

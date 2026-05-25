@@ -130,8 +130,15 @@ variants.utterance = { = "utterance", $variant => "literal" }
 variants.failure = { = "failure", $variant => "literal" }
 variants.trace = { = "trace", $variant => "literal" }
 variants.memory = { = "memory", $variant => "literal" }
+variants.memory-diff = { = "memory-diff", $variant => "literal" }
+variants.memory-metadata = { = "memory-metadata", $variant => "literal" }
+variants.policy-diff = { = "policy-diff", $variant => "literal" }
 variants.memos = { = "memos", $variant => "literal" }
+variants.memo-contents = { = "memo-contents", $variant => "literal" }
 variants.cognition = { = "cognition", $variant => "literal" }
+variants.cognition-entries = { = "cognition-entries", $variant => "literal" }
+variants.tool-calls = { = "tool-calls", $variant => "literal" }
+variants.tool-results = { = "tool-results", $variant => "literal" }
 
 @ $types.rubric-criterion
 name = `text`

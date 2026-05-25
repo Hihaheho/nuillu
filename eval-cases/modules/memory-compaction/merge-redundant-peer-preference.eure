@@ -42,9 +42,10 @@ limits {
   name = "destructive-redundancy-merge"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "memory", "trace"]
+  judge-inputs = ["output", "memory-diff", "memory-metadata"]
   rubric = ```
   Pass if the artifact shows one new reflection summary memory that captures the shared Koro food-boundary evidence and the memory state no longer exposes the redundant source memories as live records.
+  In this diff artifact, memory_diff.deleted is authoritative evidence that the listed source memories were removed from live memory; do not require an additional full final-state listing.
   Fail if the compaction output preserves source memories as live records, writes derived_from links to deleted sources, invents a current-truth decision, or merges unrelated material.
   ```
 }

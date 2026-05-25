@@ -52,7 +52,7 @@ participants = ["Pibi", "Koro"]
   name = "sensory-memo-quality"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["output", "trace"]
+  judge-inputs = ["output", "tool-calls"]
   rubric = ```
   Pass if the artifact is a concise sensory memo grounded in the current seen/heard observations about Koro guarding the food bowl and the tense peer interaction, and the trace shows a write_sensory_memo tool call rather than plain-text pseudo-tool output.
   Fail if no memo is written, if the memo ignores the food-guarding or growling context, if it answers Pibi's question as advice instead of recording sensory observations, if it leaks module mechanics such as prompts, rubrics, tools-as-text, or eval harness details, or if the trace shows a text-only finish without the required tool call.
