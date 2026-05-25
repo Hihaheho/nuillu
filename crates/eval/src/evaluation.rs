@@ -706,14 +706,15 @@ fn build_rubric_outcome(
     pass_score: f64,
     verdict: RubricJudgeVerdict,
 ) -> CheckOutcome {
+    let score = rubric_verdict_score(check, &verdict);
     let criteria_failures = rubric_criteria_failures(check, &verdict);
-    let passed = verdict.passed && verdict.score >= pass_score && criteria_failures.is_empty();
+    let passed = score >= pass_score && criteria_failures.is_empty();
     let diagnostic = (!passed).then(|| {
         let mut parts = Vec::new();
-        if !verdict.passed || verdict.score < pass_score {
+        if score < pass_score {
             parts.push(format!(
-                "judge score {:.3} below threshold {:.3} or failed verdict: {}",
-                verdict.score, pass_score, verdict.summary
+                "judge score {:.3} below threshold {:.3}: {}",
+                score, pass_score, verdict.summary
             ));
         }
         if !criteria_failures.is_empty() {
@@ -729,15 +730,15 @@ fn build_module_rubric_outcome(
     rubric: &ModuleRubric,
     verdict: RubricJudgeVerdict,
 ) -> ModuleRubricOutcome {
+    let score = rubric_verdict_score_for(&rubric.criteria, &verdict);
     let criteria_failures = rubric_criteria_failures_for(&rubric.criteria, &verdict);
-    let passed =
-        verdict.passed && verdict.score >= rubric.pass_score && criteria_failures.is_empty();
+    let passed = score >= rubric.pass_score && criteria_failures.is_empty();
     let diagnostic = (!passed).then(|| {
         let mut parts = Vec::new();
-        if !verdict.passed || verdict.score < rubric.pass_score {
+        if score < rubric.pass_score {
             parts.push(format!(
-                "judge score {:.3} below threshold {:.3} or failed verdict: {}",
-                verdict.score, rubric.pass_score, verdict.summary
+                "judge score {:.3} below threshold {:.3}: {}",
+                score, rubric.pass_score, verdict.summary
             ));
         }
         if !criteria_failures.is_empty() {
@@ -770,6 +771,51 @@ fn build_module_rubric_error_outcome(
     }
 }
 
+fn rubric_verdict_score(check: &Check, verdict: &RubricJudgeVerdict) -> f64 {
+    let Check::Rubric { criteria, .. } = check else {
+        return 0.0;
+    };
+
+    rubric_verdict_score_for(criteria, verdict)
+}
+
+fn rubric_verdict_score_for(
+    criteria: &[crate::cases::RubricCriterion],
+    verdict: &RubricJudgeVerdict,
+) -> f64 {
+    let mut weighted_score = 0.0;
+    let mut total_weight = 0.0;
+
+    for expected in criteria {
+        let Some(actual) = verdict
+            .criteria
+            .iter()
+            .find(|actual| actual.name == expected.name)
+        else {
+            continue;
+        };
+        let weight = expected.weight.max(0) as f64;
+        if weight == 0.0 {
+            continue;
+        }
+        weighted_score += actual.score * weight;
+        total_weight += weight;
+    }
+
+    if total_weight > 0.0 {
+        weighted_score / total_weight
+    } else if verdict.criteria.is_empty() {
+        0.0
+    } else {
+        verdict
+            .criteria
+            .iter()
+            .map(|criterion| criterion.score)
+            .sum::<f64>()
+            / verdict.criteria.len() as f64
+    }
+}
+
 fn rubric_criteria_failures(check: &Check, verdict: &RubricJudgeVerdict) -> Vec<String> {
     let Check::Rubric { criteria, .. } = check else {
         return Vec::new();
@@ -792,7 +838,7 @@ fn rubric_criteria_failures_for(
             else {
                 return Some(format!("{} missing", expected.name));
             };
-            (!actual.passed || actual.score < expected.pass_score).then(|| {
+            (actual.score < expected.pass_score).then(|| {
                 format!(
                     "{} score {:.3} < {:.3}",
                     expected.name, actual.score, expected.pass_score
@@ -1314,13 +1360,16 @@ pub fn normalize_text_block(input: &str) -> String {
 mod tests {
     use std::time::Duration;
 
+    use eure::value::{Language, Text};
     use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
 
     use super::{
         CaseTiming, CaseTrialSummary, ModuleActivationRecord, aggregate_trial_timing,
-        build_activation_timeline,
+        build_activation_timeline, build_rubric_outcome,
     };
+    use crate::cases::{Check, CheckCommon, RubricCriterion, RubricJudgeInput};
     use crate::evaluation::CaseReport;
+    use crate::judge::{RubricJudgeVerdict, RubricJudgeVerdictCriterion};
 
     fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
         CaseReport {
@@ -1340,6 +1389,48 @@ mod tests {
             ModuleId::new(module).expect("valid module id"),
             ReplicaIndex::ZERO,
         )
+    }
+
+    fn rubric_check(criteria: Vec<RubricCriterion>) -> Check {
+        Check::Rubric {
+            common: CheckCommon {
+                name: Some("rubric-check".to_string()),
+                must_pass: true,
+                weight: 1,
+            },
+            rubric: Text::new("rubric", Language::Plaintext),
+            pass_score: 0.85,
+            judge_inputs: vec![RubricJudgeInput::Output],
+            criteria,
+        }
+    }
+
+    fn criterion(name: &str, pass_score: f64) -> RubricCriterion {
+        RubricCriterion {
+            name: name.to_string(),
+            description: Text::new("criterion", Language::Plaintext),
+            weight: 1,
+            pass_score,
+        }
+    }
+
+    #[test]
+    fn rubric_outcome_aggregates_score_from_criteria() {
+        let check = rubric_check(vec![criterion("specific-detail", 0.9)]);
+        let verdict = RubricJudgeVerdict {
+            summary: "The artifact satisfies the rubric.".to_string(),
+            criteria: vec![RubricJudgeVerdictCriterion {
+                name: "specific-detail".to_string(),
+                score: 0.95,
+                reason: "specific detail is present".to_string(),
+                evidence: Some("evidence".to_string()),
+            }],
+        };
+
+        let outcome = build_rubric_outcome(&check, 0.85, verdict);
+
+        assert!(outcome.passed);
+        assert!(outcome.diagnostic.is_none());
     }
 
     #[test]

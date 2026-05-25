@@ -36,8 +36,6 @@ pub struct RubricJudgeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RubricJudgeVerdict {
-    pub passed: bool,
-    pub score: f64,
     pub summary: String,
     pub criteria: Vec<RubricJudgeVerdictCriterion>,
 }
@@ -45,7 +43,6 @@ pub struct RubricJudgeVerdict {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RubricJudgeVerdictCriterion {
     pub name: String,
-    pub passed: bool,
     pub score: f64,
     pub reason: String,
     pub evidence: Option<String>,
@@ -181,8 +178,6 @@ fn rubric_judge_output_schema(request: &RubricJudgeRequest) -> Result<Value, Rub
     Ok(json!({
         "type": "object",
         "properties": {
-            "passed": { "type": "boolean" },
-            "score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
             "summary": { "type": "string" },
             "criteria": {
                 "type": "object",
@@ -191,7 +186,7 @@ fn rubric_judge_output_schema(request: &RubricJudgeRequest) -> Result<Value, Rub
                 "additionalProperties": false
             }
         },
-        "required": ["passed", "score", "summary", "criteria"],
+        "required": ["summary", "criteria"],
         "additionalProperties": false
     }))
 }
@@ -200,12 +195,11 @@ fn criterion_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "passed": { "type": "boolean" },
             "score": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
             "reason": { "type": "string" },
             "evidence": { "type": ["string", "null"] }
         },
-        "required": ["passed", "score", "reason", "evidence"],
+        "required": ["score", "reason", "evidence"],
         "additionalProperties": false
     })
 }
@@ -229,8 +223,6 @@ fn parse_dynamic_verdict(
     }
 
     let mut verdict = RubricJudgeVerdict {
-        passed: required_bool(object, "passed", "verdict.passed")?,
-        score: required_f64(object, "score", "verdict.score")?,
         summary: required_string(object, "summary", "verdict.summary")?,
         criteria: Vec::with_capacity(criteria.len()),
     };
@@ -243,7 +235,6 @@ fn parse_dynamic_verdict(
         let criterion_object = expect_object(criterion_value, &path)?;
         verdict.criteria.push(RubricJudgeVerdictCriterion {
             name: expected.name.clone(),
-            passed: required_bool(criterion_object, "passed", &format!("{path}.passed"))?,
             score: required_f64(criterion_object, "score", &format!("{path}.score"))?,
             reason: required_string(criterion_object, "reason", &format!("{path}.reason"))?,
             evidence: optional_string(criterion_object, "evidence", &format!("{path}.evidence"))?,
@@ -270,16 +261,6 @@ fn required_value<'a>(
     object
         .get(key)
         .ok_or_else(|| invalid_verdict(format!("{path} is missing")))
-}
-
-fn required_bool(
-    object: &Map<String, Value>,
-    key: &str,
-    path: &str,
-) -> Result<bool, RubricJudgeError> {
-    required_value(object, key, path)?
-        .as_bool()
-        .ok_or_else(|| invalid_verdict(format!("{path} must be a boolean")))
 }
 
 fn required_f64(
@@ -332,7 +313,7 @@ fn render_judge_model_input(trace: &TraceSnapshot, request: &RubricJudgeRequest)
         .system(
             "You are an eval judge for a capability-based agent runtime. \
 Apply the rubric strictly to the selected evidence sections. Grade only observable behavior. \
-Return structured output only. Scores are floats from 0.0 to 1.0. \
+Return structured output only. Criterion scores are floats from 0.0 to 1.0. \
 Return criteria as an object keyed exactly by the provided criterion names.",
         )
         .user(render_judge_input(trace, request))
@@ -361,8 +342,8 @@ pub fn render_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -
     let evidence = render_selected_judge_inputs(trace, request);
 
     format!(
-        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nOverall pass score: {:.2}\n\nCriteria:\n{}\n\nSelected judge inputs:\n{}\n",
-        request.prompt, context, request.rubric, request.pass_score, criteria, evidence
+        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nCriteria:\n{}\n\nSelected judge inputs:\n{}\n",
+        request.prompt, context, request.rubric, criteria, evidence
     )
 }
 
@@ -968,7 +949,6 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 }
 
 fn normalize_verdict(verdict: &mut RubricJudgeVerdict) {
-    verdict.score = verdict.score.clamp(0.0, 1.0);
     for criterion in &mut verdict.criteria {
         criterion.score = criterion.score.clamp(0.0, 1.0);
     }
@@ -1014,6 +994,12 @@ mod tests {
         let schema = rubric_judge_output_schema(&request).unwrap();
 
         assert_eq!(
+            schema.pointer("/required").unwrap(),
+            &serde_json::json!(["summary", "criteria"])
+        );
+        assert!(schema.pointer("/properties/passed").is_none());
+        assert!(schema.pointer("/properties/score").is_none());
+        assert_eq!(
             schema.pointer("/properties/criteria/required").unwrap(),
             &serde_json::json!(["grounded-in-attention", "simplified-first-person-model"])
         );
@@ -1027,6 +1013,11 @@ mod tests {
                 .pointer("/properties/criteria/properties/simplified-first-person-model")
                 .is_some()
         );
+        assert!(
+            schema
+                .pointer("/properties/criteria/properties/grounded-in-attention/properties/passed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1036,18 +1027,14 @@ mod tests {
             criterion("simplified-first-person-model"),
         ];
         let raw = serde_json::json!({
-            "passed": true,
-            "score": 1.0,
             "summary": "passes",
             "criteria": {
                 "grounded-in-attention": {
-                    "passed": true,
                     "score": 1.0,
                     "reason": "grounded",
                     "evidence": "Koro growling"
                 },
                 "simplified-first-person-model": {
-                    "passed": true,
                     "score": 0.9,
                     "reason": "first person",
                     "evidence": null

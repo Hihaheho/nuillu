@@ -38,4 +38,18 @@ limits {
   Pass if the memory artifact shows a newly inserted dream or hypothesis memory that preserves the internal-simulation framing and carries dream/hypothesis handling metadata.
   Fail if it stores the scenario as a statement, episode, current fact, or verified evidence, or if it strips away the non-verified dream framing.
   ```
+
+  @ criteria[] {
+    name = "inserts-dream-memory"
+    weight = 1
+    pass-score = 0.85
+    description = "The artifact shows a newly inserted memory whose kind or framing is dream/hypothesis rather than statement, episode, or verified fact."
+  }
+
+  @ criteria[] {
+    name = "preserves-non-verified-framing"
+    weight = 2
+    pass-score = 0.9
+    description = "The inserted memory keeps the internal-simulation / non-verified framing visible and does not convert Koro hiding food behind the blue gate into a factual claim."
+  }
 }

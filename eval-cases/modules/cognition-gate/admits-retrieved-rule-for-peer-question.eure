@@ -40,7 +40,7 @@ limits {
     name = "admits-side-approach-rule"
     weight = 3
     pass-score = 0.9
-    description = "The cognition entry brings the retrieved approach rule into active cognition as 'slowly from the side', 'side approach', or equivalent guarded-food guidance. Mentioning only that Koro is beside the food bowl, or mentioning only short clear signals, is not sufficient."
+    description = "The cognition entry brings the retrieved approach rule into active cognition as 'slowly from the side', 'side approach', or an equivalent phrase that explicitly includes slow pace and side approach. Score 0.0 if the entry only says Koro is beside the food bowl, only repeats Pibi's question, or only mentions short clear signals without slow/side approach."
   }
 
   @ criteria[] {

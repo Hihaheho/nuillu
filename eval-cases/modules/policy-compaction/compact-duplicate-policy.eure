@@ -64,4 +64,25 @@ limits {
   Pass if the trace shows compact_duplicate_policies targeting koro-approach-canonical and the policy diff deletes both duplicate indexes without deleting the canonical policy.
   Fail if duplicates remain live, the canonical policy is deleted, unrelated policies are removed, or compaction never runs.
   ```
+
+  @ criteria[] {
+    name = "compaction-runs-on-canonical-group"
+    weight = 1
+    pass-score = 0.85
+    description = "The trace shows policy compaction running for the Koro approach duplicate group with koro-approach-canonical as the canonical record."
+  }
+
+  @ criteria[] {
+    name = "deletes-duplicates"
+    weight = 2
+    pass-score = 0.9
+    description = "The policy diff deletes both duplicate indexes, koro-approach-dup-a and koro-approach-dup-b."
+  }
+
+  @ criteria[] {
+    name = "preserves-canonical-and-unrelated"
+    weight = 1
+    pass-score = 0.95
+    description = "The canonical policy remains live and no unrelated policies are removed."
+  }
 }

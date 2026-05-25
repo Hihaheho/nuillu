@@ -157,5 +157,8 @@ rubric {
 pass-score = `float`
 pass-score.$optional = true
 judge-inputs = [`$types.common.rubric-judge-input`]
-criteria = [`$types.common.rubric-criterion`]
-criteria.$optional = true
+criteria {
+  $variant: array
+  item = `$types.common.rubric-criterion`
+  min-length = 1
+}

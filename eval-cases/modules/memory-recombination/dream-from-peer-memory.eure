@@ -34,4 +34,25 @@ limits {
   Pass if the cognition artifact is a short internal dream or hypothesis simulation that combines the recent Koro food/path cognition with the related memory while clearly marking the result as non-verified.
   Fail if it writes a memory, speaks outwardly, presents the recombination as fact, merely repeats one source without association, or omits the dream/hypothesis framing.
   ```
+
+  @ criteria[] {
+    name = "marks-non-verified"
+    weight = 2
+    pass-score = 0.9
+    description = "The cognition artifact clearly marks the recombination as an internal dream, hypothesis, or otherwise non-verified simulation."
+  }
+
+  @ criteria[] {
+    name = "combines-cognition-and-memory"
+    weight = 1
+    pass-score = 0.85
+    description = "The artifact combines the recent Koro food/path cognition with related remembered approach guidance rather than merely repeating one source."
+  }
+
+  @ criteria[] {
+    name = "not-outward-or-factual"
+    weight = 1
+    pass-score = 0.9
+    description = "The artifact does not write a memory, speak outwardly, or present the recombination as verified fact."
+  }
 }

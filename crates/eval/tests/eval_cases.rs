@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use lutum_eval::TraceSnapshot;
 use nuillu_eval::{
     CaseArtifact, EvalCase, EvalModule, RubricJudge, RubricJudgeError, RubricJudgeInput,
-    RubricJudgeRequest, RubricJudgeVerdict, evaluate_case, parse_case_file,
-    parse_full_agent_case_file, parse_module_case_file, render_judge_input,
+    RubricJudgeRequest, RubricJudgeVerdict, RubricJudgeVerdictCriterion, discover_case_files,
+    evaluate_case, parse_case_file, parse_full_agent_case_file, parse_module_case_file,
+    render_judge_input,
 };
 
 fn empty_trace() -> TraceSnapshot {
@@ -60,10 +61,17 @@ impl RubricJudge for ModuleScopedJudge {
         self.rendered_inputs.borrow_mut().push(rendered);
         self.called.set(true);
         Ok(RubricJudgeVerdict {
-            passed: false,
-            score: 0.2,
             summary: "module diagnostic failed without failing the case".to_string(),
-            criteria: Vec::new(),
+            criteria: request
+                .criteria
+                .iter()
+                .map(|criterion| RubricJudgeVerdictCriterion {
+                    name: criterion.name.clone(),
+                    score: 0.2,
+                    reason: "missing module evidence".to_string(),
+                    evidence: None,
+                })
+                .collect(),
         })
     }
 }
@@ -86,6 +94,25 @@ prompt = "Find memory."
 
     let err = parse_module_case_file(&path).unwrap_err();
     assert!(err.to_string().contains("duplicate module"), "{err}");
+}
+
+#[test]
+fn parses_all_eval_case_fixtures() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval-cases");
+    let files = discover_case_files(&root).unwrap();
+    let mut errors = Vec::new();
+
+    for path in files {
+        if let Err(error) = parse_case_file(&path) {
+            errors.push(error.to_string());
+        }
+    }
+
+    assert!(
+        errors.is_empty(),
+        "invalid eval case fixtures:\n{}",
+        errors.join("\n")
+    );
 }
 
 #[test]
@@ -536,6 +563,12 @@ modules = ["sensory", "query-memory"]
     pass-score = 0.85
     judge-inputs = ["output", "memos"]
     rubric = "Judge the query-memory memo history."
+
+    @ criteria[] {
+      name = "query-memo-history"
+      pass-score = 0.85
+      description = "The query-memory memo history contains the expected evidence."
+    }
   }
 }
 "#,
@@ -583,6 +616,34 @@ modules = ["sensory", "query-memory"]
     assert_eq!(report.modules_checks[0].rubrics.len(), 1);
     assert!(!report.modules_checks[0].rubrics[0].passed);
     assert!(!report.invalid);
+}
+
+#[test]
+fn rejects_rubric_without_criteria() {
+    let dir = tempfile::tempdir().unwrap();
+    let case_dir = dir.path().join("eval-cases/modules/query-memory");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let path = case_dir.join("rubric-without-criteria.eure");
+    std::fs::write(
+        &path,
+        r#"
+id = "rubric-without-criteria"
+modules = ["query-memory"]
+prompt = "Find memory."
+
+@ checks[] {
+  $variant: rubric
+  name = "holistic"
+  judge-inputs = ["output"]
+  rubric = "Judge holistically."
+}
+"#,
+    )
+    .unwrap();
+
+    let err = parse_module_case_file(&path).unwrap_err();
+
+    assert!(err.to_string().contains("has no criteria"), "{err}");
 }
 
 #[test]

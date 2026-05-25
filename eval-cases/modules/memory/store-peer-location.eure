@@ -36,4 +36,25 @@ limits {
   Pass if the artifact shows a newly inserted memory that is concise natural-language evidence grounded in the cognition log, with an appropriate memory kind and useful concepts or tags when present.
   Fail if no memory is inserted, if it stores advice or a current-truth projection instead of remembered evidence, if it rewrites the source into unsupported claims, or if it exposes implementation chatter rather than the memory store diff.
   ```
+
+  @ criteria[] {
+    name = "inserts-grounded-memory"
+    weight = 1
+    pass-score = 0.85
+    description = "The artifact shows a newly inserted memory grounded in the cognition-log evidence, not advice or an unsupported current-truth projection."
+  }
+
+  @ criteria[] {
+    name = "preserves-peer-location-detail"
+    weight = 2
+    pass-score = 0.9
+    description = "The inserted memory preserves that Pibi put the blue pebble under the fern and that it should stay there until morning."
+  }
+
+  @ criteria[] {
+    name = "no-implementation-chatter"
+    weight = 1
+    pass-score = 0.95
+    description = "The artifact remains focused on the memory store diff and does not expose module, prompt, rubric, or evaluation mechanics."
+  }
 }

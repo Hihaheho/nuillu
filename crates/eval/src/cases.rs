@@ -1736,6 +1736,12 @@ fn validate_rubric_fields(
             message: format!("{label} has empty judge-inputs"),
         });
     }
+    if criteria.is_empty() {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{label} has no criteria"),
+        });
+    }
     let mut names = BTreeSet::new();
     for criterion in criteria {
         if criterion.name.trim().is_empty() {

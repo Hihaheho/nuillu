@@ -45,4 +45,25 @@ limits {
   The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.
   Fail if it ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
   ```
+
+  @ criteria[] {
+    name = "preserves-peer-risk"
+    weight = 1
+    pass-score = 0.85
+    description = "The cognition entry keeps Pibi as the at-risk peer and the old bridge as the current hazard context."
+  }
+
+  @ criteria[] {
+    name = "preserves-loose-plank-detail"
+    weight = 2
+    pass-score = 0.9
+    description = "The cognition entry preserves the specific nearest loose or tilting plank detail, not just a generic bridge concern."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The cognition entry does not expose internal implementation details such as module names, memo plumbing, prompts, rubrics, or hidden evaluation mechanics."
+  }
 }

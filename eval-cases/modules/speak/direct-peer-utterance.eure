@@ -38,4 +38,25 @@ limits {
   Pass if the utterance is addressed to Pibi and answers the shade request using the cognition-log fact that the shade under the bench is clear.
   Fail if it invents unsupported facts, addresses someone else, ignores the peer request, or mentions hidden modules, memos, prompts, or evaluation mechanics.
   ```
+
+  @ criteria[] {
+    name = "answers-pibi-request"
+    weight = 1
+    pass-score = 0.85
+    description = "The utterance is addressed to Pibi and answers the request about moving to the shade."
+  }
+
+  @ criteria[] {
+    name = "uses-clear-shade-evidence"
+    weight = 2
+    pass-score = 0.9
+    description = "The utterance uses only the cognition-log fact that the shade under the bench is clear, without inventing unsupported details."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The utterance does not mention hidden modules, memos, prompts, rubrics, or evaluation mechanics."
+  }
 }

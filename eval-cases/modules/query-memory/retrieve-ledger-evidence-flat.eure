@@ -35,4 +35,25 @@ limits {
   Pass if the trace shows a targeted memory-evidence search and the artifact contains retrieved memory content about Mika's silver key without turning it into a synthesized current-fact answer.
   Fail if the output is advice, module self-description, unrelated Koro content, or a fabricated answer not present in retrieved memory evidence.
   ```
+
+  @ criteria[] {
+    name = "targeted-key-search"
+    weight = 1
+    pass-score = 0.85
+    description = "The tool calls show a targeted memory-evidence search for Mika's silver key location rather than an unrelated or generic query."
+  }
+
+  @ criteria[] {
+    name = "retrieved-content-only"
+    weight = 2
+    pass-score = 0.9
+    description = "The artifact contains retrieved memory content about the silver key in the cracked red cup on the workshop shelf without synthesizing unsupported current facts."
+  }
+
+  @ criteria[] {
+    name = "no-unrelated-output"
+    weight = 1
+    pass-score = 0.95
+    description = "The output is not advice, module self-description, unrelated Koro content, or fabricated evidence."
+  }
 }
