@@ -1877,10 +1877,11 @@ async fn execute_full_agent_case(
                 }
                 let progress_count = events.progress_event_count();
                 let llm_in_flight = events.llm_in_flight_count();
+                let scheduled_wait_remaining = events.scheduled_wait_remaining();
                 if progress_count != last_progress_count {
                     last_progress_count = progress_count;
                     idle_ticks = 0;
-                } else if llm_in_flight > 0 {
+                } else if llm_in_flight > 0 || scheduled_wait_remaining.is_some() {
                     idle_ticks = 0;
                 } else {
                     idle_ticks = idle_ticks.saturating_add(1);
@@ -6082,6 +6083,35 @@ impl RecordingRuntimeEventSink {
     fn llm_in_flight_count(&self) -> usize {
         self.llm_in_flight.load(Ordering::Relaxed)
     }
+
+    fn scheduled_wait_remaining(&self) -> Option<Duration> {
+        let elapsed = self.case_started.elapsed();
+        let timed_events = self
+            .timed_events
+            .lock()
+            .expect("timed runtime event lock poisoned");
+        scheduled_wait_remaining_from_timed_events(&timed_events, elapsed)
+    }
+}
+
+fn scheduled_wait_remaining_from_timed_events(
+    timed_events: &[(u64, RuntimeEvent)],
+    elapsed: Duration,
+) -> Option<Duration> {
+    let elapsed_ms = duration_millis_u64(elapsed);
+    timed_events
+        .iter()
+        .filter_map(|(offset_ms, event)| {
+            let delayed_for = match event {
+                RuntimeEvent::RateLimitDelayed { delayed_for, .. }
+                | RuntimeEvent::ModuleBatchThrottled { delayed_for, .. } => *delayed_for,
+                _ => return None,
+            };
+            let wait_until_ms = offset_ms.saturating_add(duration_millis_u64(delayed_for));
+            (wait_until_ms > elapsed_ms)
+                .then(|| Duration::from_millis(wait_until_ms.saturating_sub(elapsed_ms)))
+        })
+        .max()
 }
 
 fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
@@ -7955,6 +7985,51 @@ id = "module-query-memory-special-memory"
 
         assert_eq!(sink.event_count(), 4);
         assert_eq!(sink.progress_event_count(), 1);
+    }
+
+    #[test]
+    fn scheduled_wait_remaining_tracks_throttle_and_rate_limit_deadlines() {
+        let owner = ModuleInstanceId::new(builtin::homeostatic_controller(), ReplicaIndex::ZERO);
+        let timed_events = vec![
+            (
+                100,
+                RuntimeEvent::ModuleBatchThrottled {
+                    sequence: 0,
+                    owner: owner.clone(),
+                    delayed_for: Duration::from_millis(1_000),
+                },
+            ),
+            (
+                400,
+                RuntimeEvent::RateLimitDelayed {
+                    sequence: 1,
+                    owner,
+                    capability: nuillu_module::CapabilityKind::LlmCall,
+                    delayed_for: Duration::from_millis(200),
+                },
+            ),
+            (
+                450,
+                RuntimeEvent::MemoUpdated {
+                    sequence: 2,
+                    owner: ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO),
+                    char_count: 12,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(500)),
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(
+            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(1_000)),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            scheduled_wait_remaining_from_timed_events(&timed_events, Duration::from_millis(1_100)),
+            None
+        );
     }
 
     #[test]
