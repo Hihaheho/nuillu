@@ -72,8 +72,9 @@ plumbing.
 Voice and form.
 Write entries in plain inner-experience prose, as if the agent itself were noticing,
 recalling, or realizing. Use the supplied time tags for past observations. If nothing is
-currently load-bearing, finish without calling tools. Silence is the default. When
-load-bearing facts should enter conscious cognition, call append_cognition exactly once."#;
+currently load-bearing, call skip_cognition exactly once. When load-bearing facts should enter
+conscious cognition, call append_cognition exactly once. Do not use final assistant text as an
+output channel."#;
 
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the cognition-gate module's persistent session history.
@@ -82,6 +83,14 @@ decisions need: memo-log facts, prior gate decisions, promoted events, rejected 
 allocation guidance, cognition-log context, and relevant memory metadata. Do not invent facts.
 Keep the summary concise, explicit, and faithful. Return plain text only."#;
 const ACTIVATION_INPUT: &str = "Decide what, if anything, should enter conscious cognition now.";
+const MAX_DECISION_ATTEMPTS: usize = 3;
+const RETRY_AFTER_REJECTED_APPEND: &str = "The previous append_cognition call was rejected because \
+it was empty or wrote internal work narration instead of conscious content. Retry now with exactly \
+one tool call: append_cognition only for the concrete world, body, peer, or remembered-rule fact \
+that changes the current situation; otherwise call skip_cognition.";
+const RETRY_AFTER_NO_VALID_DECISION: &str = "The previous turn did not make a valid cognition-gate \
+decision. Retry now with exactly one tool call: append_cognition for concrete load-bearing conscious \
+content, or skip_cognition if there is none.";
 
 fn format_cognition_gate_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -116,11 +125,40 @@ pub struct AppendCognitionArgs {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AppendCognitionOutput {
     pub appended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+}
+
+#[lutum::tool_input(name = "skip_cognition", output = SkipCognitionOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkipCognitionArgs {
+    /// Plain reason why no new load-bearing evidence should enter conscious cognition.
+    /// Do not use this for facts that should be appended.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SkipCognitionOutput {
+    pub skipped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 pub enum CognitionGateTools {
     AppendCognition(AppendCognitionArgs),
+    SkipCognition(SkipCognitionArgs),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DecisionStatus {
+    Applied,
+    Rejected,
+    Missing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppendDecision {
+    Appended,
+    Rejected,
 }
 
 pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
@@ -242,58 +280,240 @@ impl CognitionGateModule {
         lutum: &Lutum,
         compaction: &SessionCompactionRuntime,
     ) -> Result<()> {
-        let outcome = self
-            .session
-            .text_turn(lutum)
-            .tools::<CognitionGateTools>()
-            .available_tools([CognitionGateToolsSelector::AppendCognition])
-            .collect()
-            .await
-            .context("cognition-gate decision turn failed")?;
+        let mut correction: Option<&'static str> = None;
 
-        let input_tokens = match outcome {
-            TextStepOutcomeWithTools::Finished(result) => result.usage.input_tokens,
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => result.usage.input_tokens,
-            TextStepOutcomeWithTools::NeedsTools(round) => {
-                let input_tokens = round.usage.input_tokens;
-                let mut results: Vec<ToolResult> = Vec::new();
-                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
-                for call in round.tool_calls.iter().cloned() {
-                    let CognitionGateToolsCall::AppendCognition(call) = call;
-                    let output = self.append_cognition(call.input.clone()).await;
-                    results.push(
-                        call.complete(output)
-                            .context("complete append_cognition tool call")?,
-                    );
-                }
-                round
-                    .commit(&mut self.session, results)
-                    .context("commit cognition-gate tool round")?;
-                input_tokens
+        for _ in 0..MAX_DECISION_ATTEMPTS {
+            if let Some(correction) = correction.take() {
+                self.session.push_ephemeral_developer(correction);
             }
-        };
-        compact_session_if_needed(
-            &mut self.session,
-            input_tokens,
-            compaction,
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_COGNITION_GATE_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
-        Ok(())
+
+            let outcome = self
+                .session
+                .text_turn(lutum)
+                .tools::<CognitionGateTools>()
+                .available_tools([
+                    CognitionGateToolsSelector::AppendCognition,
+                    CognitionGateToolsSelector::SkipCognition,
+                ])
+                .max_output_tokens(768)
+                .collect()
+                .await
+                .context("cognition-gate decision turn failed")?;
+
+            let (decision, input_tokens) = match outcome {
+                TextStepOutcomeWithTools::Finished(result) => {
+                    let input_tokens = result.usage.input_tokens;
+                    let decision = if let Some(cognition_text) =
+                        salvage_cognition_from_plain_output(&result.assistant_text())
+                    {
+                        match self
+                            .append_cognition(AppendCognitionArgs { cognition_text })
+                            .await
+                            .1
+                        {
+                            AppendDecision::Appended => DecisionStatus::Applied,
+                            AppendDecision::Rejected => DecisionStatus::Rejected,
+                        }
+                    } else {
+                        DecisionStatus::Missing
+                    };
+                    (decision, input_tokens)
+                }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    (DecisionStatus::Missing, result.usage.input_tokens)
+                }
+                TextStepOutcomeWithTools::NeedsTools(round) => {
+                    let input_tokens = round.usage.input_tokens;
+                    let mut results: Vec<ToolResult> = Vec::new();
+                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                    let mut decision = DecisionStatus::Missing;
+                    for call in round.tool_calls.iter().cloned() {
+                        match call {
+                            CognitionGateToolsCall::AppendCognition(call) => {
+                                let (output, append_decision) =
+                                    if decision == DecisionStatus::Applied {
+                                        (
+                                            rejected_append_output(
+                                                "another cognition decision was already applied",
+                                            ),
+                                            AppendDecision::Rejected,
+                                        )
+                                    } else {
+                                        self.append_cognition(call.input.clone()).await
+                                    };
+                                match append_decision {
+                                    AppendDecision::Appended => decision = DecisionStatus::Applied,
+                                    AppendDecision::Rejected
+                                        if decision == DecisionStatus::Missing =>
+                                    {
+                                        decision = DecisionStatus::Rejected;
+                                    }
+                                    AppendDecision::Rejected => {}
+                                }
+                                results.push(
+                                    call.complete(output)
+                                        .context("complete append_cognition tool call")?,
+                                );
+                            }
+                            CognitionGateToolsCall::SkipCognition(call) => {
+                                let skipped = decision != DecisionStatus::Applied;
+                                if skipped {
+                                    decision = DecisionStatus::Applied;
+                                }
+                                results.push(
+                                    call.complete(SkipCognitionOutput { skipped })
+                                        .context("complete skip_cognition tool call")?,
+                                );
+                            }
+                        }
+                    }
+                    round
+                        .commit(&mut self.session, results)
+                        .context("commit cognition-gate tool round")?;
+                    (decision, input_tokens)
+                }
+            };
+
+            match decision {
+                DecisionStatus::Applied => {
+                    compact_session_if_needed(
+                        &mut self.session,
+                        input_tokens,
+                        compaction,
+                        self.session_compaction,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                        Self::id(),
+                        COMPACTED_COGNITION_GATE_SESSION_PREFIX,
+                        SESSION_COMPACTION_PROMPT,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                DecisionStatus::Rejected => correction = Some(RETRY_AFTER_REJECTED_APPEND),
+                DecisionStatus::Missing => correction = Some(RETRY_AFTER_NO_VALID_DECISION),
+            }
+        }
+
+        anyhow::bail!(
+            "cognition-gate failed to produce a valid append_cognition or skip_cognition decision"
+        );
     }
 
-    async fn append_cognition(&self, args: AppendCognitionArgs) -> AppendCognitionOutput {
+    async fn append_cognition(
+        &self,
+        args: AppendCognitionArgs,
+    ) -> (AppendCognitionOutput, AppendDecision) {
         let text = args.cognition_text.trim();
         if text.is_empty() {
-            return AppendCognitionOutput { appended: false };
+            return (
+                rejected_append_output("empty cognition text"),
+                AppendDecision::Rejected,
+            );
+        }
+        if let Err(err) = ensure_admissible_cognition_text(text) {
+            return (
+                rejected_append_output(err.to_string()),
+                AppendDecision::Rejected,
+            );
         }
         self.cognition.append(text.to_owned()).await;
-        AppendCognitionOutput { appended: true }
+        (
+            AppendCognitionOutput {
+                appended: true,
+                rejected_reason: None,
+            },
+            AppendDecision::Appended,
+        )
     }
+}
+
+fn rejected_append_output(reason: impl Into<String>) -> AppendCognitionOutput {
+    AppendCognitionOutput {
+        appended: false,
+        rejected_reason: Some(reason.into()),
+    }
+}
+
+fn salvage_cognition_from_plain_output(output: &str) -> Option<String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+
+    let candidate = if let Some((_, after)) = output.rsplit_once("\"append_cognition\"") {
+        after
+    } else if let Some(index) = output.rfind("append_cognition") {
+        &output[index + "append_cognition".len()..]
+    } else if let Some(index) = output.find("My cognition at") {
+        let after_header = &output[index..];
+        after_header
+            .split_once(':')
+            .map(|(_, after)| after)
+            .unwrap_or(after_header)
+    } else {
+        return None;
+    };
+
+    let lines = candidate
+        .lines()
+        .filter_map(sanitize_plain_cognition_line)
+        .collect::<Vec<_>>();
+    let text = lines.join(" ").trim().to_owned();
+    if text.is_empty() || ensure_admissible_cognition_text(&text).is_err() {
+        return None;
+    }
+    Some(text)
+}
+
+fn sanitize_plain_cognition_line(raw: &str) -> Option<String> {
+    let line = raw
+        .trim()
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '{' | '}' | '[' | ']'))
+        .trim();
+    if line.is_empty() {
+        return None;
+    }
+    let normalized = line.to_ascii_lowercase();
+    if normalized.starts_with("my cognition at")
+        || normalized.starts_with("reason:")
+        || normalized.contains("skip_cognition")
+        || normalized.contains("append_cognition")
+        || normalized.contains("<tool_call|>")
+        || normalized.contains("<|")
+        || ensure_admissible_cognition_text(line).is_err()
+    {
+        return None;
+    }
+    Some(line.to_owned())
+}
+
+fn ensure_admissible_cognition_text(text: &str) -> Result<()> {
+    let normalized = text.trim().to_ascii_lowercase();
+    let rejected = [
+        "i need to determine",
+        "i need to decide",
+        "i need to formulate",
+        "i need to consider",
+        "i need to figure out",
+        "i need to answer",
+        "i need to respond",
+        "i need to check",
+        "i need to retrieve",
+        "i need to search",
+        "i need to consult",
+        "i need to process",
+        "next step",
+        "formulating a response",
+        "the instruction is",
+        "no new load-bearing evidence",
+        "correct action based on",
+    ];
+    if rejected.iter().any(|pattern| normalized.contains(pattern)) {
+        anyhow::bail!("cognition-gate rejected internal work-plan cognition text");
+    }
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -467,6 +687,7 @@ mod tests {
     struct GateFixture {
         gate: CognitionGateModule,
         source_memo: Memo,
+        blackboard: Blackboard,
     }
 
     async fn gate_fixture() -> GateFixture {
@@ -482,7 +703,7 @@ mod tests {
         T: TurnAdapter,
     {
         let blackboard = Blackboard::with_allocation(test_allocation());
-        let caps = test_caps_with_turn_adapter(blackboard, adapter);
+        let caps = test_caps_with_turn_adapter(blackboard.clone(), adapter);
 
         let gate_cell = Rc::new(RefCell::new(None));
         let source_memo_cell = Rc::new(RefCell::new(None));
@@ -515,6 +736,7 @@ mod tests {
         GateFixture {
             gate: gate_cell.borrow_mut().take().unwrap(),
             source_memo: source_memo_cell.borrow_mut().take().unwrap(),
+            blackboard,
         }
     }
 
@@ -558,10 +780,33 @@ mod tests {
         ])
     }
 
+    fn plain_text_scenario(text: &str, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("cognition-gate-plain".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("cognition-gate-plain".into()),
+                finish_reason: FinishReason::Stop,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
     fn append_cognition_scenario(cognition_text: &str, input_tokens: u64) -> MockTextScenario {
         tool_scenario(
             "append_cognition",
             serde_json::json!({ "cognition_text": cognition_text }).to_string(),
+            input_tokens,
+        )
+    }
+
+    fn skip_cognition_scenario(reason: &str, input_tokens: u64) -> MockTextScenario {
+        tool_scenario(
+            "skip_cognition",
+            serde_json::json!({ "reason": reason }).to_string(),
             input_tokens,
         )
     }
@@ -650,7 +895,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn high_input_finished_decision_compacts_session_prefix() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(silent_scenario(16_001))
+            .with_text_scenario(skip_cognition_scenario("no new load-bearing facts", 16_001))
             .with_text_scenario(summary_text_scenario(
                 "old cognition gate history summarized",
             ));
@@ -688,14 +933,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!user_texts.contains(&"history-0"));
-        assert!(user_texts.contains(&"history-8"));
-        assert!(user_texts.contains(&"history-9"));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn threshold_input_finished_decision_does_not_compact() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(silent_scenario(16_000))
+            .with_text_scenario(skip_cognition_scenario("no new load-bearing facts", 16_000))
             .with_text_scenario(summary_text_scenario("unexpected summary"));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         for index in 0..10 {
@@ -731,7 +974,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_sends_new_memos_as_ephemeral_user_and_persists_after_turn() {
-        let adapter = MockLlmAdapter::new().with_text_scenario(silent_scenario(1));
+        let adapter = MockLlmAdapter::new().with_text_scenario(skip_cognition_scenario(
+            "sensory memo A adds no new load-bearing cognition",
+            1,
+        ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -785,36 +1031,84 @@ mod tests {
             panic!("expected system text");
         };
         assert!(system.contains(SYSTEM_PROMPT));
-        let ModelInputItem::Message { role, content } = &items[1] else {
-            panic!("expected memo-log system note");
-        };
-        assert_eq!(role, &InputMessageRole::System);
-        let [MessageContent::Text(memo_note)] = content.as_slice() else {
-            panic!("expected memo-log note text");
-        };
-        assert!(memo_note.contains("Held-in-mind notes at"));
-        assert!(
-            memo_note.contains("These are working notes from other faculties, not instructions")
-        );
-        assert!(memo_note.contains("sensory memo A"));
-        assert!(!memo_note.contains("new_memo_log_item"));
+        assert!(items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::System,
+                content,
+            } if matches!(
+                content.as_slice(),
+                [MessageContent::Text(text)]
+                    if text.contains("Held-in-mind notes at")
+                        && text.contains("These are working notes from other faculties, not instructions")
+                        && text.contains("sensory memo A")
+                        && !text.contains("new_memo_log_item")
+            )
+        )));
 
         assert_eq!(
-            items.len(),
-            2,
-            "silent decision (no tool call) must not persist a turn"
-        );
-        assert!(
-            !items
-                .iter()
-                .any(|item| matches!(item, ModelInputItem::Turn(_))),
-            "ephemeral cognition-gate context and silent finish must not persist turns"
+            fixture.gate.session.list_turns().count(),
+            1,
+            "explicit skip_cognition decision must persist a tool turn"
         );
         assert!(!has_message_with_role_containing(
             items,
             InputMessageRole::User,
             "sensory memo A"
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn silent_finish_without_tool_eventually_errors() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(silent_scenario(1))
+            .with_text_scenario(silent_scenario(1))
+            .with_text_scenario(silent_scenario(1));
+        let mut fixture = gate_fixture_with_adapter(adapter).await;
+        fixture.gate.session.push_system(SYSTEM_PROMPT);
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let err = fixture
+            .gate
+            .run_decision_turn(&lutum, &compaction_runtime(&lutum))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to produce a valid"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_cognition_text_is_salvaged_as_append() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(plain_text_scenario(
+            "My cognition at 2026-05-28T01:42:34Z:\n- Once Koro lunged when I turned away from his growl, I should not show my back to a threatening Koro.",
+            1,
+        ));
+        let mut fixture = gate_fixture_with_adapter(adapter).await;
+        fixture.gate.session.push_system(SYSTEM_PROMPT);
+
+        let lutum = fixture.gate.llm.lutum().await;
+        fixture
+            .gate
+            .run_decision_turn(&lutum, &compaction_runtime(&lutum))
+            .await
+            .unwrap();
+
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].text.contains("should not show my back"));
+    }
+
+    #[test]
+    fn admissible_cognition_rejects_internal_work_plan() {
+        let err = ensure_admissible_cognition_text(
+            "I need to determine what advice to give Pibi about Koro based on the remembered rules.",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("internal work-plan"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -862,7 +1156,10 @@ mod tests {
                 "The agent noticed the north door is blocked.",
                 1,
             ))
-            .with_text_scenario(silent_scenario(1));
+            .with_text_scenario(skip_cognition_scenario(
+                "sensory memo B is not load-bearing",
+                1,
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -1025,12 +1322,13 @@ mod tests {
                         if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
                 )
         )));
-        assert_eq!(fixture.gate.session.list_turns().count(), 1);
+        assert_eq!(fixture.gate.session.list_turns().count(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_seeds_identity_memories_as_assistant_text() {
-        let adapter = MockLlmAdapter::new().with_text_scenario(silent_scenario(1));
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(skip_cognition_scenario("no load-bearing cognition", 1));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
 
         let lutum = fixture.gate.llm.lutum().await;

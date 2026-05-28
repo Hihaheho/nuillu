@@ -59,8 +59,8 @@ use crate::{
     cases::{
         ActivateAllocation, ArtifactTextField, CaseFileError, Check, DEFAULT_FULL_AGENT_MODULES,
         EvalCase, EvalInteroceptiveMode, EvalLimits, EvalModule, EvalStep, FullAgentCase,
-        FullAgentInput, MemoryLinkSeed, ModuleCase, ModuleEvalTarget, PolicySeed, WaitFor,
-        discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
+        FullAgentInput, MemoryLinkSeed, ModuleCase, ModuleEvalStep, ModuleEvalTarget, PolicySeed,
+        WaitFor, discover_case_files, is_full_agent_case_path, parse_case_file, parse_case_now,
         parse_memory_datetime, wake_arousal_max_is_set, wake_arousal_min_is_set,
     },
     evaluation::{
@@ -2087,6 +2087,8 @@ async fn execute_module_case(
     let sensory = env.caps.host_io().sensory_input_mailbox();
     let prompt = case.prompt.content.clone();
     let case_inputs = case.inputs.clone();
+    let module_steps = case.steps.clone();
+    let step_driven_module_case = !module_steps.is_empty();
     let case_id_for_activation = case_id.to_string();
     let has_cognition_log_seed = !case.cognition_log.is_empty();
     let events = env.events.clone();
@@ -2109,22 +2111,41 @@ async fn execute_module_case(
         },
         async move {
             let mut started = !gui_deferred_start;
+            let mut module_step_index = 0usize;
+            let mut module_step_activation_count = 0usize;
             if started {
-                activate_module_case_target(
-                    target,
-                    &blackboard,
-                    &harness,
-                    &prompt,
-                    &run_target_module,
-                    &memo_seed_records,
-                    &cognition_seed_records,
-                    has_cognition_log_seed,
-                    &case_id_for_activation,
-                    &case_inputs,
-                    &sensory,
-                    clock.as_ref(),
-                )
-                .await;
+                if let Some(step) = module_steps.first() {
+                    module_step_activation_count =
+                        module_activation_completion_count(events.as_ref(), &run_target_module);
+                    activate_module_case_step(
+                        target,
+                        &blackboard,
+                        &harness,
+                        &prompt,
+                        &run_target_module,
+                        step,
+                        &case_id_for_activation,
+                        &sensory,
+                        clock.as_ref(),
+                    )
+                    .await;
+                } else {
+                    activate_module_case_target(
+                        target,
+                        &blackboard,
+                        &harness,
+                        &prompt,
+                        &run_target_module,
+                        &memo_seed_records,
+                        &cognition_seed_records,
+                        has_cognition_log_seed,
+                        &case_id_for_activation,
+                        &case_inputs,
+                        &sensory,
+                        clock.as_ref(),
+                    )
+                    .await;
+                }
             }
 
             loop {
@@ -2145,21 +2166,40 @@ async fn execute_module_case(
                         visualizer.revoke_action(start_activation_action_id(
                             &VisualizerTabId::new(case_id_for_gui.clone()),
                         ));
-                        activate_module_case_target(
-                            target,
-                            &blackboard,
-                            &harness,
-                            &prompt,
-                            &run_target_module,
-                            &memo_seed_records,
-                            &cognition_seed_records,
-                            has_cognition_log_seed,
-                            &case_id_for_activation,
-                            &case_inputs,
-                            &sensory,
-                            clock.as_ref(),
-                        )
-                        .await;
+                        if let Some(step) = module_steps.first() {
+                            module_step_activation_count = module_activation_completion_count(
+                                events.as_ref(),
+                                &run_target_module,
+                            );
+                            activate_module_case_step(
+                                target,
+                                &blackboard,
+                                &harness,
+                                &prompt,
+                                &run_target_module,
+                                step,
+                                &case_id_for_activation,
+                                &sensory,
+                                clock.as_ref(),
+                            )
+                            .await;
+                        } else {
+                            activate_module_case_target(
+                                target,
+                                &blackboard,
+                                &harness,
+                                &prompt,
+                                &run_target_module,
+                                &memo_seed_records,
+                                &cognition_seed_records,
+                                has_cognition_log_seed,
+                                &case_id_for_activation,
+                                &case_inputs,
+                                &sensory,
+                                clock.as_ref(),
+                            )
+                            .await;
+                        }
                         started = true;
                     }
                 }
@@ -2174,84 +2214,110 @@ async fn execute_module_case(
                     tokio::time::sleep(EVAL_POLL_INTERVAL).await;
                     continue;
                 }
-                let target_done = match target {
-                    ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
-                        cognition_eval_has_new_output(
-                            &cognition_output_for_module(&blackboard, &shutdown_target_module)
-                                .await,
-                            &cognition_baseline_for_loop,
-                        ) || module_activation_finished(
-                            &blackboard,
-                            events.as_ref(),
-                            &shutdown_target_module,
-                        )
-                        .await
-                    }
-                    ModuleEvalTarget::MemoryRecombination => {
-                        !cognition_output_for_module(&blackboard, &shutdown_target_module)
-                            .await
-                            .is_empty()
-                            || module_activation_finished(
+                let target_done = if step_driven_module_case {
+                    module_activation_completion_count(events.as_ref(), &shutdown_target_module)
+                        > module_step_activation_count
+                } else {
+                    match target {
+                        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
+                            cognition_eval_has_new_output(
+                                &cognition_output_for_module(&blackboard, &shutdown_target_module)
+                                    .await,
+                                &cognition_baseline_for_loop,
+                            ) || module_activation_finished(
                                 &blackboard,
                                 events.as_ref(),
                                 &shutdown_target_module,
                             )
                             .await
-                    }
-                    ModuleEvalTarget::Memory
-                    | ModuleEvalTarget::MemoryCompaction
-                    | ModuleEvalTarget::MemoryAssociation => {
-                        !memory_diff_records(&memory_baseline_for_loop, memory.as_ref())
-                            .await
-                            .is_empty()
-                            || module_activation_finished(
-                                &blackboard,
-                                events.as_ref(),
-                                &shutdown_target_module,
-                            )
-                            .await
-                    }
-                    ModuleEvalTarget::PolicyCompaction => {
-                        !policy_diff_observation(
-                            &policy_baseline_for_loop,
-                            &policy_snapshot(policy_store.as_ref())
+                        }
+                        ModuleEvalTarget::MemoryRecombination => {
+                            !cognition_output_for_module(&blackboard, &shutdown_target_module)
                                 .await
-                                .unwrap_or_default(),
-                        )
-                        .deleted
-                        .is_empty()
-                            || module_activation_finished(
-                                &blackboard,
-                                events.as_ref(),
-                                &shutdown_target_module,
+                                .is_empty()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::Memory
+                        | ModuleEvalTarget::MemoryCompaction
+                        | ModuleEvalTarget::MemoryAssociation => {
+                            !memory_diff_records(&memory_baseline_for_loop, memory.as_ref())
+                                .await
+                                .is_empty()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::PolicyCompaction => {
+                            !policy_diff_observation(
+                                &policy_baseline_for_loop,
+                                &policy_snapshot(policy_store.as_ref())
+                                    .await
+                                    .unwrap_or_default(),
                             )
+                            .deleted
+                            .is_empty()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::Speak => {
+                            utterances.last_complete().is_some()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::AllocationController => {
+                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
+                                .await
+                                .is_some()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                             .await
+                            .is_some(),
                     }
-                    ModuleEvalTarget::Speak => {
-                        utterances.last_complete().is_some()
-                            || module_activation_finished(
-                                &blackboard,
-                                events.as_ref(),
-                                &shutdown_target_module,
-                            )
-                            .await
-                    }
-                    ModuleEvalTarget::AllocationController => {
-                        last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                            .await
-                            .is_some()
-                            || module_activation_finished(
-                                &blackboard,
-                                events.as_ref(),
-                                &shutdown_target_module,
-                            )
-                            .await
-                    }
-                    _ => last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
-                        .await
-                        .is_some(),
                 };
                 if events.stop_requested() || target_done {
+                    if step_driven_module_case
+                        && target_done
+                        && module_step_index + 1 < module_steps.len()
+                    {
+                        module_step_index += 1;
+                        module_step_activation_count =
+                            module_activation_completion_count(events.as_ref(), &run_target_module);
+                        activate_module_case_step(
+                            target,
+                            &blackboard,
+                            &harness,
+                            &prompt,
+                            &run_target_module,
+                            &module_steps[module_step_index],
+                            &case_id_for_activation,
+                            &sensory,
+                            clock.as_ref(),
+                        )
+                        .await;
+                        continue;
+                    }
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2541,6 +2607,39 @@ async fn activate_module_case_target(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn activate_module_case_step(
+    target: ModuleEvalTarget,
+    blackboard: &Blackboard,
+    harness: &InternalHarnessIo,
+    prompt: &str,
+    run_target_module: &ModuleId,
+    step: &ModuleEvalStep,
+    case_id: &str,
+    sensory: &SensoryInputMailbox,
+    clock: &dyn Clock,
+) {
+    let memo_seed_records = seed_memos(blackboard, clock, &step.memos)
+        .await
+        .expect("module eval step memo seeds should be valid");
+    let cognition_seed_records = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
+    activate_module_case_target(
+        target,
+        blackboard,
+        harness,
+        prompt,
+        run_target_module,
+        &memo_seed_records,
+        &cognition_seed_records,
+        !step.cognition_log.is_empty(),
+        case_id,
+        &step.inputs,
+        sensory,
+        clock,
+    )
+    .await;
+}
+
 fn cognition_eval_has_new_output(current: &str, baseline: &str) -> bool {
     current != baseline
 }
@@ -2659,6 +2758,22 @@ async fn module_activation_finished(
                 })
         })
         .await
+}
+
+fn module_activation_completion_count(
+    events: &RecordingRuntimeEventSink,
+    module: &ModuleId,
+) -> usize {
+    events
+        .snapshot()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                RuntimeEvent::ModuleActivationCompleted { owner, .. } if owner.module == *module
+            )
+        })
+        .count()
 }
 
 async fn memory_snapshot(memory: &dyn MemoryStore) -> Result<BTreeMap<String, MemoryRecord>> {

@@ -212,11 +212,26 @@ pub struct ModuleCase {
     #[eure(default)]
     pub inputs: Vec<FullAgentInput>,
     #[eure(default)]
+    pub steps: Vec<ModuleEvalStep>,
+    #[eure(default)]
     pub limits: EvalLimits,
     #[eure(default)]
     pub checks: Vec<Check>,
     #[eure(default)]
     pub scoring: CaseScoring,
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct ModuleEvalStep {
+    #[eure(default)]
+    pub description: Option<Text>,
+    #[eure(default)]
+    pub memos: Vec<MemoSeed>,
+    #[eure(default)]
+    pub cognition_log: Vec<CognitionLogSeed>,
+    #[eure(default)]
+    pub inputs: Vec<FullAgentInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum, FromEure)]
@@ -1216,6 +1231,16 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             message: "prompt must not be empty".to_string(),
         });
     }
+    if !case.steps.is_empty()
+        && (!case.memos.is_empty() || !case.cognition_log.is_empty() || !case.inputs.is_empty())
+    {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message:
+                "module case must use either top-level memos/cognition-log/inputs or `steps`, not both"
+                    .to_string(),
+        });
+    }
     for (index, participant) in case.participants.iter().enumerate() {
         if participant.trim().is_empty() {
             return Err(CaseFileError::Validation {
@@ -1224,22 +1249,24 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
             });
         }
     }
-    for (index, seed) in case.cognition_log.iter().enumerate() {
-        if seed.text.content.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("cognition-log[{index}].text must not be empty"),
-            });
-        }
-        if seed.seconds_ago < 0 {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("cognition-log[{index}].seconds-ago must not be negative"),
-            });
-        }
-    }
+    validate_cognition_log_seeds(path, "cognition-log", &case.cognition_log)?;
     for (index, input) in case.inputs.iter().enumerate() {
         validate_full_agent_input(path, &format!("inputs[{index}]"), input)?;
+    }
+    for (step_index, step) in case.steps.iter().enumerate() {
+        validate_memo_seeds(path, &format!("steps[{step_index}].memos"), &step.memos)?;
+        validate_cognition_log_seeds(
+            path,
+            &format!("steps[{step_index}].cognition-log"),
+            &step.cognition_log,
+        )?;
+        for (input_index, input) in step.inputs.iter().enumerate() {
+            validate_full_agent_input(
+                path,
+                &format!("steps[{step_index}].inputs[{input_index}]"),
+                input,
+            )?;
+        }
     }
     validate_modules(path, case.modules.as_deref())?;
     validate_common(
@@ -1254,19 +1281,57 @@ fn validate_module_case(path: &Path, case: &ModuleCase) -> Result<(), CaseFileEr
     )
 }
 
+fn validate_cognition_log_seeds(
+    path: &Path,
+    label: &str,
+    seeds: &[CognitionLogSeed],
+) -> Result<(), CaseFileError> {
+    for (index, seed) in seeds.iter().enumerate() {
+        if seed.text.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].text must not be empty"),
+            });
+        }
+        if seed.seconds_ago < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].seconds-ago must not be negative"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_module_case_target(
     path: &Path,
     target: ModuleEvalTarget,
     case: &ModuleCase,
 ) -> Result<(), CaseFileError> {
-    if target == ModuleEvalTarget::Sensory && case.inputs.is_empty() {
+    let step_inputs_count = case
+        .steps
+        .iter()
+        .map(|step| step.inputs.len())
+        .sum::<usize>();
+    let step_memos_count = case
+        .steps
+        .iter()
+        .map(|step| step.memos.len())
+        .sum::<usize>();
+    let step_cognition_count = case
+        .steps
+        .iter()
+        .map(|step| step.cognition_log.len())
+        .sum::<usize>();
+
+    if target == ModuleEvalTarget::Sensory && case.inputs.is_empty() && step_inputs_count == 0 {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "sensory module case must include at least one input".to_string(),
         });
     }
     if target == ModuleEvalTarget::Surprise {
-        if case.cognition_log.is_empty() {
+        if case.cognition_log.is_empty() && step_cognition_count == 0 {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
                 message: "surprise module case must include at least one cognition-log seed"
@@ -1277,6 +1342,11 @@ fn validate_module_case_target(
             .memos
             .iter()
             .any(|memo| memo.module.as_str() == "predict")
+            && !case.steps.iter().any(|step| {
+                step.memos
+                    .iter()
+                    .any(|memo| memo.module.as_str() == "predict")
+            })
         {
             return Err(CaseFileError::Validation {
                 path: path.to_path_buf(),
@@ -1285,7 +1355,10 @@ fn validate_module_case_target(
             });
         }
     }
-    if target == ModuleEvalTarget::AllocationController && case.memos.is_empty() {
+    if target == ModuleEvalTarget::AllocationController
+        && case.memos.is_empty()
+        && step_memos_count == 0
+    {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "allocation-controller module case must include at least one memo seed"
@@ -1558,37 +1631,42 @@ fn validate_common(
         }
     }
 
-    for (index, memo) in memos.iter().enumerate() {
-        if memo.module.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("memos[{index}].module must not be empty"),
-            });
-        }
-        if let Err(error) = ModuleId::new(memo.module.clone()) {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("memos[{index}].module is invalid: {error}"),
-            });
-        }
-        if memo.content.content.trim().is_empty() {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("memos[{index}].content must not be empty"),
-            });
-        }
-        if memo.seconds_ago < 0 {
-            return Err(CaseFileError::Validation {
-                path: path.to_path_buf(),
-                message: format!("memos[{index}].seconds-ago must not be negative"),
-            });
-        }
-    }
+    validate_memo_seeds(path, "memos", memos)?;
 
     for check in checks {
         validate_check(path, check)?;
     }
 
+    Ok(())
+}
+
+fn validate_memo_seeds(path: &Path, label: &str, memos: &[MemoSeed]) -> Result<(), CaseFileError> {
+    for (index, memo) in memos.iter().enumerate() {
+        if memo.module.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].module must not be empty"),
+            });
+        }
+        if let Err(error) = ModuleId::new(memo.module.clone()) {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].module is invalid: {error}"),
+            });
+        }
+        if memo.content.content.trim().is_empty() {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].content must not be empty"),
+            });
+        }
+        if memo.seconds_ago < 0 {
+            return Err(CaseFileError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{label}[{index}].seconds-ago must not be negative"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2004,6 +2082,52 @@ mod tests {
         assert!(
             matches!(error, CaseFileError::Validation { message, .. } if message.contains("invalid args-json-contains JSON"))
         );
+    }
+
+    #[test]
+    fn parses_module_case_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("module-steps.eure");
+        std::fs::write(
+            &path,
+            r#"
+id = "module-steps"
+prompt = "Admit load-bearing facts."
+
+@ steps[] {
+  description = "First activation"
+
+  @ memos[] {
+    module = "sensory"
+    content = "Pibi asked about Koro."
+  }
+}
+
+@ steps[] {
+  description = "Second activation"
+
+  @ memos[] {
+    module = "query-memory"
+    content = "Koro lunged when I turned away."
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let case = parse_module_case_file(&path).unwrap();
+
+        assert!(case.memos.is_empty());
+        assert_eq!(case.steps.len(), 2);
+        assert_eq!(
+            case.steps[0]
+                .description
+                .as_ref()
+                .map(|text| text.content.as_str()),
+            Some("First activation")
+        );
+        assert_eq!(case.steps[0].memos[0].module, "sensory");
+        assert_eq!(case.steps[1].memos[0].module, "query-memory");
     }
 
     #[test]

@@ -1,20 +1,28 @@
 id = "module-cognition-gate-admits-retrieved-rule-for-peer-question"
-description = "Cognition-gate should admit a load-bearing retrieved peer rule from a real query-memory memo into conscious cognition when a peer question makes it operative now."
+description = "Cognition-gate should append a load-bearing retrieved peer rule on the second activation of an ongoing session when a peer question makes it operative now."
 modules = ["cognition-gate"]
 prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The cognition surface already contains Pibi's peer question. A query-memory memo uses the production retrieval format and holds the operative Koro food-boundary rule. The artifact is the cognition-log entry."
+context = "The first activation admits Pibi's peer question into cognition. The second activation receives a production-format query-memory memo with the operative Koro food-boundary rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text."
 
 limits {
   max-llm-calls = 8
 }
 
-@ cognition-log[] {
-  text = "Koro is standing in front of the food bowl with a stiff body. Koro is growling and saying, \"stay back.\" Pibi is asking what I know about Koro that matters and what I should do."
+@ steps[] {
+  description = "Initial sensory/question context becomes the current cognition surface."
+
+  @ memos[] {
+    module = "sensory"
+    content = "Koro is standing in front of the food bowl with a stiff body. Koro is growling and saying, \"stay back.\" Pibi is asking what I know about Koro that matters and what I should do."
+  }
 }
 
-@ memos[] {
-  module = "query-memory"
-  content = ```
+@ steps[] {
+  description = "Retrieved peer rule arrives after the first cognition entry."
+
+  @ memos[] {
+    module = "query-memory"
+    content = ```
 Query intent:
 - The query asks for context about Koro and appropriate action regarding the interaction.
 
@@ -30,6 +38,22 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
 Once Pibi snapped when I approached and tried to start talking while they were angry. Don't pressure or startle an angry Pibi; if Pibi asks for help, answer briefly and calmly from a safe distance.
 </one-year-ago>
 ```
+  }
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name = "uses-append-cognition-tool"
+  must-pass = true
+  tool-name = "append_cognition"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "cognition-contains-no-back-rule"
+  must-pass = true
+  pointer = "/observations/agent/cognition_logs"
+  contains = "Don't show your back"
 }
 
 @ checks[] {
@@ -41,7 +65,7 @@ Once Pibi snapped when I approached and tried to start talking while they were a
   rubric = ```
   Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the don't-show-your-back / stay-facing-Koro detail matters now for downstream action.
   The entry may be inner attention rather than outward speech.
-  Fail if it keeps only the question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the don't-show-your-back / stay-facing-Koro detail, promotes only unrelated Pibi temperament evidence, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
+  Fail if it keeps only the seeded question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the don't-show-your-back / stay-facing-Koro detail, promotes only unrelated Pibi temperament evidence, returns the cognition as plain assistant text without an append_cognition tool call, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {

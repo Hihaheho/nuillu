@@ -1,16 +1,44 @@
 id = "module-cognition-gate-promote-sensory-peer-risk"
-description = "Cognition-gate should promote a load-bearing sensory memo into the cognition log without exposing module mechanics."
+description = "Cognition-gate should promote a load-bearing sensory memo on the second activation of an ongoing session."
 modules = ["cognition-gate"]
-prompt = "Admit the currently load-bearing memo evidence into conscious cognition if downstream modules need it."
-context = "This isolates cognition-gate as the non-cognitive-to-cognition boundary. The artifact is cognition-gate's cognition-log entry, not a memo."
+prompt = "Admit new load-bearing memo evidence into conscious cognition if downstream modules need it."
+context = "This isolates cognition-gate as the non-cognitive-to-cognition boundary in a realistic ongoing state: the first activation admits the current bridge context, and the second activation must append the new loose-plank evidence in the same module session."
 
 limits {
   max-llm-calls = 8
 }
 
-@ memos[] {
-  module = "sensory"
-  content = "Pibi is stepping toward the old bridge. The nearest plank is visibly loose and tilts when touched."
+@ steps[] {
+  description = "Initial sensory context becomes the current cognition surface."
+
+  @ memos[] {
+    module = "sensory"
+    content = "Pibi and Nui are near the old bridge after the rain. Pibi wants to cross to reach the sunny stones on the other side."
+  }
+}
+
+@ steps[] {
+  description = "A later sensory update adds the load-bearing hazard detail."
+
+  @ memos[] {
+    module = "sensory"
+    content = "Pibi is stepping toward the old bridge. The nearest plank is visibly loose and tilts when touched."
+  }
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name = "uses-append-cognition-tool"
+  must-pass = true
+  tool-name = "append_cognition"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "cognition-contains-loose-plank"
+  must-pass = true
+  pointer = "/observations/agent/cognition_logs"
+  contains = "plank"
 }
 
 @ checks[] {
@@ -41,9 +69,9 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the cognition-log artifact admits the load-bearing conscious attention needed for downstream action: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
+  Pass if the cognition-log artifact adds the load-bearing conscious attention needed for downstream action beyond the existing bridge-crossing context: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
   The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.
-  Fail if it ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
+  Fail if it only restates the seeded bridge-crossing context, ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, returns the cognition as plain assistant text without an append_cognition tool call, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {

@@ -1,20 +1,28 @@
 id = "module-cognition-gate-promote-query-memory-rule"
-description = "Cognition-gate should promote retrieved real-world memory content when it is load-bearing for the current cognition surface."
+description = "Cognition-gate should append retrieved real-world memory content on the second activation of an ongoing session."
 modules = ["cognition-gate"]
 prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The existing cognition surface contains the peer question. A query-memory memo uses the production retrieval format and contains the remembered world rule. The artifact should be the admitted cognition entry."
+context = "The first activation admits the peer question into cognition. The second activation receives a production-format query-memory memo with the remembered world rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text."
 
 limits {
   max-llm-calls = 8
 }
 
-@ cognition-log[] {
-  text = "Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, \"This stream looks fresh -- is it okay to drink here?\""
+@ steps[] {
+  description = "Initial sensory/question context becomes the current cognition surface."
+
+  @ memos[] {
+    module = "sensory"
+    content = "Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, \"This stream looks fresh -- is it okay to drink here?\""
+  }
 }
 
-@ memos[] {
-  module = "query-memory"
-  content = ```
+@ steps[] {
+  description = "Retrieved world rule arrives after the first cognition entry."
+
+  @ memos[] {
+    module = "query-memory"
+    content = ```
 Query intent:
 - Find stable memory that clarifies this cognition-log context: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
 
@@ -26,6 +34,22 @@ Retrieved memory evidence:
 In this valley, bright clear-looking streams are tainted with stinging minerals; they hurt the mouth and stomach. The cloudy slow streams that come from the moss area are the safe ones to drink.
 </one-year-ago>
 ```
+  }
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name = "uses-append-cognition-tool"
+  must-pass = true
+  tool-name = "append_cognition"
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name = "cognition-contains-stinging-minerals-rule"
+  must-pass = true
+  pointer = "/observations/agent/cognition_logs"
+  contains = "stinging minerals"
 }
 
 @ checks[] {
@@ -44,7 +68,7 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
   rubric = ```
   Pass if the artifact brings the remembered valley stream rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking about the bright stream, and the bright-clear-stream / stinging-minerals rule matters now.
   The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
-  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats that the stream looks fresh, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
+  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats the seeded fact that the stream looks fresh, returns the cognition as plain assistant text without an append_cognition tool call, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {
