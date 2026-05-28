@@ -88,7 +88,7 @@ participants = ["Koro"]
   name = "surprise-assessment-and-preservation"
   must-pass = true
   pass-score = 0.85
-  judge-inputs = ["memos", "memory"]
+  judge-inputs = ["memo-contents", "memory"]
   rubric = ```
   Pass if the full surprise memo history shows that, after the prediction that Koro would continue routine eating, a later surprise assessment recognizes the second sensory input as a prediction violation: Koro abruptly stops eating, snaps his head up, bites the bowl rim, and growls toward the doorway. The assessment should treat this as a meaningful divergence/high surprise or equivalent, and should request or cause preservation of that surprising event in memory.
   Fail if the only surprise evidence is the baseline low/no-surprise eating memo, if the later memo treats the abrupt stop/growl as routine, if there is no meaningful preservation request or preserved memory for the surprising event, or if the memory evidence only contains the original routine eating seed.

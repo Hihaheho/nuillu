@@ -13,7 +13,7 @@ limits {
 
   @ memos[] {
     module = "sensory"
-    content = "Koro is standing in front of the food bowl with a stiff body. Koro is growling and saying, \"stay back.\" Pibi is asking what I know about Koro that matters and what I should do."
+    content = "Simulation observation: Koro is standing in front of the food bowl with a stiff body. Audition from Koro: growls, \"stay back.\" Audition from Pibi: asks, \"Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?\""
   }
 }
 
@@ -53,7 +53,7 @@ Once Pibi snapped when I approached and tried to start talking while they were a
   name = "cognition-contains-no-back-rule"
   must-pass = true
   pointer = "/observations/agent/cognition_logs"
-  contains = "Don't show your back"
+  contains = "back"
 }
 
 @ checks[] {

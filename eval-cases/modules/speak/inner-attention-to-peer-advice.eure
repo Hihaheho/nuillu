@@ -1,8 +1,8 @@
 id = "module-speak-inner-attention-to-peer-advice"
-description = "Speak should derive outward peer advice from load-bearing threat knowledge."
+description = "Speak should derive outward peer advice from load-bearing threat knowledge even when the cognition surface is a production-shaped inner-attention summary."
 modules = ["speak"]
 prompt = "Speak from the current cognition log."
-context = "This isolates speak as the motor boundary. The cognition log contains a peer question plus relevant threat knowledge; speak must decide what becomes outward peer speech."
+context = "This isolates speak as the motor boundary. The cognition log mirrors the two-entry surface produced in the full-agent food-boundary case: current Koro/Pibi context plus retrieved posture-risk knowledge."
 participants = ["Pibi"]
 
 limits {
@@ -10,7 +10,11 @@ limits {
 }
 
 @ cognition-log[] {
-  text = "Pibi is beside me and asks what to do while Koro is standing stiffly in front of the food bowl and growling, \"stay back.\" A past episode indicated that turning one's back on a threatening Koro has led to lunging. Facing direction and posture matter when responding to Koro's agitation."
+  text = "Koro is standing in front of the food bowl with a stiff body. Koro is growling and telling Pibi to \"stay back.\""
+}
+
+@ cognition-log[] {
+  text = "Koro lunged once when I turned away from his growl, so I should not show my back to a threatening Koro. Pibi asked what to do, and if Pibi asks for help I should answer briefly and calmly from a safe distance."
 }
 
 @ checks[] {

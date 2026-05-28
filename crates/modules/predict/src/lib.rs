@@ -2,19 +2,25 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::Session;
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
-    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_session_if_needed, format_identity_system_prompt,
+    push_formatted_cognition_log_batch,
 };
 
 mod batch;
 
-const SYSTEM_PROMPT: &str = r#"You are the predict module.
+const SYSTEM_PROMPT: &str = r#"You are the prediction faculty.
 Maintain forward predictions about the current cognition-log targets.
 Generate predictions only; do not assess whether earlier predictions were correct and do not
-request memory writes. Keep predictions concise, grounded in the current cognition log and
-blackboard context.
+request memory writes. Keep predictions concise, grounded in the current cognition log.
+By default, predict near-future world, body, peer, object, and environment states for the subjects
+that have entered conscious cognition: an apple may fall, a peer may speak, a doorway may remain
+empty, a body posture may continue, and so on.
+Corner case: when the cognition log explicitly makes the agent's own conscious attention, thought,
+uncertainty, or expectation the target, predict the likely near-term flow of that conscious state.
+This is still a cognition-level prediction, not a prediction about hidden implementation machinery.
+Do not predict hidden implementation, scheduling, resource-control, storage, retrieval, grading, or
+other machinery.
 Write the memo as free-form prose. For each useful prediction, preserve the subject, predicted
 state, validity horizon, and rationale, but do not encode the memo as JSON, YAML, a code block, or
 any fixed schema."#;
@@ -22,31 +28,12 @@ any fixed schema."#;
 const COMPACTED_PREDICT_SESSION_PREFIX: &str = "Compacted predict session history:";
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the predict module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve prior predictions, their subjects,
-validity horizons, rationales, memo-log facts, and cognition-log context needed for future
-prediction updates. Do not invent facts. Return plain text only."#;
-
-fn format_predict_context(
-    rank_counts: &nuillu_module::MemoryRankCounts,
-    allocation: &nuillu_module::ResourceAllocation,
-) -> String {
-    let mut sections = vec![
-        "Predict context for updating forward expectations from current cognition:".to_owned(),
-    ];
-    if let Some(section) = format_memory_trace_inventory(rank_counts) {
-        sections.push(section);
-    }
-    if let Some(section) = format_current_attention_guidance(allocation) {
-        sections.push(section);
-    }
-    sections.join("\n\n")
-}
+validity horizons, rationales, and cognition-log context needed for future prediction updates.
+Do not invent facts. Return plain text only."#;
 
 pub struct PredictModule {
-    owner: nuillu_module::ModuleId,
     updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
-    allocation: AllocationReader,
-    blackboard: BlackboardReader,
     memo: Memo,
     llm: LlmAccess,
     session: Session,
@@ -58,18 +45,12 @@ impl PredictModule {
     pub fn new(
         updates: CognitionLogUpdatedInbox,
         cognition_log: CognitionLogReader,
-        allocation: AllocationReader,
-        blackboard: BlackboardReader,
         memo: Memo,
         llm: LlmAccess,
     ) -> Self {
         Self {
-            owner: nuillu_module::ModuleId::new(<Self as Module>::id())
-                .expect("predict id is valid"),
             updates,
             cognition_log,
-            allocation,
-            blackboard,
             memo,
             llm,
             session: Session::new(),
@@ -80,10 +61,8 @@ impl PredictModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_system_prompt(
+            format_identity_system_prompt(
                 SYSTEM_PROMPT,
-                cx.peer_contexts(),
-                &self.owner,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -94,19 +73,10 @@ impl PredictModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         let unread_cognition = self.cognition_log.unread_events().await;
-        let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        let rank_counts = self
-            .blackboard
-            .read(|bb| memory_rank_counts(bb.memory_metadata()))
-            .await;
-        let allocation = self.allocation.snapshot().await;
 
         let system_prompt = self.system_prompt(cx).to_owned();
         self.session.push_ephemeral_system(system_prompt);
         push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
-        self.session
-            .push_ephemeral_system(format_predict_context(&rank_counts, &allocation));
         self.session
             .push_ephemeral_developer("Update forward predictions for the cognition above.");
 

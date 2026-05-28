@@ -263,8 +263,6 @@ fn register_server_module(
                 nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
                     caps.memo(),
                     caps.llm_access(),
                 )

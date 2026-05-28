@@ -175,7 +175,7 @@ admitted surface rather than racing ahead of late evidence memos.
 | policy | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyConsiderationWriter` |
 | reward | ✓ | ✓ | ✓ | ✓ | — | ✓ | `PolicyConsiderationEvictedInbox`, `InteroceptiveReader`, `PolicySearcher`, `PolicyUpserter` |
 | policy-compaction | ✓ | — | ✓ | — | — | ✓ | `InteroceptiveUpdatedInbox`, `PolicyCompactor` |
-| predict | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
+| predict | — | ✓ | — | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | surprise | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `AttentionControlRequestMailbox` |
 | speak | — | ✓ | — | ✓ | ✓ | ✓ | `CognitionLogUpdatedInbox`, `SceneReader`, `UtteranceWriter` |
 
@@ -287,7 +287,7 @@ Fetches policy content and conservatively removes redundant non-Core duplicate p
 
 ### Predict
 
-Maintains forward predictions about current cognition-log targets. On each cognition log update, reads the cognition log, blackboard context, and allocation guidance, then uses an LLM to generate predictions about the likely near-future states of the admitted cognitive targets — external subjects (people, objects, events), conversational trajectory, or the agent's own mental state when attention-schema cognition-log entries report self-directed attention. Each prediction entry includes the target subject, predicted state, and an estimated validity horizon.
+Maintains forward predictions about current cognition-log targets. On each cognition log update, reads only the cognition log, then uses an LLM to generate predictions about the likely near-future states of the admitted targets. The default target class is external world/body/peer/object/environment state, such as a falling object, a peer likely to speak, or a continuing posture. A corner case is the agent's own conscious cognition flow when the cognition log explicitly makes attention, uncertainty, or expectation the target. Each prediction entry includes the target subject, predicted state, and an estimated validity horizon.
 
 Predictions are written to the predict memo. Predict does not detect whether its predictions were correct and does not write memory — divergence detection and explicit preservation requests belong to surprise.
 

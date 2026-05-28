@@ -48,13 +48,13 @@ impl RubricJudge for ModuleScopedJudge {
         );
         assert_eq!(
             request.judge_inputs,
-            vec![RubricJudgeInput::Output, RubricJudgeInput::Memos]
+            vec![RubricJudgeInput::Output, RubricJudgeInput::MemoContents]
         );
         assert!(request.artifact.output.contains("first query memo"));
         assert!(request.artifact.output.contains("second query memo"));
         assert!(!request.artifact.output.contains("sensory memo"));
         let rendered = render_judge_input(trace, &request);
-        assert!(rendered.contains("agent.memo_logs"));
+        assert!(rendered.contains("Memo contents:"));
         assert!(rendered.contains("first query memo"));
         assert!(rendered.contains("second query memo"));
         assert!(!rendered.contains("sensory memo"));
@@ -232,6 +232,14 @@ fn parses_added_speak_and_self_model_module_cases() {
             EvalModule::Surprise,
         ),
         (
+            "../../eval-cases/modules/predict/routine-eating-preserves-subject.eure",
+            EvalModule::Predict,
+        ),
+        (
+            "../../eval-cases/modules/predict/self-cognition-flow-attention-hold.eure",
+            EvalModule::Predict,
+        ),
+        (
             "../../eval-cases/modules/allocation-controller/prioritizes-speak-for-peer-question.eure",
             EvalModule::AllocationController,
         ),
@@ -325,6 +333,25 @@ prompt = "Assess surprise."
     assert!(
         err.to_string()
             .contains("surprise module case must include at least one predict memo seed"),
+        "{err}"
+    );
+
+    let predict_dir = dir.path().join("eval-cases/modules/predict");
+    std::fs::create_dir_all(&predict_dir).unwrap();
+    let missing_cognition = predict_dir.join("missing-cognition.eure");
+    std::fs::write(
+        &missing_cognition,
+        r#"
+id = "missing-cognition"
+modules = ["predict"]
+prompt = "Predict what happens next."
+"#,
+    )
+    .unwrap();
+    let err = parse_case_file(&missing_cognition).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("predict module case must include at least one cognition-log seed"),
         "{err}"
     );
 
@@ -561,7 +588,7 @@ modules = ["sensory", "query-memory"]
   @ rubrics[] {
     name = "query-history"
     pass-score = 0.85
-    judge-inputs = ["output", "memos"]
+    judge-inputs = ["output", "memo-contents"]
     rubric = "Judge the query-memory memo history."
 
     @ criteria[] {

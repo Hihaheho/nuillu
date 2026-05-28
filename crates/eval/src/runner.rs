@@ -2553,6 +2553,20 @@ async fn activate_module_case_target(
                     .expect("module eval failed to publish CognitionLogUpdated");
             }
         }
+        ModuleEvalTarget::Predict => {
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+        }
         ModuleEvalTarget::Surprise => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
@@ -4876,8 +4890,6 @@ fn register_eval_module(
                     nuillu_predict::PredictModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
                         caps.memo(),
                         caps.llm_access(),
                     )

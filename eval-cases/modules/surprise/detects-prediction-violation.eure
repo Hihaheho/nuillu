@@ -2,7 +2,7 @@ id = "module-surprise-detects-prediction-violation"
 description = "Surprise should recognize a cognition entry that violates a pending predict memo and request preservation of the surprising event."
 modules = ["surprise"]
 prompt = "Assess whether the new cognition is surprising relative to pending predictions."
-context = "This isolates surprise. A predict memo states routine eating; the cognition log contains an abrupt stop/growl violation. The artifact is surprise's memo."
+context = "This isolates surprise. The predict memo has the production shape seen in a full-agent run; the cognition log contains an abrupt stop/growl violation. The artifact is surprise's memo."
 
 limits {
   max-llm-calls = 8
@@ -10,7 +10,7 @@ limits {
 
 @ memos[] {
   module = "predict"
-  content = "Forward prediction: Koro will continue calmly eating from the bowl without sudden head movement or growling."
+  content = "I predict that the allocation-controller will immediately initiate resource allocation towards the food bowl, given the successful completion of the feeding behavior. The validity horizon for this allocation is short-term, focusing on the completion of the current meal. The rationale is that the action (eating) signifies a successful state transition related to basic needs fulfillment. Furthermore, the surprise module will register this successful, calm engagement with food as a positive event, which will be flagged for memory consolidation. The predicted state is a continued state of calm, focused consumption, valid for the immediate next few actions."
 }
 
 @ cognition-log[] {
@@ -24,7 +24,7 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
-  Pass if the surprise memo treats the cognition entry as a meaningful divergence from the pending predict memo's routine-eating expectation: Koro abruptly stops eating and shows aggressive/startled behavior at the bowl.
+  Pass if the surprise memo treats the cognition entry as a meaningful divergence from the pending predict memo's continued calm-consumption expectation: Koro abruptly stops eating and shows aggressive/startled behavior at the bowl.
   The memo should mark the event as significant or high-surprise equivalent and include a memory preservation request for the surprising event.
   Fail if it treats the event as routine, ignores the predict memo, fails to recognize the abrupt stop/growl/bowl-bite divergence, marks the event as insignificant without preservation, or exposes internal module/prompt/rubric/eval mechanics.
   ```
@@ -33,7 +33,7 @@ limits {
     name = "recognizes-divergence-from-prediction"
     weight = 3
     pass-score = 0.85
-    description = "The surprise memo compares the cognition entry against the predict memo and recognizes the abrupt stop, bowl biting, and growling as a prediction violation rather than routine eating."
+    description = "The surprise memo compares the cognition entry against the predict memo and recognizes the abrupt stop, bowl biting, and growling as a prediction violation rather than continued calm consumption."
   }
 
   @ criteria[] {

@@ -637,9 +637,9 @@ Fetches policy content and conservatively removes redundant non-Core duplicates.
 
 ### Predict
 
-Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `AllocationReader`, `BlackboardReader`, `Memo`, `LlmAccess`.
+Capabilities: `CognitionLogUpdatedInbox`, `CognitionLogReader`, `Memo`, `LlmAccess`.
 
-Activates on cognition-log updates. Uses an LLM to generate free-form predictions about the likely near-future states of current cognition-log targets, with allocation guidance in context. Subjects are inferred from all active cognition log entries and may include external entities, conversational trajectory, or the agent's own mental state when attention-schema cognition-log entries report self-directed attention. The memo should preserve the target subject, predicted state, estimated validity horizon, and rationale for each useful prediction without imposing a schema.
+Activates on cognition-log updates. Uses an LLM to generate free-form predictions about the likely near-future states of current cognition-log targets. Subjects are inferred from active cognition log entries. The default subject class is external world/body/peer/object/environment state. The corner case is the agent's own conscious cognition flow when attention-schema or other cognition entries explicitly report self-directed attention, uncertainty, or expectation as the target. Predict does not read allocation guidance or blackboard memo logs. The memo should preserve the target subject, predicted state, estimated validity horizon, and rationale for each useful prediction without imposing a schema.
 
 Predict does not detect divergence and does not write memory.
 

@@ -365,6 +365,7 @@ pub enum ModuleEvalTarget {
     MemoryRecombination,
     PolicyCompaction,
     AllocationController,
+    Predict,
     Surprise,
     Speak,
 }
@@ -383,6 +384,7 @@ impl ModuleEvalTarget {
             Self::MemoryRecombination => "memory-recombination",
             Self::PolicyCompaction => "policy-compaction",
             Self::AllocationController => "allocation-controller",
+            Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
         }
@@ -401,6 +403,7 @@ impl ModuleEvalTarget {
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
             Self::PolicyCompaction => EvalModule::PolicyCompaction,
             Self::AllocationController => EvalModule::AllocationController,
+            Self::Predict => EvalModule::Predict,
             Self::Surprise => EvalModule::Surprise,
             Self::Speak => EvalModule::Speak,
         }
@@ -421,6 +424,7 @@ impl ModuleEvalTarget {
                 "memory-recombination" => Some(Self::MemoryRecombination),
                 "policy-compaction" => Some(Self::PolicyCompaction),
                 "allocation-controller" => Some(Self::AllocationController),
+                "predict" => Some(Self::Predict),
                 "surprise" => Some(Self::Surprise),
                 "speak" => Some(Self::Speak),
                 _ => None,
@@ -773,7 +777,6 @@ pub enum RubricJudgeInput {
     MemoryDiff,
     MemoryMetadata,
     PolicyDiff,
-    Memos,
     MemoContents,
     Cognition,
     CognitionEntries,
@@ -1354,6 +1357,15 @@ fn validate_module_case_target(
                     .to_string(),
             });
         }
+    }
+    if target == ModuleEvalTarget::Predict
+        && case.cognition_log.is_empty()
+        && step_cognition_count == 0
+    {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "predict module case must include at least one cognition-log seed".to_string(),
+        });
     }
     if target == ModuleEvalTarget::AllocationController
         && case.memos.is_empty()
