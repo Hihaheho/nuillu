@@ -72,6 +72,8 @@ pub struct ModelDefinition {
     pub use_responses_api: Option<bool>,
     #[eure(default)]
     pub max_concurrent_llm_calls: Option<u64>,
+    #[eure(default)]
+    pub compaction_input_token_threshold: Option<u64>,
 }
 
 impl ModelDefinition {
@@ -306,6 +308,7 @@ fn resolve_tier(
     let use_responses_api = definition.use_responses_api.unwrap_or(false);
     let compaction_input_token_threshold = binding
         .compaction_input_token_threshold
+        .or(definition.compaction_input_token_threshold)
         .or(global_compaction)
         .unwrap_or(DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD);
 
@@ -461,6 +464,14 @@ fn validate_model_definition(
                 message: format!("{prefix}.max-concurrent-llm-calls must fit in usize"),
             });
         }
+    }
+    if definition.compaction_input_token_threshold == Some(0) {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: format!(
+                "{prefix}.compaction-input-token-threshold must be greater than zero when set"
+            ),
+        });
     }
     Ok(())
 }
@@ -765,5 +776,96 @@ premium {
 
         let resolved = resolve_llm_backends(&model_set).unwrap();
         assert_eq!(resolved.cheap.compaction_input_token_threshold, 4096);
+    }
+
+    #[test]
+    fn model_compaction_threshold_applies_via_tier_ref() {
+        let model_set = parse_model_set(
+            r#"
+compaction-input-token-threshold = 8192
+
+models {
+  gemma4-e4b {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    compaction-input-token-threshold = 3000
+  }
+
+  gemma4-e2b {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e2b"
+  }
+}
+
+cheap-model = "gemma4-e2b"
+default-model = "gemma4-e4b"
+premium-model = "gemma4-e4b"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(resolved.cheap.compaction_input_token_threshold, 8192);
+        assert_eq!(resolved.default.compaction_input_token_threshold, 3000);
+        assert_eq!(resolved.premium.compaction_input_token_threshold, 3000);
+    }
+
+    #[test]
+    fn tier_compaction_threshold_overrides_model_definition() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    compaction-input-token-threshold = 3000
+  }
+}
+
+cheap {
+  model = "gemma4"
+  compaction-input-token-threshold = 4096
+}
+
+default {
+  model = "gemma4"
+}
+
+premium {
+  model = "gemma4"
+}
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(resolved.cheap.compaction_input_token_threshold, 4096);
+        assert_eq!(resolved.default.compaction_input_token_threshold, 3000);
+    }
+
+    #[test]
+    fn rejects_zero_compaction_threshold_on_model() {
+        let error = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    compaction-input-token-threshold = 0
+  }
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("models.gemma4.compaction-input-token-threshold must be greater than zero")
+        ));
     }
 }
