@@ -4,6 +4,7 @@ pub mod cognition;
 pub mod errors;
 pub mod memories;
 pub mod memos;
+pub mod module_filter;
 pub mod modules;
 pub mod text;
 pub mod window;
@@ -12,7 +13,7 @@ pub use eframe;
 pub use egui;
 pub use egui_hooks;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use nuillu_module::RuntimeEvent;
@@ -298,12 +299,22 @@ pub struct RuntimeTab {
     logs: VecDeque<String>,
     window_open: BTreeMap<String, bool>,
     window_requests: BTreeMap<String, bool>,
+    memos_module_filter: module_filter::ModuleFilterState,
+    llm_turns_module_filter: module_filter::ModuleFilterState,
 }
 
 #[derive(Debug, Clone)]
 struct ViewWindowSpec {
     id: String,
     title: String,
+    default_open: bool,
+    kind: ViewWindowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewWindowKind {
+    Normal,
+    Module,
 }
 
 impl RuntimeTab {
@@ -321,6 +332,8 @@ impl RuntimeTab {
             logs: VecDeque::new(),
             window_open: BTreeMap::new(),
             window_requests: BTreeMap::new(),
+            memos_module_filter: module_filter::ModuleFilterState::default(),
+            llm_turns_module_filter: module_filter::ModuleFilterState::default(),
         }
     }
 
@@ -337,8 +350,19 @@ impl RuntimeTab {
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         let specs = self.window_specs();
         ui.menu_button("View", |ui| {
+            if specs.iter().any(|spec| spec.kind == ViewWindowKind::Module) {
+                if ui.button("Close all module windows").clicked() {
+                    self.close_all_module_windows();
+                    ui.close();
+                }
+                ui.separator();
+            }
             for spec in specs {
-                let mut open = self.window_open.get(&spec.id).copied().unwrap_or(true);
+                let mut open = self
+                    .window_open
+                    .get(&spec.id)
+                    .copied()
+                    .unwrap_or(spec.default_open);
                 ui.horizontal(|ui| {
                     if ui.add(egui::Checkbox::without_text(&mut open)).changed() {
                         self.window_requests.insert(spec.id.clone(), open);
@@ -362,43 +386,81 @@ impl RuntimeTab {
             ViewWindowSpec {
                 id: format!("{base}:chat"),
                 title: format!("💬 Chat - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:blackboard"),
                 title: format!("🧾 Blackboard - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:memories"),
                 title: format!("🧠 Memory - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:memos"),
                 title: format!("📝 Memo - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
+            },
+            ViewWindowSpec {
+                id: format!("{base}:llm-turns"),
+                title: format!("LLM Turns - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:cognition"),
                 title: format!("🧩 Cognition Log - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:errors"),
                 title: format!("Errors - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:logs"),
                 title: format!("📜 Logs - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:modules"),
                 title: format!("Modules - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
             },
         ];
         for module in self.modules.iter() {
             specs.push(ViewWindowSpec {
                 id: format!("{base}:module:{}", module.owner),
                 title: modules::window_title(module),
+                default_open: false,
+                kind: ViewWindowKind::Module,
             });
         }
         specs
+    }
+
+    fn module_window_ids(&self) -> Vec<String> {
+        let base = self.id.as_str();
+        self.modules
+            .iter()
+            .map(|module| format!("{base}:module:{}", module.owner))
+            .collect()
+    }
+
+    fn close_all_module_windows(&mut self) {
+        for id in self.module_window_ids() {
+            self.window_requests.insert(id, false);
+        }
     }
 
     fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
@@ -436,12 +498,37 @@ impl RuntimeTab {
 
         let memos_id = format!("{base}:memos");
         let memos_title = format!("📝 Memo - {}", self.title);
+        let memo_filter_modules = self.memo_filter_modules();
         let open = window::PersistedWindow::new(&memos_id, &memos_title)
             .open_override(window_requests.remove(&memos_id))
             .default_pos(840.0, 636.0)
             .default_size(520.0, 360.0)
-            .show(ui, |ui| memos::ui(ui, &self.blackboard.memos));
+            .show(ui, |ui| {
+                memos::ui(
+                    ui,
+                    &self.blackboard.memos,
+                    &mut self.memos_module_filter,
+                    &memo_filter_modules,
+                )
+            });
         self.record_window_open(memos_id, open);
+
+        let llm_turns_id = format!("{base}:llm-turns");
+        let llm_turns_title = format!("LLM Turns - {}", self.title);
+        let llm_turns_filter_modules = self.modules.module_names();
+        let open = window::PersistedWindow::new(&llm_turns_id, &llm_turns_title)
+            .open_override(window_requests.remove(&llm_turns_id))
+            .default_pos(1384.0, 88.0)
+            .default_size(640.0, 520.0)
+            .show(ui, |ui| {
+                modules::render_llm_turns(
+                    ui,
+                    &self.modules,
+                    &mut self.llm_turns_module_filter,
+                    &llm_turns_filter_modules,
+                )
+            });
+        self.record_window_open(llm_turns_id, open);
 
         let cognition_id = format!("{base}:cognition");
         let cognition_title = format!("🧩 Cognition Log - {}", self.title);
@@ -529,6 +616,7 @@ impl RuntimeTab {
                 };
                 window::PersistedWindow::new(&module_id, &module_title)
                     .open_override(requested)
+                    .default_open(false)
                     .default_pos(x, y)
                     .default_size(420.0, 360.0)
                     .show(ui, |ui| {
@@ -541,6 +629,16 @@ impl RuntimeTab {
 
     fn record_window_open(&mut self, id: String, open: bool) {
         self.window_open.insert(id, open);
+    }
+
+    fn memo_filter_modules(&self) -> Vec<String> {
+        self.modules
+            .module_names()
+            .into_iter()
+            .chain(self.blackboard.memos.iter().map(|memo| memo.module.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn push_log(&mut self, message: String) {
@@ -719,9 +817,50 @@ mod tests {
                 .iter()
                 .any(|spec| { spec.id == "case-1:modules" && spec.title == "Modules - Case 1" })
         );
-        assert!(specs.iter().any(|spec| {
-            spec.id == "case-1:module:sensory" && spec.title == "Module - sensory"
-        }));
+        assert!(
+            specs.iter().any(|spec| {
+                spec.id == "case-1:llm-turns" && spec.title == "LLM Turns - Case 1"
+            })
+        );
+        let module_spec = specs
+            .iter()
+            .find(|spec| spec.id == "case-1:module:sensory")
+            .expect("module window spec exists");
+        assert_eq!(module_spec.title, "Module - sensory");
+        assert!(!module_spec.default_open);
+        assert_eq!(module_spec.kind, ViewWindowKind::Module);
+    }
+
+    #[test]
+    fn close_all_module_windows_requests_only_module_windows_closed() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        state.apply(VisualizerEvent::LlmObserved {
+            tab_id: tab_id.clone(),
+            event: LlmObservationEvent::ModelInput {
+                turn_id: "turn-1".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        });
+        let tab = state.tabs.get_mut(&tab_id).expect("tab exists");
+
+        tab.close_all_module_windows();
+
+        assert_eq!(
+            tab.window_requests.get("case-1:module:sensory"),
+            Some(&false)
+        );
+        assert!(!tab.window_requests.contains_key("case-1:memos"));
     }
 
     #[test]

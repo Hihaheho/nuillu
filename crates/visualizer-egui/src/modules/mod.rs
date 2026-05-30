@@ -20,7 +20,8 @@ use nuillu_module::RuntimeEvent;
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
     LlmObservationSource, LlmUsageView, MemoView, ModulePolicyView, ModuleSettingsView,
-    ModuleStatusView, ZeroReplicaWindowView, memos,
+    ModuleStatusView, ZeroReplicaWindowView, memos, module_filter,
+    module_filter::ModuleFilterState,
     text::{hard_wrap_long_segments, wrapped_label},
 };
 
@@ -28,6 +29,7 @@ use crate::{
 pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
     turn_to_owner: BTreeMap<String, String>,
+    turn_order: Vec<String>,
 }
 
 impl ModulesState {
@@ -37,6 +39,15 @@ impl ModulesState {
 
     pub fn get(&self, owner: &str) -> Option<&ModuleState> {
         self.modules.get(owner)
+    }
+
+    pub fn module_names(&self) -> Vec<String> {
+        self.modules
+            .values()
+            .map(module_name)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -88,6 +99,16 @@ pub struct LlmOutputItemState {
     pub content: String,
     pub streaming: bool,
     pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmTurnListRow {
+    pub owner: String,
+    pub module: String,
+    pub turn_id: String,
+    pub turn_number: usize,
+    pub label: String,
+    pub streaming: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -227,7 +248,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             items,
             ..
         } => {
-            state.turn_to_owner.insert(turn_id.clone(), owner.clone());
+            record_turn_owner(state, &turn_id, &owner);
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
@@ -248,7 +269,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             model,
             ..
         } => {
-            state.turn_to_owner.insert(turn_id.clone(), owner.clone());
+            record_turn_owner(state, &turn_id, &owner);
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
@@ -489,6 +510,50 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState, memos: &[MemoView]
     }
 }
 
+pub fn render_llm_turns(
+    ui: &mut egui::Ui,
+    state: &ModulesState,
+    filter: &mut ModuleFilterState,
+    modules: &[String],
+) {
+    module_filter::render_module_filter(ui, "llm-turns-module-filter", filter, modules);
+    ui.separator();
+
+    let rows = llm_turn_rows(state, |module| filter.is_selected(module));
+    let persisted_selection = ui.use_persisted_state(|| String::new(), "llm-turns-selection");
+    let mut selected_turn_id = selected_llm_turn_id(persisted_selection.as_str(), &rows);
+
+    let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
+    ui.horizontal(|ui| {
+        ui.set_min_height(body_height);
+        ui.vertical(|ui| {
+            ui.set_width(220.0);
+            ui.strong("Turns");
+            ui.separator();
+            render_llm_turn_selector(ui, &rows, &mut selected_turn_id);
+        });
+
+        ui.separator();
+
+        ui.vertical(|ui| {
+            ui.set_min_width((ui.available_width() - 8.0).max(300.0));
+            if rows.is_empty() {
+                ui.label("No LLM turns yet.");
+            } else if let Some(turn_id) = selected_turn_id.as_deref()
+                && let Some((turn_index, module, turn)) = turn_by_id(state, turn_id)
+            {
+                render_active_turn(ui, module, turn_index, turn);
+            } else {
+                ui.label("Select a turn.");
+            }
+        });
+    });
+
+    if selected_turn_id.as_deref().unwrap_or_default() != persisted_selection.as_str() {
+        persisted_selection.set_next(selected_turn_id.unwrap_or_default());
+    }
+}
+
 pub fn window_title(module: &ModuleState) -> String {
     format!("Module - {}", module.owner)
 }
@@ -521,6 +586,28 @@ fn render_module_selector(
                         .on_hover_text(turn_selector_hover(turn));
                     if response.clicked() {
                         *next_panel = panel_id;
+                    }
+                });
+            }
+        });
+}
+
+fn render_llm_turn_selector(
+    ui: &mut egui::Ui,
+    rows: &[LlmTurnListRow],
+    selected_turn_id: &mut Option<String>,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("llm-turn-panel-list")
+        .show(ui, |ui| {
+            for (index, row) in rows.iter().enumerate() {
+                let selected = selected_turn_id.as_deref() == Some(row.turn_id.as_str());
+                ui.push_id(("llm-turn-row", index, row.turn_id.as_str()), |ui| {
+                    let response = ui
+                        .selectable_label(selected, &row.label)
+                        .on_hover_text(llm_turn_row_hover(row));
+                    if response.clicked() {
+                        *selected_turn_id = Some(row.turn_id.clone());
                     }
                 });
             }
@@ -1363,6 +1450,61 @@ fn module_memos<'a>(module: &ModuleState, memos: &'a [MemoView]) -> Vec<&'a Memo
         .collect()
 }
 
+pub fn llm_turn_rows(
+    state: &ModulesState,
+    module_selected: impl Fn(&str) -> bool,
+) -> Vec<LlmTurnListRow> {
+    state
+        .turn_order
+        .iter()
+        .filter_map(|turn_id| {
+            let owner = state.turn_to_owner.get(turn_id)?;
+            let module = state.modules.get(owner)?;
+            let turn_index = module
+                .turns
+                .iter()
+                .position(|turn| turn.turn_id == *turn_id)?;
+            let turn = &module.turns[turn_index];
+            let module_name = module_name(module);
+            module_selected(&module_name).then(|| {
+                let streaming = turn_is_streaming(turn);
+                LlmTurnListRow {
+                    owner: module.owner.clone(),
+                    module: module_name,
+                    turn_id: turn.turn_id.clone(),
+                    turn_number: turn_index + 1,
+                    label: llm_turn_row_label(
+                        module_turn_label_module(module),
+                        turn_index,
+                        streaming,
+                    ),
+                    streaming,
+                }
+            })
+        })
+        .collect()
+}
+
+pub fn selected_llm_turn_id(selected: &str, rows: &[LlmTurnListRow]) -> Option<String> {
+    if rows.iter().any(|row| row.turn_id == selected) {
+        return Some(selected.to_string());
+    }
+    rows.first().map(|row| row.turn_id.clone())
+}
+
+fn turn_by_id<'a>(
+    state: &'a ModulesState,
+    turn_id: &str,
+) -> Option<(usize, &'a ModuleState, &'a LlmTurnState)> {
+    let owner = state.turn_to_owner.get(turn_id)?;
+    let module = state.modules.get(owner)?;
+    let turn_index = module
+        .turns
+        .iter()
+        .position(|turn| turn.turn_id == turn_id)?;
+    Some((turn_index, module, &module.turns[turn_index]))
+}
+
 fn selected_module_panel(module: &ModuleState, persisted: &str) -> String {
     if persisted == MODULE_MEMOS_SELECTION {
         return MODULE_MEMOS_SELECTION.to_string();
@@ -1405,6 +1547,45 @@ fn turn_selector_hover(turn: &LlmTurnState) -> String {
 
 fn turn_usage_tokens(usage: &LlmUsageView) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
+}
+
+fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) {
+    if !state.turn_to_owner.contains_key(turn_id) {
+        state.turn_order.push(turn_id.to_string());
+    }
+    state
+        .turn_to_owner
+        .insert(turn_id.to_string(), owner.to_string());
+}
+
+fn module_turn_label_module(module: &ModuleState) -> String {
+    if module.replica == 0 {
+        module_name(module)
+    } else {
+        module.owner.clone()
+    }
+}
+
+fn llm_turn_row_label(module: String, turn_index: usize, streaming: bool) -> String {
+    let label = format!("{module} {} turn", turn_index + 1);
+    if streaming {
+        format!("* {label}")
+    } else {
+        label
+    }
+}
+
+fn llm_turn_row_hover(row: &LlmTurnListRow) -> String {
+    let status = if row.streaming {
+        "streaming"
+    } else {
+        "not streaming"
+    };
+    format!("{} {} ({status})", row.owner, row.turn_id)
+}
+
+fn turn_is_streaming(turn: &LlmTurnState) -> bool {
+    turn.status == ModuleSessionStatus::Running || turn.output.iter().any(|item| item.streaming)
 }
 
 fn ensure_turn(
@@ -1945,6 +2126,111 @@ mod tests {
 
         assert_eq!(turn_selector_label(0, &turn), "turn 1 (5)");
         assert!(turn_selector_hover(&turn).contains("tokens: 5"));
+    }
+
+    #[test]
+    fn llm_turn_rows_follow_first_seen_order_and_mark_streaming() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "sensory-turn".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Completed {
+                turn_id: "sensory-turn".to_string(),
+                request_id: None,
+                finish_reason: "stop".to_string(),
+                usage: LlmUsageView {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "memory-turn".to_string(),
+                owner: "memory".to_string(),
+                module: "memory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        let rows = llm_turn_rows(&state, |_| true);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sensory-turn", "memory-turn"]
+        );
+        assert_eq!(rows[0].label, "sensory 1 turn");
+        assert!(!rows[0].streaming);
+        assert_eq!(rows[1].label, "* memory 1 turn");
+        assert!(rows[1].streaming);
+    }
+
+    #[test]
+    fn llm_turn_rows_filter_by_module_and_selection_falls_back() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "sensory-turn".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "memory-turn".to_string(),
+                owner: "memory".to_string(),
+                module: "memory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        let rows = llm_turn_rows(&state, |module| module == "memory");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id, "memory-turn");
+        assert_eq!(
+            selected_llm_turn_id("sensory-turn", &rows),
+            Some("memory-turn".to_string())
+        );
+        assert_eq!(
+            selected_llm_turn_id("memory-turn", &rows),
+            Some("memory-turn".to_string())
+        );
+        assert_eq!(selected_llm_turn_id("memory-turn", &[]), None);
     }
 
     #[test]
