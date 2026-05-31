@@ -67,6 +67,7 @@ fn register_server_module(
                     caps.memo(),
                     caps.clock(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -79,6 +80,7 @@ fn register_server_module(
                     caps.cognition_writer(),
                     caps.time_division(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -95,6 +97,7 @@ fn register_server_module(
                     caps.allocation_writer(voluntary.clone(), Vec::new()),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -108,6 +111,7 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.cognition_writer(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -120,6 +124,7 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -134,6 +139,7 @@ fn register_server_module(
                     memory_caps.content_reader(),
                     caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -147,6 +153,7 @@ fn register_server_module(
                     memory_caps.writer(),
                     memory_caps.retriever(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -200,6 +207,7 @@ fn register_server_module(
                     caps.interoception_policy(),
                     caps.interoception_writer(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -227,6 +235,7 @@ fn register_server_module(
                     caps.memo(),
                     consideration_writer,
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -255,6 +264,7 @@ fn register_server_module(
                     policy_caps.upserter(),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -265,6 +275,7 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }
@@ -278,6 +289,7 @@ fn register_server_module(
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 )
             })
         }

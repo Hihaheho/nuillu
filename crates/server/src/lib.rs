@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod environment;
 pub mod gui;
+pub mod llm_db_trace;
 pub mod llm_observer;
 pub mod model_set;
 pub mod registry;

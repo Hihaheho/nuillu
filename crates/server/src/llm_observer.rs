@@ -422,7 +422,7 @@ fn emit_structured_completion_stream_event(
     }
 }
 
-fn model_input_views(items: &[ModelInputItem]) -> Vec<LlmInputItemView> {
+pub(crate) fn model_input_views(items: &[ModelInputItem]) -> Vec<LlmInputItemView> {
     let mut output = Vec::new();
     for item in items {
         match item {
@@ -566,14 +566,14 @@ fn turn_role_label(role: TurnRole) -> &'static str {
     }
 }
 
-fn observation_source(source: LlmRequestSource) -> LlmObservationSource {
+pub(crate) fn observation_source(source: LlmRequestSource) -> LlmObservationSource {
     match source {
         LlmRequestSource::ModuleTurn => LlmObservationSource::ModuleTurn,
         LlmRequestSource::SessionCompaction => LlmObservationSource::SessionCompaction,
     }
 }
 
-fn operation_kind_label(kind: OperationKind) -> &'static str {
+pub(crate) fn operation_kind_label(kind: OperationKind) -> &'static str {
     match kind {
         OperationKind::TextTurn => "text_turn",
         OperationKind::StructuredTurn => "structured_turn",
@@ -582,7 +582,7 @@ fn operation_kind_label(kind: OperationKind) -> &'static str {
     }
 }
 
-fn usage_view(usage: Usage) -> LlmUsageView {
+pub(crate) fn usage_view(usage: Usage) -> LlmUsageView {
     LlmUsageView {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,

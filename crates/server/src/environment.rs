@@ -9,7 +9,9 @@ use lutum::{
     SharedPoolBudgetOptions,
 };
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
-use lutum_libsql_adapter::{EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig};
+use lutum_libsql_adapter::{
+    EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlLlmTranscriptStore,
+};
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
@@ -31,6 +33,7 @@ use nuillu_visualizer_protocol::{
 use super::SERVER_TAB_ID;
 use super::config::{EmbeddingBackendConfig, LlmBackendConfig, ServerConfig};
 use super::gui::VisualizerEventSink;
+use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
 
 pub(super) struct ServerEnvironment {
@@ -41,6 +44,7 @@ pub(super) struct ServerEnvironment {
     pub(super) policy_caps: PolicyCapabilities,
     pub(super) clock: Rc<dyn Clock>,
     pub(super) utterance_sink: Rc<dyn UtteranceSink>,
+    pub(super) llm_transcript_store: LibsqlLlmTranscriptStore,
 }
 
 pub(super) async fn build_server_environment(
@@ -62,6 +66,10 @@ pub(super) async fn build_server_environment(
     let agent_store = connect_agent_store(config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
+    let session_store = Rc::new(agent_store.session_store());
+    let llm_transcript_store = agent_store.llm_transcript_store();
+    let db_trace_sink =
+        DbLlmTraceSink::new(config.session_id.clone(), llm_transcript_store.clone());
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
@@ -75,11 +83,13 @@ pub(super) async fn build_server_environment(
                 &llm_concurrency_pool,
                 Some(llm_observer),
                 Some(server_llm_log_context(config)),
+                Some(db_trace_sink),
             )?,
         },
         runtime: CapabilityProviderRuntime {
             event_sink,
             policy: server_runtime_policy(config),
+            session_store,
         },
     });
 
@@ -109,6 +119,7 @@ pub(super) async fn build_server_environment(
         policy_caps,
         clock,
         utterance_sink,
+        llm_transcript_store,
     })
 }
 
@@ -188,12 +199,25 @@ pub fn build_tiers(
     pool: &LlmConcurrencyPool,
     llm_observer: Option<VisualizerLlmObserver>,
     llm_log_context: Option<LlmLogContext>,
+    db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<LutumTiers> {
     let file_trace_sink = llm_log_context.map(FileLlmTraceSink::new);
     Ok(LutumTiers {
-        cheap: build_tier_handle(cheap, pool, llm_observer.clone(), file_trace_sink.clone())?,
-        default: build_tier_handle(default, pool, llm_observer.clone(), file_trace_sink.clone())?,
-        premium: build_tier_handle(premium, pool, llm_observer, file_trace_sink)?,
+        cheap: build_tier_handle(
+            cheap,
+            pool,
+            llm_observer.clone(),
+            file_trace_sink.clone(),
+            db_trace_sink.clone(),
+        )?,
+        default: build_tier_handle(
+            default,
+            pool,
+            llm_observer.clone(),
+            file_trace_sink.clone(),
+            db_trace_sink.clone(),
+        )?,
+        premium: build_tier_handle(premium, pool, llm_observer, file_trace_sink, db_trace_sink)?,
     })
 }
 
@@ -202,8 +226,9 @@ fn build_tier_handle(
     pool: &LlmConcurrencyPool,
     llm_observer: Option<VisualizerLlmObserver>,
     file_trace_sink: Option<FileLlmTraceSink>,
+    db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<LlmTierHandle> {
-    let lutum = build_lutum_with_file_trace(config, llm_observer, file_trace_sink)?;
+    let lutum = build_lutum_with_file_trace(config, llm_observer, file_trace_sink, db_trace_sink)?;
     let concurrency = pool.limiter_for(&config.model_key, config.max_concurrent_llm_calls);
     Ok(LlmTierHandle::new(
         lutum,
@@ -217,21 +242,23 @@ pub fn build_model_handle(
     pool: &LlmConcurrencyPool,
     llm_observer: Option<VisualizerLlmObserver>,
     file_trace_sink: Option<FileLlmTraceSink>,
+    db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<LlmTierHandle> {
-    build_tier_handle(config, pool, llm_observer, file_trace_sink)
+    build_tier_handle(config, pool, llm_observer, file_trace_sink, db_trace_sink)
 }
 
 pub fn build_lutum(
     config: &LlmBackendConfig,
     llm_observer: Option<VisualizerLlmObserver>,
 ) -> anyhow::Result<Lutum> {
-    build_lutum_with_file_trace(config, llm_observer, None)
+    build_lutum_with_file_trace(config, llm_observer, None, None)
 }
 
 pub fn build_lutum_with_file_trace(
     config: &LlmBackendConfig,
     llm_observer: Option<VisualizerLlmObserver>,
     file_trace_sink: Option<FileLlmTraceSink>,
+    db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<Lutum> {
     let adapter = OpenAiAdapter::new(config.token.clone())
         .with_base_url(config.endpoint.clone())
@@ -248,6 +275,9 @@ pub fn build_lutum_with_file_trace(
     )
     .with_extension(RawTelemetryConfig::all());
     if let Some(sink) = file_trace_sink {
+        lutum.extend_hooks(sink.hook_set());
+    }
+    if let Some(sink) = db_trace_sink {
         lutum.extend_hooks(sink.hook_set());
     }
     if let Some(observer) = llm_observer {

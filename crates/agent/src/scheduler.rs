@@ -1498,13 +1498,18 @@ async fn activate_with_retries(
             replica = owner.replica.get(),
             retry = retries,
         );
-        match with_activation_llm_request_metadata(
+        let activation_result = with_activation_llm_request_metadata(
             activation_attempt,
             batch,
             module.activate(&cx, batch).instrument(activation_span),
         )
-        .await
-        {
+        .await;
+        if let Err(error) = runtime.flush_sessions_for(&owner).await {
+            let message = format!("module session flush failed: {error}");
+            tracing::warn!(owner = %owner, error = ?error, "module session flush failed");
+            runtime.record_module_task_failed(owner.clone(), "session-flush", message);
+        }
+        match activation_result {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {
                 retries = retries.saturating_add(1);

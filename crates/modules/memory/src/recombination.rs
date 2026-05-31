@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{ModelInput, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionWriter, InteroceptiveUpdatedInbox, LlmAccess,
     Module, render_memory_for_llm,
@@ -114,20 +114,20 @@ impl MemoryRecombinationModule {
             .collect::<Vec<_>>();
         self.memory.record_accesses(&targets).await;
 
-        let mut session = Session::new();
-        session.push_system(nuillu_module::format_system_prompt(
-            SYSTEM_PROMPT,
-            cx.peer_contexts(),
-            &self.owner,
-            cx.identity_memories(),
-            cx.core_policies(),
-            cx.now(),
-        ));
-        session.push_user(format_recombination_context(cx, &recent, &related));
+        let mut input = ModelInput::new()
+            .system(nuillu_module::format_system_prompt(
+                SYSTEM_PROMPT,
+                cx.peer_contexts(),
+                &self.owner,
+                cx.identity_memories(),
+                cx.core_policies(),
+                cx.now(),
+            ))
+            .user(format_recombination_context(cx, &recent, &related));
 
         let lutum = self.llm.lutum().await;
-        let outcome = session
-            .text_turn(&lutum)
+        let outcome = lutum
+            .text_turn(input.clone())
             .tools::<RecombinationTools>()
             .available_tools([RecombinationToolsSelector::AppendRecombination])
             .collect()
@@ -151,7 +151,7 @@ impl MemoryRecombinationModule {
             );
         }
         round
-            .commit(&mut session, results)
+            .commit_into(&mut input, results)
             .context("commit memory-recombination tool round")?;
         Ok(())
     }

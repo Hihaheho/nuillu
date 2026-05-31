@@ -3,14 +3,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::StructuredTurnOutcome;
 use nuillu_blackboard::{
     AllocationCommand, AllocationEffectLevel, CognitionLogEntryRecord, InteroceptiveMode,
     InteroceptivePatch, InteroceptiveState, MemoLogRecord,
 };
 use nuillu_module::{
     AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox, InteroceptionRuntimePolicy,
-    InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module,
+    InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module, ModuleSession,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -82,7 +82,7 @@ pub struct InteroceptionModule {
     interoception: InteroceptiveWriter,
     policy: InteroceptionRuntimePolicy,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     last_seen_cognition_index: Option<u64>,
     last_total_remember_tokens: Option<u32>,
     last_activity_at: Option<DateTime<Utc>>,
@@ -97,6 +97,7 @@ impl InteroceptionModule {
         policy: InteroceptionRuntimePolicy,
         interoception: InteroceptiveWriter,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             memo_updates,
@@ -106,7 +107,7 @@ impl InteroceptionModule {
             policy,
             interoception,
             llm,
-            session: Session::new(),
+            session,
             last_seen_cognition_index: None,
             last_total_remember_tokens: None,
             last_activity_at: None,
@@ -219,21 +220,23 @@ impl InteroceptionModule {
         unread_cognition: &[CognitionLogEntryRecord],
         allocation: &nuillu_blackboard::ResourceAllocation,
     ) -> Result<AffectAssessment> {
-        self.session.push_ephemeral_system(SYSTEM_PROMPT);
-        self.session.push_ephemeral_user(format!(
-            "Current interoceptive state:\n{}\n\nUnread memos:\n{}\n\nUnread cognition:\n{}\n\nCurrent allocation:\n{}",
-            serde_json::to_string(current).unwrap_or_default(),
-            serde_json::to_string(unread_memos).unwrap_or_default(),
-            serde_json::to_string(unread_cognition).unwrap_or_default(),
-            serde_json::to_string(allocation).unwrap_or_default(),
-        ));
         let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .structured_turn::<AffectAssessment>(&lutum)
-            .collect()
-            .await
-            .context("interoception structured turn failed")?;
+        let result = {
+            let mut session = self.session.borrow_mut();
+            session.push_ephemeral_system(SYSTEM_PROMPT);
+            session.push_ephemeral_user(format!(
+                "Current interoceptive state:\n{}\n\nUnread memos:\n{}\n\nUnread cognition:\n{}\n\nCurrent allocation:\n{}",
+                serde_json::to_string(current).unwrap_or_default(),
+                serde_json::to_string(unread_memos).unwrap_or_default(),
+                serde_json::to_string(unread_cognition).unwrap_or_default(),
+                serde_json::to_string(allocation).unwrap_or_default(),
+            ));
+            session
+                .structured_turn::<AffectAssessment>(&lutum)
+                .collect()
+                .await
+                .context("interoception structured turn failed")?
+        };
         let StructuredTurnOutcome::Structured(assessment) = result.semantic else {
             anyhow::bail!("interoception structured turn refused");
         };

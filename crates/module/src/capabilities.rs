@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
@@ -13,10 +13,11 @@ use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, Repli
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy};
-use crate::ports::{Clock, CognitionLogRepository};
+use crate::ports::{Clock, CognitionLogRepository, PortError};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::scene::{SceneReader, SceneRegistry};
+use crate::session::{ModuleSession, NoopSessionStore, SessionKey, SessionStore};
 use crate::tiers::{LlmTierHandle, LutumTiers};
 use crate::r#trait::ErasedModule;
 use crate::{
@@ -59,6 +60,8 @@ struct CapabilityProvidersInner {
     rate_limiter: RateLimiter,
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
+    session_store: Rc<dyn SessionStore>,
+    sessions: Rc<RefCell<Vec<ModuleSession>>>,
 }
 
 /// Required external services for the root capability provider set.
@@ -75,6 +78,7 @@ pub struct CapabilityProviderPorts {
 pub struct CapabilityProviderRuntime {
     pub event_sink: Rc<dyn RuntimeEventSink>,
     pub policy: RuntimePolicy,
+    pub session_store: Rc<dyn SessionStore>,
 }
 
 impl Default for CapabilityProviderRuntime {
@@ -82,6 +86,7 @@ impl Default for CapabilityProviderRuntime {
         Self {
             event_sink: Rc::new(NoopRuntimeEventSink),
             policy: RuntimePolicy::default(),
+            session_store: Rc::new(NoopSessionStore),
         }
     }
 }
@@ -111,7 +116,11 @@ impl CapabilityProviders {
             clock,
             tiers,
         } = ports;
-        let CapabilityProviderRuntime { event_sink, policy } = runtime;
+        let CapabilityProviderRuntime {
+            event_sink,
+            policy,
+            session_store,
+        } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         Self {
@@ -175,6 +184,8 @@ impl CapabilityProviders {
                 rate_limiter,
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
+                session_store,
+                sessions: Rc::new(RefCell::new(Vec::new())),
             }),
         }
     }
@@ -257,7 +268,29 @@ impl CapabilityProviders {
             session_compaction_policy: self.inner.runtime_policy.session_compaction,
             runtime_events: self.inner.runtime_events.clone(),
             activation_gates: self.inner.activation_gates.clone(),
+            session_store: self.inner.session_store.clone(),
+            sessions: self.inner.sessions.clone(),
         }
+    }
+
+    async fn restore_sessions(&self) -> Result<(), ModuleRegistryError> {
+        let sessions = self.inner.sessions.borrow().clone();
+        for session in sessions {
+            let snapshot = self
+                .inner
+                .session_store
+                .load(session.owner(), session.key())
+                .await
+                .map_err(|source| ModuleRegistryError::SessionRestore {
+                    owner: session.owner().clone(),
+                    key: session.key().clone(),
+                    source,
+                })?;
+            if let Some(snapshot) = snapshot {
+                session.restore(snapshot);
+            }
+        }
+        Ok(())
     }
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
@@ -318,6 +351,8 @@ pub struct AgentRuntimeControl {
     session_compaction_policy: SessionCompactionPolicy,
     runtime_events: RuntimeEventEmitter,
     activation_gates: ActivationGateHub,
+    session_store: Rc<dyn SessionStore>,
+    sessions: Rc<RefCell<Vec<ModuleSession>>>,
 }
 
 impl AgentRuntimeControl {
@@ -499,6 +534,26 @@ impl AgentRuntimeControl {
         batch: ModuleBatch,
     ) -> Vec<tokio::sync::oneshot::Receiver<crate::ActivationGateVote>> {
         self.activation_gates.dispatch(target, batch).await
+    }
+
+    pub async fn flush_sessions_for(&self, owner: &ModuleInstanceId) -> Result<(), PortError> {
+        let sessions = self
+            .sessions
+            .borrow()
+            .iter()
+            .filter(|session| session.owner() == owner)
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            let Some(snapshot) = session.snapshot_if_dirty() else {
+                continue;
+            };
+            self.session_store
+                .save(session.owner(), session.key(), &snapshot)
+                .await?;
+            session.mark_clean();
+        }
+        Ok(())
     }
 }
 
@@ -692,6 +747,13 @@ impl ModuleCapabilityFactory {
             self.root.inner.runtime_events.clone(),
             self.root.inner.rate_limiter.clone(),
         )
+    }
+
+    pub fn session(&self, key: impl Into<String>) -> ModuleSession {
+        let key = SessionKey::new(key).expect("module session key must be valid kebab-case");
+        let session = ModuleSession::new(self.owner.clone(), key);
+        self.root.inner.sessions.borrow_mut().push(session.clone());
+        session
     }
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
@@ -1062,6 +1124,7 @@ impl ModuleRegistry {
                 })
                 .collect(),
         );
+        caps.inner.sessions.borrow_mut().clear();
 
         let mut modules = Vec::new();
         for registration in &self.registrations {
@@ -1075,6 +1138,7 @@ impl ModuleRegistry {
                 modules.push(AllocatedModule::new(owner, (registration.builder)(scoped)));
             }
         }
+        caps.restore_sessions().await?;
         Ok(AllocatedModules::new(
             caps.runtime_control(),
             modules,
@@ -1201,6 +1265,12 @@ pub enum ModuleRegistryError {
         cycle.iter().map(ModuleId::as_str).collect::<Vec<_>>().join(" -> ")
     )]
     DependencyCycle { cycle: Vec<ModuleId> },
+    #[error("failed to restore session {owner}/{key}: {source}")]
+    SessionRestore {
+        owner: ModuleInstanceId,
+        key: SessionKey,
+        source: PortError,
+    },
 }
 
 #[cfg(test)]
@@ -1218,6 +1288,7 @@ mod tests {
     use nuillu_types::{ReplicaCapRange, builtin};
 
     use crate::ports::{CognitionLogRepository, PortError, SystemClock};
+    use crate::session::PersistedSessionSnapshot;
     use crate::test_support::{scoped, test_caps};
 
     fn test_policy(replicas_range: std::ops::RangeInclusive<u8>) -> ModulePolicy {
@@ -1236,6 +1307,40 @@ mod tests {
     impl RecordingCognitionLogRepository {
         fn records(&self) -> Vec<(ModuleInstanceId, CognitionLogEntry)> {
             self.records.lock().expect("records mutex poisoned").clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSessionStore {
+        saves: Rc<RefCell<Vec<(ModuleInstanceId, SessionKey, PersistedSessionSnapshot)>>>,
+    }
+
+    impl RecordingSessionStore {
+        fn saves(&self) -> Vec<(ModuleInstanceId, SessionKey, PersistedSessionSnapshot)> {
+            self.saves.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SessionStore for RecordingSessionStore {
+        async fn load(
+            &self,
+            _owner: &ModuleInstanceId,
+            _key: &SessionKey,
+        ) -> Result<Option<PersistedSessionSnapshot>, PortError> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            owner: &ModuleInstanceId,
+            key: &SessionKey,
+            snapshot: &PersistedSessionSnapshot,
+        ) -> Result<(), PortError> {
+            self.saves
+                .borrow_mut()
+                .push((owner.clone(), key.clone(), snapshot.clone()));
+            Ok(())
         }
     }
 
@@ -1281,6 +1386,27 @@ mod tests {
             cognition_log_port,
             clock: Rc::new(SystemClock),
             tiers: LutumTiers::from_shared_lutum(lutum),
+        })
+    }
+
+    fn test_caps_with_session_store(
+        blackboard: Blackboard,
+        session_store: Rc<dyn SessionStore>,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(lutum::MockLlmAdapter::new());
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port: Rc::new(crate::ports::NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum),
+            },
+            runtime: CapabilityProviderRuntime {
+                session_store,
+                ..CapabilityProviderRuntime::default()
+            },
         })
     }
 
@@ -1431,6 +1557,31 @@ mod tests {
         let _w2 = cognition_gate.cognition_writer();
         let _a1 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
         let _a2 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
+    }
+
+    #[tokio::test]
+    async fn runtime_flushes_dirty_sessions_for_owner_and_marks_clean() {
+        let store = RecordingSessionStore::default();
+        let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
+        let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
+        let session = caps.scoped(owner.clone()).session("main");
+        session.borrow_mut().push_user("remember this");
+
+        caps.runtime_control()
+            .flush_sessions_for(&owner)
+            .await
+            .unwrap();
+        let saves = store.saves();
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].0, owner);
+        assert_eq!(saves[0].1, SessionKey::new("main").unwrap());
+        assert_eq!(saves[0].2.items.len(), 1);
+
+        caps.runtime_control()
+            .flush_sessions_for(&owner)
+            .await
+            .unwrap();
+        assert_eq!(store.saves().len(), 1);
     }
 
     #[tokio::test]

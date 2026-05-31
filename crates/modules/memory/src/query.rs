@@ -3,13 +3,12 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module,
+    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module, ModuleSession,
     SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
     compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
     memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
-    seed_persistent_faculty_session,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -207,8 +206,7 @@ pub struct QueryMemoryModule {
     linked_memory: MemoryContentReader,
     memo: TypedMemo<QueryMemoryMemo>,
     llm: LlmAccess,
-    session: Session,
-    session_seeded: bool,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
     pending_retrieval: QueryMemoryRetrieval,
@@ -224,6 +222,7 @@ impl QueryMemoryModule {
         linked_memory: MemoryContentReader,
         memo: TypedMemo<QueryMemoryMemo>,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -235,8 +234,7 @@ impl QueryMemoryModule {
             linked_memory,
             memo,
             llm,
-            session: Session::new(),
-            session_seeded: false,
+            session,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             pending_retrieval: QueryMemoryRetrieval::default(),
@@ -253,18 +251,10 @@ impl QueryMemoryModule {
         })
     }
 
-    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        if self.session_seeded {
-            return;
-        }
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        seed_persistent_faculty_session(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
-        self.session_seeded = true;
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -425,41 +415,46 @@ impl QueryMemoryModule {
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let prior_query_memory_searches = self.prior_query_memory_searches().await;
         let rank_counts = self
             .blackboard
             .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
-        self.session.push_user(format_memory_questions(questions));
-        if let Some(prior) = prior_query_memory_searches {
-            self.session.push_ephemeral_user(prior);
+        {
+            let mut session = self.session.borrow_mut();
+            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            session.push_user(format_memory_questions(questions));
+            if let Some(prior) = prior_query_memory_searches {
+                session.push_ephemeral_user(prior);
+            }
+            session.push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
         }
-        self.session
-            .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
         let mut retrieval = self.pending_retrieval.clone();
         let mut memo_written = false;
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
-            let outcome = self
-                .session
-                .text_turn(&lutum)
-                .tools::<QueryMemoryTools>()
-                .available_tools([
-                    QueryMemoryToolsSelector::SearchMemory,
-                    QueryMemoryToolsSelector::FetchLinkedMemories,
-                    QueryMemoryToolsSelector::WriteRetrievalMemo,
-                ])
-                .collect()
-                .await
-                .context("query-memory text turn failed")?;
+            let outcome = {
+                let mut session = self.session.borrow_mut();
+                session
+                    .text_turn(&lutum)
+                    .tools::<QueryMemoryTools>()
+                    .available_tools([
+                        QueryMemoryToolsSelector::SearchMemory,
+                        QueryMemoryToolsSelector::FetchLinkedMemories,
+                        QueryMemoryToolsSelector::WriteRetrievalMemo,
+                    ])
+                    .collect()
+                    .await
+                    .context("query-memory text turn failed")?
+            };
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
+                    let mut session = self.session.borrow_mut();
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -473,8 +468,9 @@ impl QueryMemoryModule {
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    let mut session = self.session.borrow_mut();
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -491,8 +487,9 @@ impl QueryMemoryModule {
                     let input_tokens = round.usage.input_tokens;
                     nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     if round.tool_calls.is_empty() {
+                        let mut session = self.session.borrow_mut();
                         compact_session_if_needed(
-                            &mut self.session,
+                            &mut session,
                             input_tokens,
                             cx.session_compaction(),
                             self.session_compaction,
@@ -559,11 +556,12 @@ impl QueryMemoryModule {
                             }
                         }
                     }
+                    let mut session = self.session.borrow_mut();
                     round
-                        .commit(&mut self.session, tool_results)
+                        .commit(&mut session, tool_results)
                         .context("commit query-memory tool round")?;
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -578,8 +576,7 @@ impl QueryMemoryModule {
                         return Ok(());
                     }
                     self.pending_retrieval = retrieval.clone();
-                    self.session
-                        .push_ephemeral_user(TOOL_RESULT_CONTINUATION_PROMPT);
+                    session.push_ephemeral_user(TOOL_RESULT_CONTINUATION_PROMPT);
                 }
             }
         }

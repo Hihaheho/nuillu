@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    CognitionWriter, LlmAccess, MemoUpdatedInbox, Module, SessionCompactionConfig,
+    CognitionWriter, LlmAccess, MemoUpdatedInbox, Module, ModuleSession, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -93,10 +92,9 @@ pub struct AttentionSchemaModule {
     cognition_log: CognitionLogReader,
     cognition: CognitionWriter,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     model_prompt: std::sync::OnceLock<String>,
-    session_seeded: bool,
 }
 
 impl AttentionSchemaModule {
@@ -109,6 +107,7 @@ impl AttentionSchemaModule {
         cognition_log: CognitionLogReader,
         cognition: CognitionWriter,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             memo_updates,
@@ -118,25 +117,16 @@ impl AttentionSchemaModule {
             cognition_log,
             cognition,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: SessionCompactionConfig::default(),
             model_prompt: std::sync::OnceLock::new(),
-            session_seeded: false,
         }
     }
 
-    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        if self.session_seeded {
-            return;
-        }
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
         let model_prompt = self.model_prompt(cx).to_owned();
-        seed_persistent_faculty_session(
-            &mut self.session,
-            model_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
-        self.session_seeded = true;
+        self.session
+            .ensure_seeded(model_prompt, cx.identity_memories(), cx.now());
     }
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -155,35 +145,37 @@ impl AttentionSchemaModule {
         self.ensure_session_seeded(cx);
 
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
         let unread_cognition_log = self.cognition_log.unread_events().await;
         let allocation = self.allocation.snapshot().await;
 
-        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition_log, cx.now());
-        if let Some(context) = format_attention_schema_context(&allocation) {
-            self.session.push_ephemeral_system(context);
-        }
-        self.session
-            .push_ephemeral_developer("Update the attention schema from the new notes above.");
-
         let lutum = self.llm.lutum().await;
-        let outcome = self
-            .session
-            .text_turn(&lutum)
-            .tools::<AttentionSchemaTools>()
-            .available_tools([
-                AttentionSchemaToolsSelector::AppendAttentionExperience,
-                AttentionSchemaToolsSelector::LeaveAttentionUnchanged,
-            ])
-            .require_any_tool()
-            .collect()
-            .await
-            .context("attention-schema attention experience turn failed")?;
+        let outcome = {
+            let mut session = self.session.borrow_mut();
+            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            push_formatted_cognition_log_batch(&mut session, &unread_cognition_log, cx.now());
+            if let Some(context) = format_attention_schema_context(&allocation) {
+                session.push_ephemeral_system(context);
+            }
+            session
+                .push_ephemeral_developer("Update the attention schema from the new notes above.");
+            session
+                .text_turn(&lutum)
+                .tools::<AttentionSchemaTools>()
+                .available_tools([
+                    AttentionSchemaToolsSelector::AppendAttentionExperience,
+                    AttentionSchemaToolsSelector::LeaveAttentionUnchanged,
+                ])
+                .require_any_tool()
+                .collect()
+                .await
+                .context("attention-schema attention experience turn failed")?
+        };
 
         let round = match outcome {
             TextStepOutcomeWithTools::Finished(result) => {
+                let mut session = self.session.borrow_mut();
                 compact_session_if_needed(
-                    &mut self.session,
+                    &mut session,
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
@@ -196,8 +188,9 @@ impl AttentionSchemaModule {
                 anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                let mut session = self.session.borrow_mut();
                 compact_session_if_needed(
-                    &mut self.session,
+                    &mut session,
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
@@ -236,11 +229,12 @@ impl AttentionSchemaModule {
                 }
             }
         }
+        let mut session = self.session.borrow_mut();
         round
-            .commit(&mut self.session, results)
+            .commit(&mut session, results)
             .context("commit attention-schema tool round")?;
         compact_session_if_needed(
-            &mut self.session,
+            &mut session,
             input_tokens,
             cx.session_compaction(),
             self.session_compaction,

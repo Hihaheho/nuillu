@@ -470,6 +470,7 @@ pub async fn run_suite_with_hooks(
         &config.llm_concurrency_pool,
         None,
         None,
+        None,
     )
     .map_err(|error| RunnerError::Driver {
         path: config.cases_root.clone(),
@@ -4130,6 +4131,7 @@ pub(crate) async fn build_eval_environment(
         &config.llm_concurrency_pool,
         llm_observer,
         Some(eval_llm_log_context(config, case_id)),
+        None,
     )
     .map_err(|error| RunnerError::Driver {
         path: output_dir.to_path_buf(),
@@ -4152,6 +4154,7 @@ pub(crate) async fn build_eval_environment(
         runtime: CapabilityProviderRuntime {
             event_sink: events.clone(),
             policy: runtime_policy,
+            ..CapabilityProviderRuntime::default()
         },
     });
 
@@ -4597,6 +4600,7 @@ fn register_eval_module(
                         caps.memo(),
                         caps.clock(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -4615,6 +4619,7 @@ fn register_eval_module(
                         caps.cognition_writer(),
                         caps.time_division(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -4639,6 +4644,7 @@ fn register_eval_module(
                             caps.allocation_writer(voluntary.clone(), Vec::new()),
                             caps.memo(),
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4659,6 +4665,7 @@ fn register_eval_module(
                         caps.cognition_log_reader(),
                         caps.cognition_writer(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -4676,6 +4683,7 @@ fn register_eval_module(
                         caps.cognition_log_reader(),
                         caps.memo(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -4697,6 +4705,7 @@ fn register_eval_module(
                             memory_caps.content_reader(),
                             caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4717,6 +4726,7 @@ fn register_eval_module(
                             memory_caps.writer(),
                             memory_caps.retriever(),
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4795,6 +4805,7 @@ fn register_eval_module(
                             caps.interoception_policy(),
                             caps.interoception_writer(),
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4836,6 +4847,7 @@ fn register_eval_module(
                             caps.memo(),
                             consideration_writer,
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4876,6 +4888,7 @@ fn register_eval_module(
                             policy_caps.upserter(),
                             caps.memo(),
                             caps.llm_access(),
+                            caps.session("main"),
                         )
                     }
                 },
@@ -4892,6 +4905,7 @@ fn register_eval_module(
                         caps.cognition_log_reader(),
                         caps.memo(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -4911,6 +4925,7 @@ fn register_eval_module(
                         caps.attention_control_mailbox(),
                         caps.memo(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                 },
             )
@@ -8859,6 +8874,7 @@ prompt = "What am I attending to?"
                                 caps.cognition_log_reader(),
                                 caps.cognition_writer(),
                                 caps.llm_access(),
+                                caps.session("main"),
                             )
                         },
                     )

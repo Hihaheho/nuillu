@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{Lutum, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, SessionCompactionRuntime,
-    TimeDivision, compact_session_if_needed, format_current_attention_guidance,
-    format_faculty_system_prompt, format_memo_log_batch, format_memory_trace_inventory,
-    format_stuckness, format_time_division_guidance, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    SessionCompactionRuntime, TimeDivision, compact_session_if_needed,
+    format_current_attention_guidance, format_faculty_system_prompt, format_memo_log_batch,
+    format_memory_trace_inventory, format_stuckness, format_time_division_guidance,
+    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -171,10 +170,9 @@ pub struct CognitionGateModule {
     cognition: CognitionWriter,
     time_division: TimeDivision,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: CognitionGateSessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
-    session_seeded: bool,
     last_seen_cognition_index: Option<u64>,
 }
 
@@ -186,6 +184,7 @@ impl CognitionGateModule {
         cognition: CognitionWriter,
         time_division: TimeDivision,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -196,10 +195,9 @@ impl CognitionGateModule {
             cognition,
             time_division,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: CognitionGateSessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            session_seeded: false,
             last_seen_cognition_index: None,
         }
     }
@@ -215,18 +213,10 @@ impl CognitionGateModule {
         })
     }
 
-    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        if self.session_seeded {
-            return;
-        }
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        seed_persistent_faculty_session(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
-        self.session_seeded = true;
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -240,13 +230,7 @@ impl CognitionGateModule {
         if let Some(index) = unread_cognition.last().map(|record| record.index) {
             self.last_seen_cognition_index = Some(index);
         }
-        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
-
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        if let Some(memo_notes) = format_memo_log_batch(&unread_memos, cx.now()) {
-            self.session.push_ephemeral_user(memo_notes);
-        }
-
         let (rank_counts, stuckness) = self
             .blackboard
             .read(|bb| {
@@ -263,14 +247,21 @@ impl CognitionGateModule {
             &self.time_division,
             stuckness.as_ref(),
         );
-        self.session.push_ephemeral_system(context);
-        self.session.push_ephemeral_developer(ACTIVATION_INPUT);
+        {
+            let mut session = self.session.borrow_mut();
+            push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
+            if let Some(memo_notes) = format_memo_log_batch(&unread_memos, cx.now()) {
+                session.push_ephemeral_user(memo_notes);
+            }
+            session.push_ephemeral_system(context);
+            session.push_ephemeral_developer(ACTIVATION_INPUT);
+        }
 
         let lutum = self.llm.lutum().await;
         let result = self
             .run_decision_turn(&lutum, cx.session_compaction())
             .await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memos, cx.now());
+        push_formatted_memo_log_batch(&mut self.session.borrow_mut(), &unread_memos, cx.now());
         result?;
         Ok(())
     }
@@ -284,21 +275,25 @@ impl CognitionGateModule {
 
         for _ in 0..MAX_DECISION_ATTEMPTS {
             if let Some(correction) = correction.take() {
-                self.session.push_ephemeral_developer(correction);
+                self.session
+                    .borrow_mut()
+                    .push_ephemeral_developer(correction);
             }
 
-            let outcome = self
-                .session
-                .text_turn(lutum)
-                .tools::<CognitionGateTools>()
-                .available_tools([
-                    CognitionGateToolsSelector::AppendCognition,
-                    CognitionGateToolsSelector::SkipCognition,
-                ])
-                .max_output_tokens(768)
-                .collect()
-                .await
-                .context("cognition-gate decision turn failed")?;
+            let outcome = {
+                let mut session = self.session.borrow_mut();
+                session
+                    .text_turn(lutum)
+                    .tools::<CognitionGateTools>()
+                    .available_tools([
+                        CognitionGateToolsSelector::AppendCognition,
+                        CognitionGateToolsSelector::SkipCognition,
+                    ])
+                    .max_output_tokens(768)
+                    .collect()
+                    .await
+                    .context("cognition-gate decision turn failed")?
+            };
 
             let (decision, input_tokens) = match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
@@ -368,7 +363,7 @@ impl CognitionGateModule {
                         }
                     }
                     round
-                        .commit(&mut self.session, results)
+                        .commit(&mut self.session.borrow_mut(), results)
                         .context("commit cognition-gate tool round")?;
                     (decision, input_tokens)
                 }
@@ -376,8 +371,9 @@ impl CognitionGateModule {
 
             match decision {
                 DecisionStatus::Applied => {
+                    let mut session = self.session.borrow_mut();
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         input_tokens,
                         compaction,
                         self.session_compaction,
@@ -720,6 +716,7 @@ mod tests {
                     caps.cognition_writer(),
                     caps.time_division(),
                     caps.llm_access(),
+                    caps.session("main"),
                 ));
                 CognitionGateStub
             })

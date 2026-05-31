@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::StructuredTurnOutcome;
 use nuillu_module::ports::Clock;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox, Module,
+    InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox, Module, ModuleSession,
     format_current_attention_guidance,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
@@ -123,7 +123,7 @@ pub struct PolicyModule {
     memo: Memo,
     writer: PolicyConsiderationWriter,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
 }
 
 impl PolicyModule {
@@ -139,6 +139,7 @@ impl PolicyModule {
         memo: Memo,
         writer: PolicyConsiderationWriter,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             owner: ModuleId::new(<Self as Module>::id()).expect("policy id is valid"),
@@ -152,7 +153,7 @@ impl PolicyModule {
             memo,
             writer,
             llm,
-            session: Session::new(),
+            session,
         }
     }
 
@@ -213,37 +214,39 @@ impl PolicyModule {
         let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
 
-        self.session.push_ephemeral_system(SYSTEM_PROMPT);
-        if let Some(guidance) = format_current_attention_guidance(&allocation) {
-            self.session.push_ephemeral_system(guidance);
-        }
-        self.session.push_ephemeral_system(format!(
-            "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
-            interoception.affect_arousal,
-            interoception.valence,
-            if interoception.emotion.trim().is_empty() {
-                "unknown"
-            } else {
-                interoception.emotion.trim()
-            }
-        ));
-        self.session.push_ephemeral_user(format!(
-            "Policy consideration request for {}:\nQuery text:\n{}\n\nExisting policy hits:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}",
-            self.owner,
-            query_text,
-            serde_json::to_string(&render_hit_inputs(hits))
-                .expect("policy hit input serialization should not fail"),
-            serde_json::to_string(&memos).expect("memo log serialization should not fail"),
-            serde_json::to_string(&cognition).expect("cognition log serialization should not fail"),
-        ));
-
         let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .structured_turn::<PolicyConsiderationDecision>(&lutum)
-            .collect()
-            .await
-            .context("policy structured turn failed")?;
+        let result = {
+            let mut session = self.session.borrow_mut();
+            session.push_ephemeral_system(SYSTEM_PROMPT);
+            if let Some(guidance) = format_current_attention_guidance(&allocation) {
+                session.push_ephemeral_system(guidance);
+            }
+            session.push_ephemeral_system(format!(
+                "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
+                interoception.affect_arousal,
+                interoception.valence,
+                if interoception.emotion.trim().is_empty() {
+                    "unknown"
+                } else {
+                    interoception.emotion.trim()
+                }
+            ));
+            session.push_ephemeral_user(format!(
+                "Policy consideration request for {}:\nQuery text:\n{}\n\nExisting policy hits:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}",
+                self.owner,
+                query_text,
+                serde_json::to_string(&render_hit_inputs(hits))
+                    .expect("policy hit input serialization should not fail"),
+                serde_json::to_string(&memos).expect("memo log serialization should not fail"),
+                serde_json::to_string(&cognition)
+                    .expect("cognition log serialization should not fail"),
+            ));
+            session
+                .structured_turn::<PolicyConsiderationDecision>(&lutum)
+                .collect()
+                .await
+                .context("policy structured turn failed")?
+        };
         let StructuredTurnOutcome::Structured(decision) = result.semantic else {
             tracing::debug!("policy structured turn refused; skipping activation");
             return Ok(None);

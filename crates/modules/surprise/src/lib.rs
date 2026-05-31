@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, ModuleSession,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_current_attention_guidance, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -102,10 +102,9 @@ pub struct SurpriseModule {
     attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
-    session_seeded: bool,
 }
 
 impl SurpriseModule {
@@ -118,6 +117,7 @@ impl SurpriseModule {
         attention_control: AttentionControlRequestMailbox,
         memo: Memo,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             updates,
@@ -127,25 +127,16 @@ impl SurpriseModule {
             attention_control,
             memo,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            session_seeded: false,
         }
     }
 
-    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        if self.session_seeded {
-            return;
-        }
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        seed_persistent_faculty_session(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
-        self.session_seeded = true;
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -165,33 +156,35 @@ impl SurpriseModule {
 
         let unread_cognition = self.cognition_log.unread_events().await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
         let allocation = self.allocation.snapshot().await;
 
-        if let Some(context) = format_surprise_context(&allocation) {
-            self.session.push_ephemeral_system(context);
-        }
-        self.session.push_ephemeral_developer(ACTIVATION_INPUT);
-
         let lutum = self.llm.lutum().await;
-        let outcome = self
-            .session
-            .text_turn(&lutum)
-            .tools::<SurpriseTools>()
-            .available_tools([
-                SurpriseToolsSelector::PreserveUnexpectedEvent,
-                SurpriseToolsSelector::MarkExpectedEvent,
-            ])
-            .require_any_tool()
-            .collect()
-            .await
-            .context("surprise assessment turn failed")?;
+        let outcome = {
+            let mut session = self.session.borrow_mut();
+            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
+            if let Some(context) = format_surprise_context(&allocation) {
+                session.push_ephemeral_system(context);
+            }
+            session.push_ephemeral_developer(ACTIVATION_INPUT);
+            session
+                .text_turn(&lutum)
+                .tools::<SurpriseTools>()
+                .available_tools([
+                    SurpriseToolsSelector::PreserveUnexpectedEvent,
+                    SurpriseToolsSelector::MarkExpectedEvent,
+                ])
+                .require_any_tool()
+                .collect()
+                .await
+                .context("surprise assessment turn failed")?
+        };
 
         let round = match outcome {
             TextStepOutcomeWithTools::Finished(result) => {
+                let mut session = self.session.borrow_mut();
                 compact_session_if_needed(
-                    &mut self.session,
+                    &mut session,
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
@@ -204,8 +197,9 @@ impl SurpriseModule {
                 anyhow::bail!("surprise finished without required tool call");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                let mut session = self.session.borrow_mut();
                 compact_session_if_needed(
-                    &mut self.session,
+                    &mut session,
                     result.usage.input_tokens,
                     cx.session_compaction(),
                     self.session_compaction,
@@ -257,11 +251,12 @@ impl SurpriseModule {
                 }
             }
         }
+        let mut session = self.session.borrow_mut();
         round
-            .commit(&mut self.session, results)
+            .commit(&mut session, results)
             .context("commit surprise tool round")?;
         compact_session_if_needed(
-            &mut self.session,
+            &mut session,
             input_tokens,
             cx.session_compaction(),
             self.session_compaction,
@@ -484,6 +479,7 @@ mod tests {
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
+                    caps.session("main"),
                 ));
                 *attention_requests_sink.borrow_mut() = Some(caps.attention_control_inbox());
                 SurpriseStub

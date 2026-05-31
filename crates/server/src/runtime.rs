@@ -16,6 +16,7 @@ use crate::gui::{
     VisualizerHook, accept_visualizer_connection, spawn_visualizer_gui,
     wait_for_visualizer_exit_with_context,
 };
+use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
 use crate::snapshot::{emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page};
 use crate::state::{AmbientRows, ModuleSettingsState};
@@ -131,6 +132,12 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         env.memory.as_ref(),
         0,
         25,
+    )
+    .await;
+    emit_persisted_llm_transcripts(
+        &env.llm_transcript_store,
+        SERVER_TAB_ID,
+        &visualizer.event_sender(),
     )
     .await;
 

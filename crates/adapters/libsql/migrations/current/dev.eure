@@ -6,3 +6,8 @@ next-minor = 1
   tag = "initial-agent-schema"
   file = "dev/v0.1.initial-agent-schema.sql"
 }
+
+@ tasks[] {
+  tag = "llm-transcripts"
+  file = "dev/v0.1.llm-transcripts.sql"
+}

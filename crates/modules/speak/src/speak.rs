@@ -5,7 +5,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use lutum::{Session, StructuredTurnOutcome, TextStepOutcomeWithTools, TextTurnEvent};
+use lutum::{ModelInput, StructuredTurnOutcome, TextStepOutcomeWithTools, TextTurnEvent};
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
     SceneReader, UtteranceProgress,
@@ -185,17 +185,28 @@ fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
 }
 
 fn push_generation_context(
-    session: &mut Session,
+    input: &mut ModelInput,
     cognition_context: &str,
     args: &ShouldSpeakArgs,
     draft: &GenerationDraft,
     generation_prompt: &str,
 ) {
-    session.push_system(generation_prompt);
-    session.push_user(format_generation_input(cognition_context, args, draft));
+    input.push(lutum::ModelInputItem::text(
+        lutum::InputMessageRole::System,
+        generation_prompt,
+    ));
+    input.push(lutum::ModelInputItem::text(
+        lutum::InputMessageRole::User,
+        format_generation_input(cognition_context, args, draft),
+    ));
     if !draft.accumulated.is_empty() {
-        session.push_system(PARTIAL_CONTINUATION_PROMPT);
-        session.push_assistant_text(draft.accumulated.clone());
+        input.push(lutum::ModelInputItem::text(
+            lutum::InputMessageRole::System,
+            PARTIAL_CONTINUATION_PROMPT,
+        ));
+        input.push(lutum::ModelInputItem::assistant_text(
+            draft.accumulated.clone(),
+        ));
     }
 }
 
@@ -375,9 +386,7 @@ impl SpeakModule {
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
     ) -> Result<Option<PlannedSpeech>> {
-        let mut session = Session::new();
-        session.push_system(self.plan_prompt(cx));
-        session.push_user(format!(
+        let input = ModelInput::new().system(self.plan_prompt(cx)).user(format!(
             "Current cognition log:\n{}",
             cognition_context.trim()
         ));
@@ -387,8 +396,8 @@ impl SpeakModule {
         let validation_schema = target_schema.clone();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
-                session
-                    .text_turn(&lutum)
+                lutum
+                    .text_turn(input)
                     .tools::<SpeakTools>()
                     .available_tools([SpeakToolsSelector::ShouldSpeak])
                     .collect()
@@ -429,9 +438,9 @@ impl SpeakModule {
         let stream_started_at = cx.now();
         let cognition_context_at_start = cognition_context.clone();
 
-        let mut session = Session::new();
+        let mut input = ModelInput::new();
         push_generation_context(
-            &mut session,
+            &mut input,
             &cognition_context,
             args,
             draft,
@@ -439,8 +448,8 @@ impl SpeakModule {
         );
 
         let lutum = self.llm.lutum().await;
-        let mut stream = session
-            .text_turn(&lutum)
+        let mut stream = lutum
+            .text_turn(input)
             .stream()
             .await
             .context("speak generation stream failed")?;
@@ -566,16 +575,16 @@ impl SpeakModule {
         cognition_context_at_start: String,
         new_entries: Vec<String>,
     ) -> Result<bool> {
-        let mut session = Session::new();
-        session.push_system(abort_judge_prompt);
-        session.push_user(format_abort_judge_input(
-            &cognition_context_at_start,
-            &new_entries,
-        ));
+        let input = ModelInput::new()
+            .system(abort_judge_prompt)
+            .user(format_abort_judge_input(
+                &cognition_context_at_start,
+                &new_entries,
+            ));
 
         let lutum = llm.lutum().await;
-        let result = session
-            .structured_turn::<AbortJudgement>(&lutum)
+        let result = lutum
+            .structured_turn::<AbortJudgement>(input)
             .collect()
             .await
             .context("speak abort-judge turn failed")?;
@@ -1092,10 +1101,10 @@ mod tests {
     fn fresh_generation_omits_assistant_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
         let args = test_should_speak_args("Koro");
-        let mut session = test_session();
+        let mut input = ModelInput::new();
 
-        push_generation_context(&mut session, "none", &args, &draft, GENERATION_PROMPT);
-        let items = session.input().items();
+        push_generation_context(&mut input, "none", &args, &draft, GENERATION_PROMPT);
+        let items = input.items();
 
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
@@ -1572,12 +1581,12 @@ mod tests {
     fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
         let mut draft = GenerationDraft::new(11, "Koro");
         let args = test_should_speak_args("Koro");
-        let mut session = test_session();
+        let mut input = ModelInput::new();
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        push_generation_context(&mut session, "none", &args, &draft, GENERATION_PROMPT);
-        let items = session.input().items();
+        push_generation_context(&mut input, "none", &args, &draft, GENERATION_PROMPT);
+        let items = input.items();
 
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);

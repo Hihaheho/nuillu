@@ -40,6 +40,7 @@ mod rate_limit;
 mod readers;
 mod runtime_events;
 mod scene;
+mod session;
 mod session_compaction;
 mod tiers;
 mod time_division;
@@ -103,6 +104,10 @@ pub use readers::{
 };
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
+pub use session::{
+    ModuleSession, NoopSessionStore, PersistedModelInputItem, PersistedSessionSnapshot, SessionKey,
+    SessionStore,
+};
 pub use session_compaction::{
     DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
     SessionCompactionConfig, SessionCompactionPolicy, SessionCompactionProtectedPrefix,

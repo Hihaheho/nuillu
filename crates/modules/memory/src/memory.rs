@@ -4,12 +4,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
-    MemoryMetadataReader, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
-    memory_rank_counts, push_formatted_cognition_log_batch, render_memory_for_llm,
+    MemoryMetadataReader, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
+    format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
+    render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -126,7 +127,7 @@ pub struct MemoryModule {
     memory: MemoryWriter,
     memory_retriever: MemoryRetriever,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
     batching: MemoryBatchConfig,
@@ -160,6 +161,7 @@ impl MemoryModule {
         memory: MemoryWriter,
         memory_retriever: MemoryRetriever,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
@@ -169,7 +171,7 @@ impl MemoryModule {
             memory,
             memory_retriever,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             batching: MemoryBatchConfig::default(),
@@ -201,7 +203,10 @@ impl MemoryModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &MemoryBatch,
     ) -> Result<()> {
-        push_formatted_cognition_log_batch(&mut self.session, &batch.cognition_log, cx.now());
+        {
+            let mut session = self.session.borrow_mut();
+            push_formatted_cognition_log_batch(&mut session, &batch.cognition_log, cx.now());
+        }
         let (memory_metadata, rank_counts) = self
             .memory_metadata
             .read(|metadata_map| {
@@ -235,38 +240,44 @@ impl MemoryModule {
             .collect::<HashMap<_, _>>();
 
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
-        self.session.push_user(format_memory_activation_request(
-            &allocation_guidance,
-            batch.cognition_log.len(),
-        ));
-        if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
-            self.session.push_ephemeral_user(metadata_context);
+        {
+            let mut session = self.session.borrow_mut();
+            session.push_ephemeral_system(system_prompt);
+            session.push_user(format_memory_activation_request(
+                &allocation_guidance,
+                batch.cognition_log.len(),
+            ));
+            if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
+                session.push_ephemeral_user(metadata_context);
+            }
+            if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
+                session.push_ephemeral_user(candidate_context);
+            }
+            session
+                .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
         }
-        if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
-            self.session.push_ephemeral_user(candidate_context);
-        }
-        self.session
-            .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
 
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
-            let outcome = self
-                .session
-                .text_turn(&lutum)
-                .tools::<MemoryTools>()
-                .available_tools([
-                    MemoryToolsSelector::InsertMemory,
-                    MemoryToolsSelector::ReinforceMemory,
-                ])
-                .collect()
-                .await
-                .context("memory text turn failed")?;
+            let outcome = {
+                let mut session = self.session.borrow_mut();
+                session
+                    .text_turn(&lutum)
+                    .tools::<MemoryTools>()
+                    .available_tools([
+                        MemoryToolsSelector::InsertMemory,
+                        MemoryToolsSelector::ReinforceMemory,
+                    ])
+                    .collect()
+                    .await
+                    .context("memory text turn failed")?
+            };
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
+                    let mut session = self.session.borrow_mut();
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -279,8 +290,9 @@ impl MemoryModule {
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    let mut session = self.session.borrow_mut();
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -320,11 +332,12 @@ impl MemoryModule {
                             }
                         }
                     }
+                    let mut session = self.session.borrow_mut();
                     round
-                        .commit(&mut self.session, results)
+                        .commit(&mut session, results)
                         .context("commit memory tool round")?;
                     compact_session_if_needed(
-                        &mut self.session,
+                        &mut session,
                         input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
@@ -719,6 +732,7 @@ mod tests {
                         memory_caps.writer(),
                         memory_caps.retriever(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                     .with_batch_config(batching),
                     recorder: recorder.clone(),

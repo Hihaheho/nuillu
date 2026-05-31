@@ -4,12 +4,12 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eure::FromEure;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::{ModelInput, StructuredTurnOutcome};
 use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo,
-    Module,
+    Module, ModuleSession,
 };
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -367,7 +367,7 @@ pub struct RewardModule {
     upserter: PolicyUpserter,
     memo: Memo,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     config: ReinforcementConfig,
 }
 
@@ -383,6 +383,7 @@ impl RewardModule {
         upserter: PolicyUpserter,
         memo: Memo,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             policy_evictions,
@@ -394,7 +395,7 @@ impl RewardModule {
             upserter,
             memo,
             llm,
-            session: Session::new(),
+            session,
             config: ReinforcementConfig::default(),
         }
     }
@@ -523,26 +524,26 @@ impl RewardModule {
         synthetic: &SyntheticPolicyConsideration,
         hits: &[PolicySearchHit],
     ) -> Result<Option<SyntheticPolicyDedupDecision>> {
-        let mut session = Session::new();
-        session.push_system(SYNTHETIC_DEDUP_PROMPT);
-        session.push_user(format!(
-            "Synthetic policy candidate:\n{}\n\nExisting policy candidates:\n{}",
-            serde_json::to_string(&SyntheticDedupCandidateInput {
-                candidate_id: &candidate.candidate_id,
-                trigger: &synthetic.trigger,
-                behavior: &synthetic.behavior,
-                predicted_expected_reward: candidate.predicted_expected_reward,
-                confidence_hint: candidate.confidence_hint,
-                advice: &candidate.advice,
-                rationale: &candidate.rationale,
-            })
-            .expect("synthetic dedup candidate serialization should not fail"),
-            serde_json::to_string(&render_policy_hit_inputs(hits))
-                .expect("policy hit serialization should not fail"),
-        ));
+        let input = ModelInput::new()
+            .system(SYNTHETIC_DEDUP_PROMPT)
+            .user(format!(
+                "Synthetic policy candidate:\n{}\n\nExisting policy candidates:\n{}",
+                serde_json::to_string(&SyntheticDedupCandidateInput {
+                    candidate_id: &candidate.candidate_id,
+                    trigger: &synthetic.trigger,
+                    behavior: &synthetic.behavior,
+                    predicted_expected_reward: candidate.predicted_expected_reward,
+                    confidence_hint: candidate.confidence_hint,
+                    advice: &candidate.advice,
+                    rationale: &candidate.rationale,
+                })
+                .expect("synthetic dedup candidate serialization should not fail"),
+                serde_json::to_string(&render_policy_hit_inputs(hits))
+                    .expect("policy hit serialization should not fail"),
+            ));
         let lutum = self.llm.lutum().await;
-        let result = session
-            .structured_turn::<SyntheticPolicyDedupDecision>(&lutum)
+        let result = lutum
+            .structured_turn::<SyntheticPolicyDedupDecision>(input)
             .collect()
             .await
             .context("policy synthetic dedup structured turn failed")?;
@@ -557,24 +558,28 @@ impl RewardModule {
         let cognition = self.cognition.snapshot().await;
         let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
-        self.session.push_ephemeral_system(SYSTEM_PROMPT);
-        self.session.push_ephemeral_user(format!(
-            "Evicted policy consideration:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
-            serde_json::to_string(&evicted.payload)
-                .expect("policy consideration serialization should not fail"),
-            serde_json::to_string(&memos).expect("memo log serialization should not fail"),
-            serde_json::to_string(&cognition).expect("cognition log serialization should not fail"),
-            serde_json::to_string(&allocation).expect("allocation serialization should not fail"),
-            serde_json::to_string(&interoception)
-                .expect("interoception serialization should not fail"),
-        ));
         let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .structured_turn::<RewardAssessment>(&lutum)
-            .collect()
-            .await
-            .context("reward structured turn failed")?;
+        let result = {
+            let mut session = self.session.borrow_mut();
+            session.push_ephemeral_system(SYSTEM_PROMPT);
+            session.push_ephemeral_user(format!(
+                "Evicted policy consideration:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
+                serde_json::to_string(&evicted.payload)
+                    .expect("policy consideration serialization should not fail"),
+                serde_json::to_string(&memos).expect("memo log serialization should not fail"),
+                serde_json::to_string(&cognition)
+                    .expect("cognition log serialization should not fail"),
+                serde_json::to_string(&allocation)
+                    .expect("allocation serialization should not fail"),
+                serde_json::to_string(&interoception)
+                    .expect("interoception serialization should not fail"),
+            ));
+            session
+                .structured_turn::<RewardAssessment>(&lutum)
+                .collect()
+                .await
+                .context("reward structured turn failed")?
+        };
         let StructuredTurnOutcome::Structured(assessment) = result.semantic else {
             anyhow::bail!("reward structured turn refused");
         };

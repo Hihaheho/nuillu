@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::Session;
 use nuillu_module::{
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_session_if_needed, format_identity_system_prompt,
-    push_formatted_cognition_log_batch,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, ModuleSession,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_identity_system_prompt, push_formatted_cognition_log_batch,
 };
 
 mod batch;
@@ -36,7 +35,7 @@ pub struct PredictModule {
     cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
@@ -47,13 +46,14 @@ impl PredictModule {
         cognition_log: CognitionLogReader,
         memo: Memo,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             updates,
             cognition_log,
             memo,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
@@ -75,30 +75,30 @@ impl PredictModule {
         let unread_cognition = self.cognition_log.unread_events().await;
 
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session.push_ephemeral_system(system_prompt);
-        push_formatted_cognition_log_batch(&mut self.session, &unread_cognition, cx.now());
-        self.session
-            .push_ephemeral_developer("Update forward predictions for the cognition above.");
-
         let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .text_turn(&lutum)
-            .collect()
-            .await
-            .context("predict text turn failed")?;
-        compact_session_if_needed(
-            &mut self.session,
-            result.usage.input_tokens,
-            cx.session_compaction(),
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::None,
-            Self::id(),
-            COMPACTED_PREDICT_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
-        let memo = result.assistant_text();
+        let memo = {
+            let mut session = self.session.borrow_mut();
+            session.push_ephemeral_system(system_prompt);
+            push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
+            session.push_ephemeral_developer("Update forward predictions for the cognition above.");
+            let result = session
+                .text_turn(&lutum)
+                .collect()
+                .await
+                .context("predict text turn failed")?;
+            compact_session_if_needed(
+                &mut session,
+                result.usage.input_tokens,
+                cx.session_compaction(),
+                self.session_compaction,
+                SessionCompactionProtectedPrefix::None,
+                Self::id(),
+                COMPACTED_PREDICT_SESSION_PREFIX,
+                SESSION_COMPACTION_PROMPT,
+            )
+            .await;
+            result.assistant_text()
+        };
         if !memo.trim().is_empty() {
             self.memo.write(memo).await;
         }

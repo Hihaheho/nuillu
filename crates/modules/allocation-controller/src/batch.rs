@@ -203,6 +203,7 @@ mod tests {
                         ),
                         caps.memo(),
                         caps.llm_access(),
+                        caps.session("main"),
                     )
                     .with_batch_config(batching),
                     recorder: recorder.clone(),

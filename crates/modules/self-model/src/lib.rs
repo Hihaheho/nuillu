@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::Session;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    Memo, Module, ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_session_if_needed, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
 };
 use nuillu_types::builtin;
 
@@ -37,10 +35,9 @@ pub struct SelfModelModule {
     cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
-    session: Session,
+    session: ModuleSession,
     session_compaction: SessionCompactionConfig,
     system_prompt: std::sync::OnceLock<String>,
-    session_seeded: bool,
 }
 
 impl SelfModelModule {
@@ -51,6 +48,7 @@ impl SelfModelModule {
         cognition_log: CognitionLogReader,
         memo: Memo,
         llm: LlmAccess,
+        session: ModuleSession,
     ) -> Self {
         Self {
             owner: nuillu_module::ModuleId::new(<Self as Module>::id())
@@ -61,25 +59,16 @@ impl SelfModelModule {
             cognition_log,
             memo,
             llm,
-            session: Session::new(),
+            session,
             session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
-            session_seeded: false,
         }
     }
 
-    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        if self.session_seeded {
-            return;
-        }
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        seed_persistent_faculty_session(
-            &mut self.session,
-            system_prompt,
-            cx.identity_memories(),
-            cx.now(),
-        );
-        self.session_seeded = true;
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -113,36 +102,33 @@ impl SelfModelModule {
             .collect::<Vec<_>>();
         self.ensure_session_seeded(cx);
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        push_formatted_memo_log_batch(&mut self.session, &unread_memo_logs, cx.now());
-        self.session.push_user(format!(
-            "Request for the next self-model memo:\n{}",
-            guidance.trim()
-        ));
-        push_formatted_cognition_log_batch(
-            &mut self.session,
-            &attention_schema_cognition,
-            cx.now(),
-        );
-
         let lutum = self.llm.lutum().await;
-        let result = self
-            .session
-            .text_turn(&lutum)
-            .collect()
-            .await
-            .context("self-model text turn failed")?;
-        compact_session_if_needed(
-            &mut self.session,
-            result.usage.input_tokens,
-            cx.session_compaction(),
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_SELF_MODEL_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
-        let memo = result.assistant_text();
+        let memo = {
+            let mut session = self.session.borrow_mut();
+            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            session.push_user(format!(
+                "Request for the next self-model memo:\n{}",
+                guidance.trim()
+            ));
+            push_formatted_cognition_log_batch(&mut session, &attention_schema_cognition, cx.now());
+            let result = session
+                .text_turn(&lutum)
+                .collect()
+                .await
+                .context("self-model text turn failed")?;
+            compact_session_if_needed(
+                &mut session,
+                result.usage.input_tokens,
+                cx.session_compaction(),
+                self.session_compaction,
+                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                Self::id(),
+                COMPACTED_SELF_MODEL_SESSION_PREFIX,
+                SESSION_COMPACTION_PROMPT,
+            )
+            .await;
+            result.assistant_text()
+        };
         if !memo.trim().is_empty() {
             self.memo.write(memo).await;
         }

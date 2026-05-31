@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{ModelInput, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
 };
@@ -132,17 +132,18 @@ impl MemoryCompactionModule {
             })
             .collect::<Vec<_>>();
 
-        let mut session = Session::new();
-        session.push_system(self.system_prompt(cx));
-        session.push_user(format_compaction_context(
-            &memory_metadata,
-            &allocation_guidance,
-        ));
+        let mut input =
+            ModelInput::new()
+                .system(self.system_prompt(cx))
+                .user(format_compaction_context(
+                    &memory_metadata,
+                    &allocation_guidance,
+                ));
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;
-            let outcome = session
-                .text_turn(&lutum)
+            let outcome = lutum
+                .text_turn(input.clone())
                 .tools::<CompactionTools>()
                 .available_tools([
                     CompactionToolsSelector::GetMemories,
@@ -183,7 +184,7 @@ impl MemoryCompactionModule {
                         }
                     }
                     round
-                        .commit(&mut session, results)
+                        .commit_into(&mut input, results)
                         .context("commit memory-compaction tool round")?;
                 }
             }

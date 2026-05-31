@@ -15,7 +15,7 @@ use nuillu_memory::{
     NewMemory, NewMemoryLink,
 };
 pub use nuillu_module::ports::Embedder;
-use nuillu_module::ports::PortError;
+use nuillu_module::{PersistedSessionSnapshot, SessionKey, SessionStore, ports::PortError};
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
@@ -118,6 +118,7 @@ impl LibsqlAgentStoreConfig {
 
 #[derive(Clone)]
 pub struct LibsqlAgentStore {
+    conn: Connection,
     memory: LibsqlMemoryStore,
     policy: LibsqlPolicyStore,
 }
@@ -140,6 +141,47 @@ pub struct LibsqlPolicyStore {
     profile_id: String,
     embedding_table_name: String,
     embedder: Arc<dyn Embedder>,
+}
+
+#[derive(Clone)]
+pub struct LibsqlSessionStore {
+    conn: Connection,
+}
+
+#[derive(Clone)]
+pub struct LibsqlLlmTranscriptStore {
+    conn: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewLlmTranscriptTurn {
+    pub server_session_id: String,
+    pub turn_id: String,
+    pub owner: String,
+    pub owner_module: String,
+    pub owner_replica: u8,
+    pub tier: String,
+    pub source: String,
+    pub operation: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub trace_json: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmTranscriptTurnRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub turn_id: String,
+    pub owner: String,
+    pub owner_module: String,
+    pub owner_replica: u8,
+    pub tier: String,
+    pub source: String,
+    pub operation: String,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub trace_json: serde_json::Value,
 }
 
 impl LibsqlAgentStore {
@@ -168,7 +210,11 @@ impl LibsqlAgentStore {
             policy_embedder,
         )
         .await?;
-        Ok(Self { memory, policy })
+        Ok(Self {
+            conn,
+            memory,
+            policy,
+        })
     }
 
     pub fn memory_store(&self) -> LibsqlMemoryStore {
@@ -177,6 +223,194 @@ impl LibsqlAgentStore {
 
     pub fn policy_store(&self) -> LibsqlPolicyStore {
         self.policy.clone()
+    }
+
+    pub fn session_store(&self) -> LibsqlSessionStore {
+        LibsqlSessionStore {
+            conn: self.conn.clone(),
+        }
+    }
+
+    pub fn llm_transcript_store(&self) -> LibsqlLlmTranscriptStore {
+        LibsqlLlmTranscriptStore {
+            conn: self.conn.clone(),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl SessionStore for LibsqlSessionStore {
+    async fn load(
+        &self,
+        owner: &nuillu_types::ModuleInstanceId,
+        key: &SessionKey,
+    ) -> Result<Option<PersistedSessionSnapshot>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT snapshot_json
+                   FROM llm_sessions
+                  WHERE owner_module = ?1
+                    AND owner_replica = ?2
+                    AND session_key = ?3",
+                params![
+                    owner.module.as_str(),
+                    i64::from(owner.replica.get()),
+                    key.as_str()
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let Some(row) = rows.next().await.map_err(map_libsql_error)? else {
+            return Ok(None);
+        };
+        let json: String = row.get(0).map_err(map_libsql_error)?;
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|error| PortError::InvalidData(error.to_string()))
+    }
+
+    async fn save(
+        &self,
+        owner: &nuillu_types::ModuleInstanceId,
+        key: &SessionKey,
+        snapshot: &PersistedSessionSnapshot,
+    ) -> Result<(), PortError> {
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO llm_sessions (
+                    owner_module,
+                    owner_replica,
+                    session_key,
+                    snapshot_json,
+                    updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(owner_module, owner_replica, session_key) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    owner.module.as_str(),
+                    i64::from(owner.replica.get()),
+                    key.as_str(),
+                    snapshot_json,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+}
+
+impl LibsqlLlmTranscriptStore {
+    pub async fn insert_completed_turn(&self, turn: NewLlmTranscriptTurn) -> Result<(), PortError> {
+        let trace_json = serde_json::to_string(&turn.trace_json)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO llm_transcript_turns (
+                    server_session_id,
+                    turn_id,
+                    owner,
+                    owner_module,
+                    owner_replica,
+                    tier,
+                    source,
+                    operation,
+                    started_at_ms,
+                    completed_at_ms,
+                    trace_json,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    turn.server_session_id,
+                    turn.turn_id,
+                    turn.owner,
+                    turn.owner_module,
+                    i64::from(turn.owner_replica),
+                    turn.tier,
+                    turn.source,
+                    turn.operation,
+                    turn.started_at_ms,
+                    turn.completed_at_ms,
+                    trace_json,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    pub async fn recent_completed_turns(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<LlmTranscriptTurnRecord>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    id,
+                    server_session_id,
+                    turn_id,
+                    owner,
+                    owner_module,
+                    owner_replica,
+                    tier,
+                    source,
+                    operation,
+                    started_at_ms,
+                    completed_at_ms,
+                    trace_json
+                   FROM llm_transcript_turns
+                  ORDER BY id DESC
+                  LIMIT ?1",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let owner_replica: i64 = row.get(5).map_err(map_libsql_error)?;
+            let trace_json: String = row.get(11).map_err(map_libsql_error)?;
+            records.push(LlmTranscriptTurnRecord {
+                id: row.get(0).map_err(map_libsql_error)?,
+                server_session_id: row.get(1).map_err(map_libsql_error)?,
+                turn_id: row.get(2).map_err(map_libsql_error)?,
+                owner: row.get(3).map_err(map_libsql_error)?,
+                owner_module: row.get(4).map_err(map_libsql_error)?,
+                owner_replica: u8::try_from(owner_replica).map_err(|_| {
+                    PortError::InvalidData(format!("owner_replica out of range: {owner_replica}"))
+                })?,
+                tier: row.get(6).map_err(map_libsql_error)?,
+                source: row.get(7).map_err(map_libsql_error)?,
+                operation: row.get(8).map_err(map_libsql_error)?,
+                started_at_ms: row.get(9).map_err(map_libsql_error)?,
+                completed_at_ms: row.get(10).map_err(map_libsql_error)?,
+                trace_json: serde_json::from_str(&trace_json)
+                    .map_err(|error| PortError::InvalidData(error.to_string()))?,
+            });
+        }
+        records.reverse();
+        Ok(records)
+    }
+
+    pub async fn prune_completed_turns(&self, keep: usize) -> Result<(), PortError> {
+        self.conn
+            .execute(
+                "DELETE FROM llm_transcript_turns
+                  WHERE id NOT IN (
+                    SELECT id FROM llm_transcript_turns
+                     ORDER BY id DESC
+                     LIMIT ?1
+                  )",
+                params![limit_to_i64(keep)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
     }
 }
 
@@ -2552,6 +2786,8 @@ mod tests {
         assert_eq!(profiles, 1);
         assert_eq!(memories, 0);
         assert_eq!(policies, 0);
+        assert!(table_exists(&store.conn, "llm_sessions").await);
+        assert!(table_exists(&store.conn, "llm_transcript_turns").await);
         assert_eq!(
             version,
             SchemaVersion {
@@ -2579,6 +2815,86 @@ mod tests {
         assert!(table_exists(&memory.conn, DEFAULT_MEMORY_TABLE).await);
         assert!(table_exists(&policy.conn, DEFAULT_POLICY_TABLE).await);
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn llm_session_store_upserts_by_owner_replica_and_key() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.session_store();
+        let owner = nuillu_types::ModuleInstanceId::new(
+            nuillu_types::ModuleId::new("memory").unwrap(),
+            nuillu_types::ReplicaIndex::new(1),
+        );
+        let key = SessionKey::new("main").unwrap();
+        let first = test_session_snapshot(1);
+        let second = test_session_snapshot(2);
+
+        assert!(store.load(&owner, &key).await.unwrap().is_none());
+        store.save(&owner, &key, &first).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(store.load(&owner, &key).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        store.save(&owner, &key, &second).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(store.load(&owner, &key).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_transcript_store_returns_recent_chronological_and_prunes() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.llm_transcript_store();
+        for index in 0..3 {
+            store
+                .insert_completed_turn(NewLlmTranscriptTurn {
+                    server_session_id: "server-session".to_owned(),
+                    turn_id: format!("turn-{index}"),
+                    owner: "memory#0".to_owned(),
+                    owner_module: "memory".to_owned(),
+                    owner_replica: 0,
+                    tier: "cheap".to_owned(),
+                    source: "faculty".to_owned(),
+                    operation: "text-turn".to_owned(),
+                    started_at_ms: index * 10,
+                    completed_at_ms: index * 10 + 1,
+                    trace_json: serde_json::json!({ "index": index }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let recent = store.recent_completed_turns(2).await.unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|record| record.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1", "turn-2"]
+        );
+
+        store.prune_completed_turns(2).await.unwrap();
+        let retained = store.recent_completed_turns(10).await.unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|record| record.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1", "turn-2"]
+        );
     }
 
     #[tokio::test]
@@ -2767,7 +3083,7 @@ mod tests {
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "affect_arousal").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "valence").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 1);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 2);
     }
 
     #[tokio::test]
@@ -3784,6 +4100,13 @@ mod tests {
 
     fn profile(name: &str, version: &str, dimensions: usize) -> EmbeddingProfile {
         EmbeddingProfile::new(name, version, dimensions)
+    }
+
+    fn test_session_snapshot(version: u32) -> PersistedSessionSnapshot {
+        PersistedSessionSnapshot {
+            version,
+            items: Vec::new(),
+        }
     }
 
     async fn count_rows(store: &LibsqlMemoryStore, table: &str) -> i64 {
