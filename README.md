@@ -6,7 +6,11 @@ Build a **lightweight cognitive agent that runs locally**, inspired by [Attentio
 
 ## Design
 
-The agent is built as a small society of cooperating cognitive modules: sensory, summarize, allocation-controller, attention-schema, query-memory, memory, memory-compaction, predict, surprise, and speak. The modules share an *attention stream*, the agent's running picture of what it is currently attending to. That stream drives resource allocation: the allocation-controller uses it to decide which modules are enabled, how often they run, and what model tier and context budget they receive. The agent also maintains a coarse internal model of its own attention through the **attention-schema** module rather than a complete description of its inner workings.
+The agent is built as a small society of cooperating cognitive modules. The default runtime wiring currently includes sensory, cognition-gate, allocation-controller, attention-schema, self-model, query-memory, memory, memory-compaction, memory-association, memory-recombination, interoception, homeostatic-controller, policy, policy-compaction, reward, predict, surprise, and speak.
+
+Modules cooperate through a non-cognitive blackboard, per-module memo logs, typed transient channels, and an admitted **cognition log**. The cognition-gate promotes selected memo/blackboard state into that cognitive surface; attention-schema may append concise first-person attention-experience entries; self-model integrates those attention entries with stable and current context in its own memo log. Durable module output is memo- or log-authoritative rather than request/response traffic.
+
+Resource allocation is durable context rather than a wake path. The allocation-controller wakes from memo updates and internal attention-control bids, then writes activation priorities and guidance for modules. Effective allocation controls active replicas and rate limiting, while model tier is resolved through the allocation snapshot when a module requests LLM access. Homeostatic control can also drive or cap allocation from interoceptive state.
 
 Two characteristics shape the implementation:
 
@@ -22,7 +26,7 @@ The multi-agent decomposition and the deterministic logic are therefore means, n
 
 ## Project status
 
-A proof-of-concept is currently being built. It is not yet at a usable stage, let alone pre-alpha. The design (`docs/design/`) leads the implementation, and large parts of the system are still missing or in flux. Nothing is published to crates.io.
+A proof-of-concept runtime is currently being built. Core crates, server/runtime wiring, eval tooling, and many built-in modules exist, but the project is still pre-alpha and APIs and behavior remain in flux. The design notes in `docs/design/` are the source of truth for architectural intent. Nothing is published to crates.io.
 
 ## License
 
