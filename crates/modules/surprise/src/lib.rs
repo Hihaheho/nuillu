@@ -3,10 +3,10 @@ use async_trait::async_trait;
 use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, Memo, Module, ModuleSession,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
-    format_current_attention_guidance, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
+    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
+    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_session_if_needed, format_current_attention_guidance,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,8 @@ const EXPECTED_SURPRISE_MEMO: &str =
 const ACTIVATION_INPUT: &str = "Assess whether the new cognition is surprising relative to pending predictions and recent history.";
 
 const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
 log facts, significant events, memory preservation requests, and cognition-log context needed for
@@ -161,8 +163,18 @@ impl SurpriseModule {
         let lutum = self.llm.lutum().await;
         let outcome = {
             let mut session = self.session.borrow_mut();
-            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
-            push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
+            push_formatted_memo_log_batch(
+                &mut session,
+                &unread_memo_logs,
+                cx.now(),
+                MEMO_CONTEXT_WINDOW,
+            );
+            push_formatted_cognition_log_batch(
+                &mut session,
+                &unread_cognition,
+                cx.now(),
+                COGNITION_CONTEXT_WINDOW,
+            );
             if let Some(context) = format_surprise_context(&allocation) {
                 session.push_ephemeral_system(context);
             }

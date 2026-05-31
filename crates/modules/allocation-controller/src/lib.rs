@@ -6,12 +6,12 @@ use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo, MemoUpdatedInbox,
-    Module, ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    SessionCompactionRuntime, compact_session_if_needed, format_available_faculties,
-    format_current_attention_guidance, format_memo_log_batch, format_memory_trace_inventory,
-    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
+    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
+    MemoUpdatedInbox, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, SessionCompactionRuntime, compact_session_if_needed,
+    format_available_faculties, format_bounded_memo_log_batch, format_current_attention_guidance,
+    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -50,6 +50,8 @@ not encode it as JSON, YAML, a code block, or any fixed schema."#;
 
 const COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX: &str =
     "Compacted allocation-controller session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation-controller module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
 decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
@@ -342,7 +344,12 @@ impl AllocationControllerModule {
         let outcome = MODULE_TARGET_ID_SCHEMA
             .scope(module_target_schema, async {
                 let mut session = self.session.borrow_mut();
-                push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
+                push_formatted_cognition_log_batch(
+                    &mut session,
+                    &unread_cognition,
+                    cx.now(),
+                    COGNITION_CONTEXT_WINDOW,
+                );
                 session.push_ephemeral_system(format_allocation_controller_context(
                     &rank_counts,
                     &visible_current,
@@ -351,7 +358,7 @@ impl AllocationControllerModule {
                     stuckness.as_ref(),
                 ));
                 session.push_ephemeral_developer(controller_activation_input(
-                    format_memo_log_batch(&unread_memos, cx.now()),
+                    format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
                     requests,
                 ));
                 session
@@ -405,7 +412,12 @@ impl AllocationControllerModule {
                     }
                 }
                 let mut session = self.session.borrow_mut();
-                push_formatted_memo_log_batch(&mut session, &unread_memos, cx.now());
+                push_formatted_memo_log_batch(
+                    &mut session,
+                    &unread_memos,
+                    cx.now(),
+                    MEMO_CONTEXT_WINDOW,
+                );
                 round
                     .commit(&mut session, results)
                     .context("commit allocation-controller tool round")?;
@@ -977,7 +989,10 @@ mod tests {
             written_at: now,
             content: "fresh sensory memo".into(),
         }];
-        let input = controller_activation_input(format_memo_log_batch(&records, now), &[]);
+        let input = controller_activation_input(
+            format_bounded_memo_log_batch(&records, now, MEMO_CONTEXT_WINDOW),
+            &[],
+        );
 
         assert!(input.contains("Current memo batch"));
         assert!(input.contains("triggered this allocation turn"));
@@ -1131,7 +1146,13 @@ mod tests {
             }
         )));
 
-        let session_after_second = fixture.controller.session.input().items();
+        let session_after_second = fixture
+            .controller
+            .session
+            .borrow_mut()
+            .input()
+            .items()
+            .to_vec();
         assert!(session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
@@ -1172,6 +1193,9 @@ mod tests {
                     [MessageContent::Text(text)] if text.contains("Current memo batch")
                 )
         )));
-        assert_eq!(fixture.controller.session.list_turns().count(), 2);
+        assert_eq!(
+            fixture.controller.session.borrow_mut().list_turns().count(),
+            2
+        );
     }
 }

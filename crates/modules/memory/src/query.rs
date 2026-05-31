@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, Module, ModuleSession,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
+    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
+    Module, ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
     compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
     memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
 };
@@ -43,6 +43,7 @@ not produce user-facing answers, decide final truth, explain results from outsid
 use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, memory
 search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
@@ -423,7 +424,12 @@ impl QueryMemoryModule {
         let allocation = self.allocation.snapshot().await;
         {
             let mut session = self.session.borrow_mut();
-            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            push_formatted_memo_log_batch(
+                &mut session,
+                &unread_memo_logs,
+                cx.now(),
+                MEMO_CONTEXT_WINDOW,
+            );
             session.push_user(format_memory_questions(questions));
             if let Some(prior) = prior_query_memory_searches {
                 session.push_ephemeral_user(prior);
@@ -838,6 +844,12 @@ fn render_memo(
     }
 
     let mut sections = Vec::new();
+    if !retrieved.is_empty() {
+        sections.push(format!("Retrieved memory evidence:\n{retrieved}"));
+    }
+    if !linked.is_empty() {
+        sections.push(format!("Linked memory evidence:\n{linked}"));
+    }
     let request_lines = bullet_lines(requests.iter().map(String::as_str));
     if !request_lines.is_empty() {
         sections.push(format!("Query intent:\n{request_lines}"));
@@ -845,12 +857,6 @@ fn render_memo(
     let search_lines = bullet_lines(searches.iter().map(|search| search.query.as_str()));
     if !search_lines.is_empty() {
         sections.push(format!("Search queries:\n{search_lines}"));
-    }
-    if !retrieved.is_empty() {
-        sections.push(format!("Retrieved memory evidence:\n{retrieved}"));
-    }
-    if !linked.is_empty() {
-        sections.push(format!("Linked memory evidence:\n{linked}"));
     }
     sections.join("\n\n")
 }
@@ -942,5 +948,36 @@ mod tests {
 
         assert_eq!(args.memory_indexes.len(), 1);
         assert_eq!(args.memory_indexes[0].as_str(), "koro-approach-primary");
+    }
+
+    #[test]
+    fn retrieval_memo_puts_evidence_before_query_bookkeeping() {
+        let memo = render_memo(
+            &["Find the useful rule.".to_owned()],
+            &[QueryMemoryMemoSearch {
+                query: "useful rule".to_owned(),
+                limit: 8,
+                hit_indices: vec![],
+            }],
+            &[QueryMemoryHit {
+                index: MemoryIndex::new("rule-1"),
+                content: "A concrete remembered rule.".to_owned(),
+                rank: MemoryRank::ShortTerm,
+                occurred_at: None,
+                stored_at: Utc::now(),
+                kind: MemoryKind::Statement,
+                concepts: vec![],
+                tags: vec![],
+                affect_arousal: 0.0,
+                valence: 0.0,
+                emotion: String::new(),
+                linked_neighbor_count: 0,
+            }],
+            &[],
+        );
+
+        assert!(memo.starts_with("Retrieved memory evidence:\nA concrete remembered rule."));
+        assert!(memo.contains("\n\nQuery intent:\n- Find the useful rule."));
+        assert!(memo.contains("\n\nSearch queries:\n- useful rule"));
     }
 }

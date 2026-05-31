@@ -863,10 +863,11 @@ mod tests {
         ) -> Result<()> {
             self.recorder.batches.borrow_mut().push(batch.inputs.len());
             <SensoryModule as Module>::activate(&mut self.inner, cx, batch).await?;
+            let session_items = self.inner.session.borrow_mut().input().items().to_vec();
             self.recorder
                 .session_inputs
                 .borrow_mut()
-                .push(self.inner.session.input().items().to_vec());
+                .push(session_items);
             Ok(())
         }
     }

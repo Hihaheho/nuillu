@@ -5,11 +5,16 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eure::FromEure;
 use lutum::{ModelInput, StructuredTurnOutcome};
-use nuillu_blackboard::{Blackboard, BlackboardCommand, PolicyMetaPatch};
+use nuillu_blackboard::{
+    Blackboard, BlackboardCommand, CognitionLogEntryRecord, MemoLogRecord, PolicyMetaPatch,
+};
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, Memo,
-    Module, ModuleSession,
+    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess,
+    LlmContextWindow, Memo, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_llm_context_text, compact_session_if_needed,
+    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
+    format_current_attention_guidance, format_identity_system_prompt,
 };
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -35,6 +40,14 @@ existing policies. Choose reinforce_existing_policy only when an existing policy
 behavior already cover the candidate without contradiction. Choose insert_policy_candidate when the
 candidate is novel, contradictory, materially more specific, or otherwise not clearly covered.
 Use only the existing policy indexes in the provided candidate set."#;
+const REWARD_CONSIDERATION_CHARS: usize = 3_000;
+const REWARD_MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_000, 4_000);
+const REWARD_COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
+const COMPACTED_REWARD_SESSION_PREFIX: &str = "Compacted reward session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the reward module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve policy-consideration outcome evidence,
+reward channel judgments, candidate credit rationale, and policy update consequences future reward
+decisions need. Do not invent outcomes. Return plain text only."#;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ObservedReward {
@@ -368,6 +381,8 @@ pub struct RewardModule {
     memo: Memo,
     llm: LlmAccess,
     session: ModuleSession,
+    session_compaction: SessionCompactionConfig,
+    system_prompt: std::sync::OnceLock<String>,
     config: ReinforcementConfig,
 }
 
@@ -396,12 +411,35 @@ impl RewardModule {
             memo,
             llm,
             session,
+            session_compaction: SessionCompactionConfig::default(),
+            system_prompt: std::sync::OnceLock::new(),
             config: ReinforcementConfig::default(),
         }
     }
 
-    async fn settle(&mut self, evicted: PolicyConsiderationEvicted) -> Result<()> {
-        let assessment = self.assess(&evicted).await?;
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            format_identity_system_prompt(
+                SYSTEM_PROMPT,
+                cx.identity_memories(),
+                cx.core_policies(),
+                cx.now(),
+            )
+        })
+    }
+
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+    }
+
+    async fn settle(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        evicted: PolicyConsiderationEvicted,
+    ) -> Result<()> {
+        let assessment = self.assess(cx, &evicted).await?;
         let observed_scalar = self.config.observed_scalar(&assessment.observed_reward);
         let mut updates = Vec::new();
         let mut skipped_updates = Vec::new();
@@ -553,38 +591,108 @@ impl RewardModule {
         }
     }
 
-    async fn assess(&mut self, evicted: &PolicyConsiderationEvicted) -> Result<RewardAssessment> {
-        let memos = self.blackboard.recent_memo_logs().await;
-        let cognition = self.cognition.snapshot().await;
+    async fn assess(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        evicted: &PolicyConsiderationEvicted,
+    ) -> Result<RewardAssessment> {
+        self.ensure_session_seeded(cx);
+        let memos =
+            reward_memo_evidence(self.blackboard.recent_memo_logs().await, evicted.written_at);
+        let cognition = reward_cognition_evidence(self.cognition.snapshot().await, evicted);
         let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
         let lutum = self.llm.lutum().await;
-        let result = {
+        let semantic = {
             let mut session = self.session.borrow_mut();
-            session.push_ephemeral_system(SYSTEM_PROMPT);
             session.push_ephemeral_user(format!(
-                "Evicted policy consideration:\n{}\n\nRecent memos:\n{}\n\nCognition:\n{}\n\nAllocation:\n{}\n\nInteroception:\n{}",
-                serde_json::to_string(&evicted.payload)
-                    .expect("policy consideration serialization should not fail"),
-                serde_json::to_string(&memos).expect("memo log serialization should not fail"),
-                serde_json::to_string(&cognition)
-                    .expect("cognition log serialization should not fail"),
-                serde_json::to_string(&allocation)
-                    .expect("allocation serialization should not fail"),
-                serde_json::to_string(&interoception)
-                    .expect("interoception serialization should not fail"),
+                "Evicted policy consideration written at {}:\n{}\n\nOutcome memo evidence since consideration:\n{}\n\nOutcome cognition evidence since consideration:\n{}\n\nAllocation:\n{}\n\nInteroception:\naffect_arousal={:.2}; valence={:.2}; emotion={}",
+                evicted.written_at.to_rfc3339(),
+                compact_llm_context_text(
+                    &serde_json::to_string(&evicted.payload)
+                        .expect("policy consideration serialization should not fail"),
+                    REWARD_CONSIDERATION_CHARS,
+                ),
+                format_bounded_memo_log_batch(&memos, cx.now(), REWARD_MEMO_CONTEXT_WINDOW)
+                    .unwrap_or_else(|| "none".to_owned()),
+                format_bounded_cognition_log_batch(
+                    &cognition,
+                    cx.now(),
+                    REWARD_COGNITION_CONTEXT_WINDOW,
+                )
+                .unwrap_or_else(|| "none".to_owned()),
+                format_current_attention_guidance(&allocation).unwrap_or_else(|| "none".to_owned()),
+                interoception.affect_arousal,
+                interoception.valence,
+                if interoception.emotion.trim().is_empty() {
+                    "unknown"
+                } else {
+                    interoception.emotion.trim()
+                },
             ));
-            session
+            let result = session
                 .structured_turn::<RewardAssessment>(&lutum)
+                .max_output_tokens(768)
                 .collect()
                 .await
-                .context("reward structured turn failed")?
+                .context("reward structured turn failed")?;
+            let input_tokens = result.usage.input_tokens;
+            let semantic = result.semantic;
+            compact_session_if_needed(
+                &mut session,
+                input_tokens,
+                cx.session_compaction(),
+                self.session_compaction,
+                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                Self::id(),
+                COMPACTED_REWARD_SESSION_PREFIX,
+                SESSION_COMPACTION_PROMPT,
+            )
+            .await;
+            semantic
         };
-        let StructuredTurnOutcome::Structured(assessment) = result.semantic else {
+        let StructuredTurnOutcome::Structured(assessment) = semantic else {
             anyhow::bail!("reward structured turn refused");
         };
         Ok(assessment)
     }
+}
+
+fn reward_memo_evidence(
+    memos: Vec<MemoLogRecord>,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Vec<MemoLogRecord> {
+    memos
+        .into_iter()
+        .filter(|record| record.written_at >= since)
+        .collect()
+}
+
+fn reward_cognition_evidence(
+    cognition: nuillu_blackboard::CognitionLogSet,
+    evicted: &PolicyConsiderationEvicted,
+) -> Vec<CognitionLogEntryRecord> {
+    let mut index = 0_u64;
+    let mut records = Vec::new();
+    for log in cognition.logs() {
+        for entry in &log.entries {
+            if entry.at >= evicted.written_at {
+                records.push(CognitionLogEntryRecord {
+                    index,
+                    source: log.source.clone(),
+                    entry: entry.clone(),
+                });
+                index = index.saturating_add(1);
+            }
+        }
+    }
+    records.sort_by(|left, right| {
+        left.entry
+            .at
+            .cmp(&right.entry.at)
+            .then_with(|| left.source.to_string().cmp(&right.source.to_string()))
+    });
+    records
 }
 
 #[derive(Debug, PartialEq)]
@@ -757,12 +865,12 @@ impl Module for RewardModule {
 
     async fn activate(
         &mut self,
-        _cx: &nuillu_module::ActivateCx<'_>,
+        cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
         let mut first_error = None;
         for evicted in batch {
-            if let Err(error) = RewardModule::settle(self, evicted.clone()).await {
+            if let Err(error) = RewardModule::settle(self, cx, evicted.clone()).await {
                 tracing::warn!(?error, "failed to settle policy consideration");
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -781,12 +889,209 @@ impl Module for RewardModule {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use lutum::{
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
+        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
+        Lutum, MessageContent, MockLlmAdapter, MockStructuredScenario, ModelInput, ModelInputItem,
+        RawStructuredTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter,
+        Usage,
+    };
     use nuillu_module::ports::SystemClock;
+    use nuillu_module::{
+        CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
+        ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
+    };
+    use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaCapRange, ReplicaIndex, builtin};
 
     use super::*;
-    use crate::{PolicyCapabilities, PolicyCompactor, PolicySearchHit};
+    use crate::{
+        PolicyCapabilities, PolicyCompactor, PolicyConsideration, PolicyConsiderationPayload,
+        PolicySearchHit,
+    };
+
+    #[derive(Clone)]
+    struct CapturingStructuredAdapter {
+        inner: MockLlmAdapter,
+        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
+    }
+
+    impl CapturingStructuredAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn structured_inputs(&self) -> Vec<ModelInput> {
+            self.structured_inputs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingStructuredAdapter {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.structured_inputs.lock().unwrap().push(input.clone());
+            self.inner.structured_turn(input, turn).await
+        }
+    }
+
+    fn text_usage(input_tokens: u64) -> Usage {
+        Usage {
+            input_tokens,
+            ..Usage::zero()
+        }
+    }
+
+    fn reward_assessment_scenario(input_tokens: u64) -> MockStructuredScenario {
+        let json = serde_json::json!({
+            "observed_reward": {
+                "external": 0.0,
+                "task": 0.1,
+                "social": 0.0,
+                "cost": 0.0,
+                "risk": 0.0,
+                "novelty": 0.0
+            },
+            "candidate_credits": [],
+            "rationale": "bounded outcome evidence"
+        })
+        .to_string();
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("reward-assess".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk { json_delta: json }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("reward-assess".into()),
+                finish_reason: FinishReason::Stop,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn test_caps_with_adapter<T>(
+        blackboard: Blackboard,
+        adapter: Arc<T>,
+    ) -> (CapabilityProviders, Lutum)
+    where
+        T: TurnAdapter + 'static,
+    {
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        let caps = CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard,
+            cognition_log_port: Rc::new(nuillu_module::ports::NoopCognitionLogRepository),
+            clock: Rc::new(SystemClock),
+            tiers: LutumTiers::from_shared_lutum(lutum.clone()),
+        });
+        (caps, lutum)
+    }
+
+    fn compaction_runtime(lutum: &Lutum) -> SessionCompactionRuntime {
+        SessionCompactionRuntime::new(
+            lutum.clone(),
+            LlmConcurrencyLimiter::new(None),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::default(),
+        )
+    }
+
+    fn module_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            ReplicaCapRange::new(1, 1).unwrap(),
+            nuillu_blackboard::Bpm::from_f64(60_000.0)..=nuillu_blackboard::Bpm::from_f64(60_000.0),
+            nuillu_blackboard::linear_ratio_fn,
+        )
+    }
+
+    async fn build_reward_module(
+        caps: &CapabilityProviders,
+        policy_caps: PolicyCapabilities,
+    ) -> nuillu_module::AllocatedModule {
+        let modules = ModuleRegistry::new()
+            .register(module_policy(), move |caps| {
+                RewardModule::new(
+                    policy_caps.consideration_evicted_inbox(),
+                    caps.blackboard_reader(),
+                    caps.cognition_log_reader(),
+                    caps.allocation_reader(),
+                    caps.interoception_reader(),
+                    policy_caps.searcher(),
+                    policy_caps.upserter(),
+                    caps.memo(),
+                    caps.llm_access(),
+                    caps.session("main"),
+                )
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let (_, mut modules) = modules.into_parts();
+        modules.remove(0)
+    }
+
+    fn activate_cx(
+        lutum: &Lutum,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> nuillu_module::ActivateCx<'static> {
+        nuillu_module::ActivateCx::new(&[], &[], &[], &[], compaction_runtime(lutum), now)
+    }
+
+    fn all_input_text(input: &ModelInput) -> String {
+        let mut out = String::new();
+        for item in input.items() {
+            match item {
+                ModelInputItem::Message { content, .. } => {
+                    for content in content.as_slice() {
+                        if let MessageContent::Text(text) = content {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
+                ModelInputItem::Assistant(AssistantInputItem::Text(text)) => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn system_prompt_count(input: &ModelInput) -> usize {
+        input
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ModelInputItem::Message {
+                        role: InputMessageRole::System,
+                        content,
+                    } if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains(SYSTEM_PROMPT))
+                )
+            })
+            .count()
+    }
 
     #[test]
     fn bundled_reinforcement_config_loads() {
@@ -909,6 +1214,85 @@ mod tests {
             vec!["existing-policy"]
         );
         assert!(blackboard.read(|bb| bb.policy_metadata().is_empty()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_bounds_reward_input_to_post_consideration_evidence() {
+        let adapter = MockLlmAdapter::new().with_structured_scenario(reward_assessment_scenario(1));
+        let capture = CapturingStructuredAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let store = Rc::new(RecordingPolicyStore::default());
+        let policy_caps = PolicyCapabilities::new_with_consideration_retention(
+            blackboard.clone(),
+            Rc::new(SystemClock),
+            store,
+            Vec::new(),
+            1,
+        );
+        let mut module = build_reward_module(&caps, policy_caps.clone()).await;
+        let writer = policy_caps
+            .consideration_writer(ModuleInstanceId::new(builtin::policy(), ReplicaIndex::ZERO));
+        writer.write(reward_payload("first", &"P".repeat(4_000)));
+        writer.write(reward_payload("second", "replacement"));
+        let batch = module.next_batch().await.unwrap();
+
+        let old_time = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        let new_time = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let memo_owner = ModuleInstanceId::new(builtin::self_model(), ReplicaIndex::ZERO);
+        blackboard
+            .update_memo(
+                memo_owner.clone(),
+                "old outcome memo before consideration".to_owned(),
+                old_time,
+            )
+            .await;
+        blackboard
+            .update_memo(
+                memo_owner,
+                format!("new outcome memo after consideration {}", "N".repeat(1_200)),
+                new_time,
+            )
+            .await;
+        let cognition_owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        blackboard
+            .append_cognition_log(
+                cognition_owner.clone(),
+                nuillu_blackboard::CognitionLogEntry {
+                    at: old_time,
+                    text: "old outcome cognition before consideration".to_owned(),
+                },
+            )
+            .await;
+        blackboard
+            .append_cognition_log(
+                cognition_owner,
+                nuillu_blackboard::CognitionLogEntry {
+                    at: new_time,
+                    text: format!(
+                        "new outcome cognition after consideration {}",
+                        "Q".repeat(1_200)
+                    ),
+                },
+            )
+            .await;
+
+        let cx = activate_cx(&lutum, new_time);
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.structured_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(system_prompt_count(&inputs[0]), 1);
+        let text = all_input_text(&inputs[0]);
+        assert!(text.contains("Evicted policy consideration"));
+        assert!(text.contains("new outcome memo after consideration"));
+        assert!(text.contains("new outcome cognition after consideration"));
+        assert!(!text.contains("old outcome memo before consideration"));
+        assert!(!text.contains("old outcome cognition before consideration"));
+        assert!(!text.contains(&"P".repeat(3_500)));
+        assert!(!text.contains(&"N".repeat(800)));
+        assert!(!text.contains(&"Q".repeat(800)));
     }
 
     #[test]
@@ -1196,6 +1580,24 @@ mod tests {
             value: SignedUnitF32::ZERO,
             reward_tokens: 0,
             decay_remaining_secs: 60,
+        }
+    }
+
+    fn reward_payload(label: &str, long_text: &str) -> PolicyConsiderationPayload {
+        PolicyConsiderationPayload {
+            request_context: format!("{label} request {long_text}"),
+            query_text: format!("{label} query {long_text}"),
+            considerations: vec![PolicyConsideration {
+                candidate_id: format!("synthetic:{label}"),
+                source: PolicyConsiderationSource::Synthetic(SyntheticPolicyConsideration {
+                    trigger: format!("{label} trigger {long_text}"),
+                    behavior: format!("{label} behavior {long_text}"),
+                }),
+                predicted_expected_reward: 0.1,
+                confidence_hint: 0.4,
+                advice: "test advice".into(),
+                rationale: format!("{label} rationale {long_text}"),
+            }],
         }
     }
 }

@@ -359,7 +359,6 @@ fn truncated_batch_debug(debug: &str) -> String {
     let mut out = String::with_capacity(debug.len().min(MAX_LLM_BATCH_DEBUG_CHARS));
     for (index, ch) in debug.chars().enumerate() {
         if index == MAX_LLM_BATCH_DEBUG_CHARS {
-            out.push_str("\n... [truncated]");
             return out;
         }
         out.push(ch);

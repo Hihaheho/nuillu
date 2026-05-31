@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
-    MemoryMetadataReader, Module, ModuleSession, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
-    format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
-    render_memory_for_llm,
+    LlmContextWindow, MemoryMetadataReader, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_llm_context_text, compact_session_if_needed,
+    format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
+    push_formatted_cognition_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -54,6 +54,9 @@ framed as dream or hypothesis material with dream/hypothesis kind and operationa
 
 pub(crate) const SHORT_TERM_MEMORY_DECAY_SECS: i64 = 86_400;
 const RELATED_MEMORY_SEARCH_LIMIT: usize = 4;
+const RELATED_MEMORY_CANDIDATE_CONTEXT_LIMIT: usize = 12;
+const RELATED_MEMORY_CONTENT_CHARS: usize = 800;
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
@@ -134,17 +137,6 @@ pub struct MemoryModule {
 }
 
 #[derive(Clone, Debug)]
-struct MemoryMetadataContext {
-    index: String,
-    rank: MemoryRank,
-    occurred_at: String,
-    decay_remaining_secs: i64,
-    access_count: u32,
-    use_count: u32,
-    reinforcement_count: u32,
-}
-
-#[derive(Clone, Debug)]
 struct RelatedMemoryCandidate {
     target: MemoryUsageTarget,
     content: String,
@@ -197,38 +189,29 @@ impl MemoryModule {
         })
     }
 
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &MemoryBatch,
     ) -> Result<()> {
+        self.ensure_session_seeded(cx);
         {
             let mut session = self.session.borrow_mut();
-            push_formatted_cognition_log_batch(&mut session, &batch.cognition_log, cx.now());
+            push_formatted_cognition_log_batch(
+                &mut session,
+                &batch.cognition_log,
+                cx.now(),
+                COGNITION_CONTEXT_WINDOW,
+            );
         }
-        let (memory_metadata, rank_counts) = self
-            .memory_metadata
-            .read(|metadata_map| {
-                let mut metadata = metadata_map
-                    .values()
-                    .map(|item| MemoryMetadataContext {
-                        index: item.index.to_string(),
-                        rank: item.rank,
-                        occurred_at: item
-                            .occurred_at
-                            .map(|at| at.to_rfc3339())
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        decay_remaining_secs: item.decay_remaining_secs,
-                        access_count: item.access_count,
-                        use_count: item.use_count,
-                        reinforcement_count: item.reinforcement_count,
-                    })
-                    .collect::<Vec<_>>();
-                metadata.sort_by(|left, right| left.index.cmp(&right.index));
-                (metadata, memory_rank_counts(metadata_map))
-            })
-            .await;
+        let rank_counts = self.memory_metadata.read(memory_rank_counts).await;
         let allocation = self.allocation.snapshot().await;
         let allocation_guidance = allocation.for_module(&self.owner).guidance;
         let related_memories = self
@@ -239,17 +222,12 @@ impl MemoryModule {
             .map(|candidate| (candidate.target.index.clone(), candidate.target.clone()))
             .collect::<HashMap<_, _>>();
 
-        let system_prompt = self.system_prompt(cx).to_owned();
         {
             let mut session = self.session.borrow_mut();
-            session.push_ephemeral_system(system_prompt);
             session.push_user(format_memory_activation_request(
                 &allocation_guidance,
                 batch.cognition_log.len(),
             ));
-            if let Some(metadata_context) = format_memory_metadata_candidates(&memory_metadata) {
-                session.push_ephemeral_user(metadata_context);
-            }
             if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
                 session.push_ephemeral_user(candidate_context);
             }
@@ -281,7 +259,7 @@ impl MemoryModule {
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
-                        SessionCompactionProtectedPrefix::None,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -296,7 +274,7 @@ impl MemoryModule {
                         result.usage.input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
-                        SessionCompactionProtectedPrefix::None,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -341,7 +319,7 @@ impl MemoryModule {
                         input_tokens,
                         cx.session_compaction(),
                         self.session_compaction,
-                        SessionCompactionProtectedPrefix::None,
+                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
                         Self::id(),
                         COMPACTED_MEMORY_SESSION_PREFIX,
                         SESSION_COMPACTION_PROMPT,
@@ -414,6 +392,9 @@ impl MemoryModule {
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
         for query in queries {
+            if candidates.len() >= RELATED_MEMORY_CANDIDATE_CONTEXT_LIMIT {
+                break;
+            }
             let hits = self
                 .memory_retriever
                 .search(&query, RELATED_MEMORY_SEARCH_LIMIT)
@@ -429,6 +410,9 @@ impl MemoryModule {
                     stored_at: hit.stored_at.to_rfc3339(),
                     kind: hit.kind,
                 });
+                if candidates.len() >= RELATED_MEMORY_CANDIDATE_CONTEXT_LIMIT {
+                    break;
+                }
             }
         }
         let targets = candidates
@@ -460,26 +444,6 @@ fn format_memory_activation_request(guidance: &str, cognition_evicted_count: usi
     )
 }
 
-fn format_memory_metadata_candidates(metadata: &[MemoryMetadataContext]) -> Option<String> {
-    if metadata.is_empty() {
-        return None;
-    }
-    let mut out = String::from("Existing memory metadata for deduplication:");
-    for item in metadata {
-        out.push_str(&format!(
-            "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}; use_count={}; reinforcement_count={}",
-            item.index,
-            item.rank,
-            item.occurred_at,
-            item.decay_remaining_secs,
-            item.access_count,
-            item.use_count,
-            item.reinforcement_count
-        ));
-    }
-    Some(out)
-}
-
 fn format_related_memory_candidates(candidates: &[RelatedMemoryCandidate]) -> Option<String> {
     if candidates.is_empty() {
         return None;
@@ -499,7 +463,7 @@ fn format_related_memory_candidates(candidates: &[RelatedMemoryCandidate]) -> Op
                 .map(|at| at.to_rfc3339())
                 .unwrap_or_else(|| "unknown".to_owned()),
             candidate.stored_at,
-            candidate.content.trim()
+            compact_llm_context_text(&candidate.content, RELATED_MEMORY_CONTENT_CHARS)
         ));
     }
     Some(out)

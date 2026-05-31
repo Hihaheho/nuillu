@@ -80,7 +80,8 @@ pub use llm::{
 pub use memo::{Memo, TypedMemo};
 pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
-    MemoryRankCounts, format_available_faculties, format_cognition_log_batch,
+    LlmContextWindow, MemoryRankCounts, compact_llm_context_text, format_available_faculties,
+    format_bounded_cognition_log_batch, format_bounded_memo_log_batch, format_cognition_log_batch,
     format_current_attention_guidance, format_identity_memory_seed, format_memo_log_batch,
     format_memory_trace_inventory, format_stuckness, format_time_division_guidance,
     memory_rank_counts,

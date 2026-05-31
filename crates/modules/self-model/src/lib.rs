@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess,
-    Memo, Module, ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    LlmContextWindow, Memo, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_session_if_needed,
+    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use nuillu_types::builtin;
 
@@ -22,6 +23,8 @@ Write the memo as free-form prose. Preserve the current self-description and eve
 question/answer, but do not encode the memo as JSON, YAML, a code block, or any fixed schema."#;
 
 const COMPACTED_SELF_MODEL_SESSION_PREFIX: &str = "Compacted self-model session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the self-model module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve self-descriptions, self-model questions
 and answers, memo-log facts about the agent, attention-schema first-person cognition, uncertainty,
@@ -105,12 +108,22 @@ impl SelfModelModule {
         let lutum = self.llm.lutum().await;
         let memo = {
             let mut session = self.session.borrow_mut();
-            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
+            push_formatted_memo_log_batch(
+                &mut session,
+                &unread_memo_logs,
+                cx.now(),
+                MEMO_CONTEXT_WINDOW,
+            );
             session.push_user(format!(
                 "Request for the next self-model memo:\n{}",
                 guidance.trim()
             ));
-            push_formatted_cognition_log_batch(&mut session, &attention_schema_cognition, cx.now());
+            push_formatted_cognition_log_batch(
+                &mut session,
+                &attention_schema_cognition,
+                cx.now(),
+                COGNITION_CONTEXT_WINDOW,
+            );
             let result = session
                 .text_turn(&lutum)
                 .collect()

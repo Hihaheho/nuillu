@@ -10,7 +10,10 @@ use nuillu_blackboard::{
 };
 use nuillu_module::{
     AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox, InteroceptionRuntimePolicy,
-    InteroceptiveWriter, LlmAccess, MemoUpdatedInbox, Module, ModuleSession,
+    InteroceptiveWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, ModuleSession,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
+    format_current_attention_guidance, format_identity_system_prompt,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -36,6 +39,13 @@ const QUIET_WAKE_AROUSAL_DECAY_PER_SEC: f32 = 0.08;
 const QUIET_AFFECT_AROUSAL_DECAY_PER_SEC: f32 = 0.08;
 const WAKE_AROUSAL_WAKE_LEVEL: f32 = 0.70;
 const WAKE_AROUSAL_SLEEP_LEVEL: f32 = 0.25;
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 800, 3_000);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
+const COMPACTED_INTEROCEPTION_SESSION_PREFIX: &str = "Compacted interoception session history:";
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the interoception module's persistent session history.
+Summarize only the prefix transcript you receive. Preserve affect-state judgments, salient evidence,
+and wake/sleep pressure rationale future interoception decisions need. Do not invent observations.
+Return plain text only."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +93,8 @@ pub struct InteroceptionModule {
     policy: InteroceptionRuntimePolicy,
     llm: LlmAccess,
     session: ModuleSession,
+    session_compaction: SessionCompactionConfig,
+    system_prompt: std::sync::OnceLock<String>,
     last_seen_cognition_index: Option<u64>,
     last_total_remember_tokens: Option<u32>,
     last_activity_at: Option<DateTime<Utc>>,
@@ -108,10 +120,29 @@ impl InteroceptionModule {
             interoception,
             llm,
             session,
+            session_compaction: SessionCompactionConfig::default(),
+            system_prompt: std::sync::OnceLock::new(),
             last_seen_cognition_index: None,
             last_total_remember_tokens: None,
             last_activity_at: None,
         }
+    }
+
+    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
+        self.system_prompt.get_or_init(|| {
+            format_identity_system_prompt(
+                SYSTEM_PROMPT,
+                cx.identity_memories(),
+                cx.core_policies(),
+                cx.now(),
+            )
+        })
+    }
+
+    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.system_prompt(cx).to_owned();
+        self.session
+            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
     }
 
     async fn activate(
@@ -185,7 +216,7 @@ impl InteroceptionModule {
         );
         if batch.affect_candidate && (!unread_memos.is_empty() || !unread_cognition.is_empty()) {
             let affect = self
-                .estimate_affect(&current, &unread_memos, &unread_cognition, &allocation)
+                .estimate_affect(cx, &current, &unread_memos, &unread_cognition, &allocation)
                 .await?;
             merge_affect_patch(&mut patch, &current, affect, &self.policy);
         }
@@ -215,29 +246,51 @@ impl InteroceptionModule {
 
     async fn estimate_affect(
         &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
         current: &InteroceptiveState,
         unread_memos: &[MemoLogRecord],
         unread_cognition: &[CognitionLogEntryRecord],
         allocation: &nuillu_blackboard::ResourceAllocation,
     ) -> Result<AffectAssessment> {
+        self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
-        let result = {
+        let semantic = {
             let mut session = self.session.borrow_mut();
-            session.push_ephemeral_system(SYSTEM_PROMPT);
             session.push_ephemeral_user(format!(
-                "Current interoceptive state:\n{}\n\nUnread memos:\n{}\n\nUnread cognition:\n{}\n\nCurrent allocation:\n{}",
+                "Current interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nAttention guidance:\n{}",
                 serde_json::to_string(current).unwrap_or_default(),
-                serde_json::to_string(unread_memos).unwrap_or_default(),
-                serde_json::to_string(unread_cognition).unwrap_or_default(),
-                serde_json::to_string(allocation).unwrap_or_default(),
+                format_bounded_memo_log_batch(unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
+                    .unwrap_or_else(|| "none".to_owned()),
+                format_bounded_cognition_log_batch(
+                    unread_cognition,
+                    cx.now(),
+                    COGNITION_CONTEXT_WINDOW,
+                )
+                .unwrap_or_else(|| "none".to_owned()),
+                format_current_attention_guidance(allocation).unwrap_or_else(|| "none".to_owned()),
             ));
-            session
+            let result = session
                 .structured_turn::<AffectAssessment>(&lutum)
+                .max_output_tokens(512)
                 .collect()
                 .await
-                .context("interoception structured turn failed")?
+                .context("interoception structured turn failed")?;
+            let input_tokens = result.usage.input_tokens;
+            let semantic = result.semantic;
+            compact_session_if_needed(
+                &mut session,
+                input_tokens,
+                cx.session_compaction(),
+                self.session_compaction,
+                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+                Self::id(),
+                COMPACTED_INTEROCEPTION_SESSION_PREFIX,
+                SESSION_COMPACTION_PROMPT,
+            )
+            .await;
+            semantic
         };
-        let StructuredTurnOutcome::Structured(assessment) = result.semantic else {
+        let StructuredTurnOutcome::Structured(assessment) = semantic else {
             anyhow::bail!("interoception structured turn refused");
         };
         Ok(normalize_affect_assessment(assessment))

@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use lutum::{InputMessageRole, ModelInputItem, Session};
 use nuillu_blackboard::{CognitionLogEntryRecord, IdentityMemoryRecord, MemoLogRecord};
 
-use crate::{format_cognition_log_batch, format_identity_memory_seed, format_memo_log_batch};
+use crate::{
+    LlmContextWindow, format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
+    format_identity_memory_seed,
+};
 
 pub fn seed_persistent_faculty_session(
     session: &mut Session,
@@ -24,8 +27,9 @@ pub fn push_formatted_cognition_log_batch(
     session: &mut Session,
     records: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
+    window: LlmContextWindow,
 ) {
-    if let Some(batch) = format_cognition_log_batch(records, now) {
+    if let Some(batch) = format_bounded_cognition_log_batch(records, now, window) {
         session.push_assistant_text(batch);
     }
 }
@@ -34,8 +38,9 @@ pub fn push_formatted_memo_log_batch(
     session: &mut Session,
     records: &[MemoLogRecord],
     now: DateTime<Utc>,
+    window: LlmContextWindow,
 ) {
-    if let Some(batch) = format_memo_log_batch(records, now) {
+    if let Some(batch) = format_bounded_memo_log_batch(records, now, window) {
         session.push_system(batch);
     }
 }
@@ -80,6 +85,7 @@ mod tests {
                 },
             }],
             now(),
+            LlmContextWindow::new(8, 360, 3_000),
         );
         push_formatted_memo_log_batch(
             &mut session,
@@ -90,6 +96,7 @@ mod tests {
                 content: "A memo fact.".into(),
             }],
             now(),
+            LlmContextWindow::new(8, 420, 3_000),
         );
 
         let items = session.input().items();

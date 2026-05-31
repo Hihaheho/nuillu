@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{Lutum, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, MemoUpdatedInbox, Module,
-    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    SessionCompactionRuntime, TimeDivision, compact_session_if_needed,
-    format_current_attention_guidance, format_faculty_system_prompt, format_memo_log_batch,
-    format_memory_trace_inventory, format_stuckness, format_time_division_guidance,
-    memory_rank_counts, push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow,
+    MemoUpdatedInbox, Module, ModuleSession, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, SessionCompactionRuntime, TimeDivision,
+    compact_session_if_needed, format_bounded_memo_log_batch, format_current_attention_guidance,
+    format_faculty_system_prompt, format_memory_trace_inventory, format_stuckness,
+    format_time_division_guidance, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,8 @@ conscious cognition, call append_cognition exactly once. Do not use final assist
 output channel."#;
 
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the cognition-gate module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve information that future cognition-gate
 decisions need: memo-log facts, prior gate decisions, promoted events, rejected candidate events,
@@ -249,8 +252,15 @@ impl CognitionGateModule {
         );
         {
             let mut session = self.session.borrow_mut();
-            push_formatted_cognition_log_batch(&mut session, &unread_cognition, cx.now());
-            if let Some(memo_notes) = format_memo_log_batch(&unread_memos, cx.now()) {
+            push_formatted_cognition_log_batch(
+                &mut session,
+                &unread_cognition,
+                cx.now(),
+                COGNITION_CONTEXT_WINDOW,
+            );
+            if let Some(memo_notes) =
+                format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
+            {
                 session.push_ephemeral_user(memo_notes);
             }
             session.push_ephemeral_system(context);
@@ -261,7 +271,12 @@ impl CognitionGateModule {
         let result = self
             .run_decision_turn(&lutum, cx.session_compaction())
             .await;
-        push_formatted_memo_log_batch(&mut self.session.borrow_mut(), &unread_memos, cx.now());
+        push_formatted_memo_log_batch(
+            &mut self.session.borrow_mut(),
+            &unread_memos,
+            cx.now(),
+            MEMO_CONTEXT_WINDOW,
+        );
         result?;
         Ok(())
     }
@@ -898,7 +913,10 @@ mod tests {
             ));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         for index in 0..10 {
-            fixture.gate.session.push_user(format!("history-{index}"));
+            fixture
+                .gate
+                .session
+                .session_mut(|session| session.push_user(format!("history-{index}")));
         }
 
         let lutum = fixture.gate.llm.lutum().await;
@@ -907,7 +925,7 @@ mod tests {
             .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
-        let items = fixture.gate.session.input().items();
+        let items = fixture.gate.session.borrow_mut().input().items().to_vec();
         let ModelInputItem::Assistant(AssistantInputItem::Text(summary)) = &items[0] else {
             panic!("expected compacted assistant message");
         };
@@ -939,7 +957,10 @@ mod tests {
             .with_text_scenario(summary_text_scenario("unexpected summary"));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         for index in 0..10 {
-            fixture.gate.session.push_user(format!("history-{index}"));
+            fixture
+                .gate
+                .session
+                .session_mut(|session| session.push_user(format!("history-{index}")));
         }
 
         let lutum = fixture.gate.llm.lutum().await;
@@ -948,7 +969,7 @@ mod tests {
             .run_decision_turn(&lutum, &compaction_runtime(&lutum))
             .await
             .unwrap();
-        let items = fixture.gate.session.input().items();
+        let items = fixture.gate.session.borrow_mut().input().items().to_vec();
         let ModelInputItem::Message { role, content } = &items[0] else {
             panic!("expected original first history item");
         };
@@ -1019,7 +1040,7 @@ mod tests {
             "sensory memo A"
         ));
 
-        let items = fixture.gate.session.input().items();
+        let items = fixture.gate.session.borrow_mut().input().items().to_vec();
         let ModelInputItem::Message { role, content } = &items[0] else {
             panic!("expected persistent system prompt");
         };
@@ -1044,12 +1065,12 @@ mod tests {
         )));
 
         assert_eq!(
-            fixture.gate.session.list_turns().count(),
+            fixture.gate.session.borrow_mut().list_turns().count(),
             1,
             "explicit skip_cognition decision must persist a tool turn"
         );
         assert!(!has_message_with_role_containing(
-            items,
+            &items,
             InputMessageRole::User,
             "sensory memo A"
         ));
@@ -1062,7 +1083,10 @@ mod tests {
             .with_text_scenario(silent_scenario(1))
             .with_text_scenario(silent_scenario(1));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
-        fixture.gate.session.push_system(SYSTEM_PROMPT);
+        fixture
+            .gate
+            .session
+            .session_mut(|session| session.push_system(SYSTEM_PROMPT));
 
         let lutum = fixture.gate.llm.lutum().await;
         let err = fixture
@@ -1081,7 +1105,10 @@ mod tests {
             1,
         ));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
-        fixture.gate.session.push_system(SYSTEM_PROMPT);
+        fixture
+            .gate
+            .session
+            .session_mut(|session| session.push_system(SYSTEM_PROMPT));
 
         let lutum = fixture.gate.llm.lutum().await;
         fixture
@@ -1133,14 +1160,14 @@ mod tests {
         let err = fixture.gate.activate(&cx).await.unwrap_err();
         assert!(err.to_string().contains("decision turn failed"));
 
-        let items = fixture.gate.session.input().items();
+        let items = fixture.gate.session.borrow_mut().input().items().to_vec();
         assert!(has_message_with_role_containing(
-            items,
+            &items,
             InputMessageRole::System,
             "sensory memo A"
         ));
         assert!(!has_message_with_role_containing(
-            items,
+            &items,
             InputMessageRole::User,
             "sensory memo A"
         ));
@@ -1289,19 +1316,19 @@ mod tests {
                 )
         )));
 
-        let session_after_second = fixture.gate.session.input().items();
+        let session_after_second = fixture.gate.session.borrow_mut().input().items().to_vec();
         assert!(has_message_with_role_containing(
-            session_after_second,
+            &session_after_second,
             InputMessageRole::System,
             "sensory memo A"
         ));
         assert!(has_message_with_role_containing(
-            session_after_second,
+            &session_after_second,
             InputMessageRole::System,
             "sensory memo B"
         ));
         assert!(!has_message_with_role_containing(
-            session_after_second,
+            &session_after_second,
             InputMessageRole::User,
             "sensory memo B"
         ));
@@ -1319,7 +1346,7 @@ mod tests {
                         if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
                 )
         )));
-        assert_eq!(fixture.gate.session.list_turns().count(), 2);
+        assert_eq!(fixture.gate.session.borrow_mut().list_turns().count(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1346,7 +1373,7 @@ mod tests {
 
         fixture.gate.activate(&cx).await.unwrap();
 
-        let items = fixture.gate.session.input().items();
+        let items = fixture.gate.session.borrow_mut().input().items().to_vec();
         let ModelInputItem::Assistant(lutum::AssistantInputItem::Text(identity)) = &items[1] else {
             panic!("expected identity memories as assistant text");
         };

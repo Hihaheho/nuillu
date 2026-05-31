@@ -3,9 +3,10 @@ use async_trait::async_trait;
 use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    CognitionWriter, LlmAccess, MemoUpdatedInbox, Module, ModuleSession, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_session_if_needed, format_current_attention_guidance,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, ModuleSession,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    format_current_attention_guidance, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,8 @@ blackboards, logs, or implementation details in the appended text."#;
 
 const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
     "Compacted attention-schema session history:";
+const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the attention-schema module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, attention-state
 interpretations, prior appended first-person attention experiences, rejected candidates, allocation
@@ -151,8 +154,18 @@ impl AttentionSchemaModule {
         let lutum = self.llm.lutum().await;
         let outcome = {
             let mut session = self.session.borrow_mut();
-            push_formatted_memo_log_batch(&mut session, &unread_memo_logs, cx.now());
-            push_formatted_cognition_log_batch(&mut session, &unread_cognition_log, cx.now());
+            push_formatted_memo_log_batch(
+                &mut session,
+                &unread_memo_logs,
+                cx.now(),
+                MEMO_CONTEXT_WINDOW,
+            );
+            push_formatted_cognition_log_batch(
+                &mut session,
+                &unread_cognition_log,
+                cx.now(),
+                COGNITION_CONTEXT_WINDOW,
+            );
             if let Some(context) = format_attention_schema_context(&allocation) {
                 session.push_ephemeral_system(context);
             }
