@@ -405,7 +405,7 @@ impl CognitionGateModule {
                 AppendDecision::Rejected,
             );
         }
-        if let Err(err) = ensure_admissible_cognition_text(text) {
+        if let Err(err) = ensure_plain_cognition_text(text) {
             return (
                 rejected_append_output(err.to_string()),
                 AppendDecision::Rejected,
@@ -454,7 +454,7 @@ fn salvage_cognition_from_plain_output(output: &str) -> Option<String> {
         .filter_map(sanitize_plain_cognition_line)
         .collect::<Vec<_>>();
     let text = lines.join(" ").trim().to_owned();
-    if text.is_empty() || ensure_admissible_cognition_text(&text).is_err() {
+    if text.is_empty() || ensure_plain_cognition_text(&text).is_err() {
         return None;
     }
     Some(text)
@@ -477,38 +477,115 @@ fn sanitize_plain_cognition_line(raw: &str) -> Option<String> {
         || normalized.contains("append_cognition")
         || normalized.contains("<tool_call|>")
         || normalized.contains("<|")
-        || ensure_admissible_cognition_text(line).is_err()
+        || ensure_plain_cognition_text(line).is_err()
     {
         return None;
     }
     Some(line.to_owned())
 }
 
-fn ensure_admissible_cognition_text(text: &str) -> Result<()> {
-    let normalized = text.trim().to_ascii_lowercase();
-    let rejected = [
-        "i need to determine",
-        "i need to decide",
-        "i need to formulate",
-        "i need to consider",
-        "i need to figure out",
-        "i need to answer",
-        "i need to respond",
-        "i need to check",
-        "i need to retrieve",
-        "i need to search",
-        "i need to consult",
-        "i need to process",
-        "next step",
-        "formulating a response",
-        "the instruction is",
-        "no new load-bearing evidence",
-        "correct action based on",
-    ];
-    if rejected.iter().any(|pattern| normalized.contains(pattern)) {
-        anyhow::bail!("cognition-gate rejected internal work-plan cognition text");
+fn ensure_plain_cognition_text(text: &str) -> Result<()> {
+    let text = text.trim();
+    if contains_xml_like_tag(text) || looks_like_json_payload(text) {
+        anyhow::bail!("cognition-gate rejected structured-output cognition text");
     }
     Ok(())
+}
+
+fn contains_xml_like_tag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while let Some(offset) = text[index..].find('<') {
+        let start = index + offset;
+        let mut cursor = start + 1;
+        if cursor >= bytes.len() {
+            return false;
+        }
+        if matches!(bytes[cursor], b'!' | b'?') {
+            if text[start..].contains('>') {
+                return true;
+            }
+            index = start + 1;
+            continue;
+        }
+        if bytes[cursor] == b'/' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || !is_xml_name_start(bytes[cursor]) {
+            index = start + 1;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && is_xml_name_char(bytes[cursor]) {
+            cursor += 1;
+        }
+        while cursor < bytes.len() && !matches!(bytes[cursor], b'<' | b'\n' | b'\r' | b'>') {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b'>' {
+            return true;
+        }
+        index = start + 1;
+    }
+    false
+}
+
+fn is_xml_name_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_xml_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.')
+}
+
+fn looks_like_json_payload(text: &str) -> bool {
+    let trimmed = text.trim();
+    let starts_like_json = matches!(trimmed.as_bytes().first(), Some(b'{' | b'['));
+    if starts_like_json && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return true;
+    }
+    if starts_like_json && contains_json_key_value_fragment(trimmed) {
+        return true;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    contains_json_key_value_fragment(trimmed)
+        || normalized.contains("\"append_cognition\"")
+        || normalized.contains("\"skip_cognition\"")
+        || normalized.contains("cognition_text\":")
+}
+
+fn contains_json_key_value_fragment(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let key_start = index + 1;
+        let Some(relative_key_end) = text[key_start..].find('"') else {
+            return false;
+        };
+        let key_end = key_start + relative_key_end;
+        let key = &text[key_start..key_end];
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            index = key_end + 1;
+            continue;
+        }
+        let mut cursor = key_end + 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b':' {
+            return true;
+        }
+        index = key_end + 1;
+    }
+    false
 }
 
 #[async_trait(?Send)]
@@ -1117,13 +1194,23 @@ mod tests {
     }
 
     #[test]
-    fn admissible_cognition_rejects_internal_work_plan() {
-        let err = ensure_admissible_cognition_text(
+    fn plain_cognition_text_allows_work_plan_words() {
+        ensure_plain_cognition_text(
             "I need to determine what advice to give Pibi about Koro based on the remembered rules.",
         )
-        .unwrap_err();
+        .unwrap();
+    }
 
-        assert!(err.to_string().contains("internal work-plan"));
+    #[test]
+    fn plain_cognition_text_rejects_structured_output_artifacts() {
+        for text in [
+            r#"<tool_call name="append_cognition">{"cognition_text":"Koro should stay in view."}</tool_call>"#,
+            r#"{"cognition_text":"Koro should stay in view."}"#,
+            r#""cognition_text":"Koro should stay in view.""#,
+        ] {
+            let err = ensure_plain_cognition_text(text).unwrap_err();
+            assert!(err.to_string().contains("structured-output"));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
