@@ -412,6 +412,37 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
                 "nuillu-server module-stopped tab={} owner={} phase={} failures={} error={}",
                 self.tab_id, owner, phase, consecutive_failures, message
             ),
+            RuntimeEvent::SessionCompactionStarted {
+                owner,
+                session_key,
+                input_tokens,
+                threshold,
+                ..
+            } => eprintln!(
+                "nuillu-server session-compaction-started tab={} owner={} session={} input_tokens={} threshold={}",
+                self.tab_id, owner, session_key, input_tokens, threshold
+            ),
+            RuntimeEvent::SessionCompactionCompleted {
+                owner,
+                session_key,
+                input_tokens,
+                before_items,
+                after_items,
+                ..
+            } => eprintln!(
+                "nuillu-server session-compaction-completed tab={} owner={} session={} input_tokens={} items={}->{}",
+                self.tab_id, owner, session_key, input_tokens, before_items, after_items
+            ),
+            RuntimeEvent::SessionCompactionFailed {
+                owner,
+                session_key,
+                input_tokens,
+                message,
+                ..
+            } => eprintln!(
+                "nuillu-server session-compaction-failed tab={} owner={} session={} input_tokens={} error={}",
+                self.tab_id, owner, session_key, input_tokens, message
+            ),
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),

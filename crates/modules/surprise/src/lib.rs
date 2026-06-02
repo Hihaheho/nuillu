@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use lutum::{TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
@@ -180,16 +180,25 @@ impl SurpriseModule {
             }
             session.push_ephemeral_developer(ACTIVATION_INPUT);
             session
-                .text_turn(&lutum)
+                .text_turn()
                 .tools::<SurpriseTools>()
                 .available_tools([
                     SurpriseToolsSelector::PreserveUnexpectedEvent,
                     SurpriseToolsSelector::MarkExpectedEvent,
                 ])
                 .require_any_tool()
-                .collect()
+                .collect(&lutum)
                 .await
-                .context("surprise assessment turn failed")?
+                .map_err(|error| {
+                    if error
+                        .to_string()
+                        .contains("required tool call was not produced")
+                    {
+                        anyhow!("surprise finished without required tool call")
+                    } else {
+                        anyhow!(error).context("surprise assessment turn failed")
+                    }
+                })?
         };
 
         let round = match outcome {
@@ -483,18 +492,22 @@ mod tests {
 
         ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *module_sink.borrow_mut() = Some(SurpriseModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.attention_control_mailbox(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                ));
-                *attention_requests_sink.borrow_mut() = Some(caps.attention_control_inbox());
-                SurpriseStub
+                let module_sink = Rc::clone(&module_sink);
+                let attention_requests_sink = Rc::clone(&attention_requests_sink);
+                async move {
+                    *module_sink.borrow_mut() = Some(SurpriseModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        caps.attention_control_mailbox(),
+                        caps.memo(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ));
+                    *attention_requests_sink.borrow_mut() = Some(caps.attention_control_inbox());
+                    Ok(SurpriseStub)
+                }
             })
             .unwrap()
             .build(&caps)

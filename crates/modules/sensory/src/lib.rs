@@ -277,8 +277,9 @@ impl SensoryModule {
         let allocation = self.allocation.snapshot().await;
         let guidance = allocation.for_module(&self.owner).guidance;
         let lutum = self.llm.lutum().await;
-        let outcome = {
+        let (outcome, session_len_before_turn) = {
             let mut session = self.session.borrow_mut();
+            let session_len_before_turn = session.input().items().len();
             session.push_ephemeral_user(format_sensory_turn_user_message(
                 &observations,
                 &self.ambient_entries,
@@ -286,24 +287,34 @@ impl SensoryModule {
             ));
             session.push_ephemeral_developer(format_sensory_decision_context(&guidance));
             let turn = session
-                .text_turn(&lutum)
+                .text_turn()
                 .tools::<SensoryTools>()
                 .available_tools([
                     SensoryToolsSelector::WriteSensoryMemo,
                     SensoryToolsSelector::IgnoreObservations,
                 ])
                 .require_any_tool();
-            match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect()).await {
-                Ok(result) => result.context("sensory text turn failed")?,
-                Err(_) => anyhow::bail!(
-                    "sensory LLM turn timed out after {}s",
-                    SENSORY_LLM_TURN_TIMEOUT.as_secs()
-                ),
-            }
+            let outcome =
+                match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect(&lutum)).await {
+                    Ok(result) => result.context("sensory text turn failed")?,
+                    Err(_) => anyhow::bail!(
+                        "sensory LLM turn timed out after {}s",
+                        SENSORY_LLM_TURN_TIMEOUT.as_secs()
+                    ),
+                };
+            (outcome, session_len_before_turn)
         };
 
         match outcome {
             TextStepOutcomeWithTools::NeedsTools(round) => {
+                if round.tool_calls.is_empty() {
+                    let mut session = self.session.borrow_mut();
+                    session
+                        .input_mut()
+                        .items_mut()
+                        .truncate(session_len_before_turn);
+                    anyhow::bail!("sensory text turn finished without required tool calls");
+                }
                 let input_tokens = round.usage.input_tokens;
                 let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
@@ -335,6 +346,11 @@ impl SensoryModule {
             }
             TextStepOutcomeWithTools::Finished(_)
             | TextStepOutcomeWithTools::FinishedNoOutput(_) => {
+                let mut session = self.session.borrow_mut();
+                session
+                    .input_mut()
+                    .items_mut()
+                    .truncate(session_len_before_turn);
                 anyhow::bail!("sensory text turn finished without required tool calls");
             }
         }
@@ -808,15 +824,15 @@ mod tests {
         ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
-        linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModuleRunStatus,
+        ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
         CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
     };
-    use nuillu_types::builtin;
+    use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
     use tokio::task::LocalSet;
 
     fn reference_now() -> DateTime<Utc> {
@@ -980,24 +996,25 @@ mod tests {
     ) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                let mut inner = SensoryModule::new(
-                    caps.sensory_input_inbox(),
-                    caps.allocation_reader(),
-                    caps.memo(),
-                    caps.clock(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
-                .with_burst_config(burst);
-                if let Some(compaction) = compaction {
-                    inner.session_compaction = compaction;
-                }
-                for item in &session_history {
-                    inner.session.borrow_mut().push_user(item.clone());
-                }
-                RecordingSensoryModule {
-                    inner,
-                    recorder: recorder.clone(),
+                let recorder = recorder.clone();
+                let session_history = session_history.clone();
+                async move {
+                    let mut inner = SensoryModule::new(
+                        caps.sensory_input_inbox(),
+                        caps.allocation_reader(),
+                        caps.memo(),
+                        caps.clock(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    )
+                    .with_burst_config(burst);
+                    if let Some(compaction) = compaction {
+                        inner.session_compaction = compaction;
+                    }
+                    for item in &session_history {
+                        inner.session.borrow_mut().push_user(item.clone());
+                    }
+                    Ok(RecordingSensoryModule { inner, recorder })
                 }
             })
             .unwrap()
@@ -1444,7 +1461,7 @@ mod tests {
         local
             .run_until(async {
                 let adapter = MockLlmAdapter::new()
-                    .with_text_scenario(text_scenario("write_sensory_memo without using tools", 0));
+                    .with_text_scenario(text_scenario("plain response without tool call", 0));
                 let (blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
                 let modules = build_recording_sensory(
@@ -1459,13 +1476,16 @@ mod tests {
                 )
                 .await;
                 let sensory = caps.host_io().sensory_input_mailbox();
+                let sensory_owner =
+                    ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+                let shutdown_blackboard = blackboard.clone();
 
                 let result = nuillu_agent::run(
                     modules,
                     nuillu_agent::AgentEventLoopConfig {
                         idle_threshold: Duration::from_millis(50),
                         activate_retries: 0,
-                        module_failure_limit: 3,
+                        module_failure_limit: 1,
                     },
                     async {
                         sensory
@@ -1478,16 +1498,33 @@ mod tests {
                             }
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        for _ in 0..50 {
+                            let stopped = shutdown_blackboard
+                                .read(|bb| {
+                                    matches!(
+                                        bb.module_status_for_instance(&sensory_owner),
+                                        Some(ModuleRunStatus::Stopped { .. })
+                                    )
+                                })
+                                .await;
+                            if stopped {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                     },
                 )
                 .await;
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                let status = blackboard
+                    .read(|bb| bb.module_status_for_instance(&sensory_owner).cloned())
+                    .await;
                 assert!(
-                    result.is_err(),
-                    "plain text finish should fail sensory activation"
+                    matches!(status, Some(ModuleRunStatus::Stopped { .. })),
+                    "plain text finish should stop sensory after activation failure; result={result:?} batches={:?} logs={logs:?} status={status:?}",
+                    recorder.batches.borrow().as_slice(),
                 );
 
-                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
                 assert!(logs.is_empty());
                 assert_eq!(recorder.batches.borrow().as_slice(), &[1]);
             })

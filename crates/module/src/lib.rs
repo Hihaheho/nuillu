@@ -106,8 +106,9 @@ pub use readers::{
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
 pub use session::{
-    ModuleSession, NoopSessionStore, PersistedModelInputItem, PersistedSessionSnapshot, SessionKey,
-    SessionStore,
+    ModuleSession, ModuleSessionMetadata, NoopSessionStore, PersistedModelInputItem,
+    PersistedSessionSnapshot, SessionAutoCompaction, SessionCheckpointError, SessionKey,
+    SessionStore, ensure_persistent_session_seeded, push_persistent_identity_seed_if_absent,
 };
 pub use session_compaction::{
     DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,

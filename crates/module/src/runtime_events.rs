@@ -60,6 +60,33 @@ pub enum RuntimeEvent {
         phase: String,
         message: String,
     },
+    SessionCompactionStarted {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        tier: ModelTier,
+    },
+    SessionCompactionCompleted {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        before_items: usize,
+        after_items: usize,
+        tier: ModelTier,
+    },
+    SessionCompactionFailed {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        tier: ModelTier,
+        message: String,
+    },
     ModuleRestarted {
         sequence: u64,
         owner: ModuleInstanceId,
@@ -192,6 +219,66 @@ impl RuntimeEventEmitter {
             sequence,
             owner,
             phase,
+            message,
+        });
+    }
+
+    pub(crate) fn session_compaction_started(
+        &self,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        tier: ModelTier,
+    ) {
+        self.emit(|sequence| RuntimeEvent::SessionCompactionStarted {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            threshold,
+            tier,
+        });
+    }
+
+    pub(crate) fn session_compaction_completed(
+        &self,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        before_items: usize,
+        after_items: usize,
+        tier: ModelTier,
+    ) {
+        self.emit(|sequence| RuntimeEvent::SessionCompactionCompleted {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            threshold,
+            before_items,
+            after_items,
+            tier,
+        });
+    }
+
+    pub(crate) fn session_compaction_failed(
+        &self,
+        owner: ModuleInstanceId,
+        session_key: String,
+        input_tokens: u64,
+        threshold: u64,
+        tier: ModelTier,
+        message: String,
+    ) {
+        self.emit(|sequence| RuntimeEvent::SessionCompactionFailed {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            threshold,
+            tier,
             message,
         });
     }

@@ -13,7 +13,7 @@ use lutum::{
     OnModelInput, OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext,
     TurnRole, TurnView, Usage,
 };
-use nuillu_module::{LlmRequestMetadata, LlmRequestSource};
+use nuillu_module::{LlmRequestMetadata, LlmRequestSource, ModuleSessionMetadata};
 use nuillu_visualizer_protocol::{
     LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, VisualizerEvent,
     VisualizerTabId,
@@ -101,6 +101,7 @@ impl OnModelInput for VisualizerLlmObserver {
             replica: metadata.owner.replica.get(),
             tier: format!("{:?}", metadata.tier),
             source: observation_source(metadata.source),
+            session_key: observation_session_key(cx.extensions(), metadata),
             operation: operation_kind_label(cx.kind()).to_string(),
             items: model_input_views(cx.input().items()),
         });
@@ -151,6 +152,7 @@ fn emit_stream_observation(
 
 fn emit_started(
     observer: &VisualizerLlmObserver,
+    extensions: &RequestExtensions,
     metadata: &LlmRequestMetadata,
     turn_id: String,
     operation: OperationKind,
@@ -164,6 +166,7 @@ fn emit_started(
         replica: metadata.owner.replica.get(),
         tier: format!("{:?}", metadata.tier),
         source: observation_source(metadata.source),
+        session_key: observation_session_key(extensions, metadata),
         operation: operation_kind_label(operation).to_string(),
         request_id,
         model,
@@ -223,6 +226,17 @@ fn emit_tool_call_ready(
     });
 }
 
+fn observation_session_key(
+    extensions: &RequestExtensions,
+    metadata: &LlmRequestMetadata,
+) -> Option<String> {
+    metadata.session_key.clone().or_else(|| {
+        extensions
+            .get::<ModuleSessionMetadata>()
+            .map(|session| session.session_key.as_str().to_owned())
+    })
+}
+
 fn emit_text_turn_stream_event(
     observer: &VisualizerLlmObserver,
     extensions: &RequestExtensions,
@@ -233,6 +247,7 @@ fn emit_text_turn_stream_event(
     match event {
         ErasedTextTurnEvent::Started { request_id, model } => emit_started(
             observer,
+            extensions,
             metadata,
             turn_id,
             OperationKind::TextTurn,
@@ -282,6 +297,7 @@ fn emit_structured_turn_stream_event(
     match event {
         ErasedStructuredTurnEvent::Started { request_id, model } => emit_started(
             observer,
+            extensions,
             metadata,
             turn_id,
             OperationKind::StructuredTurn,
@@ -337,6 +353,7 @@ fn emit_completion_stream_event(
     match event {
         CompletionEvent::Started { request_id, model } => emit_started(
             observer,
+            extensions,
             metadata,
             turn_id,
             OperationKind::Completion,
@@ -386,6 +403,7 @@ fn emit_structured_completion_stream_event(
     match event {
         ErasedStructuredCompletionEvent::Started { request_id, model } => emit_started(
             observer,
+            extensions,
             metadata,
             turn_id,
             OperationKind::StructuredCompletion,

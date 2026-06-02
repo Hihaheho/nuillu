@@ -320,9 +320,9 @@ impl PolicyModule {
                 .unwrap_or_else(|| "none".to_owned()),
             ));
             let result = session
-                .structured_turn::<PolicyConsiderationDecision>(&lutum)
+                .structured_turn::<PolicyConsiderationDecision>()
                 .max_output_tokens(1024)
-                .collect()
+                .collect(&lutum)
                 .await
                 .context("policy structured turn failed")?;
             let input_tokens = result.usage.input_tokens;
@@ -692,19 +692,22 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(module_policy(), move |caps| {
-                PolicyModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    policy_caps.searcher(),
-                    caps.memo(),
-                    policy_caps.consideration_writer(caps.owner().clone()),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let policy_caps = policy_caps.clone();
+                async move {
+                    Ok(PolicyModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        policy_caps.searcher(),
+                        caps.memo(),
+                        policy_caps.consideration_writer(caps.owner().clone()),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
             .unwrap()
             .build(caps)

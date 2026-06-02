@@ -189,24 +189,29 @@ mod tests {
                     Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
                     linear_ratio_fn,
                 ),
-                move |caps| RecordingAllocationController {
-                    inner: AllocationControllerModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.attention_control_inbox(),
-                        caps.blackboard_reader(),
-                        caps.cognition_log_reader(),
-                        caps.allocation_reader(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(
-                            vec![nuillu_types::builtin::allocation_controller()],
-                            Vec::new(),
-                        ),
-                        caps.memo(),
-                        caps.llm_access(),
-                        caps.session("main"),
-                    )
-                    .with_batch_config(batching),
-                    recorder: recorder.clone(),
+                move |caps| {
+                    let recorder = recorder.clone();
+                    async move {
+                        Ok(RecordingAllocationController {
+                            inner: AllocationControllerModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.attention_control_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
+                                caps.allocation_reader(),
+                                caps.interoception_reader(),
+                                caps.allocation_writer(
+                                    vec![nuillu_types::builtin::allocation_controller()],
+                                    Vec::new(),
+                                ),
+                                caps.memo(),
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            )
+                            .with_batch_config(batching),
+                            recorder,
+                        })
+                    }
                 },
             )
             .unwrap()

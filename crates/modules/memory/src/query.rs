@@ -444,14 +444,14 @@ impl QueryMemoryModule {
             let outcome = {
                 let mut session = self.session.borrow_mut();
                 session
-                    .text_turn(&lutum)
+                    .text_turn()
                     .tools::<QueryMemoryTools>()
                     .available_tools([
                         QueryMemoryToolsSelector::SearchMemory,
                         QueryMemoryToolsSelector::FetchLinkedMemories,
                         QueryMemoryToolsSelector::WriteRetrievalMemo,
                     ])
-                    .collect()
+                    .collect(&lutum)
                     .await
                     .context("query-memory text turn failed")?
             };

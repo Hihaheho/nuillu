@@ -172,14 +172,14 @@ impl AttentionSchemaModule {
             session
                 .push_ephemeral_developer("Update the attention schema from the new notes above.");
             session
-                .text_turn(&lutum)
+                .text_turn()
                 .tools::<AttentionSchemaTools>()
                 .available_tools([
                     AttentionSchemaToolsSelector::AppendAttentionExperience,
                     AttentionSchemaToolsSelector::LeaveAttentionUnchanged,
                 ])
                 .require_any_tool()
-                .collect()
+                .collect(&lutum)
                 .await
                 .context("attention-schema attention experience turn failed")?
         };

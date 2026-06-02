@@ -51,6 +51,8 @@ pub struct LlmRequestMetadata {
     pub tier: ModelTier,
     pub source: LlmRequestSource,
     #[serde(default)]
+    pub session_key: Option<String>,
+    #[serde(default)]
     pub activation_attempt: Option<u32>,
     #[serde(default)]
     pub batch: Option<LlmBatchDebug>,
@@ -280,8 +282,9 @@ impl Drop for LlmLease {
 /// allocation's tier.
 ///
 /// Modules consume the returned `Lutum` directly — typically by passing
-/// it into `lutum::Session`'s turn builders (e.g. `session.text_turn(&lutum)`)
-/// for a single-turn or agent-loop activation. The capability deliberately stops at the `Lutum`
+/// it to `lutum::Session`'s turn builder collect step
+/// (e.g. `session.text_turn().collect(&lutum)`) for a single-turn or
+/// agent-loop activation. The capability deliberately stops at the `Lutum`
 /// boundary; everything past it (Session shape, prompts, tools) is the
 /// module's own concern.
 #[derive(Clone)]
@@ -315,6 +318,15 @@ impl LlmAccess {
     /// activations take effect on the next call without re-issuing the
     /// capability.
     pub async fn lutum(&self) -> LlmLease {
+        self.lutum_with_metadata(LlmRequestSource::ModuleTurn, None)
+            .await
+    }
+
+    async fn lutum_with_metadata(
+        &self,
+        source: LlmRequestSource,
+        session_key: Option<String>,
+    ) -> LlmLease {
         let outcome = self
             .rate_limiter
             .acquire(&self.owner, CapabilityKind::LlmCall)
@@ -338,7 +350,8 @@ impl LlmAccess {
         let lutum = handle.lutum.clone().with_extension(LlmRequestMetadata {
             owner: self.owner.clone(),
             tier,
-            source: LlmRequestSource::ModuleTurn,
+            source,
+            session_key,
             activation_attempt,
             batch,
         });
@@ -522,6 +535,7 @@ mod tests {
                 owner,
                 tier: ModelTier::Premium,
                 source: LlmRequestSource::ModuleTurn,
+                session_key: None,
                 activation_attempt: None,
                 batch: None,
             })]

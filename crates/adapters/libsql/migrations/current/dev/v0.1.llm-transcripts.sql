@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS llm_transcript_turns (
   owner_replica INTEGER NOT NULL,
   tier TEXT NOT NULL,
   source TEXT NOT NULL,
+  session_key TEXT,
   operation TEXT NOT NULL,
   started_at_ms INTEGER NOT NULL,
   completed_at_ms INTEGER NOT NULL,

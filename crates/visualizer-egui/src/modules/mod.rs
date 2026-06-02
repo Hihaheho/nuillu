@@ -260,6 +260,27 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             module.runtime_status = Some(format!("Stopped {phase}: {message}"));
             module.last_execution_failed = true;
         }
+        RuntimeEvent::SessionCompactionStarted {
+            owner, session_key, ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some(format!("Compacting session {session_key}"));
+        }
+        RuntimeEvent::SessionCompactionCompleted {
+            owner, session_key, ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some(format!("Compacted session {session_key}"));
+        }
+        RuntimeEvent::SessionCompactionFailed {
+            owner,
+            session_key,
+            message,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some(format!("Compaction failed {session_key}: {message}"));
+        }
     }
 }
 
@@ -1807,6 +1828,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: vec![LlmInputItemView {
                     role: "user".to_string(),
@@ -1851,6 +1873,7 @@ mod tests {
                 replica: 0,
                 tier: "Cheap".to_string(),
                 source: LlmObservationSource::SessionCompaction,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -1904,6 +1927,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -1935,6 +1959,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "structured_turn".to_string(),
                 items: Vec::new(),
             },
@@ -2184,6 +2209,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -2213,6 +2239,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -2244,6 +2271,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -2257,6 +2285,7 @@ mod tests {
                 replica: 0,
                 tier: "Default".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },
@@ -2412,6 +2441,7 @@ mod tests {
                 replica: 0,
                 tier: "Premium".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 operation: "text_turn".to_string(),
                 items: Vec::new(),
             },

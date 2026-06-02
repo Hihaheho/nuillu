@@ -1618,7 +1618,7 @@ async fn activate_with_retries(
     loop {
         let owner = module.owner().clone();
         let activation_attempt = u32::from(retries) + 1;
-        let cx = ActivateCx::new(
+        let cx = runtime.with_session_checkpoint_runtime(ActivateCx::new(
             peer_contexts,
             allocation_hints,
             identity_memories,
@@ -1632,6 +1632,7 @@ async fn activate_with_retries(
                         owner: module_owner.clone(),
                         tier: ModelTier::Cheap,
                         source: LlmRequestSource::SessionCompaction,
+                        session_key: None,
                         activation_attempt: Some(activation_attempt),
                         batch: Some(LlmBatchDebug::from_batch(batch)),
                     }),
@@ -1640,7 +1641,7 @@ async fn activate_with_retries(
                 runtime.session_compaction_policy(),
             ),
             runtime.clock().now(),
-        );
+        ));
         let activation_span = tracing::info_span!(
             target: "lutum",
             "module_activate",
@@ -1715,7 +1716,8 @@ mod tests {
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
         CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, Memo,
-        Module, ModuleDependencies, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
+        Module, ModuleCapabilityFactory, ModuleDependencies, ModuleRegistry, ModuleRegistryError,
+        RuntimePolicy, SessionCompactionPolicy,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
@@ -1725,6 +1727,33 @@ mod tests {
     use tokio::task::LocalSet;
 
     use crate::testing::{test_caps, test_caps_with_policy, test_caps_with_real_clock};
+
+    trait TestModuleRegistryExt {
+        fn register_sync<M, F>(
+            self,
+            policy: ModulePolicy,
+            builder: F,
+        ) -> Result<ModuleRegistry, ModuleRegistryError>
+        where
+            M: Module + 'static,
+            F: Fn(ModuleCapabilityFactory) -> M + 'static;
+    }
+
+    impl TestModuleRegistryExt for ModuleRegistry {
+        fn register_sync<M, F>(
+            self,
+            policy: ModulePolicy,
+            builder: F,
+        ) -> Result<ModuleRegistry, ModuleRegistryError>
+        where
+            M: Module + 'static,
+            F: Fn(ModuleCapabilityFactory) -> M + 'static,
+        {
+            self.register(policy, move |caps| {
+                std::future::ready(Ok::<M, ModuleRegistryError>(builder(caps)))
+            })
+        }
+    }
 
     fn test_config() -> AgentEventLoopConfig {
         AgentEventLoopConfig {
@@ -3043,7 +3072,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
@@ -3113,7 +3142,7 @@ mod tests {
                 let (seen_tx, seen_rx) = oneshot::channel();
                 let seen_tx = Rc::new(RefCell::new(Some(seen_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let seen_tx = Rc::clone(&seen_tx);
@@ -3144,6 +3173,7 @@ mod tests {
                             ),
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
+                            session_key: None,
                             activation_attempt: Some(1),
                             batch: Some(nuillu_module::LlmBatchDebug {
                                 batch_type: std::any::type_name::<AttentionControlRequest>()
@@ -3187,7 +3217,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let observations = Rc::clone(&observations);
@@ -3236,6 +3266,7 @@ mod tests {
                             owner: owner.clone(),
                             tier: ModelTier::Premium,
                             source: LlmRequestSource::ModuleTurn,
+                            session_key: None,
                             activation_attempt: Some(attempt),
                             batch: Some(expected_batch.clone()),
                         })
@@ -3246,6 +3277,7 @@ mod tests {
                             owner: owner.clone(),
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
+                            session_key: None,
                             activation_attempt: Some(attempt),
                             batch: Some(expected_batch.clone()),
                         })
@@ -3272,7 +3304,7 @@ mod tests {
                 let target_activations = Rc::new(Cell::new(0_u32));
                 let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3280,7 +3312,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(test_policy(0..=1, fast_bpm()), {
+                    .register_sync(test_policy(0..=1, fast_bpm()), {
                         let target_activations = Rc::clone(&target_activations);
                         let target_batches = Rc::clone(&target_batches);
                         move |caps| ZeroWindowTarget {
@@ -3351,7 +3383,7 @@ mod tests {
                 let target_a_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let target_b_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3359,7 +3391,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(
+                    .register_sync(
                         {
                             let mut policy = test_policy(0..=1, fast_bpm());
                             policy.zero_replica_window =
@@ -3377,7 +3409,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         {
                             let mut policy = test_policy(0..=1, fast_bpm());
                             policy.zero_replica_window =
@@ -3447,7 +3479,7 @@ mod tests {
                 let target_activations = Rc::new(Cell::new(0_u32));
                 let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3455,7 +3487,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(test_policy(0..=1, fast_bpm()), {
+                    .register_sync(test_policy(0..=1, fast_bpm()), {
                         let target_activations = Rc::clone(&target_activations);
                         let target_batches = Rc::clone(&target_batches);
                         move |caps| ZeroWindowTarget {
@@ -3540,7 +3572,7 @@ mod tests {
                 let target_activations = Rc::new(Cell::new(0_u32));
                 let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3548,7 +3580,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(
+                    .register_sync(
                         {
                             let mut policy = test_policy(0..=1, fast_bpm());
                             policy.zero_replica_window =
@@ -3623,7 +3655,7 @@ mod tests {
                 let target_activations = Rc::new(Cell::new(0_u32));
                 let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3631,7 +3663,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(
+                    .register_sync(
                         {
                             let mut policy = test_policy(0..=1, fast_bpm());
                             policy.zero_replica_window = ZeroReplicaWindowPolicy::Disabled;
@@ -3691,7 +3723,7 @@ mod tests {
                 let target_activations = Rc::new(Cell::new(0_u32));
                 let target_batches = Rc::new(RefCell::new(Vec::<String>::new()));
                 let modules = ModuleRegistry::new()
-                    .register(test_policy(1..=1, fast_bpm()), {
+                    .register_sync(test_policy(1..=1, fast_bpm()), {
                         let controller_activations = Rc::clone(&controller_activations);
                         move |caps| ControllerTickModule {
                             attention_control_inbox: caps.attention_control_inbox(),
@@ -3699,7 +3731,7 @@ mod tests {
                         }
                     })
                     .unwrap()
-                    .register(test_policy(0..=0, fast_bpm()), {
+                    .register_sync(test_policy(0..=0, fast_bpm()), {
                         let target_activations = Rc::clone(&target_activations);
                         let target_batches = Rc::clone(&target_batches);
                         move |caps| HardDisabledZeroWindowTarget {
@@ -3781,7 +3813,7 @@ mod tests {
         let secondary_seen_tx = Rc::new(RefCell::new(secondary_seen_tx));
 
         let mut registry = ModuleRegistry::new()
-            .register(
+            .register_sync(
                 test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                 {
                     let activations = Rc::clone(&activations);
@@ -3798,7 +3830,7 @@ mod tests {
 
         if !primary_votes.borrow().is_empty() {
             registry = registry
-                .register(
+                .register_sync(
                     test_policy(
                         0..=u8::try_from(primary_votes.borrow().len()).unwrap(),
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
@@ -3818,7 +3850,7 @@ mod tests {
 
         if !secondary_votes.borrow().is_empty() {
             registry = registry
-                .register(
+                .register_sync(
                     test_policy(
                         0..=u8::try_from(secondary_votes.borrow().len()).unwrap(),
                         Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
@@ -3959,7 +3991,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let seen = Rc::clone(&seen);
@@ -4027,7 +4059,7 @@ mod tests {
                 // 2000 BPM = 30ms cooldown per batch under linear_ratio_fn at
                 // activation_ratio=1.0.
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(2000.0)..=Bpm::from_f64(2000.0)),
                         {
                             let batches = Rc::clone(&batches);
@@ -4105,7 +4137,7 @@ mod tests {
                 // The first activation takes ~80ms, so remaining cooldown
                 // should be ~120ms rather than a full 200ms.
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(300.0)..=Bpm::from_f64(300.0)),
                         {
                             let batches = Rc::clone(&batches);
@@ -4179,7 +4211,7 @@ mod tests {
                 // 500 BPM = 120ms target period. Since the first activation
                 // takes longer than that, no extra cooldown should be added.
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(500.0)..=Bpm::from_f64(500.0)),
                         {
                             let batches = Rc::clone(&batches);
@@ -4247,7 +4279,7 @@ mod tests {
                 // Fixed 120 BPM = 500ms period. The test bumps activation
                 // during cooldown and expects the second batch before deadline.
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(120.0)..=Bpm::from_f64(120.0)),
                         {
                             let batches = Rc::clone(&batches);
@@ -4319,7 +4351,7 @@ mod tests {
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| HangingBatchStub,
                     )
@@ -4368,7 +4400,7 @@ mod tests {
                 let (_release_tx, release_rx) = oneshot::channel();
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let entered_tx = Rc::clone(&entered_tx);
@@ -4416,7 +4448,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
@@ -4463,7 +4495,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let attempts = Rc::clone(&attempts);
@@ -4520,7 +4552,7 @@ mod tests {
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard.clone());
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| AlwaysFailStub { batch_sent: false },
                     )
@@ -4588,7 +4620,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let constructions = Rc::clone(&constructions);
@@ -4654,7 +4686,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let constructions = Rc::clone(&constructions);
@@ -4722,12 +4754,12 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| StopAfterOneFailureDependency { batch_sent: false },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let release_rx = Rc::clone(&release_rx);
@@ -4796,7 +4828,7 @@ mod tests {
                 let (done_tx, mut done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
@@ -4858,7 +4890,7 @@ mod tests {
                 let (done_tx, mut done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);
@@ -4939,7 +4971,7 @@ mod tests {
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependency_activations = Rc::clone(&dependency_activations);
@@ -4953,7 +4985,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
@@ -5008,22 +5040,22 @@ mod tests {
                 let (dependent_done_tx, mut dependent_done_rx) = oneshot::channel();
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyA,
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyB,
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyC,
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
@@ -5101,12 +5133,12 @@ mod tests {
 
                 let caps = test_caps(Blackboard::with_allocation(alloc));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyA,
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
@@ -5203,12 +5235,12 @@ mod tests {
 
                 let caps = test_caps(Blackboard::with_allocation(alloc));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| SilentDependencyA,
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
@@ -5311,7 +5343,7 @@ mod tests {
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependency_activations = Rc::clone(&dependency_activations);
@@ -5324,7 +5356,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
@@ -5411,7 +5443,7 @@ mod tests {
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let target_activated = Rc::clone(&target_activated);
@@ -5422,7 +5454,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let gate_seen_tx = Rc::clone(&gate_seen_tx);
@@ -5435,7 +5467,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_release_rx = Rc::clone(&dependent_release_rx);
@@ -5508,7 +5540,7 @@ mod tests {
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let caps = test_caps(Blackboard::default());
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let release_rx = Rc::clone(&release_rx);
@@ -5574,7 +5606,7 @@ mod tests {
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard);
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| PendingDependencyModule {
                             release: None,
@@ -5583,7 +5615,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
@@ -5713,7 +5745,7 @@ mod tests {
 
                 let caps = test_caps(Blackboard::with_allocation(alloc));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| ImmediateDependentModule {
                             batch_sent: false,
@@ -5781,7 +5813,7 @@ mod tests {
                 let (release_tx, release_rx) = oneshot::channel();
                 let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let entered_tx = Rc::clone(&entered_tx);
@@ -5885,7 +5917,7 @@ mod tests {
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps(blackboard);
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         |_| HangingBatchStub,
                     )
@@ -5947,7 +5979,7 @@ mod tests {
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
-                    .register(
+                    .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let done_tx = Rc::clone(&done_tx);

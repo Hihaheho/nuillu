@@ -985,20 +985,24 @@ mod tests {
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *module_sink.borrow_mut() = Some(SpeakModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    UtteranceWriter::new(
-                        caps.owner().clone(),
-                        caps.blackboard(),
-                        utterance_sink_for_closure.clone(),
-                        caps.clock(),
-                    ),
-                    caps.llm_access(),
-                    caps.scene_reader(),
-                ));
-                SpeakStub
+                let module_sink = Rc::clone(&module_sink);
+                let utterance_sink_for_closure = utterance_sink_for_closure.clone();
+                async move {
+                    *module_sink.borrow_mut() = Some(SpeakModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        UtteranceWriter::new(
+                            caps.owner().clone(),
+                            caps.blackboard(),
+                            utterance_sink_for_closure.clone(),
+                            caps.clock(),
+                        ),
+                        caps.llm_access(),
+                        caps.scene_reader(),
+                    ));
+                    Ok(SpeakStub)
+                }
             })
             .unwrap()
             .build(&caps)
@@ -1195,20 +1199,24 @@ mod tests {
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *module_sink.borrow_mut() = Some(SpeakModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    UtteranceWriter::new(
-                        caps.owner().clone(),
-                        caps.blackboard(),
-                        utterance_sink_for_closure.clone(),
-                        caps.clock(),
-                    ),
-                    caps.llm_access(),
-                    caps.scene_reader(),
-                ));
-                SpeakStub
+                let module_sink = Rc::clone(&module_sink);
+                let utterance_sink_for_closure = utterance_sink_for_closure.clone();
+                async move {
+                    *module_sink.borrow_mut() = Some(SpeakModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        UtteranceWriter::new(
+                            caps.owner().clone(),
+                            caps.blackboard(),
+                            utterance_sink_for_closure.clone(),
+                            caps.clock(),
+                        ),
+                        caps.llm_access(),
+                        caps.scene_reader(),
+                    ));
+                    Ok(SpeakStub)
+                }
             })
             .unwrap()
             .build(&caps)

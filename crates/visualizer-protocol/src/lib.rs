@@ -247,6 +247,8 @@ pub enum LlmObservationEvent {
         replica: u8,
         tier: String,
         source: LlmObservationSource,
+        #[serde(default)]
+        session_key: Option<String>,
         operation: String,
         items: Vec<LlmInputItemView>,
     },
@@ -257,6 +259,8 @@ pub enum LlmObservationEvent {
         replica: u8,
         tier: String,
         source: LlmObservationSource,
+        #[serde(default)]
+        session_key: Option<String>,
         operation: String,
         request_id: Option<String>,
         model: String,

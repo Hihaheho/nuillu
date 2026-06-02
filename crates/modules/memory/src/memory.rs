@@ -240,13 +240,13 @@ impl MemoryModule {
             let outcome = {
                 let mut session = self.session.borrow_mut();
                 session
-                    .text_turn(&lutum)
+                    .text_turn()
                     .tools::<MemoryTools>()
                     .available_tools([
                         MemoryToolsSelector::InsertMemory,
                         MemoryToolsSelector::ReinforceMemory,
                     ])
-                    .collect()
+                    .collect(&lutum)
                     .await
                     .context("memory text turn failed")?
             };
@@ -688,18 +688,24 @@ mod tests {
                     Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
                     linear_ratio_fn,
                 ),
-                move |caps| RecordingMemory {
-                    inner: MemoryModule::new(
-                        caps.cognition_log_evicted_inbox(),
-                        caps.allocation_reader(),
-                        caps.memory_metadata_reader(),
-                        memory_caps.writer(),
-                        memory_caps.retriever(),
-                        caps.llm_access(),
-                        caps.session("main"),
-                    )
-                    .with_batch_config(batching),
-                    recorder: recorder.clone(),
+                move |caps| {
+                    let memory_caps = memory_caps.clone();
+                    let recorder = recorder.clone();
+                    async move {
+                        Ok(RecordingMemory {
+                            inner: MemoryModule::new(
+                                caps.cognition_log_evicted_inbox(),
+                                caps.allocation_reader(),
+                                caps.memory_metadata_reader(),
+                                memory_caps.writer(),
+                                memory_caps.retriever(),
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            )
+                            .with_batch_config(batching),
+                            recorder,
+                        })
+                    }
                 },
             )
             .unwrap()

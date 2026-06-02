@@ -362,14 +362,14 @@ impl AllocationControllerModule {
                     requests,
                 ));
                 session
-                    .text_turn(&lutum)
+                    .text_turn()
                     .tools::<AllocationControllerTools>()
                     .available_tools([
                         AllocationControllerToolsSelector::LeaveAllocationUnchanged,
                         AllocationControllerToolsSelector::ReprioritizeModules,
                     ])
                     .require_any_tool()
-                    .collect()
+                    .collect(&lutum)
                     .await
             })
             .await
@@ -738,27 +738,33 @@ mod tests {
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *controller_sink.borrow_mut() = Some(AllocationControllerModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.attention_control_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    caps.allocation_writer(
-                        vec![builtin::allocation_controller(), builtin::sensory()],
-                        Vec::new(),
-                    ),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                ));
-                AllocationControllerStub
+                let controller_sink = Rc::clone(&controller_sink);
+                async move {
+                    *controller_sink.borrow_mut() = Some(AllocationControllerModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.attention_control_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(
+                            vec![builtin::allocation_controller(), builtin::sensory()],
+                            Vec::new(),
+                        ),
+                        caps.memo(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ));
+                    Ok(AllocationControllerStub)
+                }
             })
             .unwrap()
             .register(test_policy(), move |caps| {
-                *source_memo_sink.borrow_mut() = Some(caps.memo());
-                SensoryStub
+                let source_memo_sink = Rc::clone(&source_memo_sink);
+                async move {
+                    *source_memo_sink.borrow_mut() = Some(caps.memo());
+                    Ok(SensoryStub)
+                }
             })
             .unwrap()
             .build(&caps)

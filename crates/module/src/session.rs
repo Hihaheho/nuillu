@@ -15,6 +15,7 @@ use nuillu_types::ModuleInstanceId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::ports::PortError;
+use crate::session_compaction::{SessionCompactionConfig, SessionCompactionProtectedPrefix};
 use crate::{format_identity_memory_seed, seed_persistent_faculty_session};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -89,6 +90,51 @@ struct ModuleSessionInner {
     dirty: Cell<bool>,
     restored: Cell<bool>,
     seeded: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionAutoCompaction {
+    pub config: SessionCompactionConfig,
+    pub protected_prefix: SessionCompactionProtectedPrefix,
+    pub compacted_prefix: &'static str,
+    pub compaction_prompt: &'static str,
+}
+
+impl SessionAutoCompaction {
+    pub fn new(
+        config: SessionCompactionConfig,
+        protected_prefix: SessionCompactionProtectedPrefix,
+        compacted_prefix: &'static str,
+        compaction_prompt: &'static str,
+    ) -> Self {
+        Self {
+            config,
+            protected_prefix,
+            compacted_prefix,
+            compaction_prompt,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleSessionMetadata {
+    pub owner: ModuleInstanceId,
+    pub session_key: SessionKey,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PersistentSessionMetadata {
+    pub owner: ModuleInstanceId,
+    pub key: SessionKey,
+    pub auto_compaction: Option<SessionAutoCompaction>,
+    pub restored: bool,
+    pub seeded: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SessionCheckpointError {
+    #[error("session is missing persistent capability metadata")]
+    MissingMetadata,
 }
 
 impl ModuleSession {
@@ -182,6 +228,76 @@ impl fmt::Debug for ModuleSession {
             .field("restored", &self.inner.restored.get())
             .field("seeded", &self.inner.seeded.get())
             .finish()
+    }
+}
+
+pub(crate) fn attach_persistent_session_metadata(
+    session: &mut Session,
+    owner: ModuleInstanceId,
+    key: SessionKey,
+    auto_compaction: Option<SessionAutoCompaction>,
+    restored: bool,
+) {
+    session.extensions_mut().insert(ModuleSessionMetadata {
+        owner: owner.clone(),
+        session_key: key.clone(),
+    });
+    session.extensions_mut().insert(PersistentSessionMetadata {
+        owner,
+        key,
+        auto_compaction,
+        restored,
+        seeded: restored,
+    });
+}
+
+pub(crate) fn persistent_session_metadata(session: &Session) -> Option<&PersistentSessionMetadata> {
+    session.extensions().get::<PersistentSessionMetadata>()
+}
+
+pub(crate) fn persistent_session_metadata_mut(
+    session: &mut Session,
+) -> Option<&mut PersistentSessionMetadata> {
+    session
+        .extensions_mut()
+        .get_mut::<PersistentSessionMetadata>()
+}
+
+pub fn ensure_persistent_session_seeded(
+    session: &mut Session,
+    system_prompt: impl Into<String>,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+) {
+    let should_seed = match persistent_session_metadata_mut(session) {
+        Some(metadata) if metadata.seeded || metadata.restored => {
+            metadata.seeded = true;
+            false
+        }
+        Some(_) | None => true,
+    };
+    if !should_seed {
+        return;
+    }
+    seed_persistent_faculty_session(session, system_prompt, identity_memories, now);
+    if let Some(metadata) = persistent_session_metadata_mut(session) {
+        metadata.seeded = true;
+    }
+}
+
+pub fn push_persistent_identity_seed_if_absent(
+    session: &mut Session,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+) {
+    if persistent_session_metadata(session)
+        .map(|metadata| metadata.restored)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
+        session.push_assistant_text(seed);
     }
 }
 

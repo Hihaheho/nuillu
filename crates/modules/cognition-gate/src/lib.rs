@@ -298,14 +298,14 @@ impl CognitionGateModule {
             let outcome = {
                 let mut session = self.session.borrow_mut();
                 session
-                    .text_turn(lutum)
+                    .text_turn()
                     .tools::<CognitionGateTools>()
                     .available_tools([
                         CognitionGateToolsSelector::AppendCognition,
                         CognitionGateToolsSelector::SkipCognition,
                     ])
                     .max_output_tokens(768)
-                    .collect()
+                    .collect(lutum)
                     .await
                     .context("cognition-gate decision turn failed")?
             };
@@ -724,21 +724,27 @@ mod tests {
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
-                *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.cognition_writer(),
-                    caps.time_division(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                ));
-                CognitionGateStub
+                let gate_sink = Rc::clone(&gate_sink);
+                async move {
+                    *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_reader(),
+                        caps.cognition_writer(),
+                        caps.time_division(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ));
+                    Ok(CognitionGateStub)
+                }
             })
             .unwrap()
             .register(test_policy(), move |caps| {
-                *source_memo_sink.borrow_mut() = Some(caps.memo());
-                SensoryStub
+                let source_memo_sink = Rc::clone(&source_memo_sink);
+                async move {
+                    *source_memo_sink.borrow_mut() = Some(caps.memo());
+                    Ok(SensoryStub)
+                }
             })
             .unwrap()
             .build(&caps)

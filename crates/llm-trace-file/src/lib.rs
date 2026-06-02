@@ -920,6 +920,7 @@ mod tests {
             owner: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
             tier: ModelTier::Premium,
             source: LlmRequestSource::ModuleTurn,
+            session_key: None,
             activation_attempt: Some(1),
             batch: Some(LlmBatchDebug {
                 batch_type: "test::Batch".to_string(),

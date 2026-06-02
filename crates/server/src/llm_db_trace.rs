@@ -11,7 +11,7 @@ use lutum::{
     OnStreamEvent, OperationKind, RequestExtensions, StreamEventHookContext, Usage,
 };
 use lutum_libsql_adapter::{LibsqlLlmTranscriptStore, NewLlmTranscriptTurn};
-use nuillu_module::LlmRequestMetadata;
+use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
 use nuillu_visualizer_protocol::{
     LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, VisualizerEvent,
     VisualizerTabId,
@@ -46,6 +46,8 @@ pub struct CompletedTurnTrace {
     replica: u8,
     tier: String,
     source: LlmObservationSource,
+    #[serde(default)]
+    session_key: Option<String>,
     operation: String,
     started_at_ms: i64,
     completed_at_ms: Option<i64>,
@@ -120,6 +122,7 @@ impl DbLlmTraceSink {
                 replica: metadata.owner.replica.get(),
                 tier: format!("{:?}", metadata.tier),
                 source: observation_source(metadata.source),
+                session_key: observation_session_key(extensions, metadata),
                 operation: operation_kind_label(operation).to_string(),
                 started_at_ms: now,
                 completed_at_ms: None,
@@ -161,6 +164,7 @@ impl DbLlmTraceSink {
                 owner_replica: trace.replica,
                 tier: trace.tier.clone(),
                 source: source_label(trace.source).to_string(),
+                session_key: trace.session_key.clone(),
                 operation: trace.operation.clone(),
                 started_at_ms: trace.started_at_ms,
                 completed_at_ms: trace
@@ -250,6 +254,7 @@ impl CompletedTurnTrace {
                 replica: self.replica,
                 tier: self.tier.clone(),
                 source: self.source,
+                session_key: self.session_key.clone(),
                 operation: self.operation.clone(),
                 items: self.input.clone(),
             },
@@ -260,6 +265,7 @@ impl CompletedTurnTrace {
                 replica: self.replica,
                 tier: self.tier.clone(),
                 source: self.source,
+                session_key: self.session_key.clone(),
                 operation: self.operation.clone(),
                 request_id: self.request_id.clone(),
                 model: self.model.clone().unwrap_or_default(),
@@ -309,6 +315,17 @@ impl CompletedTurnTrace {
 
 fn extension_key(extensions: &RequestExtensions) -> usize {
     std::ptr::from_ref(extensions) as usize
+}
+
+fn observation_session_key(
+    extensions: &RequestExtensions,
+    metadata: &LlmRequestMetadata,
+) -> Option<String> {
+    metadata.session_key.clone().or_else(|| {
+        extensions
+            .get::<ModuleSessionMetadata>()
+            .map(|session| session.session_key.as_str().to_owned())
+    })
 }
 
 fn apply_event(trace: &mut CompletedTurnTrace, event: LutumStreamEvent<'_>) -> bool {

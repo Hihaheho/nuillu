@@ -1,10 +1,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use lutum::Lutum;
+use lutum::{Lutum, Session};
 use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
@@ -17,7 +19,10 @@ use crate::ports::{Clock, CognitionLogRepository, PortError};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::scene::{SceneReader, SceneRegistry};
-use crate::session::{ModuleSession, NoopSessionStore, SessionKey, SessionStore};
+use crate::session::{
+    ModuleSession, NoopSessionStore, SessionAutoCompaction, SessionKey, SessionStore,
+    attach_persistent_session_metadata,
+};
 use crate::tiers::{LlmTierHandle, LutumTiers};
 use crate::r#trait::ErasedModule;
 use crate::{
@@ -517,6 +522,13 @@ impl AgentRuntimeControl {
         self.runtime_events.module_batch_ready(owner, batch);
     }
 
+    pub fn with_session_checkpoint_runtime<'a>(
+        &self,
+        cx: crate::ActivateCx<'a>,
+    ) -> crate::ActivateCx<'a> {
+        cx.with_session_checkpoint_runtime(self.session_store.clone(), self.runtime_events.clone())
+    }
+
     pub fn record_module_activation_completed(
         &self,
         owner: ModuleInstanceId,
@@ -803,7 +815,16 @@ impl ModuleCapabilityFactory {
         )
     }
 
-    pub fn session(&self, key: impl Into<String>) -> ModuleSession {
+    pub fn session(&self, key: impl Into<String>) -> SessionCapabilityRequest {
+        SessionCapabilityRequest {
+            owner: self.owner.clone(),
+            root: self.root.clone(),
+            key: key.into(),
+            auto_compaction: None,
+        }
+    }
+
+    pub fn legacy_session(&self, key: impl Into<String>) -> ModuleSession {
         let key = SessionKey::new(key).expect("module session key must be valid kebab-case");
         let session = ModuleSession::new(self.owner.clone(), key);
         self.root.inner.sessions.borrow_mut().push(session.clone());
@@ -900,7 +921,62 @@ impl ModuleCapabilityFactory {
     }
 }
 
-type ErasedModuleBuilder = Rc<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>;
+pub struct SessionCapabilityRequest {
+    owner: ModuleInstanceId,
+    root: CapabilityProviders,
+    key: String,
+    auto_compaction: Option<SessionAutoCompaction>,
+}
+
+impl SessionCapabilityRequest {
+    pub fn with_auto_compaction(mut self, auto_compaction: SessionAutoCompaction) -> Self {
+        self.auto_compaction = Some(auto_compaction);
+        self
+    }
+}
+
+impl IntoFuture for SessionCapabilityRequest {
+    type Output = Result<Session, ModuleRegistryError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let key = SessionKey::new(self.key).map_err(|source| {
+                ModuleRegistryError::SessionAcquire {
+                    owner: self.owner.clone(),
+                    source,
+                }
+            })?;
+            let snapshot = self
+                .root
+                .inner
+                .session_store
+                .load(&self.owner, &key)
+                .await
+                .map_err(|source| ModuleRegistryError::SessionRestore {
+                    owner: self.owner.clone(),
+                    key: key.clone(),
+                    source,
+                })?;
+            let restored = snapshot.is_some();
+            let mut session = snapshot
+                .map(crate::PersistedSessionSnapshot::into_session)
+                .unwrap_or_else(Session::new);
+            attach_persistent_session_metadata(
+                &mut session,
+                self.owner,
+                key,
+                self.auto_compaction,
+                restored,
+            );
+            Ok(session)
+        })
+    }
+}
+
+type ErasedModuleBuildFuture =
+    Pin<Box<dyn Future<Output = Result<Box<dyn ErasedModule>, ModuleRegistryError>>>>;
+type ErasedModuleBuilder = Rc<dyn Fn(ModuleCapabilityFactory) -> ErasedModuleBuildFuture>;
 
 pub struct AllocatedModule {
     owner: ModuleInstanceId,
@@ -931,8 +1007,9 @@ impl AllocatedModule {
     pub async fn restart(&mut self) -> Result<(), ModuleRegistryError> {
         self.caps.remove_sessions_for(&self.owner);
         let scoped = self.caps.scoped(self.owner.clone());
-        self.module = (self.builder)(scoped);
-        self.caps.restore_sessions_for(&self.owner).await
+        self.module = (self.builder)(scoped).await?;
+        self.caps.restore_sessions_for(&self.owner).await?;
+        Ok(())
     }
 
     pub async fn next_batch(&mut self) -> anyhow::Result<ModuleBatch> {
@@ -1051,18 +1128,21 @@ impl fmt::Debug for ModuleRegistration {
 
 /// Builds one module replica from its replica-scoped capability factory.
 ///
-/// Closures that return a concrete `Module` implement this automatically, so
-/// registration call sites do not need to allocate erased module wrappers.
-pub trait ModuleRegisterer: Fn(ModuleCapabilityFactory) -> Self::Module {
+/// Registration builders are async so boot-time capability acquisition can
+/// perform eager I/O, such as loading persistent module sessions.
+pub trait ModuleRegisterer: Fn(ModuleCapabilityFactory) -> Self::Future {
     type Module: crate::Module + 'static;
+    type Future: Future<Output = Result<Self::Module, ModuleRegistryError>> + 'static;
 }
 
-impl<F, M> ModuleRegisterer for F
+impl<F, Fut, M> ModuleRegisterer for F
 where
-    F: Fn(ModuleCapabilityFactory) -> M,
+    F: Fn(ModuleCapabilityFactory) -> Fut,
+    Fut: Future<Output = Result<M, ModuleRegistryError>> + 'static,
     M: Module + 'static,
 {
     type Module = M;
+    type Future = Fut;
 }
 
 impl ModuleRegistry {
@@ -1108,7 +1188,14 @@ impl ModuleRegistry {
             allocation_hint,
             policy,
             replica_capacity,
-            builder: Rc::new(move |caps| Box::new(builder(caps))),
+            builder: Rc::new(move |caps| {
+                let future = builder(caps);
+                Box::pin(async move {
+                    future
+                        .await
+                        .map(|module| Box::new(module) as Box<dyn ErasedModule>)
+                })
+            }),
         });
         Ok(self)
     }
@@ -1152,7 +1239,14 @@ impl ModuleRegistry {
             allocation_hint,
             policy,
             replica_capacity,
-            builder: Rc::new(move |caps| Box::new(builder(caps))),
+            builder: Rc::new(move |caps| {
+                let future = builder(caps);
+                Box::pin(async move {
+                    future
+                        .await
+                        .map(|module| Box::new(module) as Box<dyn ErasedModule>)
+                })
+            }),
         });
         Ok(self)
     }
@@ -1200,7 +1294,6 @@ impl ModuleRegistry {
                 .collect(),
         );
         caps.inner.sessions.borrow_mut().clear();
-
         let mut modules = Vec::new();
         for registration in &self.registrations {
             // Build every possible replica up to the registered max, with a
@@ -1214,7 +1307,7 @@ impl ModuleRegistry {
                     owner,
                     caps.clone(),
                     Rc::clone(&registration.builder),
-                    (registration.builder)(scoped),
+                    (registration.builder)(scoped).await?,
                 ));
             }
         }
@@ -1345,6 +1438,11 @@ pub enum ModuleRegistryError {
         cycle.iter().map(ModuleId::as_str).collect::<Vec<_>>().join(" -> ")
     )]
     DependencyCycle { cycle: Vec<ModuleId> },
+    #[error("failed to acquire session capability for {owner}: {source}")]
+    SessionAcquire {
+        owner: ModuleInstanceId,
+        source: PortError,
+    },
     #[error("failed to restore session {owner}/{key}: {source}")]
     SessionRestore {
         owner: ModuleInstanceId,
@@ -1517,8 +1615,8 @@ mod tests {
         }
     }
 
-    fn noop_builder(_: ModuleCapabilityFactory) -> NoopModule {
-        NoopModule
+    async fn noop_builder(_: ModuleCapabilityFactory) -> Result<NoopModule, ModuleRegistryError> {
+        Ok(NoopModule)
     }
 
     struct AllocationHintOnlyModule;
@@ -1552,8 +1650,10 @@ mod tests {
         }
     }
 
-    fn allocation_hint_only_builder(_: ModuleCapabilityFactory) -> AllocationHintOnlyModule {
-        AllocationHintOnlyModule
+    async fn allocation_hint_only_builder(
+        _: ModuleCapabilityFactory,
+    ) -> Result<AllocationHintOnlyModule, ModuleRegistryError> {
+        Ok(AllocationHintOnlyModule)
     }
 
     #[test]
@@ -1644,7 +1744,7 @@ mod tests {
         let store = RecordingSessionStore::default();
         let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
         let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
-        let session = caps.scoped(owner.clone()).session("main");
+        let session = caps.scoped(owner.clone()).legacy_session("main");
         session.borrow_mut().push_user("remember this");
 
         caps.runtime_control()

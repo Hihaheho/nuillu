@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use lutum::{AssistantInputItem, InputMessageRole, Lutum, ModelInput, ModelInputItem, Session};
-use nuillu_types::ModelTier;
+use nuillu_types::{ModelTier, ModuleInstanceId};
 
-use crate::llm::LlmConcurrencyLimiter;
+use crate::llm::{LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
 
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
@@ -108,6 +108,24 @@ impl SessionCompactionRuntime {
 
     pub fn input_token_threshold(&self) -> u64 {
         self.policy.threshold_for(self.module_tier)
+    }
+
+    pub fn lutum_for_session(&self, owner: ModuleInstanceId, session_key: String) -> Lutum {
+        let base = self
+            .lutum
+            .default_extensions()
+            .get::<LlmRequestMetadata>()
+            .cloned();
+        self.lutum.clone().with_extension(LlmRequestMetadata {
+            owner,
+            tier: self.module_tier,
+            source: LlmRequestSource::SessionCompaction,
+            session_key: Some(session_key),
+            activation_attempt: base
+                .as_ref()
+                .and_then(|metadata| metadata.activation_attempt),
+            batch: base.and_then(|metadata| metadata.batch),
+        })
     }
 }
 

@@ -162,6 +162,7 @@ pub struct NewLlmTranscriptTurn {
     pub owner_replica: u8,
     pub tier: String,
     pub source: String,
+    pub session_key: Option<String>,
     pub operation: String,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
@@ -178,6 +179,7 @@ pub struct LlmTranscriptTurnRecord {
     pub owner_replica: u8,
     pub tier: String,
     pub source: String,
+    pub session_key: Option<String>,
     pub operation: String,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
@@ -318,12 +320,13 @@ impl LibsqlLlmTranscriptStore {
                     owner_replica,
                     tier,
                     source,
+                    session_key,
                     operation,
                     started_at_ms,
                     completed_at_ms,
                     trace_json,
                     created_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     turn.server_session_id,
                     turn.turn_id,
@@ -332,6 +335,7 @@ impl LibsqlLlmTranscriptStore {
                     i64::from(turn.owner_replica),
                     turn.tier,
                     turn.source,
+                    turn.session_key,
                     turn.operation,
                     turn.started_at_ms,
                     turn.completed_at_ms,
@@ -360,6 +364,7 @@ impl LibsqlLlmTranscriptStore {
                     owner_replica,
                     tier,
                     source,
+                    session_key,
                     operation,
                     started_at_ms,
                     completed_at_ms,
@@ -374,7 +379,7 @@ impl LibsqlLlmTranscriptStore {
         let mut records = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
             let owner_replica: i64 = row.get(5).map_err(map_libsql_error)?;
-            let trace_json: String = row.get(11).map_err(map_libsql_error)?;
+            let trace_json: String = row.get(12).map_err(map_libsql_error)?;
             records.push(LlmTranscriptTurnRecord {
                 id: row.get(0).map_err(map_libsql_error)?,
                 server_session_id: row.get(1).map_err(map_libsql_error)?,
@@ -386,9 +391,10 @@ impl LibsqlLlmTranscriptStore {
                 })?,
                 tier: row.get(6).map_err(map_libsql_error)?,
                 source: row.get(7).map_err(map_libsql_error)?,
-                operation: row.get(8).map_err(map_libsql_error)?,
-                started_at_ms: row.get(9).map_err(map_libsql_error)?,
-                completed_at_ms: row.get(10).map_err(map_libsql_error)?,
+                session_key: row.get(8).map_err(map_libsql_error)?,
+                operation: row.get(9).map_err(map_libsql_error)?,
+                started_at_ms: row.get(10).map_err(map_libsql_error)?,
+                completed_at_ms: row.get(11).map_err(map_libsql_error)?,
                 trace_json: serde_json::from_str(&trace_json)
                     .map_err(|error| PortError::InvalidData(error.to_string()))?,
             });
@@ -2868,6 +2874,7 @@ mod tests {
                     owner_replica: 0,
                     tier: "cheap".to_owned(),
                     source: "faculty".to_owned(),
+                    session_key: Some("main".to_owned()),
                     operation: "text-turn".to_owned(),
                     started_at_ms: index * 10,
                     completed_at_ms: index * 10 + 1,

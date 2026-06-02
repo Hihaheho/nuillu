@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use lutum::Session;
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
-    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, format_identity_system_prompt, push_formatted_cognition_log_batch,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, format_identity_system_prompt,
+    push_formatted_cognition_log_batch,
 };
 
 mod batch;
@@ -31,13 +33,21 @@ Summarize only the prefix transcript you receive. Preserve prior predictions, th
 validity horizons, rationales, and cognition-log context needed for future prediction updates.
 Do not invent facts. Return plain text only."#;
 
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_PREDICT_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
+
 pub struct PredictModule {
     updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
     memo: Memo,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -47,7 +57,7 @@ impl PredictModule {
         cognition_log: CognitionLogReader,
         memo: Memo,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             updates,
@@ -55,7 +65,6 @@ impl PredictModule {
             memo,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -71,10 +80,14 @@ impl PredictModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -84,30 +97,21 @@ impl PredictModule {
         self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let memo = {
-            let mut session = self.session.borrow_mut();
             push_formatted_cognition_log_batch(
-                &mut session,
+                &mut self.session,
                 &unread_cognition,
                 cx.now(),
                 COGNITION_CONTEXT_WINDOW,
             );
-            session.push_ephemeral_developer("Update forward predictions for the cognition above.");
-            let result = session
-                .text_turn(&lutum)
-                .collect()
+            self.session
+                .push_ephemeral_developer("Update forward predictions for the cognition above.");
+            let result = self
+                .session
+                .text_turn()
+                .collect(&lutum)
                 .await
                 .context("predict text turn failed")?;
-            compact_session_if_needed(
-                &mut session,
-                result.usage.input_tokens,
-                cx.session_compaction(),
-                self.session_compaction,
-                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                Self::id(),
-                COMPACTED_PREDICT_SESSION_PREFIX,
-                SESSION_COMPACTION_PROMPT,
-            )
-            .await;
+            cx.compact_and_save(&mut self.session, result.usage).await?;
             result.assistant_text()
         };
         if !memo.trim().is_empty() {

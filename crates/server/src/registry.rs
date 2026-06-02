@@ -60,50 +60,55 @@ fn register_server_module(
 ) -> ModuleRegistry {
     match module {
         RuntimeModule::Sensory => {
-            registry.register_server(policy(1..=1, Bpm::range(3.0, 8.0)), |caps| {
-                nuillu_sensory::SensoryModule::new(
+            registry.register_server(policy(1..=1, Bpm::range(3.0, 8.0)), |caps| async move {
+                Ok(nuillu_sensory::SensoryModule::new(
                     caps.sensory_input_inbox(),
                     caps.allocation_reader(),
                     caps.memo(),
                     caps.clock(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.legacy_session("main"),
+                ))
             })
         }
         RuntimeModule::CognitionGate => {
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 12.0)), |caps| {
-                nuillu_cognition_gate::CognitionGateModule::new(
+            registry.register_server(policy(1..=1, Bpm::range(6.0, 12.0)), |caps| async move {
+                Ok(nuillu_cognition_gate::CognitionGateModule::new(
                     caps.memo_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.allocation_reader(),
                     caps.cognition_writer(),
                     caps.time_division(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.legacy_session("main"),
+                ))
             })
         }
         RuntimeModule::AllocationController => {
             let voluntary = voluntary_modules(all_modules);
             registry.register_server(policy(1..=1, Bpm::range(6.0, 6.0)), move |caps| {
-                nuillu_allocation_controller::AllocationControllerModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.attention_control_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    caps.allocation_writer(voluntary.clone(), Vec::new()),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let voluntary = voluntary.clone();
+                async move {
+                    Ok(
+                        nuillu_allocation_controller::AllocationControllerModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.attention_control_inbox(),
+                            caps.blackboard_reader(),
+                            caps.cognition_log_reader(),
+                            caps.allocation_reader(),
+                            caps.interoception_reader(),
+                            caps.allocation_writer(voluntary.clone(), Vec::new()),
+                            caps.memo(),
+                            caps.llm_access(),
+                            caps.legacy_session("main"),
+                        ),
+                    )
+                }
             })
         }
         RuntimeModule::AttentionSchema => {
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_attention_schema::AttentionSchemaModule::new(
+            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| async move {
+                Ok(nuillu_attention_schema::AttentionSchemaModule::new(
                     caps.memo_updated_inbox(),
                     caps.cognition_log_updated_inbox(),
                     caps.blackboard_reader(),
@@ -111,177 +116,216 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.cognition_writer(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.legacy_session("main"),
+                ))
             })
         }
         RuntimeModule::SelfModel => {
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| {
-                nuillu_self_model::SelfModelModule::new(
+            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| async move {
+                Ok(nuillu_self_model::SelfModelModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.allocation_reader(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
                     caps.memo(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_self_model::session_auto_compaction())
+                        .await?,
+                ))
             })
         }
         RuntimeModule::QueryMemory => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
-                nuillu_memory::QueryMemoryModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    memory_caps.retriever(),
-                    memory_caps.content_reader(),
-                    caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(nuillu_memory::QueryMemoryModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.retriever(),
+                        memory_caps.content_reader(),
+                        caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
         }
         RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
-                nuillu_memory::MemoryModule::new(
-                    caps.cognition_log_evicted_inbox(),
-                    caps.allocation_reader(),
-                    caps.memory_metadata_reader(),
-                    memory_caps.writer(),
-                    memory_caps.retriever(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(nuillu_memory::MemoryModule::new(
+                        caps.cognition_log_evicted_inbox(),
+                        caps.allocation_reader(),
+                        caps.memory_metadata_reader(),
+                        memory_caps.writer(),
+                        memory_caps.retriever(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
         }
         RuntimeModule::MemoryCompaction => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                nuillu_memory::MemoryCompactionModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    memory_caps.compactor(),
-                    caps.llm_access(),
-                )
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(nuillu_memory::MemoryCompactionModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.compactor(),
+                        caps.llm_access(),
+                    ))
+                }
             })
         }
         RuntimeModule::MemoryAssociation => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                nuillu_memory::MemoryAssociationModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    memory_caps.content_reader(),
-                    memory_caps.writer(),
-                    memory_caps.associator(),
-                    caps.llm_access(),
-                )
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(nuillu_memory::MemoryAssociationModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.content_reader(),
+                        memory_caps.writer(),
+                        memory_caps.associator(),
+                        caps.llm_access(),
+                    ))
+                }
             })
         }
         RuntimeModule::MemoryRecombination => {
             let memory_caps = memory_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                nuillu_memory::MemoryRecombinationModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    memory_caps.retriever(),
-                    caps.cognition_writer(),
-                    caps.llm_access(),
-                )
+                let memory_caps = memory_caps.clone();
+                async move {
+                    Ok(nuillu_memory::MemoryRecombinationModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        memory_caps.retriever(),
+                        caps.cognition_writer(),
+                        caps.llm_access(),
+                    ))
+                }
             })
         }
         RuntimeModule::Interoception => {
             let suppressed = sleep_suppressed_modules();
             registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), move |caps| {
-                nuillu_interoception::InteroceptionModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_writer(Vec::new(), suppressed.clone()),
-                    caps.interoception_policy(),
-                    caps.interoception_writer(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let suppressed = suppressed.clone();
+                async move {
+                    Ok(nuillu_interoception::InteroceptionModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.allocation_writer(Vec::new(), suppressed.clone()),
+                        caps.interoception_policy(),
+                        caps.interoception_writer(),
+                        caps.llm_access(),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_interoception::session_auto_compaction())
+                            .await?,
+                    ))
+                }
             })
         }
         RuntimeModule::HomeostaticController => {
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| {
-                nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.interoception_reader(),
-                    caps.allocation_writer(homeostatic_drive_modules(), sleep_suppressed_modules()),
+            registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| async move {
+                Ok(
+                    nuillu_homeostatic_controller::HomeostaticControllerModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(
+                            homeostatic_drive_modules(),
+                            sleep_suppressed_modules(),
+                        ),
+                    ),
                 )
             })
         }
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                let consideration_writer = policy_caps.consideration_writer(caps.owner().clone());
-                nuillu_reward::PolicyModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    policy_caps.searcher(),
-                    caps.memo(),
-                    consideration_writer,
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let policy_caps = policy_caps.clone();
+                async move {
+                    let consideration_writer =
+                        policy_caps.consideration_writer(caps.owner().clone());
+                    Ok(nuillu_reward::PolicyModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.cognition_log_updated_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        policy_caps.searcher(),
+                        caps.memo(),
+                        consideration_writer,
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
         }
         RuntimeModule::PolicyCompaction => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
-                nuillu_reward::PolicyCompactionModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    policy_caps.compactor(),
-                    caps.llm_access(),
-                )
+                let policy_caps = policy_caps.clone();
+                async move {
+                    Ok(nuillu_reward::PolicyCompactionModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.allocation_reader(),
+                        caps.blackboard_reader(),
+                        policy_caps.compactor(),
+                        caps.llm_access(),
+                    ))
+                }
             })
         }
         RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
             registry.register_server(policy(0..=1, Bpm::range(1.0, 2.0)), move |caps| {
-                nuillu_reward::RewardModule::new(
-                    policy_caps.consideration_evicted_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    policy_caps.searcher(),
-                    policy_caps.upserter(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let policy_caps = policy_caps.clone();
+                async move {
+                    Ok(nuillu_reward::RewardModule::new(
+                        policy_caps.consideration_evicted_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        policy_caps.searcher(),
+                        policy_caps.upserter(),
+                        caps.memo(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
         }
         RuntimeModule::Predict => {
-            registry.register_server(policy(0..=1, Bpm::range(1.0, 6.0)), |caps| {
-                nuillu_predict::PredictModule::new(
+            registry.register_server(policy(0..=1, Bpm::range(1.0, 6.0)), |caps| async move {
+                Ok(nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
                     caps.memo(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_predict::session_auto_compaction())
+                        .await?,
+                ))
             })
         }
         RuntimeModule::Surprise => {
-            registry.register_server(policy(0..=1, Bpm::range(1.0, 3.0)), |caps| {
-                nuillu_surprise::SurpriseModule::new(
+            registry.register_server(policy(0..=1, Bpm::range(1.0, 3.0)), |caps| async move {
+                Ok(nuillu_surprise::SurpriseModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
                     caps.allocation_reader(),
@@ -289,26 +333,29 @@ fn register_server_module(
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
-                    caps.session("main"),
-                )
+                    caps.legacy_session("main"),
+                ))
             })
         }
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
             registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), move |caps| {
-                nuillu_speak::SpeakModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    UtteranceWriter::new(
-                        caps.owner().clone(),
-                        caps.blackboard(),
-                        utterance_sink.clone(),
-                        caps.clock(),
-                    ),
-                    caps.llm_access(),
-                    caps.scene_reader(),
-                )
+                let utterance_sink = utterance_sink.clone();
+                async move {
+                    Ok(nuillu_speak::SpeakModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.memo(),
+                        UtteranceWriter::new(
+                            caps.owner().clone(),
+                            caps.blackboard(),
+                            utterance_sink.clone(),
+                            caps.clock(),
+                        ),
+                        caps.llm_access(),
+                        caps.scene_reader(),
+                    ))
+                }
             })
         }
     }

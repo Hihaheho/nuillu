@@ -4595,15 +4595,15 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_sensory::SensoryModule::new(
+                |caps| async move {
+                    Ok(nuillu_sensory::SensoryModule::new(
                         caps.sensory_input_inbox(),
                         caps.allocation_reader(),
                         caps.memo(),
                         caps.clock(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.legacy_session("main"),
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4613,16 +4613,16 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_cognition_gate::CognitionGateModule::new(
+                |caps| async move {
+                    Ok(nuillu_cognition_gate::CognitionGateModule::new(
                         caps.memo_updated_inbox(),
                         caps.blackboard_reader(),
                         caps.allocation_reader(),
                         caps.cognition_writer(),
                         caps.time_division(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.legacy_session("main"),
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4636,18 +4636,23 @@ fn register_eval_module(
                 {
                     let voluntary = voluntary_modules(all_modules);
                     move |caps| {
-                        nuillu_allocation_controller::AllocationControllerModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.attention_control_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
-                            caps.allocation_reader(),
-                            caps.interoception_reader(),
-                            caps.allocation_writer(voluntary.clone(), Vec::new()),
-                            caps.memo(),
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let voluntary = voluntary.clone();
+                        async move {
+                            Ok(
+                                nuillu_allocation_controller::AllocationControllerModule::new(
+                                    caps.memo_updated_inbox(),
+                                    caps.attention_control_inbox(),
+                                    caps.blackboard_reader(),
+                                    caps.cognition_log_reader(),
+                                    caps.allocation_reader(),
+                                    caps.interoception_reader(),
+                                    caps.allocation_writer(voluntary.clone(), Vec::new()),
+                                    caps.memo(),
+                                    caps.llm_access(),
+                                    caps.legacy_session("main"),
+                                ),
+                            )
+                        }
                     }
                 },
             )
@@ -4658,8 +4663,8 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_attention_schema::AttentionSchemaModule::new(
+                |caps| async move {
+                    Ok(nuillu_attention_schema::AttentionSchemaModule::new(
                         caps.memo_updated_inbox(),
                         caps.cognition_log_updated_inbox(),
                         caps.blackboard_reader(),
@@ -4667,8 +4672,8 @@ fn register_eval_module(
                         caps.cognition_log_reader(),
                         caps.cognition_writer(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.legacy_session("main"),
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4677,16 +4682,18 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_self_model::SelfModelModule::new(
+                |caps| async move {
+                    Ok(nuillu_self_model::SelfModelModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_self_model::session_auto_compaction())
+                            .await?,
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4699,16 +4706,19 @@ fn register_eval_module(
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::QueryMemoryModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            memory_caps.retriever(),
-                            memory_caps.content_reader(),
-                            caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let memory_caps = memory_caps.clone();
+                        async move {
+                            Ok(nuillu_memory::QueryMemoryModule::new(
+                                caps.cognition_log_updated_inbox(),
+                                caps.allocation_reader(),
+                                caps.blackboard_reader(),
+                                memory_caps.retriever(),
+                                memory_caps.content_reader(),
+                                caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            ))
+                        }
                     }
                 },
             )
@@ -4721,15 +4731,18 @@ fn register_eval_module(
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::MemoryModule::new(
-                            caps.cognition_log_evicted_inbox(),
-                            caps.allocation_reader(),
-                            caps.memory_metadata_reader(),
-                            memory_caps.writer(),
-                            memory_caps.retriever(),
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let memory_caps = memory_caps.clone();
+                        async move {
+                            Ok(nuillu_memory::MemoryModule::new(
+                                caps.cognition_log_evicted_inbox(),
+                                caps.allocation_reader(),
+                                caps.memory_metadata_reader(),
+                                memory_caps.writer(),
+                                memory_caps.retriever(),
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            ))
+                        }
                     }
                 },
             )
@@ -4742,13 +4755,16 @@ fn register_eval_module(
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::MemoryCompactionModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            memory_caps.compactor(),
-                            caps.llm_access(),
-                        )
+                        let memory_caps = memory_caps.clone();
+                        async move {
+                            Ok(nuillu_memory::MemoryCompactionModule::new(
+                                caps.interoception_updated_inbox(),
+                                caps.allocation_reader(),
+                                caps.blackboard_reader(),
+                                memory_caps.compactor(),
+                                caps.llm_access(),
+                            ))
+                        }
                     }
                 },
             )
@@ -4760,15 +4776,18 @@ fn register_eval_module(
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::MemoryAssociationModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            memory_caps.content_reader(),
-                            memory_caps.writer(),
-                            memory_caps.associator(),
-                            caps.llm_access(),
-                        )
+                        let memory_caps = memory_caps.clone();
+                        async move {
+                            Ok(nuillu_memory::MemoryAssociationModule::new(
+                                caps.interoception_updated_inbox(),
+                                caps.allocation_reader(),
+                                caps.blackboard_reader(),
+                                memory_caps.content_reader(),
+                                memory_caps.writer(),
+                                memory_caps.associator(),
+                                caps.llm_access(),
+                            ))
+                        }
                     }
                 },
             )
@@ -4780,14 +4799,17 @@ fn register_eval_module(
                 {
                     let memory_caps = memory_caps.clone();
                     move |caps| {
-                        nuillu_memory::MemoryRecombinationModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            memory_caps.retriever(),
-                            caps.cognition_writer(),
-                            caps.llm_access(),
-                        )
+                        let memory_caps = memory_caps.clone();
+                        async move {
+                            Ok(nuillu_memory::MemoryRecombinationModule::new(
+                                caps.interoception_updated_inbox(),
+                                caps.allocation_reader(),
+                                caps.blackboard_reader(),
+                                memory_caps.retriever(),
+                                caps.cognition_writer(),
+                                caps.llm_access(),
+                            ))
+                        }
                     }
                 },
             )
@@ -4799,16 +4821,23 @@ fn register_eval_module(
                 {
                     let suppressed = sleep_suppressed_modules();
                     move |caps| {
-                        nuillu_interoception::InteroceptionModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.cognition_log_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.allocation_writer(Vec::new(), suppressed.clone()),
-                            caps.interoception_policy(),
-                            caps.interoception_writer(),
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let suppressed = suppressed.clone();
+                        async move {
+                            Ok(nuillu_interoception::InteroceptionModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.cognition_log_updated_inbox(),
+                                caps.blackboard_reader(),
+                                caps.allocation_writer(Vec::new(), suppressed.clone()),
+                                caps.interoception_policy(),
+                                caps.interoception_writer(),
+                                caps.llm_access(),
+                                caps.session("main")
+                                    .with_auto_compaction(
+                                        nuillu_interoception::session_auto_compaction(),
+                                    )
+                                    .await?,
+                            ))
+                        }
                     }
                 },
             )
@@ -4817,13 +4846,15 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 20.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(
-                            homeostatic_drive_modules(),
-                            sleep_suppressed_modules(),
+                |caps| async move {
+                    Ok(
+                        nuillu_homeostatic_controller::HomeostaticControllerModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.interoception_reader(),
+                            caps.allocation_writer(
+                                homeostatic_drive_modules(),
+                                sleep_suppressed_modules(),
+                            ),
                         ),
                     )
                 },
@@ -4836,21 +4867,24 @@ fn register_eval_module(
                 {
                     let policy_caps = policy_caps.clone();
                     move |caps| {
-                        let consideration_writer =
-                            policy_caps.consideration_writer(caps.owner().clone());
-                        nuillu_reward::PolicyModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.cognition_log_updated_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
-                            caps.allocation_reader(),
-                            caps.interoception_reader(),
-                            policy_caps.searcher(),
-                            caps.memo(),
-                            consideration_writer,
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let policy_caps = policy_caps.clone();
+                        async move {
+                            let consideration_writer =
+                                policy_caps.consideration_writer(caps.owner().clone());
+                            Ok(nuillu_reward::PolicyModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.cognition_log_updated_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
+                                caps.allocation_reader(),
+                                caps.interoception_reader(),
+                                policy_caps.searcher(),
+                                caps.memo(),
+                                consideration_writer,
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            ))
+                        }
                     }
                 },
             )
@@ -4862,13 +4896,16 @@ fn register_eval_module(
                 {
                     let policy_caps = policy_caps.clone();
                     move |caps| {
-                        nuillu_reward::PolicyCompactionModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.allocation_reader(),
-                            caps.blackboard_reader(),
-                            policy_caps.compactor(),
-                            caps.llm_access(),
-                        )
+                        let policy_caps = policy_caps.clone();
+                        async move {
+                            Ok(nuillu_reward::PolicyCompactionModule::new(
+                                caps.interoception_updated_inbox(),
+                                caps.allocation_reader(),
+                                caps.blackboard_reader(),
+                                policy_caps.compactor(),
+                                caps.llm_access(),
+                            ))
+                        }
                     }
                 },
             )
@@ -4880,18 +4917,21 @@ fn register_eval_module(
                 {
                     let policy_caps = policy_caps.clone();
                     move |caps| {
-                        nuillu_reward::RewardModule::new(
-                            policy_caps.consideration_evicted_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
-                            caps.allocation_reader(),
-                            caps.interoception_reader(),
-                            policy_caps.searcher(),
-                            policy_caps.upserter(),
-                            caps.memo(),
-                            caps.llm_access(),
-                            caps.session("main"),
-                        )
+                        let policy_caps = policy_caps.clone();
+                        async move {
+                            Ok(nuillu_reward::RewardModule::new(
+                                policy_caps.consideration_evicted_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
+                                caps.allocation_reader(),
+                                caps.interoception_reader(),
+                                policy_caps.searcher(),
+                                policy_caps.upserter(),
+                                caps.memo(),
+                                caps.llm_access(),
+                                caps.legacy_session("main"),
+                            ))
+                        }
                     }
                 },
             )
@@ -4901,14 +4941,16 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_predict::PredictModule::new(
+                |caps| async move {
+                    Ok(nuillu_predict::PredictModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.cognition_log_reader(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_predict::session_auto_compaction())
+                            .await?,
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4918,8 +4960,8 @@ fn register_eval_module(
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
-                |caps| {
-                    nuillu_surprise::SurpriseModule::new(
+                |caps| async move {
+                    Ok(nuillu_surprise::SurpriseModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.cognition_log_reader(),
                         caps.allocation_reader(),
@@ -4927,8 +4969,8 @@ fn register_eval_module(
                         caps.attention_control_mailbox(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.session("main"),
-                    )
+                        caps.legacy_session("main"),
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -4941,19 +4983,22 @@ fn register_eval_module(
                 {
                     let utterance_sink = utterance_sink.clone();
                     move |caps| {
-                        nuillu_speak::SpeakModule::new(
-                            caps.cognition_log_updated_inbox(),
-                            caps.cognition_log_reader(),
-                            caps.memo(),
-                            UtteranceWriter::new(
-                                caps.owner().clone(),
-                                caps.blackboard(),
-                                utterance_sink.clone(),
-                                caps.clock(),
-                            ),
-                            caps.llm_access(),
-                            caps.scene_reader(),
-                        )
+                        let utterance_sink = utterance_sink.clone();
+                        async move {
+                            Ok(nuillu_speak::SpeakModule::new(
+                                caps.cognition_log_updated_inbox(),
+                                caps.cognition_log_reader(),
+                                caps.memo(),
+                                UtteranceWriter::new(
+                                    caps.owner().clone(),
+                                    caps.blackboard(),
+                                    utterance_sink.clone(),
+                                    caps.clock(),
+                                ),
+                                caps.llm_access(),
+                                caps.scene_reader(),
+                            ))
+                        }
                     }
                 },
             )
@@ -5817,6 +5862,39 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
         } => format!(
             "seq={sequence} module_stopped owner={owner} phase={phase} failures={consecutive_failures} message={message}"
         ),
+        RuntimeEvent::SessionCompactionStarted {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            threshold,
+            tier,
+        } => format!(
+            "seq={sequence} session_compaction_started owner={owner} session={session_key} input_tokens={input_tokens} threshold={threshold} tier={tier:?}"
+        ),
+        RuntimeEvent::SessionCompactionCompleted {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            before_items,
+            after_items,
+            tier,
+            ..
+        } => format!(
+            "seq={sequence} session_compaction_completed owner={owner} session={session_key} input_tokens={input_tokens} items={before_items}->{after_items} tier={tier:?}"
+        ),
+        RuntimeEvent::SessionCompactionFailed {
+            sequence,
+            owner,
+            session_key,
+            input_tokens,
+            message,
+            tier,
+            ..
+        } => format!(
+            "seq={sequence} session_compaction_failed owner={owner} session={session_key} input_tokens={input_tokens} tier={tier:?} message={message}"
+        ),
     }
 }
 
@@ -6280,6 +6358,9 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         RuntimeEvent::LlmAccessed { .. }
         | RuntimeEvent::LlmCompleted { .. }
         | RuntimeEvent::MemoUpdated { .. }
+        | RuntimeEvent::SessionCompactionStarted { .. }
+        | RuntimeEvent::SessionCompactionCompleted { .. }
+        | RuntimeEvent::SessionCompactionFailed { .. }
         | RuntimeEvent::ModuleTaskFailed { .. }
         | RuntimeEvent::ModuleRestarted { .. }
         | RuntimeEvent::ModuleStopped { .. } => true,
@@ -6305,6 +6386,9 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleTaskFailed { .. } => false,
             RuntimeEvent::ModuleRestarted { .. } => false,
             RuntimeEvent::ModuleStopped { .. } => false,
+            RuntimeEvent::SessionCompactionStarted { .. } => false,
+            RuntimeEvent::SessionCompactionCompleted { .. } => false,
+            RuntimeEvent::SessionCompactionFailed { .. } => false,
         };
         match &event {
             RuntimeEvent::LlmAccessed { .. } => {
@@ -6432,6 +6516,53 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 owner,
                 phase,
                 consecutive_failures,
+                message
+            ),
+            RuntimeEvent::SessionCompactionStarted {
+                owner,
+                session_key,
+                input_tokens,
+                threshold,
+                ..
+            } => format!(
+                "{} session-compaction-started {} owner={} session={} input_tokens={} threshold={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                session_key,
+                input_tokens,
+                threshold
+            ),
+            RuntimeEvent::SessionCompactionCompleted {
+                owner,
+                session_key,
+                input_tokens,
+                before_items,
+                after_items,
+                ..
+            } => format!(
+                "{} session-compaction-completed {} owner={} session={} input_tokens={} items={}->{}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                session_key,
+                input_tokens,
+                before_items,
+                after_items
+            ),
+            RuntimeEvent::SessionCompactionFailed {
+                owner,
+                session_key,
+                input_tokens,
+                message,
+                ..
+            } => format!(
+                "{} session-compaction-failed {} owner={} session={} input_tokens={} error={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                session_key,
+                input_tokens,
                 message
             ),
         };
@@ -8916,8 +9047,8 @@ prompt = "What am I attending to?"
                 let modules = ModuleRegistry::new()
                     .register(
                         eval_policy(1..=1, Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0)),
-                        |caps| {
-                            nuillu_attention_schema::AttentionSchemaModule::new(
+                        |caps| async move {
+                            Ok(nuillu_attention_schema::AttentionSchemaModule::new(
                                 caps.memo_updated_inbox(),
                                 caps.cognition_log_updated_inbox(),
                                 caps.blackboard_reader(),
@@ -8925,8 +9056,8 @@ prompt = "What am I attending to?"
                                 caps.cognition_log_reader(),
                                 caps.cognition_writer(),
                                 caps.llm_access(),
-                                caps.session("main"),
-                            )
+                                caps.legacy_session("main"),
+                            ))
                         },
                     )
                     .unwrap()

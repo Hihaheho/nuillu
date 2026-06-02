@@ -5,10 +5,16 @@ use std::rc::Rc;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use lutum::{Session, Usage};
 use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
 use nuillu_types::ModuleId;
 
-use crate::SessionCompactionRuntime;
+use crate::ports::PortError;
+use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter};
+use crate::session::{
+    NoopSessionStore, SessionCheckpointError, SessionStore, persistent_session_metadata,
+};
+use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session};
 
 /// Read-only context passed to `Module::activate` carrying agent-wide
 /// information that is shared across all modules. **Capabilities are
@@ -21,6 +27,8 @@ pub struct ActivateCx<'a> {
     identity_memories: &'a [IdentityMemoryRecord],
     core_policies: &'a [CorePolicyRecord],
     session_compaction: SessionCompactionRuntime,
+    session_store: Rc<dyn SessionStore>,
+    runtime_events: RuntimeEventEmitter,
     now: DateTime<Utc>,
 }
 
@@ -39,8 +47,20 @@ impl<'a> ActivateCx<'a> {
             identity_memories,
             core_policies,
             session_compaction,
+            session_store: Rc::new(NoopSessionStore),
+            runtime_events: RuntimeEventEmitter::new(Rc::new(NoopRuntimeEventSink)),
             now,
         }
+    }
+
+    pub(crate) fn with_session_checkpoint_runtime(
+        mut self,
+        session_store: Rc<dyn SessionStore>,
+        runtime_events: RuntimeEventEmitter,
+    ) -> Self {
+        self.session_store = session_store;
+        self.runtime_events = runtime_events;
+        self
     }
 
     /// Peer-context entries for modules that should be described in sibling
@@ -73,6 +93,105 @@ impl<'a> ActivateCx<'a> {
     pub fn now(&self) -> DateTime<Utc> {
         self.now
     }
+
+    pub async fn compact_and_save(
+        &self,
+        session: &mut Session,
+        usage: Usage,
+    ) -> std::result::Result<(), SessionCheckpointError> {
+        let metadata = persistent_session_metadata(session)
+            .cloned()
+            .ok_or(SessionCheckpointError::MissingMetadata)?;
+        if let Some(profile) = metadata.auto_compaction
+            && usage.input_tokens > self.session_compaction.input_token_threshold()
+        {
+            let threshold = self.session_compaction.input_token_threshold();
+            let tier = self.session_compaction.module_tier();
+            let before_items = session.input().items().len();
+            self.runtime_events.session_compaction_started(
+                metadata.owner.clone(),
+                metadata.key.as_str().to_owned(),
+                usage.input_tokens,
+                threshold,
+                tier,
+            );
+            let _permit = self.session_compaction.concurrency().acquire().await;
+            let lutum = self
+                .session_compaction
+                .lutum_for_session(metadata.owner.clone(), metadata.key.as_str().to_owned());
+            match compact_session(
+                session,
+                &lutum,
+                profile.config,
+                profile.protected_prefix,
+                profile.compacted_prefix,
+                profile.compaction_prompt,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.runtime_events.session_compaction_completed(
+                        metadata.owner.clone(),
+                        metadata.key.as_str().to_owned(),
+                        usage.input_tokens,
+                        threshold,
+                        before_items,
+                        session.input().items().len(),
+                        tier,
+                    );
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    tracing::warn!(
+                        owner = %metadata.owner,
+                        session_key = %metadata.key,
+                        input_tokens = usage.input_tokens,
+                        threshold,
+                        module_tier = ?tier,
+                        error = ?error,
+                        "module session compaction failed"
+                    );
+                    self.runtime_events.session_compaction_failed(
+                        metadata.owner.clone(),
+                        metadata.key.as_str().to_owned(),
+                        usage.input_tokens,
+                        threshold,
+                        tier,
+                        message,
+                    );
+                }
+            }
+        }
+
+        let snapshot = PersistedSessionSnapshot::from_session(session);
+        if let Err(error) = self
+            .session_store
+            .save(&metadata.owner, &metadata.key, &snapshot)
+            .await
+        {
+            let message = format_session_save_error(&metadata.owner, &metadata.key, error);
+            tracing::warn!(
+                owner = %metadata.owner,
+                session_key = %metadata.key,
+                message,
+                "module session save failed"
+            );
+            self.runtime_events.module_task_failed(
+                metadata.owner,
+                "session-save".to_owned(),
+                message,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn format_session_save_error(
+    owner: &nuillu_types::ModuleInstanceId,
+    key: &crate::SessionKey,
+    error: PortError,
+) -> String {
+    format!("failed to save session {owner}/{key}: {error}")
 }
 
 /// A cognitive or functional module.

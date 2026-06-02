@@ -631,9 +631,9 @@ impl RewardModule {
                 },
             ));
             let result = session
-                .structured_turn::<RewardAssessment>(&lutum)
+                .structured_turn::<RewardAssessment>()
                 .max_output_tokens(768)
-                .collect()
+                .collect(&lutum)
                 .await
                 .context("reward structured turn failed")?;
             let input_tokens = result.usage.input_tokens;
@@ -1027,18 +1027,21 @@ mod tests {
     ) -> nuillu_module::AllocatedModule {
         let modules = ModuleRegistry::new()
             .register(module_policy(), move |caps| {
-                RewardModule::new(
-                    policy_caps.consideration_evicted_inbox(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.interoception_reader(),
-                    policy_caps.searcher(),
-                    policy_caps.upserter(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main"),
-                )
+                let policy_caps = policy_caps.clone();
+                async move {
+                    Ok(RewardModule::new(
+                        policy_caps.consideration_evicted_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        policy_caps.searcher(),
+                        policy_caps.upserter(),
+                        caps.memo(),
+                        caps.llm_access(),
+                        caps.legacy_session("main"),
+                    ))
+                }
             })
             .unwrap()
             .build(caps)

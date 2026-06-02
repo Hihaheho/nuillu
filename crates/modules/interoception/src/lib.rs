@@ -3,17 +3,18 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::StructuredTurnOutcome;
+use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{
     AllocationCommand, AllocationEffectLevel, CognitionLogEntryRecord, InteroceptiveMode,
     InteroceptivePatch, InteroceptiveState, MemoLogRecord,
 };
 use nuillu_module::{
     AllocationWriter, BlackboardReader, CognitionLogUpdatedInbox, InteroceptionRuntimePolicy,
-    InteroceptiveWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, ModuleSession,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
-    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
-    format_current_attention_guidance, format_identity_system_prompt,
+    InteroceptiveWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
+    format_bounded_memo_log_batch, format_current_attention_guidance,
+    format_identity_system_prompt,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -46,6 +47,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the interoception module'
 Summarize only the prefix transcript you receive. Preserve affect-state judgments, salient evidence,
 and wake/sleep pressure rationale future interoception decisions need. Do not invent observations.
 Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_INTEROCEPTION_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -92,8 +102,7 @@ pub struct InteroceptionModule {
     interoception: InteroceptiveWriter,
     policy: InteroceptionRuntimePolicy,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
     last_seen_cognition_index: Option<u64>,
     last_total_remember_tokens: Option<u32>,
@@ -109,7 +118,7 @@ impl InteroceptionModule {
         policy: InteroceptionRuntimePolicy,
         interoception: InteroceptiveWriter,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             memo_updates,
@@ -120,7 +129,6 @@ impl InteroceptionModule {
             interoception,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             last_seen_cognition_index: None,
             last_total_remember_tokens: None,
@@ -139,10 +147,14 @@ impl InteroceptionModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     async fn activate(
@@ -255,8 +267,7 @@ impl InteroceptionModule {
         self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let semantic = {
-            let mut session = self.session.borrow_mut();
-            session.push_ephemeral_user(format!(
+            self.session.push_ephemeral_user(format!(
                 "Current interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nAttention guidance:\n{}",
                 serde_json::to_string(current).unwrap_or_default(),
                 format_bounded_memo_log_batch(unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
@@ -269,25 +280,16 @@ impl InteroceptionModule {
                 .unwrap_or_else(|| "none".to_owned()),
                 format_current_attention_guidance(allocation).unwrap_or_else(|| "none".to_owned()),
             ));
-            let result = session
-                .structured_turn::<AffectAssessment>(&lutum)
+            let result = self
+                .session
+                .structured_turn::<AffectAssessment>()
                 .max_output_tokens(512)
-                .collect()
+                .collect(&lutum)
                 .await
                 .context("interoception structured turn failed")?;
-            let input_tokens = result.usage.input_tokens;
+            let usage = result.usage;
             let semantic = result.semantic;
-            compact_session_if_needed(
-                &mut session,
-                input_tokens,
-                cx.session_compaction(),
-                self.session_compaction,
-                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                Self::id(),
-                COMPACTED_INTEROCEPTION_SESSION_PREFIX,
-                SESSION_COMPACTION_PROMPT,
-            )
-            .await;
+            cx.compact_and_save(&mut self.session, usage).await?;
             semantic
         };
         let StructuredTurnOutcome::Structured(assessment) = semantic else {
