@@ -256,6 +256,10 @@ impl VisualizerHook {
                 VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
                 | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
+                | VisualizerCommand::CreateSceneRow { tab_id, .. }
+                | VisualizerCommand::UpdateSceneRow { tab_id, .. }
+                | VisualizerCommand::RemoveSceneRow { tab_id, .. }
+                | VisualizerCommand::SendScenePersonMessage { tab_id, .. }
                 | VisualizerCommand::FetchLinkedMemories { tab_id, .. }
                 | VisualizerCommand::DeleteMemory { tab_id, .. }
                 | VisualizerCommand::SetModuleDisabled { tab_id, .. }
@@ -3684,7 +3688,7 @@ async fn handle_visualizer_commands(
                 let observed_at = clock.now();
                 let body = SensoryInput::OneShot {
                     modality: SensoryModality::parse(input.modality),
-                    direction: None,
+                    direction: input.direction,
                     content: input.content,
                     observed_at,
                 };
@@ -3795,11 +3799,15 @@ async fn handle_visualizer_commands(
             VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::RemoveAmbientSensoryRow { tab_id, .. }
+            | VisualizerCommand::CreateSceneRow { tab_id, .. }
+            | VisualizerCommand::UpdateSceneRow { tab_id, .. }
+            | VisualizerCommand::RemoveSceneRow { tab_id, .. }
+            | VisualizerCommand::SendScenePersonMessage { tab_id, .. }
                 if tab_id.as_str() == case_id =>
             {
                 visualizer.send_event(VisualizerEvent::Log {
                     tab_id,
-                    message: "ambient sensory rows are only supported by nuillu-server".to_string(),
+                    message: "scene editing is only supported by nuillu-server".to_string(),
                 });
             }
             _ => {}

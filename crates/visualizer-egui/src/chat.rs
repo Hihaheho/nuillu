@@ -1,43 +1,56 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
 
 use nuillu_module::SensoryInput;
 
 use crate::{
-    AmbientSensoryRowView, OneShotSensoryInput, UtteranceDeltaView, UtteranceView,
-    VisualizerClientMessage, VisualizerCommand, VisualizerTabId, text::wrapped_label,
+    DerivedAmbientSensoryRowView, SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView,
+    UtteranceView, VisualizerClientMessage, VisualizerCommand, VisualizerTabId,
+    text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
-const MODALITY_FIELD_WIDTH: f32 = 120.0;
-const AMBIENT_INPUT_WIDTH: f32 = 360.0;
-const ONE_SHOT_INPUT_MIN_WIDTH: f32 = 320.0;
+const SHORT_FIELD_WIDTH: f32 = 96.0;
+const MEDIUM_FIELD_WIDTH: f32 = 150.0;
+const LONG_FIELD_WIDTH: f32 = 260.0;
+const MESSAGE_FIELD_WIDTH: f32 = 260.0;
+const PREVIEW_MODALITY_WIDTH: f32 = 96.0;
+const PREVIEW_CONTENT_WIDTH: f32 = 560.0;
+
+const ATMOSPHERE_ASPECTS: [&str; 6] = [
+    "light",
+    "smell",
+    "temperature",
+    "air/weather",
+    "surface/feel",
+    "other",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ChatRole {
+enum ActivityRole {
     User,
     Assistant,
 }
 
-impl ChatRole {
+impl ActivityRole {
     fn label(&self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
+            Self::User => "sensory",
+            Self::Assistant => "nui",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChatMessage {
-    role: ChatRole,
+struct ActivityMessage {
+    role: ActivityRole,
     content: String,
     source: Option<String>,
     streaming: bool,
 }
 
-impl ChatMessage {
-    fn new(role: ChatRole, content: impl Into<String>) -> Self {
+impl ActivityMessage {
+    fn new(role: ActivityRole, content: impl Into<String>) -> Self {
         Self {
             role,
             content: content.into(),
@@ -54,58 +67,56 @@ struct UtteranceKey {
     generation_id: u64,
 }
 
-#[derive(Debug)]
-pub struct ChatState {
-    messages: Vec<ChatMessage>,
+#[derive(Debug, Default)]
+pub struct SceneUiState {
+    scene: SceneStateView,
+    activity: Vec<ActivityMessage>,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
-    ambient_rows: Vec<AmbientSensoryRowView>,
-    one_shot_modality: String,
-    one_shot_draft: String,
+    person_message_drafts: BTreeMap<String, String>,
 }
 
-impl Default for ChatState {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-            streaming_utterances: BTreeMap::new(),
-            ambient_rows: Vec::new(),
-            one_shot_modality: "audition".to_string(),
-            one_shot_draft: String::new(),
-        }
+impl SceneUiState {
+    pub fn scene_view(&self) -> &SceneStateView {
+        &self.scene
     }
-}
 
-impl ChatState {
-    pub fn set_ambient_rows(&mut self, rows: Vec<AmbientSensoryRowView>) {
-        self.ambient_rows = rows;
+    pub fn set_scene_state(&mut self, scene: SceneStateView) {
+        let valid_people = scene
+            .people
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<BTreeSet<_>>();
+        self.person_message_drafts
+            .retain(|row_id, _| valid_people.contains(row_id));
+        for row_id in valid_people {
+            self.person_message_drafts.entry(row_id).or_default();
+        }
+        self.scene = scene;
     }
 
     pub fn push_sensory_input(&mut self, input: SensoryInput) {
-        let (source, content) = match input {
-            SensoryInput::OneShot {
-                modality,
-                content,
-                observed_at,
-                ..
-            } => (
-                format!("one-shot {} at {}", modality.as_str(), observed_at),
-                content,
-            ),
-            SensoryInput::AmbientSnapshot {
-                entries,
-                observed_at,
-            } => (
-                format!("ambient snapshot at {observed_at}"),
-                entries
-                    .into_iter()
-                    .map(|entry| format!("{}: {}", entry.modality.as_str(), entry.content))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+        let SensoryInput::OneShot {
+            modality,
+            direction,
+            content,
+            observed_at,
+        } = input
+        else {
+            return;
         };
-        let mut message = ChatMessage::new(ChatRole::User, content);
+        let source = if let Some(direction) = direction {
+            format!(
+                "one-shot {} from {} at {}",
+                modality.as_str(),
+                direction,
+                observed_at
+            )
+        } else {
+            format!("one-shot {} at {}", modality.as_str(), observed_at)
+        };
+        let mut message = ActivityMessage::new(ActivityRole::User, content);
         message.source = Some(source);
-        self.messages.push(message);
+        self.activity.push(message);
     }
 
     pub fn push_utterance_delta(&mut self, delta: UtteranceDeltaView) {
@@ -117,17 +128,17 @@ impl ChatState {
         let index = if let Some(index) = self.streaming_utterances.get(&key).copied() {
             index
         } else {
-            let index = self.messages.len();
+            let index = self.activity.len();
             self.streaming_utterances.insert(key, index);
-            self.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
+            self.activity.push(ActivityMessage {
+                role: ActivityRole::Assistant,
                 content: String::new(),
                 streaming: true,
                 source: Some(format!("{} -> {}", delta.sender, delta.target)),
             });
             index
         };
-        if let Some(message) = self.messages.get_mut(index) {
+        if let Some(message) = self.activity.get_mut(index) {
             message.content.push_str(&delta.delta);
             message.streaming = true;
         }
@@ -142,223 +153,424 @@ impl ChatState {
         if let Some(key) = matching_key
             && let Some(index) = self.streaming_utterances.remove(&key)
         {
-            if let Some(message) = self.messages.get_mut(index) {
+            if let Some(message) = self.activity.get_mut(index) {
                 message.content = utterance.text;
                 message.streaming = false;
             }
             return;
         }
 
-        let mut message = ChatMessage::new(ChatRole::Assistant, utterance.text);
+        let mut message = ActivityMessage::new(ActivityRole::Assistant, utterance.text);
         message.source = Some(format!(
             "{} -> {} at {}",
             utterance.sender, utterance.target, utterance.emitted_at
         ));
-        self.messages.push(message);
+        self.activity.push(message);
     }
 }
 
 pub fn ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
-    state: &mut ChatState,
+    state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    chat_messages_ui(ui, &state.messages);
-
-    ui.separator();
-    ambient_table_ui(ui, tab_id, state, commands);
-    ui.separator();
-    one_shot_ui(ui, tab_id, state, commands);
-}
-
-fn ambient_table_ui(
-    ui: &mut egui::Ui,
-    tab_id: &VisualizerTabId,
-    state: &mut ChatState,
-    commands: &Sender<VisualizerClientMessage>,
-) {
-    ui.horizontal(|ui| {
-        ui.strong("Ambient");
-        if ui.button("Add row").clicked() {
-            let _ = commands.send(VisualizerClientMessage::Command {
-                command: VisualizerCommand::CreateAmbientSensoryRow {
-                    tab_id: tab_id.clone(),
-                    modality: "vision".to_string(),
-                    content: String::new(),
-                    disabled: false,
-                },
-            });
-        }
-    });
-    egui::ScrollArea::horizontal()
-        .id_salt("ambient-sensory-table-scroll")
+    egui::ScrollArea::vertical()
+        .id_salt("scene-window-scroll")
         .show(ui, |ui| {
-            egui::Grid::new("ambient-sensory-table")
-                .striped(true)
-                .num_columns(4)
-                .show(ui, |ui| {
-                    ui.strong("Enabled");
-                    ui.strong("Category");
-                    ui.strong("Input");
-                    ui.end_row();
-
-                    let mut index = 0;
-                    while index < state.ambient_rows.len() {
-                        let row_id = state.ambient_rows[index].id.clone();
-                        let mut send_update = false;
-
-                        let mut enabled = !state.ambient_rows[index].disabled;
-                        if ui
-                            .add_sized(
-                                [56.0, FIELD_HEIGHT],
-                                egui::Checkbox::without_text(&mut enabled),
-                            )
-                            .on_hover_text("Include this row in ambient snapshots")
-                            .changed()
-                        {
-                            state.ambient_rows[index].disabled = !enabled;
-                            send_update = true;
-                        }
-
-                        let category_response = ui.add_sized(
-                            [MODALITY_FIELD_WIDTH, FIELD_HEIGHT],
-                            egui::TextEdit::singleline(&mut state.ambient_rows[index].modality)
-                                .desired_width(MODALITY_FIELD_WIDTH),
-                        );
-                        if category_response.lost_focus() {
-                            send_update = true;
-                        }
-
-                        let input_response = ui.add_sized(
-                            [AMBIENT_INPUT_WIDTH, FIELD_HEIGHT],
-                            egui::TextEdit::singleline(&mut state.ambient_rows[index].content)
-                                .desired_width(AMBIENT_INPUT_WIDTH),
-                        );
-                        if input_response.lost_focus() {
-                            send_update = true;
-                        }
-
-                        if ui
-                            .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Delete"))
-                            .clicked()
-                        {
-                            let _ = commands.send(VisualizerClientMessage::Command {
-                                command: VisualizerCommand::RemoveAmbientSensoryRow {
-                                    tab_id: tab_id.clone(),
-                                    row_id,
-                                },
-                            });
-                            state.ambient_rows.remove(index);
-                            ui.end_row();
-                            continue;
-                        } else if send_update {
-                            let _ = commands.send(VisualizerClientMessage::Command {
-                                command: VisualizerCommand::UpdateAmbientSensoryRow {
-                                    tab_id: tab_id.clone(),
-                                    row: state.ambient_rows[index].clone(),
-                                },
-                            });
-                        }
-                        ui.end_row();
-                        index += 1;
-                    }
-                });
+            people_section_ui(ui, tab_id, state, commands);
+            ui.separator();
+            objects_section_ui(ui, tab_id, state, commands);
+            ui.separator();
+            sounds_section_ui(ui, tab_id, state, commands);
+            ui.separator();
+            atmosphere_section_ui(ui, tab_id, state, commands);
+            ui.separator();
+            derived_ambient_ui(ui, &state.scene.derived_ambient);
+            ui.separator();
+            activity_ui(ui, &state.activity);
         });
 }
 
-fn one_shot_ui(
+fn people_section_ui(
     ui: &mut egui::Ui,
     tab_id: &VisualizerTabId,
-    state: &mut ChatState,
+    state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    ui.vertical(|ui| {
-        ui.strong("One shot");
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [MODALITY_FIELD_WIDTH, FIELD_HEIGHT],
-                egui::TextEdit::singleline(&mut state.one_shot_modality)
-                    .desired_width(MODALITY_FIELD_WIDTH),
+    section_header(ui, "People", tab_id, commands, SceneRowKind::Person);
+    horizontal_grid(ui, "scene-people-grid", 7, |ui| {
+        ui.strong("Remove");
+        ui.strong("Name");
+        ui.strong("Direction");
+        ui.strong("Distance");
+        ui.strong("State");
+        ui.strong("Message");
+        ui.strong("Send");
+        ui.end_row();
+
+        let mut index = 0;
+        while index < state.scene.people.len() {
+            let row_id = state.scene.people[index].id.clone();
+            let mut send_update = false;
+            let remove_clicked = ui
+                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .clicked();
+            {
+                let row = &mut state.scene.people[index];
+                send_update |= text_field(ui, &mut row.name, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.state, LONG_FIELD_WIDTH);
+            }
+            let draft = state
+                .person_message_drafts
+                .entry(row_id.clone())
+                .or_default();
+            let message_response = ui.add_sized(
+                [MESSAGE_FIELD_WIDTH, FIELD_HEIGHT],
+                egui::TextEdit::singleline(draft).desired_width(MESSAGE_FIELD_WIDTH),
             );
-            let input_width = (ui.available_width() - 72.0).max(ONE_SHOT_INPUT_MIN_WIDTH);
-            let response = ui.add_sized(
-                [input_width, FIELD_HEIGHT],
-                egui::TextEdit::singleline(&mut state.one_shot_draft).desired_width(input_width),
-            );
-            let send = ui
+            let send_clicked = ui
                 .add_sized([56.0, FIELD_HEIGHT], egui::Button::new("Send"))
                 .clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-            if send {
-                let content = state.one_shot_draft.trim().to_owned();
-                if !content.is_empty() {
-                    let modality = if state.one_shot_modality.trim().is_empty() {
-                        "audition".to_string()
-                    } else {
-                        state.one_shot_modality.trim().to_owned()
-                    };
+                || (message_response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+
+            if remove_clicked {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::RemoveSceneRow {
+                        tab_id: tab_id.clone(),
+                        kind: SceneRowKind::Person,
+                        row_id: row_id.clone(),
+                    },
+                });
+                state.scene.people.remove(index);
+                state.person_message_drafts.remove(&row_id);
+                ui.end_row();
+                continue;
+            }
+            if send_update {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::UpdateSceneRow {
+                        tab_id: tab_id.clone(),
+                        row: SceneRowView::Person(state.scene.people[index].clone()),
+                    },
+                });
+            }
+            if send_clicked {
+                let message = state
+                    .person_message_drafts
+                    .get(&row_id)
+                    .map(|draft| draft.trim().to_string())
+                    .unwrap_or_default();
+                if !message.is_empty() {
                     let _ = commands.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::SendOneShotSensoryInput {
+                        command: VisualizerCommand::SendScenePersonMessage {
                             tab_id: tab_id.clone(),
-                            input: OneShotSensoryInput { modality, content },
+                            row_id: row_id.clone(),
+                            message,
                         },
                     });
-                    state.one_shot_draft.clear();
+                    if let Some(draft) = state.person_message_drafts.get_mut(&row_id) {
+                        draft.clear();
+                    }
                 }
             }
-        });
+            ui.end_row();
+            index += 1;
+        }
     });
 }
 
-fn chat_messages_ui(ui: &mut egui::Ui, messages: &[ChatMessage]) {
+fn objects_section_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    section_header(ui, "Objects", tab_id, commands, SceneRowKind::Object);
+    horizontal_grid(ui, "scene-objects-grid", 6, |ui| {
+        ui.strong("Remove");
+        ui.strong("Name");
+        ui.strong("Direction");
+        ui.strong("Distance");
+        ui.strong("Visual Description");
+        ui.strong("Sound Description");
+        ui.end_row();
+
+        let mut index = 0;
+        while index < state.scene.objects.len() {
+            let row_id = state.scene.objects[index].id.clone();
+            let remove_clicked = ui
+                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .clicked();
+            let mut send_update = false;
+            {
+                let row = &mut state.scene.objects[index];
+                send_update |= text_field(ui, &mut row.name, MEDIUM_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.visual_description, LONG_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.sound_description, LONG_FIELD_WIDTH);
+            }
+            if remove_clicked {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::RemoveSceneRow {
+                        tab_id: tab_id.clone(),
+                        kind: SceneRowKind::Object,
+                        row_id,
+                    },
+                });
+                state.scene.objects.remove(index);
+                ui.end_row();
+                continue;
+            }
+            if send_update {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::UpdateSceneRow {
+                        tab_id: tab_id.clone(),
+                        row: SceneRowView::Object(state.scene.objects[index].clone()),
+                    },
+                });
+            }
+            ui.end_row();
+            index += 1;
+        }
+    });
+}
+
+fn sounds_section_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    section_header(ui, "Sounds", tab_id, commands, SceneRowKind::Sound);
+    horizontal_grid(ui, "scene-sounds-grid", 4, |ui| {
+        ui.strong("Remove");
+        ui.strong("Direction");
+        ui.strong("Distance");
+        ui.strong("Description");
+        ui.end_row();
+
+        let mut index = 0;
+        while index < state.scene.sounds.len() {
+            let row_id = state.scene.sounds[index].id.clone();
+            let remove_clicked = ui
+                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .clicked();
+            let mut send_update = false;
+            {
+                let row = &mut state.scene.sounds[index];
+                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
+                send_update |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
+            }
+            if remove_clicked {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::RemoveSceneRow {
+                        tab_id: tab_id.clone(),
+                        kind: SceneRowKind::Sound,
+                        row_id,
+                    },
+                });
+                state.scene.sounds.remove(index);
+                ui.end_row();
+                continue;
+            }
+            if send_update {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::UpdateSceneRow {
+                        tab_id: tab_id.clone(),
+                        row: SceneRowView::Sound(state.scene.sounds[index].clone()),
+                    },
+                });
+            }
+            ui.end_row();
+            index += 1;
+        }
+    });
+}
+
+fn atmosphere_section_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    section_header(ui, "Atmosphere", tab_id, commands, SceneRowKind::Atmosphere);
+    horizontal_grid(ui, "scene-atmosphere-grid", 3, |ui| {
+        ui.strong("Remove");
+        ui.strong("Aspect");
+        ui.strong("Description");
+        ui.end_row();
+
+        let mut index = 0;
+        while index < state.scene.atmosphere.len() {
+            let row_id = state.scene.atmosphere[index].id.clone();
+            let remove_clicked = ui
+                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .clicked();
+            let mut send_update = false;
+            {
+                let row = &mut state.scene.atmosphere[index];
+                let before = row.aspect.clone();
+                egui::ComboBox::from_id_salt(format!("atmosphere-aspect-{row_id}"))
+                    .selected_text(if row.aspect.is_empty() {
+                        "other"
+                    } else {
+                        row.aspect.as_str()
+                    })
+                    .show_ui(ui, |ui| {
+                        for aspect in ATMOSPHERE_ASPECTS {
+                            ui.selectable_value(&mut row.aspect, aspect.to_string(), aspect);
+                        }
+                    });
+                send_update |= row.aspect != before;
+                send_update |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
+            }
+            if remove_clicked {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::RemoveSceneRow {
+                        tab_id: tab_id.clone(),
+                        kind: SceneRowKind::Atmosphere,
+                        row_id,
+                    },
+                });
+                state.scene.atmosphere.remove(index);
+                ui.end_row();
+                continue;
+            }
+            if send_update {
+                let _ = commands.send(VisualizerClientMessage::Command {
+                    command: VisualizerCommand::UpdateSceneRow {
+                        tab_id: tab_id.clone(),
+                        row: SceneRowView::Atmosphere(state.scene.atmosphere[index].clone()),
+                    },
+                });
+            }
+            ui.end_row();
+            index += 1;
+        }
+    });
+}
+
+fn derived_ambient_ui(ui: &mut egui::Ui, rows: &[DerivedAmbientSensoryRowView]) {
+    ui.strong("Derived sensory preview");
+    horizontal_grid(ui, "scene-derived-ambient-grid", 3, |ui| {
+        ui.strong("Id");
+        ui.strong("Modality");
+        ui.strong("Description");
+        ui.end_row();
+
+        if rows.is_empty() {
+            ui.label("-");
+            ui.label("-");
+            ui.label("No active derived sensory input.");
+            ui.end_row();
+            return;
+        }
+        for row in rows {
+            ui.add_sized(
+                [MEDIUM_FIELD_WIDTH, FIELD_HEIGHT],
+                egui::Label::new(row.id.as_str()),
+            );
+            ui.add_sized(
+                [PREVIEW_MODALITY_WIDTH, FIELD_HEIGHT],
+                egui::Label::new(row.modality.as_str()),
+            );
+            ui.add_sized(
+                [PREVIEW_CONTENT_WIDTH, FIELD_HEIGHT],
+                egui::Label::new(row.content.as_str()),
+            );
+            ui.end_row();
+        }
+    });
+}
+
+fn activity_ui(ui: &mut egui::Ui, activity: &[ActivityMessage]) {
+    ui.strong("Recent activity");
     egui::ScrollArea::vertical()
-        .id_salt("chat-messages")
+        .id_salt("scene-activity")
         .stick_to_bottom(true)
+        .max_height(220.0)
         .show(ui, |ui| {
-            for message in messages {
-                chat_message_ui(ui, message);
+            if activity.is_empty() {
+                ui.label("No recent speech.");
+                return;
+            }
+            for message in activity {
+                activity_message_ui(ui, message);
                 ui.add_space(6.0);
             }
         });
 }
 
-fn chat_message_ui(ui: &mut egui::Ui, message: &ChatMessage) {
-    let is_user = matches!(message.role, ChatRole::User);
-    ui.horizontal(|ui| {
-        let row_width = ui.available_width();
-        let side_space = row_width * 0.08;
-        let bubble_width = (row_width - side_space).clamp(160.0, 720.0);
-        if is_user {
-            ui.add_space(side_space);
-        }
-        egui::Frame::new()
-            .fill(if is_user {
-                ui.visuals().selection.bg_fill.linear_multiply(0.65)
-            } else {
-                ui.visuals().extreme_bg_color
-            })
-            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::same(8))
-            .show(ui, |ui| {
-                let inner_width = (bubble_width - 16.0).max(120.0);
-                ui.set_min_width(inner_width);
-                ui.set_max_width(inner_width);
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(message.role.label());
-                    if message.streaming {
-                        ui.label("streaming");
-                    }
-                    if let Some(source) = &message.source {
-                        wrapped_label(ui, source);
-                    }
-                });
-                ui.add_space(3.0);
-                wrapped_label(ui, &message.content);
+fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
+    egui::Frame::new()
+        .fill(match message.role {
+            ActivityRole::User => ui.visuals().selection.bg_fill.linear_multiply(0.65),
+            ActivityRole::Assistant => ui.visuals().extreme_bg_color,
+        })
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(message.role.label());
+                if message.streaming {
+                    ui.label("streaming");
+                }
+                if let Some(source) = &message.source {
+                    wrapped_label(ui, source);
+                }
             });
-        if !is_user {
-            ui.add_space(side_space);
+            ui.add_space(3.0);
+            wrapped_label(ui, &message.content);
+        });
+}
+
+fn section_header(
+    ui: &mut egui::Ui,
+    label: &str,
+    tab_id: &VisualizerTabId,
+    commands: &Sender<VisualizerClientMessage>,
+    kind: SceneRowKind,
+) {
+    ui.horizontal(|ui| {
+        ui.strong(label);
+        if ui.button("Add").clicked() {
+            let _ = commands.send(VisualizerClientMessage::Command {
+                command: VisualizerCommand::CreateSceneRow {
+                    tab_id: tab_id.clone(),
+                    kind,
+                },
+            });
         }
     });
+}
+
+fn horizontal_grid(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    columns: usize,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::ScrollArea::horizontal()
+        .id_salt(format!("{id}-scroll"))
+        .show(ui, |ui| {
+            egui::Grid::new(id)
+                .striped(true)
+                .num_columns(columns)
+                .show(ui, add_contents);
+        });
+}
+
+fn text_field(ui: &mut egui::Ui, value: &mut String, width: f32) -> bool {
+    ui.add_sized(
+        [width, FIELD_HEIGHT],
+        egui::TextEdit::singleline(value).desired_width(width),
+    )
+    .lost_focus()
 }

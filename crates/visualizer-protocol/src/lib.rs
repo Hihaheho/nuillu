@@ -181,6 +181,10 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         rows: Vec<AmbientSensoryRowView>,
     },
+    SceneState {
+        tab_id: VisualizerTabId,
+        state: SceneStateView,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +206,24 @@ pub enum VisualizerCommand {
     RemoveAmbientSensoryRow {
         tab_id: VisualizerTabId,
         row_id: String,
+    },
+    CreateSceneRow {
+        tab_id: VisualizerTabId,
+        kind: SceneRowKind,
+    },
+    UpdateSceneRow {
+        tab_id: VisualizerTabId,
+        row: SceneRowView,
+    },
+    RemoveSceneRow {
+        tab_id: VisualizerTabId,
+        kind: SceneRowKind,
+        row_id: String,
+    },
+    SendScenePersonMessage {
+        tab_id: VisualizerTabId,
+        row_id: String,
+        message: String,
     },
     SetModuleDisabled {
         tab_id: VisualizerTabId,
@@ -350,6 +372,8 @@ pub enum TabStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneShotSensoryInput {
     pub modality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
     pub content: String,
 }
 
@@ -359,6 +383,74 @@ pub struct AmbientSensoryRowView {
     pub modality: String,
     pub content: String,
     pub disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SceneStateView {
+    pub people: Vec<ScenePersonRowView>,
+    pub objects: Vec<SceneObjectRowView>,
+    pub sounds: Vec<SceneSoundRowView>,
+    pub atmosphere: Vec<SceneAtmosphereRowView>,
+    pub derived_ambient: Vec<DerivedAmbientSensoryRowView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneRowKind {
+    Person,
+    Object,
+    Sound,
+    Atmosphere,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "row", rename_all = "snake_case")]
+pub enum SceneRowView {
+    Person(ScenePersonRowView),
+    Object(SceneObjectRowView),
+    Sound(SceneSoundRowView),
+    Atmosphere(SceneAtmosphereRowView),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenePersonRowView {
+    pub id: String,
+    pub name: String,
+    pub direction: String,
+    pub distance: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneObjectRowView {
+    pub id: String,
+    pub name: String,
+    pub direction: String,
+    pub distance: String,
+    pub visual_description: String,
+    pub sound_description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneSoundRowView {
+    pub id: String,
+    pub direction: String,
+    pub distance: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneAtmosphereRowView {
+    pub id: String,
+    pub aspect: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedAmbientSensoryRowView {
+    pub id: String,
+    pub modality: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -792,6 +884,7 @@ mod tests {
                 tab_id: VisualizerTabId::new("live"),
                 input: OneShotSensoryInput {
                     modality: "touch".to_string(),
+                    direction: Some("tabletop".to_string()),
                     content: "the tabletop feels cold".to_string(),
                 },
             },
@@ -802,7 +895,99 @@ mod tests {
             actual,
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::SendOneShotSensoryInput { input, .. },
-            } if input.modality == "touch" && input.content == "the tabletop feels cold"
+            } if input.modality == "touch"
+                && input.direction.as_deref() == Some("tabletop")
+                && input.content == "the tabletop feels cold"
+        ));
+
+        let scene = SceneStateView {
+            people: vec![ScenePersonRowView {
+                id: "person-1".to_string(),
+                name: "Pibi".to_string(),
+                direction: "front".to_string(),
+                distance: "2m".to_string(),
+                state: "watching Nui".to_string(),
+            }],
+            objects: vec![SceneObjectRowView {
+                id: "object-1".to_string(),
+                name: "bowl".to_string(),
+                direction: "left".to_string(),
+                distance: "1m".to_string(),
+                visual_description: "red bowl".to_string(),
+                sound_description: "soft rattling".to_string(),
+            }],
+            sounds: vec![SceneSoundRowView {
+                id: "sound-1".to_string(),
+                direction: "behind".to_string(),
+                distance: "far".to_string(),
+                description: "rain tapping".to_string(),
+            }],
+            atmosphere: vec![SceneAtmosphereRowView {
+                id: "atmosphere-1".to_string(),
+                aspect: "light".to_string(),
+                description: "dim yellow light".to_string(),
+            }],
+            derived_ambient: vec![DerivedAmbientSensoryRowView {
+                id: "scene:person:person-1".to_string(),
+                modality: "vision".to_string(),
+                content: "Pibi is present at front, 2m away; watching Nui.".to_string(),
+            }],
+        };
+        let message = VisualizerServerMessage::event(VisualizerEvent::SceneState {
+            tab_id: VisualizerTabId::new("live"),
+            state: scene.clone(),
+        });
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SceneState { state, .. },
+            } if state == scene
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::UpdateSceneRow {
+                tab_id: VisualizerTabId::new("live"),
+                row: SceneRowView::Person(ScenePersonRowView {
+                    id: "person-1".to_string(),
+                    name: "Pibi".to_string(),
+                    direction: "front".to_string(),
+                    distance: "2m".to_string(),
+                    state: "watching Nui".to_string(),
+                }),
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::UpdateSceneRow {
+                    row: SceneRowView::Person(row),
+                    ..
+                },
+            } if row.name == "Pibi"
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::SendScenePersonMessage {
+                tab_id: VisualizerTabId::new("live"),
+                row_id: "person-1".to_string(),
+                message: "hello".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SendScenePersonMessage {
+                    row_id,
+                    message,
+                    ..
+                },
+            } if row_id == "person-1" && message == "hello"
         ));
 
         let command = VisualizerClientMessage::Command {

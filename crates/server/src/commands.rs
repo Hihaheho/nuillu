@@ -18,19 +18,19 @@ use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, list_all_memories,
     memory_record_view,
 };
-use crate::state::{AmbientRows, ModuleSettingsState};
+use crate::state::{ModuleSettingsState, SceneState};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(super) async fn drive_server_until_shutdown(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
-    ambient: &mut AmbientRows,
+    scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
 ) {
-    publish_ambient_snapshot(ambient, sensory, visualizer, tab_id, env.clock.as_ref()).await;
+    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
     loop {
         if visualizer.shutdown_requested() {
             break;
@@ -40,7 +40,7 @@ pub(super) async fn drive_server_until_shutdown(
                 message,
                 visualizer,
                 tab_id,
-                ambient,
+                scene,
                 module_settings,
                 sensory,
                 env,
@@ -63,7 +63,7 @@ async fn handle_server_visualizer_message(
     message: VisualizerClientMessage,
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
-    ambient: &mut AmbientRows,
+    scene: &mut SceneState,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
@@ -84,7 +84,7 @@ async fn handle_server_visualizer_message(
         } if command_tab == *tab_id => {
             let body = SensoryInput::OneShot {
                 modality: SensoryModality::parse(input.modality),
-                direction: None,
+                direction: input.direction,
                 content: input.content,
                 observed_at: env.clock.now(),
             };
@@ -101,26 +101,57 @@ async fn handle_server_visualizer_message(
             content,
             disabled,
         } if command_tab == *tab_id => {
-            ambient.create(modality, content, disabled);
-            persist_and_emit_ambient(ambient, visualizer, tab_id, sensory, env.clock.as_ref())
-                .await;
+            scene.create_legacy_ambient(modality, content, disabled);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
             false
         }
         VisualizerCommand::UpdateAmbientSensoryRow {
             tab_id: command_tab,
             row,
         } if command_tab == *tab_id => {
-            ambient.update(row);
-            persist_and_emit_ambient(ambient, visualizer, tab_id, sensory, env.clock.as_ref())
-                .await;
+            scene.update_legacy_ambient(row);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
             false
         }
         VisualizerCommand::RemoveAmbientSensoryRow {
             tab_id: command_tab,
             row_id,
         } if command_tab == *tab_id => {
-            ambient.remove(&row_id);
-            persist_and_emit_ambient(ambient, visualizer, tab_id, sensory, env.clock.as_ref())
+            scene.remove_legacy_ambient(&row_id);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            false
+        }
+        VisualizerCommand::CreateSceneRow {
+            tab_id: command_tab,
+            kind,
+        } if command_tab == *tab_id => {
+            scene.create(kind);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            false
+        }
+        VisualizerCommand::UpdateSceneRow {
+            tab_id: command_tab,
+            row,
+        } if command_tab == *tab_id => {
+            scene.update(row);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            false
+        }
+        VisualizerCommand::RemoveSceneRow {
+            tab_id: command_tab,
+            kind,
+            row_id,
+        } if command_tab == *tab_id => {
+            scene.remove(kind, &row_id);
+            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            false
+        }
+        VisualizerCommand::SendScenePersonMessage {
+            tab_id: command_tab,
+            row_id,
+            message,
+        } if command_tab == *tab_id => {
+            send_scene_person_message(scene, &row_id, message, visualizer, tab_id, sensory, env)
                 .await;
             false
         }
@@ -273,46 +304,95 @@ async fn set_module_disabled(
         .await;
 }
 
-async fn persist_and_emit_ambient(
-    ambient: &AmbientRows,
+async fn persist_and_emit_scene(
+    scene: &SceneState,
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     sensory: &SensoryInputMailbox,
-    clock: &dyn nuillu_module::ports::Clock,
+    env: &ServerEnvironment,
 ) {
-    if let Err(error) = ambient.save() {
+    if let Err(error) = scene.save() {
         visualizer.send_event(VisualizerEvent::Log {
             tab_id: tab_id.clone(),
-            message: format!("failed to save ambient sensory rows: {error}"),
+            message: format!("failed to save scene state: {error}"),
         });
     }
-    visualizer.send_event(VisualizerEvent::AmbientSensoryRows {
-        tab_id: tab_id.clone(),
-        rows: ambient.rows.clone(),
-    });
-    publish_ambient_snapshot(ambient, sensory, visualizer, tab_id, clock).await;
+    env.caps.scene().set(scene.participants());
+    emit_scene_state(scene, visualizer, tab_id);
+    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
 }
 
-async fn publish_ambient_snapshot(
-    ambient: &AmbientRows,
+pub(super) fn emit_scene_state(
+    scene: &SceneState,
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+) {
+    visualizer.send_event(VisualizerEvent::SceneState {
+        tab_id: tab_id.clone(),
+        state: scene.view(),
+    });
+}
+
+async fn publish_scene_snapshot(
+    scene: &SceneState,
     sensory: &SensoryInputMailbox,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
     clock: &dyn nuillu_module::ports::Clock,
 ) {
-    let entries = ambient
-        .rows
-        .iter()
-        .filter(|row| !row.disabled && !row.content.trim().is_empty())
+    let entries = scene
+        .derived_ambient()
+        .into_iter()
         .map(|row| AmbientSensoryEntry {
-            id: row.id.clone(),
+            id: row.id,
             modality: SensoryModality::parse(&row.modality),
-            content: row.content.clone(),
+            content: row.content,
         })
         .collect::<Vec<_>>();
     let body = SensoryInput::AmbientSnapshot {
         entries,
         observed_at: clock.now(),
+    };
+    let _ = sensory.publish(body.clone()).await;
+    visualizer.send_event(VisualizerEvent::SensoryInput {
+        tab_id: tab_id.clone(),
+        input: body,
+    });
+}
+
+async fn send_scene_person_message(
+    scene: &SceneState,
+    row_id: &str,
+    message: String,
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    sensory: &SensoryInputMailbox,
+    env: &ServerEnvironment,
+) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    let Some(person) = scene.find_person(row_id) else {
+        visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("scene person row not found: {row_id}"),
+        });
+        return;
+    };
+    let name = person.name.trim();
+    if name.is_empty() {
+        visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: "cannot send a person message from an unnamed scene row".to_string(),
+        });
+        return;
+    }
+    let body = SensoryInput::OneShot {
+        modality: SensoryModality::parse("audition"),
+        direction: Some(name.to_string()),
+        content: format!("{name} says, \"{message}\""),
+        observed_at: env.clock.now(),
     };
     let _ = sensory.publish(body.clone()).await;
     visualizer.send_event(VisualizerEvent::SensoryInput {

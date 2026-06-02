@@ -9,7 +9,9 @@ use nuillu_visualizer_protocol::{
 use tokio::{runtime::Builder, task::LocalSet};
 
 use crate::SERVER_TAB_ID;
-use crate::commands::{apply_persisted_module_settings, drive_server_until_shutdown};
+use crate::commands::{
+    apply_persisted_module_settings, drive_server_until_shutdown, emit_scene_state,
+};
 use crate::config::{DEFAULT_MODULES, ServerConfig};
 use crate::environment::build_server_environment;
 use crate::gui::{
@@ -19,7 +21,7 @@ use crate::gui::{
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
 use crate::snapshot::{emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page};
-use crate::state::{AmbientRows, ModuleSettingsState};
+use crate::state::{ModuleSettingsState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
 
@@ -94,13 +96,15 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         tab_id: tab_id.clone(),
         message: format!("nuillu-server session_id={}", config.session_id),
     });
-    let mut ambient = AmbientRows::load(config.state_dir.join("ambient-sensory.json"))?;
+    let legacy_ambient_path = config.state_dir.join("ambient-sensory.json");
+    let mut scene = SceneState::load(
+        config.state_dir.join("scene-state.json"),
+        &legacy_ambient_path,
+        &config.participants,
+    )?;
+    scene.save()?;
     let mut module_settings =
         ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
-    visualizer.send_event(VisualizerEvent::AmbientSensoryRows {
-        tab_id: tab_id.clone(),
-        rows: ambient.rows.clone(),
-    });
 
     let modules = DEFAULT_MODULES.to_vec();
     let env = build_server_environment(
@@ -109,12 +113,8 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         visualizer.event_sender(),
     )
     .await?;
-    env.caps.scene().set(
-        config
-            .participants
-            .iter()
-            .map(nuillu_module::Participant::new),
-    );
+    env.caps.scene().set(scene.participants());
+    emit_scene_state(&scene, visualizer, &tab_id);
     for module in &config.disabled_modules {
         env.blackboard
             .apply(BlackboardCommand::SetModuleForcedDisabled {
@@ -165,7 +165,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
             drive_server_until_shutdown(
                 visualizer,
                 &tab_id,
-                &mut ambient,
+                &mut scene,
                 &mut module_settings,
                 &sensory,
                 &env,

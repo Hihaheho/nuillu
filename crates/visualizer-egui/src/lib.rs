@@ -196,14 +196,14 @@ impl VisualizerState {
                 self.tab_mut(tab_id).push_log(message);
             }
             VisualizerEvent::SensoryInput { tab_id, input } => {
-                self.tab_mut(tab_id).chat.push_sensory_input(input);
+                self.tab_mut(tab_id).scene.push_sensory_input(input);
             }
             VisualizerEvent::UtteranceDelta { tab_id, utterance } => {
-                self.tab_mut(tab_id).chat.push_utterance_delta(utterance);
+                self.tab_mut(tab_id).scene.push_utterance_delta(utterance);
             }
             VisualizerEvent::UtteranceCompleted { tab_id, utterance } => {
                 self.tab_mut(tab_id)
-                    .chat
+                    .scene
                     .push_utterance_completed(utterance);
             }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
@@ -258,8 +258,9 @@ impl VisualizerState {
                 tab.memories.linked_memory_index = memory_index;
                 tab.memories.linked_results = records;
             }
-            VisualizerEvent::AmbientSensoryRows { tab_id, rows } => {
-                self.tab_mut(tab_id).chat.set_ambient_rows(rows);
+            VisualizerEvent::AmbientSensoryRows { .. } => {}
+            VisualizerEvent::SceneState { tab_id, state } => {
+                self.tab_mut(tab_id).scene.set_scene_state(state);
             }
         }
     }
@@ -290,7 +291,7 @@ pub struct RuntimeTab {
     id: VisualizerTabId,
     title: String,
     status: TabStatus,
-    chat: chat::ChatState,
+    scene: chat::SceneUiState,
     blackboard: BlackboardSnapshot,
     memories: memories::MemoriesState,
     modules: modules::ModulesState,
@@ -323,7 +324,7 @@ impl RuntimeTab {
             id,
             title,
             status: TabStatus::Running,
-            chat: chat::ChatState::default(),
+            scene: chat::SceneUiState::default(),
             blackboard: BlackboardSnapshot::default(),
             memories: memories::MemoriesState::default(),
             modules: modules::ModulesState::default(),
@@ -385,7 +386,7 @@ impl RuntimeTab {
         let mut specs = vec![
             ViewWindowSpec {
                 id: format!("{base}:chat"),
-                title: format!("💬 Chat - {}", self.title),
+                title: format!("Scene - {}", self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
@@ -468,12 +469,12 @@ impl RuntimeTab {
         let mut window_requests = std::mem::take(&mut self.window_requests);
 
         let chat_id = format!("{base}:chat");
-        let chat_title = format!("💬 Chat - {}", self.title);
+        let chat_title = format!("Scene - {}", self.title);
         let open = window::PersistedWindow::new(&chat_id, &chat_title)
             .open_override(window_requests.remove(&chat_id))
             .default_pos(24.0, 88.0)
-            .default_size(520.0, 520.0)
-            .show(ui, |ui| chat::ui(ui, &self.id, &mut self.chat, commands));
+            .default_size(760.0, 620.0)
+            .show(ui, |ui| chat::ui(ui, &self.id, &mut self.scene, commands));
         self.record_window_open(chat_id, open);
 
         let blackboard_id = format!("{base}:blackboard");
@@ -819,6 +820,11 @@ mod tests {
                 .any(|spec| { spec.id == "case-1:modules" && spec.title == "Modules - Case 1" })
         );
         assert!(
+            specs
+                .iter()
+                .any(|spec| { spec.id == "case-1:chat" && spec.title == "Scene - Case 1" })
+        );
+        assert!(
             specs.iter().any(|spec| {
                 spec.id == "case-1:llm-turns" && spec.title == "LLM Turns - Case 1"
             })
@@ -885,5 +891,37 @@ mod tests {
         assert_eq!(tab.errors.len(), 1);
         assert_eq!(state.selected.as_ref(), Some(&tab_id));
         assert_eq!(tab.window_requests.get("case-1:errors"), Some(&true));
+    }
+
+    #[test]
+    fn reducer_applies_scene_state_to_selected_tab() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+
+        state.apply(VisualizerEvent::SceneState {
+            tab_id: tab_id.clone(),
+            state: SceneStateView {
+                people: vec![ScenePersonRowView {
+                    id: "person-1".to_string(),
+                    name: "Pibi".to_string(),
+                    direction: "front".to_string(),
+                    distance: "2m".to_string(),
+                    state: "watching Nui".to_string(),
+                }],
+                derived_ambient: vec![DerivedAmbientSensoryRowView {
+                    id: "scene:person:person-1".to_string(),
+                    modality: "vision".to_string(),
+                    content: "Pibi is present at front, 2m away; watching Nui.".to_string(),
+                }],
+                ..SceneStateView::default()
+            },
+        });
+
+        let tab = state.tabs().get(&tab_id).expect("tab exists");
+        assert_eq!(tab.scene.scene_view().people[0].name, "Pibi");
+        assert_eq!(
+            tab.scene.scene_view().derived_ambient[0].id,
+            "scene:person:person-1"
+        );
     }
 }
