@@ -117,6 +117,9 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
         } => format!(
             "nuillu-server module-task-failed tab={tab_id} owner={owner} phase={phase} error={message}"
         ),
+        RuntimeEvent::ModuleWarning { owner, message, .. } => format!(
+            "nuillu-server module-warning tab={tab_id} owner={owner} message={message}"
+        ),
         RuntimeEvent::SessionCompactionStarted {
             owner,
             session_key,
@@ -222,6 +225,21 @@ mod tests {
         assert_eq!(
             runtime_event_message("server", &event),
             "nuillu-server module-activation-completed tab=server owner=sensory duration_ms=42 succeeded=true"
+        );
+    }
+
+    #[test]
+    fn runtime_event_message_formats_module_warning() {
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let event = RuntimeEvent::ModuleWarning {
+            sequence: 4,
+            owner,
+            message: "decision attempt 1/3 failed: model finished with no output".to_string(),
+        };
+
+        assert_eq!(
+            runtime_event_message("server", &event),
+            "nuillu-server module-warning tab=server owner=cognition-gate message=decision attempt 1/3 failed: model finished with no output"
         );
     }
 

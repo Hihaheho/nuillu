@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolResult, Usage};
+use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolCallWrapper, ToolResult, Usage};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow,
     MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
@@ -171,6 +171,64 @@ enum AppendDecision {
     Rejected,
 }
 
+#[derive(Clone, Debug)]
+struct DecisionTurnResult {
+    status: DecisionStatus,
+    usage: Usage,
+    failure_detail: Option<String>,
+}
+
+impl DecisionTurnResult {
+    fn applied(usage: Usage) -> Self {
+        Self {
+            status: DecisionStatus::Applied,
+            usage,
+            failure_detail: None,
+        }
+    }
+
+    fn missing(usage: Usage, failure_detail: impl Into<String>) -> Self {
+        Self {
+            status: DecisionStatus::Missing,
+            usage,
+            failure_detail: Some(failure_detail.into()),
+        }
+    }
+
+    fn rejected(usage: Usage, failure_detail: impl Into<String>) -> Self {
+        Self {
+            status: DecisionStatus::Rejected,
+            usage,
+            failure_detail: Some(failure_detail.into()),
+        }
+    }
+}
+
+fn format_decision_attempt_failures(attempt_failures: &[(u32, String)]) -> String {
+    attempt_failures
+        .iter()
+        .map(|(attempt, reason)| format!("attempt {attempt}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod decision_failure_format_tests {
+    use super::format_decision_attempt_failures;
+
+    #[test]
+    fn formats_each_attempt_reason() {
+        let formatted = format_decision_attempt_failures(&[
+            (1, "model finished with no output".into()),
+            (2, "append_cognition rejected: empty cognition text".into()),
+        ]);
+        assert_eq!(
+            formatted,
+            "attempt 1: model finished with no output; attempt 2: append_cognition rejected: empty cognition text"
+        );
+    }
+}
+
 pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
 
 pub struct CognitionGateModule {
@@ -289,8 +347,9 @@ impl CognitionGateModule {
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
         let mut correction: Option<&'static str> = None;
+        let mut attempt_failures = Vec::new();
 
-        for _ in 0..MAX_DECISION_ATTEMPTS {
+        for attempt in 1..=MAX_DECISION_ATTEMPTS as u32 {
             if let Some(correction) = correction.take() {
                 self.session.push_ephemeral_developer(correction);
             }
@@ -308,89 +367,133 @@ impl CognitionGateModule {
                 .await
                 .context("cognition-gate decision turn failed")?;
 
-            let (decision, usage) = match outcome {
+            let turn = match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
-                    let decision = if let Some(cognition_text) =
+                    if let Some(cognition_text) =
                         salvage_cognition_from_plain_output(&result.assistant_text())
                     {
-                        match self
+                        let (output, append_decision) = self
                             .append_cognition(AppendCognitionArgs { cognition_text })
-                            .await
-                            .1
-                        {
-                            AppendDecision::Appended => DecisionStatus::Applied,
-                            AppendDecision::Rejected => DecisionStatus::Rejected,
+                            .await;
+                        match append_decision {
+                            AppendDecision::Appended => DecisionTurnResult::applied(result.usage),
+                            AppendDecision::Rejected => DecisionTurnResult::rejected(
+                                result.usage,
+                                output
+                                    .rejected_reason
+                                    .unwrap_or_else(|| "append_cognition rejected".into()),
+                            ),
                         }
                     } else {
-                        DecisionStatus::Missing
-                    };
-                    (decision, result.usage)
+                        DecisionTurnResult::missing(
+                            result.usage,
+                            "model finished without tool call or salvageable cognition text",
+                        )
+                    }
                 }
-                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                    (DecisionStatus::Missing, result.usage)
-                }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => DecisionTurnResult::missing(
+                    result.usage,
+                    "model finished with no output",
+                ),
                 TextStepOutcomeWithTools::NeedsTools(round) => {
                     let usage = round.usage;
-                    let mut results: Vec<ToolResult> = Vec::new();
-                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
-                    let mut decision = DecisionStatus::Missing;
-                    for call in round.tool_calls.iter().cloned() {
-                        match call {
-                            CognitionGateToolsCall::AppendCognition(call) => {
-                                let (output, append_decision) =
-                                    if decision == DecisionStatus::Applied {
-                                        (
-                                            rejected_append_output(
-                                                "another cognition decision was already applied",
-                                            ),
-                                            AppendDecision::Rejected,
-                                        )
-                                    } else {
-                                        self.append_cognition(call.input.clone()).await
-                                    };
-                                match append_decision {
-                                    AppendDecision::Appended => decision = DecisionStatus::Applied,
-                                    AppendDecision::Rejected
-                                        if decision == DecisionStatus::Missing =>
-                                    {
-                                        decision = DecisionStatus::Rejected;
+                    if round.tool_calls.is_empty() {
+                        DecisionTurnResult::missing(usage, "model returned no tool calls")
+                    } else {
+                        let mut results: Vec<ToolResult> = Vec::new();
+                        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                        let tool_names = round
+                            .tool_calls
+                            .iter()
+                            .map(|call| call.metadata().name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut decision = DecisionStatus::Missing;
+                        let mut rejection_reason: Option<String> = None;
+                        for call in round.tool_calls.iter().cloned() {
+                            match call {
+                                CognitionGateToolsCall::AppendCognition(call) => {
+                                    let (output, append_decision) =
+                                        if decision == DecisionStatus::Applied {
+                                            (
+                                                rejected_append_output(
+                                                    "another cognition decision was already applied",
+                                                ),
+                                                AppendDecision::Rejected,
+                                            )
+                                        } else {
+                                            self.append_cognition(call.input.clone()).await
+                                        };
+                                    match append_decision {
+                                        AppendDecision::Appended => {
+                                            decision = DecisionStatus::Applied
+                                        }
+                                        AppendDecision::Rejected
+                                            if decision == DecisionStatus::Missing =>
+                                        {
+                                            decision = DecisionStatus::Rejected;
+                                            rejection_reason = output.rejected_reason.clone();
+                                        }
+                                        AppendDecision::Rejected => {}
                                     }
-                                    AppendDecision::Rejected => {}
+                                    results.push(
+                                        call.complete(output)
+                                            .context("complete append_cognition tool call")?,
+                                    );
                                 }
-                                results.push(
-                                    call.complete(output)
-                                        .context("complete append_cognition tool call")?,
-                                );
-                            }
-                            CognitionGateToolsCall::SkipCognition(call) => {
-                                let skipped = decision != DecisionStatus::Applied;
-                                if skipped {
-                                    decision = DecisionStatus::Applied;
+                                CognitionGateToolsCall::SkipCognition(call) => {
+                                    let skipped = decision != DecisionStatus::Applied;
+                                    if skipped {
+                                        decision = DecisionStatus::Applied;
+                                    }
+                                    results.push(
+                                        call.complete(SkipCognitionOutput { skipped })
+                                            .context("complete skip_cognition tool call")?,
+                                    );
                                 }
-                                results.push(
-                                    call.complete(SkipCognitionOutput { skipped })
-                                        .context("complete skip_cognition tool call")?,
-                                );
                             }
                         }
+                        round
+                            .commit(&mut self.session, results)
+                            .context("commit cognition-gate tool round")?;
+                        match decision {
+                            DecisionStatus::Applied => DecisionTurnResult::applied(usage),
+                            DecisionStatus::Rejected => DecisionTurnResult::rejected(
+                                usage,
+                                rejection_reason
+                                    .unwrap_or_else(|| "append_cognition rejected".into()),
+                            ),
+                            DecisionStatus::Missing => DecisionTurnResult::missing(
+                                usage,
+                                format!("tool turn produced no valid decision (tools: {tool_names})"),
+                            ),
+                        }
                     }
-                    round
-                        .commit(&mut self.session, results)
-                        .context("commit cognition-gate tool round")?;
-                    (decision, usage)
                 }
             };
-            cx.compact_and_save(&mut self.session, usage).await?;
-
-            match decision {
-                DecisionStatus::Applied => return Ok(()),
-                DecisionStatus::Rejected => correction = Some(RETRY_AFTER_REJECTED_APPEND),
-                DecisionStatus::Missing => correction = Some(RETRY_AFTER_NO_VALID_DECISION),
+            if turn.status == DecisionStatus::Applied {
+                cx.compact_and_save(&mut self.session, turn.usage).await?;
+                return Ok(());
             }
+
+            let failure_detail = turn
+                .failure_detail
+                .unwrap_or_else(|| "no valid cognition-gate decision".to_string());
+            attempt_failures.push((attempt, failure_detail.clone()));
+            cx.warn(format!(
+                "cognition-gate decision attempt {attempt}/{MAX_DECISION_ATTEMPTS} failed: {failure_detail}"
+            ));
+            cx.compact_and_save(&mut self.session, turn.usage).await?;
+            correction = Some(match turn.status {
+                DecisionStatus::Rejected => RETRY_AFTER_REJECTED_APPEND,
+                DecisionStatus::Missing => RETRY_AFTER_NO_VALID_DECISION,
+                DecisionStatus::Applied => unreachable!("applied turns return early"),
+            });
         }
 
+        let attempts = format_decision_attempt_failures(&attempt_failures);
         anyhow::bail!(
-            "cognition-gate failed to produce a valid append_cognition or skip_cognition decision"
+            "cognition-gate failed to produce a valid append_cognition or skip_cognition decision after {MAX_DECISION_ATTEMPTS} attempts: {attempts}"
         );
     }
 
@@ -1162,6 +1265,8 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("failed to produce a valid"));
+        assert!(err.to_string().contains("attempt 1: model finished with no output"));
+        assert!(err.to_string().contains("attempt 3:"));
     }
 
     #[tokio::test(flavor = "current_thread")]

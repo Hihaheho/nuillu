@@ -472,8 +472,13 @@ impl AgentRuntimeControl {
     pub fn with_session_checkpoint_runtime<'a>(
         &self,
         cx: crate::ActivateCx<'a>,
+        owner: ModuleInstanceId,
     ) -> crate::ActivateCx<'a> {
-        cx.with_session_checkpoint_runtime(self.session_store.clone(), self.runtime_events.clone())
+        cx.with_session_checkpoint_runtime(
+            self.session_store.clone(),
+            self.runtime_events.clone(),
+            owner,
+        )
     }
 
     pub fn record_module_activation_completed(
@@ -1383,8 +1388,10 @@ mod tests {
     use nuillu_types::{ReplicaCapRange, builtin};
 
     use crate::ports::{CognitionLogRepository, PortError, SystemClock};
+    use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
     use crate::session::{
-        PersistedSessionSnapshot, SessionAutoCompaction, SessionKey, persistent_session_metadata,
+        NoopSessionStore, PersistedSessionSnapshot, SessionAutoCompaction, SessionKey,
+        persistent_session_metadata,
     };
     use crate::session_compaction::{
         SessionCompactionConfig, SessionCompactionPolicy, SessionCompactionProtectedPrefix,
@@ -1408,6 +1415,25 @@ mod tests {
     impl RecordingCognitionLogRepository {
         fn records(&self) -> Vec<(ModuleInstanceId, CognitionLogEntry)> {
             self.records.lock().expect("records mutex poisoned").clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntimeEventSink {
+        events: Rc<RefCell<Vec<RuntimeEvent>>>,
+    }
+
+    impl RecordingRuntimeEventSink {
+        fn events(&self) -> Vec<RuntimeEvent> {
+            self.events.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl RuntimeEventSink for RecordingRuntimeEventSink {
+        fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+            self.events.borrow_mut().push(event);
+            Ok(())
         }
     }
 
@@ -1684,14 +1710,10 @@ mod tests {
             SessionCompactionPolicy::default(),
         );
         let runtime = caps.runtime_control();
-        let cx = runtime.with_session_checkpoint_runtime(crate::ActivateCx::new(
-            &[],
-            &[],
-            &[],
-            &[],
-            compaction,
-            Utc::now(),
-        ));
+        let cx = runtime.with_session_checkpoint_runtime(
+            crate::ActivateCx::new(&[], &[], &[], &[], compaction, Utc::now()),
+            owner.clone(),
+        );
 
         cx.compact_and_save(&mut session, lutum::Usage::zero())
             .await
@@ -1754,14 +1776,10 @@ mod tests {
             SessionCompactionPolicy::new(1, 1, 1),
         );
         let runtime = caps.runtime_control();
-        let cx = runtime.with_session_checkpoint_runtime(crate::ActivateCx::new(
-            &[],
-            &[],
-            &[],
-            &[],
-            compaction,
-            Utc::now(),
-        ));
+        let cx = runtime.with_session_checkpoint_runtime(
+            crate::ActivateCx::new(&[], &[], &[], &[], compaction, Utc::now()),
+            owner.clone(),
+        );
 
         cx.compact_and_save(
             &mut session,
@@ -1780,6 +1798,45 @@ mod tests {
         cx.compact_and_save(&mut session, lutum::Usage::zero())
             .await
             .expect("second checkpoint should succeed after metadata restore");
+    }
+
+    #[test]
+    fn activate_cx_warn_emits_module_warning() {
+        let sink = Rc::new(RecordingRuntimeEventSink::default());
+        let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
+        let cx = crate::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            &[],
+            crate::SessionCompactionRuntime::new(
+                lutum::Lutum::new(
+                    Arc::new(lutum::MockLlmAdapter::new()),
+                    lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default()),
+                ),
+                crate::LlmConcurrencyLimiter::new(None),
+                ModelTier::Cheap,
+                SessionCompactionPolicy::default(),
+            ),
+            Utc::now(),
+        )
+        .with_session_checkpoint_runtime(
+            Rc::new(NoopSessionStore),
+            RuntimeEventEmitter::new(sink.clone()),
+            owner.clone(),
+        );
+
+        cx.warn("decision attempt failed: no tool call");
+
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(
+            sink.events()[0],
+            RuntimeEvent::ModuleWarning {
+                sequence: 0,
+                owner,
+                message: "decision attempt failed: no tool call".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]

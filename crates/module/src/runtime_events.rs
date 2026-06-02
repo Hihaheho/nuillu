@@ -60,6 +60,11 @@ pub enum RuntimeEvent {
         phase: String,
         message: String,
     },
+    ModuleWarning {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        message: String,
+    },
     SessionCompactionStarted {
         sequence: u64,
         owner: ModuleInstanceId,
@@ -219,6 +224,14 @@ impl RuntimeEventEmitter {
             sequence,
             owner,
             phase,
+            message,
+        });
+    }
+
+    pub(crate) fn module_warning(&self, owner: ModuleInstanceId, message: String) {
+        self.emit(|sequence| RuntimeEvent::ModuleWarning {
+            sequence,
+            owner,
             message,
         });
     }

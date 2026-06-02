@@ -5883,6 +5883,11 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
         } => format!(
             "seq={sequence} module_task_failed owner={owner} phase={phase} message={message}"
         ),
+        RuntimeEvent::ModuleWarning {
+            sequence,
+            owner,
+            message,
+        } => format!("seq={sequence} module_warning owner={owner} message={message}"),
         RuntimeEvent::ModuleRestarted {
             sequence,
             owner,
@@ -6405,7 +6410,8 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         RuntimeEvent::RateLimitDelayed { .. }
         | RuntimeEvent::ModuleBatchThrottled { .. }
         | RuntimeEvent::ModuleBatchReady { .. }
-        | RuntimeEvent::ModuleActivationCompleted { .. } => false,
+        | RuntimeEvent::ModuleActivationCompleted { .. }
+        | RuntimeEvent::ModuleWarning { .. } => false,
     }
 }
 
@@ -6422,6 +6428,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleBatchReady { .. } => false,
             RuntimeEvent::ModuleActivationCompleted { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
+            RuntimeEvent::ModuleWarning { .. } => false,
             RuntimeEvent::ModuleRestarted { .. } => false,
             RuntimeEvent::ModuleStopped { .. } => false,
             RuntimeEvent::SessionCompactionStarted { .. } => false,
@@ -6526,6 +6533,13 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.reporter.log_scope(&self.case_id),
                 owner,
                 phase,
+                message
+            ),
+            RuntimeEvent::ModuleWarning { owner, message, .. } => format!(
+                "{} module-warning {} owner={} message={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
                 message
             ),
             RuntimeEvent::ModuleRestarted {

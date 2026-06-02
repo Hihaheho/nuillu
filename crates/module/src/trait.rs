@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, Usage};
 use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
-use nuillu_types::ModuleId;
+use nuillu_types::{ModuleId, ModuleInstanceId};
 
 use crate::ports::PortError;
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter};
@@ -30,6 +30,7 @@ pub struct ActivateCx<'a> {
     session_compaction: SessionCompactionRuntime,
     session_store: Rc<dyn SessionStore>,
     runtime_events: RuntimeEventEmitter,
+    owner: Option<ModuleInstanceId>,
     now: DateTime<Utc>,
 }
 
@@ -50,6 +51,7 @@ impl<'a> ActivateCx<'a> {
             session_compaction,
             session_store: Rc::new(NoopSessionStore),
             runtime_events: RuntimeEventEmitter::new(Rc::new(NoopRuntimeEventSink)),
+            owner: None,
             now,
         }
     }
@@ -58,10 +60,34 @@ impl<'a> ActivateCx<'a> {
         mut self,
         session_store: Rc<dyn SessionStore>,
         runtime_events: RuntimeEventEmitter,
+        owner: ModuleInstanceId,
     ) -> Self {
         self.session_store = session_store;
         self.runtime_events = runtime_events;
+        self.owner = Some(owner);
         self
+    }
+
+    /// Stamp the activating module for runtime diagnostics such as [`Self::warn`].
+    pub fn with_owner(mut self, owner: ModuleInstanceId) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Emit a module-scoped activation warning to runtime observers and tracing.
+    pub fn warn(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(owner) = &self.owner {
+            tracing::warn!(
+                owner = %owner,
+                message = %message,
+                "module activation warning"
+            );
+            self.runtime_events
+                .module_warning(owner.clone(), message);
+        } else {
+            tracing::warn!(message = %message, "module activation warning");
+        }
     }
 
     /// Peer-context entries for modules that should be described in sibling

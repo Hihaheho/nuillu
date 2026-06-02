@@ -1612,30 +1612,33 @@ async fn activate_with_retries(
     loop {
         let owner = module.owner().clone();
         let activation_attempt = u32::from(retries) + 1;
-        let cx = runtime.with_session_checkpoint_runtime(ActivateCx::new(
-            peer_contexts,
-            allocation_hints,
-            identity_memories,
-            core_policies,
-            SessionCompactionRuntime::new(
-                runtime
-                    .session_compaction_handle()
-                    .lutum
-                    .clone()
-                    .with_extension(LlmRequestMetadata {
-                        owner: module_owner.clone(),
-                        tier: ModelTier::Cheap,
-                        source: LlmRequestSource::SessionCompaction,
-                        session_key: None,
-                        activation_attempt: Some(activation_attempt),
-                        batch: Some(LlmBatchDebug::from_batch(batch)),
-                    }),
-                runtime.session_compaction_handle().concurrency.clone(),
-                module_tier,
-                runtime.session_compaction_policy(),
+        let cx = runtime.with_session_checkpoint_runtime(
+            ActivateCx::new(
+                peer_contexts,
+                allocation_hints,
+                identity_memories,
+                core_policies,
+                SessionCompactionRuntime::new(
+                    runtime
+                        .session_compaction_handle()
+                        .lutum
+                        .clone()
+                        .with_extension(LlmRequestMetadata {
+                            owner: module_owner.clone(),
+                            tier: ModelTier::Cheap,
+                            source: LlmRequestSource::SessionCompaction,
+                            session_key: None,
+                            activation_attempt: Some(activation_attempt),
+                            batch: Some(LlmBatchDebug::from_batch(batch)),
+                        }),
+                    runtime.session_compaction_handle().concurrency.clone(),
+                    module_tier,
+                    runtime.session_compaction_policy(),
+                ),
+                runtime.clock().now(),
             ),
-            runtime.clock().now(),
-        ));
+            owner.clone(),
+        );
         let activation_span = tracing::info_span!(
             target: "lutum",
             "module_activate",

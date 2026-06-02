@@ -245,6 +245,10 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             module.error_count = module.error_count.saturating_add(1);
             module.last_execution_failed = true;
         }
+        RuntimeEvent::ModuleWarning { owner, message, .. } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some(format!("Warning: {message}"));
+        }
         RuntimeEvent::ModuleRestarted { owner, .. } => {
             let module = module_mut_for_owner(state, owner);
             module.runtime_status = Some("Restarted".to_string());
