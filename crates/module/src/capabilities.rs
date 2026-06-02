@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::{Future, IntoFuture};
@@ -20,7 +20,7 @@ use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
 use crate::scene::{SceneReader, SceneRegistry};
 use crate::session::{
-    ModuleSession, NoopSessionStore, SessionAutoCompaction, SessionKey, SessionStore,
+    NoopSessionStore, SessionAutoCompaction, SessionKey, SessionStore,
     attach_persistent_session_metadata,
 };
 use crate::tiers::{LlmTierHandle, LutumTiers};
@@ -66,7 +66,6 @@ struct CapabilityProvidersInner {
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
     session_store: Rc<dyn SessionStore>,
-    sessions: Rc<RefCell<Vec<ModuleSession>>>,
 }
 
 /// Required external services for the root capability provider set.
@@ -190,7 +189,6 @@ impl CapabilityProviders {
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
                 session_store,
-                sessions: Rc::new(RefCell::new(Vec::new())),
             }),
         }
     }
@@ -274,57 +272,7 @@ impl CapabilityProviders {
             runtime_events: self.inner.runtime_events.clone(),
             activation_gates: self.inner.activation_gates.clone(),
             session_store: self.inner.session_store.clone(),
-            sessions: self.inner.sessions.clone(),
         }
-    }
-
-    async fn restore_sessions(&self) -> Result<(), ModuleRegistryError> {
-        let sessions = self.inner.sessions.borrow().clone();
-        self.restore_session_list(sessions).await
-    }
-
-    async fn restore_sessions_for(
-        &self,
-        owner: &ModuleInstanceId,
-    ) -> Result<(), ModuleRegistryError> {
-        let sessions = self
-            .inner
-            .sessions
-            .borrow()
-            .iter()
-            .filter(|session| session.owner() == owner)
-            .cloned()
-            .collect();
-        self.restore_session_list(sessions).await
-    }
-
-    fn remove_sessions_for(&self, owner: &ModuleInstanceId) {
-        self.inner
-            .sessions
-            .borrow_mut()
-            .retain(|session| session.owner() != owner);
-    }
-
-    async fn restore_session_list(
-        &self,
-        sessions: Vec<ModuleSession>,
-    ) -> Result<(), ModuleRegistryError> {
-        for session in sessions {
-            let snapshot = self
-                .inner
-                .session_store
-                .load(session.owner(), session.key())
-                .await
-                .map_err(|source| ModuleRegistryError::SessionRestore {
-                    owner: session.owner().clone(),
-                    key: session.key().clone(),
-                    source,
-                })?;
-            if let Some(snapshot) = snapshot {
-                session.restore(snapshot);
-            }
-        }
-        Ok(())
     }
 
     pub fn blackboard_reader(&self) -> BlackboardReader {
@@ -386,7 +334,6 @@ pub struct AgentRuntimeControl {
     runtime_events: RuntimeEventEmitter,
     activation_gates: ActivationGateHub,
     session_store: Rc<dyn SessionStore>,
-    sessions: Rc<RefCell<Vec<ModuleSession>>>,
 }
 
 impl AgentRuntimeControl {
@@ -601,26 +548,6 @@ impl AgentRuntimeControl {
     ) -> Vec<tokio::sync::oneshot::Receiver<crate::ActivationGateVote>> {
         self.activation_gates.dispatch(target, batch).await
     }
-
-    pub async fn flush_sessions_for(&self, owner: &ModuleInstanceId) -> Result<(), PortError> {
-        let sessions = self
-            .sessions
-            .borrow()
-            .iter()
-            .filter(|session| session.owner() == owner)
-            .cloned()
-            .collect::<Vec<_>>();
-        for session in sessions {
-            let Some(snapshot) = session.snapshot_if_dirty() else {
-                continue;
-            };
-            self.session_store
-                .save(session.owner(), session.key(), &snapshot)
-                .await?;
-            session.mark_clean();
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
@@ -824,13 +751,6 @@ impl ModuleCapabilityFactory {
         }
     }
 
-    pub fn legacy_session(&self, key: impl Into<String>) -> ModuleSession {
-        let key = SessionKey::new(key).expect("module session key must be valid kebab-case");
-        let session = ModuleSession::new(self.owner.clone(), key);
-        self.root.inner.sessions.borrow_mut().push(session.clone());
-        session
-    }
-
     pub fn blackboard_reader(&self) -> BlackboardReader {
         self.root.blackboard_reader()
     }
@@ -1005,10 +925,8 @@ impl AllocatedModule {
     }
 
     pub async fn restart(&mut self) -> Result<(), ModuleRegistryError> {
-        self.caps.remove_sessions_for(&self.owner);
         let scoped = self.caps.scoped(self.owner.clone());
         self.module = (self.builder)(scoped).await?;
-        self.caps.restore_sessions_for(&self.owner).await?;
         Ok(())
     }
 
@@ -1293,7 +1211,6 @@ impl ModuleRegistry {
                 })
                 .collect(),
         );
-        caps.inner.sessions.borrow_mut().clear();
         let mut modules = Vec::new();
         for registration in &self.registrations {
             // Build every possible replica up to the registered max, with a
@@ -1311,7 +1228,6 @@ impl ModuleRegistry {
                 ));
             }
         }
-        caps.restore_sessions().await?;
         Ok(AllocatedModules::new(
             caps.runtime_control(),
             modules,
@@ -1455,6 +1371,7 @@ pub enum ModuleRegistryError {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1740,15 +1657,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_flushes_dirty_sessions_for_owner_and_marks_clean() {
+    async fn owned_session_checkpoint_saves_each_time() {
         let store = RecordingSessionStore::default();
         let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
         let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
-        let session = caps.scoped(owner.clone()).legacy_session("main");
-        session.borrow_mut().push_user("remember this");
+        let mut session = caps
+            .scoped(owner.clone())
+            .session("main")
+            .await
+            .expect("session acquisition should succeed");
+        session.push_user("remember this");
 
-        caps.runtime_control()
-            .flush_sessions_for(&owner)
+        let adapter = Arc::new(lutum::MockLlmAdapter::new());
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        let compaction = crate::SessionCompactionRuntime::new(
+            lutum,
+            crate::LlmConcurrencyLimiter::new(None),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::default(),
+        );
+        let runtime = caps.runtime_control();
+        let cx = runtime.with_session_checkpoint_runtime(crate::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            &[],
+            compaction,
+            Utc::now(),
+        ));
+
+        cx.compact_and_save(&mut session, lutum::Usage::zero())
             .await
             .unwrap();
         let saves = store.saves();
@@ -1757,11 +1696,10 @@ mod tests {
         assert_eq!(saves[0].1, SessionKey::new("main").unwrap());
         assert_eq!(saves[0].2.items.len(), 1);
 
-        caps.runtime_control()
-            .flush_sessions_for(&owner)
+        cx.compact_and_save(&mut session, lutum::Usage::zero())
             .await
             .unwrap();
-        assert_eq!(store.saves().len(), 1);
+        assert_eq!(store.saves().len(), 2);
     }
 
     #[tokio::test]

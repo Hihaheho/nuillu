@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use lutum::{TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
     CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
-    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_session_if_needed, format_current_attention_guidance,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, format_current_attention_guidance,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
@@ -44,6 +44,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's per
 Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
 log facts, significant events, memory preservation requests, and cognition-log context needed for
 future surprise checks. Do not invent facts. Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_SURPRISE_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 fn format_surprise_context(allocation: &nuillu_module::ResourceAllocation) -> Option<String> {
     format_current_attention_guidance(allocation).map(|attention| {
@@ -104,8 +113,7 @@ pub struct SurpriseModule {
     attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -119,7 +127,7 @@ impl SurpriseModule {
         attention_control: AttentionControlRequestMailbox,
         memo: Memo,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             updates,
@@ -130,15 +138,18 @@ impl SurpriseModule {
             memo,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -162,24 +173,23 @@ impl SurpriseModule {
 
         let lutum = self.llm.lutum().await;
         let outcome = {
-            let mut session = self.session.borrow_mut();
             push_formatted_memo_log_batch(
-                &mut session,
+                &mut self.session,
                 &unread_memo_logs,
                 cx.now(),
                 MEMO_CONTEXT_WINDOW,
             );
             push_formatted_cognition_log_batch(
-                &mut session,
+                &mut self.session,
                 &unread_cognition,
                 cx.now(),
                 COGNITION_CONTEXT_WINDOW,
             );
             if let Some(context) = format_surprise_context(&allocation) {
-                session.push_ephemeral_system(context);
+                self.session.push_ephemeral_system(context);
             }
-            session.push_ephemeral_developer(ACTIVATION_INPUT);
-            session
+            self.session.push_ephemeral_developer(ACTIVATION_INPUT);
+            self.session
                 .text_turn()
                 .tools::<SurpriseTools>()
                 .available_tools([
@@ -203,38 +213,16 @@ impl SurpriseModule {
 
         let round = match outcome {
             TextStepOutcomeWithTools::Finished(result) => {
-                let mut session = self.session.borrow_mut();
-                compact_session_if_needed(
-                    &mut session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_SURPRISE_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("surprise finished without required tool call");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                let mut session = self.session.borrow_mut();
-                compact_session_if_needed(
-                    &mut session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_SURPRISE_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("surprise finished without required tool call");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
-        let input_tokens = round.usage.input_tokens;
+        let usage = round.usage;
         let mut memo: Option<String> = None;
         let mut results: Vec<ToolResult> = Vec::new();
         nuillu_module::emit_trace_tool_calls(&round.tool_calls);
@@ -272,21 +260,10 @@ impl SurpriseModule {
                 }
             }
         }
-        let mut session = self.session.borrow_mut();
         round
-            .commit(&mut session, results)
+            .commit(&mut self.session, results)
             .context("commit surprise tool round")?;
-        compact_session_if_needed(
-            &mut session,
-            input_tokens,
-            cx.session_compaction(),
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_SURPRISE_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
+        cx.compact_and_save(&mut self.session, usage).await?;
 
         let Some(memo) = memo else {
             anyhow::bail!("surprise finished without a valid tool decision");
@@ -503,7 +480,9 @@ mod tests {
                         caps.attention_control_mailbox(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
                     ));
                     *attention_requests_sink.borrow_mut() = Some(caps.attention_control_inbox());
                     Ok(SurpriseStub)

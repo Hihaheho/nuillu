@@ -3,12 +3,13 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
-    Module, ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
-    compact_session_if_needed, format_current_attention_guidance, format_memory_trace_inventory,
-    memory_rank_counts, push_formatted_memo_log_batch, render_memory_for_llm,
+    Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    TypedMemo, ensure_persistent_session_seeded, format_current_attention_guidance,
+    format_memory_trace_inventory, memory_rank_counts, push_formatted_memo_log_batch,
+    render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -54,6 +55,15 @@ fetch_linked_memories for the seed hit before writing a memo.
 If retrieved evidence is useful, call write_retrieval_memo with the selected flat hit_indexes and
 linked_hit_indexes. If the tool results do not contain useful evidence and no targeted search
 remains, finish without assistant text."#;
+
+pub fn query_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 fn format_memory_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -207,8 +217,7 @@ pub struct QueryMemoryModule {
     linked_memory: MemoryContentReader,
     memo: TypedMemo<QueryMemoryMemo>,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
     pending_retrieval: QueryMemoryRetrieval,
 }
@@ -223,7 +232,7 @@ impl QueryMemoryModule {
         linked_memory: MemoryContentReader,
         memo: TypedMemo<QueryMemoryMemo>,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -236,7 +245,6 @@ impl QueryMemoryModule {
             memo,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             pending_retrieval: QueryMemoryRetrieval::default(),
         }
@@ -252,10 +260,14 @@ impl QueryMemoryModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -422,89 +434,52 @@ impl QueryMemoryModule {
             .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
         let allocation = self.allocation.snapshot().await;
-        {
-            let mut session = self.session.borrow_mut();
-            push_formatted_memo_log_batch(
-                &mut session,
-                &unread_memo_logs,
-                cx.now(),
-                MEMO_CONTEXT_WINDOW,
-            );
-            session.push_user(format_memory_questions(questions));
-            if let Some(prior) = prior_query_memory_searches {
-                session.push_ephemeral_user(prior);
-            }
-            session.push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
+        push_formatted_memo_log_batch(
+            &mut self.session,
+            &unread_memo_logs,
+            cx.now(),
+            MEMO_CONTEXT_WINDOW,
+        );
+        self.session.push_user(format_memory_questions(questions));
+        if let Some(prior) = prior_query_memory_searches {
+            self.session.push_ephemeral_user(prior);
         }
+        self.session
+            .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
         let mut retrieval = self.pending_retrieval.clone();
         let mut memo_written = false;
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
-            let outcome = {
-                let mut session = self.session.borrow_mut();
-                session
-                    .text_turn()
-                    .tools::<QueryMemoryTools>()
-                    .available_tools([
-                        QueryMemoryToolsSelector::SearchMemory,
-                        QueryMemoryToolsSelector::FetchLinkedMemories,
-                        QueryMemoryToolsSelector::WriteRetrievalMemo,
-                    ])
-                    .collect(&lutum)
-                    .await
-                    .context("query-memory text turn failed")?
-            };
+            let outcome = self
+                .session
+                .text_turn()
+                .tools::<QueryMemoryTools>()
+                .available_tools([
+                    QueryMemoryToolsSelector::SearchMemory,
+                    QueryMemoryToolsSelector::FetchLinkedMemories,
+                    QueryMemoryToolsSelector::WriteRetrievalMemo,
+                ])
+                .collect(&lutum)
+                .await
+                .context("query-memory text turn failed")?;
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
-                    let mut session = self.session.borrow_mut();
-                    compact_session_if_needed(
-                        &mut session,
-                        result.usage.input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
                     self.pending_retrieval = retrieval;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                    let mut session = self.session.borrow_mut();
-                    compact_session_if_needed(
-                        &mut session,
-                        result.usage.input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
                     self.pending_retrieval = retrieval;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
-                    let input_tokens = round.usage.input_tokens;
+                    let usage = round.usage;
                     nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     if round.tool_calls.is_empty() {
-                        let mut session = self.session.borrow_mut();
-                        compact_session_if_needed(
-                            &mut session,
-                            input_tokens,
-                            cx.session_compaction(),
-                            self.session_compaction,
-                            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                            Self::id(),
-                            COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
-                            SESSION_COMPACTION_PROMPT,
-                        )
-                        .await;
+                        cx.compact_and_save(&mut self.session, usage).await?;
                         self.pending_retrieval = retrieval;
                         return Ok(());
                     }
@@ -562,27 +537,17 @@ impl QueryMemoryModule {
                             }
                         }
                     }
-                    let mut session = self.session.borrow_mut();
                     round
-                        .commit(&mut session, tool_results)
+                        .commit(&mut self.session, tool_results)
                         .context("commit query-memory tool round")?;
-                    compact_session_if_needed(
-                        &mut session,
-                        input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, usage).await?;
                     if wrote_retrieval_memo {
                         self.pending_retrieval = QueryMemoryRetrieval::default();
                         return Ok(());
                     }
                     self.pending_retrieval = retrieval.clone();
-                    session.push_ephemeral_user(TOOL_RESULT_CONTINUATION_PROMPT);
+                    self.session
+                        .push_ephemeral_user(TOOL_RESULT_CONTINUATION_PROMPT);
                 }
             }
         }

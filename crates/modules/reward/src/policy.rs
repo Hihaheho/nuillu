@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::StructuredTurnOutcome;
+use lutum::{Session, StructuredTurnOutcome};
 use nuillu_blackboard::{CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_module::ports::Clock;
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
     InteroceptiveReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
-    ModuleSession, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, compact_session_if_needed, format_bounded_cognition_log_batch,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
     format_bounded_memo_log_batch, format_current_attention_guidance,
     format_identity_system_prompt,
 };
@@ -35,6 +35,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the policy module's persi
 Summarize only the prefix transcript you receive. Preserve reusable policy advice, existing policy
 judgments, synthetic policy candidates, cautions, and reward-relevant rationale future policy
 decisions need. Do not invent policies or claim persistence. Return plain text only."#;
+
+pub fn policy_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_POLICY_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyConsiderationPayload {
@@ -138,8 +147,7 @@ pub struct PolicyModule {
     memo: Memo,
     writer: PolicyConsiderationWriter,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
 }
 
@@ -162,7 +170,7 @@ impl PolicyModule {
         memo: Memo,
         writer: PolicyConsiderationWriter,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             owner: ModuleId::new(<Self as Module>::id()).expect("policy id is valid"),
@@ -177,7 +185,6 @@ impl PolicyModule {
             writer,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
     }
@@ -193,10 +200,14 @@ impl PolicyModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
@@ -286,11 +297,10 @@ impl PolicyModule {
 
         let lutum = self.llm.lutum().await;
         let result = {
-            let mut session = self.session.borrow_mut();
             if let Some(guidance) = format_current_attention_guidance(&allocation) {
-                session.push_ephemeral_system(guidance);
+                self.session.push_ephemeral_system(guidance);
             }
-            session.push_ephemeral_system(format!(
+            self.session.push_ephemeral_system(format!(
                 "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
                 interoception.affect_arousal,
                 interoception.valence,
@@ -300,7 +310,7 @@ impl PolicyModule {
                     interoception.emotion.trim()
                 }
             ));
-            session.push_ephemeral_user(format!(
+            self.session.push_ephemeral_user(format!(
                 "Policy consideration request for {}:\nQuery text:\n{}\n\nExisting policy hits:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}",
                 self.owner,
                 context.query_text,
@@ -319,25 +329,15 @@ impl PolicyModule {
                 )
                 .unwrap_or_else(|| "none".to_owned()),
             ));
-            let result = session
+            let result = self
+                .session
                 .structured_turn::<PolicyConsiderationDecision>()
                 .max_output_tokens(1024)
                 .collect(&lutum)
                 .await
                 .context("policy structured turn failed")?;
-            let input_tokens = result.usage.input_tokens;
             let semantic = result.semantic;
-            compact_session_if_needed(
-                &mut session,
-                input_tokens,
-                cx.session_compaction(),
-                self.session_compaction,
-                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                Self::id(),
-                COMPACTED_POLICY_SESSION_PREFIX,
-                SESSION_COMPACTION_PROMPT,
-            )
-            .await;
+            cx.compact_and_save(&mut self.session, result.usage).await?;
             semantic
         };
         let StructuredTurnOutcome::Structured(decision) = result else {
@@ -705,7 +705,9 @@ mod tests {
                         caps.memo(),
                         policy_caps.consideration_writer(caps.owner().clone()),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(policy_session_auto_compaction())
+                            .await?,
                     ))
                 }
             })

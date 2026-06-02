@@ -38,12 +38,12 @@ pub use compaction::{
 pub use policy::{
     ExistingPolicyConsideration, PolicyConsideration, PolicyConsiderationDecision,
     PolicyConsiderationPayload, PolicyConsiderationSource, PolicyConsiderationWriter, PolicyModule,
-    SyntheticPolicyConsideration,
+    SyntheticPolicyConsideration, policy_session_auto_compaction,
 };
 pub use reward::{
     InsertPolicyCandidateDecision, ObservedReward, PolicyCandidateCredit, PolicyRewardSkip,
     PolicyRewardUpdate, PolicyUpserter, ReinforceExistingPolicyDecision, RewardAssessment,
-    RewardMemo, RewardModule, SyntheticPolicyDedupDecision,
+    RewardMemo, RewardModule, SyntheticPolicyDedupDecision, reward_session_auto_compaction,
 };
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,4 @@
-use std::cell::{Cell, RefCell, RefMut};
 use std::fmt;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -78,20 +76,6 @@ fn validate_session_key(value: &str) -> Result<(), PortError> {
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct ModuleSession {
-    inner: Rc<ModuleSessionInner>,
-}
-
-struct ModuleSessionInner {
-    owner: ModuleInstanceId,
-    key: SessionKey,
-    session: RefCell<Session>,
-    dirty: Cell<bool>,
-    restored: Cell<bool>,
-    seeded: Cell<bool>,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SessionAutoCompaction {
     pub config: SessionCompactionConfig,
@@ -135,100 +119,6 @@ pub(crate) struct PersistentSessionMetadata {
 pub enum SessionCheckpointError {
     #[error("session is missing persistent capability metadata")]
     MissingMetadata,
-}
-
-impl ModuleSession {
-    pub(crate) fn new(owner: ModuleInstanceId, key: SessionKey) -> Self {
-        Self {
-            inner: Rc::new(ModuleSessionInner {
-                owner,
-                key,
-                session: RefCell::new(Session::new()),
-                dirty: Cell::new(false),
-                restored: Cell::new(false),
-                seeded: Cell::new(false),
-            }),
-        }
-    }
-
-    pub fn owner(&self) -> &ModuleInstanceId {
-        &self.inner.owner
-    }
-
-    pub fn key(&self) -> &SessionKey {
-        &self.inner.key
-    }
-
-    pub fn session_mut<R>(&self, f: impl FnOnce(&mut Session) -> R) -> R {
-        self.inner.dirty.set(true);
-        f(&mut self.inner.session.borrow_mut())
-    }
-
-    pub fn borrow_mut(&self) -> RefMut<'_, Session> {
-        self.inner.dirty.set(true);
-        self.inner.session.borrow_mut()
-    }
-
-    pub fn ensure_seeded(
-        &self,
-        system_prompt: impl Into<String>,
-        identity_memories: &[IdentityMemoryRecord],
-        now: DateTime<Utc>,
-    ) {
-        if self.inner.seeded.get() || self.inner.restored.get() {
-            self.inner.seeded.set(true);
-            return;
-        }
-        self.session_mut(|session| {
-            seed_persistent_faculty_session(session, system_prompt, identity_memories, now);
-        });
-        self.inner.seeded.set(true);
-    }
-
-    pub fn push_identity_seed_if_absent(
-        &self,
-        identity_memories: &[IdentityMemoryRecord],
-        now: DateTime<Utc>,
-    ) {
-        if self.inner.restored.get() {
-            return;
-        }
-        if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
-            self.session_mut(|session| session.push_assistant_text(seed));
-        }
-    }
-
-    pub(crate) fn restore(&self, snapshot: PersistedSessionSnapshot) {
-        *self.inner.session.borrow_mut() = snapshot.into_session();
-        self.inner.restored.set(true);
-        self.inner.seeded.set(true);
-        self.inner.dirty.set(false);
-    }
-
-    pub(crate) fn snapshot_if_dirty(&self) -> Option<PersistedSessionSnapshot> {
-        if !self.inner.dirty.get() {
-            return None;
-        }
-        Some(PersistedSessionSnapshot::from_session(
-            &self.inner.session.borrow(),
-        ))
-    }
-
-    pub(crate) fn mark_clean(&self) {
-        self.inner.dirty.set(false);
-    }
-}
-
-impl fmt::Debug for ModuleSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ModuleSession")
-            .field("owner", &self.inner.owner)
-            .field("key", &self.inner.key)
-            .field("dirty", &self.inner.dirty.get())
-            .field("restored", &self.inner.restored.get())
-            .field("seeded", &self.inner.seeded.get())
-            .finish()
-    }
 }
 
 pub(crate) fn attach_persistent_session_metadata(

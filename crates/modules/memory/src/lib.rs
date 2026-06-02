@@ -43,14 +43,14 @@ pub use compaction::{
 pub use memory::{
     InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
     MemoryTagInput, MemoryTools, MemoryToolsCall, MemoryToolsSelector, ReinforceMemoryArgs,
-    ReinforceMemoryOutput,
+    ReinforceMemoryOutput, session_auto_compaction,
 };
 pub use query::{
     FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryMemoryBatch, QueryMemoryHit,
     QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit, QueryMemoryMemoLinkedHit,
     QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools, QueryMemoryToolsCall,
     QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput, WriteRetrievalMemoArgs,
-    WriteRetrievalMemoOutput,
+    WriteRetrievalMemoOutput, query_session_auto_compaction,
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,

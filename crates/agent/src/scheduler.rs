@@ -997,12 +997,6 @@ async fn recover_failed_module(
         return;
     }
 
-    if let Err(error) = runtime.flush_sessions_for(owner).await {
-        let message = format!("module session flush failed before restart: {error}");
-        tracing::warn!(owner = %owner, error = ?error, "module session flush failed before restart");
-        runtime.record_module_task_failed(owner.clone(), "session-flush", message);
-    }
-
     loop {
         match module.restart().await {
             Ok(()) => {
@@ -1657,11 +1651,6 @@ async fn activate_with_retries(
             module.activate(&cx, batch).instrument(activation_span),
         )
         .await;
-        if let Err(error) = runtime.flush_sessions_for(&owner).await {
-            let message = format!("module session flush failed: {error}");
-            tracing::warn!(owner = %owner, error = ?error, "module session flush failed");
-            runtime.record_module_task_failed(owner.clone(), "session-flush", message);
-        }
         match activation_result {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {

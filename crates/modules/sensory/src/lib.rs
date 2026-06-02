@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, ModuleSession, SensoryInput,
-    SensoryInputInbox, SensoryModality, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    SessionCompactionRuntime, compact_session_if_needed, ports::Clock,
+    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
+    SensoryInputInbox, SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, ports::Clock,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,15 @@ Summarize only the prefix transcript you receive. Preserve observed sensory fact
 details, relative timing, salience/habituation cues, memo-log outputs written through tools,
 ignored/background context that may affect future salience, and uncertainty.
 Do not invent facts. Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_SENSORY_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 const DEFAULT_BURST_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_BURST_BUDGET: Duration = Duration::from_secs(1);
@@ -126,8 +135,7 @@ pub struct SensoryModule {
     memo: Memo,
     clock: Rc<dyn Clock>,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     burst: SensoryBurstConfig,
     system_prompt: std::sync::OnceLock<String>,
     stimuli: HashMap<String, StimulusState>,
@@ -184,7 +192,7 @@ impl SensoryModule {
         memo: Memo,
         clock: Rc<dyn Clock>,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
@@ -195,7 +203,6 @@ impl SensoryModule {
             clock,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             burst: SensoryBurstConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             stimuli: HashMap::new(),
@@ -219,10 +226,14 @@ impl SensoryModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     fn format_age(now: DateTime<Utc>, observed_at: DateTime<Utc>) -> String {
@@ -278,15 +289,17 @@ impl SensoryModule {
         let guidance = allocation.for_module(&self.owner).guidance;
         let lutum = self.llm.lutum().await;
         let (outcome, session_len_before_turn) = {
-            let mut session = self.session.borrow_mut();
-            let session_len_before_turn = session.input().items().len();
-            session.push_ephemeral_user(format_sensory_turn_user_message(
-                &observations,
-                &self.ambient_entries,
-                now,
-            ));
-            session.push_ephemeral_developer(format_sensory_decision_context(&guidance));
-            let turn = session
+            let session_len_before_turn = self.session.input().items().len();
+            self.session
+                .push_ephemeral_user(format_sensory_turn_user_message(
+                    &observations,
+                    &self.ambient_entries,
+                    now,
+                ));
+            self.session
+                .push_ephemeral_developer(format_sensory_decision_context(&guidance));
+            let turn = self
+                .session
                 .text_turn()
                 .tools::<SensoryTools>()
                 .available_tools([
@@ -308,14 +321,15 @@ impl SensoryModule {
         match outcome {
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 if round.tool_calls.is_empty() {
-                    let mut session = self.session.borrow_mut();
-                    session
+                    let usage = round.usage;
+                    self.session
                         .input_mut()
                         .items_mut()
                         .truncate(session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
                     anyhow::bail!("sensory text turn finished without required tool calls");
                 }
-                let input_tokens = round.usage.input_tokens;
+                let usage = round.usage;
                 let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 for call in round.tool_calls.iter().cloned() {
@@ -336,33 +350,35 @@ impl SensoryModule {
                         }
                     }
                 }
-                let mut session = self.session.borrow_mut();
                 round
-                    .commit(&mut session, results)
+                    .commit(&mut self.session, results)
                     .context("commit sensory tool round")?;
-                self.persist_sensory_ledger(&mut session, &observations);
-                self.compact_if_needed(&mut session, input_tokens, cx.session_compaction())
-                    .await;
+                self.persist_sensory_ledger(&observations);
+                cx.compact_and_save(&mut self.session, usage).await?;
             }
-            TextStepOutcomeWithTools::Finished(_)
-            | TextStepOutcomeWithTools::FinishedNoOutput(_) => {
-                let mut session = self.session.borrow_mut();
-                session
+            TextStepOutcomeWithTools::Finished(result) => {
+                self.session
                     .input_mut()
                     .items_mut()
                     .truncate(session_len_before_turn);
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                anyhow::bail!("sensory text turn finished without required tool calls");
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                self.session
+                    .input_mut()
+                    .items_mut()
+                    .truncate(session_len_before_turn);
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("sensory text turn finished without required tool calls");
             }
         }
         Ok(())
     }
 
-    fn persist_sensory_ledger(
-        &self,
-        session: &mut Session,
-        observations: &[PreparedSensoryObservation],
-    ) {
-        session.push_assistant_text(format_sensory_ledger(observations));
+    fn persist_sensory_ledger(&mut self, observations: &[PreparedSensoryObservation]) {
+        self.session
+            .push_assistant_text(format_sensory_ledger(observations));
     }
 
     fn prepare_input_observations(
@@ -584,25 +600,6 @@ impl SensoryModule {
 
     fn ignore_observations(&self, _args: IgnoreObservationsArgs) -> IgnoreObservationsOutput {
         IgnoreObservationsOutput { ignored: true }
-    }
-
-    async fn compact_if_needed(
-        &self,
-        session: &mut Session,
-        input_tokens: u64,
-        runtime: &SessionCompactionRuntime,
-    ) {
-        compact_session_if_needed(
-            session,
-            input_tokens,
-            runtime,
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_SENSORY_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
     }
 
     async fn next_batch(&mut self) -> Result<SensoryBatch> {
@@ -879,7 +876,7 @@ mod tests {
         ) -> Result<()> {
             self.recorder.batches.borrow_mut().push(batch.inputs.len());
             <SensoryModule as Module>::activate(&mut self.inner, cx, batch).await?;
-            let session_items = self.inner.session.borrow_mut().input().items().to_vec();
+            let session_items = self.inner.session.input().items().to_vec();
             self.recorder
                 .session_inputs
                 .borrow_mut()
@@ -991,7 +988,7 @@ mod tests {
         caps: &CapabilityProviders,
         recorder: SensoryTestRecorder,
         burst: SensoryBurstConfig,
-        compaction: Option<SessionCompactionConfig>,
+        _compaction: Option<SessionCompactionConfig>,
         session_history: Vec<String>,
     ) -> nuillu_module::AllocatedModules {
         ModuleRegistry::new()
@@ -1005,14 +1002,13 @@ mod tests {
                         caps.memo(),
                         caps.clock(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
                     )
                     .with_burst_config(burst);
-                    if let Some(compaction) = compaction {
-                        inner.session_compaction = compaction;
-                    }
                     for item in &session_history {
-                        inner.session.borrow_mut().push_user(item.clone());
+                        inner.session.push_user(item.clone());
                     }
                     Ok(RecordingSensoryModule { inner, recorder })
                 }

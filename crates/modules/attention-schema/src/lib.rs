@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox,
-    CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, ModuleSession,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, compact_session_if_needed,
+    CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module, SessionAutoCompaction,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
     format_current_attention_guidance, push_formatted_cognition_log_batch,
     push_formatted_memo_log_batch,
 };
@@ -44,6 +44,15 @@ Summarize only the prefix transcript you receive. Preserve memo-log facts, atten
 interpretations, prior appended first-person attention experiences, rejected candidates, allocation
 guidance, and cognition-log context needed for future attention updates. Do not invent facts.
 Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 fn format_attention_schema_context(
     allocation: &nuillu_module::ResourceAllocation,
@@ -95,8 +104,7 @@ pub struct AttentionSchemaModule {
     cognition_log: CognitionLogReader,
     cognition: CognitionWriter,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     model_prompt: std::sync::OnceLock<String>,
 }
 
@@ -110,7 +118,7 @@ impl AttentionSchemaModule {
         cognition_log: CognitionLogReader,
         cognition: CognitionWriter,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             memo_updates,
@@ -121,15 +129,18 @@ impl AttentionSchemaModule {
             cognition,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             model_prompt: std::sync::OnceLock::new(),
         }
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let model_prompt = self.model_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(model_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            model_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
@@ -153,25 +164,24 @@ impl AttentionSchemaModule {
 
         let lutum = self.llm.lutum().await;
         let outcome = {
-            let mut session = self.session.borrow_mut();
             push_formatted_memo_log_batch(
-                &mut session,
+                &mut self.session,
                 &unread_memo_logs,
                 cx.now(),
                 MEMO_CONTEXT_WINDOW,
             );
             push_formatted_cognition_log_batch(
-                &mut session,
+                &mut self.session,
                 &unread_cognition_log,
                 cx.now(),
                 COGNITION_CONTEXT_WINDOW,
             );
             if let Some(context) = format_attention_schema_context(&allocation) {
-                session.push_ephemeral_system(context);
+                self.session.push_ephemeral_system(context);
             }
-            session
+            self.session
                 .push_ephemeral_developer("Update the attention schema from the new notes above.");
-            session
+            self.session
                 .text_turn()
                 .tools::<AttentionSchemaTools>()
                 .available_tools([
@@ -186,38 +196,16 @@ impl AttentionSchemaModule {
 
         let round = match outcome {
             TextStepOutcomeWithTools::Finished(result) => {
-                let mut session = self.session.borrow_mut();
-                compact_session_if_needed(
-                    &mut session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                let mut session = self.session.borrow_mut();
-                compact_session_if_needed(
-                    &mut session,
-                    result.usage.input_tokens,
-                    cx.session_compaction(),
-                    self.session_compaction,
-                    SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                    Self::id(),
-                    COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
-                    SESSION_COMPACTION_PROMPT,
-                )
-                .await;
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("attention-schema finished without required tool call");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
-        let input_tokens = round.usage.input_tokens;
+        let usage = round.usage;
 
         let mut results: Vec<ToolResult> = Vec::new();
         nuillu_module::emit_trace_tool_calls(&round.tool_calls);
@@ -242,21 +230,10 @@ impl AttentionSchemaModule {
                 }
             }
         }
-        let mut session = self.session.borrow_mut();
         round
-            .commit(&mut session, results)
+            .commit(&mut self.session, results)
             .context("commit attention-schema tool round")?;
-        compact_session_if_needed(
-            &mut session,
-            input_tokens,
-            cx.session_compaction(),
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
+        cx.compact_and_save(&mut self.session, usage).await?;
         Ok(())
     }
 

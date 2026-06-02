@@ -4,15 +4,15 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eure::FromEure;
-use lutum::{ModelInput, StructuredTurnOutcome};
+use lutum::{ModelInput, Session, StructuredTurnOutcome};
 use nuillu_blackboard::{
     Blackboard, BlackboardCommand, CognitionLogEntryRecord, MemoLogRecord, PolicyMetaPatch,
 };
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
     AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess,
-    LlmContextWindow, Memo, Module, ModuleSession, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_llm_context_text, compact_session_if_needed,
+    LlmContextWindow, Memo, Module, SessionAutoCompaction, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_llm_context_text, ensure_persistent_session_seeded,
     format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
     format_current_attention_guidance, format_identity_system_prompt,
 };
@@ -48,6 +48,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the reward module's persi
 Summarize only the prefix transcript you receive. Preserve policy-consideration outcome evidence,
 reward channel judgments, candidate credit rationale, and policy update consequences future reward
 decisions need. Do not invent outcomes. Return plain text only."#;
+
+pub fn reward_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_REWARD_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ObservedReward {
@@ -380,8 +389,7 @@ pub struct RewardModule {
     upserter: PolicyUpserter,
     memo: Memo,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
     config: ReinforcementConfig,
 }
@@ -398,7 +406,7 @@ impl RewardModule {
         upserter: PolicyUpserter,
         memo: Memo,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             policy_evictions,
@@ -411,7 +419,6 @@ impl RewardModule {
             memo,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             config: ReinforcementConfig::default(),
         }
@@ -428,10 +435,14 @@ impl RewardModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     async fn settle(
@@ -604,8 +615,7 @@ impl RewardModule {
         let interoception = self.interoception.snapshot().await;
         let lutum = self.llm.lutum().await;
         let semantic = {
-            let mut session = self.session.borrow_mut();
-            session.push_ephemeral_user(format!(
+            self.session.push_ephemeral_user(format!(
                 "Evicted policy consideration written at {}:\n{}\n\nOutcome memo evidence since consideration:\n{}\n\nOutcome cognition evidence since consideration:\n{}\n\nAllocation:\n{}\n\nInteroception:\naffect_arousal={:.2}; valence={:.2}; emotion={}",
                 evicted.written_at.to_rfc3339(),
                 compact_llm_context_text(
@@ -630,25 +640,15 @@ impl RewardModule {
                     interoception.emotion.trim()
                 },
             ));
-            let result = session
+            let result = self
+                .session
                 .structured_turn::<RewardAssessment>()
                 .max_output_tokens(768)
                 .collect(&lutum)
                 .await
                 .context("reward structured turn failed")?;
-            let input_tokens = result.usage.input_tokens;
             let semantic = result.semantic;
-            compact_session_if_needed(
-                &mut session,
-                input_tokens,
-                cx.session_compaction(),
-                self.session_compaction,
-                SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                Self::id(),
-                COMPACTED_REWARD_SESSION_PREFIX,
-                SESSION_COMPACTION_PROMPT,
-            )
-            .await;
+            cx.compact_and_save(&mut self.session, result.usage).await?;
             semantic
         };
         let StructuredTurnOutcome::Structured(assessment) = semantic else {
@@ -1039,7 +1039,9 @@ mod tests {
                         policy_caps.upserter(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(reward_session_auto_compaction())
+                            .await?,
                     ))
                 }
             })

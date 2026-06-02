@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
-    LlmContextWindow, MemoryMetadataReader, Module, ModuleSession, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_llm_context_text, compact_session_if_needed,
+    LlmContextWindow, MemoryMetadataReader, Module, SessionAutoCompaction, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, compact_llm_context_text, ensure_persistent_session_seeded,
     format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
     push_formatted_cognition_log_batch, render_memory_for_llm,
 };
@@ -64,6 +64,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persi
 Summarize only the prefix transcript you receive. Preserve cognition-log facts, memory requests,
 inserted memory content, rejected candidates, and deduplication decisions future memory decisions
 need. Do not invent facts. Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_MEMORY_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 fn format_memory_decision_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -130,8 +139,7 @@ pub struct MemoryModule {
     memory: MemoryWriter,
     memory_retriever: MemoryRetriever,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     system_prompt: std::sync::OnceLock<String>,
     batching: MemoryBatchConfig,
 }
@@ -153,7 +161,7 @@ impl MemoryModule {
         memory: MemoryWriter,
         memory_retriever: MemoryRetriever,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id()).expect("memory id is valid"),
@@ -164,7 +172,6 @@ impl MemoryModule {
             memory_retriever,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
             batching: MemoryBatchConfig::default(),
         }
@@ -189,10 +196,14 @@ impl MemoryModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
@@ -202,15 +213,12 @@ impl MemoryModule {
         batch: &MemoryBatch,
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
-        {
-            let mut session = self.session.borrow_mut();
-            push_formatted_cognition_log_batch(
-                &mut session,
-                &batch.cognition_log,
-                cx.now(),
-                COGNITION_CONTEXT_WINDOW,
-            );
-        }
+        push_formatted_cognition_log_batch(
+            &mut self.session,
+            &batch.cognition_log,
+            cx.now(),
+            COGNITION_CONTEXT_WINDOW,
+        );
         let rank_counts = self.memory_metadata.read(memory_rank_counts).await;
         let allocation = self.allocation.snapshot().await;
         let allocation_guidance = allocation.for_module(&self.owner).guidance;
@@ -222,68 +230,41 @@ impl MemoryModule {
             .map(|candidate| (candidate.target.index.clone(), candidate.target.clone()))
             .collect::<HashMap<_, _>>();
 
-        {
-            let mut session = self.session.borrow_mut();
-            session.push_user(format_memory_activation_request(
-                &allocation_guidance,
-                batch.cognition_log.len(),
-            ));
-            if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
-                session.push_ephemeral_user(candidate_context);
-            }
-            session
-                .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
+        self.session.push_user(format_memory_activation_request(
+            &allocation_guidance,
+            batch.cognition_log.len(),
+        ));
+        if let Some(candidate_context) = format_related_memory_candidates(&related_memories) {
+            self.session.push_ephemeral_user(candidate_context);
         }
+        self.session
+            .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
 
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
-            let outcome = {
-                let mut session = self.session.borrow_mut();
-                session
-                    .text_turn()
-                    .tools::<MemoryTools>()
-                    .available_tools([
-                        MemoryToolsSelector::InsertMemory,
-                        MemoryToolsSelector::ReinforceMemory,
-                    ])
-                    .collect(&lutum)
-                    .await
-                    .context("memory text turn failed")?
-            };
+            let outcome = self
+                .session
+                .text_turn()
+                .tools::<MemoryTools>()
+                .available_tools([
+                    MemoryToolsSelector::InsertMemory,
+                    MemoryToolsSelector::ReinforceMemory,
+                ])
+                .collect(&lutum)
+                .await
+                .context("memory text turn failed")?;
 
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
-                    let mut session = self.session.borrow_mut();
-                    compact_session_if_needed(
-                        &mut session,
-                        result.usage.input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                    let mut session = self.session.borrow_mut();
-                    compact_session_if_needed(
-                        &mut session,
-                        result.usage.input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
-                    let input_tokens = round.usage.input_tokens;
+                    let usage = round.usage;
                     let mut results: Vec<ToolResult> = Vec::new();
                     nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     for call in round.tool_calls.iter().cloned() {
@@ -310,21 +291,10 @@ impl MemoryModule {
                             }
                         }
                     }
-                    let mut session = self.session.borrow_mut();
                     round
-                        .commit(&mut session, results)
+                        .commit(&mut self.session, results)
                         .context("commit memory tool round")?;
-                    compact_session_if_needed(
-                        &mut session,
-                        input_tokens,
-                        cx.session_compaction(),
-                        self.session_compaction,
-                        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-                        Self::id(),
-                        COMPACTED_MEMORY_SESSION_PREFIX,
-                        SESSION_COMPACTION_PROMPT,
-                    )
-                    .await;
+                    cx.compact_and_save(&mut self.session, usage).await?;
                 }
             }
         }
@@ -700,7 +670,9 @@ mod tests {
                                 memory_caps.writer(),
                                 memory_caps.retriever(),
                                 caps.llm_access(),
-                                caps.legacy_session("main"),
+                                caps.session("main")
+                                    .with_auto_compaction(session_auto_compaction())
+                                    .await?,
                             )
                             .with_batch_config(batching),
                             recorder,

@@ -67,7 +67,9 @@ fn register_server_module(
                     caps.memo(),
                     caps.clock(),
                     caps.llm_access(),
-                    caps.legacy_session("main"),
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_sensory::session_auto_compaction())
+                        .await?,
                 ))
             })
         }
@@ -80,7 +82,9 @@ fn register_server_module(
                     caps.cognition_writer(),
                     caps.time_division(),
                     caps.llm_access(),
-                    caps.legacy_session("main"),
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
+                        .await?,
                 ))
             })
         }
@@ -100,7 +104,11 @@ fn register_server_module(
                             caps.allocation_writer(voluntary.clone(), Vec::new()),
                             caps.memo(),
                             caps.llm_access(),
-                            caps.legacy_session("main"),
+                            caps.session("main")
+                                .with_auto_compaction(
+                                    nuillu_allocation_controller::session_auto_compaction(),
+                                )
+                                .await?,
                         ),
                     )
                 }
@@ -116,7 +124,9 @@ fn register_server_module(
                     caps.cognition_log_reader(),
                     caps.cognition_writer(),
                     caps.llm_access(),
-                    caps.legacy_session("main"),
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())
+                        .await?,
                 ))
             })
         }
@@ -148,7 +158,9 @@ fn register_server_module(
                         memory_caps.content_reader(),
                         caps.typed_memo::<nuillu_memory::QueryMemoryMemo>(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_memory::query_session_auto_compaction())
+                            .await?,
                     ))
                 }
             })
@@ -165,7 +177,9 @@ fn register_server_module(
                         memory_caps.writer(),
                         memory_caps.retriever(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_memory::session_auto_compaction())
+                            .await?,
                     ))
                 }
             })
@@ -270,7 +284,9 @@ fn register_server_module(
                         caps.memo(),
                         consideration_writer,
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_reward::policy_session_auto_compaction())
+                            .await?,
                     ))
                 }
             })
@@ -305,7 +321,9 @@ fn register_server_module(
                         policy_caps.upserter(),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_reward::reward_session_auto_compaction())
+                            .await?,
                     ))
                 }
             })
@@ -333,7 +351,9 @@ fn register_server_module(
                     caps.attention_control_mailbox(),
                     caps.memo(),
                     caps.llm_access(),
-                    caps.legacy_session("main"),
+                    caps.session("main")
+                        .with_auto_compaction(nuillu_surprise::session_auto_compaction())
+                        .await?,
                 ))
             })
         }

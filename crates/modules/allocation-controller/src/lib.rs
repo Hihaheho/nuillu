@@ -2,14 +2,14 @@ use std::borrow::Cow;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{TextStepOutcomeWithTools, ToolResult};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
-    MemoUpdatedInbox, Module, ModuleSession, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, SessionCompactionRuntime, compact_session_if_needed,
-    format_available_faculties, format_bounded_memo_log_batch, format_current_attention_guidance,
+    MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, format_available_faculties,
+    format_bounded_memo_log_batch, format_current_attention_guidance,
     format_memory_trace_inventory, format_stuckness, memory_rank_counts,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
@@ -56,6 +56,15 @@ const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation-controller
 Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
 decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
 allocation decisions. Do not invent facts. Return plain text only."#;
+
+pub fn session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX,
+        SESSION_COMPACTION_PROMPT,
+    )
+}
 
 fn format_allocation_controller_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
@@ -241,8 +250,7 @@ pub struct AllocationControllerModule {
     allocation_writer: AllocationWriter,
     memo: Memo,
     llm: LlmAccess,
-    session: ModuleSession,
-    session_compaction: SessionCompactionConfig,
+    session: Session,
     batching: batch::AttentionControlBatchConfig,
     system_prompt: std::sync::OnceLock<String>,
 }
@@ -259,7 +267,7 @@ impl AllocationControllerModule {
         allocation_writer: AllocationWriter,
         memo: Memo,
         llm: LlmAccess,
-        session: ModuleSession,
+        session: Session,
     ) -> Self {
         Self {
             owner: ModuleId::new(<Self as Module>::id())
@@ -274,7 +282,6 @@ impl AllocationControllerModule {
             memo,
             llm,
             session,
-            session_compaction: SessionCompactionConfig::default(),
             batching: batch::AttentionControlBatchConfig::default(),
             system_prompt: std::sync::OnceLock::new(),
         }
@@ -296,17 +303,20 @@ impl AllocationControllerModule {
         })
     }
 
-    fn ensure_session_seeded(&self, cx: &nuillu_module::ActivateCx<'_>) {
+    fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
         let system_prompt = self.system_prompt(cx).to_owned();
-        self.session
-            .ensure_seeded(system_prompt, cx.identity_memories(), cx.now());
+        ensure_persistent_session_seeded(
+            &mut self.session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate_with(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        compaction: &SessionCompactionRuntime,
         requests: &[AttentionControlRequest],
     ) -> Result<()> {
         self.ensure_session_seeded(cx);
@@ -343,25 +353,26 @@ impl AllocationControllerModule {
         let lutum = self.llm.lutum().await;
         let outcome = MODULE_TARGET_ID_SCHEMA
             .scope(module_target_schema, async {
-                let mut session = self.session.borrow_mut();
                 push_formatted_cognition_log_batch(
-                    &mut session,
+                    &mut self.session,
                     &unread_cognition,
                     cx.now(),
                     COGNITION_CONTEXT_WINDOW,
                 );
-                session.push_ephemeral_system(format_allocation_controller_context(
-                    &rank_counts,
-                    &visible_current,
-                    &interoception,
-                    &visible_modules,
-                    stuckness.as_ref(),
-                ));
-                session.push_ephemeral_developer(controller_activation_input(
-                    format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
-                    requests,
-                ));
-                session
+                self.session
+                    .push_ephemeral_system(format_allocation_controller_context(
+                        &rank_counts,
+                        &visible_current,
+                        &interoception,
+                        &visible_modules,
+                        stuckness.as_ref(),
+                    ));
+                self.session
+                    .push_ephemeral_developer(controller_activation_input(
+                        format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
+                        requests,
+                    ));
+                self.session
                     .text_turn()
                     .tools::<AllocationControllerTools>()
                     .available_tools([
@@ -376,14 +387,18 @@ impl AllocationControllerModule {
             .context("allocation-controller tool turn failed")?;
 
         let mut applied: Option<AppliedDecision> = None;
-        let input_tokens = match outcome {
+        match outcome {
             // `require_any_tool()` should prevent a finish-without-tools outcome.
-            TextStepOutcomeWithTools::Finished(_)
-            | TextStepOutcomeWithTools::FinishedNoOutput(_) => {
+            TextStepOutcomeWithTools::Finished(result) => {
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                anyhow::bail!("allocation-controller finished without required tool call");
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                cx.compact_and_save(&mut self.session, result.usage).await?;
                 anyhow::bail!("allocation-controller finished without required tool call");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
-                let input_tokens = round.usage.input_tokens;
+                let usage = round.usage;
                 let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 // The LLM may return multiple tool calls; adopt the first decision only.
@@ -411,35 +426,22 @@ impl AllocationControllerModule {
                         }
                     }
                 }
-                let mut session = self.session.borrow_mut();
                 push_formatted_memo_log_batch(
-                    &mut session,
+                    &mut self.session,
                     &unread_memos,
                     cx.now(),
                     MEMO_CONTEXT_WINDOW,
                 );
                 round
-                    .commit(&mut session, results)
+                    .commit(&mut self.session, results)
                     .context("commit allocation-controller tool round")?;
-                input_tokens
+                cx.compact_and_save(&mut self.session, usage).await?;
             }
         };
         let applied = applied.context("allocation-controller tool turn produced no decision")?;
         if applied.memo.is_empty() {
             anyhow::bail!("allocation-controller tool turn produced an empty memo");
         }
-        let mut session = self.session.borrow_mut();
-        compact_session_if_needed(
-            &mut session,
-            input_tokens,
-            compaction,
-            self.session_compaction,
-            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-            Self::id(),
-            COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX,
-            SESSION_COMPACTION_PROMPT,
-        )
-        .await;
 
         self.memo.write(applied.memo.clone()).await;
         self.allocation_writer.submit(applied.commands).await;
@@ -565,8 +567,7 @@ impl Module for AllocationControllerModule {
         cx: &nuillu_module::ActivateCx<'_>,
         batch: &Self::Batch,
     ) -> Result<()> {
-        self.activate_with(cx, cx.session_compaction(), &batch.requests)
-            .await
+        self.activate_with(cx, &batch.requests).await
     }
 }
 
@@ -753,7 +754,9 @@ mod tests {
                         ),
                         caps.memo(),
                         caps.llm_access(),
-                        caps.legacy_session("main"),
+                        caps.session("main")
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
                     ));
                     Ok(AllocationControllerStub)
                 }
@@ -1042,17 +1045,9 @@ mod tests {
         );
 
         fixture.source_memo.write("sensory memo A").await;
-        fixture
-            .controller
-            .activate_with(&cx, &compaction, &[])
-            .await
-            .unwrap();
+        fixture.controller.activate_with(&cx, &[]).await.unwrap();
         fixture.source_memo.write("sensory memo B").await;
-        fixture
-            .controller
-            .activate_with(&cx, &compaction, &[])
-            .await
-            .unwrap();
+        fixture.controller.activate_with(&cx, &[]).await.unwrap();
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
@@ -1152,13 +1147,7 @@ mod tests {
             }
         )));
 
-        let session_after_second = fixture
-            .controller
-            .session
-            .borrow_mut()
-            .input()
-            .items()
-            .to_vec();
+        let session_after_second = fixture.controller.session.input().items().to_vec();
         assert!(session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Message { content, .. }
@@ -1199,9 +1188,6 @@ mod tests {
                     [MessageContent::Text(text)] if text.contains("Current memo batch")
                 )
         )));
-        assert_eq!(
-            fixture.controller.session.borrow_mut().list_turns().count(),
-            2
-        );
+        assert_eq!(fixture.controller.session.list_turns().count(), 2);
     }
 }

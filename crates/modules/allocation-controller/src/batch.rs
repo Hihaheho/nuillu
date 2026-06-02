@@ -206,7 +206,9 @@ mod tests {
                                 ),
                                 caps.memo(),
                                 caps.llm_access(),
-                                caps.legacy_session("main"),
+                                caps.session("main")
+                                    .with_auto_compaction(crate::session_auto_compaction())
+                                    .await?,
                             )
                             .with_batch_config(batching),
                             recorder,
