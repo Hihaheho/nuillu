@@ -141,6 +141,17 @@ pub(crate) fn attach_persistent_session_metadata(
     });
 }
 
+pub(crate) fn restore_persistent_session_metadata(
+    session: &mut Session,
+    metadata: &PersistentSessionMetadata,
+) {
+    session.extensions_mut().insert(ModuleSessionMetadata {
+        owner: metadata.owner.clone(),
+        session_key: metadata.key.clone(),
+    });
+    session.extensions_mut().insert(metadata.clone());
+}
+
 pub(crate) fn persistent_session_metadata(session: &Session) -> Option<&PersistentSessionMetadata> {
     session.extensions().get::<PersistentSessionMetadata>()
 }

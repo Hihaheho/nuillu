@@ -1383,8 +1383,14 @@ mod tests {
     use nuillu_types::{ReplicaCapRange, builtin};
 
     use crate::ports::{CognitionLogRepository, PortError, SystemClock};
-    use crate::session::PersistedSessionSnapshot;
+    use crate::session::{
+        PersistedSessionSnapshot, SessionAutoCompaction, SessionKey, persistent_session_metadata,
+    };
+    use crate::session_compaction::{
+        SessionCompactionConfig, SessionCompactionPolicy, SessionCompactionProtectedPrefix,
+    };
     use crate::test_support::{scoped, test_caps};
+    use lutum::{FinishReason, MockLlmAdapter, MockTextScenario, RawTextTurnEvent};
 
     fn test_policy(replicas_range: std::ops::RangeInclusive<u8>) -> ModulePolicy {
         ModulePolicy::new(
@@ -1700,6 +1706,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.saves().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compact_and_save_restores_metadata_after_session_compaction() {
+        let store = RecordingSessionStore::default();
+        let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
+        let owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
+        let mut session = caps
+            .scoped(owner.clone())
+            .session("main")
+            .with_auto_compaction(SessionAutoCompaction::new(
+                SessionCompactionConfig::default(),
+                SessionCompactionProtectedPrefix::LeadingSystem,
+                "Compacted session:",
+                "Summarize.",
+            ))
+            .await
+            .expect("session acquisition should succeed");
+        session.push_system("SYSTEM PROMPT");
+        for index in 0..5 {
+            session.push_user(format!("history-{index}"));
+        }
+
+        let adapter = Arc::new(
+            MockLlmAdapter::new().with_text_scenario(MockTextScenario::events(vec![
+                Ok(RawTextTurnEvent::Started {
+                    request_id: Some("compact".into()),
+                    model: "mock".into(),
+                }),
+                Ok(RawTextTurnEvent::TextDelta {
+                    delta: "history summarized".into(),
+                }),
+                Ok(RawTextTurnEvent::Completed {
+                    request_id: Some("compact".into()),
+                    finish_reason: FinishReason::Stop,
+                    usage: lutum::Usage::zero(),
+                }),
+            ])),
+        );
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        let compaction = crate::SessionCompactionRuntime::new(
+            lutum,
+            crate::LlmConcurrencyLimiter::new(None),
+            ModelTier::Cheap,
+            SessionCompactionPolicy::new(1, 1, 1),
+        );
+        let runtime = caps.runtime_control();
+        let cx = runtime.with_session_checkpoint_runtime(crate::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            &[],
+            compaction,
+            Utc::now(),
+        ));
+
+        cx.compact_and_save(
+            &mut session,
+            lutum::Usage {
+                input_tokens: 2,
+                ..lutum::Usage::zero()
+            },
+        )
+        .await
+        .expect("first checkpoint after compaction should succeed");
+        assert!(
+            persistent_session_metadata(&session).is_some(),
+            "session metadata should survive compaction"
+        );
+
+        cx.compact_and_save(&mut session, lutum::Usage::zero())
+            .await
+            .expect("second checkpoint should succeed after metadata restore");
     }
 
     #[tokio::test]

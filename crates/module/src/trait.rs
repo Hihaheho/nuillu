@@ -13,6 +13,7 @@ use crate::ports::PortError;
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter};
 use crate::session::{
     NoopSessionStore, SessionCheckpointError, SessionStore, persistent_session_metadata,
+    restore_persistent_session_metadata,
 };
 use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session};
 
@@ -130,6 +131,7 @@ impl<'a> ActivateCx<'a> {
             .await
             {
                 Ok(()) => {
+                    restore_persistent_session_metadata(session, &metadata);
                     self.runtime_events.session_compaction_completed(
                         metadata.owner.clone(),
                         metadata.key.as_str().to_owned(),
