@@ -387,20 +387,36 @@ impl AllocationControllerModule {
             .context("allocation-controller tool turn failed")?;
 
         let mut applied: Option<AppliedDecision> = None;
+        let mut decision_tool_names: Option<String> = None;
         match outcome {
             // `require_any_tool()` should prevent a finish-without-tools outcome.
             TextStepOutcomeWithTools::Finished(result) => {
                 cx.compact_and_save(&mut self.session, result.usage).await?;
-                anyhow::bail!("allocation-controller finished without required tool call");
+                let detail = "model finished with assistant output but no tool call \
+                                (require_any_tool should have prevented this outcome)";
+                cx.warn(format!("allocation-controller activation failed: {detail}"));
+                anyhow::bail!("allocation-controller finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                 cx.compact_and_save(&mut self.session, result.usage).await?;
-                anyhow::bail!("allocation-controller finished without required tool call");
+                let detail =
+                    "model finished with no output and no tool call (require_any_tool should \
+                     have prevented this outcome)";
+                cx.warn(format!("allocation-controller activation failed: {detail}"));
+                anyhow::bail!("allocation-controller finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let usage = round.usage;
+                decision_tool_names = Some(format_tool_call_names(&round.tool_calls));
                 let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                if round.tool_calls.is_empty() {
+                    let detail = format!(
+                        "model returned NeedsTools outcome with empty tool_calls; {expected}",
+                        expected = "expected leave_allocation_unchanged or reprioritize_modules"
+                    );
+                    cx.warn(format!("allocation-controller activation failed: {detail}"));
+                }
                 // The LLM may return multiple tool calls; adopt the first decision only.
                 for call in round.tool_calls.iter().cloned() {
                     match call {
@@ -438,9 +454,17 @@ impl AllocationControllerModule {
                 cx.compact_and_save(&mut self.session, usage).await?;
             }
         };
-        let applied = applied.context("allocation-controller tool turn produced no decision")?;
+        let Some(applied) = applied else {
+            let detail = no_decision_failure_detail(
+                decision_tool_names.as_deref().unwrap_or("(unavailable)"),
+            );
+            cx.warn(format!("allocation-controller activation failed: {detail}"));
+            anyhow::bail!("allocation-controller {detail}");
+        };
         if applied.memo.is_empty() {
-            anyhow::bail!("allocation-controller tool turn produced an empty memo");
+            let detail = "tool turn applied but memo field was empty";
+            cx.warn(format!("allocation-controller activation failed: {detail}"));
+            anyhow::bail!("allocation-controller tool turn produced an empty memo: {detail}");
         }
 
         self.memo.write(applied.memo.clone()).await;
@@ -527,6 +551,27 @@ fn current_memo_batch_input(batch: Option<String>) -> String {
         )
 }
 
+fn format_tool_call_names<C>(calls: &[C]) -> String
+where
+    C: lutum::ToolCallWrapper,
+{
+    if calls.is_empty() {
+        return "(none)".to_owned();
+    }
+    calls
+        .iter()
+        .map(|call| call.metadata().name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn no_decision_failure_detail(tool_names: &str) -> String {
+    format!(
+        "tool turn produced no decision: tool_calls=[{tool_names}]; expected exactly one of \
+         leave_allocation_unchanged, reprioritize_modules"
+    )
+}
+
 fn controller_activation_input(
     memo_batch: Option<String>,
     requests: &[AttentionControlRequest],
@@ -594,6 +639,15 @@ mod tests {
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
     use nuillu_types::builtin;
+
+    #[test]
+    fn no_decision_failure_detail_includes_tool_names() {
+        assert_eq!(
+            no_decision_failure_detail("foo, bar"),
+            "tool turn produced no decision: tool_calls=[foo, bar]; expected exactly one of \
+             leave_allocation_unchanged, reprioritize_modules"
+        );
+    }
 
     #[test]
     fn visible_modules_uses_allocation_hint_catalog() {
