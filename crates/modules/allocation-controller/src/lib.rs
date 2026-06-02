@@ -22,10 +22,10 @@ mod batch;
 const SYSTEM_PROMPT: &str = r#"You are the allocation-controller module.
 You wake on memo updates and internal attention-control requests. Use blackboard memos, attention
 control requests, the cognition log, the current allocation, and the registry schema to decide which
-modules deserve activation right now.
+allocation posture is best for the mind and which modules deserve extra activation now.
 
 Use exactly one tool per activation:
-- leave_allocation_unchanged when the current memo batch does not warrant changing activation priorities.
+- leave_allocation_unchanged when the current allocation already fits the best current posture.
 - reprioritize_modules when one or more modules need extra activation now. The priority array lists
   modules in descending priority order, each entry pairing a module_id (must be a registered module)
   with a hint — one concise sentence saying why that module needs extra activation now. Omitted
@@ -535,9 +535,11 @@ fn controller_activation_input(
     output.push_str("\n\n");
     output.push_str(&controller_request_input(requests));
     output.push_str(
-        "\n\nInstruction: decide whether this current batch warrants changed activation priorities. \
-Choose exactly one allocation tool from the current memo batch, current attention-control requests, \
-and current allocation state.",
+        "\n\nInstruction: choose the best current allocation posture for the mind. Use the current \
+memo batch, current attention-control requests, cognition log, interoception, memory inventory, \
+stuckness, and current allocation state. If the current allocation already fits that posture, call \
+leave_allocation_unchanged; otherwise call reprioritize_modules for modules that need extra \
+activation now.",
     );
     output
 }
@@ -1006,9 +1008,9 @@ mod tests {
         assert!(input.contains("Current memo batch"));
         assert!(input.contains("triggered this allocation turn"));
         assert!(input.contains("fresh sensory memo"));
-        assert!(input.contains(
-            "Instruction: decide whether this current batch warrants changed activation priorities"
-        ));
+        assert!(
+            input.contains("Instruction: choose the best current allocation posture for the mind")
+        );
         assert!(!input.contains("Never call leave_allocation_unchanged"));
         assert!(!input.contains("not instructions"));
     }
