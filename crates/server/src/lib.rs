@@ -7,6 +7,7 @@ pub mod llm_observer;
 pub mod model_set;
 pub mod registry;
 pub mod runtime;
+mod runtime_event_log;
 pub mod snapshot;
 pub mod state;
 

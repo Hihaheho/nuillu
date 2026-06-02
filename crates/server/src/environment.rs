@@ -35,6 +35,9 @@ use super::config::{EmbeddingBackendConfig, LlmBackendConfig, ServerConfig};
 use super::gui::VisualizerEventSink;
 use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
+use super::runtime_event_log::{
+    RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
+};
 
 pub(super) struct ServerEnvironment {
     pub(super) blackboard: Blackboard,
@@ -53,9 +56,26 @@ pub(super) async fn build_server_environment(
     visualizer: VisualizerEventSink,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
+    let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
+    let runtime_event_log = RuntimeEventLogWriter::open(
+        runtime_event_log_path,
+        config.session_id.clone(),
+        SERVER_TAB_ID.to_string(),
+    )
+    .with_context(|| {
+        format!(
+            "open runtime event log under {}",
+            config.state_dir.display()
+        )
+    })?;
+    eprintln!(
+        "nuillu-server runtime-event-log path={}",
+        runtime_event_log.path().display()
+    );
     let event_sink = Rc::new(ServerRuntimeEventSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer.clone(),
+        runtime_event_log,
     ));
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
@@ -311,138 +331,38 @@ async fn configured_reasoning_effort(
 struct ServerRuntimeEventSink {
     tab_id: String,
     visualizer: VisualizerEventSink,
+    runtime_event_log: RuntimeEventLogWriter,
 }
 
 impl ServerRuntimeEventSink {
-    fn new(tab_id: String, visualizer: VisualizerEventSink) -> Self {
-        Self { tab_id, visualizer }
+    fn new(
+        tab_id: String,
+        visualizer: VisualizerEventSink,
+        runtime_event_log: RuntimeEventLogWriter,
+    ) -> Self {
+        Self {
+            tab_id,
+            visualizer,
+            runtime_event_log,
+        }
     }
 }
 
 impl RuntimeEventSink for ServerRuntimeEventSink {
     fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
-        match &event {
-            RuntimeEvent::LlmAccessed {
-                call, owner, tier, ..
-            } => eprintln!(
-                "nuillu-server llm-accessed tab={} call={} owner={} tier={:?}",
-                self.tab_id, call, owner, tier
-            ),
-            RuntimeEvent::LlmCompleted {
-                call, owner, tier, ..
-            } => eprintln!(
-                "nuillu-server llm-completed tab={} call={} owner={} tier={:?}",
-                self.tab_id, call, owner, tier
-            ),
-            RuntimeEvent::MemoUpdated {
-                owner, char_count, ..
-            } => eprintln!(
-                "nuillu-server memo-updated tab={} owner={} chars={}",
-                self.tab_id, owner, char_count
-            ),
-            RuntimeEvent::RateLimitDelayed {
-                owner,
-                capability,
-                delayed_for,
-                ..
-            } => eprintln!(
-                "nuillu-server rate-limit-delayed tab={} owner={} capability={:?} delayed_ms={}",
-                self.tab_id,
-                owner,
-                capability,
-                delayed_for.as_millis()
-            ),
-            RuntimeEvent::ModuleBatchThrottled {
-                owner, delayed_for, ..
-            } => eprintln!(
-                "nuillu-server module-batch-throttled tab={} owner={} delayed_ms={}",
-                self.tab_id,
-                owner,
-                delayed_for.as_millis()
-            ),
-            RuntimeEvent::ModuleBatchReady {
-                owner,
-                batch_type,
-                batch_debug,
-                ..
-            } => eprintln!(
-                "nuillu-server module-batch-ready tab={} owner={} type={} chars={}",
-                self.tab_id,
-                owner,
-                batch_type,
-                batch_debug.chars().count()
-            ),
-            RuntimeEvent::ModuleActivationCompleted {
-                owner,
-                duration,
-                succeeded,
-                ..
-            } => eprintln!(
-                "nuillu-server module-activation-completed tab={} owner={} duration_ms={} succeeded={}",
-                self.tab_id,
-                owner,
-                duration.as_millis(),
-                succeeded
-            ),
-            RuntimeEvent::ModuleTaskFailed {
-                owner,
-                phase,
-                message,
-                ..
-            } => eprintln!(
-                "nuillu-server module-task-failed tab={} owner={} phase={} error={}",
-                self.tab_id, owner, phase, message
-            ),
-            RuntimeEvent::ModuleRestarted {
-                owner,
-                consecutive_failures,
-                failure_limit,
-                ..
-            } => eprintln!(
-                "nuillu-server module-restarted tab={} owner={} failures={} limit={}",
-                self.tab_id, owner, consecutive_failures, failure_limit
-            ),
-            RuntimeEvent::ModuleStopped {
-                owner,
-                phase,
-                message,
-                consecutive_failures,
-                ..
-            } => eprintln!(
-                "nuillu-server module-stopped tab={} owner={} phase={} failures={} error={}",
-                self.tab_id, owner, phase, consecutive_failures, message
-            ),
-            RuntimeEvent::SessionCompactionStarted {
-                owner,
-                session_key,
-                input_tokens,
-                threshold,
-                ..
-            } => eprintln!(
-                "nuillu-server session-compaction-started tab={} owner={} session={} input_tokens={} threshold={}",
-                self.tab_id, owner, session_key, input_tokens, threshold
-            ),
-            RuntimeEvent::SessionCompactionCompleted {
-                owner,
-                session_key,
-                input_tokens,
-                before_items,
-                after_items,
-                ..
-            } => eprintln!(
-                "nuillu-server session-compaction-completed tab={} owner={} session={} input_tokens={} items={}->{}",
-                self.tab_id, owner, session_key, input_tokens, before_items, after_items
-            ),
-            RuntimeEvent::SessionCompactionFailed {
-                owner,
-                session_key,
-                input_tokens,
-                message,
-                ..
-            } => eprintln!(
-                "nuillu-server session-compaction-failed tab={} owner={} session={} input_tokens={} error={}",
-                self.tab_id, owner, session_key, input_tokens, message
-            ),
+        let message = runtime_event_message(&self.tab_id, &event);
+        eprintln!("{message}");
+        if let Err(error) = self.runtime_event_log.append(&message, &event) {
+            tracing::warn!(
+                path = %self.runtime_event_log.path().display(),
+                ?error,
+                "failed to append runtime event log"
+            );
+            eprintln!(
+                "nuillu-server runtime-event-log-write-failed path={} error={}",
+                self.runtime_event_log.path().display(),
+                error
+            );
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),
