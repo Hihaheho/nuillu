@@ -387,7 +387,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
     for module in modules {
         let (activation, tier) = match module {
             RuntimeModule::Sensory => (1.0, ModelTier::Cheap),
-            RuntimeModule::CognitionGate => (1.0, ModelTier::Cheap),
+            RuntimeModule::CognitionGate => (1.0, ModelTier::Default),
             RuntimeModule::AllocationController => (1.0, ModelTier::Default),
             RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
             RuntimeModule::SelfModel => (0.0, ModelTier::Default),
