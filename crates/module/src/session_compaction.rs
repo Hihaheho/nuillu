@@ -6,6 +6,8 @@ use crate::llm::{LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
 
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
+const COMPACTION_SUMMARY_USER_INPUT: &str =
+    "Summarize the session history above per the system instructions.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionCompactionConfig {
@@ -206,6 +208,12 @@ pub async fn compact_session(
         compaction_prompt,
     ));
     summary_items.extend(prefix);
+    // Responses API rejects inputs ending with two or more assistant messages; faculty
+    // sessions often end a compactable prefix with assistant context plus a tool turn.
+    summary_items.push(ModelInputItem::text(
+        InputMessageRole::User,
+        COMPACTION_SUMMARY_USER_INPUT,
+    ));
     let summary = lutum
         .text_turn(ModelInput::from_items(summary_items))
         .collect()
@@ -498,9 +506,17 @@ mod tests {
         let captured = observed.text_inputs();
         assert_eq!(captured.len(), 1);
         let summary_items = captured[0].items();
-        assert_eq!(summary_items.len(), 4);
+        assert_eq!(summary_items.len(), 5);
         let summary_users = text_of_user_messages(summary_items);
-        assert_eq!(summary_users, vec!["history-0", "history-1", "history-2"]);
+        assert_eq!(
+            summary_users,
+            vec![
+                "history-0",
+                "history-1",
+                "history-2",
+                COMPACTION_SUMMARY_USER_INPUT,
+            ]
+        );
         assert!(!summary_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message {
@@ -579,6 +595,55 @@ mod tests {
             }
         ));
         assert_eq!(text_of_user_messages(items), vec!["history-0"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_summary_input_ends_with_user_after_assistant_context_and_turn() {
+        use lutum::{AssistantTurnItem, AssistantTurnView};
+
+        let adapter = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(summary_scenario("history summarized")),
+        );
+        let (lutum, observed) = lutum_with_adapter(adapter);
+        let mut session = Session::new();
+        session.push_system("SYSTEM PROMPT");
+        session.push_assistant_text(
+            "What I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
+        );
+        session.push_assistant_text("My cognition at 2026-05-11T06:23:00Z:\n- door open");
+        session.input_mut().push(ModelInputItem::turn(Arc::new(
+            AssistantTurnView::from_items(&[AssistantTurnItem::Text(
+                "skip cognition this cycle".into(),
+            )]),
+        )));
+        session.push_user("history-3");
+        session.push_user("history-4");
+
+        compact_session(
+            &mut session,
+            &lutum,
+            SessionCompactionConfig { prefix_ratio: 0.6 },
+            SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+            "Compacted session:",
+            "Summarize.",
+        )
+        .await
+        .unwrap();
+
+        let captured = observed.text_inputs();
+        assert_eq!(captured.len(), 1);
+        let summary_items = captured[0].items();
+        let ModelInputItem::Message {
+            role: InputMessageRole::User,
+            content,
+        } = summary_items.last().expect("expected trailing user input")
+        else {
+            panic!("expected trailing user input item");
+        };
+        let [MessageContent::Text(text)] = content.as_slice() else {
+            panic!("expected trailing user text");
+        };
+        assert_eq!(text, COMPACTION_SUMMARY_USER_INPUT);
     }
 
     #[tokio::test(flavor = "current_thread")]
