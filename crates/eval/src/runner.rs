@@ -1761,6 +1761,7 @@ async fn execute_full_agent_case(
         AgentEventLoopConfig {
             idle_threshold: Duration::from_secs(1),
             activate_retries: 2,
+            module_failure_limit: 3,
         },
         async move {
             if !gui_deferred_start {
@@ -2109,6 +2110,7 @@ async fn execute_module_case(
         AgentEventLoopConfig {
             idle_threshold: Duration::from_secs(1),
             activate_retries: 2,
+            module_failure_limit: 3,
         },
         async move {
             let mut started = !gui_deferred_start;
@@ -5798,6 +5800,23 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
         } => format!(
             "seq={sequence} module_task_failed owner={owner} phase={phase} message={message}"
         ),
+        RuntimeEvent::ModuleRestarted {
+            sequence,
+            owner,
+            consecutive_failures,
+            failure_limit,
+        } => format!(
+            "seq={sequence} module_restarted owner={owner} failures={consecutive_failures} limit={failure_limit}"
+        ),
+        RuntimeEvent::ModuleStopped {
+            sequence,
+            owner,
+            phase,
+            message,
+            consecutive_failures,
+        } => format!(
+            "seq={sequence} module_stopped owner={owner} phase={phase} failures={consecutive_failures} message={message}"
+        ),
     }
 }
 
@@ -6261,7 +6280,9 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         RuntimeEvent::LlmAccessed { .. }
         | RuntimeEvent::LlmCompleted { .. }
         | RuntimeEvent::MemoUpdated { .. }
-        | RuntimeEvent::ModuleTaskFailed { .. } => true,
+        | RuntimeEvent::ModuleTaskFailed { .. }
+        | RuntimeEvent::ModuleRestarted { .. }
+        | RuntimeEvent::ModuleStopped { .. } => true,
         RuntimeEvent::RateLimitDelayed { .. }
         | RuntimeEvent::ModuleBatchThrottled { .. }
         | RuntimeEvent::ModuleBatchReady { .. }
@@ -6282,6 +6303,8 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleBatchReady { .. } => false,
             RuntimeEvent::ModuleActivationCompleted { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
+            RuntimeEvent::ModuleRestarted { .. } => false,
+            RuntimeEvent::ModuleStopped { .. } => false,
         };
         match &event {
             RuntimeEvent::LlmAccessed { .. } => {
@@ -6381,6 +6404,34 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.reporter.log_scope(&self.case_id),
                 owner,
                 phase,
+                message
+            ),
+            RuntimeEvent::ModuleRestarted {
+                owner,
+                consecutive_failures,
+                failure_limit,
+                ..
+            } => format!(
+                "{} module-restarted {} owner={} failures={} limit={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                consecutive_failures,
+                failure_limit
+            ),
+            RuntimeEvent::ModuleStopped {
+                owner,
+                phase,
+                message,
+                consecutive_failures,
+                ..
+            } => format!(
+                "{} module-stopped {} owner={} phase={} failures={} error={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                phase,
+                consecutive_failures,
                 message
             ),
         };
@@ -8895,6 +8946,7 @@ prompt = "What am I attending to?"
                     AgentEventLoopConfig {
                         idle_threshold: Duration::from_millis(50),
                         activate_retries: 1,
+                        module_failure_limit: 3,
                     },
                     async {
                         let record = run_blackboard

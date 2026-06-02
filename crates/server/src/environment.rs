@@ -393,6 +393,25 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
                 "nuillu-server module-task-failed tab={} owner={} phase={} error={}",
                 self.tab_id, owner, phase, message
             ),
+            RuntimeEvent::ModuleRestarted {
+                owner,
+                consecutive_failures,
+                failure_limit,
+                ..
+            } => eprintln!(
+                "nuillu-server module-restarted tab={} owner={} failures={} limit={}",
+                self.tab_id, owner, consecutive_failures, failure_limit
+            ),
+            RuntimeEvent::ModuleStopped {
+                owner,
+                phase,
+                message,
+                consecutive_failures,
+                ..
+            } => eprintln!(
+                "nuillu-server module-stopped tab={} owner={} phase={} failures={} error={}",
+                self.tab_id, owner, phase, consecutive_failures, message
+            ),
         }
         self.visualizer.send(VisualizerEvent::RuntimeEvent {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),

@@ -62,6 +62,8 @@ pub struct ModuleState {
     pub last_tier: Option<String>,
     pub last_throttle: Option<ThrottleSummary>,
     pub latest_batch: Option<ModuleBatchDebugState>,
+    pub error_count: u32,
+    pub last_execution_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +141,8 @@ pub struct ModuleOverviewRow {
     pub policy: Option<ModulePolicyView>,
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
+    pub error_count: u32,
+    pub last_execution_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,7 +225,14 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 debug: batch_debug.clone(),
             });
         }
-        RuntimeEvent::ModuleActivationCompleted { .. } => {}
+        RuntimeEvent::ModuleActivationCompleted {
+            owner, succeeded, ..
+        } => {
+            if *succeeded {
+                let module = module_mut_for_owner(state, owner);
+                module.last_execution_failed = false;
+            }
+        }
         RuntimeEvent::ModuleTaskFailed {
             owner,
             phase,
@@ -231,6 +242,23 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             let module = module_mut_for_owner(state, owner);
             module.status = ModuleSessionStatus::Failed;
             module.runtime_status = Some(format!("Failed {phase}: {message}"));
+            module.error_count = module.error_count.saturating_add(1);
+            module.last_execution_failed = true;
+        }
+        RuntimeEvent::ModuleRestarted { owner, .. } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some("Restarted".to_string());
+        }
+        RuntimeEvent::ModuleStopped {
+            owner,
+            phase,
+            message,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.status = ModuleSessionStatus::Failed;
+            module.runtime_status = Some(format!("Stopped {phase}: {message}"));
+            module.last_execution_failed = true;
         }
     }
 }
@@ -388,6 +416,8 @@ pub fn overview_rows(
         }
         row.throttle = module.last_throttle.as_ref().map(throttle_label);
         row.latest_llm_output = latest_llm_output(module);
+        row.error_count = module.error_count;
+        row.last_execution_failed = module.last_execution_failed;
     }
 
     let allocations = snapshot
@@ -938,6 +968,7 @@ const TIER_COLUMN_WIDTH: f32 = 60.0;
 const BPM_COLUMN_WIDTH: f32 = 30.0;
 const COOLDOWN_COLUMN_WIDTH: f32 = 40.0;
 const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
+const ERRORS_COLUMN_WIDTH: f32 = 44.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
 const CONFIG_POPUP_WIDTH: f32 = 310.0;
 const CONFIG_POPUP_ESTIMATED_HEIGHT: f32 = 160.0;
@@ -956,6 +987,7 @@ fn overview_header(ui: &mut egui::Ui) {
         overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
         overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
         overview_header_cell(ui, "LLM", LLM_COLUMN_WIDTH);
+        overview_header_cell(ui, "Errors", ERRORS_COLUMN_WIDTH);
         overview_header_cell(ui, "Latest LLM out", LATEST_OUTPUT_COLUMN_WIDTH);
     });
 }
@@ -967,7 +999,11 @@ fn overview_row(
     actions: &mut Vec<ModuleOverviewAction>,
     open_config: &mut Option<OpenModuleConfig>,
 ) {
-    let fill = (index % 2 == 1).then(|| ui.visuals().faint_bg_color);
+    let fill = if row.last_execution_failed {
+        Some(ui.visuals().error_fg_color.linear_multiply(0.18))
+    } else {
+        (index % 2 == 1).then(|| ui.visuals().faint_bg_color)
+    };
     let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -1011,6 +1047,7 @@ fn overview_row(
             );
             overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
             overview_label_cell(ui, &row.llm_status, None, LLM_COLUMN_WIDTH);
+            overview_label_cell(ui, &row.error_count.to_string(), None, ERRORS_COLUMN_WIDTH);
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
             let output_preview = tail_preview_text(output, 96);
             overview_label_cell(
@@ -1311,6 +1348,8 @@ fn upsert_overview_row<'a>(
             policy: None,
             throttle: None,
             latest_llm_output: None,
+            error_count: 0,
+            last_execution_failed: false,
         });
     if !module.is_empty() {
         row.module = module.to_string();
@@ -1341,17 +1380,22 @@ fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
     row.llm_status != status_label(ModuleSessionStatus::Idle)
         || row.latest_llm_output.is_some()
         || row.throttle.is_some()
+        || row.error_count > 0
+        || row.last_execution_failed
         || !matches!(row.runtime_status.as_str(), "Inactive" | "not reported")
 }
 
 fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
-    module_mut_with_metadata(
+    let module = module_mut_with_metadata(
         state,
         status.owner.clone(),
         status.module.clone(),
         status.replica,
-    )
-    .runtime_status = Some(status.status.clone());
+    );
+    module.runtime_status = Some(status.status.clone());
+    if status.status.starts_with("Failed") || status.status.starts_with("Stopped") {
+        module.last_execution_failed = true;
+    }
 }
 
 fn latest_llm_output(module: &ModuleState) -> Option<String> {
@@ -2287,6 +2331,73 @@ mod tests {
             module.runtime_status.as_deref(),
             Some("Failed activate: llm request failed")
         );
+        assert_eq!(module.error_count, 1);
+        assert!(module.last_execution_failed);
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error_count, 1);
+        assert!(rows[0].last_execution_failed);
+    }
+
+    #[test]
+    fn successful_activation_clears_failed_highlight_without_resetting_errors() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleTaskFailed {
+                sequence: 2,
+                owner: owner.clone(),
+                phase: "activate".to_string(),
+                message: "llm request failed".to_string(),
+            },
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 3,
+                owner: owner.clone(),
+                duration: Duration::from_millis(42),
+                succeeded: true,
+            },
+        );
+
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(module.error_count, 1);
+        assert!(!module.last_execution_failed);
+    }
+
+    #[test]
+    fn stopped_event_keeps_module_highlighted() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleStopped {
+                sequence: 4,
+                owner: owner.clone(),
+                phase: "activate".to_string(),
+                message: "permanent failure".to_string(),
+                consecutive_failures: 3,
+            },
+        );
+
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(module.status, ModuleSessionStatus::Failed);
+        assert_eq!(
+            module.runtime_status.as_deref(),
+            Some("Stopped activate: permanent failure")
+        );
+        assert!(module.last_execution_failed);
     }
 
     #[test]
@@ -2362,6 +2473,8 @@ mod tests {
                 policy: None,
                 throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
+                error_count: 0,
+                last_execution_failed: false,
             }]
         );
     }
@@ -2385,6 +2498,8 @@ mod tests {
             policy: None,
             throttle: None,
             latest_llm_output: None,
+            error_count: 0,
+            last_execution_failed: false,
         };
 
         assert_eq!(replica_label(&row), "2/2");

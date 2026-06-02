@@ -275,6 +275,35 @@ impl CapabilityProviders {
 
     async fn restore_sessions(&self) -> Result<(), ModuleRegistryError> {
         let sessions = self.inner.sessions.borrow().clone();
+        self.restore_session_list(sessions).await
+    }
+
+    async fn restore_sessions_for(
+        &self,
+        owner: &ModuleInstanceId,
+    ) -> Result<(), ModuleRegistryError> {
+        let sessions = self
+            .inner
+            .sessions
+            .borrow()
+            .iter()
+            .filter(|session| session.owner() == owner)
+            .cloned()
+            .collect();
+        self.restore_session_list(sessions).await
+    }
+
+    fn remove_sessions_for(&self, owner: &ModuleInstanceId) {
+        self.inner
+            .sessions
+            .borrow_mut()
+            .retain(|session| session.owner() != owner);
+    }
+
+    async fn restore_session_list(
+        &self,
+        sessions: Vec<ModuleSession>,
+    ) -> Result<(), ModuleRegistryError> {
         for session in sessions {
             let snapshot = self
                 .inner
@@ -506,6 +535,31 @@ impl AgentRuntimeControl {
     ) {
         self.runtime_events
             .module_task_failed(owner, phase.into(), message.into());
+    }
+
+    pub fn record_module_restarted(
+        &self,
+        owner: ModuleInstanceId,
+        consecutive_failures: u32,
+        failure_limit: u32,
+    ) {
+        self.runtime_events
+            .module_restarted(owner, consecutive_failures, failure_limit);
+    }
+
+    pub fn record_module_stopped(
+        &self,
+        owner: ModuleInstanceId,
+        phase: impl Into<String>,
+        message: impl Into<String>,
+        consecutive_failures: u32,
+    ) {
+        self.runtime_events.module_stopped(
+            owner,
+            phase.into(),
+            message.into(),
+            consecutive_failures,
+        );
     }
 
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
@@ -846,18 +900,39 @@ impl ModuleCapabilityFactory {
     }
 }
 
+type ErasedModuleBuilder = Rc<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>;
+
 pub struct AllocatedModule {
     owner: ModuleInstanceId,
+    caps: CapabilityProviders,
+    builder: ErasedModuleBuilder,
     module: Box<dyn ErasedModule>,
 }
 
 impl AllocatedModule {
-    fn new(owner: ModuleInstanceId, module: Box<dyn ErasedModule>) -> Self {
-        Self { owner, module }
+    fn new(
+        owner: ModuleInstanceId,
+        caps: CapabilityProviders,
+        builder: ErasedModuleBuilder,
+        module: Box<dyn ErasedModule>,
+    ) -> Self {
+        Self {
+            owner,
+            caps,
+            builder,
+            module,
+        }
     }
 
     pub fn owner(&self) -> &ModuleInstanceId {
         &self.owner
+    }
+
+    pub async fn restart(&mut self) -> Result<(), ModuleRegistryError> {
+        self.caps.remove_sessions_for(&self.owner);
+        let scoped = self.caps.scoped(self.owner.clone());
+        self.module = (self.builder)(scoped);
+        self.caps.restore_sessions_for(&self.owner).await
     }
 
     pub async fn next_batch(&mut self) -> anyhow::Result<ModuleBatch> {
@@ -959,7 +1034,7 @@ struct ModuleRegistration {
     allocation_hint: Option<&'static str>,
     policy: ModulePolicy,
     replica_capacity: u8,
-    builder: Box<dyn Fn(ModuleCapabilityFactory) -> Box<dyn ErasedModule>>,
+    builder: ErasedModuleBuilder,
 }
 
 impl fmt::Debug for ModuleRegistration {
@@ -1033,7 +1108,7 @@ impl ModuleRegistry {
             allocation_hint,
             policy,
             replica_capacity,
-            builder: Box::new(move |caps| Box::new(builder(caps))),
+            builder: Rc::new(move |caps| Box::new(builder(caps))),
         });
         Ok(self)
     }
@@ -1077,7 +1152,7 @@ impl ModuleRegistry {
             allocation_hint,
             policy,
             replica_capacity,
-            builder: Box::new(move |caps| Box::new(builder(caps))),
+            builder: Rc::new(move |caps| Box::new(builder(caps))),
         });
         Ok(self)
     }
@@ -1135,7 +1210,12 @@ impl ModuleRegistry {
                 let owner =
                     ModuleInstanceId::new(registration.module.clone(), ReplicaIndex::new(replica));
                 let scoped = caps.scoped(owner.clone());
-                modules.push(AllocatedModule::new(owner, (registration.builder)(scoped)));
+                modules.push(AllocatedModule::new(
+                    owner,
+                    caps.clone(),
+                    Rc::clone(&registration.builder),
+                    (registration.builder)(scoped),
+                ));
             }
         }
         caps.restore_sessions().await?;

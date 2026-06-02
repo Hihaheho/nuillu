@@ -31,6 +31,7 @@ const KICK_SILENT_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct AgentEventLoopConfig {
     pub idle_threshold: Duration,
     pub activate_retries: u8,
+    pub module_failure_limit: u8,
 }
 
 #[derive(Debug, Error)]
@@ -90,6 +91,7 @@ pub async fn run(
             next_batch_throttle: None,
         })
         .collect::<Vec<_>>();
+    let mut consecutive_failures = vec![0_u32; states.len()];
     let mut active = vec![false; states.len()];
     let mut zero_windows = ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
     let mut zero_window_wakers = std::iter::repeat_with(|| None)
@@ -153,6 +155,7 @@ pub async fn run(
                             &dependency_targets,
                             &replica_zero_index_by_role,
                             &mut zero_windows,
+                            &mut consecutive_failures,
                             config,
                             &parent,
                             &subscriber,
@@ -225,6 +228,11 @@ enum ModuleState {
     PendingDependencyFlush,
     PendingActivationGate,
     Activating,
+    Stopped {
+        phase: String,
+        message: String,
+        consecutive_failures: u32,
+    },
 }
 
 enum TaskMessage {
@@ -636,6 +644,22 @@ async fn refresh_active_and_schedule(
                     .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                     .await;
             }
+            ModuleState::Stopped {
+                phase,
+                message,
+                consecutive_failures,
+            } => {
+                runtime
+                    .record_module_status(
+                        owners[index].clone(),
+                        ModuleRunStatus::Stopped {
+                            phase: phase.clone(),
+                            message: message.clone(),
+                            consecutive_failures: *consecutive_failures,
+                        },
+                    )
+                    .await;
+            }
         }
     }
 }
@@ -669,6 +693,7 @@ async fn handle_task_message(
     dependency_targets: &DependencyTargets,
     replica_zero_index_by_role: &HashMap<ModuleId, usize>,
     zero_windows: &mut ZeroReplicaWindows,
+    consecutive_failures: &mut [u32],
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -735,25 +760,20 @@ async fn handle_task_message(
             }
             Err(message) => {
                 notify_pending_and_ready(Vec::new(), &mut kick_inbox);
-                runtime
-                    .record_module_status(
-                        owners[index].clone(),
-                        ModuleRunStatus::Failed {
-                            phase: "next_batch".to_string(),
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
-                runtime.record_module_task_failed(
-                    owners[index].clone(),
+                kick_inboxes[index] = Some(kick_inbox);
+                recover_failed_module(
+                    runtime,
+                    &owners[index],
+                    states,
+                    consecutive_failures,
+                    index,
+                    module,
                     "next_batch",
-                    message.clone(),
-                );
-                Err(SchedulerError::ModuleTaskFailed {
-                    owner: owners[index].clone(),
-                    phase: "next_batch",
                     message,
-                })
+                    config,
+                )
+                .await;
+                Ok(())
             }
         },
         TaskMessage::DependencyFlush {
@@ -810,6 +830,7 @@ async fn handle_task_message(
             );
             match result {
                 Ok(()) => {
+                    consecutive_failures[index] = 0;
                     notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                     kick_inboxes[index] = Some(kick_inbox);
                     let now = runtime.clock().now();
@@ -850,25 +871,20 @@ async fn handle_task_message(
                 Err(message) => {
                     notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                     kick_inboxes[index] = Some(kick_inbox);
-                    runtime
-                        .record_module_status(
-                            owners[index].clone(),
-                            ModuleRunStatus::Failed {
-                                phase: "activate".to_string(),
-                                message: message.clone(),
-                            },
-                        )
-                        .await;
-                    runtime.record_module_task_failed(
-                        owners[index].clone(),
+                    zero_windows.finish(&owners[index]);
+                    recover_failed_module(
+                        runtime,
+                        &owners[index],
+                        states,
+                        consecutive_failures,
+                        index,
+                        module,
                         "activate",
-                        message.clone(),
-                    );
-                    Err(SchedulerError::ModuleTaskFailed {
-                        owner: owners[index].clone(),
-                        phase: "activate",
                         message,
-                    })
+                        config,
+                    )
+                    .await;
+                    Ok(())
                 }
             }
         }
@@ -946,6 +962,140 @@ async fn handle_task_message(
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_failed_module(
+    runtime: &AgentRuntimeControl,
+    owner: &ModuleInstanceId,
+    states: &mut [ModuleState],
+    consecutive_failures: &mut [u32],
+    index: usize,
+    module: AllocatedModule,
+    phase: &'static str,
+    message: String,
+    config: AgentEventLoopConfig,
+) {
+    let mut module = module;
+    let failure_limit = u32::from(config.module_failure_limit.max(1));
+    let mut last_failure_phase = phase.to_string();
+    let mut last_failure_message = message.clone();
+    let mut failures =
+        record_module_failure(runtime, owner, consecutive_failures, index, phase, message).await;
+
+    if failures >= failure_limit {
+        stop_module(
+            runtime,
+            owner,
+            states,
+            index,
+            last_failure_phase,
+            last_failure_message,
+            failures,
+        )
+        .await;
+        return;
+    }
+
+    if let Err(error) = runtime.flush_sessions_for(owner).await {
+        let message = format!("module session flush failed before restart: {error}");
+        tracing::warn!(owner = %owner, error = ?error, "module session flush failed before restart");
+        runtime.record_module_task_failed(owner.clone(), "session-flush", message);
+    }
+
+    loop {
+        match module.restart().await {
+            Ok(()) => {
+                runtime.record_module_restarted(owner.clone(), failures, failure_limit);
+                states[index] = ModuleState::Stored {
+                    module,
+                    next_batch_throttle: None,
+                };
+                return;
+            }
+            Err(error) => {
+                last_failure_phase = "restart".to_string();
+                last_failure_message = format!("{error:#}");
+                failures = record_module_failure(
+                    runtime,
+                    owner,
+                    consecutive_failures,
+                    index,
+                    "restart",
+                    last_failure_message.clone(),
+                )
+                .await;
+                if failures >= failure_limit {
+                    stop_module(
+                        runtime,
+                        owner,
+                        states,
+                        index,
+                        last_failure_phase,
+                        last_failure_message,
+                        failures,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn record_module_failure(
+    runtime: &AgentRuntimeControl,
+    owner: &ModuleInstanceId,
+    consecutive_failures: &mut [u32],
+    index: usize,
+    phase: &'static str,
+    message: String,
+) -> u32 {
+    let failures = consecutive_failures[index].saturating_add(1);
+    consecutive_failures[index] = failures;
+    runtime
+        .record_module_status(
+            owner.clone(),
+            ModuleRunStatus::Failed {
+                phase: phase.to_string(),
+                message: message.clone(),
+            },
+        )
+        .await;
+    runtime.record_module_task_failed(owner.clone(), phase, message);
+    failures
+}
+
+async fn stop_module(
+    runtime: &AgentRuntimeControl,
+    owner: &ModuleInstanceId,
+    states: &mut [ModuleState],
+    index: usize,
+    phase: String,
+    message: String,
+    consecutive_failures: u32,
+) {
+    runtime
+        .record_module_status(
+            owner.clone(),
+            ModuleRunStatus::Stopped {
+                phase: phase.clone(),
+                message: message.clone(),
+                consecutive_failures,
+            },
+        )
+        .await;
+    runtime.record_module_stopped(
+        owner.clone(),
+        phase.clone(),
+        message.clone(),
+        consecutive_failures,
+    );
+    states[index] = ModuleState::Stopped {
+        phase,
+        message,
+        consecutive_failures,
+    };
 }
 
 fn notify_pending_and_ready(mut pending_kicks: Vec<Kick>, kick_inbox: &mut KickInbox) {
@@ -1078,7 +1228,9 @@ async fn collect_dependency_flush_completions(
                 pending_kicks.push(kick);
                 completions.push(completion);
             }
-            ModuleState::Stored { .. } | ModuleState::WaitingForActivation => {}
+            ModuleState::Stored { .. }
+            | ModuleState::WaitingForActivation
+            | ModuleState::Stopped { .. } => {}
         }
     }
     completions
@@ -1529,6 +1681,9 @@ async fn activate_with_retries(
 fn is_idle(active: &[bool], states: &[ModuleState]) -> bool {
     let mut active_count = 0_usize;
     for (is_active, state) in active.iter().copied().zip(states) {
+        if matches!(state, ModuleState::Stopped { .. }) {
+            continue;
+        }
         if !is_active {
             continue;
         }
@@ -1542,7 +1697,7 @@ fn is_idle(active: &[bool], states: &[ModuleState]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEventLoopConfig, SchedulerError};
+    use super::AgentEventLoopConfig;
 
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
@@ -1575,6 +1730,7 @@ mod tests {
         AgentEventLoopConfig {
             idle_threshold: std::time::Duration::from_millis(50),
             activate_retries: 2,
+            module_failure_limit: 3,
         }
     }
 
@@ -2151,6 +2307,126 @@ mod tests {
             _batch: &Self::Batch,
         ) -> anyhow::Result<()> {
             anyhow::bail!("permanent activation failure")
+        }
+    }
+
+    struct FailsFirstConstructedActivation {
+        memo: Memo,
+        on_done: Rc<RefCell<Option<oneshot::Sender<()>>>>,
+        batch_sent: bool,
+        fail_this_instance: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailsFirstConstructedActivation {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "fails-first-constructed-activation"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test restartable activation")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if self.fail_this_instance {
+                anyhow::bail!("first constructed instance fails");
+            }
+            self.memo.write("restarted instance activated").await;
+            if let Some(done) = self.on_done.borrow_mut().take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct FailsFirstConstructedBatch {
+        on_done: Rc<RefCell<Option<oneshot::Sender<()>>>>,
+        fail_this_instance: bool,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for FailsFirstConstructedBatch {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "fails-first-constructed-batch"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test restartable batch")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.fail_this_instance {
+                anyhow::bail!("first constructed next_batch fails");
+            }
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(done) = self.on_done.borrow_mut().take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct StopAfterOneFailureDependency {
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for StopAfterOneFailureDependency {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "stop-after-one-failure-dependency"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test stopped dependency")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("dependency stops on first failure")
         }
     }
 
@@ -4210,6 +4486,7 @@ mod tests {
                     AgentEventLoopConfig {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 2,
+                        module_failure_limit: 3,
                     },
                     async move {
                         let _ = done_rx.await;
@@ -4229,11 +4506,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn activation_retry_exhaustion_fails_runtime() {
+    async fn activation_retry_exhaustion_stops_module_after_failure_limit() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let fail_id = ModuleId::new(AlwaysFailStub::id()).unwrap();
+                let owner =
+                    nuillu_types::ModuleInstanceId::new(fail_id.clone(), ReplicaIndex::ZERO);
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(fail_id.clone(), ModuleConfig::default());
                 alloc.set_activation(fail_id.clone(), ActivationRatio::ONE);
@@ -4250,32 +4529,251 @@ mod tests {
                     .await
                     .unwrap();
 
-                let err = super::run(
+                let shutdown_blackboard = blackboard.clone();
+                let shutdown_owner = owner.clone();
+                super::run(
                     modules,
                     AgentEventLoopConfig {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 1,
+                        module_failure_limit: 3,
                     },
-                    std::future::pending::<()>(),
+                    async move {
+                        loop {
+                            let stopped = shutdown_blackboard
+                                .read(|bb| {
+                                    matches!(
+                                        bb.module_status_for_instance(&shutdown_owner),
+                                        Some(ModuleRunStatus::Stopped { .. })
+                                    )
+                                })
+                                .await;
+                            if stopped {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    },
                 )
                 .await
-                .unwrap_err();
-
-                assert!(matches!(
-                    err,
-                    SchedulerError::ModuleTaskFailed { owner, phase: "activate", message }
-                        if owner.module == fail_id
-                            && message.contains("permanent activation failure")
-                ));
-                let owner =
-                    nuillu_types::ModuleInstanceId::new(fail_id, nuillu_types::ReplicaIndex::ZERO);
+                .expect("scheduler should keep running until shutdown after module stop");
                 assert!(matches!(
                     blackboard
                         .read(|bb| bb.module_status_for_instance(&owner).cloned())
                         .await,
-                    Some(ModuleRunStatus::Failed { phase, message })
-                        if phase == "activate" && message.contains("permanent activation failure")
+                    Some(ModuleRunStatus::Stopped { phase, message, consecutive_failures })
+                        if phase == "activate"
+                            && message.contains("permanent activation failure")
+                            && consecutive_failures == 3
                 ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn activation_failure_restarts_only_failed_module_and_then_succeeds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(FailsFirstConstructedActivation::id()).unwrap();
+                let owner = ModuleInstanceId::new(module_id.clone(), ReplicaIndex::ZERO);
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let constructions = Rc::new(Cell::new(0_u32));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let constructions = Rc::clone(&constructions);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| {
+                                let construction = constructions.get();
+                                constructions.set(construction.saturating_add(1));
+                                FailsFirstConstructedActivation {
+                                    memo: caps.memo(),
+                                    on_done: Rc::clone(&done_tx),
+                                    batch_sent: false,
+                                    fail_this_instance: construction == 0,
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        idle_threshold: std::time::Duration::from_millis(50),
+                        activate_retries: 0,
+                        module_failure_limit: 3,
+                    },
+                    async move {
+                        let _ = done_rx.await;
+                    },
+                )
+                .await
+                .expect("scheduler should continue through module restart");
+
+                assert_eq!(constructions.get(), 2);
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(logs.iter().any(|record| {
+                    record.owner == owner && record.content == "restarted instance activated"
+                }));
+                let status = blackboard
+                    .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                    .await;
+                assert!(!matches!(status, Some(ModuleRunStatus::Stopped { .. })));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn next_batch_failure_restarts_module_and_then_succeeds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(FailsFirstConstructedBatch::id()).unwrap();
+                let owner = ModuleInstanceId::new(module_id.clone(), ReplicaIndex::ZERO);
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let constructions = Rc::new(Cell::new(0_u32));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let constructions = Rc::clone(&constructions);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |_| {
+                                let construction = constructions.get();
+                                constructions.set(construction.saturating_add(1));
+                                FailsFirstConstructedBatch {
+                                    on_done: Rc::clone(&done_tx),
+                                    fail_this_instance: construction == 0,
+                                    batch_sent: false,
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        idle_threshold: std::time::Duration::from_millis(50),
+                        activate_retries: 0,
+                        module_failure_limit: 3,
+                    },
+                    async move {
+                        let _ = done_rx.await;
+                    },
+                )
+                .await
+                .expect("scheduler should restart after next_batch failure");
+
+                assert_eq!(constructions.get(), 2);
+                assert!(!matches!(
+                    blackboard
+                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
+                        .await,
+                    Some(ModuleRunStatus::Stopped { .. })
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn stopped_dependency_does_not_block_dependent_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(StopAfterOneFailureDependency::id()).unwrap();
+                let dependent_id = ModuleId::new(ReleasedDependentModule::id()).unwrap();
+                let dependency_owner =
+                    ModuleInstanceId::new(dependency_id.clone(), ReplicaIndex::ZERO);
+                let mut alloc = ResourceAllocation::default();
+                for module in [dependency_id.clone(), dependent_id.clone()] {
+                    alloc.set(module.clone(), ModuleConfig::default());
+                    alloc.set_activation(module, ActivationRatio::ONE);
+                }
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard.clone());
+                let (release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| StopAfterOneFailureDependency { batch_sent: false },
+                    )
+                    .unwrap()
+                    .register(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let release_rx = Rc::clone(&release_rx);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |_| ReleasedDependentModule {
+                                release: release_rx.borrow_mut().take(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id, dependency_id)
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                let shutdown_blackboard = blackboard.clone();
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        idle_threshold: std::time::Duration::from_millis(50),
+                        activate_retries: 0,
+                        module_failure_limit: 1,
+                    },
+                    async move {
+                        loop {
+                            let stopped = shutdown_blackboard
+                                .read(|bb| {
+                                    matches!(
+                                        bb.module_status_for_instance(&dependency_owner),
+                                        Some(ModuleRunStatus::Stopped { .. })
+                                    )
+                                })
+                                .await;
+                            if stopped {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                        let _ = release_tx.send(());
+                        let _ = done_rx.await;
+                    },
+                )
+                .await
+                .expect("stopped dependency should not block dependent activation");
             })
             .await;
     }
@@ -5265,7 +5763,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn activation_failure_noops_ready_kicks_before_reporting_error() {
+    async fn activation_failure_noops_ready_kicks_before_module_restart() {
         use futures::StreamExt as _;
 
         let local = LocalSet::new();
@@ -5343,7 +5841,8 @@ mod tests {
                 let mut followup_tasks = futures::stream::FuturesUnordered::new();
                 let mut zero_window_wakers = vec![None];
                 let mut zero_windows = super::ZeroReplicaWindows::new(HashMap::new());
-                let err = super::handle_task_message(
+                let mut consecutive_failures = vec![0_u32];
+                super::handle_task_message(
                     message,
                     &runtime,
                     std::slice::from_ref(&owner),
@@ -5355,20 +5854,18 @@ mod tests {
                     &dependency_targets,
                     &HashMap::new(),
                     &mut zero_windows,
+                    &mut consecutive_failures,
                     test_config(),
                     &parent,
                     &subscriber,
                 )
                 .await
-                .expect_err("activation failure should be reported");
-                assert!(matches!(
-                    err,
-                    SchedulerError::ModuleTaskFailed { phase: "activate", message, .. }
-                        if message.contains("planned activation failure")
-                ));
+                .expect("activation failure should be handled by module restart");
+                assert_eq!(consecutive_failures[0], 1);
+                assert!(matches!(states[0], super::ModuleState::Stored { .. }));
                 completion
                     .await
-                    .expect("ready kick should be completed before activation error escapes");
+                    .expect("ready kick should be completed before activation restart");
             })
             .await;
     }
@@ -5471,6 +5968,7 @@ mod tests {
                     AgentEventLoopConfig {
                         idle_threshold: std::time::Duration::from_millis(10),
                         activate_retries: 0,
+                        module_failure_limit: 3,
                     },
                     async move {
                         let _ = done_rx.await;

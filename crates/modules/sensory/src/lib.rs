@@ -1023,6 +1023,7 @@ mod tests {
             nuillu_agent::AgentEventLoopConfig {
                 idle_threshold: Duration::from_millis(50),
                 activate_retries,
+                module_failure_limit: 3,
             },
             body,
         )
@@ -1464,6 +1465,7 @@ mod tests {
                     nuillu_agent::AgentEventLoopConfig {
                         idle_threshold: Duration::from_millis(50),
                         activate_retries: 0,
+                        module_failure_limit: 3,
                     },
                     async {
                         sensory
