@@ -1,10 +1,13 @@
 use std::time::Duration;
 
-use nuillu_blackboard::{Blackboard, BlackboardInner, ResourceAllocation, ZeroReplicaWindowPolicy};
+use nuillu_blackboard::{
+    Blackboard, BlackboardInner, InteroceptiveMode, InteroceptiveState, ResourceAllocation,
+    ZeroReplicaWindowPolicy,
+};
 use nuillu_memory::{LinkedMemoryRecord, MemoryRecord, MemoryStore};
 use nuillu_types::{MemoryRank, ModelTier};
 use nuillu_visualizer_protocol::{
-    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView,
+    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
     LinkedMemoryRecordView, MemoView, MemoryConceptView, MemoryLinkView, MemoryMetadataView,
     MemoryRecordView, MemoryTagView, ModulePolicyView, ModuleStatusView, UtteranceProgressView,
     VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
@@ -160,6 +163,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             })
             .collect(),
         allocation: allocation_views(bb.allocation()),
+        interoception: interoception_view(bb.interoception()),
         module_policies: module_policy_views(bb),
         forced_disabled_modules: {
             let mut modules = bb
@@ -210,6 +214,27 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             })
             .collect(),
         memory_metadata: memory_metadata_views(bb),
+    }
+}
+
+fn interoception_view(state: &InteroceptiveState) -> InteroceptionView {
+    InteroceptionView {
+        mode: interoceptive_mode_name(state.mode).to_owned(),
+        wake_arousal: state.wake_arousal,
+        nrem_pressure: state.nrem_pressure,
+        rem_pressure: state.rem_pressure,
+        affect_arousal: state.affect_arousal,
+        valence: state.valence,
+        emotion: state.emotion.clone(),
+        last_updated: state.last_updated,
+    }
+}
+
+fn interoceptive_mode_name(mode: InteroceptiveMode) -> &'static str {
+    match mode {
+        InteroceptiveMode::Wake => "wake",
+        InteroceptiveMode::NremPressure => "nrem_pressure",
+        InteroceptiveMode::RemPressure => "rem_pressure",
     }
 }
 
@@ -302,4 +327,48 @@ pub fn duration_millis_u64(duration: Duration) -> u64 {
 pub fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
     let seconds = cooldown.as_secs_f64();
     (seconds.is_finite() && seconds > 0.0).then_some(60.0 / seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use nuillu_blackboard::{BlackboardCommand, InteroceptivePatch};
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn visualizer_snapshot_includes_interoception() {
+        let blackboard = Blackboard::new();
+        let now = DateTime::<Utc>::from_timestamp(42, 0).unwrap();
+        blackboard
+            .apply(BlackboardCommand::UpdateInteroceptive {
+                patch: InteroceptivePatch {
+                    mode: Some(InteroceptiveMode::NremPressure),
+                    wake_arousal: Some(0.25),
+                    nrem_pressure: Some(0.75),
+                    rem_pressure: Some(0.15),
+                    affect_arousal: Some(0.4),
+                    valence: Some(-0.5),
+                    emotion: Some("drowsy".to_string()),
+                },
+                now,
+            })
+            .await;
+
+        let snapshot = blackboard.read(visualizer_blackboard_snapshot).await;
+
+        assert_eq!(
+            snapshot.interoception,
+            InteroceptionView {
+                mode: "nrem_pressure".to_string(),
+                wake_arousal: 0.25,
+                nrem_pressure: 0.75,
+                rem_pressure: 0.15,
+                affect_arousal: 0.4,
+                valence: -0.5,
+                emotion: "drowsy".to_string(),
+                last_updated: now,
+            }
+        );
+    }
 }

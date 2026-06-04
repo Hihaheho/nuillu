@@ -475,6 +475,8 @@ pub struct BlackboardSnapshot {
     pub module_statuses: Vec<ModuleStatusView>,
     pub allocation: Vec<AllocationView>,
     #[serde(default)]
+    pub interoception: InteroceptionView,
+    #[serde(default)]
     pub module_policies: Vec<ModulePolicyView>,
     #[serde(default)]
     pub forced_disabled_modules: Vec<String>,
@@ -503,6 +505,34 @@ pub struct AllocationView {
     pub cooldown_ms: Option<u64>,
     pub tier: String,
     pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteroceptionView {
+    pub mode: String,
+    pub wake_arousal: f32,
+    pub nrem_pressure: f32,
+    pub rem_pressure: f32,
+    pub affect_arousal: f32,
+    pub valence: f32,
+    pub emotion: String,
+    pub last_updated: DateTime<Utc>,
+}
+
+impl Default for InteroceptionView {
+    fn default() -> Self {
+        Self {
+            mode: "wake".to_string(),
+            wake_arousal: 0.0,
+            nrem_pressure: 0.0,
+            rem_pressure: 0.0,
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
+            last_updated: DateTime::<Utc>::from_timestamp(0, 0)
+                .expect("unix epoch timestamp is valid"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1023,6 +1053,22 @@ mod tests {
                 },
             } if module == "predict"
         ));
+    }
+
+    #[test]
+    fn blackboard_snapshot_defaults_missing_interoception() {
+        let json = r#"{
+            "module_statuses": [],
+            "allocation": [],
+            "memos": [],
+            "cognition_logs": [],
+            "utterance_progresses": [],
+            "memory_metadata": []
+        }"#;
+
+        let actual: BlackboardSnapshot = serde_json::from_str(json).unwrap();
+
+        assert_eq!(actual.interoception, InteroceptionView::default());
     }
 
     #[test]

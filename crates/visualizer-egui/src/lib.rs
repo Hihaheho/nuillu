@@ -6,6 +6,7 @@ pub mod memories;
 pub mod memos;
 pub mod module_filter;
 pub mod modules;
+pub mod resource_monitor;
 pub mod text;
 pub mod window;
 
@@ -15,6 +16,7 @@ pub use egui_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Instant;
 
 use nuillu_module::RuntimeEvent;
 pub use nuillu_visualizer_protocol::*;
@@ -208,6 +210,7 @@ impl VisualizerState {
             }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);
+                tab.record_runtime_event_for_monitor(&event);
                 modules::apply_runtime_event(&mut tab.modules, &event);
                 tab.runtime_events.push_back(event);
                 if tab.runtime_events.len() > 256 {
@@ -229,6 +232,7 @@ impl VisualizerState {
             }
             VisualizerEvent::BlackboardSnapshot { tab_id, snapshot } => {
                 let tab = self.tab_mut(tab_id);
+                tab.record_snapshot_for_monitor(&snapshot);
                 modules::apply_blackboard_snapshot(&mut tab.modules, &snapshot);
                 tab.blackboard = snapshot;
             }
@@ -295,6 +299,7 @@ pub struct RuntimeTab {
     blackboard: BlackboardSnapshot,
     memories: memories::MemoriesState,
     modules: modules::ModulesState,
+    resource_monitor: resource_monitor::ResourceMonitorState,
     runtime_events: VecDeque<RuntimeEvent>,
     errors: VecDeque<VisualizerErrorView>,
     logs: VecDeque<String>,
@@ -302,6 +307,8 @@ pub struct RuntimeTab {
     window_requests: BTreeMap<String, bool>,
     memos_module_filter: module_filter::ModuleFilterState,
     llm_turns_module_filter: module_filter::ModuleFilterState,
+    resource_monitor_module_filter: module_filter::ModuleFilterState,
+    resource_monitor_started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +335,7 @@ impl RuntimeTab {
             blackboard: BlackboardSnapshot::default(),
             memories: memories::MemoriesState::default(),
             modules: modules::ModulesState::default(),
+            resource_monitor: resource_monitor::ResourceMonitorState::default(),
             runtime_events: VecDeque::new(),
             errors: VecDeque::new(),
             logs: VecDeque::new(),
@@ -335,6 +343,8 @@ impl RuntimeTab {
             window_requests: BTreeMap::new(),
             memos_module_filter: module_filter::ModuleFilterState::default(),
             llm_turns_module_filter: module_filter::ModuleFilterState::default(),
+            resource_monitor_module_filter: module_filter::ModuleFilterState::default(),
+            resource_monitor_started_at: Instant::now(),
         }
     }
 
@@ -429,6 +439,12 @@ impl RuntimeTab {
             ViewWindowSpec {
                 id: format!("{base}:logs"),
                 title: format!("📜 Logs - {}", self.title),
+                default_open: true,
+                kind: ViewWindowKind::Normal,
+            },
+            ViewWindowSpec {
+                id: format!("{base}:resource-monitor"),
+                title: format!("Resource Monitor - {}", self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
@@ -558,6 +574,25 @@ impl RuntimeTab {
             .show(ui, |ui| self.logs_ui(ui));
         self.record_window_open(logs_id, open);
 
+        let resource_monitor_id = format!("{base}:resource-monitor");
+        let resource_monitor_title = format!("Resource Monitor - {}", self.title);
+        let resource_monitor_modules = self.resource_monitor_modules();
+        let resource_monitor_now_secs = self.resource_monitor_elapsed_secs();
+        let open = window::PersistedWindow::new(&resource_monitor_id, &resource_monitor_title)
+            .open_override(window_requests.remove(&resource_monitor_id))
+            .default_pos(1232.0, 1020.0)
+            .default_size(760.0, 560.0)
+            .show(ui, |ui| {
+                resource_monitor::ui(
+                    ui,
+                    &mut self.resource_monitor,
+                    &mut self.resource_monitor_module_filter,
+                    &resource_monitor_modules,
+                    resource_monitor_now_secs,
+                )
+            });
+        self.record_window_open(resource_monitor_id, open);
+
         let modules_id = format!("{base}:modules");
         let modules_title = format!("Modules - {}", self.title);
         let mut requested_module = None;
@@ -640,6 +675,30 @@ impl RuntimeTab {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn resource_monitor_modules(&self) -> Vec<String> {
+        self.modules
+            .module_names()
+            .into_iter()
+            .chain(self.resource_monitor.module_names())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn record_runtime_event_for_monitor(&mut self, event: &RuntimeEvent) {
+        self.resource_monitor
+            .record_runtime_event_at(event, self.resource_monitor_elapsed_secs());
+    }
+
+    fn record_snapshot_for_monitor(&mut self, snapshot: &BlackboardSnapshot) {
+        self.resource_monitor
+            .record_snapshot_at(snapshot, self.resource_monitor_elapsed_secs());
+    }
+
+    fn resource_monitor_elapsed_secs(&self) -> f64 {
+        self.resource_monitor_started_at.elapsed().as_secs_f64()
     }
 
     fn push_log(&mut self, message: String) {

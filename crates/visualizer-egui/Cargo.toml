@@ -19,6 +19,7 @@ chrono = { workspace = true }
 eframe = { version = "0.34.2", features = ["persistence"] }
 egui = "0.34.2"
 egui_hooks = { version = "0.11.0", features = ["persistence"] }
+egui_plot = "0.35.0"
 nuillu-module = { workspace = true }
 nuillu-types = { workspace = true }
 nuillu-visualizer-protocol = { workspace = true }
