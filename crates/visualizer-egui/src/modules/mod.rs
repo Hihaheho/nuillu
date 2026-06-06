@@ -152,6 +152,12 @@ pub enum ModuleOverviewAction {
     SetModuleSettings { settings: ModuleSettingsView },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveReplicaHighlight {
+    AllocationDriven,
+    MinReplicaDriven,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct OpenModuleConfig {
     module: String,
@@ -1035,7 +1041,7 @@ fn overview_row(
             overview_disable_cell(ui, row, actions);
             overview_config_cell(ui, row, open_config);
             overview_module_cell(ui, row, actions);
-            overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
+            overview_replica_cell(ui, row);
             overview_label_cell(
                 ui,
                 &row.activation_ratio
@@ -1333,6 +1339,34 @@ fn overview_module_cell(
     }
 }
 
+fn overview_replica_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
+    let Some(highlight) = active_replica_highlight(row) else {
+        overview_label_cell(ui, &replica_label(row), None, REPLICA_COLUMN_WIDTH);
+        return;
+    };
+
+    let visuals = ui.visuals();
+    let (fill, stroke, hover) = match highlight {
+        ActiveReplicaHighlight::AllocationDriven => (
+            Some(visuals.selection.bg_fill.linear_multiply(0.55)),
+            visuals.selection.stroke,
+            "Allocation-active replica",
+        ),
+        ActiveReplicaHighlight::MinReplicaDriven => (
+            None,
+            egui::Stroke::new(1.0, visuals.weak_text_color()),
+            "Minimum replica kept active",
+        ),
+    };
+    let frame = egui::Frame::new()
+        .fill(fill.unwrap_or(egui::Color32::TRANSPARENT))
+        .stroke(stroke)
+        .inner_margin(egui::Margin::same(0));
+    frame.show(ui, |ui| {
+        overview_label_cell(ui, &replica_label(row), Some(hover), REPLICA_COLUMN_WIDTH);
+    });
+}
+
 fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width: f32) {
     let response = ui.add_sized(
         [width, OVERVIEW_ROW_HEIGHT],
@@ -1408,6 +1442,18 @@ fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
         || row.error_count > 0
         || row.last_execution_failed
         || !matches!(row.runtime_status.as_str(), "Inactive" | "not reported")
+}
+
+fn active_replica_highlight(row: &ModuleOverviewRow) -> Option<ActiveReplicaHighlight> {
+    if !row.active {
+        return None;
+    }
+    let ratio = row.activation_ratio?;
+    if ratio > 0.0 {
+        Some(ActiveReplicaHighlight::AllocationDriven)
+    } else {
+        Some(ActiveReplicaHighlight::MinReplicaDriven)
+    }
 }
 
 fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
@@ -1809,6 +1855,59 @@ mod tests {
     use super::*;
     use crate::{LlmObservationSource, LlmUsageView};
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
+
+    fn overview_row_for_highlight(
+        active: bool,
+        activation_ratio: Option<f64>,
+    ) -> ModuleOverviewRow {
+        ModuleOverviewRow {
+            owner: "sensory".to_string(),
+            module: "sensory".to_string(),
+            replica: 0,
+            active,
+            forced_disabled: false,
+            runtime_status: "Activating".to_string(),
+            llm_status: "idle".to_string(),
+            activation_ratio,
+            active_replicas: active.then_some(1),
+            tier: Some("Default".to_string()),
+            guidance: None,
+            bpm: None,
+            cooldown_ms: None,
+            policy: None,
+            throttle: None,
+            latest_llm_output: None,
+            error_count: 0,
+            last_execution_failed: false,
+        }
+    }
+
+    #[test]
+    fn active_replica_highlight_distinguishes_allocation_and_min_replicas() {
+        assert_eq!(
+            active_replica_highlight(&overview_row_for_highlight(true, Some(0.75))),
+            Some(ActiveReplicaHighlight::AllocationDriven)
+        );
+        assert_eq!(
+            active_replica_highlight(&overview_row_for_highlight(true, Some(0.0))),
+            Some(ActiveReplicaHighlight::MinReplicaDriven)
+        );
+        assert_eq!(
+            active_replica_highlight(&overview_row_for_highlight(false, Some(0.75))),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_row_keeps_active_replica_highlight() {
+        let mut row = overview_row_for_highlight(true, Some(0.75));
+        row.last_execution_failed = true;
+
+        assert_eq!(
+            active_replica_highlight(&row),
+            Some(ActiveReplicaHighlight::AllocationDriven)
+        );
+    }
 
     #[test]
     fn observation_events_update_module_stream_state() {
