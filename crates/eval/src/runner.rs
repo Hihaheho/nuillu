@@ -4768,7 +4768,7 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        // Rare; runs on interoceptive state changes and reads allocation guidance as context.
+        // Rare; runs on interoceptive state changes.
         EvalModule::MemoryCompaction => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
@@ -4780,7 +4780,6 @@ fn register_eval_module(
                         async move {
                             Ok(nuillu_memory::MemoryCompactionModule::new(
                                 caps.interoception_updated_inbox(),
-                                caps.allocation_reader(),
                                 caps.blackboard_reader(),
                                 memory_caps.compactor(),
                                 caps.llm_access(),
@@ -4801,7 +4800,6 @@ fn register_eval_module(
                         async move {
                             Ok(nuillu_memory::MemoryAssociationModule::new(
                                 caps.interoception_updated_inbox(),
-                                caps.allocation_reader(),
                                 caps.blackboard_reader(),
                                 memory_caps.content_reader(),
                                 memory_caps.writer(),

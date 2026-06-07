@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{ModelInput, TextStepOutcomeWithTools, ToolResult};
-use nuillu_module::{
-    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
-};
+use nuillu_module::{BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module};
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,15 +14,20 @@ use crate::memory::{
 use crate::store::MemoryCompactor;
 
 const SYSTEM_PROMPT: &str = r#"You are the memory-compaction module.
-Inspect memory metadata, fetch source contents when useful, and perform destructive NREM-like
-consolidation. Compaction output is one replacement summary memory; source memories are removed
-from live retrieval after the replacement is written. Use merge_memories only when multiple source
-memories are redundant enough that preserving them separately adds noise. Do not create
-memory-to-memory links here; non-destructive relationship work belongs to memory-association. Do
-not collapse evidence into a single current fact.
+Inspect candidate memories, fetch source contents when useful, and consolidate memories whose
+contents overlap enough that preserving them separately adds retrieval noise. Compatible variations
+around the same subject, object, preference, or procedure can be merged when one concise summary
+preserves the useful distinctions. Keep memories separate when they contain unrelated subjects,
+conflicting evidence, or details that would be lost in a summary. Compaction output is one
+replacement summary memory; source memories are removed from live retrieval after the replacement is
+written. Do not create memory-to-memory links here. Do not collapse evidence into a single current
+fact.
 
-Tool input rules: merge_memories takes source_indexes, merged_content, concepts, and tags only.
-The runtime chooses the merged rank and decay from the source memory metadata."#;
+The candidate list is the maintenance work item. When multiple candidates are present, inspect their
+contents with get_memories before deciding whether to merge or leave them unchanged.
+
+Tool input rules: merge_memories takes source_indexes, merged_content, concepts, and tags only. The
+runtime chooses the merged rank, decay, and storage metadata."#;
 
 #[lutum::tool_input(name = "get_memories", output = GetMemoriesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -58,7 +61,6 @@ pub enum CompactionTools {
 pub struct MemoryCompactionModule {
     owner: nuillu_types::ModuleId,
     interoception_updates: InteroceptiveUpdatedInbox,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     compactor: MemoryCompactor,
     llm: LlmAccess,
@@ -68,7 +70,6 @@ pub struct MemoryCompactionModule {
 impl MemoryCompactionModule {
     pub fn new(
         interoception_updates: InteroceptiveUpdatedInbox,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         compactor: MemoryCompactor,
         llm: LlmAccess,
@@ -77,7 +78,6 @@ impl MemoryCompactionModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("memory-compaction id is valid"),
             interoception_updates,
-            allocation,
             blackboard,
             compactor,
             llm,
@@ -113,32 +113,16 @@ impl MemoryCompactionModule {
                             .occurred_at
                             .map(|at| at.to_rfc3339())
                             .unwrap_or_else(|| "unknown".to_owned()),
-                        decay_remaining_secs: item.decay_remaining_secs,
-                        access_count: item.access_count,
-                        use_count: item.use_count,
-                        reinforcement_count: item.reinforcement_count,
                     })
                     .collect::<Vec<_>>();
                 metadata.sort_by(|left, right| left.index.cmp(&right.index));
                 metadata
             })
             .await;
-        let allocation = self.allocation.snapshot().await;
-        let allocation_guidance = allocation
-            .iter()
-            .filter_map(|(id, config)| {
-                let guidance = config.guidance.trim();
-                (!guidance.is_empty()).then(|| (id.to_string(), guidance.to_owned()))
-            })
-            .collect::<Vec<_>>();
 
-        let mut input =
-            ModelInput::new()
-                .system(self.system_prompt(cx))
-                .user(format_compaction_context(
-                    &memory_metadata,
-                    &allocation_guidance,
-                ));
+        let mut input = ModelInput::new()
+            .system(self.system_prompt(cx))
+            .user(format_compaction_context(&memory_metadata));
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;
@@ -264,34 +248,17 @@ impl MemoryCompactionModule {
     }
 }
 
-fn format_compaction_context(
-    memory_metadata: &[MemoryMetadataContext],
-    allocation_guidance: &[(String, String)],
-) -> String {
+fn format_compaction_context(memory_metadata: &[MemoryMetadataContext]) -> String {
     let mut out = String::from("Memory compaction context.");
-    out.push_str("\n\nMemory metadata candidates:");
+    out.push_str("\n\nMemory candidates:");
     if memory_metadata.is_empty() {
         out.push_str("\n- none");
     } else {
         for item in memory_metadata {
             out.push_str(&format!(
-                "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}; use_count={}; reinforcement_count={}",
-                item.index,
-                item.rank,
-                item.occurred_at,
-                item.decay_remaining_secs,
-                item.access_count,
-                item.use_count,
-                item.reinforcement_count
+                "\n- {}: rank={:?}; occurred_at={}",
+                item.index, item.rank, item.occurred_at
             ));
-        }
-    }
-    out.push_str("\n\nCurrent compaction guidance:");
-    if allocation_guidance.is_empty() {
-        out.push_str("\n- none");
-    } else {
-        for (id, guidance) in allocation_guidance {
-            out.push_str(&format!("\n- {id}: {guidance}"));
         }
     }
     out
@@ -358,5 +325,23 @@ mod tests {
             schema.pointer("/properties/tags/items/type"),
             Some(&serde_json::json!("string"))
         );
+    }
+
+    #[test]
+    fn compaction_context_exposes_only_candidate_identity() {
+        let context = format_compaction_context(&[MemoryMetadataContext {
+            index: "mem-1".to_owned(),
+            rank: MemoryRank::ShortTerm,
+            occurred_at: "2026-06-07T00:00:00Z".to_owned(),
+        }]);
+
+        assert_eq!(
+            context,
+            "Memory compaction context.\n\nMemory candidates:\n- mem-1: rank=ShortTerm; occurred_at=2026-06-07T00:00:00Z"
+        );
+        assert!(!context.contains("guidance"));
+        assert!(!context.contains("decay_remaining_secs"));
+        assert!(!context.contains("access_count"));
+        assert!(!context.contains("reinforcement_count"));
     }
 }

@@ -11,13 +11,9 @@ pub struct MemoryContentView {
     pub content: String,
     pub rank: MemoryRank,
     pub occurred_at: Option<DateTime<Utc>>,
-    pub stored_at: DateTime<Utc>,
     pub kind: MemoryKind,
     pub concepts: Vec<MemoryConcept>,
     pub tags: Vec<MemoryTag>,
-    pub affect_arousal: f32,
-    pub valence: f32,
-    pub emotion: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -30,10 +26,6 @@ pub(crate) struct MemoryMetadataContext {
     pub(crate) index: String,
     pub(crate) rank: MemoryRank,
     pub(crate) occurred_at: String,
-    pub(crate) decay_remaining_secs: i64,
-    pub(crate) access_count: u32,
-    pub(crate) use_count: u32,
-    pub(crate) reinforcement_count: u32,
 }
 
 pub(crate) fn memory_record_to_view(record: MemoryRecord) -> MemoryContentView {
@@ -42,12 +34,45 @@ pub(crate) fn memory_record_to_view(record: MemoryRecord) -> MemoryContentView {
         content: record.content.as_str().to_owned(),
         rank: record.rank,
         occurred_at: record.occurred_at,
-        stored_at: record.stored_at,
         kind: record.kind,
         concepts: record.concepts,
         tags: record.tags,
-        affect_arousal: record.affect_arousal,
-        valence: record.valence,
-        emotion: record.emotion,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_content_view_schema_exposes_only_memory_evidence_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(GetMemoriesOutput))
+            .expect("get memories schema should serialize");
+        let memory_properties = schema
+            .pointer("/$defs/MemoryContentView/properties")
+            .expect("memory content view properties should exist");
+
+        assert_eq!(
+            memory_properties.pointer("/index/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            memory_properties.pointer("/content/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            memory_properties.pointer("/rank/$ref"),
+            Some(&serde_json::json!("#/$defs/MemoryRank"))
+        );
+        assert_eq!(
+            memory_properties.pointer("/kind/$ref"),
+            Some(&serde_json::json!("#/$defs/MemoryKind"))
+        );
+        assert!(memory_properties.pointer("/concepts").is_some());
+        assert!(memory_properties.pointer("/tags").is_some());
+        assert_eq!(memory_properties.pointer("/stored_at"), None);
+        assert_eq!(memory_properties.pointer("/affect_arousal"), None);
+        assert_eq!(memory_properties.pointer("/valence"), None);
+        assert_eq!(memory_properties.pointer("/emotion"), None);
     }
 }

@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lutum::{ModelInput, TextStepOutcomeWithTools, ToolResult};
-use nuillu_module::{
-    AllocationReader, BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module,
-};
+use nuillu_module::{BlackboardReader, InteroceptiveUpdatedInbox, LlmAccess, Module};
 use nuillu_types::{MemoryContent, MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -19,12 +17,16 @@ use crate::store::{
 };
 
 const SYSTEM_PROMPT: &str = r#"You are the memory-association module.
-Inspect memory metadata, fetch source contents when useful, and write non-destructive memory
+Inspect candidate memories, fetch source contents when useful, and write non-destructive memory
 associations. Source memories remain live. Use get_association_memories to inspect sources. Use
 write_association_summary when a reflection memory would help explain a group of source memories,
 and write_memory_links when only direct memory-to-memory relationships are needed. Links can state
 derived_from, updates, corrects, contradicts, supports, or related relationships justified by the
 source memories. Do not delete, rewrite, or compact source memories.
+
+The candidate list is the maintenance work item. When multiple candidates are present, inspect their
+contents with get_association_memories before deciding whether to write a summary, write links, or
+leave them unchanged.
 
 Tool input rules:
 - write_association_summary takes source_indexes, summary_content, concepts, and tags only.
@@ -85,7 +87,6 @@ pub enum AssociationTools {
 pub struct MemoryAssociationModule {
     owner: nuillu_types::ModuleId,
     interoception_updates: InteroceptiveUpdatedInbox,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     reader: MemoryContentReader,
     writer: MemoryWriter,
@@ -98,7 +99,6 @@ impl MemoryAssociationModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         interoception_updates: InteroceptiveUpdatedInbox,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         reader: MemoryContentReader,
         writer: MemoryWriter,
@@ -109,7 +109,6 @@ impl MemoryAssociationModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("memory-association id is valid"),
             interoception_updates,
-            allocation,
             blackboard,
             reader,
             writer,
@@ -147,32 +146,16 @@ impl MemoryAssociationModule {
                             .occurred_at
                             .map(|at| at.to_rfc3339())
                             .unwrap_or_else(|| "unknown".to_owned()),
-                        decay_remaining_secs: item.decay_remaining_secs,
-                        access_count: item.access_count,
-                        use_count: item.use_count,
-                        reinforcement_count: item.reinforcement_count,
                     })
                     .collect::<Vec<_>>();
                 metadata.sort_by(|left, right| left.index.cmp(&right.index));
                 metadata
             })
             .await;
-        let allocation = self.allocation.snapshot().await;
-        let allocation_guidance = allocation
-            .iter()
-            .filter_map(|(id, config)| {
-                let guidance = config.guidance.trim();
-                (!guidance.is_empty()).then(|| (id.to_string(), guidance.to_owned()))
-            })
-            .collect::<Vec<_>>();
 
-        let mut input =
-            ModelInput::new()
-                .system(self.system_prompt(cx))
-                .user(format_association_context(
-                    &memory_metadata,
-                    &allocation_guidance,
-                ));
+        let mut input = ModelInput::new()
+            .system(self.system_prompt(cx))
+            .user(format_association_context(&memory_metadata));
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;
@@ -361,34 +344,17 @@ impl MemoryAssociationModule {
     }
 }
 
-fn format_association_context(
-    memory_metadata: &[MemoryMetadataContext],
-    allocation_guidance: &[(String, String)],
-) -> String {
+fn format_association_context(memory_metadata: &[MemoryMetadataContext]) -> String {
     let mut out = String::from("Memory association context.");
-    out.push_str("\n\nMemory metadata candidates:");
+    out.push_str("\n\nMemory candidates:");
     if memory_metadata.is_empty() {
         out.push_str("\n- none");
     } else {
         for item in memory_metadata {
             out.push_str(&format!(
-                "\n- {}: rank={:?}; occurred_at={}; decay_remaining_secs={}; access_count={}; use_count={}; reinforcement_count={}",
-                item.index,
-                item.rank,
-                item.occurred_at,
-                item.decay_remaining_secs,
-                item.access_count,
-                item.use_count,
-                item.reinforcement_count
+                "\n- {}: rank={:?}; occurred_at={}",
+                item.index, item.rank, item.occurred_at
             ));
-        }
-    }
-    out.push_str("\n\nCurrent association guidance:");
-    if allocation_guidance.is_empty() {
-        out.push_str("\n- none");
-    } else {
-        for (id, guidance) in allocation_guidance {
-            out.push_str(&format!("\n- {id}: {guidance}"));
         }
     }
     out
@@ -446,6 +412,24 @@ mod tests {
             schema.pointer("/properties/tags/items/type"),
             Some(&serde_json::json!("string"))
         );
+    }
+
+    #[test]
+    fn association_context_exposes_only_candidate_identity() {
+        let context = format_association_context(&[MemoryMetadataContext {
+            index: "mem-1".to_owned(),
+            rank: MemoryRank::LongTerm,
+            occurred_at: "2026-06-07T00:00:00Z".to_owned(),
+        }]);
+
+        assert_eq!(
+            context,
+            "Memory association context.\n\nMemory candidates:\n- mem-1: rank=LongTerm; occurred_at=2026-06-07T00:00:00Z"
+        );
+        assert!(!context.contains("guidance"));
+        assert!(!context.contains("decay_remaining_secs"));
+        assert!(!context.contains("access_count"));
+        assert!(!context.contains("reinforcement_count"));
     }
 
     #[test]

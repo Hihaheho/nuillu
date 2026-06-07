@@ -186,7 +186,6 @@ fn register_server_module(
                 async move {
                     Ok(nuillu_memory::MemoryCompactionModule::new(
                         caps.interoception_updated_inbox(),
-                        caps.allocation_reader(),
                         caps.blackboard_reader(),
                         memory_caps.compactor(),
                         caps.llm_access(),
@@ -201,7 +200,6 @@ fn register_server_module(
                 async move {
                     Ok(nuillu_memory::MemoryAssociationModule::new(
                         caps.interoception_updated_inbox(),
-                        caps.allocation_reader(),
                         caps.blackboard_reader(),
                         memory_caps.content_reader(),
                         memory_caps.writer(),
