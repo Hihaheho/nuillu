@@ -1,0 +1,234 @@
+$frontmatter {
+  title: allocation の reprioritize_modules schema probe
+  description: allocation の reprioritize_modules tool schema を live LLM で比較し、schema-only 成功率、transport error、token usage、priority module 数を集計した記録。split-arrays ではなく ids-map を採用した理由と production patch の内容を残す。
+  tags = ["nuillu", "allocation", "eval", "llm", "schema", "devlog"]
+}
+
+"#": allocation の reprioritize_modules schema probe
+
+"lead" = ```markdown
+`docs/devlog/2026-06-04-server-greeting-no-response-investigation.eure` で見つかった allocation の `reprioritize_modules` schema 違反に対して、複数の候補 schema を live LLM に同条件で投げる probe を作った。
+
+結論として、実測上は `split-arrays`、`ids-map`、`primary-rest` がすべて transport error を除く schema-only 成功率 100% だった。ただし `split-arrays` は `priority_module_ids[i]` と `priority_hints[i]` の意味的対応を schema で保証できない。guidance を production で使う以上、この緩さを勝ちとみなすのは危険なので、rank は配列、hint は module id keyed map に分ける `ids-map` を採用した。
+```
+
+"toc".$toc = true
+
+@ "probe" {
+  "##": Probe 実装
+
+  "body" = ````markdown
+`crates/eval/src/bin/allocation-schema-probe.rs` を追加し、候補 schema ごとに同じ allocation 風 prompt と同じ backend で tool call を実行するようにした。
+
+実行例:
+
+```bash
+cargo run -p nuillu-eval --bin allocation-schema-probe -- \
+  --model-set configs/modelsets/eval.local.eure \
+  --trials 100 \
+  --schema split-arrays,ids-map,primary-rest
+```
+
+重要な実装条件:
+
+- `--trials 100` は schema 候補ごとの trial 数。
+- `--schema` は comma-separated の候補指定。`--only` は作らず、既存の `--schema` を使う。
+- backend は model-set の `cheap` を使う。
+- concurrency は backend の `max_concurrent_llm_calls` を使う。
+- transport error は schema failure に数えず、`success_rate = successes / evaluable_trials` で集計する。
+- report は `.tmp/allocation-schema-probe/probe-report.json` と `.tmp/allocation-schema-probe/probe-report.md` に出す。
+````
+}
+
+@ "success-condition" {
+  "##": 成功条件
+
+  "body" = ```markdown
+今回の probe は schema-only 判定にした。`speak` が先頭かどうか、実際の allocation 方針として良いかどうかは成功条件に含めない。
+
+成功条件:
+
+- tool call の args が候補 Rust 型に parse できる。
+- priority module id list が非空。
+- module id が登録済み target id の enum 内にある。
+
+ただし、この条件では `split-arrays` の hint/module 対応は検証できない。後述の採用判断ではこの点を別途考慮した。
+```
+}
+
+@ "candidates" {
+  "##": 比較候補
+
+  "body" = ```markdown
+比較した候補は、ranked module ids を構造的に保持する形式だけに限定した。
+
+| candidate | shape |
+|---|---|
+| `current` | `priority: [{ module_id, hint }]` |
+| `short-keys` | `priority: [{ id, reason }]` |
+| `split-arrays` | `priority_module_ids`, `priority_hints` |
+| `ids-map` | `priority_module_ids`, `hints_by_module` |
+| `primary-rest` | `primary_module_id`, `secondary_module_ids`, `hints_by_module` |
+
+最終比較 run では `split-arrays,ids-map,primary-rest` に絞った。
+```
+}
+
+@ "run" {
+  "##": 実測 run
+
+  "body" = ```markdown
+直近の `.tmp/allocation-schema-probe/probe-report.md` に残っている run:
+
+| item | value |
+|---|---|
+| generated_at | `2026-06-07T01:52:18.903822+00:00` |
+| model | `gemma4:e2b` (`gemma4-e2b`) |
+| max_concurrent_llm_calls | 16 |
+| trials_per_schema | 100 |
+| report winner | `split-arrays` |
+
+この report は production distance を `current < short-keys < split-arrays < ids-map < primary-rest` としていた時点のもの。semantic review 後、現在の probe code では production distance を `ids-map` 最小に更新している。
+```
+
+  "summary" = ```markdown
+| schema | successes | evaluable | attempted | transport_errors | success_rate | invalid_module_ids | tool_issues |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| split-arrays | 99 | 99 | 100 | 1 | 1.000 | 0 | 0 |
+| ids-map | 99 | 99 | 100 | 1 | 1.000 | 0 | 0 |
+| primary-rest | 99 | 99 | 100 | 1 | 1.000 | 0 | 0 |
+
+raw attempted で見ると各候補は `99 / 100 = 99%`。transport error を除く schema-only 成功率では全候補 `99 / 99 = 100%`。
+```
+}
+
+@ "usage" {
+  "##": Token usage と module 数
+
+  "tokens" = ```markdown
+| schema | samples | input avg | input p50 | input p95 | output avg | output p50 | output p95 | total avg | total p50 | total p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| split-arrays | 99 | 583.0 | 583 | 583 | 100.9 | 102 | 105 | 683.9 | 685 | 688 |
+| ids-map | 99 | 593.0 | 593 | 593 | 116.2 | 116 | 120 | 709.2 | 709 | 713 |
+| primary-rest | 99 | 669.0 | 669 | 669 | 134.5 | 141 | 144 | 803.5 | 810 | 813 |
+```
+
+  "module-counts" = ```markdown
+| schema | success samples | min | p05 | p50 | p95 | max | avg | module id counts |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| split-arrays | 99 | 2 | 2 | 3 | 3 | 3 | 2.8 | attention-schema=99, cognition-gate=84, speak=69, policy=30 |
+| ids-map | 99 | 2 | 2 | 2 | 2 | 2 | 2.0 | attention-schema=99, cognition-gate=99 |
+| primary-rest | 99 | 2 | 2 | 3 | 3 | 3 | 2.6 | attention-schema=99, cognition-gate=99, memory=56 |
+```
+
+  "note" = ```markdown
+module 数は多い分には困りにくいが、少なすぎる場合は downstream activation が不足する可能性がある。今回の prompt では `ids-map` が常に 2 modules に絞った。これは schema failure ではないが、allocation prompt や runtime eval で別途見るべき behavioral signal として残す。
+```
+}
+
+@ "why-ids-map" {
+  "##": なぜ ids-map を採用したか
+
+  "body" = ````markdown
+自動 winner は当初 `split-arrays` だった。理由は、transport error を除く成功率が同率 100% で、invalid module id も同率 0、最後の tie-break が「production 差分が小さいもの」だったため。
+
+ただし `split-arrays` は次の問題を持つ。
+
+```json
+{
+  "priority_module_ids": ["speak", "query-memory"],
+  "priority_hints": ["retrieve context", "answer peer"]
+}
+```
+
+この形は、長さが一致していても `priority_module_ids[i]` と `priority_hints[i]` の意味的な対応を検証できない。LLM が hint を逆順に出しても schema 的には通る。つまり成功率が高い理由の一部は、coupling を表現していないからとも読める。
+
+`ids-map` は rank と guidance の責務を分ける。
+
+```json
+{
+  "priority_module_ids": ["speak", "query-memory"],
+  "hints_by_module": {
+    "speak": "acknowledge the peer after cognition evidence is ready",
+    "query-memory": "retrieve relevant context for the greeting"
+  }
+}
+```
+
+rank は `priority_module_ids` が保持し、hint は module id keyed にする。これなら guidance を使う production でも対応関係が構造的に保たれる。同じ schema-only 成功率 100% なら、`split-arrays` より `ids-map` を採用するのが妥当。
+````
+}
+
+@ "production" {
+  "##": Production patch
+
+  "body" = ````markdown
+`nuillu-allocation` は `ids-map` に切り替えた。
+
+```rust
+pub struct ReprioritizeModulesArgs {
+    pub memo: String,
+    pub priority_module_ids: Vec<ModuleTargetId>,
+    #[serde(default)]
+    pub hints_by_module: BTreeMap<String, String>,
+}
+```
+
+mapping 方針:
+
+- rank は `priority_module_ids` の順序で決まる。
+- guidance は `hints_by_module[module_id]` から取る。
+- `hints_by_module` 自体がない、該当 key がない、値が空白だけ、のいずれも error にしない。
+- hint がない場合は `AllocationCommand::target(..., guidance=None)` にする。
+- missing hint を tool error として LLM に返さない。warning も出さない。
+
+`controller_schema_json` は allocation 固有なので `nuillu-module::AllocationReader` から削除し、`nuillu-allocation` の pure helper に移した。
+````
+}
+
+@ "probe-followup" {
+  "##": Probe 側の追随
+
+  "body" = ```markdown
+probe report に次の統計を追加した。
+
+- trial 単位: `priority_module_count`
+- candidate summary: token usage の `min,p05,p50,p95,max,mean`
+- candidate summary: schema 成功 trial の priority module 数統計
+- candidate summary: schema 成功 trial に出た module id の頻度
+
+production 採用後は、tie-break の production distance も `ids-map` を最小にした。これにより、同じ 100% schema success なら `ids-map` が winner になる。
+```
+}
+
+@ "validation" {
+  "##": 確認したテスト
+
+  "body" = ````markdown
+production patch 後に確認したコマンド:
+
+```bash
+cargo fmt
+cargo test -p nuillu-allocation
+cargo test -p nuillu-module
+cargo test -p nuillu-eval --bin allocation-schema-probe
+cargo check -p nuillu-eval
+```
+
+すべて pass。
+
+LLM endpoint を使う live probe は、この devlog 時点では production patch 後に再実行していない。上記の実測表は `.tmp/allocation-schema-probe/probe-report.md` に残っていた run の記録である。
+````
+}
+
+@ "takeaways" {
+  "##": 残した判断
+
+  "body" = ```markdown
+今回の教訓は、schema-only 成功率だけでは production 採用に足りないということだった。特に LLM tool args では、parse しやすい形が必ずしも意味的に安全な形とは限らない。
+
+`split-arrays` は parse しやすく、token usage も少ない。ただし guidance と module id の対応が配列 index に隠れる。production で guidance を使う以上、この coupling を隠すべきではない。
+
+`ids-map` は少し token が増えるが、ranked ids と guidance の対応を module id によって固定できる。今回の allocation schema では、その構造的な安全性を優先する。
+```
+}

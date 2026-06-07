@@ -1,0 +1,300 @@
+$frontmatter {
+  title: speak planning の role/schema probe
+  description: speak の planning turn について、tool schema と context role 配置を live LLM で比較した記録。greeting scenario で should_speak が実 tool call として parse されるか、Peer と everyone の target 選択が安定するかを測り、production では current optional schema のまま final developer instruction を追加した。
+  tags = ["nuillu", "speak", "eval", "llm", "schema", "role", "devlog"]
+}
+
+"#": speak planning の role/schema probe
+
+"lead" = ```markdown
+`docs/devlog/2026-06-04-server-greeting-no-response-investigation.eure` で見つかった greeting no-response の切り分けとして、`speak` の planning turn だけを live LLM に投げる probe を作った。
+
+目的は、文言そのものではなく、message role の並び、最後の role、tool schema の違いが `should_speak` の実 tool call 率や target 選択に影響するかを見ることだった。
+
+結論として、`current-optional`、`current-required`、`required-with-silent` は greeting planning ではすべて evaluable trial 100% 成功した。`single-decision` は target invalid が多く、今回の候補から外した。`Peer` と `everyone` を同時に target enum に入れた追試でも、evaluable tool call はすべて `Peer` を選んだ。
+
+production には `current-optional + system-user-developer` を反映した。schema/toolset は現行 `should_speak { target, speech_content }` optional のまま、context role だけ `system(plan prompt) -> user(cognition log) -> developer(final generic planning instruction)` に固定した。
+```
+
+"toc".$toc = true
+
+@ "probe" {
+  "##": Probe 実装
+
+  "body" = ````markdown
+`crates/eval/src/bin/speak-planning-probe.rs` を追加した。`allocation-schema-probe.rs` と同じく、候補ごとに同じ scenario を 100 回ずつ live backend に投げ、JSON と Markdown に集計する。
+
+基本実行:
+
+```bash
+cargo run -p nuillu-eval --bin speak-planning-probe -- \
+  --model-set configs/modelsets/eval.local.eure \
+  --trials 100 \
+  --output .tmp/speak-planning-probe
+```
+
+target enum に `everyone` も入れる追試:
+
+```bash
+cargo run -p nuillu-eval --bin speak-planning-probe -- \
+  --model-set configs/modelsets/eval.local.eure \
+  --schema current-optional,current-required,required-with-silent \
+  --context system-user-current,system-developer,system-system,system-user-developer,system-developer-user \
+  --target peer,everyone \
+  --output .tmp/speak-planning-probe-peer-everyone
+```
+
+重要な実装条件:
+
+- backend は model-set の `premium` を使う。
+- concurrency は backend の `max_concurrent_llm_calls` を使う。
+- transport error は schema/role failure に数えず、`success_rate = successes / evaluable_trials` で集計する。
+- trial ごとに `schema`, `context`, `success`, `failure`, `target`, `speech_content`, `tool_issue_count`, `pseudo_tool_text`, `latency_ms`, `usage` を出す。
+- candidate summary は success rate、failure reason histogram、tool issue count、pseudo-tool text count、target validity failure count、target histogram、token/latency p50/p95 を持つ。
+- report は `.tmp/speak-planning-probe*/probe-report.json` と `.tmp/speak-planning-probe*/probe-report.md` に出す。
+````
+}
+
+@ "success-condition" {
+  "##": 成功条件
+
+  "body" = ```markdown
+対象 scenario は greeting planning に固定した。
+
+- scene target: `Peer`
+- cognition log: `Peer greeted me with "Hi"; brief acknowledgement is warranted.`
+
+成功条件:
+
+- parsed tool call が得られる。
+- speech path の場合 `target == "Peer"`。
+- `speech_content` が greeting acknowledgement として使える。
+- `speech_content` に `idle`, `tool`, `module`, `cognition log`, `rubric`, `eval`, `schema`, `prompt`, `internal`, `implementation` などの内部/無関係語を含まない。
+
+失敗条件:
+
+- finished without tool。
+- pseudo-tool text。
+- recoverable tool issue。
+- `stay_silent` または `should_speak=false` on greeting。
+- target が `Peer` 以外。
+```
+}
+
+@ "candidates" {
+  "##": 比較候補
+
+  "schemas" = ```markdown
+| schema | shape |
+|---|---|
+| `current-optional` | 現行 `should_speak { target, speech_content }`。tool optional |
+| `current-required` | 現行 schema で `require_any_tool()` |
+| `required-with-silent` | `should_speak { target, speech_content }` + `stay_silent { reason }`。`require_any_tool()` |
+| `single-decision` | `decide_speech { should_speak, target, speech_content, reason }`。`require_any_tool()` |
+```
+
+  "contexts" = ```markdown
+| context | role order |
+|---|---|
+| `system-user-current` | `system(plan prompt)` -> `user(Current cognition log...)` |
+| `system-developer` | `system(plan prompt)` -> `developer(cognition + instruction)` |
+| `system-system` | `system(plan prompt)` -> `system(cognition + instruction)` |
+| `system-user-developer` | `system(plan prompt)` -> `user(cognition)` -> `developer(final instruction)` |
+| `system-developer-user` | `system(plan prompt)` -> `developer(decision contract)` -> `user(cognition)` |
+```
+}
+
+@ "run-full-matrix" {
+  "##": Full matrix run
+
+  "body" = ```markdown
+`.tmp/speak-planning-probe/probe-report.md` の run:
+
+| item | value |
+|---|---|
+| generated_at | `2026-06-07T03:13:22.564713+00:00` |
+| model | `gemma4:e4b` (`gemma4-e4b`) |
+| max_concurrent_llm_calls | 4 |
+| trials_per_candidate | 100 |
+| report winner | `current-optional + system-user-current` |
+```
+
+  "summary" = ```markdown
+| schema | context | successes | evaluable | attempted | success_rate | transport_errors | target_failures | total token p50 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| current-optional | system-user-current | 100 | 100 | 100 | 1.000 | 0 | 0 | 431 |
+| current-optional | system-developer | 100 | 100 | 100 | 1.000 | 0 | 0 | 451 |
+| current-optional | system-system | 99 | 99 | 100 | 1.000 | 1 | 0 | 451 |
+| current-optional | system-user-developer | 100 | 100 | 100 | 1.000 | 0 | 0 | 455 |
+| current-optional | system-developer-user | 100 | 100 | 100 | 1.000 | 0 | 0 | 489 |
+| current-required | system-user-current | 100 | 100 | 100 | 1.000 | 0 | 0 | 431 |
+| current-required | system-developer | 100 | 100 | 100 | 1.000 | 0 | 0 | 451 |
+| current-required | system-system | 99 | 99 | 100 | 1.000 | 1 | 0 | 451 |
+| current-required | system-user-developer | 100 | 100 | 100 | 1.000 | 0 | 0 | 455 |
+| current-required | system-developer-user | 99 | 99 | 100 | 1.000 | 1 | 0 | 488 |
+| required-with-silent | system-user-current | 100 | 100 | 100 | 1.000 | 0 | 0 | 469 |
+| required-with-silent | system-developer | 100 | 100 | 100 | 1.000 | 0 | 0 | 488 |
+| required-with-silent | system-system | 100 | 100 | 100 | 1.000 | 0 | 0 | 488 |
+| required-with-silent | system-user-developer | 99 | 99 | 100 | 1.000 | 1 | 0 | 491 |
+| required-with-silent | system-developer-user | 98 | 98 | 100 | 1.000 | 2 | 0 | 525 |
+| single-decision | system-user-current | 45 | 100 | 100 | 0.450 | 0 | 55 | 483 |
+| single-decision | system-developer | 0 | 100 | 100 | 0.000 | 0 | 100 | 503 |
+| single-decision | system-system | 0 | 100 | 100 | 0.000 | 0 | 100 | 503 |
+| single-decision | system-user-developer | 9 | 100 | 100 | 0.090 | 0 | 91 | 507 |
+| single-decision | system-developer-user | 45 | 99 | 100 | 0.455 | 1 | 54 | 538 |
+```
+
+  "interpretation" = ```markdown
+`current-*` と `required-with-silent` はすべて evaluable trial で 100% 成功した。tool issue と pseudo-tool text は全候補 0。
+
+`single-decision` は `target` invalid が支配的な失敗理由になった。今回の success criteria では greeting で `target == "Peer"` を必須にしている。`single-decision` は `should_speak=true` でも `target` が optional field なので、この形は target selection を安定させるには弱いと判断した。
+
+自動 winner は `current-optional + system-user-current`。同率 100% の中で tool issue、pseudo-tool、production distance、token p50 の tie-break をかけると、現行 production と同じ形が勝つ。
+```
+}
+
+@ "run-peer-everyone" {
+  "##": Peer/everyone target 追試
+
+  "body" = ```markdown
+full matrix で 100% 成功した `current-*` と `required-with-silent` の 15 組だけを対象に、target enum を `Peer, everyone` にして再実行した。
+
+`.tmp/speak-planning-probe-peer-everyone/probe-report.md` の run:
+
+| item | value |
+|---|---|
+| generated_at | `2026-06-07T03:24:56.192183+00:00` |
+| model | `gemma4:e4b` (`gemma4-e4b`) |
+| trials_per_candidate | 100 |
+| target_schema_values | `Peer, everyone` |
+| report winner | `current-optional + system-user-current` |
+```
+
+  "target-selection" = ```markdown
+結果として、evaluable tool call では `everyone` が 0 件だった。
+
+| schema | context | peer targets | non-peer targets | peer target rate | target counts | transport_errors |
+|---|---|---:|---:|---:|---|---:|
+| current-optional | system-user-current | 99 | 0 | 1.000 | Peer=99 | 1 |
+| current-optional | system-developer | 99 | 0 | 1.000 | Peer=99 | 1 |
+| current-optional | system-system | 100 | 0 | 1.000 | Peer=100 | 0 |
+| current-optional | system-user-developer | 100 | 0 | 1.000 | Peer=100 | 0 |
+| current-optional | system-developer-user | 99 | 0 | 1.000 | Peer=99 | 1 |
+| current-required | system-user-current | 99 | 0 | 1.000 | Peer=99 | 1 |
+| current-required | system-developer | 99 | 0 | 1.000 | Peer=99 | 1 |
+| current-required | system-system | 100 | 0 | 1.000 | Peer=100 | 0 |
+| current-required | system-user-developer | 100 | 0 | 1.000 | Peer=100 | 0 |
+| current-required | system-developer-user | 99 | 0 | 1.000 | Peer=99 | 1 |
+| required-with-silent | system-user-current | 99 | 0 | 1.000 | Peer=99 | 1 |
+| required-with-silent | system-developer | 100 | 0 | 1.000 | Peer=100 | 0 |
+| required-with-silent | system-system | 100 | 0 | 1.000 | Peer=100 | 0 |
+| required-with-silent | system-user-developer | 100 | 0 | 1.000 | Peer=100 | 0 |
+| required-with-silent | system-developer-user | 100 | 0 | 1.000 | Peer=100 | 0 |
+```
+
+  "tie-break" = ```markdown
+target 選択だけでは差が出なかった。evaluable trial だけを見れば全候補が `Peer` 100%。
+
+ただし「attempt 100 回中、transport error もなく、全件 `Peer`」に寄せて見ると、`current-optional + system-user-developer` が current schema 系で一番小さい変更だった。
+
+| candidate | attempted | evaluable | Peer | everyone | total token p50 | production distance |
+|---|---:|---:|---:|---:|---:|---:|
+| current-optional + system-user-developer | 100 | 100 | 100 | 0 | 458 | 1 |
+| current-optional + system-system | 100 | 100 | 100 | 0 | 455 | 2 |
+| current-required + system-user-developer | 100 | 100 | 100 | 0 | 458 | 2 |
+| current-required + system-system | 100 | 100 | 100 | 0 | 455 | 3 |
+| required-with-silent + system-developer | 100 | 100 | 100 | 0 | 492 | 3 |
+| required-with-silent + system-user-developer | 100 | 100 | 100 | 0 | 495 | 3 |
+| required-with-silent + system-developer-user | 100 | 100 | 100 | 0 | 529 | 3 |
+| required-with-silent + system-system | 100 | 100 | 100 | 0 | 492 | 4 |
+```
+}
+
+@ "decision" {
+  "##": 採用判断
+
+  "body" = ```markdown
+採用したのは `current-optional + system-user-developer`。
+
+理由:
+
+- schema/toolset は現行のままなので no-speech behavior への影響が小さい。
+- `Peer, everyone` 追試で 100/100 attempt が `Peer` を選んだ。
+- `current-required` は同じ greeting success だが、`require_any_tool()` にすると no-speech case への影響を見る必要がある。
+- `required-with-silent` は明示 silence path として設計上は魅力があるが、この greeting probe では成功率上の優位がなく、token p50 も増える。
+- `single-decision` は target invalid が多く、今回の目的には合わない。
+
+`system-user-current` は full matrix の自動 winner だったが、`Peer, everyone` 追試では transport error が 1 件あった。transport error は role/schema failure ではないものの、今回の「100 回やって全部 Peer」を優先する判断では `system-user-developer` を採った。
+```
+}
+
+@ "production" {
+  "##": Production patch
+
+  "body" = ````markdown
+`crates/modules/speak/src/speak.rs` の planning input を `ModelInput::from_items` で固定した。
+
+production schema は変えていない。
+
+- before: `system(plan prompt)` -> `user(Current cognition log...)`
+- after: `system(plan prompt)` -> `user(Current cognition log...)` -> `developer(generic final planning instruction)`
+
+追加した developer instruction は greeting 固有ではなく、planning turn 全般の contract にした。
+
+```rust
+const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str =
+    "Decide whether to speak now from the current cognition log. If outward speech is warranted, use the speech tool; otherwise finish without calling a tool.";
+```
+
+`build_planning_input` を pure helper として切り出し、unit test で role order と text を固定した。
+````
+}
+
+@ "validation" {
+  "##": 確認したテスト
+
+  "body" = ````markdown
+production patch 後に確認したコマンド:
+
+```bash
+cargo fmt
+cargo test -p nuillu-speak
+cargo check -p nuillu-speak
+cargo test -p nuillu-eval --bin speak-planning-probe
+cargo check -p nuillu-eval --bin speak-planning-probe
+cargo run -p nuillu-eval --bin nuillu-eval -- --model-set configs/modelsets/eval.local.eure module-speak-responds-to-peer-greeting
+cargo run -p nuillu-eval --bin nuillu-eval -- --model-set configs/modelsets/eval.local.eure --no-full-agent --module speak
+```
+
+結果:
+
+- `nuillu-speak` unit tests: 13/13 pass
+- `speak-planning-probe` bin tests: 11/11 pass
+- `module-speak-responds-to-peer-greeting`: pass
+- 既存 speak module eval 一式: 5/5 pass
+
+`full-agent-responds-to-peer-greeting` はまだ fail。再実行では timeout ではなく通常 fail になり、speak planning まで到達していなかった。
+
+失敗時の allocation memo:
+
+```text
+Speak remains low as no response/intent is clear.
+```
+
+最終 allocation でも `speak.activation_ratio = 0.0`。これは今回の speak planning role 変更とは別に、allocation/cognition routing が greeting を outward response として扱えていない問題として残す。
+````
+}
+
+@ "takeaways" {
+  "##": 残した判断
+
+  "body" = ```markdown
+今回の結果では、greeting planning 単体の tool call parse は schema を大きく変えなくても安定していた。特に `current-optional` は `required` や明示 `stay_silent` に比べて悪化がなく、production impact が小さい。
+
+一方で `single-decision` のように speech/no-speech を一つの decision tool にまとめる形は、target field を optional にしたことで target selection が弱くなった。単一 decision 形式を再検討するなら、`should_speak=true` のときだけ target required にする表現が必要だが、JSON Schema でその条件を LLM に安定して守らせられるかは別途検証が必要。
+
+`Peer` vs `everyone` については、今回の direct greeting scenario ではすべて `Peer` を選べた。したがって、server greeting no-response の主因は speak planning の target ambiguity ではなさそう。
+
+残る full-agent failure は、allocation が greeting を speak-worthy と見なさず、speak を起動しない点にある。次の改善対象は allocation/cognition routing の greeting response 認識である。
+```
+}

@@ -5,7 +5,10 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use lutum::{ModelInput, StructuredTurnOutcome, TextStepOutcomeWithTools, TextTurnEvent};
+use lutum::{
+    InputMessageRole, ModelInput, ModelInputItem, StructuredTurnOutcome, TextStepOutcomeWithTools,
+    TextTurnEvent,
+};
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
     SceneReader, UtteranceProgress,
@@ -25,6 +28,8 @@ For questions or requests, transform the relevant cognition into an answer. Pres
 For self-directed cognition, transform only the listener-relevant implication into outward substance. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the listener.
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
+
+const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Decide whether to speak now from the current cognition log. If outward speech is warranted, use the speech tool; otherwise finish without calling a tool.";
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -222,6 +227,20 @@ fn finish_speech_cognition_context(lines: Vec<String>, idle_for_secs: Option<u64
     }
 }
 
+fn build_planning_input(plan_prompt: &str, cognition_context: &str) -> ModelInput {
+    ModelInput::from_items(vec![
+        ModelInputItem::text(InputMessageRole::System, plan_prompt),
+        ModelInputItem::text(
+            InputMessageRole::User,
+            format!("Current cognition log:\n{}", cognition_context.trim()),
+        ),
+        ModelInputItem::text(
+            InputMessageRole::Developer,
+            PLANNING_TURN_DEVELOPER_INSTRUCTION,
+        ),
+    ])
+}
+
 fn format_abort_judge_input(cognition_context_at_start: &str, new_entries: &[String]) -> String {
     let mut out = format!(
         "Cognition log at the start of the current speech attempt:\n{}",
@@ -386,10 +405,7 @@ impl SpeakModule {
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
     ) -> Result<Option<PlannedSpeech>> {
-        let input = ModelInput::new().system(self.plan_prompt(cx)).user(format!(
-            "Current cognition log:\n{}",
-            cognition_context.trim()
-        ));
+        let input = build_planning_input(self.plan_prompt(cx), cognition_context);
 
         let lutum = self.llm.lutum().await;
         let target_schema = self.scene.target_schema();
@@ -1099,6 +1115,39 @@ mod tests {
         blackboard
             .read(|bb| bb.utterance_progress_for_instance(&speak_owner).is_some())
             .await
+    }
+
+    fn assert_message_text(item: &ModelInputItem, expected_role: InputMessageRole, expected: &str) {
+        let ModelInputItem::Message { role, content } = item else {
+            panic!("expected message item");
+        };
+        assert_eq!(*role, expected_role);
+        let [MessageContent::Text(text)] = content.as_slice() else {
+            panic!("expected one text content item");
+        };
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn planning_input_uses_user_cognition_then_final_developer_instruction() {
+        let input = build_planning_input(
+            "planning prompt",
+            "- Peer greeted me with \"Hi\"; brief acknowledgement is warranted.\n",
+        );
+        let items = input.items();
+
+        assert_eq!(items.len(), 3);
+        assert_message_text(&items[0], InputMessageRole::System, "planning prompt");
+        assert_message_text(
+            &items[1],
+            InputMessageRole::User,
+            "Current cognition log:\n- Peer greeted me with \"Hi\"; brief acknowledgement is warranted.",
+        );
+        assert_message_text(
+            &items[2],
+            InputMessageRole::Developer,
+            PLANNING_TURN_DEVELOPER_INSTRUCTION,
+        );
     }
 
     #[test]

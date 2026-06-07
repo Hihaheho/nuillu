@@ -74,6 +74,7 @@ When changing module wiring or adding a module, these must remain true (they're 
 
 ## Conventions
 
+- This is a public repository: never commit anything unfit for public view — secrets/credentials, private IPs or hosts, LLM endpoint URLs, host-specific or personal model identifiers, internal infra topology, or local-only config filenames (e.g. `*.local.eure`). This applies everywhere, including devlogs, comments, and captured probe/report tables: redact or omit such fields rather than pasting raw run output. Reference model sets by the documented convention name (`configs/modelsets/eval.local.eure`), not by an ad-hoc local file.
 - Use `<project root>/.tmp` for scratch files (the repo's `.gitignore` covers it). Don't write to `/tmp`.
 - Don't use Python for project scripts; prefer shell or Rust.
 - In tests for structured JSON/schema values, prefer one `assert_eq!(actual, expected)` against the whole value. Don't walk a `serde_json::Value` with nested indexing, `find`, and multiple partial assertions when the expected shape is static.
