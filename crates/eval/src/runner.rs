@@ -4533,6 +4533,7 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
+        nuillu_types::builtin::policy_compaction(),
     ]
 }
 
@@ -4745,7 +4746,7 @@ fn register_eval_module(
         // Background durability writer. Cognition-log triggered.
         EvalModule::Memory => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
@@ -4881,7 +4882,7 @@ fn register_eval_module(
             .expect("eval module registration should be unique"),
         EvalModule::Policy => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(2.0, 6.0)),
+                eval_policy(1..=1, Bpm::range(2.0, 6.0)),
                 replica_hard_cap,
                 {
                     let policy_caps = policy_caps.clone();
@@ -9407,7 +9408,7 @@ prompt = "What am I attending to?"
     }
 
     #[tokio::test]
-    async fn full_agent_gui_initial_allocation_starts_every_module_detached() {
+    async fn full_agent_gui_initial_allocation_starts_only_durable_writers_active() {
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_gui_initial_allocation(
             &crate::cases::EvalLimits {
@@ -9448,7 +9449,14 @@ prompt = "What am I attending to?"
                 for module in &selected {
                     let id = module.module_id();
                     assert_eq!(bb.allocation().activation_for(&id), ActivationRatio::ZERO);
-                    assert_eq!(bb.allocation().active_replicas(&id), 0);
+                    let expected_active_replicas = match module {
+                        EvalModule::Memory | EvalModule::Policy => 1,
+                        _ => 0,
+                    };
+                    assert_eq!(
+                        bb.allocation().active_replicas(&id),
+                        expected_active_replicas
+                    );
                 }
             })
             .await;

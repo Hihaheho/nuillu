@@ -163,7 +163,7 @@ fn register_server_module(
         }
         RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(6.0, 18.0)), move |caps| {
+            registry.register_server(policy(1..=1, Bpm::range(6.0, 18.0)), move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryModule::new(
@@ -259,7 +259,7 @@ fn register_server_module(
         }
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
                     let consideration_writer =
@@ -444,7 +444,6 @@ fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
         builtin::query_memory(),
         builtin::memory(),
         builtin::policy(),
-        builtin::policy_compaction(),
         builtin::reward(),
         builtin::predict(),
         builtin::surprise(),
