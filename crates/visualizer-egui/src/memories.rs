@@ -133,7 +133,6 @@ pub fn ui(
         ui.label(format!("Linked memories: {}", state.linked_memory_index));
         egui::ScrollArea::vertical()
             .id_salt("linked-memory-list")
-            .max_height(220.0)
             .show(ui, |ui| {
                 for linked in &state.linked_results {
                     ui.horizontal_wrapped(|ui| {

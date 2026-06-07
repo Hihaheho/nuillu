@@ -494,7 +494,6 @@ fn activity_ui(ui: &mut egui::Ui, activity: &[ActivityMessage]) {
     egui::ScrollArea::vertical()
         .id_salt("scene-activity")
         .stick_to_bottom(true)
-        .max_height(220.0)
         .show(ui, |ui| {
             if activity.is_empty() {
                 ui.label("No recent speech.");
