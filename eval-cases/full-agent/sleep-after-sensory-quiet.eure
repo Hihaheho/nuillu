@@ -73,9 +73,9 @@ participants = ["Koro"]
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name: suppressed-bpm-is-near-sleep-floor
+  name: suppressed-period-is-near-sleep-floor
   must-pass = true
-  pointer: /observations/agent/allocation/speak/cooldown_ms
+  pointer: /observations/agent/allocation/speak/period_ms
   min = 9000.0
 }
 

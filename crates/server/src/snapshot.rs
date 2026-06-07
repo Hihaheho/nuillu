@@ -241,14 +241,17 @@ fn interoceptive_mode_name(mode: InteroceptiveMode) -> &'static str {
 fn allocation_views(allocation: &ResourceAllocation) -> Vec<AllocationView> {
     let mut modules = allocation
         .iter()
-        .map(|(module, config)| AllocationView {
-            bpm: allocation.cooldown_for(module).and_then(bpm_from_cooldown),
-            cooldown_ms: allocation.cooldown_for(module).map(duration_millis_u64),
-            module: module.as_str().to_owned(),
-            activation_ratio: allocation.activation_for(module).as_f64(),
-            active_replicas: allocation.active_replicas(module),
-            tier: model_tier_name(allocation.tier_for(module)).to_owned(),
-            guidance: config.guidance.clone(),
+        .map(|(module, config)| {
+            let bpm = allocation.bpm_for(module);
+            AllocationView {
+                bpm: bpm.map(|bpm| bpm.as_f64()),
+                period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
+                module: module.as_str().to_owned(),
+                activation_ratio: allocation.activation_for(module).as_f64(),
+                active_replicas: allocation.active_replicas(module),
+                tier: model_tier_name(allocation.tier_for(module)).to_owned(),
+                guidance: config.guidance.clone(),
+            }
         })
         .collect::<Vec<_>>();
     modules.sort_by(|left, right| left.module.cmp(&right.module));
@@ -322,11 +325,6 @@ pub fn model_tier_name(tier: ModelTier) -> &'static str {
 
 pub fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-pub fn bpm_from_cooldown(cooldown: Duration) -> Option<f64> {
-    let seconds = cooldown.as_secs_f64();
-    (seconds.is_finite() && seconds > 0.0).then_some(60.0 / seconds)
 }
 
 #[cfg(test)]

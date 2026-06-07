@@ -217,7 +217,7 @@ enum ModuleState {
         next_batch_throttle: Option<NextBatchThrottle>,
     },
     WaitingForActivation,
-    CoolingDown,
+    Throttling,
     Awaiting,
     PendingBatch {
         module: AllocatedModule,
@@ -236,7 +236,7 @@ enum ModuleState {
 }
 
 enum TaskMessage {
-    BatchCooldownExpired {
+    BatchThrottleExpired {
         index: usize,
         module: AllocatedModule,
         kick_inbox: KickInbox,
@@ -489,9 +489,9 @@ async fn refresh_active_and_schedule(
                         .activation_increase_waiter(&owners[index], throttle.activation_threshold)
                         .await
                     {
-                        states[index] = ModuleState::CoolingDown;
+                        states[index] = ModuleState::Throttling;
                         let allocation_change = runtime.allocation_change_waiter().await;
-                        spawn_batch_cooldown(
+                        spawn_batch_throttle(
                             tasks,
                             index,
                             module,
@@ -544,7 +544,7 @@ async fn refresh_active_and_schedule(
                     .record_module_status(owners[index].clone(), ModuleRunStatus::Inactive)
                     .await;
             }
-            ModuleState::CoolingDown | ModuleState::Awaiting => {
+            ModuleState::Throttling | ModuleState::Awaiting => {
                 let status = if active[index] {
                     ModuleRunStatus::AwaitingBatch
                 } else {
@@ -671,8 +671,8 @@ async fn current_next_batch_throttle(
     now: DateTime<Utc>,
 ) -> Option<NextBatchThrottle> {
     let throttle = throttle?;
-    let (interval, activation_threshold) = runtime.module_batch_throttle_baseline(owner).await?;
-    let not_before = throttle.baseline + ChronoDuration::from_std(interval).ok()?;
+    let (bpm, activation_threshold) = runtime.module_batch_throttle_baseline(owner).await?;
+    let not_before = throttle.baseline + ChronoDuration::from_std(bpm.period()).ok()?;
     (not_before > now).then_some(NextBatchThrottle {
         baseline: throttle.baseline,
         not_before,
@@ -699,7 +699,7 @@ async fn handle_task_message(
     subscriber: &tracing::Dispatch,
 ) -> Result<(), SchedulerError> {
     match message {
-        TaskMessage::BatchCooldownExpired {
+        TaskMessage::BatchThrottleExpired {
             index,
             module,
             kick_inbox,
@@ -837,8 +837,8 @@ async fn handle_task_message(
                     let next_batch_throttle = runtime
                         .module_batch_throttle_baseline(&owners[index])
                         .await
-                        .and_then(|(interval, activation_threshold)| {
-                            let remaining = interval.saturating_sub(activation_elapsed);
+                        .and_then(|(bpm, activation_threshold)| {
+                            let remaining = bpm.sleep_after_turn(activation_elapsed);
                             if remaining.is_zero() {
                                 None
                             } else {
@@ -1210,7 +1210,7 @@ async fn collect_dependency_flush_completions(
             continue;
         }
         match &mut states[target_index] {
-            ModuleState::CoolingDown
+            ModuleState::Throttling
             | ModuleState::Awaiting
             | ModuleState::PendingDependencyFlush
             | ModuleState::PendingActivationGate
@@ -1452,7 +1452,7 @@ fn spawn_next_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_batch_cooldown(
+fn spawn_batch_throttle(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     module: AllocatedModule,
@@ -1478,7 +1478,7 @@ fn spawn_batch_cooldown(
                 _ = clock.sleep_until(deadline) => {},
             }
             let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
-            TaskMessage::BatchCooldownExpired {
+            TaskMessage::BatchThrottleExpired {
                 index,
                 module,
                 kick_inbox,
@@ -4040,7 +4040,7 @@ mod tests {
                 alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
-                // Use real wall-clock so the test can observe the 30ms cooldown
+                // Use real wall-clock so the test can observe the 30ms period
                 // actually delaying the second batch.
                 let caps = test_caps_with_real_clock(blackboard);
                 let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
@@ -4048,7 +4048,7 @@ mod tests {
                 let (second_tx, second_rx) = oneshot::channel();
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
-                // 2000 BPM = 30ms cooldown per batch under linear_ratio_fn at
+                // 2000 BPM = 30ms period per batch under linear_ratio_fn at
                 // activation_ratio=1.0.
                 let modules = ModuleRegistry::new()
                     .register_sync(
@@ -4126,7 +4126,7 @@ mod tests {
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
                 // 300 BPM = 200ms target period between activation starts.
-                // The first activation takes ~80ms, so remaining cooldown
+                // The first activation takes ~80ms, so remaining sleep
                 // should be ~120ms rather than a full 200ms.
                 let modules = ModuleRegistry::new()
                     .register_sync(
@@ -4201,7 +4201,7 @@ mod tests {
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
                 // 500 BPM = 120ms target period. Since the first activation
-                // takes longer than that, no extra cooldown should be added.
+                // takes longer than that, no extra sleep should be added.
                 let modules = ModuleRegistry::new()
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(500.0)..=Bpm::from_f64(500.0)),
@@ -4269,7 +4269,7 @@ mod tests {
                 let first_tx = Rc::new(RefCell::new(Some(first_tx)));
                 let second_tx = Rc::new(RefCell::new(Some(second_tx)));
                 // Fixed 120 BPM = 500ms period. The test bumps activation
-                // during cooldown and expects the second batch before deadline.
+                // during throttling and expects the second batch before deadline.
                 let modules = ModuleRegistry::new()
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(120.0)..=Bpm::from_f64(120.0)),

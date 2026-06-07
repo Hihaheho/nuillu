@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use lutum::{Lutum, Session};
 use nuillu_blackboard::{
-    ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, ModulePolicy,
+    ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
@@ -395,22 +395,16 @@ impl AgentRuntimeControl {
             .await;
     }
 
-    pub async fn module_batch_min_interval(&self, owner: &ModuleInstanceId) -> Option<Duration> {
-        self.blackboard
-            .read(|bb| bb.allocation().cooldown_for(&owner.module))
-            .await
-    }
-
     pub async fn module_batch_throttle_baseline(
         &self,
         owner: &ModuleInstanceId,
-    ) -> Option<(Duration, ActivationRatio)> {
+    ) -> Option<(Bpm, ActivationRatio)> {
         self.blackboard
             .read(|bb| {
                 let allocation = bb.allocation();
                 allocation
-                    .cooldown_for(&owner.module)
-                    .map(|interval| (interval, allocation.activation_for(&owner.module)))
+                    .bpm_for(&owner.module)
+                    .map(|bpm| (bpm, allocation.activation_for(&owner.module)))
             })
             .await
     }

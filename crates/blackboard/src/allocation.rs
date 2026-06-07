@@ -180,7 +180,7 @@ impl ReplicasRatio {
 }
 
 /// `0.0..=1.0` ratio mapping into a per-module BPM range. Higher means more
-/// frequent `next_batch` invocations (shorter cooldown between batches).
+/// frequent `next_batch` invocations (shorter period between batches).
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct RateLimitRatio(f64);
 
@@ -206,10 +206,10 @@ pub struct Bpm(f64);
 
 impl Bpm {
     /// Floor for the BPM value. Anything `<=` this floor (including `0.0` and
-    /// non-finite inputs) is treated as the floor so that `cooldown()` never
+    /// non-finite inputs) is treated as the floor so that `period()` never
     /// produces a non-finite or out-of-range `Duration` and never panics.
     /// 0.001 BPM corresponds to one beat per 1000 minutes (~16.7h), which is
-    /// effectively "never" but still a valid, finite cooldown.
+    /// effectively "never" but still a valid, finite period.
     pub const MIN: Self = Self(0.001);
 
     pub fn from_f64(value: f64) -> Self {
@@ -227,7 +227,7 @@ impl Bpm {
         self.0
     }
 
-    pub fn cooldown(self) -> Duration {
+    pub fn period(self) -> Duration {
         // `Duration::from_secs_f64` panics on non-finite or out-of-range
         // inputs; saturate just in case `self.0` is somehow below `MIN`.
         let secs = 60.0 / self.0.max(Self::MIN.0);
@@ -235,6 +235,10 @@ impl Bpm {
             return Duration::MAX;
         }
         Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
+    }
+
+    pub fn sleep_after_turn(self, turn_elapsed: Duration) -> Duration {
+        self.period().saturating_sub(turn_elapsed)
     }
 }
 
@@ -285,13 +289,13 @@ impl ModulePolicy {
         }
     }
 
-    pub fn cooldown_for(&self, ratio: RateLimitRatio) -> Duration {
+    pub fn bpm_for(&self, ratio: RateLimitRatio) -> Bpm {
         let start = self.rate_limit_range.start().as_f64();
         let end = self.rate_limit_range.end().as_f64();
-        // ratio = 1.0 picks the high end (max BPM, shortest cooldown);
-        // ratio = 0.0 picks the low end (min BPM, longest cooldown).
+        // ratio = 1.0 picks the high end (max BPM, shortest period);
+        // ratio = 0.0 picks the low end (min BPM, longest period).
         let bpm = start + (end - start) * ratio.as_f64();
-        Bpm::from_f64(bpm).cooldown()
+        Bpm::from_f64(bpm)
     }
 
     /// Total active replica count for a given `replicas_ratio`, clamped to the
@@ -360,7 +364,7 @@ pub struct ModuleConfig {
 ///   priority position via `activation_table`).
 /// - `activation_table`: host-set ratio table; index = priority position.
 /// - `model_override`: host-set tier per module; absent => `ModelTier::Default`.
-/// - `active_replicas` / `cooldown`: derived state populated by `derived()`
+/// - `active_replicas` / `bpm`: derived state populated by `derived()`
 ///   when the blackboard knows the registered [`ModulePolicy`] per module.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceAllocation {
@@ -374,7 +378,7 @@ pub struct ResourceAllocation {
     #[serde(skip)]
     active_replicas: HashMap<ModuleId, u8>,
     #[serde(skip)]
-    cooldown: HashMap<ModuleId, Duration>,
+    bpm: HashMap<ModuleId, Bpm>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,8 +423,8 @@ impl ResourceAllocation {
         self.activation.get(id).copied().unwrap_or_default()
     }
 
-    pub fn cooldown_for(&self, id: &ModuleId) -> Option<Duration> {
-        self.cooldown.get(id).copied()
+    pub fn bpm_for(&self, id: &ModuleId) -> Option<Bpm> {
+        self.bpm.get(id).copied()
     }
 
     pub fn active_replicas(&self, id: &ModuleId) -> u8 {
@@ -463,7 +467,7 @@ impl ResourceAllocation {
         self.per_module.retain(|id, _| allowed.contains(id));
         self.activation.retain(|id, _| allowed.contains(id));
         self.model_override.retain(|id, _| allowed.contains(id));
-        self.cooldown.retain(|id, _| allowed.contains(id));
+        self.bpm.retain(|id, _| allowed.contains(id));
         self.active_replicas.retain(|id, _| allowed.contains(id));
     }
 
@@ -491,20 +495,19 @@ impl ResourceAllocation {
         self.model_override.iter().map(|(id, tier)| (id, *tier))
     }
 
-    /// Derive `active_replicas` and `cooldown` from the controller's activation
+    /// Derive `active_replicas` and `bpm` from the controller's activation
     /// knob and each registered module's [`ModulePolicy`]. Modules without a
     /// registered policy are left at zero active replicas (the unregistered
     /// fallback).
     pub fn derived(mut self, policies: &HashMap<ModuleId, ModulePolicy>) -> Self {
         self.active_replicas.clear();
-        self.cooldown.clear();
+        self.bpm.clear();
         for (id, policy) in policies {
             let ratio = self.activation_for(id);
             let (replicas_ratio, rate_ratio) = (policy.activation_ratio_fn)(ratio);
             self.active_replicas
                 .insert(id.clone(), policy.active_replicas_for(replicas_ratio));
-            self.cooldown
-                .insert(id.clone(), policy.cooldown_for(rate_ratio));
+            self.bpm.insert(id.clone(), policy.bpm_for(rate_ratio));
         }
         self
     }
@@ -653,11 +656,31 @@ mod tests {
     }
 
     #[test]
-    fn bpm_cooldown_is_inverse_of_rate() {
+    fn bpm_period_is_inverse_of_rate() {
         // 60 BPM = 1 second per beat.
-        assert_eq!(Bpm::from_f64(60.0).cooldown(), Duration::from_secs(1));
+        assert_eq!(Bpm::from_f64(60.0).period(), Duration::from_secs(1));
         // 120 BPM = 0.5 seconds per beat.
-        assert_eq!(Bpm::from_f64(120.0).cooldown(), Duration::from_millis(500));
+        assert_eq!(Bpm::from_f64(120.0).period(), Duration::from_millis(500));
+        // 3 BPM = 20 seconds per beat.
+        assert_eq!(Bpm::from_f64(3.0).period(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn bpm_sleep_after_turn_subtracts_elapsed_from_period() {
+        let bpm = Bpm::from_f64(3.0);
+
+        assert_eq!(
+            bpm.sleep_after_turn(Duration::from_secs(20)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            bpm.sleep_after_turn(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            bpm.sleep_after_turn(Duration::from_secs(25)),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -679,7 +702,7 @@ mod tests {
         assert_eq!(from_nan, Bpm::MIN);
         assert!(from_inf.as_f64().is_finite());
         // Should be a finite, non-zero Duration without panicking.
-        assert!(from_zero.cooldown() > Duration::ZERO);
-        assert!(from_zero.cooldown() < Duration::MAX);
+        assert!(from_zero.period() > Duration::ZERO);
+        assert!(from_zero.period() < Duration::MAX);
     }
 }

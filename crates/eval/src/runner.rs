@@ -276,9 +276,9 @@ impl VisualizerHook {
 }
 
 use nuillu_server::{
-    LlmLogContext, VisualizerEventSink, VisualizerLlmObserver, bpm_from_cooldown, build_embedder,
-    build_model_handle, build_tiers, duration_millis_u64, linked_memory_record_view,
-    memory_rank_name, memory_record_view, model_tier_name, module_policy_views,
+    LlmLogContext, VisualizerEventSink, VisualizerLlmObserver, build_embedder, build_model_handle,
+    build_tiers, duration_millis_u64, linked_memory_record_view, memory_rank_name,
+    memory_record_view, model_tier_name, module_policy_views,
 };
 
 #[derive(Debug, Clone)]
@@ -5282,20 +5282,19 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             .collect(),
         allocation: allocation_module_dumps(bb.allocation())
             .into_iter()
-            .map(|module| AllocationView {
-                bpm: ModuleId::new(module.module.clone())
+            .map(|module| {
+                let bpm = ModuleId::new(module.module.clone())
                     .ok()
-                    .and_then(|id| bb.allocation().cooldown_for(&id))
-                    .and_then(bpm_from_cooldown),
-                cooldown_ms: ModuleId::new(module.module.clone())
-                    .ok()
-                    .and_then(|id| bb.allocation().cooldown_for(&id))
-                    .map(duration_millis_u64),
-                module: module.module,
-                activation_ratio: module.activation_ratio,
-                active_replicas: module.active_replicas,
-                tier: module.tier,
-                guidance: module.guidance.as_str().to_owned(),
+                    .and_then(|id| bb.allocation().bpm_for(&id));
+                AllocationView {
+                    bpm: bpm.map(|bpm| bpm.as_f64()),
+                    period_ms: bpm.map(|bpm| duration_millis_u64(bpm.period())),
+                    module: module.module,
+                    activation_ratio: module.activation_ratio,
+                    active_replicas: module.active_replicas,
+                    tier: module.tier,
+                    guidance: module.guidance.as_str().to_owned(),
+                }
             })
             .collect(),
         interoception: interoception_view(bb.interoception()),
@@ -5385,7 +5384,9 @@ fn allocation_module_dumps(allocation: &ResourceAllocation) -> Vec<AllocationMod
             module: module.as_str().to_owned(),
             activation_ratio: allocation.activation_for(module).as_f64(),
             active_replicas: allocation.active_replicas(module),
-            cooldown_ms: allocation.cooldown_for(module).map(duration_millis_u64),
+            period_ms: allocation
+                .bpm_for(module)
+                .map(|bpm| duration_millis_u64(bpm.period())),
             tier: model_tier_name(allocation.tier_for(module)).to_owned(),
             guidance: DumpText::new(config.guidance.clone()),
         })
@@ -5549,7 +5550,7 @@ impl AgentObservation {
 struct AllocationModuleObservation {
     activation_ratio: ActivationRatio,
     active_replicas: u8,
-    cooldown_ms: Option<u64>,
+    period_ms: Option<u64>,
     guidance: String,
     tier: ModelTier,
 }
@@ -5641,7 +5642,9 @@ fn allocation_observation(
                 AllocationModuleObservation {
                     activation_ratio: allocation.activation_for(module),
                     active_replicas: allocation.active_replicas(module),
-                    cooldown_ms: allocation.cooldown_for(module).map(duration_millis_u64),
+                    period_ms: allocation
+                        .bpm_for(module)
+                        .map(|bpm| duration_millis_u64(bpm.period())),
                     guidance: config.guidance.clone(),
                     tier: allocation.tier_for(module),
                 },
@@ -6784,7 +6787,7 @@ mod tests {
 
         async fn sleep_until(&self, _deadline: chrono::DateTime<Utc>) {
             // Test clock: sleeps complete immediately so test wall-clock stays
-            // independent of the registered BPM cooldown ranges.
+            // independent of the registered BPM period ranges.
         }
     }
 
@@ -8887,7 +8890,7 @@ limits {
                 "query-memory": {
                     "activation_ratio": 1.0,
                     "active_replicas": 0,
-                    "cooldown_ms": 1000,
+                    "period_ms": 1000,
                     "guidance": "test guidance",
                     "tier": "Default",
                 },
@@ -8897,7 +8900,7 @@ limits {
                     "query-memory": {
                         "activation_ratio": 1.0,
                         "active_replicas": 0,
-                        "cooldown_ms": null,
+                        "period_ms": null,
                         "guidance": "test guidance",
                         "tier": "Default",
                     },

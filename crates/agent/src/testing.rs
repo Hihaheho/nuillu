@@ -14,7 +14,7 @@ use nuillu_module::{
 };
 
 /// Test clock whose `now()` is the wall clock but whose `sleep_until` returns
-/// immediately. Cooldown deadlines and idle timers don't block test
+/// immediately. Period deadlines and idle timers don't block test
 /// wall-clock time.
 struct InstantSleepClock;
 
@@ -36,7 +36,7 @@ pub(crate) fn test_caps(blackboard: Blackboard) -> CapabilityProviders {
 }
 
 /// Like `test_caps` but uses the real wall-clock for sleeps. Pick this when a
-/// test specifically asserts that cooldown deadlines block long enough to
+/// test specifically asserts that period deadlines block long enough to
 /// coalesce subsequent work.
 pub(crate) fn test_caps_with_real_clock(blackboard: Blackboard) -> CapabilityProviders {
     test_caps_inner(blackboard, RuntimePolicy::default(), Rc::new(SystemClock))

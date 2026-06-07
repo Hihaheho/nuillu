@@ -122,7 +122,7 @@ pub struct AllocationModuleDump {
     pub module: String,
     pub activation_ratio: f64,
     pub active_replicas: u8,
-    pub cooldown_ms: Option<u64>,
+    pub period_ms: Option<u64>,
     pub tier: String,
     pub guidance: DumpText,
 }

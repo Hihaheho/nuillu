@@ -1740,8 +1740,8 @@ mod tests {
         );
         assert_eq!(effective.active_replicas(&builtin::speak()), 1);
         assert_eq!(
-            effective.cooldown_for(&builtin::speak()),
-            Some(crate::Bpm::from_f64(7.25).cooldown())
+            effective.bpm_for(&builtin::speak()),
+            Some(crate::Bpm::from_f64(7.25))
         );
         assert_eq!(
             effective.for_module(&builtin::speak()).guidance,
@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocation_change_waiter_fires_when_policy_changes_derived_cooldown() {
+    async fn allocation_change_waiter_fires_when_policy_changes_derived_bpm() {
         let module = builtin::query_memory();
         let mut base = ResourceAllocation::default();
         base.set(module.clone(), crate::ModuleConfig::default());

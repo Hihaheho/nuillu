@@ -180,7 +180,7 @@ struct ModuleResourceSample {
     activation_ratio: f64,
     active_replicas: u8,
     bpm: Option<f64>,
-    cooldown_ms: Option<u64>,
+    period_ms: Option<u64>,
     replica_capacity: u8,
 }
 
@@ -190,7 +190,7 @@ impl ModuleResourceSample {
             activation_ratio: view.activation_ratio,
             active_replicas: view.active_replicas,
             bpm: view.bpm,
-            cooldown_ms: view.cooldown_ms,
+            period_ms: view.period_ms,
             replica_capacity: capacity.copied().unwrap_or(view.active_replicas.max(1)),
         }
     }
@@ -495,8 +495,8 @@ fn render_latest_snapshot(ui: &mut egui::Ui, state: &ResourceMonitorState) {
                 .bpm
                 .map(|bpm| format!("{bpm:.1} bpm"))
                 .unwrap_or_else(|| "- bpm".to_string());
-            let cooldown = allocation
-                .cooldown_ms
+            let period = allocation
+                .period_ms
                 .map(|ms| format!("{ms} ms"))
                 .unwrap_or_else(|| "- ms".to_string());
             format!(
@@ -506,7 +506,7 @@ fn render_latest_snapshot(ui: &mut egui::Ui, state: &ResourceMonitorState) {
                 allocation.active_replicas,
                 allocation.replica_capacity,
                 bpm,
-                cooldown
+                period
             )
         })
         .collect::<Vec<_>>();
@@ -758,7 +758,7 @@ mod tests {
                 activation_ratio: 0.5,
                 active_replicas: 1,
                 bpm: Some(12.0),
-                cooldown_ms: Some(5_000),
+                period_ms: Some(5_000),
                 replica_capacity: 2,
             }
         );
@@ -909,7 +909,7 @@ mod tests {
         active_replicas: u8,
         replica_capacity: u8,
         bpm: f64,
-        cooldown_ms: u64,
+        period_ms: u64,
     ) -> BlackboardSnapshot {
         BlackboardSnapshot {
             allocation: vec![AllocationView {
@@ -917,7 +917,7 @@ mod tests {
                 activation_ratio,
                 active_replicas,
                 bpm: Some(bpm),
-                cooldown_ms: Some(cooldown_ms),
+                period_ms: Some(period_ms),
                 tier: "default".to_string(),
                 guidance: String::new(),
             }],

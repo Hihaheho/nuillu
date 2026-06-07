@@ -137,7 +137,7 @@ pub struct ModuleOverviewRow {
     pub tier: Option<String>,
     pub guidance: Option<String>,
     pub bpm: Option<f64>,
-    pub cooldown_ms: Option<u64>,
+    pub period_ms: Option<u64>,
     pub policy: Option<ModulePolicyView>,
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
@@ -993,7 +993,7 @@ const LLM_COLUMN_WIDTH: f32 = 80.0;
 const ALLOCATION_COLUMN_WIDTH: f32 = 36.0;
 const TIER_COLUMN_WIDTH: f32 = 60.0;
 const BPM_COLUMN_WIDTH: f32 = 30.0;
-const COOLDOWN_COLUMN_WIDTH: f32 = 40.0;
+const PERIOD_COLUMN_WIDTH: f32 = 40.0;
 const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
 const ERRORS_COLUMN_WIDTH: f32 = 44.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
@@ -1009,7 +1009,7 @@ fn overview_header(ui: &mut egui::Ui) {
         overview_header_cell(ui, "Replica", REPLICA_COLUMN_WIDTH);
         overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
         overview_header_cell(ui, "BPM", BPM_COLUMN_WIDTH);
-        overview_header_cell(ui, "Cooldown", COOLDOWN_COLUMN_WIDTH);
+        overview_header_cell(ui, "Period", PERIOD_COLUMN_WIDTH);
         overview_header_cell(ui, "Throttle", THROTTLE_COLUMN_WIDTH);
         overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
         overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
@@ -1054,11 +1054,11 @@ fn overview_row(
             );
             overview_label_cell(
                 ui,
-                &row.cooldown_ms
+                &row.period_ms
                     .map(format_millis)
                     .unwrap_or_else(|| "-".to_string()),
                 None,
-                COOLDOWN_COLUMN_WIDTH,
+                PERIOD_COLUMN_WIDTH,
             );
             overview_label_cell(
                 ui,
@@ -1465,7 +1465,7 @@ fn upsert_overview_row<'a>(
             tier: None,
             guidance: None,
             bpm: None,
-            cooldown_ms: None,
+            period_ms: None,
             policy: None,
             throttle: None,
             latest_llm_output: None,
@@ -1484,7 +1484,7 @@ fn apply_allocation_to_row(row: &mut ModuleOverviewRow, allocation: &AllocationV
     row.activation_ratio = Some(allocation.activation_ratio);
     row.active_replicas = Some(allocation.active_replicas);
     row.bpm = allocation.bpm;
-    row.cooldown_ms = allocation.cooldown_ms;
+    row.period_ms = allocation.period_ms;
     row.tier = Some(allocation.tier.clone());
     row.guidance = (!allocation.guidance.is_empty()).then(|| allocation.guidance.clone());
 }
@@ -1966,7 +1966,7 @@ mod tests {
             tier: Some("Default".to_string()),
             guidance: None,
             bpm: None,
-            cooldown_ms: None,
+            period_ms: None,
             policy: None,
             throttle: None,
             latest_llm_output: None,
@@ -2751,7 +2751,7 @@ mod tests {
                 activation_ratio: 0.25,
                 active_replicas: 1,
                 bpm: Some(9.0),
-                cooldown_ms: Some(6667),
+                period_ms: Some(6667),
                 tier: "Default".to_string(),
                 guidance: String::new(),
             }],
@@ -2798,7 +2798,7 @@ mod tests {
                 activation_ratio: 1.0,
                 active_replicas: 1,
                 bpm: Some(18.0),
-                cooldown_ms: Some(3333),
+                period_ms: Some(3333),
                 tier: "Cheap".to_string(),
                 guidance: String::new(),
             }],
@@ -3183,7 +3183,7 @@ mod tests {
                 activation_ratio: 0.75,
                 active_replicas: 1,
                 bpm: Some(12.5),
-                cooldown_ms: Some(4800),
+                period_ms: Some(4800),
                 tier: "Premium".to_string(),
                 guidance: "inspect recent input".to_string(),
             }],
@@ -3207,7 +3207,7 @@ mod tests {
                 tier: Some("Premium".to_string()),
                 guidance: Some("inspect recent input".to_string()),
                 bpm: Some(12.5),
-                cooldown_ms: Some(4800),
+                period_ms: Some(4800),
                 policy: None,
                 throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
@@ -3232,7 +3232,7 @@ mod tests {
             tier: Some("Default".to_string()),
             guidance: None,
             bpm: None,
-            cooldown_ms: None,
+            period_ms: None,
             policy: None,
             throttle: None,
             latest_llm_output: None,

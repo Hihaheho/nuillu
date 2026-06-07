@@ -64,6 +64,8 @@ variants.none = { = null, $variant => "literal" }
 module = `text`
 activation-ratio = `float`
 active-replicas = `integer`
+period-ms = `$types.nullable-integer`
+period-ms.$optional = true
 tier = `$types.model-tier`
 guidance = `text`
 
@@ -131,4 +133,9 @@ variants.premium = { = "premium", $variant => "literal" }
 @ $types.nullable-text
 $variant: union
 variants.some = `text`
+variants.none = { = null, $variant => "literal" }
+
+@ $types.nullable-integer
+$variant: union
+variants.some = `integer`
 variants.none = { = null, $variant => "literal" }
