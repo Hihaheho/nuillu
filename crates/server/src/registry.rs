@@ -143,7 +143,7 @@ fn register_server_module(
         }
         RuntimeModule::QueryMemory => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(6.0, 15.0)), move |caps| {
+            registry.register_server(policy(1..=1, Bpm::range(6.0, 15.0)), move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::QueryMemoryModule::new(
@@ -299,7 +299,7 @@ fn register_server_module(
         }
         RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(1.0, 2.0)), move |caps| {
+            registry.register_server(policy(1..=1, Bpm::range(1.0, 2.0)), move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
                     Ok(nuillu_reward::RewardModule::new(
@@ -320,7 +320,7 @@ fn register_server_module(
             })
         }
         RuntimeModule::Predict => {
-            registry.register_server(policy(0..=1, Bpm::range(1.0, 6.0)), |caps| async move {
+            registry.register_server(policy(1..=1, Bpm::range(1.0, 6.0)), |caps| async move {
                 Ok(nuillu_predict::PredictModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),
@@ -333,7 +333,7 @@ fn register_server_module(
             })
         }
         RuntimeModule::Surprise => {
-            registry.register_server(policy(0..=1, Bpm::range(1.0, 3.0)), |caps| async move {
+            registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), |caps| async move {
                 Ok(nuillu_surprise::SurpriseModule::new(
                     caps.cognition_log_updated_inbox(),
                     caps.cognition_log_reader(),

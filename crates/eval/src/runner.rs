@@ -4717,7 +4717,7 @@ fn register_eval_module(
         // and speak; needs a quick active pace.
         EvalModule::QueryMemory => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 15.0)),
+                eval_policy(1..=1, Bpm::range(6.0, 15.0)),
                 replica_hard_cap,
                 {
                     let memory_caps = memory_caps.clone();
@@ -4936,7 +4936,7 @@ fn register_eval_module(
             .expect("eval module registration should be unique"),
         EvalModule::Reward => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(3.0, 9.0)),
+                eval_policy(1..=1, Bpm::range(3.0, 9.0)),
                 replica_hard_cap,
                 {
                     let policy_caps = policy_caps.clone();
@@ -4967,7 +4967,7 @@ fn register_eval_module(
         // Cognition-log triggered; not on speak critical path.
         EvalModule::Predict => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
                 |caps| async move {
                     Ok(nuillu_predict::PredictModule::new(
@@ -4986,7 +4986,7 @@ fn register_eval_module(
         // unexpected events while they're still relevant.
         EvalModule::Surprise => registry
             .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                eval_policy(1..=1, Bpm::range(6.0, 18.0)),
                 replica_hard_cap,
                 |caps| async move {
                     Ok(nuillu_surprise::SurpriseModule::new(
@@ -9408,7 +9408,7 @@ prompt = "What am I attending to?"
     }
 
     #[tokio::test]
-    async fn full_agent_gui_initial_allocation_starts_only_durable_writers_active() {
+    async fn full_agent_gui_initial_allocation_keeps_baseline_faculties_active() {
         let selected = DEFAULT_FULL_AGENT_MODULES.to_vec();
         let allocation = full_agent_gui_initial_allocation(
             &crate::cases::EvalLimits {
@@ -9450,7 +9450,12 @@ prompt = "What am I attending to?"
                     let id = module.module_id();
                     assert_eq!(bb.allocation().activation_for(&id), ActivationRatio::ZERO);
                     let expected_active_replicas = match module {
-                        EvalModule::Memory | EvalModule::Policy => 1,
+                        EvalModule::QueryMemory
+                        | EvalModule::Memory
+                        | EvalModule::Policy
+                        | EvalModule::Reward
+                        | EvalModule::Predict
+                        | EvalModule::Surprise => 1,
                         _ => 0,
                     };
                     assert_eq!(
