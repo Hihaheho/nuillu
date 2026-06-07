@@ -147,10 +147,10 @@ impl SchemaKind {
 
     fn production_distance(self) -> u32 {
         match self {
-            Self::Current => 0,
-            Self::ShortKeys => 1,
-            Self::SplitArrays => 2,
-            Self::IdsMap => 3,
+            Self::IdsMap => 0,
+            Self::SplitArrays => 1,
+            Self::Current => 2,
+            Self::ShortKeys => 3,
             Self::PrimaryRest => 4,
         }
     }
@@ -274,6 +274,7 @@ mod ids_map_schema {
     pub(super) struct Args {
         pub(super) memo: String,
         pub(super) priority_module_ids: Vec<ModuleTargetId>,
+        #[serde(default)]
         pub(super) hints_by_module: BTreeMap<String, String>,
     }
 
@@ -324,6 +325,7 @@ struct TrialReport {
     success: bool,
     failure: Option<String>,
     transport_error: bool,
+    priority_module_count: usize,
     priority_module_ids: Vec<String>,
     invalid_module_ids: Vec<String>,
     tool_call_count: usize,
@@ -344,6 +346,31 @@ struct CandidateSummary {
     invalid_module_ids: usize,
     tool_issues: usize,
     production_distance: u32,
+    usage: UsageSummary,
+    success_priority_module_count: NumericStats,
+    success_module_id_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct UsageSummary {
+    sample_count: usize,
+    input_tokens: NumericStats,
+    output_tokens: NumericStats,
+    total_tokens: NumericStats,
+    cache_creation_tokens: NumericStats,
+    cache_read_tokens: NumericStats,
+    cost_micros_usd: NumericStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct NumericStats {
+    sample_count: usize,
+    min: Option<u64>,
+    p05: Option<u64>,
+    p50: Option<u64>,
+    p95: Option<u64>,
+    max: Option<u64>,
+    mean: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -665,12 +692,14 @@ where
                     invalid_module_ids: Vec::new(),
                 }
             });
+            let priority_module_count = validation.priority_module_ids.len();
             TrialReport {
                 schema,
                 trial,
                 success: validation.success,
                 failure: validation.failure,
                 transport_error: false,
+                priority_module_count,
                 priority_module_ids: validation.priority_module_ids,
                 invalid_module_ids: validation.invalid_module_ids,
                 tool_call_count: round.tool_calls.len(),
@@ -685,6 +714,7 @@ where
             success: false,
             failure: Some(format!("finished_without_tool:{:?}", result.finish_reason)),
             transport_error: false,
+            priority_module_count: 0,
             priority_module_ids: Vec::new(),
             invalid_module_ids: Vec::new(),
             tool_call_count: 0,
@@ -701,6 +731,7 @@ where
                 result.finish_reason
             )),
             transport_error: false,
+            priority_module_count: 0,
             priority_module_ids: Vec::new(),
             invalid_module_ids: Vec::new(),
             tool_call_count: 0,
@@ -716,6 +747,7 @@ where
                 success: false,
                 transport_error: is_transport_failure(&failure),
                 failure: Some(failure),
+                priority_module_count: 0,
                 priority_module_ids: Vec::new(),
                 invalid_module_ids: Vec::new(),
                 tool_call_count: 0,
@@ -886,6 +918,18 @@ fn summarize_trials(trials: &[TrialReport]) -> Vec<CandidateSummary> {
                 .filter(|trial| trial.transport_error)
                 .count();
             let evaluable_count = evaluable_trials.len();
+            let success_priority_module_count = numeric_stats(
+                evaluable_trials
+                    .iter()
+                    .filter(|trial| trial.success)
+                    .map(|trial| trial.priority_module_count as u64),
+            );
+            let success_module_id_counts = module_id_counts(
+                evaluable_trials
+                    .iter()
+                    .filter(|trial| trial.success)
+                    .flat_map(|trial| trial.priority_module_ids.iter().cloned()),
+            );
             Some(CandidateSummary {
                 schema: *schema,
                 attempted_trials: schema_trials.len(),
@@ -901,9 +945,64 @@ fn summarize_trials(trials: &[TrialReport]) -> Vec<CandidateSummary> {
                 invalid_module_ids,
                 tool_issues,
                 production_distance: schema.production_distance(),
+                usage: usage_summary(
+                    evaluable_trials
+                        .iter()
+                        .filter_map(|trial| trial.usage.as_ref()),
+                ),
+                success_priority_module_count,
+                success_module_id_counts,
             })
         })
         .collect()
+}
+
+fn usage_summary<'a>(usages: impl IntoIterator<Item = &'a lutum::Usage>) -> UsageSummary {
+    let usages = usages.into_iter().collect::<Vec<_>>();
+    UsageSummary {
+        sample_count: usages.len(),
+        input_tokens: numeric_stats(usages.iter().map(|usage| usage.input_tokens)),
+        output_tokens: numeric_stats(usages.iter().map(|usage| usage.output_tokens)),
+        total_tokens: numeric_stats(usages.iter().map(|usage| usage.total_tokens)),
+        cache_creation_tokens: numeric_stats(
+            usages.iter().map(|usage| usage.cache_creation_tokens),
+        ),
+        cache_read_tokens: numeric_stats(usages.iter().map(|usage| usage.cache_read_tokens)),
+        cost_micros_usd: numeric_stats(usages.iter().map(|usage| usage.cost_micros_usd)),
+    }
+}
+
+fn numeric_stats(values: impl IntoIterator<Item = u64>) -> NumericStats {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    if values.is_empty() {
+        return NumericStats::default();
+    }
+    let sum = values.iter().copied().sum::<u64>();
+    NumericStats {
+        sample_count: values.len(),
+        min: values.first().copied(),
+        p05: Some(percentile(&values, 0.05)),
+        p50: Some(percentile(&values, 0.50)),
+        p95: Some(percentile(&values, 0.95)),
+        max: values.last().copied(),
+        mean: Some(sum as f64 / values.len() as f64),
+    }
+}
+
+fn percentile(sorted_values: &[u64], quantile: f64) -> u64 {
+    debug_assert!(!sorted_values.is_empty());
+    let max_index = sorted_values.len() - 1;
+    let index = ((max_index as f64) * quantile).round() as usize;
+    sorted_values[index.min(max_index)]
+}
+
+fn module_id_counts(ids: impl IntoIterator<Item = String>) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for id in ids {
+        *counts.entry(id).or_default() += 1;
+    }
+    counts
 }
 
 fn pick_winner(summaries: &[CandidateSummary]) -> Option<SchemaKind> {
@@ -962,7 +1061,73 @@ fn render_markdown_report(report: &ProbeReport) -> String {
             summary.production_distance
         ));
     }
+    out.push_str("\n## Token Usage\n\n");
+    out.push_str(
+        "| schema | samples | input avg | input p50 | input p95 | output avg | output p50 | output p95 | total avg | total p50 | total p95 |\n",
+    );
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for summary in &report.schemas {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            summary.schema,
+            summary.usage.sample_count,
+            format_mean(summary.usage.input_tokens.mean),
+            format_u64(summary.usage.input_tokens.p50),
+            format_u64(summary.usage.input_tokens.p95),
+            format_mean(summary.usage.output_tokens.mean),
+            format_u64(summary.usage.output_tokens.p50),
+            format_u64(summary.usage.output_tokens.p95),
+            format_mean(summary.usage.total_tokens.mean),
+            format_u64(summary.usage.total_tokens.p50),
+            format_u64(summary.usage.total_tokens.p95),
+        ));
+    }
+    out.push_str("\n## Priority Module Counts\n\n");
+    out.push_str(
+        "| schema | success samples | min | p05 | p50 | p95 | max | avg | module id counts |\n",
+    );
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    for summary in &report.schemas {
+        let stats = &summary.success_priority_module_count;
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            summary.schema,
+            stats.sample_count,
+            format_u64(stats.min),
+            format_u64(stats.p05),
+            format_u64(stats.p50),
+            format_u64(stats.p95),
+            format_u64(stats.max),
+            format_mean(stats.mean),
+            format_module_counts(&summary.success_module_id_counts),
+        ));
+    }
     out
+}
+
+fn format_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+fn format_mean(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.1}"))
+}
+
+fn format_module_counts(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_owned();
+    }
+    let mut counts = counts.iter().collect::<Vec<_>>();
+    counts.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    counts
+        .into_iter()
+        .map(|(id, count)| format!("{id}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -1069,6 +1234,9 @@ mod tests {
                 invalid_module_ids: 1,
                 tool_issues: 0,
                 production_distance: SchemaKind::SplitArrays.production_distance(),
+                usage: UsageSummary::default(),
+                success_priority_module_count: NumericStats::default(),
+                success_module_id_counts: BTreeMap::new(),
             },
             CandidateSummary {
                 schema: SchemaKind::ShortKeys,
@@ -1081,9 +1249,12 @@ mod tests {
                 invalid_module_ids: 0,
                 tool_issues: 0,
                 production_distance: SchemaKind::ShortKeys.production_distance(),
+                usage: UsageSummary::default(),
+                success_priority_module_count: NumericStats::default(),
+                success_module_id_counts: BTreeMap::new(),
             },
             CandidateSummary {
-                schema: SchemaKind::Current,
+                schema: SchemaKind::IdsMap,
                 attempted_trials: 100,
                 evaluable_trials: 100,
                 transport_errors: 0,
@@ -1092,11 +1263,14 @@ mod tests {
                 success_rate: 0.9,
                 invalid_module_ids: 0,
                 tool_issues: 0,
-                production_distance: SchemaKind::Current.production_distance(),
+                production_distance: SchemaKind::IdsMap.production_distance(),
+                usage: UsageSummary::default(),
+                success_priority_module_count: NumericStats::default(),
+                success_module_id_counts: BTreeMap::new(),
             },
         ];
 
-        assert_eq!(pick_winner(&summaries), Some(SchemaKind::Current));
+        assert_eq!(pick_winner(&summaries), Some(SchemaKind::IdsMap));
     }
 
     #[test]
@@ -1111,8 +1285,8 @@ mod tests {
                     "execution_error:execution error: request failure (kind=Transport, status=None)",
                 ),
             ),
-            trial_report(SchemaKind::IdsMap, 0, true, None),
-            trial_report(SchemaKind::IdsMap, 1, true, None),
+            trial_report(SchemaKind::PrimaryRest, 0, true, None),
+            trial_report(SchemaKind::PrimaryRest, 1, true, None),
         ];
 
         let summaries = summarize_trials(&trials);
@@ -1128,25 +1302,121 @@ mod tests {
         assert_eq!(pick_winner(&summaries), Some(SchemaKind::SplitArrays));
     }
 
+    #[test]
+    fn summary_tracks_usage_and_success_module_count_stats() {
+        let trials = vec![
+            trial_report_with_output(
+                SchemaKind::SplitArrays,
+                0,
+                true,
+                &["speak", "cognition-gate", "query-memory"],
+                Some(usage(100, 20, 120)),
+            ),
+            trial_report_with_output(
+                SchemaKind::SplitArrays,
+                1,
+                true,
+                &["speak", "cognition-gate", "query-memory", "memory"],
+                Some(usage(120, 30, 150)),
+            ),
+            trial_report_with_output(
+                SchemaKind::SplitArrays,
+                2,
+                true,
+                &[
+                    "speak",
+                    "cognition-gate",
+                    "query-memory",
+                    "memory",
+                    "policy",
+                ],
+                Some(usage(140, 40, 180)),
+            ),
+        ];
+
+        let summaries = summarize_trials(&trials);
+        let split = summaries
+            .iter()
+            .find(|summary| summary.schema == SchemaKind::SplitArrays)
+            .unwrap();
+
+        assert_eq!(split.usage.sample_count, 3);
+        assert_eq!(split.usage.input_tokens.min, Some(100));
+        assert_eq!(split.usage.input_tokens.p50, Some(120));
+        assert_eq!(split.usage.total_tokens.max, Some(180));
+        assert_eq!(split.success_priority_module_count.min, Some(3));
+        assert_eq!(split.success_priority_module_count.p50, Some(4));
+        assert_eq!(split.success_priority_module_count.max, Some(5));
+        assert_eq!(
+            split.success_module_id_counts,
+            BTreeMap::from([
+                ("cognition-gate".to_owned(), 3),
+                ("memory".to_owned(), 2),
+                ("policy".to_owned(), 1),
+                ("query-memory".to_owned(), 3),
+                ("speak".to_owned(), 3),
+            ])
+        );
+    }
+
     fn trial_report(
         schema: SchemaKind,
         trial: usize,
         success: bool,
         failure: Option<&str>,
     ) -> TrialReport {
-        let failure = failure.map(str::to_owned);
+        let module_ids = if success { &["speak"][..] } else { &[][..] };
+        trial_report_with_output(schema, trial, success, module_ids, None).with_failure(failure)
+    }
+
+    fn trial_report_with_output(
+        schema: SchemaKind,
+        trial: usize,
+        success: bool,
+        module_ids: &[&str],
+        usage: Option<lutum::Usage>,
+    ) -> TrialReport {
+        let priority_module_ids = module_ids
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect::<Vec<_>>();
         TrialReport {
             schema,
             trial,
             success,
-            transport_error: failure.as_deref().is_some_and(super::is_transport_failure),
-            failure,
-            priority_module_ids: Vec::new(),
+            transport_error: false,
+            failure: None,
+            priority_module_count: priority_module_ids.len(),
+            priority_module_ids,
             invalid_module_ids: Vec::new(),
             tool_call_count: usize::from(success),
             tool_issue_count: 0,
             latency_ms: 1,
-            usage: None,
+            usage,
+        }
+    }
+
+    trait TrialReportTestExt {
+        fn with_failure(self, failure: Option<&str>) -> Self;
+    }
+
+    impl TrialReportTestExt for TrialReport {
+        fn with_failure(mut self, failure: Option<&str>) -> Self {
+            let failure = failure.map(str::to_owned);
+            self.transport_error = failure.as_deref().is_some_and(super::is_transport_failure);
+            self.failure = failure;
+            self
+        }
+    }
+
+    fn usage(input_tokens: u64, output_tokens: u64, total_tokens: u64) -> lutum::Usage {
+        lutum::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_micros_usd: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
         }
     }
 }

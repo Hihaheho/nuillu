@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,14 +26,13 @@ allocation posture is best for the mind and which modules deserve extra activati
 
 Use exactly one tool per activation:
 - leave_allocation_unchanged when the current allocation already fits the best current posture.
-- reprioritize_modules when one or more modules need extra activation now. The priority array lists
-  modules in descending priority order, each entry pairing a module_id (must be a registered module)
-  with a hint — one concise sentence saying why that module needs extra activation now. Omitted
-  modules fall back to the host/base allocation: the priority list adds salience drive, it is not a
-  complete allow-list and not an inhibition list. Separate suppression caps, when granted by the
-  host, are the inhibition path. Position in the array maps to the host-configured activation table;
-  positions beyond the table fall to zero, so prioritise tightly. Do not invent module ids and do
-  not duplicate ids.
+- reprioritize_modules when one or more modules need extra activation now. `priority_module_ids`
+  lists registered module ids in descending priority order. `hints_by_module` may map module ids to
+  concise module-specific guidance. Omitted modules fall back to the host/base allocation: the
+  priority list adds salience drive, it is not a complete allow-list and not an inhibition list.
+  Separate suppression caps, when granted by the host, are the inhibition path. Position in
+  `priority_module_ids` maps to the host-configured activation table; positions beyond the table
+  fall to zero, so prioritise tightly. Do not invent module ids and do not duplicate ids.
 
 Attention-control requests are not target-module work queues. They are current attention bids that
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
@@ -139,7 +138,7 @@ fn format_allocation_system_prompt(
 }
 
 tokio::task_local! {
-    /// JSON Schema for `PriorityEntry.module_id` derived from the live
+    /// JSON Schema for `ModuleTargetId` derived from the live
     /// allocation target registry. Scoped around each allocation turn so the
     /// LLM sees the current host-constrained module enum.
     static MODULE_TARGET_ID_SCHEMA: Schema;
@@ -161,6 +160,52 @@ fn module_target_id_schema(allowed_modules: &[ModuleId]) -> Schema {
         Schema::try_from(serde_json::json!({ "type": "string", "enum": module_ids }))
             .expect("module target id schema must be a JSON object")
     }
+}
+
+pub fn controller_schema_json(allowed_modules: &[ModuleId]) -> serde_json::Value {
+    let mut ids = allowed_modules.to_vec();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    ids.dedup();
+    let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
+
+    let priority_module_items = if module_ids.is_empty() {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::json!({
+            "enum": module_ids,
+        })
+    };
+    let hint_property_names = if module_ids.is_empty() {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::json!({
+            "enum": module_ids,
+        })
+    };
+
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "memo": {
+                "type": "string",
+            },
+            "priority_module_ids": {
+                "type": "array",
+                "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                "items": priority_module_items,
+            },
+            "hints_by_module": {
+                "type": "object",
+                "description": "Module-id keyed concise guidance hints.",
+                "propertyNames": hint_property_names,
+                "additionalProperties": {
+                    "type": "string",
+                },
+            },
+        },
+        "required": ["memo", "priority_module_ids"],
+    })
 }
 
 /// Wire-format string with a JSON Schema dynamically constrained to the
@@ -218,7 +263,9 @@ pub struct LeaveAllocationUnchangedOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReprioritizeModulesArgs {
     pub memo: String,
-    pub priority: Vec<PriorityEntry>,
+    pub priority_module_ids: Vec<ModuleTargetId>,
+    #[serde(default)]
+    pub hints_by_module: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -230,12 +277,6 @@ pub struct ReprioritizeModulesOutput {
 pub enum AllocationTools {
     LeaveAllocationUnchanged(LeaveAllocationUnchangedArgs),
     ReprioritizeModules(ReprioritizeModulesArgs),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct PriorityEntry {
-    pub module_id: ModuleTargetId,
-    pub hint: String,
 }
 
 pub struct AllocationModule {
@@ -484,10 +525,16 @@ fn apply_reprioritize(
     registered: &std::collections::HashSet<ModuleId>,
     decision: ReprioritizeModulesArgs,
 ) -> AppliedDecision {
+    let ReprioritizeModulesArgs {
+        memo,
+        priority_module_ids,
+        hints_by_module,
+    } = decision;
     let mut commands = Vec::new();
 
-    for (rank, entry) in decision.priority.into_iter().enumerate() {
-        let Ok(id) = ModuleId::new(entry.module_id.as_str()) else {
+    for (rank, module_id) in priority_module_ids.into_iter().enumerate() {
+        let module_key = module_id.as_str().to_owned();
+        let Ok(id) = ModuleId::new(&module_key) else {
             tracing::warn!("allocation ignored invalid module id");
             continue;
         };
@@ -495,17 +542,19 @@ fn apply_reprioritize(
             tracing::warn!(module = %id, "allocation ignored unregistered module id");
             continue;
         }
+        let guidance = hints_by_module
+            .get(&module_key)
+            .map(|hint| hint.trim())
+            .filter(|hint| !hint.is_empty())
+            .map(ToOwned::to_owned);
         commands.push(AllocationCommand::target(
             id,
             priority_level(rank),
-            Some(entry.hint),
+            guidance,
         ));
     }
 
-    AppliedDecision {
-        memo: decision.memo,
-        commands,
-    }
+    AppliedDecision { memo, commands }
 }
 
 fn priority_level(rank: usize) -> AllocationEffectLevel {
@@ -655,6 +704,40 @@ mod tests {
         assert_eq!(
             visible_modules(&hints, &allowed),
             vec![(builtin::speak(), "speak hint")]
+        );
+    }
+
+    #[test]
+    fn controller_schema_json_enumerates_allowed_modules() {
+        assert_eq!(
+            controller_schema_json(&[builtin::query_memory()]),
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "memo": {
+                        "type": "string",
+                    },
+                    "priority_module_ids": {
+                        "type": "array",
+                        "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
+                        "items": {
+                            "enum": ["query-memory"],
+                        },
+                    },
+                    "hints_by_module": {
+                        "type": "object",
+                        "description": "Module-id keyed concise guidance hints.",
+                        "propertyNames": {
+                            "enum": ["query-memory"],
+                        },
+                        "additionalProperties": {
+                            "type": "string",
+                        },
+                    },
+                },
+                "required": ["memo", "priority_module_ids"],
+            })
         );
     }
 
@@ -911,20 +994,19 @@ mod tests {
             &registered,
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
-                priority: vec![
-                    PriorityEntry {
-                        module_id: "invented-module".into(),
-                        hint: "ignore".into(),
-                    },
-                    PriorityEntry {
-                        module_id: "speak".into(),
-                        hint: "respond from cognition log when ready".into(),
-                    },
-                    PriorityEntry {
-                        module_id: "sensory".into(),
-                        hint: "keep watching the food bowl".into(),
-                    },
+                priority_module_ids: vec![
+                    "invented-module".into(),
+                    "speak".into(),
+                    "sensory".into(),
                 ],
+                hints_by_module: BTreeMap::from([
+                    ("invented-module".into(), "ignore".into()),
+                    (
+                        "speak".into(),
+                        "respond from cognition log when ready".into(),
+                    ),
+                    ("sensory".into(), "keep watching the food bowl".into()),
+                ]),
             },
         );
 
@@ -969,10 +1051,11 @@ mod tests {
             &registered,
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
-                priority: vec![PriorityEntry {
-                    module_id: "sensory".into(),
-                    hint: "inspect queued input".into(),
-                }],
+                priority_module_ids: vec!["sensory".into()],
+                hints_by_module: BTreeMap::from([(
+                    "sensory".into(),
+                    "inspect queued input".into(),
+                )]),
             },
         );
 
@@ -984,6 +1067,38 @@ mod tests {
             AllocationEffectLevel::Max
         );
         assert!(last_target(&applied.commands, &builtin::cognition_gate()).is_none());
+    }
+
+    #[test]
+    fn apply_decision_omits_guidance_when_hint_is_missing_or_empty() {
+        let mut registered = std::collections::HashSet::new();
+        registered.insert(builtin::speak());
+        registered.insert(builtin::sensory());
+
+        let applied = apply_reprioritize(
+            &registered,
+            ReprioritizeModulesArgs {
+                memo: "checked".into(),
+                priority_module_ids: vec!["speak".into(), "sensory".into()],
+                hints_by_module: BTreeMap::from([("speak".into(), "   ".into())]),
+            },
+        );
+
+        let speak = last_target(&applied.commands, &builtin::speak()).unwrap();
+        assert_eq!(speak.guidance, None);
+        let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
+        assert_eq!(sensory.guidance, None);
+    }
+
+    #[test]
+    fn reprioritize_args_default_missing_hint_map_to_empty() {
+        let args = serde_json::from_value::<ReprioritizeModulesArgs>(serde_json::json!({
+            "memo": "checked",
+            "priority_module_ids": ["speak"]
+        }))
+        .expect("missing hints_by_module should default to an empty map");
+
+        assert_eq!(args.hints_by_module, BTreeMap::new());
     }
 
     #[test]

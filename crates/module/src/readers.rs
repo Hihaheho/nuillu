@@ -168,51 +168,6 @@ impl AllocationReader {
             })
             .await
     }
-
-    pub async fn controller_schema_json(
-        &self,
-        allowed_modules: &[nuillu_types::ModuleId],
-    ) -> serde_json::Value {
-        let mut ids = allowed_modules.to_vec();
-        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        ids.dedup();
-        let module_ids = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>();
-
-        let priority_items = if module_ids.is_empty() {
-            serde_json::Value::Bool(false)
-        } else {
-            serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "module_id": {
-                        "enum": module_ids,
-                    },
-                    "hint": {
-                        "type": "string",
-                        "description": "One concise sentence justifying why this module needs activation right now.",
-                    },
-                },
-                "required": ["module_id", "hint"],
-            })
-        };
-
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "memo": {
-                    "type": "string",
-                },
-                "priority": {
-                    "type": "array",
-                    "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
-                    "items": priority_items,
-                },
-            },
-            "required": ["memo", "priority"],
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -265,73 +220,8 @@ mod tests {
     use super::*;
 
     use chrono::{TimeZone, Utc};
-    use nuillu_blackboard::{
-        BlackboardCommand, Bpm, CognitionLogEntry, ModulePolicy, linear_ratio_fn,
-    };
-    use nuillu_types::{ReplicaCapRange, ReplicaIndex, builtin};
-
-    fn test_policy(range: ReplicaCapRange) -> ModulePolicy {
-        ModulePolicy::new(
-            range,
-            Bpm::from_f64(1.0)..=Bpm::from_f64(60.0),
-            linear_ratio_fn,
-        )
-    }
-
-    #[tokio::test]
-    async fn controller_schema_enumerates_allowed_modules() {
-        let blackboard = Blackboard::default();
-        blackboard
-            .apply(BlackboardCommand::SetModulePolicies {
-                policies: vec![
-                    (
-                        builtin::query_memory(),
-                        test_policy(ReplicaCapRange::new(0, 2).unwrap()),
-                    ),
-                    (
-                        builtin::speak(),
-                        test_policy(ReplicaCapRange::new(0, 0).unwrap()),
-                    ),
-                ],
-            })
-            .await;
-        let reader = AllocationReader::new(blackboard);
-
-        let schema = reader
-            .controller_schema_json(&[builtin::query_memory()])
-            .await;
-        assert_eq!(
-            schema,
-            serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "memo": {
-                        "type": "string",
-                    },
-                    "priority": {
-                        "type": "array",
-                        "description": "Modules to add salience/drive for, in descending priority order. Omitted modules keep boot/base allocation unless suppressed elsewhere. Position maps to the host-configured activation_table; positions beyond the table fall to zero.",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "module_id": {
-                                    "enum": ["query-memory"],
-                                },
-                                "hint": {
-                                    "type": "string",
-                                    "description": "One concise sentence justifying why this module needs activation right now.",
-                                },
-                            },
-                            "required": ["module_id", "hint"],
-                        },
-                    },
-                },
-                "required": ["memo", "priority"],
-            })
-        );
-    }
+    use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry};
+    use nuillu_types::{ReplicaIndex, builtin};
 
     #[tokio::test]
     async fn module_status_reader_exposes_scheduler_owned_status() {
