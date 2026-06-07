@@ -131,6 +131,7 @@ fn visualizer_gui_command(host: &str) -> anyhow::Result<Command> {
 fn build_visualizer_gui_binary() -> anyhow::Result<()> {
     let status = Command::new("cargo")
         .arg("build")
+        .arg("--release")
         .arg("-p")
         .arg("nuillu-visualizer-egui")
         .arg("--bin")
@@ -159,7 +160,7 @@ fn existing_visualizer_binary() -> Option<PathBuf> {
         Some(
             workspace_root()
                 .join("target")
-                .join("debug")
+                .join("release")
                 .join(visualizer_binary_name()),
         ),
     ]
