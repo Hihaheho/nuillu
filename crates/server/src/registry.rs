@@ -101,7 +101,6 @@ fn register_server_module(
                         caps.allocation_reader(),
                         caps.interoception_reader(),
                         caps.allocation_writer(voluntary.clone(), Vec::new()),
-                        caps.memo(),
                         caps.llm_access(),
                         caps.session("main")
                             .with_auto_compaction(nuillu_allocation::session_auto_compaction())

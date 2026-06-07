@@ -204,7 +204,6 @@ mod tests {
                                     vec![nuillu_types::builtin::allocation()],
                                     Vec::new(),
                                 ),
-                                caps.memo(),
                                 caps.llm_access(),
                                 caps.session("main")
                                     .with_auto_compaction(crate::session_auto_compaction())

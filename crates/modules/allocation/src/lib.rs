@@ -6,7 +6,7 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
+    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow,
     MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, format_available_faculties,
     format_bounded_memo_log_batch, format_current_attention_guidance,
@@ -38,14 +38,15 @@ Attention-control requests are not target-module work queues. They are current a
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
 concrete requested work in that module's guidance hint. If you defer or reject a request, do not
 activate a module for it. In every case, record the admit/defer/reject judgement and reason in
-`memo`; there is no durable pending request queue outside this allocation note.
+`memo`; this decision note is retained in allocation session history, not broadcast as a shared
+module memo, and there is no durable pending request queue outside this allocation note.
 
 Module-specific priority policy comes from the registered allocation target hints appended below.
 Do not assume any particular module exists; only target registered module ids exposed by the live
 schema and use each target's hint to decide what work it can perform.
 
-Each tool carries a free-form allocation memo; preserve the reasoning needed by other modules but do
-not encode it as JSON, YAML, a code block, or any fixed schema."#;
+Each tool carries a free-form allocation memo; preserve the reasoning needed by future allocation
+turns but do not encode it as JSON, YAML, a code block, or any fixed schema."#;
 
 const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
@@ -288,7 +289,6 @@ pub struct AllocationModule {
     allocation_reader: AllocationReader,
     interoception: InteroceptiveReader,
     allocation_writer: AllocationWriter,
-    memo: Memo,
     llm: LlmAccess,
     session: Session,
     batching: batch::AttentionControlBatchConfig,
@@ -305,7 +305,6 @@ impl AllocationModule {
         allocation_reader: AllocationReader,
         interoception: InteroceptiveReader,
         allocation_writer: AllocationWriter,
-        memo: Memo,
         llm: LlmAccess,
         session: Session,
     ) -> Self {
@@ -318,7 +317,6 @@ impl AllocationModule {
             allocation_reader,
             interoception,
             allocation_writer,
-            memo,
             llm,
             session,
             batching: batch::AttentionControlBatchConfig::default(),
@@ -503,7 +501,6 @@ impl AllocationModule {
             anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
         }
 
-        self.memo.write(applied.memo.clone()).await;
         self.allocation_writer.submit(applied.commands).await;
         Ok(())
     }
@@ -681,7 +678,9 @@ mod tests {
         Blackboard, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
-    use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, ModuleRegistry};
+    use nuillu_module::{
+        CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
+    };
     use nuillu_types::builtin;
 
     #[test]
@@ -886,7 +885,6 @@ mod tests {
                             vec![builtin::allocation(), builtin::sensory()],
                             Vec::new(),
                         ),
-                        caps.memo(),
                         caps.llm_access(),
                         caps.session("main")
                             .with_auto_compaction(session_auto_compaction())
@@ -1202,6 +1200,16 @@ mod tests {
         fixture.controller.activate_with(&cx, &[]).await.unwrap();
         fixture.source_memo.write("sensory memo B").await;
         fixture.controller.activate_with(&cx, &[]).await.unwrap();
+
+        let allocation_memos = fixture
+            .controller
+            .blackboard
+            .recent_memo_logs()
+            .await
+            .into_iter()
+            .filter(|record| record.owner.module == builtin::allocation())
+            .collect::<Vec<_>>();
+        assert_eq!(allocation_memos, Vec::new());
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);

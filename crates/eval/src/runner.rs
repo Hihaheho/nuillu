@@ -4654,7 +4654,6 @@ fn register_eval_module(
                                 caps.allocation_reader(),
                                 caps.interoception_reader(),
                                 caps.allocation_writer(voluntary.clone(), Vec::new()),
-                                caps.memo(),
                                 caps.llm_access(),
                                 caps.session("main")
                                     .with_auto_compaction(
