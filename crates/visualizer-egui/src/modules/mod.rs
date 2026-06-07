@@ -344,7 +344,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             delta,
         } => {
             if let Some(turn) = turn_mut(state, &turn_id) {
-                append_output_delta(turn, kind, delta);
+                append_output_delta(turn, kind, delta, None);
                 turn.status = ModuleSessionStatus::Running;
             }
         }
@@ -358,7 +358,8 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
                 append_output_delta(
                     turn,
                     "tool_call".to_string(),
-                    format!("{name}({id}) {arguments_json_delta}"),
+                    arguments_json_delta,
+                    Some(tool_call_source(&name, &id)),
                 );
             }
         }
@@ -369,12 +370,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             arguments_json,
         } => {
             if let Some(turn) = turn_mut(state, &turn_id) {
-                turn.output.push(LlmOutputItemState {
-                    kind: "tool_call_ready".to_string(),
-                    content: arguments_json,
-                    streaming: false,
-                    source: Some(format!("{name}({id})")),
-                });
+                apply_tool_call_ready(turn, tool_call_source(&name, &id), arguments_json);
             }
         }
         LlmObservationEvent::StructuredReady { turn_id, json } => {
@@ -1080,13 +1076,7 @@ fn overview_row(
             overview_label_cell(ui, &row.llm_status, None, LLM_COLUMN_WIDTH);
             overview_label_cell(ui, &row.error_count.to_string(), None, ERRORS_COLUMN_WIDTH);
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
-            let output_preview = tail_preview_text(output, 96);
-            overview_label_cell(
-                ui,
-                &output_preview,
-                row.latest_llm_output.as_deref(),
-                LATEST_OUTPUT_COLUMN_WIDTH,
-            );
+            overview_latest_output_cell(ui, output, row.latest_llm_output.as_deref());
         });
     });
 }
@@ -1382,6 +1372,78 @@ fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width
     }
 }
 
+fn overview_latest_output_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(LATEST_OUTPUT_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let color = ui.visuals().text_color();
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let display = latest_output_cell_text(ui, text, &font_id, color, rect.width());
+    let galley = ui.painter().layout_no_wrap(display.clone(), font_id, color);
+    let position = egui::pos2(
+        rect.right() - galley.size().x,
+        rect.center().y - (galley.size().y / 2.0),
+    );
+    ui.painter()
+        .with_clip_rect(rect)
+        .galley(position, galley, color);
+
+    if let Some(hover) = hover
+        && !hover.is_empty()
+        && hover != display
+    {
+        response.on_hover_text(hover);
+    }
+}
+
+fn latest_output_cell_text(
+    ui: &egui::Ui,
+    text: &str,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> String {
+    latest_output_cell_text_with_width(text, max_width, |text| text_width(ui, text, font_id, color))
+}
+
+fn latest_output_cell_text_with_width(
+    text: &str,
+    max_width: f32,
+    mut text_width: impl FnMut(&str) -> f32,
+) -> String {
+    if text_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut low = 0_usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let suffix = chars[chars.len().saturating_sub(mid)..]
+            .iter()
+            .collect::<String>();
+        if text_width(&suffix) <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    if low == 0 {
+        return chars.last().into_iter().collect();
+    }
+    chars[chars.len() - low..].iter().collect::<String>()
+}
+
+fn text_width(ui: &egui::Ui, text: &str, font_id: &egui::FontId, color: egui::Color32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), font_id.clone(), color)
+        .size()
+        .x
+}
+
 fn upsert_overview_row<'a>(
     rows: &'a mut BTreeMap<String, ModuleOverviewRow>,
     owner: String,
@@ -1470,22 +1532,31 @@ fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
 }
 
 fn latest_llm_output(module: &ModuleState) -> Option<String> {
-    let turn = module
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.status == ModuleSessionStatus::Running)
-        .or_else(|| module.turns.last())?;
-    let output = turn
+    let turn = module.turns.last()?;
+    if turn.status != ModuleSessionStatus::Running {
+        return None;
+    }
+    if let Some(output) = turn
         .output
         .iter()
         .rev()
-        .find(|item| !item.content.trim().is_empty())?;
-    Some(format!(
-        "{}: {}",
-        output.kind,
-        tail_preview_text(&output.content, 512)
-    ))
+        .find(|item| !item.content.trim().is_empty())
+    {
+        return Some(output_text(output));
+    }
+    Some("running: awaiting output".to_string())
+}
+
+fn output_text(output: &LlmOutputItemState) -> String {
+    let content = normalize_latest_output_text(&output.content);
+    match output.source.as_deref() {
+        Some(source) if !source.is_empty() => format!("{} {source}: {content}", output.kind),
+        _ => format!("{}: {content}", output.kind),
+    }
+}
+
+fn normalize_latest_output_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn replica_label(row: &ModuleOverviewRow) -> String {
@@ -1493,26 +1564,6 @@ fn replica_label(row: &ModuleOverviewRow) -> String {
     row.active_replicas
         .map(|total| format!("{index}/{total}"))
         .unwrap_or_else(|| format!("{index}/-"))
-}
-
-fn tail_preview_text(text: &str, max_chars: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
-    if max_chars <= 3 {
-        return ".".repeat(max_chars);
-    }
-    let mut out = normalized
-        .chars()
-        .rev()
-        .take(max_chars - 3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    out.insert_str(0, "...");
-    out
 }
 
 fn throttle_label(summary: &ThrottleSummary) -> String {
@@ -1604,7 +1655,11 @@ pub fn selected_llm_turn_id(selected: &str, rows: &[LlmTurnListRow]) -> Option<S
     if rows.iter().any(|row| row.turn_id == selected) {
         return Some(selected.to_string());
     }
-    rows.first().map(|row| row.turn_id.clone())
+    rows.iter()
+        .rev()
+        .find(|row| row.streaming)
+        .or_else(|| rows.last())
+        .map(|row| row.turn_id.clone())
 }
 
 fn turn_by_id<'a>(
@@ -1662,6 +1717,10 @@ fn turn_selector_hover(turn: &LlmTurnState) -> String {
 
 fn turn_usage_tokens(usage: &LlmUsageView) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
+}
+
+fn tool_call_source(name: &str, id: &str) -> String {
+    format!("{name}({id})")
 }
 
 fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) {
@@ -1748,21 +1807,47 @@ fn turn_mut<'a>(state: &'a mut ModulesState, turn_id: &str) -> Option<&'a mut Ll
         .find(|turn| turn.turn_id == turn_id)
 }
 
-fn append_output_delta(turn: &mut LlmTurnState, kind: String, delta: String) {
-    if let Some(row) = turn
+fn append_output_delta(
+    turn: &mut LlmTurnState,
+    kind: String,
+    delta: String,
+    source: Option<String>,
+) {
+    if let Some(index) = turn
         .output
-        .iter_mut()
-        .rev()
-        .find(|row| row.streaming && row.kind == kind)
+        .iter()
+        .rposition(|row| row.streaming && row.kind == kind && row.source == source)
     {
+        let mut row = turn.output.remove(index);
         row.content.push_str(&delta);
+        turn.output.push(row);
         return;
     }
     turn.output.push(LlmOutputItemState {
         kind,
         content: delta,
         streaming: true,
-        source: None,
+        source,
+    });
+}
+
+fn apply_tool_call_ready(turn: &mut LlmTurnState, source: String, arguments_json: String) {
+    if let Some(index) = turn.output.iter().rposition(|row| {
+        row.streaming && row.kind == "tool_call" && row.source.as_deref() == Some(source.as_str())
+    }) {
+        let mut row = turn.output.remove(index);
+        row.kind = "tool_call_ready".to_string();
+        row.content = arguments_json;
+        row.streaming = false;
+        row.source = Some(source);
+        turn.output.push(row);
+        return;
+    }
+    turn.output.push(LlmOutputItemState {
+        kind: "tool_call_ready".to_string(),
+        content: arguments_json,
+        streaming: false,
+        source: Some(source),
     });
 }
 
@@ -1771,12 +1856,20 @@ fn apply_structured_ready(turn: &mut LlmTurnState, json: String) {
         .output
         .iter_mut()
         .rev()
-        .find(|row| row.kind == "structured" || row.kind == "structured_ready")
+        .find(|row| row.kind == "structured_ready")
     {
+        row.content = json;
+        row.streaming = false;
+        row.source = None;
+        return;
+    }
+    if let Some(index) = turn.output.iter().rposition(|row| row.kind == "structured") {
+        let mut row = turn.output.remove(index);
         row.kind = "structured_ready".to_string();
         row.content = json;
         row.streaming = false;
         row.source = None;
+        turn.output.push(row);
         return;
     }
     turn.output.push(LlmOutputItemState {
@@ -2096,6 +2189,421 @@ mod tests {
     }
 
     #[test]
+    fn structured_ready_replay_updates_in_place() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO).to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-structured-replay".to_string(),
+                owner: owner.clone(),
+                module: "query-memory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "structured_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-structured-replay".to_string(),
+                kind: "structured".to_string(),
+                delta: "{\"answer\":".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StructuredReady {
+                turn_id: "turn-structured-replay".to_string(),
+                json: "{\"answer\":true}".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-structured-replay".to_string(),
+                kind: "text".to_string(),
+                delta: "later text".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StructuredReady {
+                turn_id: "turn-structured-replay".to_string(),
+                json: "{\"answer\":\"updated\"}".to_string(),
+            },
+        );
+
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].output,
+            vec![
+                LlmOutputItemState {
+                    kind: "structured_ready".to_string(),
+                    content: "{\"answer\":\"updated\"}".to_string(),
+                    streaming: false,
+                    source: None,
+                },
+                LlmOutputItemState {
+                    kind: "text".to_string(),
+                    content: "later text".to_string(),
+                    streaming: true,
+                    source: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_chunks_append_arguments_only_and_keep_source() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO).to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-tool".to_string(),
+                owner: owner.clone(),
+                module: "allocation".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-tool".to_string(),
+                id: "call-1".to_string(),
+                name: "leave_allocation_unchanged".to_string(),
+                arguments_json_delta: "{\"memo\":".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-tool".to_string(),
+                id: "call-1".to_string(),
+                name: "leave_allocation_unchanged".to_string(),
+                arguments_json_delta: "\"The current".to_string(),
+            },
+        );
+
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].output,
+            vec![LlmOutputItemState {
+                kind: "tool_call".to_string(),
+                content: "{\"memo\":\"The current".to_string(),
+                streaming: true,
+                source: Some("leave_allocation_unchanged(call-1)".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_call_chunks_with_different_sources_do_not_merge() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO).to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-tools".to_string(),
+                owner: owner.clone(),
+                module: "allocation".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-tools".to_string(),
+                id: "call-1".to_string(),
+                name: "reprioritize_modules".to_string(),
+                arguments_json_delta: "{\"memo\":".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-tools".to_string(),
+                id: "call-2".to_string(),
+                name: "leave_allocation_unchanged".to_string(),
+                arguments_json_delta: "{}".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-tools".to_string(),
+                id: "call-1".to_string(),
+                name: "reprioritize_modules".to_string(),
+                arguments_json_delta: "\"focus\"".to_string(),
+            },
+        );
+
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].output,
+            vec![
+                LlmOutputItemState {
+                    kind: "tool_call".to_string(),
+                    content: "{}".to_string(),
+                    streaming: true,
+                    source: Some("leave_allocation_unchanged(call-2)".to_string()),
+                },
+                LlmOutputItemState {
+                    kind: "tool_call".to_string(),
+                    content: "{\"memo\":\"focus\"".to_string(),
+                    streaming: true,
+                    source: Some("reprioritize_modules(call-1)".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_ready_replaces_streaming_tool_call_row() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO).to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-ready".to_string(),
+                owner: owner.clone(),
+                module: "allocation".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-ready".to_string(),
+                id: "call-1".to_string(),
+                name: "leave_allocation_unchanged".to_string(),
+                arguments_json_delta: "{\"memo\":".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallReady {
+                turn_id: "turn-ready".to_string(),
+                id: "call-1".to_string(),
+                name: "leave_allocation_unchanged".to_string(),
+                arguments_json: "{\"memo\":\"stable\"}".to_string(),
+            },
+        );
+
+        let module = state.modules.get(&owner).expect("module exists");
+        assert_eq!(
+            module.turns[0].output,
+            vec![LlmOutputItemState {
+                kind: "tool_call_ready".to_string(),
+                content: "{\"memo\":\"stable\"}".to_string(),
+                streaming: false,
+                source: Some("leave_allocation_unchanged(call-1)".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn latest_llm_output_reports_running_turn_without_output() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-empty".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        let module = state.modules.get("sensory").expect("module exists");
+        assert_eq!(
+            latest_llm_output(module),
+            Some("running: awaiting output".to_string())
+        );
+    }
+
+    #[test]
+    fn latest_llm_output_does_not_keep_completed_turn_output() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-done".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-done".to_string(),
+                kind: "text".to_string(),
+                delta: "old output".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Completed {
+                turn_id: "turn-done".to_string(),
+                request_id: None,
+                finish_reason: "stop".to_string(),
+                usage: LlmUsageView {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        );
+
+        let module = state.modules.get("sensory").expect("module exists");
+        assert_eq!(latest_llm_output(module), None);
+    }
+
+    #[test]
+    fn latest_llm_output_ignores_stale_running_turn_when_newer_turn_exists() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-stale".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-stale".to_string(),
+                kind: "text".to_string(),
+                delta: "stale output".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-newer".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Completed {
+                turn_id: "turn-newer".to_string(),
+                request_id: None,
+                finish_reason: "stop".to_string(),
+                usage: LlmUsageView {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        );
+
+        let module = state.modules.get("sensory").expect("module exists");
+        assert_eq!(latest_llm_output(module), None);
+    }
+
+    #[test]
+    fn selected_llm_turn_id_prefers_latest_streaming_then_latest() {
+        let rows = vec![
+            LlmTurnListRow {
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                turn_id: "turn-1".to_string(),
+                turn_number: 1,
+                label: "sensory 1 turn".to_string(),
+                streaming: false,
+            },
+            LlmTurnListRow {
+                owner: "memory".to_string(),
+                module: "memory".to_string(),
+                turn_id: "turn-2".to_string(),
+                turn_number: 1,
+                label: "* memory 1 turn".to_string(),
+                streaming: true,
+            },
+            LlmTurnListRow {
+                owner: "allocation".to_string(),
+                module: "allocation".to_string(),
+                turn_id: "turn-3".to_string(),
+                turn_number: 1,
+                label: "* allocation 1 turn".to_string(),
+                streaming: true,
+            },
+        ];
+
+        assert_eq!(
+            selected_llm_turn_id("turn-1", &rows),
+            Some("turn-1".to_string())
+        );
+        assert_eq!(
+            selected_llm_turn_id("missing", &rows),
+            Some("turn-3".to_string())
+        );
+
+        let completed_rows = rows
+            .into_iter()
+            .map(|mut row| {
+                row.streaming = false;
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected_llm_turn_id("missing", &completed_rows),
+            Some("turn-3".to_string())
+        );
+    }
+
+    #[test]
     fn json_display_prettifies_valid_json() {
         let display = format_json_for_display("{\"answer\":true}").expect("valid json");
 
@@ -2124,11 +2632,108 @@ mod tests {
     }
 
     #[test]
-    fn tail_preview_omits_prefix_and_keeps_latest_text() {
-        assert_eq!(
-            tail_preview_text("alpha beta gamma delta epsilon", 18),
-            "...a delta epsilon"
+    fn latest_llm_output_keeps_full_text_until_cell_rendering() {
+        let mut state = ModulesState::default();
+        let content = format!("{}final-token", "stream ".repeat(120));
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-long".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
         );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-long".to_string(),
+                kind: "text".to_string(),
+                delta: content,
+            },
+        );
+
+        let module = state.modules.get("sensory").expect("module exists");
+        let output = latest_llm_output(module).expect("latest output");
+        assert!(output.starts_with("text: stream stream"));
+        assert!(output.ends_with("final-token"));
+        assert!(!output.contains("..."));
+    }
+
+    #[test]
+    fn latest_llm_output_follows_most_recent_delta_row() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-interleaved".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-interleaved".to_string(),
+                kind: "text".to_string(),
+                delta: "first text".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ToolCallChunk {
+                turn_id: "turn-interleaved".to_string(),
+                id: "call-1".to_string(),
+                name: "lookup".to_string(),
+                arguments_json_delta: "{\"query\":\"old\"}".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "turn-interleaved".to_string(),
+                kind: "text".to_string(),
+                delta: " newest-tail".to_string(),
+            },
+        );
+
+        let module = state.modules.get("sensory").expect("module exists");
+        assert_eq!(
+            latest_llm_output(module),
+            Some("text: first text newest-tail".to_string())
+        );
+    }
+
+    #[test]
+    fn latest_output_cell_text_elides_only_the_prefix() {
+        let output =
+            latest_output_cell_text_with_width("abcdefghijklmnopqrstuvwxyz", 12.0, |text| {
+                text.chars().count() as f32
+            });
+
+        assert_eq!(output, "opqrstuvwxyz");
+        assert!(!output.starts_with("..."));
+        assert!(!output.ends_with("..."));
+    }
+
+    #[test]
+    fn latest_output_cell_text_keeps_one_char_for_tiny_width() {
+        let output = latest_output_cell_text_with_width("abc", 0.0, |text| {
+            if text.is_empty() { 0.0 } else { 10.0 }
+        });
+
+        assert_eq!(output, "c");
     }
 
     #[test]
