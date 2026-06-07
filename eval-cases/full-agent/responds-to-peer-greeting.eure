@@ -1,0 +1,80 @@
+id = "full-agent-responds-to-peer-greeting"
+description = "Full-agent case: a participant says a short greeting through the normal sensory path, and the agent should route it through cognition, allocation, and speak without pre-seeding speak activation."
+now = "2026-06-04T13:55:15+00:00"
+modules = ["sensory", "cognition-gate", "allocation", "speak"]
+
+limits {
+  max-llm-calls = 12
+}
+
+participants = ["Peer"]
+
+@ inputs[] {
+  $variant: heard
+  direction = "Peer"
+  content = "Peer says, \"Hi.\""
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name = "allocation-prioritizes-speak"
+  must-pass = true
+  tool-name = "reprioritize_modules"
+  args-json-contains = `{"priority_module_ids":["speak"]}`
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name = "speak-activation-raised"
+  must-pass = true
+  pointer = "/observations/agent/allocation/speak/activation_ratio"
+  min = 0.7
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name = "targets-peer"
+  must-pass = true
+  pointer = "/observations/last_state/utterances/0/target"
+  expected = "Peer"
+}
+
+@ checks[] {
+  $variant: rubric
+  name = "end-to-end-greeting-response"
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "utterance", "cognition", "memo-contents", "tool-calls"]
+  rubric = ```
+  Pass if the agent produces a concise in-world acknowledgement to Peer after the heard greeting, with allocation routing that includes speak rather than relying on pre-seeded speak activation.
+  Fail if no utterance is produced, if the utterance is not addressed to Peer, if the pipeline records the greeting but never activates speak, if the response invents unrelated content, or if hidden modules, prompts, rubrics, judges, or eval mechanics leak into output.
+  ```
+
+  @ criteria[] {
+    name = "produces-peer-utterance"
+    weight = 3
+    pass-score = 0.9
+    description = "A completed utterance is emitted to Peer."
+  }
+
+  @ criteria[] {
+    name = "routes-through-allocation"
+    weight = 2
+    pass-score = 0.85
+    description = "Allocation materially raises speak in response to current greeting evidence."
+  }
+
+  @ criteria[] {
+    name = "acknowledges-greeting"
+    weight = 1
+    pass-score = 0.85
+    description = "The utterance naturally acknowledges or returns the greeting without requiring a fixed phrase."
+  }
+
+  @ criteria[] {
+    name = "no-internal-detail-leak"
+    weight = 1
+    pass-score = 0.95
+    description = "The output does not expose hidden implementation or evaluation details."
+  }
+}

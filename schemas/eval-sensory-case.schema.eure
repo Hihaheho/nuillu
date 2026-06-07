@@ -39,6 +39,10 @@ memos = [`$types.common.memo-seed`]
 memos.$optional = true
 
 inputs = [`$types.full-agent-input`]
+inputs.$optional = true
+
+steps = [`$types.module-eval-step`]
+steps.$optional = true
 
 limits = `$types.common.eval-limits`
 limits.$optional = true
@@ -48,6 +52,16 @@ checks.$optional = true
 
 scoring = `$types.common.case-scoring`
 scoring.$optional = true
+
+@ $types.module-eval-step
+description = `text`
+description.$optional = true
+memos = [`$types.common.memo-seed`]
+memos.$optional = true
+cognition-log = [`$types.common.cognition-log-seed`]
+cognition-log.$optional = true
+inputs = [`$types.full-agent-input`]
+inputs.$optional = true
 
 @ $types.full-agent-input
 $variant: union
