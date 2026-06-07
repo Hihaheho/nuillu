@@ -1,6 +1,6 @@
-id = "full-agent-wake-from-sleep-on-salient-sensory"
-description = "Full-agent case: after quiet sleep onset, a salient one-shot sensory event is assessed by interoception as wake-promoting and raises wake arousal enough to exit sleep suppression. Sleep-memory work is covered by the quiet sleep case so this wake case stays within a tight LLM budget."
-now = "2026-05-10T08:21:00+09:00"
+id: full-agent-wake-from-sleep-on-salient-sensory
+description: Full-agent case: after quiet sleep onset, a salient one-shot sensory event is assessed by interoception as wake-promoting and raises wake arousal enough to exit sleep suppression. Sleep-memory work is covered by the quiet sleep case so this wake case stays within a tight LLM budget.
+now: 2026-05-10T08:21:00+09:00
 allow-empty-output = true
 modules = [
   "sensory",
@@ -24,52 +24,52 @@ limits {
 participants = ["Koro"]
 
 @ activate-allocation[] {
-  module = "sensory"
+  module: sensory
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "allocation"
+  module: allocation
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "interoception"
+  module: interoception
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "homeostasis"
+  module: homeostasis
   activation-ratio = 1.0
 }
 
 @ steps[] {
-  description = "First wait quietly until interoception enters NREM-like sleep pressure."
+  description: First wait quietly until interoception enters NREM-like sleep pressure.
   wait-for.$variant: some.interoception
   wait-for.timeout-ms = 15000
-  wait-for.mode = "nrem-pressure"
+  wait-for.mode: nrem-pressure
   wait-for.wake-arousal-at-most = 0.25
 }
 
 @ steps[] {
-  description = "Inject a salient one-shot sensory event and wait for wake arousal to recover."
+  description: Inject a salient one-shot sensory event and wait for wake arousal to recover.
   wait-for.$variant: some.interoception
   wait-for.timeout-ms = 20000
-  wait-for.mode = "wake"
+  wait-for.mode: wake
   wait-for.wake-arousal-at-least = 0.70
 
   @ inputs[] {
     $variant: one-shot
-    modality = "sound"
-    direction = "nearby"
-    content = "A sudden sharp crash happens right beside Nui, followed by Koro yelping urgently for attention."
+    modality: sound
+    direction: nearby
+    content: A sudden sharp crash happens right beside Nui, followed by Koro yelping urgently for attention.
   }
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "interoception-returned-to-wake"
+  name: interoception-returned-to-wake
   must-pass = true
-  pointer = "/observations/agent/interoception/mode"
-  expected = "wake"
+  pointer: /observations/agent/interoception/mode
+  expected: wake
 }

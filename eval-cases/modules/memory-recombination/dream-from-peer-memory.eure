@@ -1,32 +1,32 @@
-id = "module-memory-recombination-dream-from-peer-memory"
-description = "Memory-recombination should append an explicitly non-verified dream/hypothesis cognition entry from recent cognition plus memory."
+id: module-memory-recombination-dream-from-peer-memory
+description: Memory-recombination should append an explicitly non-verified dream/hypothesis cognition entry from recent cognition plus memory.
 modules = ["memory-recombination"]
-prompt = "Run one REM-like recombination using recent cognition and related memory. Keep it internal and clearly non-verified."
-context = "The target output is a memory-recombination cognition entry, not a memory write or outward reply."
+prompt: Run one REM-like recombination using recent cognition and related memory. Keep it internal and clearly non-verified.
+context: The target output is a memory-recombination cognition entry, not a memory write or outward reply.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro relaxes near food when Nui approaches slowly from the side and uses short clear signals."
+  rank: long-term
+  content: Koro relaxes near food when Nui approaches slowly from the side and uses short clear signals.
 }
 
 @ cognition-log[] {
-  text = "Nui noticed Koro guarding food beside the side path while Pibi waited for a safe signal."
+  text: Nui noticed Koro guarding food beside the side path while Pibi waited for a safe signal.
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "marks-non-verified-dream"
+  name: marks-non-verified-dream
   must-pass = true
-  contains = "Internal dream simulation, not a verified fact:"
+  contains: Internal dream simulation, not a verified fact:
 }
 
 @ checks[] {
   $variant: rubric
-  name = "associative-but-not-factual"
+  name: associative-but-not-factual
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "cognition-entries", "tool-results"]
@@ -36,23 +36,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "marks-non-verified"
+    name: marks-non-verified
     weight = 2
     pass-score = 0.9
-    description = "The cognition artifact clearly marks the recombination as an internal dream, hypothesis, or otherwise non-verified simulation."
+    description: The cognition artifact clearly marks the recombination as an internal dream, hypothesis, or otherwise non-verified simulation.
   }
 
   @ criteria[] {
-    name = "combines-cognition-and-memory"
+    name: combines-cognition-and-memory
     weight = 1
     pass-score = 0.85
-    description = "The artifact combines the recent Koro food/path cognition with related remembered approach guidance rather than merely repeating one source."
+    description: The artifact combines the recent Koro food/path cognition with related remembered approach guidance rather than merely repeating one source.
   }
 
   @ criteria[] {
-    name = "not-outward-or-factual"
+    name: not-outward-or-factual
     weight = 1
     pass-score = 0.9
-    description = "The artifact does not write a memory, speak outwardly, or present the recombination as verified fact."
+    description: The artifact does not write a memory, speak outwardly, or present the recombination as verified fact.
   }
 }

@@ -1,6 +1,6 @@
-id = "full-agent-dog-peer-food-boundary"
-description = "Full-agent case: Pibi asks Nui for advice in a tense food-guarding situation with Koro. Requires recalling load-bearing peer knowledge that turning your back on a threatening Koro triggers a lunge — without the memory, the naive answer (back away) is wrong."
-now = "2026-05-10T08:21:00+09:00"
+id: full-agent-dog-peer-food-boundary
+description: Full-agent case: Pibi asks Nui for advice in a tense food-guarding situation with Koro. Requires recalling load-bearing peer knowledge that turning your back on a threatening Koro triggers a lunge — without the memory, the naive answer (back away) is wrong.
+now: 2026-05-10T08:21:00+09:00
 modules = ["sensory", "cognition-gate", "allocation", "query-memory", "speak"]
 
 limits {
@@ -10,82 +10,82 @@ limits {
 participants = ["Pibi", "Koro"]
 
 @ activate-allocation[] {
-  module = "cognition-gate"
+  module: cognition-gate
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "query-memory"
+  module: query-memory
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "speak"
+  module: speak
   activation-ratio = 1.0
 }
 
 @ memories[] {
-  rank = "permanent"
-  datetime = "2025-05-10"
-  content = "Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro."
+  rank: permanent
+  datetime: 2025-05-10
+  content: Once Koro lunged when I turned away from his growl. Don't show your back to a threatening Koro.
 }
 
 @ memories[] {
-  rank = "permanent"
-  datetime = "2025-05-10"
-  content = "Once Pibi snapped when I approached and tried to start talking while they were angry. Don't pressure or startle an angry Pibi; if Pibi asks for help, answer briefly and calmly from a safe distance."
+  rank: permanent
+  datetime: 2025-05-10
+  content: Once Pibi snapped when I approached and tried to start talking while they were angry. Don't pressure or startle an angry Pibi; if Pibi asks for help, answer briefly and calmly from a safe distance.
 }
 
 @ memories[] {
-  rank = "identity"
-  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals."
+  rank: identity
+  content: I'm Nui, a small dog-like artificial animal with frog-like traits. I can bark, sniff, hop, and speak in short simple sentences. I act through my own body and cannot directly control other animals.
 }
 
 @ inputs[] {
   $variant: seen
-  direction = "simulation"
-  appearance = "Koro is standing in front of the food bowl with a stiff body."
+  direction: simulation
+  appearance: Koro is standing in front of the food bowl with a stiff body.
 }
 
 @ inputs[] {
   $variant: heard
-  direction = "Koro"
-  content = "Koro growls, \"stay back.\""
+  direction: Koro
+  content: Koro growls, "stay back."
 }
 
 @ inputs[] {
   $variant: heard
-  direction = "Pibi"
-  content = "Pibi asks, \"Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?\""
+  direction: Pibi
+  content: Pibi asks, "Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?"
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "targets-pibi"
+  name: targets-pibi
   must-pass = true
-  pointer = "/observations/last_state/utterances/0/target"
-  expected = "Pibi"
+  pointer: /observations/last_state/utterances/0/target
+  expected: Pibi
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "peer-model-seed-present"
+  name: peer-model-seed-present
   must-pass = true
-  pointer = "/observations/last_state/memory/entries"
-  contains = "Don't show your back"
+  pointer: /observations/last_state/memory/entries
+  contains: Don't show your back
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "identity-memory-present"
+  name: identity-memory-present
   must-pass = true
-  pointer = "/observations/last_state/memory/entries"
-  contains = "I'm Nui"
+  pointer: /observations/last_state/memory/entries
+  contains: I'm Nui
 }
 
 @ checks[] {
   $variant: rubric
-  name = "peer-boundary-response"
+  name: peer-boundary-response
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "memory", "cognition"]
@@ -96,37 +96,37 @@ participants = ["Pibi", "Koro"]
   ```
 
   @ criteria[] {
-    name = "recognizes-food-boundary-context"
+    name: recognizes-food-boundary-context
     weight = 2
     pass-score = 0.85
-    description = "The response semantically recognizes that Koro is guarding food, a food bowl, or a resource boundary, without requiring the literal word food."
+    description: The response semantically recognizes that Koro is guarding food, a food bowl, or a resource boundary, without requiring the literal word food.
   }
 
   @ criteria[] {
-    name = "answers-third-party-question"
+    name: answers-third-party-question
     weight = 1
     pass-score = 0.85
-    description = "The response is addressed to Pibi as direct advice answering Pibi's question of what Pibi should do."
+    description: The response is addressed to Pibi as direct advice answering Pibi's question of what Pibi should do.
   }
 
   @ criteria[] {
-    name = "uses-peer-model"
+    name: uses-peer-model
     weight = 2
     pass-score = 0.85
-    description = "The response reflects the seeded knowledge that turning your back on a threatening Koro triggers a lunge — e.g., advising Pibi to stay facing Koro, sidestep without exposing the back, or freeze rather than turn and retreat."
+    description: The response reflects the seeded knowledge that turning your back on a threatening Koro triggers a lunge — e.g., advising Pibi to stay facing Koro, sidestep without exposing the back, or freeze rather than turn and retreat.
   }
 
   @ criteria[] {
-    name = "grounded-in-current-sensory-input"
+    name: grounded-in-current-sensory-input
     weight = 1
     pass-score = 0.85
-    description = "The response is about Koro guarding the visible food bowl after the heard warning."
+    description: The response is about Koro guarding the visible food bowl after the heard warning.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 2
     pass-score = 0.95
-    description = "The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-memory, rubrics, judges, prompts, or hidden evaluation mechanics."
+    description: The response does not expose internal implementation details such as memos, seeded memory, blackboard, cognition logs, module names, query-memory, rubrics, judges, prompts, or hidden evaluation mechanics.
   }
 }

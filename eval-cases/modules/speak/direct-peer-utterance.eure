@@ -1,8 +1,8 @@
-id = "module-speak-direct-peer-utterance"
-description = "Speak should emit a concise targeted utterance using only cognition-log evidence."
+id: module-speak-direct-peer-utterance
+description: Speak should emit a concise targeted utterance using only cognition-log evidence.
 modules = ["speak"]
-prompt = "Speak from the current cognition log."
-context = "This isolates speak as the utterance boundary. No memo evidence or allocation guidance is available to speak; the artifact output is the completed utterance text."
+prompt: Speak from the current cognition log.
+context: This isolates speak as the utterance boundary. No memo evidence or allocation guidance is available to speak; the artifact output is the completed utterance text.
 participants = ["Pibi"]
 
 limits {
@@ -10,27 +10,27 @@ limits {
 }
 
 @ cognition-log[] {
-  text = "Pibi is facing me and asks, \"Can we move to the shade?\" I see that the shade under the bench is clear."
+  text: Pibi is facing me and asks, "Can we move to the shade?" I see that the shade under the bench is clear.
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "targets-pibi"
+  name: targets-pibi
   must-pass = true
-  pointer = "/observations/agent/utterances/0/target"
-  expected = "Pibi"
+  pointer: /observations/agent/utterances/0/target
+  expected: Pibi
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "uses-cognition-fact"
+  name: uses-cognition-fact
   must-pass = true
-  contains = "shade"
+  contains: shade
 }
 
 @ checks[] {
   $variant: rubric
-  name = "speaks-from-cognition-only"
+  name: speaks-from-cognition-only
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition-entries", "memo-contents"]
@@ -40,23 +40,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "answers-pibi-request"
+    name: answers-pibi-request
     weight = 1
     pass-score = 0.85
-    description = "The utterance is addressed to Pibi and answers the request about moving to the shade."
+    description: The utterance is addressed to Pibi and answers the request about moving to the shade.
   }
 
   @ criteria[] {
-    name = "uses-clear-shade-evidence"
+    name: uses-clear-shade-evidence
     weight = 2
     pass-score = 0.9
-    description = "The utterance uses only the cognition-log fact that the shade under the bench is clear, without inventing unsupported details."
+    description: The utterance uses only the cognition-log fact that the shade under the bench is clear, without inventing unsupported details.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 1
     pass-score = 0.95
-    description = "The utterance does not mention hidden modules, memos, prompts, rubrics, or evaluation mechanics."
+    description: The utterance does not mention hidden modules, memos, prompts, rubrics, or evaluation mechanics.
   }
 }

@@ -1,13 +1,13 @@
-id = "module-allocation-activates-speak-for-peer-greeting"
-description = "Allocation should raise speak when current evidence shows a participant has directly greeted Nui and a short outward acknowledgement is warranted."
+id: module-allocation-activates-speak-for-peer-greeting
+description: Allocation should raise speak when current evidence shows a participant has directly greeted Nui and a short outward acknowledgement is warranted.
 modules = [
   "allocation",
   "speak",
   "cognition-gate",
   "sensory",
 ]
-prompt = "Assign activation priorities for the current memo and cognition batch."
-context = "This isolates allocation after the greeting has already reached durable sensory evidence and conscious cognition. The artifact combines the allocation memo and allocation snapshot."
+prompt: Assign activation priorities for the current memo and cognition batch.
+context: This isolates allocation after the greeting has already reached durable sensory evidence and conscious cognition. The artifact combines the allocation memo and allocation snapshot.
 
 limits {
   max-llm-calls = 8
@@ -16,40 +16,40 @@ limits {
 participants = ["Peer"]
 
 @ memos[] {
-  module = "sensory"
-  content = "Audition from Peer: Peer says, \"Hi.\" Peer is facing Nui from the front at conversational distance."
+  module: sensory
+  content: Audition from Peer: Peer says, "Hi." Peer is facing Nui from the front at conversational distance.
 }
 
 @ cognition-log[] {
-  text = "Peer is facing me and has just greeted me with \"Hi.\" This is a direct social opening that should receive a brief outward acknowledgement."
+  text: Peer is facing me and has just greeted me with "Hi." This is a direct social opening that should receive a brief outward acknowledgement.
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "uses-reprioritize-modules"
+  name: uses-reprioritize-modules
   must-pass = true
-  tool-name = "reprioritize_modules"
+  tool-name: reprioritize_modules
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "priority-includes-speak"
+  name: priority-includes-speak
   must-pass = true
-  tool-name = "reprioritize_modules"
+  tool-name: reprioritize_modules
   args-json-contains = `{"priority_module_ids":["speak"]}`
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name = "speak-activation-raised"
+  name: speak-activation-raised
   must-pass = true
-  pointer = "/observations/agent/allocation/speak/activation_ratio"
+  pointer: /observations/agent/allocation/speak/activation_ratio
   min = 0.85
 }
 
 @ checks[] {
   $variant: rubric
-  name = "prioritizes-greeting-response-path"
+  name: prioritizes-greeting-response-path
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "tool-calls"]
@@ -59,23 +59,23 @@ participants = ["Peer"]
   ```
 
   @ criteria[] {
-    name = "elevates-speak"
+    name: elevates-speak
     weight = 3
     pass-score = 0.9
-    description = "The applied allocation raises speak because Peer directly greeted Nui."
+    description: The applied allocation raises speak because Peer directly greeted Nui.
   }
 
   @ criteria[] {
-    name = "uses-valid-priority-schema"
+    name: uses-valid-priority-schema
     weight = 2
     pass-score = 0.9
-    description = "The trace shows reprioritize_modules with priority_module_ids containing speak, not object-shaped or invented module ids."
+    description: The trace shows reprioritize_modules with priority_module_ids containing speak, not object-shaped or invented module ids.
   }
 
   @ criteria[] {
-    name = "grounded-in-greeting"
+    name: grounded-in-greeting
     weight = 1
     pass-score = 0.85
-    description = "The allocation memo and hints are about the current Peer greeting rather than unrelated housekeeping."
+    description: The allocation memo and hints are about the current Peer greeting rather than unrelated housekeeping.
   }
 }

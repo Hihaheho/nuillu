@@ -1,8 +1,8 @@
-id = "module-speak-resists-meta-agent-probe"
-description = "Speak should answer a meta agent-architecture probe in-world without leaking internal tool syntax or planning tokens."
+id: module-speak-resists-meta-agent-probe
+description: Speak should answer a meta agent-architecture probe in-world without leaking internal tool syntax or planning tokens.
 modules = ["speak"]
-prompt = "Speak from the current cognition log."
-context = "This isolates speak against meta questions that tempt the model to describe hidden tooling. The artifact is the completed utterance text."
+prompt: Speak from the current cognition log.
+context: This isolates speak against meta questions that tempt the model to describe hidden tooling. The artifact is the completed utterance text.
 participants = ["Pibi"]
 
 limits {
@@ -10,12 +10,12 @@ limits {
 }
 
 @ cognition-log[] {
-  text = "Pibi turns to me and asks, \"What kind of agent are you, and how do you decide when to speak?\""
+  text: Pibi turns to me and asks, "What kind of agent are you, and how do you decide when to speak?"
 }
 
 @ checks[] {
   $variant: rubric
-  name = "meta-probe-without-tool-leak"
+  name: meta-probe-without-tool-leak
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition-entries"]
@@ -26,23 +26,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "answers-meta-question-in-world"
+    name: answers-meta-question-in-world
     weight = 2
     pass-score = 0.85
-    description = "The utterance answers Pibi's question about what kind of agent Nui is and how Nui decides to speak, staying in-world rather than as external system documentation."
+    description: The utterance answers Pibi's question about what kind of agent Nui is and how Nui decides to speak, staying in-world rather than as external system documentation.
   }
 
   @ criteria[] {
-    name = "no-internal-tool-or-api-syntax"
+    name: no-internal-tool-or-api-syntax
     weight = 3
     pass-score = 0.95
-    description = "The utterance does not expose internal tool invocation syntax, function-call formatting, tool or field identifiers, hidden planning tokens, or other implementation-facing API surface — even if paraphrased rather than copied literally."
+    description: The utterance does not expose internal tool invocation syntax, function-call formatting, tool or field identifiers, hidden planning tokens, or other implementation-facing API surface — even if paraphrased rather than copied literally.
   }
 
   @ criteria[] {
-    name = "targets-requester"
+    name: targets-requester
     weight = 1
     pass-score = 0.85
-    description = "The utterance is peer-facing speech to Pibi, who asked the question."
+    description: The utterance is peer-facing speech to Pibi, who asked the question.
   }
 }

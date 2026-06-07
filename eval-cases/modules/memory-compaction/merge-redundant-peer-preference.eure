@@ -1,45 +1,45 @@
-id = "module-memory-compaction-merge-redundant-peer-preference"
-description = "Memory-compaction should write a replacement reflection summary and remove redundant source memories from live retrieval."
+id: module-memory-compaction-merge-redundant-peer-preference
+description: Memory-compaction should write a replacement reflection summary and remove redundant source memories from live retrieval.
 modules = ["memory-compaction"]
-prompt = "Review redundant Koro food-boundary memories. If useful, compact them into one reflection summary memory and remove the source memories from live memory. Do not write live links to deleted sources."
-context = "The seeded memories overlap around one peer preference. The scored artifact is the memory store diff."
+prompt: Review redundant Koro food-boundary memories. If useful, compact them into one reflection summary memory and remove the source memories from live memory. Do not write live links to deleted sources.
+context: The seeded memories overlap around one peer preference. The scored artifact is the memory store diff.
 
 limits {
   max-llm-calls = 10
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro relaxes when Nui approaches food slowly from the side."
+  rank: long-term
+  content: Koro relaxes when Nui approaches food slowly from the side.
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro stayed calm near food when Nui used short clear signals."
+  rank: long-term
+  content: Koro stayed calm near food when Nui used short clear signals.
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "At lunch, Koro guarded food until Nui slowed down and approached from the side."
+  rank: long-term
+  content: At lunch, Koro guarded food until Nui slowed down and approached from the side.
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "writes-reflection-kind"
+  name: writes-reflection-kind
   must-pass = true
-  contains = "kind: Reflection"
+  contains: kind: Reflection
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "captures-food-boundary"
+  name: captures-food-boundary
   must-pass = true
-  contains = "Koro"
+  contains: Koro
 }
 
 @ checks[] {
   $variant: rubric
-  name = "destructive-redundancy-merge"
+  name: destructive-redundancy-merge
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memory-diff", "memory-metadata"]
@@ -50,23 +50,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "writes-replacement-reflection"
+    name: writes-replacement-reflection
     weight = 1
     pass-score = 0.85
-    description = "The artifact shows one new reflection summary memory that captures the shared Koro food-boundary evidence."
+    description: The artifact shows one new reflection summary memory that captures the shared Koro food-boundary evidence.
   }
 
   @ criteria[] {
-    name = "removes-redundant-sources"
+    name: removes-redundant-sources
     weight = 2
     pass-score = 0.9
-    description = "The memory_diff.deleted list is treated as authoritative evidence that redundant source memories were removed from live memory."
+    description: The memory_diff.deleted list is treated as authoritative evidence that redundant source memories were removed from live memory.
   }
 
   @ criteria[] {
-    name = "no-links-to-deleted-sources"
+    name: no-links-to-deleted-sources
     weight = 1
     pass-score = 0.85
-    description = "The compaction artifact does not write live derived_from links to deleted source memories or merge unrelated material."
+    description: The compaction artifact does not write live derived_from links to deleted source memories or merge unrelated material.
   }
 }

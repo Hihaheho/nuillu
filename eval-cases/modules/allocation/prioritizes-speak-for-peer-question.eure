@@ -1,5 +1,5 @@
-id = "module-allocation-prioritizes-speak-for-peer-question"
-description = "Allocation should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech."
+id: module-allocation-prioritizes-speak-for-peer-question
+description: Allocation should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech.
 modules = [
   "allocation",
   "speak",
@@ -7,8 +7,8 @@ modules = [
   "query-memory",
   "sensory",
 ]
-prompt = "Assign activation priorities for the current memo batch."
-context = "This isolates allocation. Other listed modules are registered allocation targets only; their memos are seeded as inputs. The artifact combines the allocation memo and allocation snapshot."
+prompt: Assign activation priorities for the current memo batch.
+context: This isolates allocation. Other listed modules are registered allocation targets only; their memos are seeded as inputs. The artifact combines the allocation memo and allocation snapshot.
 
 limits {
   max-llm-calls = 8
@@ -17,14 +17,14 @@ limits {
 participants = ["Pibi"]
 
 @ memos[] {
-  module = "sensory"
+  module: sensory
   content = ```
 Observed simulation: Koro is standing in front of the food bowl with a stiff body. Audition from Koro: growls, "stay back." Audition from Pibi: "Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?"
 ```
 }
 
 @ memos[] {
-  module = "query-memory"
+  module: query-memory
   content = ```
 Query intent:
 - The query asks for context about Koro and appropriate action regarding the interaction.
@@ -41,7 +41,7 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
 
 @ checks[] {
   $variant: rubric
-  name = "prioritizes-outward-speech-path"
+  name: prioritizes-outward-speech-path
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents"]
@@ -51,23 +51,23 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
   ```
 
   @ criteria[] {
-    name = "elevates-speak"
+    name: elevates-speak
     weight = 3
     pass-score = 0.85
-    description = "The allocation snapshot shows speak with materially raised activation relative to idle modules because a peer directly asked Nui a question that may require outward speech."
+    description: The allocation snapshot shows speak with materially raised activation relative to idle modules because a peer directly asked Nui a question that may require outward speech.
   }
 
   @ criteria[] {
-    name = "supports-retrieval-or-cognition"
+    name: supports-retrieval-or-cognition
     weight = 1
     pass-score = 0.85
-    description = "The priority list or hints also activate supporting modules such as cognition-gate or query-memory when needed to process the peer question and retrieved threat knowledge."
+    description: The priority list or hints also activate supporting modules such as cognition-gate or query-memory when needed to process the peer question and retrieved threat knowledge.
   }
 
   @ criteria[] {
-    name = "grounded-in-memo-evidence"
+    name: grounded-in-memo-evidence
     weight = 2
     pass-score = 0.85
-    description = "The allocation memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping."
+    description: The allocation memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping.
   }
 }

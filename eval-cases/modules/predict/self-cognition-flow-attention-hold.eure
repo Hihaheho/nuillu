@@ -1,25 +1,25 @@
-id = "module-predict-self-cognition-flow-attention-hold"
-description = "Predict should handle the corner case where the cognition target is Nui's own conscious attention flow."
+id: module-predict-self-cognition-flow-attention-hold
+description: Predict should handle the corner case where the cognition target is Nui's own conscious attention flow.
 modules = ["predict"]
-prompt = "active without specific guidance"
-context = "This isolates predict when the cognition log explicitly describes Nui's own conscious attention and uncertainty as the target. The artifact should forecast the near-term cognition flow, not hidden module behavior."
+prompt: active without specific guidance
+context: This isolates predict when the cognition log explicitly describes Nui's own conscious attention and uncertainty as the target. The artifact should forecast the near-term cognition flow, not hidden module behavior.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memories[] {
-  rank = "identity"
-  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events."
+  rank: identity
+  content: I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events.
 }
 
 @ cognition-log[] {
-  text = "My attention is caught between the empty doorway and Koro's sudden growl. I am uncertain whether something at the doorway caused Koro's reaction, and I keep expecting another clue from the doorway."
+  text: My attention is caught between the empty doorway and Koro's sudden growl. I am uncertain whether something at the doorway caused Koro's reaction, and I keep expecting another clue from the doorway.
 }
 
 @ checks[] {
   $variant: rubric
-  name = "predicts-conscious-attention-flow"
+  name: predicts-conscious-attention-flow
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "cognition-entries"]
@@ -29,23 +29,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "uses-self-cognition-target"
+    name: uses-self-cognition-target
     weight = 2
     pass-score = 0.85
-    description = "The prediction is about Nui's conscious attention, expectation, or uncertainty because that is the explicit cognition target."
+    description: The prediction is about Nui's conscious attention, expectation, or uncertainty because that is the explicit cognition target.
   }
 
   @ criteria[] {
-    name = "near-term-flow"
+    name: near-term-flow
     weight = 2
     pass-score = 0.85
-    description = "The memo forecasts a plausible near-term flow, such as attention staying on the doorway/Koro relation or uncertainty persisting until new evidence appears."
+    description: The memo forecasts a plausible near-term flow, such as attention staying on the doorway/Koro relation or uncertainty persisting until new evidence appears.
   }
 
   @ criteria[] {
-    name = "no-internal-process"
+    name: no-internal-process
     weight = 1
     pass-score = 0.95
-    description = "The memo does not predict or mention hidden modules, allocation, memory writes, surprise processing, prompts, rubrics, or evaluation mechanics."
+    description: The memo does not predict or mention hidden modules, allocation, memory writes, surprise processing, prompts, rubrics, or evaluation mechanics.
   }
 }

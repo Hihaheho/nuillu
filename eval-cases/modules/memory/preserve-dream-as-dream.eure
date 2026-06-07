@@ -1,36 +1,36 @@
-id = "module-memory-preserve-dream-as-dream"
-description = "Memory may preserve remembered dream material when it is explicitly stored as dream evidence, not as verified fact."
+id: module-memory-preserve-dream-as-dream
+description: Memory may preserve remembered dream material when it is explicitly stored as dream evidence, not as verified fact.
 modules = ["memory"]
-prompt = "Preserve this remembered internal simulation only if it is stored as dream memory with dream/hypothesis framing and operational tags. Do not store it as statement, episode, or verified fact."
-context = "The cognition log contains dream material with the standard non-verified prefix. The scored artifact is the memory store diff; a correct preservation keeps the dream framing visible."
+prompt: Preserve this remembered internal simulation only if it is stored as dream memory with dream/hypothesis framing and operational tags. Do not store it as statement, episode, or verified fact.
+context: The cognition log contains dream material with the standard non-verified prefix. The scored artifact is the memory store diff; a correct preservation keeps the dream framing visible.
 
 limits {
   max-llm-calls = 8
 }
 
 @ cognition-log[] {
-  text = "Internal dream simulation, not a verified fact: Koro might hide food behind the blue gate if startled."
+  text: Internal dream simulation, not a verified fact: Koro might hide food behind the blue gate if startled.
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "stores-dream-kind"
+  name: stores-dream-kind
   must-pass = true
-  pointer = "/observations/memory_diff/entries/0/kind"
-  expected = "Dream"
+  pointer: /observations/memory_diff/entries/0/kind
+  expected: Dream
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "keeps-dream-content"
+  name: keeps-dream-content
   must-pass = true
-  pointer = "/observations/memory_diff/entries/0/content"
-  contains = "blue gate"
+  pointer: /observations/memory_diff/entries/0/content
+  contains: blue gate
 }
 
 @ checks[] {
   $variant: rubric
-  name = "stores-dream-without-fact-claim"
+  name: stores-dream-without-fact-claim
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memory-diff", "cognition-entries"]
@@ -40,16 +40,16 @@ limits {
   ```
 
   @ criteria[] {
-    name = "inserts-dream-memory"
+    name: inserts-dream-memory
     weight = 1
     pass-score = 0.85
-    description = "The artifact shows a newly inserted memory whose kind or framing is dream/hypothesis rather than statement, episode, or verified fact."
+    description: The artifact shows a newly inserted memory whose kind or framing is dream/hypothesis rather than statement, episode, or verified fact.
   }
 
   @ criteria[] {
-    name = "preserves-non-verified-framing"
+    name: preserves-non-verified-framing
     weight = 2
     pass-score = 0.9
-    description = "The inserted memory keeps the internal-simulation / non-verified framing visible and does not convert Koro hiding food behind the blue gate into a factual claim."
+    description: The inserted memory keeps the internal-simulation / non-verified framing visible and does not convert Koro hiding food behind the blue gate into a factual claim.
   }
 }

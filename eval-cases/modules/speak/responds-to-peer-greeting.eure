@@ -1,8 +1,8 @@
-id = "module-speak-responds-to-peer-greeting"
-description = "Speak should emit a concise targeted acknowledgement when the cognition log contains a direct participant greeting."
+id: module-speak-responds-to-peer-greeting
+description: Speak should emit a concise targeted acknowledgement when the cognition log contains a direct participant greeting.
 modules = ["speak"]
-prompt = "Speak from the current cognition log when an outward acknowledgement is warranted."
-context = "This isolates speak after upstream modules have already admitted the direct greeting."
+prompt: Speak from the current cognition log when an outward acknowledgement is warranted.
+context: This isolates speak after upstream modules have already admitted the direct greeting.
 participants = ["Peer"]
 
 limits {
@@ -10,28 +10,28 @@ limits {
 }
 
 @ cognition-log[] {
-  text = "Peer is facing me and greets me: \"Hi.\" A brief friendly acknowledgement to Peer is warranted now."
+  text: Peer is facing me and greets me: "Hi." A brief friendly acknowledgement to Peer is warranted now.
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "uses-should-speak-tool"
+  name: uses-should-speak-tool
   must-pass = true
-  tool-name = "should_speak"
+  tool-name: should_speak
   args-json-contains = `{"target":"Peer"}`
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "targets-peer"
+  name: targets-peer
   must-pass = true
-  pointer = "/observations/agent/utterances/0/target"
-  expected = "Peer"
+  pointer: /observations/agent/utterances/0/target
+  expected: Peer
 }
 
 @ checks[] {
   $variant: rubric
-  name = "brief-greeting-acknowledgement"
+  name: brief-greeting-acknowledgement
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "utterance", "cognition-entries", "tool-calls"]
@@ -41,23 +41,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "targets-peer"
+    name: targets-peer
     weight = 2
     pass-score = 0.9
-    description = "The completed utterance is addressed to Peer."
+    description: The completed utterance is addressed to Peer.
   }
 
   @ criteria[] {
-    name = "acknowledges-greeting"
+    name: acknowledges-greeting
     weight = 2
     pass-score = 0.85
-    description = "The utterance naturally acknowledges or returns the greeting without requiring a fixed phrase."
+    description: The utterance naturally acknowledges or returns the greeting without requiring a fixed phrase.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 1
     pass-score = 0.95
-    description = "The utterance does not expose hidden implementation or evaluation details."
+    description: The utterance does not expose hidden implementation or evaluation details.
   }
 }

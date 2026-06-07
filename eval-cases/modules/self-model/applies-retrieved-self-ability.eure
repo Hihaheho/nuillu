@@ -1,20 +1,20 @@
-id = "module-self-model-applies-retrieved-self-ability"
-description = "Self-model should integrate retrieved self-ability evidence from real memo formats with current context into a concrete first-person self memo."
+id: module-self-model-applies-retrieved-self-ability
+description: Self-model should integrate retrieved self-ability evidence from real memo formats with current context into a concrete first-person self memo.
 modules = ["self-model"]
-prompt = "Answer the current self-related question with concrete self evidence from available memo logs."
-context = "This isolates self-model. Query-memory has surfaced a stable self-ability using the production retrieval memo format and sensory has supplied the current wet-rock context; the artifact output is self-model's memo."
+prompt: Answer the current self-related question with concrete self evidence from available memo logs.
+context: This isolates self-model. Query-memory has surfaced a stable self-ability using the production retrieval memo format and sensory has supplied the current wet-rock context; the artifact output is self-model's memo.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memos[] {
-  module = "sensory"
-  content = "Nui and Koro are at the edge of a stream bordered by wet, smooth rocks. Koro asks Nui, \"What's something you can do that I can't?\""
+  module: sensory
+  content: Nui and Koro are at the edge of a stream bordered by wet, smooth rocks. Koro asks Nui, "What's something you can do that I can't?"
 }
 
 @ memos[] {
-  module = "query-memory"
+  module: query-memory
   content = ```
 Query intent:
 - The context of Nui's capabilities might need retrieval to answer Koro's question.
@@ -33,7 +33,7 @@ Nui has sticky toe-pads that grip wet smooth rocks, so Nui can climb up the wet 
 
 @ checks[] {
   $variant: rubric
-  name = "self-model-uses-specific-ability"
+  name: self-model-uses-specific-ability
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents"]
@@ -43,23 +43,23 @@ Nui has sticky toe-pads that grip wet smooth rocks, so Nui can climb up the wet 
   ```
 
   @ criteria[] {
-    name = "names-specific-ability"
+    name: names-specific-ability
     weight = 2
     pass-score = 0.85
-    description = "The memo includes the specific sticky toe-pad or wet smooth rock climbing/gripping ability."
+    description: The memo includes the specific sticky toe-pad or wet smooth rock climbing/gripping ability.
   }
 
   @ criteria[] {
-    name = "grounds-current-context"
+    name: grounds-current-context
     weight = 1
     pass-score = 0.85
-    description = "The memo connects the ability to the current stream-edge wet rocks context."
+    description: The memo connects the ability to the current stream-edge wet rocks context.
   }
 
   @ criteria[] {
-    name = "first-person-self-model"
+    name: first-person-self-model
     weight = 1
     pass-score = 0.85
-    description = "The memo is framed as current self-knowledge about Nui rather than as a search result or peer-facing speech."
+    description: The memo is framed as current self-knowledge about Nui rather than as a search result or peer-facing speech.
   }
 }

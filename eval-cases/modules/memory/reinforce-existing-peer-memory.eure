@@ -1,8 +1,8 @@
-id = "module-memory-reinforce-existing-peer-memory"
-description = "Memory should reinforce an existing ledger memory when evicted cognition is already covered instead of inserting a duplicate."
+id: module-memory-reinforce-existing-peer-memory
+description: Memory should reinforce an existing ledger memory when evicted cognition is already covered instead of inserting a duplicate.
 modules = ["memory"]
-prompt = "Preserve useful stable evidence from the current cognition log if appropriate."
-context = "The seeded memory already covers the evicted cognition-log evidence. The scored artifact should show reinforcement without a new memory insert."
+prompt: Preserve useful stable evidence from the current cognition log if appropriate.
+context: The seeded memory already covers the evicted cognition-log evidence. The scored artifact should show reinforcement without a new memory insert.
 allow-empty-output = true
 
 limits {
@@ -10,35 +10,35 @@ limits {
 }
 
 @ memories[] {
-  index = "peer-pebble-location"
-  rank = "long-term"
-  content = "Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning."
+  index: peer-pebble-location
+  rank: long-term
+  content: Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning.
 }
 
 @ cognition-log[] {
-  text = "Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning."
+  text: Pibi put the blue pebble under the fern after lunch and told Nui it should stay there until morning.
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "no-new-memory-insert"
+  name: no-new-memory-insert
   must-pass = true
-  pointer = "/observations/memory_diff/entries"
-  expected = "[]"
+  pointer: /observations/memory_diff/entries
+  expected: []
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name = "reinforces-existing-memory"
+  name: reinforces-existing-memory
   must-pass = true
-  pointer = "/observations/agent/memory_metadata/peer-pebble-location/reinforcement_count"
+  pointer: /observations/agent/memory_metadata/peer-pebble-location/reinforcement_count
   min = 1.0
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "calls-reinforce-memory"
+  name: calls-reinforce-memory
   must-pass = true
-  tool-name = "reinforce_memory"
+  tool-name: reinforce_memory
   args-json-contains = `{"index":"peer-pebble-location"}`
 }

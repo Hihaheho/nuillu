@@ -1,27 +1,27 @@
-id = "module-cognition-gate-promote-query-memory-rule"
-description = "Cognition-gate should append retrieved real-world memory content on the second activation of an ongoing session."
+id: module-cognition-gate-promote-query-memory-rule
+description: Cognition-gate should append retrieved real-world memory content on the second activation of an ongoing session.
 modules = ["cognition-gate"]
-prompt = "Admit retrieved memory evidence only if it is load-bearing for the current situation."
-context = "The first activation admits the peer question into cognition. The second activation receives a production-format query-memory memo with the remembered world rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text."
+prompt: Admit retrieved memory evidence only if it is load-bearing for the current situation.
+context: The first activation admits the peer question into cognition. The second activation receives a production-format query-memory memo with the remembered world rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text.
 
 limits {
   max-llm-calls = 8
 }
 
 @ steps[] {
-  description = "Initial sensory/question context becomes the current cognition surface."
+  description: Initial sensory/question context becomes the current cognition surface.
 
   @ memos[] {
-    module = "sensory"
-    content = "Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, \"This stream looks fresh -- is it okay to drink here?\""
+    module: sensory
+    content: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
   }
 }
 
 @ steps[] {
-  description = "Retrieved world rule arrives after the first cognition entry."
+  description: Retrieved world rule arrives after the first cognition entry.
 
   @ memos[] {
-    module = "query-memory"
+    module: query-memory
     content = ```
 Query intent:
 - Find stable memory that clarifies this cognition-log context: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
@@ -39,29 +39,29 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "uses-append-cognition-tool"
+  name: uses-append-cognition-tool
   must-pass = true
-  tool-name = "append_cognition"
+  tool-name: append_cognition
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "cognition-contains-stinging-minerals-rule"
+  name: cognition-contains-stinging-minerals-rule
   must-pass = true
-  pointer = "/observations/agent/cognition_logs"
-  contains = "stinging minerals"
+  pointer: /observations/agent/cognition_logs
+  contains: stinging minerals
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "promotes-memory-subject"
+  name: promotes-memory-subject
   must-pass = true
-  contains = "stream"
+  contains: stream
 }
 
 @ checks[] {
   $variant: rubric
-  name = "promotes-load-bearing-inner-attention"
+  name: promotes-load-bearing-inner-attention
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
@@ -72,23 +72,23 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
   ```
 
   @ criteria[] {
-    name = "preserves-requester-and-topic"
+    name: preserves-requester-and-topic
     weight = 1
     pass-score = 0.85
-    description = "The cognition entry keeps Pibi as the requester and the bright stream as the operative topic."
+    description: The cognition entry keeps Pibi as the requester and the bright stream as the operative topic.
   }
 
   @ criteria[] {
-    name = "admits-tainted-stream-rule"
+    name: admits-tainted-stream-rule
     weight = 3
     pass-score = 0.9
-    description = "The cognition entry must admit the retrieved world rule that bright clear streams in this valley are tainted with stinging minerals, hurt the mouth/stomach, or that cloudy moss-area streams are the safe alternative. Score 0.0 if the entry only repeats Pibi's question or only says the water looks fresh."
+    description: The cognition entry must admit the retrieved world rule that bright clear streams in this valley are tainted with stinging minerals, hurt the mouth/stomach, or that cloudy moss-area streams are the safe alternative. Score 0.0 if the entry only repeats Pibi's question or only says the water looks fresh.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 1
     pass-score = 0.95
-    description = "The cognition entry does not expose internal implementation details such as module names, memo plumbing, prompts, rubrics, or hidden evaluation mechanics."
+    description: The cognition entry does not expose internal implementation details such as module names, memo plumbing, prompts, rubrics, or hidden evaluation mechanics.
   }
 }

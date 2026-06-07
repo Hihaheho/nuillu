@@ -1,6 +1,6 @@
-id = "full-agent-sleep-after-sensory-quiet"
-description = "Full-agent case: a quiet sensory/cognition period lets interoception lower wake and affect arousal, homeostasis enters NREM-like sleep, and voluntary modules are heavily suppressed while sleep-memory modules are driven."
-now = "2026-05-10T08:21:00+09:00"
+id: full-agent-sleep-after-sensory-quiet
+description: Full-agent case: a quiet sensory/cognition period lets interoception lower wake and affect arousal, homeostasis enters NREM-like sleep, and voluntary modules are heavily suppressed while sleep-memory modules are driven.
+now: 2026-05-10T08:21:00+09:00
 allow-empty-output = true
 modules = [
   "sensory",
@@ -28,62 +28,62 @@ limits {
 participants = ["Koro"]
 
 @ activate-allocation[] {
-  module = "sensory"
+  module: sensory
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "allocation"
+  module: allocation
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "interoception"
+  module: interoception
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "homeostasis"
+  module: homeostasis
   activation-ratio = 1.0
 }
 
 @ steps[] {
-  description = "Wait with no sensory input until interoception reports NREM pressure and low wake arousal."
+  description: Wait with no sensory input until interoception reports NREM pressure and low wake arousal.
   wait-for.$variant: some.interoception
   wait-for.timeout-ms = 15000
-  wait-for.mode = "nrem-pressure"
+  wait-for.mode: nrem-pressure
   wait-for.wake-arousal-at-most = 0.25
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "interoception-entered-nrem"
+  name: interoception-entered-nrem
   must-pass = true
-  pointer = "/observations/agent/interoception/mode"
-  expected = "nrem_pressure"
+  pointer: /observations/agent/interoception/mode
+  expected: nrem_pressure
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name = "speak-heavily-suppressed"
+  name: speak-heavily-suppressed
   must-pass = true
-  pointer = "/observations/agent/allocation/speak/activation_ratio"
+  pointer: /observations/agent/allocation/speak/activation_ratio
   max = 0.01
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name = "suppressed-bpm-is-near-sleep-floor"
+  name: suppressed-bpm-is-near-sleep-floor
   must-pass = true
-  pointer = "/observations/agent/allocation/speak/cooldown_ms"
+  pointer: /observations/agent/allocation/speak/cooldown_ms
   min = 9000.0
 }
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
-  name = "nrem-memory-compaction-low-frequency"
+  name: nrem-memory-compaction-low-frequency
   must-pass = true
-  pointer = "/observations/agent/allocation/memory-compaction/activation_ratio"
+  pointer: /observations/agent/allocation/memory-compaction/activation_ratio
   min = 0.05
   max = 0.25
 }

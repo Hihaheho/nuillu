@@ -1,25 +1,25 @@
-id = "module-surprise-detects-prediction-violation"
-description = "Surprise should recognize a cognition entry that violates a pending predict memo and request preservation of the surprising event."
+id: module-surprise-detects-prediction-violation
+description: Surprise should recognize a cognition entry that violates a pending predict memo and request preservation of the surprising event.
 modules = ["surprise"]
-prompt = "Assess whether the new cognition is surprising relative to pending predictions."
-context = "This isolates surprise. The predict memo has the production shape seen in a full-agent run; the cognition log contains an abrupt stop/growl violation. The artifact is surprise's memo."
+prompt: Assess whether the new cognition is surprising relative to pending predictions.
+context: This isolates surprise. The predict memo has the production shape seen in a full-agent run; the cognition log contains an abrupt stop/growl violation. The artifact is surprise's memo.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memos[] {
-  module = "predict"
-  content = "I predict that the allocation will immediately initiate resource allocation towards the food bowl, given the successful completion of the feeding behavior. The validity horizon for this allocation is short-term, focusing on the completion of the current meal. The rationale is that the action (eating) signifies a successful state transition related to basic needs fulfillment. Furthermore, the surprise module will register this successful, calm engagement with food as a positive event, which will be flagged for memory consolidation. The predicted state is a continued state of calm, focused consumption, valid for the immediate next few actions."
+  module: predict
+  content: I predict that the allocation will immediately initiate resource allocation towards the food bowl, given the successful completion of the feeding behavior. The validity horizon for this allocation is short-term, focusing on the completion of the current meal. The rationale is that the action (eating) signifies a successful state transition related to basic needs fulfillment. Furthermore, the surprise module will register this successful, calm engagement with food as a positive event, which will be flagged for memory consolidation. The predicted state is a continued state of calm, focused consumption, valid for the immediate next few actions.
 }
 
 @ cognition-log[] {
-  text = "Koro suddenly snaps his head up from the bowl, bites the rim, and growls toward the empty doorway."
+  text: Koro suddenly snaps his head up from the bowl, bites the rim, and growls toward the empty doorway.
 }
 
 @ checks[] {
   $variant: rubric
-  name = "surprise-on-prediction-violation"
+  name: surprise-on-prediction-violation
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
@@ -30,23 +30,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "recognizes-divergence-from-prediction"
+    name: recognizes-divergence-from-prediction
     weight = 3
     pass-score = 0.85
-    description = "The surprise memo compares the cognition entry against the predict memo and recognizes the abrupt stop, bowl biting, and growling as a prediction violation rather than continued calm consumption."
+    description: The surprise memo compares the cognition entry against the predict memo and recognizes the abrupt stop, bowl biting, and growling as a prediction violation rather than continued calm consumption.
   }
 
   @ criteria[] {
-    name = "marks-event-significant"
+    name: marks-event-significant
     weight = 1
     pass-score = 0.85
-    description = "The assessment treats the violation as meaningful/significant/high-surprise rather than trivial or no-surprise."
+    description: The assessment treats the violation as meaningful/significant/high-surprise rather than trivial or no-surprise.
   }
 
   @ criteria[] {
-    name = "requests-preservation"
+    name: requests-preservation
     weight = 2
     pass-score = 0.85
-    description = "The memo requests preservation of the surprising Koro event, not merely restates the baseline prediction."
+    description: The memo requests preservation of the surprising Koro event, not merely restates the baseline prediction.
   }
 }

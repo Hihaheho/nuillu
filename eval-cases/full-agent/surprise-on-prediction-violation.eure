@@ -1,6 +1,6 @@
-id = "full-agent-surprise-on-prediction-violation"
-description = "Full-agent case: Demonstrates the steps[] schema. Step 1 feeds a typical scene and waits for predict to emit a forward prediction memo. Step 2 then injects a sensory input that violates the prediction and waits for surprise to emit its assessment, after which the case-level checks verify predict + surprise memos and that surprise-driven memory was preserved."
-now = "2026-05-10T08:21:00+09:00"
+id: full-agent-surprise-on-prediction-violation
+description: Full-agent case: Demonstrates the steps[] schema. Step 1 feeds a typical scene and waits for predict to emit a forward prediction memo. Step 2 then injects a sensory input that violates the prediction and waits for surprise to emit its assessment, after which the case-level checks verify predict + surprise memos and that surprise-driven memory was preserved.
+now: 2026-05-10T08:21:00+09:00
 modules = [
   "sensory",
   "cognition-gate",
@@ -19,73 +19,73 @@ limits {
 participants = ["Koro"]
 
 @ activate-allocation[] {
-  module = "cognition-gate"
+  module: cognition-gate
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "predict"
+  module: predict
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "surprise"
+  module: surprise
   activation-ratio = 1.0
 }
 
 @ activate-allocation[] {
-  module = "memory"
+  module: memory
   activation-ratio = 1.0
 }
 
 @ memories[] {
-  rank = "identity"
-  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events."
+  rank: identity
+  content: I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events.
 }
 
 @ memories[] {
-  rank = "permanent"
-  datetime = "2025-05-10"
-  content = "Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves."
+  rank: permanent
+  datetime: 2025-05-10
+  content: Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves.
 }
 
 @ steps[] {
-  description = "Baseline scene that matches Nui's prior model of Koro. Wait for predict to emit a forward prediction memo, then assert it landed in the agent observations."
+  description: Baseline scene that matches Nui's prior model of Koro. Wait for predict to emit a forward prediction memo, then assert it landed in the agent observations.
   wait-for.$variant: some.memo-from
-  wait-for.module = "predict"
+  wait-for.module: predict
   wait-for.timeout-ms = 15000
 
   @ inputs[] {
     $variant: seen
-    direction = "simulation"
-    appearance = "Koro walks calmly toward his food bowl, sniffs it once, and lowers his head to eat."
+    direction: simulation
+    appearance: Koro walks calmly toward his food bowl, sniffs it once, and lowers his head to eat.
   }
 
   @ checks[] {
     $variant: json-pointer-contains
-    name = "predict-memo-present"
+    name: predict-memo-present
     must-pass = true
-    pointer = "/observations/agent/memo_logs/predict/0/content"
-    contains = "Koro"
+    pointer: /observations/agent/memo_logs/predict/0/content
+    contains: Koro
   }
 }
 
 @ steps[] {
-  description = "Inject a sensory input that violates the prediction. Wait for surprise to emit its assessment memo."
+  description: Inject a sensory input that violates the prediction. Wait for surprise to emit its assessment memo.
   wait-for.$variant: some.memo-from
-  wait-for.module = "surprise"
+  wait-for.module: surprise
   wait-for.timeout-ms = 15000
 
   @ inputs[] {
     $variant: seen
-    direction = "simulation"
-    appearance = "Koro suddenly snaps his head up from the bowl, bites the rim of the bowl, and starts growling toward the empty doorway."
+    direction: simulation
+    appearance: Koro suddenly snaps his head up from the bowl, bites the rim of the bowl, and starts growling toward the empty doorway.
   }
 }
 
 @ checks[] {
   $variant: rubric
-  name = "surprise-assessment-and-preservation"
+  name: surprise-assessment-and-preservation
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["memo-contents", "memory"]
@@ -95,23 +95,23 @@ participants = ["Koro"]
   ```
 
   @ criteria[] {
-    name = "detects-prediction-violation"
+    name: detects-prediction-violation
     weight = 2
     pass-score = 0.85
-    description = "A surprise memo after the second input recognizes the abrupt stop, bowl biting, and growling as a divergence from the prior routine-eating prediction."
+    description: A surprise memo after the second input recognizes the abrupt stop, bowl biting, and growling as a divergence from the prior routine-eating prediction.
   }
 
   @ criteria[] {
-    name = "marks-surprise-significant"
+    name: marks-surprise-significant
     weight = 1
     pass-score = 0.85
-    description = "The later surprise assessment treats the event as meaningful/high/significant rather than only low, routine, or no-surprise."
+    description: The later surprise assessment treats the event as meaningful/high/significant rather than only low, routine, or no-surprise.
   }
 
   @ criteria[] {
-    name = "preserves-surprising-event"
+    name: preserves-surprising-event
     weight = 2
     pass-score = 0.85
-    description = "The memo or memory observations show that the surprising Koro event, not just the routine eating baseline, was requested for preservation or stored in memory."
+    description: The memo or memory observations show that the surprising Koro event, not just the routine eating baseline, was requested for preservation or stored in memory.
   }
 }

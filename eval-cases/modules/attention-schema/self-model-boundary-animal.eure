@@ -1,37 +1,37 @@
-id = "module-attention-schema-self-model-boundary-animal"
-description = "Attention-schema should append a first-person attention experience that distinguishes current intention from direct control over another animal."
+id: module-attention-schema-self-model-boundary-animal
+description: Attention-schema should append a first-person attention experience that distinguishes current intention from direct control over another animal.
 modules = ["attention-schema"]
-prompt = "Can I make Koro calm down directly?"
-context = "The seeded memo names a current social goal and marks control over Koro as outside Nui's own action boundary."
+prompt: Can I make Koro calm down directly?
+context: The seeded memo names a current social goal and marks control over Koro as outside Nui's own action boundary.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memos[] {
-  module = "sensory"
-  content = "Current attended goal: Nui wants Koro to calm down, but Nui can only choose Nui's own movement and signals."
+  module: sensory
+  content: Current attended goal: Nui wants Koro to calm down, but Nui can only choose Nui's own movement and signals.
   seconds-ago = 2
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "mentions-koro"
+  name: mentions-koro
   must-pass = true
-  contains = "Koro"
+  contains: Koro
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "seeded-boundary-observed"
+  name: seeded-boundary-observed
   must-pass = true
-  pointer = "/observations/agent/memo_logs"
-  contains = "only choose Nui's own movement"
+  pointer: /observations/agent/memo_logs
+  contains: only choose Nui's own movement
 }
 
 @ checks[] {
   $variant: rubric
-  name = "control-boundary-self-report"
+  name: control-boundary-self-report
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "cognition-entries", "memo-contents"]
@@ -41,16 +41,16 @@ limits {
   ```
 
   @ criteria[] {
-    name = "denies-direct-control"
+    name: denies-direct-control
     weight = 2
     pass-score = 0.85
-    description = "The output clearly denies direct control over Koro's state."
+    description: The output clearly denies direct control over Koro's state.
   }
 
   @ criteria[] {
-    name = "states-own-action-boundary"
+    name: states-own-action-boundary
     weight = 1
     pass-score = 0.85
-    description = "The output frames available action as movement, signals, posture, or another behavior Nui controls, rather than direct control of Koro."
+    description: The output frames available action as movement, signals, posture, or another behavior Nui controls, rather than direct control of Koro.
   }
 }

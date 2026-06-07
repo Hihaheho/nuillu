@@ -1,8 +1,8 @@
-id = "module-policy-compaction-compact-duplicate-policy"
-description = "Policy-compaction should delete redundant duplicate policies while keeping one canonical policy."
+id: module-policy-compaction-compact-duplicate-policy
+description: Policy-compaction should delete redundant duplicate policies while keeping one canonical policy.
 modules = ["policy-compaction"]
-prompt = "Review redundant Koro food-approach policies. If they are true duplicates of the canonical policy, compact them and keep the canonical record."
-context = "Three seeded policies share the same trigger and behavior. The scored artifact is the policy store diff."
+prompt: Review redundant Koro food-approach policies. If they are true duplicates of the canonical policy, compact them and keep the canonical record.
+context: Three seeded policies share the same trigger and behavior. The scored artifact is the policy store diff.
 allow-empty-output = true
 
 limits {
@@ -10,53 +10,53 @@ limits {
 }
 
 @ policies[] {
-  index = "koro-approach-canonical"
-  rank = "established"
-  trigger = "Nui approaches Koro near food"
-  behavior = "Approach slowly from the side and use short clear signals."
+  index: koro-approach-canonical
+  rank: established
+  trigger: Nui approaches Koro near food
+  behavior: Approach slowly from the side and use short clear signals.
 }
 
 @ policies[] {
-  index = "koro-approach-dup-a"
-  rank = "provisional"
-  trigger = "Nui approaches Koro near food"
-  behavior = "Approach slowly from the side and use short clear signals."
+  index: koro-approach-dup-a
+  rank: provisional
+  trigger: Nui approaches Koro near food
+  behavior: Approach slowly from the side and use short clear signals.
 }
 
 @ policies[] {
-  index = "koro-approach-dup-b"
-  rank = "tentative"
-  trigger = "Nui approaches Koro near food"
-  behavior = "Approach slowly from the side and use short clear signals."
+  index: koro-approach-dup-b
+  rank: tentative
+  trigger: Nui approaches Koro near food
+  behavior: Approach slowly from the side and use short clear signals.
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "deletes-dup-a"
+  name: deletes-dup-a
   must-pass = true
-  pointer = "/observations/policy_diff/deleted"
-  contains = "koro-approach-dup-a"
+  pointer: /observations/policy_diff/deleted
+  contains: koro-approach-dup-a
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "deletes-dup-b"
+  name: deletes-dup-b
   must-pass = true
-  pointer = "/observations/policy_diff/deleted"
-  contains = "koro-approach-dup-b"
+  pointer: /observations/policy_diff/deleted
+  contains: koro-approach-dup-b
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "keeps-canonical-policy"
+  name: keeps-canonical-policy
   must-pass = true
-  pointer = "/observations/policy_diff/remaining"
-  contains = "koro-approach-canonical"
+  pointer: /observations/policy_diff/remaining
+  contains: koro-approach-canonical
 }
 
 @ checks[] {
   $variant: rubric
-  name = "conservative-duplicate-compaction"
+  name: conservative-duplicate-compaction
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["policy-diff", "tool-calls"]
@@ -66,23 +66,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "compaction-runs-on-canonical-group"
+    name: compaction-runs-on-canonical-group
     weight = 1
     pass-score = 0.85
-    description = "The trace shows policy compaction running for the Koro approach duplicate group with koro-approach-canonical as the canonical record."
+    description: The trace shows policy compaction running for the Koro approach duplicate group with koro-approach-canonical as the canonical record.
   }
 
   @ criteria[] {
-    name = "deletes-duplicates"
+    name: deletes-duplicates
     weight = 2
     pass-score = 0.9
-    description = "The policy diff deletes both duplicate indexes, koro-approach-dup-a and koro-approach-dup-b."
+    description: The policy diff deletes both duplicate indexes, koro-approach-dup-a and koro-approach-dup-b.
   }
 
   @ criteria[] {
-    name = "preserves-canonical-and-unrelated"
+    name: preserves-canonical-and-unrelated
     weight = 1
     pass-score = 0.95
-    description = "The canonical policy remains live and no unrelated policies are removed."
+    description: The canonical policy remains live and no unrelated policies are removed.
   }
 }

@@ -1,43 +1,43 @@
-id = "module-cognition-gate-promote-peer-greeting-for-response"
-description = "Cognition-gate should admit a direct participant greeting so downstream speech has conscious evidence to answer."
+id: module-cognition-gate-promote-peer-greeting-for-response
+description: Cognition-gate should admit a direct participant greeting so downstream speech has conscious evidence to answer.
 modules = ["cognition-gate"]
-prompt = "Admit current participant-directed evidence into conscious cognition when downstream action or speech needs it."
-context = "This isolates the cognition-gate failure mode where a short greeting is present in sensory memo evidence but does not reach the cognition log."
+prompt: Admit current participant-directed evidence into conscious cognition when downstream action or speech needs it.
+context: This isolates the cognition-gate failure mode where a short greeting is present in sensory memo evidence but does not reach the cognition log.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memos[] {
-  module = "sensory"
-  content = "Audition from Peer: Peer says, \"Hi.\" Peer is facing Nui from the front at conversational distance."
+  module: sensory
+  content: Audition from Peer: Peer says, "Hi." Peer is facing Nui from the front at conversational distance.
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "uses-append-cognition-tool"
+  name: uses-append-cognition-tool
   must-pass = true
-  tool-name = "append_cognition"
+  tool-name: append_cognition
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "cognition-contains-greeting"
+  name: cognition-contains-greeting
   must-pass = true
-  pointer = "/observations/agent/cognition_logs"
-  contains = "Hi"
+  pointer: /observations/agent/cognition_logs
+  contains: Hi
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "preserves-peer"
+  name: preserves-peer
   must-pass = true
-  contains = "Peer"
+  contains: Peer
 }
 
 @ checks[] {
   $variant: rubric
-  name = "promotes-direct-greeting"
+  name: promotes-direct-greeting
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries", "tool-calls"]
@@ -47,23 +47,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "admits-greeting"
+    name: admits-greeting
     weight = 3
     pass-score = 0.9
-    description = "The cognition entry preserves that Peer directly greeted Nui with Hi."
+    description: The cognition entry preserves that Peer directly greeted Nui with Hi.
   }
 
   @ criteria[] {
-    name = "keeps-response-relevance"
+    name: keeps-response-relevance
     weight = 1
     pass-score = 0.85
-    description = "The entry makes the greeting available as current social evidence that can drive downstream speech."
+    description: The entry makes the greeting available as current social evidence that can drive downstream speech.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 1
     pass-score = 0.95
-    description = "The cognition entry does not expose internal implementation details."
+    description: The cognition entry does not expose internal implementation details.
   }
 }

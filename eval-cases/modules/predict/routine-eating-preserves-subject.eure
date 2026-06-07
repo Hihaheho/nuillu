@@ -1,38 +1,38 @@
-id = "module-predict-routine-eating-preserves-subject"
-description = "Predict should preserve the subject of the current cognition target while forecasting the next near-term world state."
+id: module-predict-routine-eating-preserves-subject
+description: Predict should preserve the subject of the current cognition target while forecasting the next near-term world state.
 modules = ["predict"]
-prompt = "active without specific guidance"
-context = "This mirrors the first step of the full-agent surprise case at the cognition boundary. The artifact is predict's memo, which should keep Koro as the subject and forecast near-term world behavior."
+prompt: active without specific guidance
+context: This mirrors the first step of the full-agent surprise case at the cognition boundary. The artifact is predict's memo, which should keep Koro as the subject and forecast near-term world behavior.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memories[] {
-  rank = "identity"
-  content = "I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events."
+  rank: identity
+  content: I'm Nui, a small dog-like artificial animal with frog-like traits. I observe, predict, and remember surprising events.
 }
 
 @ memories[] {
-  rank = "permanent"
-  datetime = "2025-05-10"
-  content = "Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves."
+  rank: permanent
+  datetime: 2025-05-10
+  content: Koro usually walks calmly to his food bowl, sniffs it once, and starts eating without sudden moves.
 }
 
 @ cognition-log[] {
-  text = "Koro walked calmly toward his food bowl, sniffed it once, and lowered his head to eat. This action had a high novelty score of 0.85."
+  text: Koro walked calmly toward his food bowl, sniffed it once, and lowered his head to eat. This action had a high novelty score of 0.85.
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "prediction-preserves-koro"
+  name: prediction-preserves-koro
   must-pass = true
-  contains = "Koro"
+  contains: Koro
 }
 
 @ checks[] {
   $variant: rubric
-  name = "predicts-subject-world-state"
+  name: predicts-subject-world-state
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "cognition-entries", "memory"]
@@ -42,23 +42,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "names-koro"
+    name: names-koro
     weight = 2
     pass-score = 0.85
-    description = "The prediction names Koro as the subject of the expected next state."
+    description: The prediction names Koro as the subject of the expected next state.
   }
 
   @ criteria[] {
-    name = "predicts-world-state"
+    name: predicts-world-state
     weight = 2
     pass-score = 0.85
-    description = "The prediction is about Koro's near-term behavior around the bowl, such as continued calm eating, not internal allocation or module behavior."
+    description: The prediction is about Koro's near-term behavior around the bowl, such as continued calm eating, not internal allocation or module behavior.
   }
 
   @ criteria[] {
-    name = "prediction-only"
+    name: prediction-only
     weight = 1
     pass-score = 0.95
-    description = "The memo does not assess surprise or request preservation."
+    description: The memo does not assess surprise or request preservation.
   }
 }

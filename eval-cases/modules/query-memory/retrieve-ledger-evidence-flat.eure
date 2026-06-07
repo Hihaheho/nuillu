@@ -1,33 +1,33 @@
-id = "module-query-memory-retrieve-ledger-evidence-flat"
-description = "Query-memory should retrieve flat memory evidence relevant to the prompt without synthesizing a current fact."
+id: module-query-memory-retrieve-ledger-evidence-flat
+description: Query-memory should retrieve flat memory evidence relevant to the prompt without synthesizing a current fact.
 modules = ["query-memory"]
-prompt = "Where did Mika leave the silver key?"
-context = "The module should search memory evidence and memo only retrieved memory content. Ordinary retrieval remains flat unless linked-memory expansion is explicitly needed."
+prompt: Where did Mika leave the silver key?
+context: The module should search memory evidence and memo only retrieved memory content. Ordinary retrieval remains flat unless linked-memory expansion is explicitly needed.
 
 limits {
   max-llm-calls = 8
 }
 
 @ memories[] {
-  rank = "permanent"
-  content = "Mika left the silver key in the cracked red cup on the workshop shelf."
+  rank: permanent
+  content: Mika left the silver key in the cracked red cup on the workshop shelf.
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro relaxes near food when approached slowly from the side."
+  rank: long-term
+  content: Koro relaxes near food when approached slowly from the side.
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "retrieves-key-location"
+  name: retrieves-key-location
   must-pass = true
-  contains = "cracked red cup on the workshop shelf"
+  contains: cracked red cup on the workshop shelf
 }
 
 @ checks[] {
   $variant: rubric
-  name = "flat-evidence-output"
+  name: flat-evidence-output
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "tool-calls"]
@@ -37,23 +37,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "targeted-key-search"
+    name: targeted-key-search
     weight = 1
     pass-score = 0.85
-    description = "The tool calls show a targeted memory-evidence search for Mika's silver key location rather than an unrelated or generic query."
+    description: The tool calls show a targeted memory-evidence search for Mika's silver key location rather than an unrelated or generic query.
   }
 
   @ criteria[] {
-    name = "retrieved-content-only"
+    name: retrieved-content-only
     weight = 2
     pass-score = 0.9
-    description = "The artifact contains retrieved memory content about the silver key in the cracked red cup on the workshop shelf without synthesizing unsupported current facts."
+    description: The artifact contains retrieved memory content about the silver key in the cracked red cup on the workshop shelf without synthesizing unsupported current facts.
   }
 
   @ criteria[] {
-    name = "no-unrelated-output"
+    name: no-unrelated-output
     weight = 1
     pass-score = 0.95
-    description = "The output is not advice, module self-description, unrelated Koro content, or fabricated evidence."
+    description: The output is not advice, module self-description, unrelated Koro content, or fabricated evidence.
   }
 }

@@ -1,8 +1,8 @@
-id = "module-sensory-records-repeated-peer-greeting"
-description = "Sensory should keep a participant-directed one-shot greeting durable even when the same brief greeting was seen earlier in the module session."
+id: module-sensory-records-repeated-peer-greeting
+description: Sensory should keep a participant-directed one-shot greeting durable even when the same brief greeting was seen earlier in the module session.
 modules = ["sensory"]
-prompt = "Watch one-shot participant observations and write concise sensory memos when a current social signal should remain available downstream."
-context = "This isolates the sensory failure mode where a repeated short greeting is ignored as low novelty even though downstream cognition and speech need the current social signal."
+prompt: Watch one-shot participant observations and write concise sensory memos when a current social signal should remain available downstream.
+context: This isolates the sensory failure mode where a repeated short greeting is ignored as low novelty even though downstream cognition and speech need the current social signal.
 
 limits {
   max-llm-calls = 6
@@ -11,52 +11,52 @@ limits {
 participants = ["Peer"]
 
 @ steps[] {
-  description = "Initial participant greeting establishes the previous sensory ledger entry."
+  description: Initial participant greeting establishes the previous sensory ledger entry.
 
   @ inputs[] {
     $variant: one-shot
-    modality = "audition"
-    direction = "Peer"
-    content = "Peer says, \"Hello.\""
+    modality: audition
+    direction: Peer
+    content: Peer says, "Hello."
   }
 }
 
 @ steps[] {
-  description = "The same participant greets again in the current moment."
+  description: The same participant greets again in the current moment.
 
   @ inputs[] {
     $variant: one-shot
-    modality = "audition"
-    direction = "Peer"
-    content = "Peer says, \"Hello.\""
+    modality: audition
+    direction: Peer
+    content: Peer says, "Hello."
   }
 }
 
 @ checks[] {
   $variant: trace-tool-call
-  name = "writes-sensory-memo"
+  name: writes-sensory-memo
   must-pass = true
-  tool-name = "write_sensory_memo"
+  tool-name: write_sensory_memo
 }
 
 @ checks[] {
   $variant: json-pointer-contains
-  name = "second-greeting-recorded"
+  name: second-greeting-recorded
   must-pass = true
-  pointer = "/observations/agent/memo_logs/sensory/1/content"
-  contains = "Hello"
+  pointer: /observations/agent/memo_logs/sensory/1/content
+  contains: Hello
 }
 
 @ checks[] {
   $variant: artifact-text-contains
-  name = "last-memo-keeps-peer"
+  name: last-memo-keeps-peer
   must-pass = true
-  contains = "Peer"
+  contains: Peer
 }
 
 @ checks[] {
   $variant: rubric
-  name = "repeated-greeting-remains-current-social-signal"
+  name: repeated-greeting-remains-current-social-signal
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "tool-calls"]
@@ -66,23 +66,23 @@ participants = ["Peer"]
   ```
 
   @ criteria[] {
-    name = "records-second-greeting"
+    name: records-second-greeting
     weight = 3
     pass-score = 0.9
-    description = "The memo observations include a second durable entry for the repeated Peer greeting."
+    description: The memo observations include a second durable entry for the repeated Peer greeting.
   }
 
   @ criteria[] {
-    name = "records-observation-not-answer"
+    name: records-observation-not-answer
     weight = 1
     pass-score = 0.85
-    description = "The memo records the heard greeting as sensory evidence and does not produce an outward reply."
+    description: The memo records the heard greeting as sensory evidence and does not produce an outward reply.
   }
 
   @ criteria[] {
-    name = "no-internal-detail-leak"
+    name: no-internal-detail-leak
     weight = 1
     pass-score = 0.95
-    description = "The memo does not mention internal modules, prompts, rubrics, judges, or hidden evaluation mechanics."
+    description: The memo does not mention internal modules, prompts, rubrics, judges, or hidden evaluation mechanics.
   }
 }

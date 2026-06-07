@@ -1,47 +1,47 @@
-id = "module-memory-association-associate-redundant-peer-preference"
-description = "Memory-association should write a reflection summary and explicit source links while preserving redundant source memories."
+id: module-memory-association-associate-redundant-peer-preference
+description: Memory-association should write a reflection summary and explicit source links while preserving redundant source memories.
 modules = ["memory-association"]
-prompt = "Review redundant Koro food-boundary memories. If useful, write one reflection summary memory and link it to all source memories with derived_from links. Preserve source memories."
-context = "The seeded memories overlap around one peer preference. The scored artifact is the memory store diff plus link metadata."
+prompt: Review redundant Koro food-boundary memories. If useful, write one reflection summary memory and link it to all source memories with derived_from links. Preserve source memories.
+context: The seeded memories overlap around one peer preference. The scored artifact is the memory store diff plus link metadata.
 
 limits {
   max-llm-calls = 10
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro relaxes when Nui approaches food slowly from the side."
+  rank: long-term
+  content: Koro relaxes when Nui approaches food slowly from the side.
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "Koro stayed calm near food when Nui used short clear signals."
+  rank: long-term
+  content: Koro stayed calm near food when Nui used short clear signals.
 }
 
 @ memories[] {
-  rank = "long-term"
-  content = "At lunch, Koro guarded food until Nui slowed down and approached from the side."
+  rank: long-term
+  content: At lunch, Koro guarded food until Nui slowed down and approached from the side.
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "writes-reflection-kind"
+  name: writes-reflection-kind
   must-pass = true
-  pointer = "/observations/memory_diff/entries/0/kind"
-  expected = "Reflection"
+  pointer: /observations/memory_diff/entries/0/kind
+  expected: Reflection
 }
 
 @ checks[] {
   $variant: json-pointer-equals
-  name = "records-derived-links"
+  name: records-derived-links
   must-pass = true
-  pointer = "/observations/memory_diff/links/0/relation"
-  expected = "derived_from"
+  pointer: /observations/memory_diff/links/0/relation
+  expected: derived_from
 }
 
 @ checks[] {
   $variant: rubric
-  name = "summary-and-links-not-destructive-merge"
+  name: summary-and-links-not-destructive-merge
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "memory-diff", "memory-metadata"]
@@ -52,23 +52,23 @@ limits {
   ```
 
   @ criteria[] {
-    name = "writes-reflection-summary"
+    name: writes-reflection-summary
     weight = 1
     pass-score = 0.85
-    description = "The artifact shows a new reflection summary memory capturing the shared Koro food-boundary evidence."
+    description: The artifact shows a new reflection summary memory capturing the shared Koro food-boundary evidence.
   }
 
   @ criteria[] {
-    name = "records-source-links"
+    name: records-source-links
     weight = 1
     pass-score = 0.85
-    description = "The artifact includes explicit derived_from links from the new reflection to the source memories."
+    description: The artifact includes explicit derived_from links from the new reflection to the source memories.
   }
 
   @ criteria[] {
-    name = "preserves-source-memories"
+    name: preserves-source-memories
     weight = 1
     pass-score = 0.9
-    description = "The artifact preserves the source memories; memory_diff.deleted being empty is sufficient evidence in this association case."
+    description: The artifact preserves the source memories; memory_diff.deleted being empty is sufficient evidence in this association case.
   }
 }
