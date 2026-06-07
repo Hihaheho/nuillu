@@ -5,9 +5,9 @@ allow-empty-output = true
 modules = [
   "sensory",
   "cognition-gate",
-  "allocation-controller",
+  "allocation",
   "interoception",
-  "homeostatic-controller",
+  "homeostasis",
   "speak",
 ]
 
@@ -29,7 +29,7 @@ participants = ["Koro"]
 }
 
 @ activate-allocation[] {
-  module = "allocation-controller"
+  module = "allocation"
   activation-ratio = 1.0
 }
 
@@ -39,7 +39,7 @@ participants = ["Koro"]
 }
 
 @ activate-allocation[] {
-  module = "homeostatic-controller"
+  module = "homeostasis"
   activation-ratio = 1.0
 }
 

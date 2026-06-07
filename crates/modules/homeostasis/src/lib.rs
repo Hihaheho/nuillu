@@ -23,7 +23,7 @@ enum HomeostaticPhase {
     Recombining,
 }
 
-pub struct HomeostaticControllerModule {
+pub struct HomeostasisModule {
     interoception_updates: InteroceptiveUpdatedInbox,
     interoception: InteroceptiveReader,
     allocation: AllocationWriter,
@@ -31,7 +31,7 @@ pub struct HomeostaticControllerModule {
     last_phase_entered_at: Option<DateTime<Utc>>,
 }
 
-impl HomeostaticControllerModule {
+impl HomeostasisModule {
     pub fn new(
         interoception_updates: InteroceptiveUpdatedInbox,
         interoception: InteroceptiveReader,
@@ -209,11 +209,11 @@ fn phase_guidance(phase: HomeostaticPhase, id: &ModuleId) -> String {
 }
 
 #[async_trait(?Send)]
-impl Module for HomeostaticControllerModule {
+impl Module for HomeostasisModule {
     type Batch = ();
 
     fn id() -> &'static str {
-        "homeostatic-controller"
+        "homeostasis"
     }
 
     fn peer_context() -> Option<&'static str> {
@@ -225,7 +225,7 @@ impl Module for HomeostaticControllerModule {
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        HomeostaticControllerModule::next_batch(self).await
+        HomeostasisModule::next_batch(self).await
     }
 
     async fn activate(
@@ -233,7 +233,7 @@ impl Module for HomeostaticControllerModule {
         cx: &nuillu_module::ActivateCx<'_>,
         _batch: &Self::Batch,
     ) -> Result<()> {
-        HomeostaticControllerModule::activate(self, cx).await
+        HomeostasisModule::activate(self, cx).await
     }
 }
 

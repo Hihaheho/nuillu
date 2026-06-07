@@ -1,4 +1,4 @@
-/// Schema for eval-cases/modules/allocation-controller/**/*.eure files.
+/// Schema for eval-cases/modules/allocation/**/*.eure files.
 
 $import = {
   common => "./eval-common.schema.eure"

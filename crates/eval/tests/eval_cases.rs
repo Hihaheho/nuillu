@@ -240,8 +240,8 @@ fn parses_added_speak_and_self_model_module_cases() {
             EvalModule::Predict,
         ),
         (
-            "../../eval-cases/modules/allocation-controller/prioritizes-speak-for-peer-question.eure",
-            EvalModule::AllocationController,
+            "../../eval-cases/modules/allocation/prioritizes-speak-for-peer-question.eure",
+            EvalModule::Allocation,
         ),
     ];
 
@@ -310,7 +310,7 @@ prompt = "Watch ambient observations."
 }
 
 #[test]
-fn validates_surprise_and_allocation_controller_module_case_requirements() {
+fn validates_surprise_and_allocation_module_case_requirements() {
     let dir = tempfile::tempdir().unwrap();
 
     let surprise_dir = dir.path().join("eval-cases/modules/surprise");
@@ -355,14 +355,14 @@ prompt = "Predict what happens next."
         "{err}"
     );
 
-    let allocation_dir = dir.path().join("eval-cases/modules/allocation-controller");
+    let allocation_dir = dir.path().join("eval-cases/modules/allocation");
     std::fs::create_dir_all(&allocation_dir).unwrap();
     let missing_memos = allocation_dir.join("missing-memos.eure");
     std::fs::write(
         &missing_memos,
         r#"
 id = "missing-memos"
-modules = ["allocation-controller"]
+modules = ["allocation"]
 prompt = "Assign priorities."
 "#,
     )
@@ -370,7 +370,7 @@ prompt = "Assign priorities."
     let err = parse_case_file(&missing_memos).unwrap_err();
     assert!(
         err.to_string()
-            .contains("allocation-controller module case must include at least one memo seed"),
+            .contains("allocation module case must include at least one memo seed"),
         "{err}"
     );
 }

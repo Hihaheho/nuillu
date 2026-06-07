@@ -3274,7 +3274,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-allocation-controller"
+name = "nuillu-allocation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3358,11 +3358,11 @@ dependencies = [
  "lutum-openai",
  "lutum-trace",
  "nuillu-agent",
- "nuillu-allocation-controller",
+ "nuillu-allocation",
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-cognition-gate",
- "nuillu-homeostatic-controller",
+ "nuillu-homeostasis",
  "nuillu-interoception",
  "nuillu-memory",
  "nuillu-module",
@@ -3387,7 +3387,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nuillu-homeostatic-controller"
+name = "nuillu-homeostasis"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3568,11 +3568,11 @@ dependencies = [
  "lutum-openai",
  "lutum-trace",
  "nuillu-agent",
- "nuillu-allocation-controller",
+ "nuillu-allocation",
  "nuillu-attention-schema",
  "nuillu-blackboard",
  "nuillu-cognition-gate",
- "nuillu-homeostatic-controller",
+ "nuillu-homeostasis",
  "nuillu-interoception",
  "nuillu-llm-trace-file",
  "nuillu-memory",

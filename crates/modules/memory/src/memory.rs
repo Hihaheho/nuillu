@@ -31,7 +31,7 @@ Memory is remembered evidence, not a fact table or current-truth projection. Sto
 normalized natural-language memory, usually one to three sentences. If source context matters,
 include it in the memory sentence itself, for example "Ryo said he recently moved to Kyoto."
 Use evicted cognition-log entries as candidate evidence. Memo-log entries are non-conscious working
-traces and are not valid direct memory evidence. Allocation guidance from allocation-controller may
+traces and are not valid direct memory evidence. Allocation guidance from allocation may
 contain explicit preservation candidates from other modules, but those candidates are prioritization
 context rather than write commands. Use insert_memory only for concrete information likely to matter
 later and grounded in cognition-log evidence. You may reject, normalize, merge, and deduplicate

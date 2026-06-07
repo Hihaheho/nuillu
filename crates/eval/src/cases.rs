@@ -239,7 +239,7 @@ pub struct ModuleEvalStep {
 pub enum EvalModule {
     Sensory,
     CognitionGate,
-    AllocationController,
+    Allocation,
     AttentionSchema,
     SelfModel,
     QueryMemory,
@@ -248,7 +248,7 @@ pub enum EvalModule {
     MemoryAssociation,
     MemoryRecombination,
     Interoception,
-    HomeostaticController,
+    Homeostasis,
     Policy,
     PolicyCompaction,
     Reward,
@@ -260,7 +260,7 @@ pub enum EvalModule {
 pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Sensory,
     EvalModule::CognitionGate,
-    EvalModule::AllocationController,
+    EvalModule::Allocation,
     EvalModule::AttentionSchema,
     EvalModule::SelfModel,
     EvalModule::QueryMemory,
@@ -269,7 +269,7 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::MemoryAssociation,
     EvalModule::MemoryRecombination,
     EvalModule::Interoception,
-    EvalModule::HomeostaticController,
+    EvalModule::Homeostasis,
     EvalModule::Policy,
     EvalModule::PolicyCompaction,
     EvalModule::Reward,
@@ -283,7 +283,7 @@ impl EvalModule {
         match self {
             Self::Sensory => "sensory",
             Self::CognitionGate => "cognition-gate",
-            Self::AllocationController => "allocation-controller",
+            Self::Allocation => "allocation",
             Self::AttentionSchema => "attention-schema",
             Self::SelfModel => "self-model",
             Self::QueryMemory => "query-memory",
@@ -292,7 +292,7 @@ impl EvalModule {
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
             Self::Interoception => "interoception",
-            Self::HomeostaticController => "homeostatic-controller",
+            Self::Homeostasis => "homeostasis",
             Self::Policy => "policy",
             Self::PolicyCompaction => "policy-compaction",
             Self::Reward => "reward",
@@ -306,7 +306,7 @@ impl EvalModule {
         match self {
             Self::Sensory => builtin::sensory(),
             Self::CognitionGate => builtin::cognition_gate(),
-            Self::AllocationController => builtin::allocation_controller(),
+            Self::Allocation => builtin::allocation(),
             Self::AttentionSchema => builtin::attention_schema(),
             Self::SelfModel => builtin::self_model(),
             Self::QueryMemory => builtin::query_memory(),
@@ -315,7 +315,7 @@ impl EvalModule {
             Self::MemoryAssociation => builtin::memory_association(),
             Self::MemoryRecombination => builtin::memory_recombination(),
             Self::Interoception => builtin::interoception(),
-            Self::HomeostaticController => builtin::homeostatic_controller(),
+            Self::Homeostasis => builtin::homeostasis(),
             Self::Policy => builtin::policy(),
             Self::PolicyCompaction => builtin::policy_compaction(),
             Self::Reward => builtin::reward(),
@@ -364,7 +364,7 @@ pub enum ModuleEvalTarget {
     MemoryAssociation,
     MemoryRecombination,
     PolicyCompaction,
-    AllocationController,
+    Allocation,
     Predict,
     Surprise,
     Speak,
@@ -383,7 +383,7 @@ impl ModuleEvalTarget {
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
             Self::PolicyCompaction => "policy-compaction",
-            Self::AllocationController => "allocation-controller",
+            Self::Allocation => "allocation",
             Self::Predict => "predict",
             Self::Surprise => "surprise",
             Self::Speak => "speak",
@@ -402,7 +402,7 @@ impl ModuleEvalTarget {
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
             Self::PolicyCompaction => EvalModule::PolicyCompaction,
-            Self::AllocationController => EvalModule::AllocationController,
+            Self::Allocation => EvalModule::Allocation,
             Self::Predict => EvalModule::Predict,
             Self::Surprise => EvalModule::Surprise,
             Self::Speak => EvalModule::Speak,
@@ -423,7 +423,7 @@ impl ModuleEvalTarget {
                 "memory-association" => Some(Self::MemoryAssociation),
                 "memory-recombination" => Some(Self::MemoryRecombination),
                 "policy-compaction" => Some(Self::PolicyCompaction),
-                "allocation-controller" => Some(Self::AllocationController),
+                "allocation" => Some(Self::Allocation),
                 "predict" => Some(Self::Predict),
                 "surprise" => Some(Self::Surprise),
                 "speak" => Some(Self::Speak),
@@ -1367,14 +1367,10 @@ fn validate_module_case_target(
             message: "predict module case must include at least one cognition-log seed".to_string(),
         });
     }
-    if target == ModuleEvalTarget::AllocationController
-        && case.memos.is_empty()
-        && step_memos_count == 0
-    {
+    if target == ModuleEvalTarget::Allocation && case.memos.is_empty() && step_memos_count == 0 {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
-            message: "allocation-controller module case must include at least one memo seed"
-                .to_string(),
+            message: "allocation module case must include at least one memo seed".to_string(),
         });
     }
     if target == ModuleEvalTarget::PolicyCompaction && case.policies.is_empty() {

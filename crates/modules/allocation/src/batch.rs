@@ -4,7 +4,7 @@ use anyhow::Result;
 use nuillu_module::AttentionControlRequest;
 use tokio::time::Instant;
 
-use crate::AllocationControllerModule;
+use crate::AllocationModule;
 
 const DEFAULT_CONTROL_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_CONTROL_BUDGET: Duration = Duration::from_secs(1);
@@ -29,7 +29,7 @@ impl Default for AttentionControlBatchConfig {
     }
 }
 
-impl AllocationControllerModule {
+impl AllocationModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
         let mut batch = self.await_first_batch().await?;
         let _ = self.collect_ready_events_into_batch(&mut batch)?;
@@ -129,25 +129,25 @@ mod tests {
 
     type BatchRecorder = Rc<RefCell<Vec<usize>>>;
 
-    struct RecordingAllocationController {
-        inner: AllocationControllerModule,
+    struct RecordingAllocation {
+        inner: AllocationModule,
         recorder: BatchRecorder,
     }
 
     #[async_trait(?Send)]
-    impl Module for RecordingAllocationController {
+    impl Module for RecordingAllocation {
         type Batch = NextBatch;
 
         fn id() -> &'static str {
-            AllocationControllerModule::id()
+            AllocationModule::id()
         }
 
         fn peer_context() -> Option<&'static str> {
-            AllocationControllerModule::peer_context()
+            AllocationModule::peer_context()
         }
 
         fn allocation_hint() -> Option<&'static str> {
-            AllocationControllerModule::allocation_hint()
+            AllocationModule::allocation_hint()
         }
 
         async fn next_batch(&mut self) -> Result<Self::Batch> {
@@ -192,8 +192,8 @@ mod tests {
                 move |caps| {
                     let recorder = recorder.clone();
                     async move {
-                        Ok(RecordingAllocationController {
-                            inner: AllocationControllerModule::new(
+                        Ok(RecordingAllocation {
+                            inner: AllocationModule::new(
                                 caps.memo_updated_inbox(),
                                 caps.attention_control_inbox(),
                                 caps.blackboard_reader(),
@@ -201,7 +201,7 @@ mod tests {
                                 caps.allocation_reader(),
                                 caps.interoception_reader(),
                                 caps.allocation_writer(
-                                    vec![nuillu_types::builtin::allocation_controller()],
+                                    vec![nuillu_types::builtin::allocation()],
                                     Vec::new(),
                                 ),
                                 caps.memo(),

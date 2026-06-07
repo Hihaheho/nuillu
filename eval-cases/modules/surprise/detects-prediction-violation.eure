@@ -10,7 +10,7 @@ limits {
 
 @ memos[] {
   module = "predict"
-  content = "I predict that the allocation-controller will immediately initiate resource allocation towards the food bowl, given the successful completion of the feeding behavior. The validity horizon for this allocation is short-term, focusing on the completion of the current meal. The rationale is that the action (eating) signifies a successful state transition related to basic needs fulfillment. Furthermore, the surprise module will register this successful, calm engagement with food as a positive event, which will be flagged for memory consolidation. The predicted state is a continued state of calm, focused consumption, valid for the immediate next few actions."
+  content = "I predict that the allocation will immediately initiate resource allocation towards the food bowl, given the successful completion of the feeding behavior. The validity horizon for this allocation is short-term, focusing on the completion of the current meal. The rationale is that the action (eating) signifies a successful state transition related to basic needs fulfillment. Furthermore, the surprise module will register this successful, calm engagement with food as a positive event, which will be flagged for memory consolidation. The predicted state is a continued state of calm, focused consumption, valid for the immediate next few actions."
 }
 
 @ cognition-log[] {

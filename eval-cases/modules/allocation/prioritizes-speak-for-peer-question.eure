@@ -1,14 +1,14 @@
-id = "module-allocation-controller-prioritizes-speak-for-peer-question"
-description = "Allocation-controller should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech."
+id = "module-allocation-prioritizes-speak-for-peer-question"
+description = "Allocation should raise speak and supporting modules when memo evidence shows a direct peer question that may warrant outward speech."
 modules = [
-  "allocation-controller",
+  "allocation",
   "speak",
   "cognition-gate",
   "query-memory",
   "sensory",
 ]
 prompt = "Assign activation priorities for the current memo batch."
-context = "This isolates allocation-controller. Other listed modules are registered allocation targets only; their memos are seeded as inputs. The artifact combines the controller memo and allocation snapshot."
+context = "This isolates allocation. Other listed modules are registered allocation targets only; their memos are seeded as inputs. The artifact combines the allocation memo and allocation snapshot."
 
 limits {
   max-llm-calls = 8
@@ -46,8 +46,8 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents"]
   rubric = ```
-  Pass if the allocation-controller output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when their hints explain why those modules need activation now.
-  Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the controller memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
+  Pass if the allocation output raises speak near the top of the priority list for this memo batch because Pibi asked a direct in-world question that may warrant outward speech, and also elevates supporting modules such as cognition-gate or query-memory when their hints explain why those modules need activation now.
+  Fail if speak is omitted or heavily suppressed despite the direct peer question, if no allocation change is reflected in the snapshot, if priorities ignore the load-bearing peer question, or if the allocation memo exposes hidden eval/runtime mechanics instead of allocation reasoning.
   ```
 
   @ criteria[] {
@@ -68,6 +68,6 @@ Once Koro lunged when I turned away from his growl. Don't show your back to a th
     name = "grounded-in-memo-evidence"
     weight = 2
     pass-score = 0.85
-    description = "The controller memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping."
+    description = "The allocation memo and hints reflect the seeded sensory peer question and retrieved Koro threat knowledge rather than unrelated housekeeping."
   }
 }

@@ -40,22 +40,10 @@ pub fn standard_dependency_edges() -> Vec<(ModuleId, ModuleId)> {
             builtin::memory_recombination(),
             builtin::memory_compaction(),
         ),
-        (
-            builtin::memory_compaction(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_association(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::memory_recombination(),
-            builtin::homeostatic_controller(),
-        ),
-        (
-            builtin::policy_compaction(),
-            builtin::homeostatic_controller(),
-        ),
+        (builtin::memory_compaction(), builtin::homeostasis()),
+        (builtin::memory_association(), builtin::homeostasis()),
+        (builtin::memory_recombination(), builtin::homeostasis()),
+        (builtin::policy_compaction(), builtin::homeostasis()),
     ]
 }
 

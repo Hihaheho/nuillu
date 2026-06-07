@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(
             effective.activation_for(&builtin::speak()),
             table[4],
-            "speak should retain the allocation-controller's positive fifth priority ratio"
+            "speak should retain the allocation's positive fifth priority ratio"
         );
         assert_eq!(
             effective.active_replicas(&builtin::speak()),

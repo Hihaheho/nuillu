@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 mod batch;
 
-const SYSTEM_PROMPT: &str = r#"You are the allocation-controller module.
+const SYSTEM_PROMPT: &str = r#"You are the allocation module.
 You wake on memo updates and internal attention-control requests. Use blackboard memos, attention
 control requests, the cognition log, the current allocation, and the registry schema to decide which
 allocation posture is best for the mind and which modules deserve extra activation now.
@@ -39,43 +39,41 @@ Attention-control requests are not target-module work queues. They are current a
 you may admit, defer, or reject. If you admit a request, activate the relevant module and put the
 concrete requested work in that module's guidance hint. If you defer or reject a request, do not
 activate a module for it. In every case, record the admit/defer/reject judgement and reason in
-`memo`; there is no durable pending request queue outside this controller note.
+`memo`; there is no durable pending request queue outside this allocation note.
 
 Module-specific priority policy comes from the registered allocation target hints appended below.
 Do not assume any particular module exists; only target registered module ids exposed by the live
 schema and use each target's hint to decide what work it can perform.
 
-Each tool carries a free-form controller memo; preserve the reasoning needed by other modules but do
+Each tool carries a free-form allocation memo; preserve the reasoning needed by other modules but do
 not encode it as JSON, YAML, a code block, or any fixed schema."#;
 
-const COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX: &str =
-    "Compacted allocation-controller session history:";
+const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation-controller module's persistent session history.
+const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation module's persistent session history.
 Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
-decisions, controller notes, guidance changes, and relevant cognition-log context needed for future
+decisions, allocation notes, guidance changes, and relevant cognition-log context needed for future
 allocation decisions. Do not invent facts. Return plain text only."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
-        COMPACTED_ALLOCATION_CONTROLLER_SESSION_PREFIX,
+        COMPACTED_ALLOCATION_SESSION_PREFIX,
         SESSION_COMPACTION_PROMPT,
     )
 }
 
-fn format_allocation_controller_context(
+fn format_allocation_context(
     rank_counts: &nuillu_module::MemoryRankCounts,
     current: &nuillu_module::ResourceAllocation,
     interoception: &nuillu_blackboard::InteroceptiveState,
     modules: &[(ModuleId, &'static str)],
     stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
 ) -> String {
-    let mut sections = vec![
-        "Allocation-controller context for assigning the next activation priorities:".to_owned(),
-    ];
+    let mut sections =
+        vec!["Allocation context for assigning the next activation priorities:".to_owned()];
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
         sections.push(section);
     }
@@ -117,7 +115,7 @@ fn visible_modules(
         .collect()
 }
 
-fn format_allocation_controller_system_prompt(
+fn format_allocation_system_prompt(
     base: &str,
     allocation_hints: &[(ModuleId, &'static str)],
     owner: &ModuleId,
@@ -133,7 +131,8 @@ fn format_allocation_controller_system_prompt(
     }
 
     let mut prompt = base.to_owned();
-    prompt.push_str("\n\nAllocation target hints for modules this controller may activate:\n");
+    prompt
+        .push_str("\n\nAllocation target hints for modules this allocation module may activate:\n");
     prompt.push_str(&targets.join("\n"));
     prompt.push('\n');
     prompt
@@ -141,7 +140,7 @@ fn format_allocation_controller_system_prompt(
 
 tokio::task_local! {
     /// JSON Schema for `PriorityEntry.module_id` derived from the live
-    /// allocation target registry. Scoped around each controller turn so the
+    /// allocation target registry. Scoped around each allocation turn so the
     /// LLM sees the current host-constrained module enum.
     static MODULE_TARGET_ID_SCHEMA: Schema;
 }
@@ -192,7 +191,7 @@ impl JsonSchema for ModuleTargetId {
     }
 
     fn schema_id() -> Cow<'static, str> {
-        "nuillu_allocation_controller::ModuleTargetId.dynamic".into()
+        "nuillu_allocation::ModuleTargetId.dynamic".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -228,7 +227,7 @@ pub struct ReprioritizeModulesOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
-pub enum AllocationControllerTools {
+pub enum AllocationTools {
     LeaveAllocationUnchanged(LeaveAllocationUnchangedArgs),
     ReprioritizeModules(ReprioritizeModulesArgs),
 }
@@ -239,7 +238,7 @@ pub struct PriorityEntry {
     pub hint: String,
 }
 
-pub struct AllocationControllerModule {
+pub struct AllocationModule {
     owner: ModuleId,
     updates: MemoUpdatedInbox,
     requests: AttentionControlRequestInbox,
@@ -255,7 +254,7 @@ pub struct AllocationControllerModule {
     system_prompt: std::sync::OnceLock<String>,
 }
 
-impl AllocationControllerModule {
+impl AllocationModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         updates: MemoUpdatedInbox,
@@ -270,8 +269,7 @@ impl AllocationControllerModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: ModuleId::new(<Self as Module>::id())
-                .expect("allocation-controller id is valid"),
+            owner: ModuleId::new(<Self as Module>::id()).expect("allocation id is valid"),
             updates,
             requests,
             blackboard,
@@ -299,7 +297,7 @@ impl AllocationControllerModule {
                 cx.allocation_hints(),
                 self.allocation_writer.allowed_target_modules(),
             );
-            format_allocation_controller_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
+            format_allocation_system_prompt(SYSTEM_PROMPT, &visible_modules, &self.owner)
         })
     }
 
@@ -360,7 +358,7 @@ impl AllocationControllerModule {
                     COGNITION_CONTEXT_WINDOW,
                 );
                 self.session
-                    .push_ephemeral_system(format_allocation_controller_context(
+                    .push_ephemeral_system(format_allocation_context(
                         &rank_counts,
                         &visible_current,
                         &interoception,
@@ -374,40 +372,39 @@ impl AllocationControllerModule {
                     ));
                 self.session
                     .text_turn()
-                    .tools::<AllocationControllerTools>()
+                    .tools::<AllocationTools>()
                     .available_tools([
-                        AllocationControllerToolsSelector::LeaveAllocationUnchanged,
-                        AllocationControllerToolsSelector::ReprioritizeModules,
+                        AllocationToolsSelector::LeaveAllocationUnchanged,
+                        AllocationToolsSelector::ReprioritizeModules,
                     ])
                     .require_any_tool()
                     .collect(&lutum)
                     .await
             })
             .await
-            .context("allocation-controller tool turn failed")?;
+            .context("allocation tool turn failed")?;
 
         let mut applied: Option<AppliedDecision> = None;
-        let mut decision_tool_names: Option<String> = None;
+        let decision_tool_names: String;
         match outcome {
             // `require_any_tool()` should prevent a finish-without-tools outcome.
             TextStepOutcomeWithTools::Finished(result) => {
                 cx.compact_and_save(&mut self.session, result.usage).await?;
                 let detail = "model finished with assistant output but no tool call \
                                 (require_any_tool should have prevented this outcome)";
-                cx.warn(format!("allocation-controller activation failed: {detail}"));
-                anyhow::bail!("allocation-controller finished without required tool call: {detail}");
+                cx.warn(format!("allocation activation failed: {detail}"));
+                anyhow::bail!("allocation finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                 cx.compact_and_save(&mut self.session, result.usage).await?;
-                let detail =
-                    "model finished with no output and no tool call (require_any_tool should \
+                let detail = "model finished with no output and no tool call (require_any_tool should \
                      have prevented this outcome)";
-                cx.warn(format!("allocation-controller activation failed: {detail}"));
-                anyhow::bail!("allocation-controller finished without required tool call: {detail}");
+                cx.warn(format!("allocation activation failed: {detail}"));
+                anyhow::bail!("allocation finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let usage = round.usage;
-                decision_tool_names = Some(format_tool_call_names(&round.tool_calls));
+                decision_tool_names = format_tool_call_names(&round.tool_calls);
                 let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                 if round.tool_calls.is_empty() {
@@ -415,12 +412,12 @@ impl AllocationControllerModule {
                         "model returned NeedsTools outcome with empty tool_calls; {expected}",
                         expected = "expected leave_allocation_unchanged or reprioritize_modules"
                     );
-                    cx.warn(format!("allocation-controller activation failed: {detail}"));
+                    cx.warn(format!("allocation activation failed: {detail}"));
                 }
                 // The LLM may return multiple tool calls; adopt the first decision only.
                 for call in round.tool_calls.iter().cloned() {
                     match call {
-                        AllocationControllerToolsCall::LeaveAllocationUnchanged(call) => {
+                        AllocationToolsCall::LeaveAllocationUnchanged(call) => {
                             if applied.is_none() {
                                 applied = Some(apply_no_change(call.input.memo.clone()));
                             }
@@ -429,7 +426,7 @@ impl AllocationControllerModule {
                                     .context("complete leave_allocation_unchanged tool call")?,
                             );
                         }
-                        AllocationControllerToolsCall::ReprioritizeModules(call) => {
+                        AllocationToolsCall::ReprioritizeModules(call) => {
                             if applied.is_none() {
                                 applied = Some(apply_reprioritize(&registered, call.input.clone()));
                             }
@@ -450,21 +447,19 @@ impl AllocationControllerModule {
                 );
                 round
                     .commit(&mut self.session, results)
-                    .context("commit allocation-controller tool round")?;
+                    .context("commit allocation tool round")?;
                 cx.compact_and_save(&mut self.session, usage).await?;
             }
         };
         let Some(applied) = applied else {
-            let detail = no_decision_failure_detail(
-                decision_tool_names.as_deref().unwrap_or("(unavailable)"),
-            );
-            cx.warn(format!("allocation-controller activation failed: {detail}"));
-            anyhow::bail!("allocation-controller {detail}");
+            let detail = no_decision_failure_detail(&decision_tool_names);
+            cx.warn(format!("allocation activation failed: {detail}"));
+            anyhow::bail!("allocation {detail}");
         };
         if applied.memo.is_empty() {
             let detail = "tool turn applied but memo field was empty";
-            cx.warn(format!("allocation-controller activation failed: {detail}"));
-            anyhow::bail!("allocation-controller tool turn produced an empty memo: {detail}");
+            cx.warn(format!("allocation activation failed: {detail}"));
+            anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
         }
 
         self.memo.write(applied.memo.clone()).await;
@@ -493,11 +488,11 @@ fn apply_reprioritize(
 
     for (rank, entry) in decision.priority.into_iter().enumerate() {
         let Ok(id) = ModuleId::new(entry.module_id.as_str()) else {
-            tracing::warn!("allocation-controller ignored invalid module id");
+            tracing::warn!("allocation ignored invalid module id");
             continue;
         };
         if !registered.contains(&id) {
-            tracing::warn!(module = %id, "allocation-controller ignored unregistered module id");
+            tracing::warn!(module = %id, "allocation ignored unregistered module id");
             continue;
         }
         commands.push(AllocationCommand::target(
@@ -590,11 +585,11 @@ activation now.",
 }
 
 #[async_trait(?Send)]
-impl Module for AllocationControllerModule {
+impl Module for AllocationModule {
     type Batch = batch::NextBatch;
 
     fn id() -> &'static str {
-        "allocation-controller"
+        "allocation"
     }
 
     fn peer_context() -> Option<&'static str> {
@@ -606,7 +601,7 @@ impl Module for AllocationControllerModule {
     }
 
     async fn next_batch(&mut self) -> Result<Self::Batch> {
-        AllocationControllerModule::next_batch(self).await
+        AllocationModule::next_batch(self).await
     }
 
     async fn activate(
@@ -721,7 +716,7 @@ mod tests {
 
     fn test_allocation() -> ResourceAllocation {
         let mut allocation = ResourceAllocation::default();
-        for module in [builtin::allocation_controller(), builtin::sensory()] {
+        for module in [builtin::allocation(), builtin::sensory()] {
             allocation.set(module.clone(), ModuleConfig::default());
             allocation.set_activation(module, ActivationRatio::ONE);
         }
@@ -772,11 +767,11 @@ mod tests {
         };
     }
 
-    noop_stub!(AllocationControllerStub, "allocation-controller");
+    noop_stub!(AllocationStub, "allocation");
     noop_stub!(SensoryStub, "sensory");
 
     struct ControllerFixture {
-        controller: AllocationControllerModule,
+        controller: AllocationModule,
         source_memo: Memo,
     }
 
@@ -797,7 +792,7 @@ mod tests {
             .register(test_policy(), move |caps| {
                 let controller_sink = Rc::clone(&controller_sink);
                 async move {
-                    *controller_sink.borrow_mut() = Some(AllocationControllerModule::new(
+                    *controller_sink.borrow_mut() = Some(AllocationModule::new(
                         caps.memo_updated_inbox(),
                         caps.attention_control_inbox(),
                         caps.blackboard_reader(),
@@ -805,7 +800,7 @@ mod tests {
                         caps.allocation_reader(),
                         caps.interoception_reader(),
                         caps.allocation_writer(
-                            vec![builtin::allocation_controller(), builtin::sensory()],
+                            vec![builtin::allocation(), builtin::sensory()],
                             Vec::new(),
                         ),
                         caps.memo(),
@@ -814,7 +809,7 @@ mod tests {
                             .with_auto_compaction(session_auto_compaction())
                             .await?,
                     ));
-                    Ok(AllocationControllerStub)
+                    Ok(AllocationStub)
                 }
             })
             .unwrap()
@@ -839,16 +834,16 @@ mod tests {
     fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
-                request_id: Some("allocation-controller-tool".into()),
+                request_id: Some("allocation-tool".into()),
                 model: "mock".into(),
             }),
             Ok(RawTextTurnEvent::ToolCallChunk {
-                id: "call-allocation-controller".into(),
+                id: "call-allocation".into(),
                 name: name.into(),
                 arguments_json_delta: arguments_json,
             }),
             Ok(RawTextTurnEvent::Completed {
-                request_id: Some("allocation-controller-tool".into()),
+                request_id: Some("allocation-tool".into()),
                 finish_reason: FinishReason::ToolCall,
                 usage: Usage {
                     input_tokens,
@@ -862,18 +857,6 @@ mod tests {
         tool_scenario(
             "leave_allocation_unchanged",
             serde_json::json!({ "memo": memo }).to_string(),
-            input_tokens,
-        )
-    }
-
-    fn reprioritize_scenario(
-        input_tokens: u64,
-        memo: &str,
-        priority: serde_json::Value,
-    ) -> MockTextScenario {
-        tool_scenario(
-            "reprioritize_modules",
-            serde_json::json!({ "memo": memo, "priority": priority }).to_string(),
             input_tokens,
         )
     }
@@ -967,15 +950,15 @@ mod tests {
     #[test]
     fn apply_decision_leaves_controller_to_base_allocation_when_omitted() {
         let mut registered = std::collections::HashSet::new();
-        registered.insert(builtin::allocation_controller());
+        registered.insert(builtin::allocation());
         registered.insert(builtin::sensory());
         registered.insert(builtin::cognition_gate());
 
         let mut current = ResourceAllocation::default();
         current.set_activation_table(vec![ActivationRatio::ONE]);
-        current.set_activation(builtin::allocation_controller(), ActivationRatio::ONE);
+        current.set_activation(builtin::allocation(), ActivationRatio::ONE);
         current.set(
-            builtin::allocation_controller(),
+            builtin::allocation(),
             ModuleConfig {
                 guidance: "continue controlling allocation".into(),
             },
@@ -993,7 +976,7 @@ mod tests {
             },
         );
 
-        assert!(last_target(&applied.commands, &builtin::allocation_controller()).is_none());
+        assert!(last_target(&applied.commands, &builtin::allocation()).is_none());
         assert_eq!(
             last_target(&applied.commands, &builtin::sensory())
                 .unwrap()
@@ -1116,7 +1099,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected first input system prompt text");
         };
-        assert!(system.contains("You are the allocation-controller module"));
+        assert!(system.contains("You are the allocation module"));
 
         assert!(any_message_with_role_contains(
             first_items,
@@ -1139,7 +1122,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Allocation-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation context for assigning the next activation priorities")
                 )
         )));
 
@@ -1151,7 +1134,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected second input system prompt text");
         };
-        assert!(system.contains("You are the allocation-controller module"));
+        assert!(system.contains("You are the allocation module"));
         assert!(any_message_with_role_contains(
             second_items,
             InputMessageRole::System,
@@ -1192,7 +1175,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Allocation-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation context for assigning the next activation priorities")
                 )
         )));
         assert!(second_items.iter().any(|item| matches!(
@@ -1233,7 +1216,7 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
-                        if text.contains("Allocation-controller context for assigning the next activation priorities")
+                        if text.contains("Allocation context for assigning the next activation priorities")
                 )
         )));
         assert!(!session_after_second.iter().any(|item| matches!(

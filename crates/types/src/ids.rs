@@ -172,7 +172,7 @@ pub mod builtin {
     builtin!(
         sensory               => "sensory",
         cognition_gate        => "cognition-gate",
-        allocation_controller => "allocation-controller",
+        allocation => "allocation",
         attention_schema      => "attention-schema",
         self_model            => "self-model",
         query_memory          => "query-memory",
@@ -181,7 +181,7 @@ pub mod builtin {
         memory_association    => "memory-association",
         memory_recombination  => "memory-recombination",
         interoception        => "interoception",
-        homeostatic_controller => "homeostatic-controller",
+        homeostasis => "homeostasis",
         policy                => "policy",
         policy_compaction     => "policy-compaction",
         reward                => "reward",
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn builtins_parse() {
         let _ = builtin::cognition_gate();
-        let _ = builtin::allocation_controller();
+        let _ = builtin::allocation();
         let _ = builtin::attention_schema();
         let _ = builtin::self_model();
         let _ = builtin::query_memory();

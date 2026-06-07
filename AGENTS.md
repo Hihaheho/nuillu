@@ -35,7 +35,7 @@ types  →  blackboard  →  module  →  modules/*
 - `crates/types`: newtypes only (`ModuleId`, `MemoryRank`, `ModelTier`, …). No business logic.
 - `crates/blackboard`: passive shared state (memos, attention stream, memory metadata, `ResourceAllocation`). Mutates only via `apply(BlackboardCommand)` under a single write lock.
 - `crates/module`: the `Module` trait, outbound port traits (`MemoryStore`, `AttentionRepository`, `Clock`), capability handles, typed channels, and the `CapabilityFactory` that dispenses them at boot.
-- `crates/modules/*`: one crate per cognitive module (sensory, cognition-gate, allocation-controller, attention-schema, self-model, memory, homeostatic-controller, vital, reward, predict, surprise, speak). Additional builtin ids in `nuillu_types::builtin` (query-memory, query-policy, memory-compaction, memory-association, memory-recombination, policy, value-estimator, speak-gate) are reserved for legacy data or implemented inside sibling crates.
+- `crates/modules/*`: one crate per cognitive module (sensory, cognition-gate, allocation, attention-schema, self-model, memory, homeostasis, vital, reward, predict, surprise, speak). Additional builtin ids in `nuillu_types::builtin` (query-memory, query-policy, memory-compaction, memory-association, memory-recombination, policy, value-estimator, speak-gate) are reserved for legacy data or implemented inside sibling crates.
 - `crates/agent`: the scheduler (`run`) and `AgentEventLoop` — the only places that spawn module tasks or advance periodic time.
 
 ### Runtime shape
@@ -46,10 +46,10 @@ types  →  blackboard  →  module  →  modules/*
 
 ### Capabilities (the load-bearing concept)
 
-`CapabilityFactory` is the single point that issues handles. **All capabilities are non-exclusive** — every issuer call returns a fresh handle and the factory does not enforce uniqueness. Single-writer roles (cognition-gate → attention stream, allocation-controller → allocation) are upheld by boot-time wiring, not by panics.
+`CapabilityFactory` is the single point that issues handles. **All capabilities are non-exclusive** — every issuer call returns a fresh handle and the factory does not enforce uniqueness. Single-writer roles (cognition-gate → attention stream, allocation → allocation) are upheld by boot-time wiring, not by panics.
 
 - `AttentionWriter` — appends to the cognitive attention stream (conventionally granted to cognition-gate).
-- `AllocationWriter` — replaces `ResourceAllocation` (conventionally granted to allocation-controller).
+- `AllocationWriter` — replaces `ResourceAllocation` (conventionally granted to allocation).
 
 Owner-stamped handles (`Memo`, `LlmAccess`, `PeriodicInbox`, `AttentionWriter`, typed `*Mailbox`/`*Inbox`) bake the `ModuleId` in at construction so a module cannot impersonate another. Don't add an API that lets a holder override the stamped owner.
 
@@ -79,7 +79,7 @@ When changing module wiring or adding a module, these must remain true (they're 
 - In tests for structured JSON/schema values, prefer one `assert_eq!(actual, expected)` against the whole value. Don't walk a `serde_json::Value` with nested indexing, `find`, and multiple partial assertions when the expected shape is static.
 - In new eval cases, don't use `artifact-text-contains` for invariants that can be read structurally. Prefer `json-pointer-equals` / `json-pointer-contains` against typed observations or memory diffs; reserve rubrics for natural-language quality.
 - For numeric blackboard/allocation values (ratios, cooldowns, arousal, etc.) in eval cases, use `json-pointer-numeric-in-range` with `min`/`max` bounds. Don't assert numeric values via `json-pointer-equals` / `json-pointer-contains` against the float's string form — that pattern is brittle to formatting and breaks when the value moves *further* in the intended direction (e.g. `0.0` failing a "heavily suppressed" check that asserted `contains "0.0009"`).
-- Full-agent eval `activate-allocation` seeds activation ratios only; do not write module guidance from full-agent eval bootstrap because guidance is allocation-controller output. Module eval may use explicit guidance fixtures only when the allocation-controller is absent and the target module normally consumes allocation-controller guidance.
+- Full-agent eval `activate-allocation` seeds activation ratios only; do not write module guidance from full-agent eval bootstrap because guidance is allocation output. Module eval may use explicit guidance fixtures only when allocation is absent and the target module normally consumes allocation guidance.
 - The `lutum` LLM SDK is a git dependency. The capability layer stops at returning a `Lutum`; each module builds its own `Session` and tool loop — don't add a shared session/agent-loop abstraction in `crates/module`.
 
 ## libSQL migrations

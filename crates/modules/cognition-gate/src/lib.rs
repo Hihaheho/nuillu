@@ -348,17 +348,16 @@ impl CognitionGateModule {
                 for call in round.tool_calls.iter().cloned() {
                     match call {
                         CognitionGateToolsCall::AppendCognition(call) => {
-                            let (output, append_decision) =
-                                if decision == DecisionStatus::Applied {
-                                    (
-                                        rejected_append_output(
-                                            "another cognition decision was already applied",
-                                        ),
-                                        AppendDecision::Rejected,
-                                    )
-                                } else {
-                                    self.append_cognition(call.input.clone()).await
-                                };
+                            let (output, append_decision) = if decision == DecisionStatus::Applied {
+                                (
+                                    rejected_append_output(
+                                        "another cognition decision was already applied",
+                                    ),
+                                    AppendDecision::Rejected,
+                                )
+                            } else {
+                                self.append_cognition(call.input.clone()).await
+                            };
                             match append_decision {
                                 AppendDecision::Appended => decision = DecisionStatus::Applied,
                                 AppendDecision::Rejected if decision == DecisionStatus::Missing => {
@@ -392,8 +391,9 @@ impl CognitionGateModule {
                     return Ok(());
                 }
                 let detail = match decision {
-                    DecisionStatus::Rejected => rejection_reason
-                        .unwrap_or_else(|| "append_cognition rejected".into()),
+                    DecisionStatus::Rejected => {
+                        rejection_reason.unwrap_or_else(|| "append_cognition rejected".into())
+                    }
                     DecisionStatus::Missing => no_decision_failure_detail(&tool_names),
                     DecisionStatus::Applied => unreachable!("applied turns return early"),
                 };
@@ -1179,7 +1179,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.to_string().contains("finished without required tool call"));
+        assert!(
+            err.to_string()
+                .contains("finished without required tool call")
+        );
     }
 
     #[test]

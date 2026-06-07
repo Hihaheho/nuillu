@@ -83,8 +83,7 @@ impl<'a> ActivateCx<'a> {
                 message = %message,
                 "module activation warning"
             );
-            self.runtime_events
-                .module_warning(owner.clone(), message);
+            self.runtime_events.module_warning(owner.clone(), message);
         } else {
             tracing::warn!(message = %message, "module activation warning");
         }
@@ -96,7 +95,7 @@ impl<'a> ActivateCx<'a> {
         self.peer_contexts
     }
 
-    /// Allocation hints for modules that the allocation controller may target:
+    /// Allocation hints for modules that allocation may target:
     /// `(id, allocation_hint)`.
     pub fn allocation_hints(&self) -> &[(ModuleId, &'static str)] {
         self.allocation_hints
@@ -248,7 +247,7 @@ pub trait Module {
     where
         Self: Sized;
 
-    /// Hint shown to the allocation controller when this module is eligible as
+    /// Hint shown to allocation when this module is eligible as
     /// an allocation target. Return `None` to keep this module out of the
     /// allocation target catalog.
     fn allocation_hint() -> Option<&'static str>

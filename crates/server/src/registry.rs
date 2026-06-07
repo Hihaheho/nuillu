@@ -88,29 +88,25 @@ fn register_server_module(
                 ))
             })
         }
-        RuntimeModule::AllocationController => {
+        RuntimeModule::Allocation => {
             let voluntary = voluntary_modules(all_modules);
             registry.register_server(policy(1..=1, Bpm::range(6.0, 6.0)), move |caps| {
                 let voluntary = voluntary.clone();
                 async move {
-                    Ok(
-                        nuillu_allocation_controller::AllocationControllerModule::new(
-                            caps.memo_updated_inbox(),
-                            caps.attention_control_inbox(),
-                            caps.blackboard_reader(),
-                            caps.cognition_log_reader(),
-                            caps.allocation_reader(),
-                            caps.interoception_reader(),
-                            caps.allocation_writer(voluntary.clone(), Vec::new()),
-                            caps.memo(),
-                            caps.llm_access(),
-                            caps.session("main")
-                                .with_auto_compaction(
-                                    nuillu_allocation_controller::session_auto_compaction(),
-                                )
-                                .await?,
-                        ),
-                    )
+                    Ok(nuillu_allocation::AllocationModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.attention_control_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(voluntary.clone(), Vec::new()),
+                        caps.memo(),
+                        caps.llm_access(),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_allocation::session_auto_compaction())
+                            .await?,
+                    ))
                 }
             })
         }
@@ -252,18 +248,13 @@ fn register_server_module(
                 }
             })
         }
-        RuntimeModule::HomeostaticController => {
+        RuntimeModule::Homeostasis => {
             registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| async move {
-                Ok(
-                    nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.interoception_reader(),
-                        caps.allocation_writer(
-                            homeostatic_drive_modules(),
-                            sleep_suppressed_modules(),
-                        ),
-                    ),
-                )
+                Ok(nuillu_homeostasis::HomeostasisModule::new(
+                    caps.interoception_updated_inbox(),
+                    caps.interoception_reader(),
+                    caps.allocation_writer(homeostatic_drive_modules(), sleep_suppressed_modules()),
+                ))
             })
         }
         RuntimeModule::Policy => {
@@ -388,7 +379,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
         let (activation, tier) = match module {
             RuntimeModule::Sensory => (1.0, ModelTier::Cheap),
             RuntimeModule::CognitionGate => (1.0, ModelTier::Default),
-            RuntimeModule::AllocationController => (1.0, ModelTier::Default),
+            RuntimeModule::Allocation => (1.0, ModelTier::Default),
             RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
             RuntimeModule::SelfModel => (0.0, ModelTier::Default),
             RuntimeModule::QueryMemory => (0.0, ModelTier::Cheap),
@@ -397,7 +388,7 @@ pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAlloca
             RuntimeModule::MemoryAssociation => (0.0, ModelTier::Cheap),
             RuntimeModule::MemoryRecombination => (0.0, ModelTier::Cheap),
             RuntimeModule::Interoception => (1.0, ModelTier::Cheap),
-            RuntimeModule::HomeostaticController => (1.0, ModelTier::Cheap),
+            RuntimeModule::Homeostasis => (1.0, ModelTier::Cheap),
             RuntimeModule::Policy => (0.0, ModelTier::Default),
             RuntimeModule::PolicyCompaction => (0.0, ModelTier::Cheap),
             RuntimeModule::Reward => (0.0, ModelTier::Default),

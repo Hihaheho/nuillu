@@ -43,7 +43,7 @@ Supported module directory names are the `EvalModule` kebab-case names:
 ```text
 sensory
 cognition-gate
-allocation-controller
+allocation
 attention-schema
 self-model
 query-memory
@@ -51,7 +51,7 @@ memory
 memory-compaction
 memory-recombination
 interoception
-homeostatic-controller
+homeostasis
 policy
 policy-compaction
 reward
@@ -141,7 +141,7 @@ The intended artifact boundaries by module family are:
 | `memory-recombination` | source-tagged dream/hypothesis cognition entry |
 | `policy` | policy-consideration advice memo |
 | `reward` | reward memo plus policy store insert/reinforce effects |
-| `homeostatic-controller` | allocation drive/cap changes |
+| `homeostasis` | allocation drive/cap changes |
 | `interoception` | interoception state |
 
 If the intended boundary is not implemented in the executor yet, implement that

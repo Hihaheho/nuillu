@@ -197,6 +197,6 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("agent's first-person voice"));
         assert!(SYSTEM_PROMPT.contains("underlying model"));
         assert!(!SYSTEM_PROMPT.contains("You are the self-model module"));
-        assert!(!SYSTEM_PROMPT.contains("allocation-controller"));
+        assert!(!SYSTEM_PROMPT.contains("allocation"));
     }
 }

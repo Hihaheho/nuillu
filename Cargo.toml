@@ -73,12 +73,12 @@ nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }
 nuillu-llm-trace-file = { path = "crates/llm-trace-file" }
 
 nuillu-cognition-gate = { path = "crates/modules/cognition-gate" }
-nuillu-allocation-controller = { path = "crates/modules/allocation-controller" }
+nuillu-allocation = { path = "crates/modules/allocation" }
 nuillu-attention-schema = { path = "crates/modules/attention-schema" }
 nuillu-self-model = { path = "crates/modules/self-model" }
 nuillu-memory = { path = "crates/modules/memory" }
 nuillu-interoception = { path = "crates/modules/interoception" }
-nuillu-homeostatic-controller = { path = "crates/modules/homeostatic-controller" }
+nuillu-homeostasis = { path = "crates/modules/homeostasis" }
 nuillu-reward = { path = "crates/modules/reward" }
 nuillu-predict = { path = "crates/modules/predict" }
 nuillu-surprise = { path = "crates/modules/surprise" }

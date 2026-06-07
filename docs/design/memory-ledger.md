@@ -61,8 +61,8 @@ remain transient wake signals, and durable module output remains memo-authoritat
 | `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. |
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
 | `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
-| `interoception` / `homeostatic-controller` | `interoception` estimates internal state; `homeostatic-controller` regulates sleep-like memory balancing by raising compaction or recombination allocation from that state. |
-| `allocation-controller` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
+| `interoception` / `homeostasis` | `interoception` estimates internal state; `homeostasis` regulates sleep-like memory balancing by raising compaction or recombination allocation from that state. |
+| `allocation` | Allocates memory work through ordinary guidance. It does not gain direct memory graph mutation or truth-projection power. |
 | `self-model` | Integrates retrieved identity and self-related memories into current self-description. Identity memories are high-rank memories, not current-fact rows. |
 
 The store owns ledger consistency, search indexes, embeddings, access accounting,
@@ -377,8 +377,8 @@ dream or hypothesis material. These entries may be useful for planning, surprise
 or later associations, but they are not verified evidence. They should use `dream`
 or `hypothesis` kind and operational tags when stored.
 
-Existing `interoception` and `homeostatic-controller` roles drive this balancing through
-allocation. `interoception` owns the pressure and affect estimate; `homeostatic-controller`
+Existing `interoception` and `homeostasis` roles drive this balancing through
+allocation. `interoception` owns the pressure and affect estimate; `homeostasis`
 only regulates compaction/recombination drive and action caps from that estimate. The
 memory ledger does not add a new memory tick API or a background SQL job that bypasses
 module capabilities.

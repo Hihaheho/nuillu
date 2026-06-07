@@ -117,9 +117,9 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
         } => format!(
             "nuillu-server module-task-failed tab={tab_id} owner={owner} phase={phase} error={message}"
         ),
-        RuntimeEvent::ModuleWarning { owner, message, .. } => format!(
-            "nuillu-server module-warning tab={tab_id} owner={owner} message={message}"
-        ),
+        RuntimeEvent::ModuleWarning { owner, message, .. } => {
+            format!("nuillu-server module-warning tab={tab_id} owner={owner} message={message}")
+        }
         RuntimeEvent::SessionCompactionStarted {
             owner,
             session_key,

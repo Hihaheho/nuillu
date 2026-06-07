@@ -6,7 +6,7 @@ $schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
 $variant: union
 variants.sensory = { = "sensory", $variant => "literal" }
 variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
-variants.allocation-controller = { = "allocation-controller", $variant => "literal" }
+variants.allocation = { = "allocation", $variant => "literal" }
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
 variants.query-memory = { = "query-memory", $variant => "literal" }
@@ -15,7 +15,7 @@ variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
 variants.memory-association = { = "memory-association", $variant => "literal" }
 variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
 variants.interoception = { = "interoception", $variant => "literal" }
-variants.homeostatic-controller = { = "homeostatic-controller", $variant => "literal" }
+variants.homeostasis = { = "homeostasis", $variant => "literal" }
 variants.policy = { = "policy", $variant => "literal" }
 variants.policy-compaction = { = "policy-compaction", $variant => "literal" }
 variants.reward = { = "reward", $variant => "literal" }

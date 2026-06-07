@@ -79,7 +79,7 @@ struct Args {
 
     /// Modules to drop from the full-agent wiring (repeatable). Useful for
     /// isolating module-level effects, e.g. `--disable-module query-memory`.
-    /// Required modules (allocation-controller, sensory, speak) cannot be disabled.
+    /// Required modules (allocation, sensory, speak) cannot be disabled.
     #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
     disable_module: Vec<EvalModule>,
 

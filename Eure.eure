@@ -58,9 +58,9 @@ schema = "schemas/eval-surprise-case.schema.eure"
 globs = ["eval-cases/modules/predict/**/*.eure"]
 schema = "schemas/eval-predict-case.schema.eure"
 
-@ targets.eval-allocation-controller-cases
-globs = ["eval-cases/modules/allocation-controller/**/*.eure"]
-schema = "schemas/eval-allocation-controller-case.schema.eure"
+@ targets.eval-allocation-cases
+globs = ["eval-cases/modules/allocation/**/*.eure"]
+schema = "schemas/eval-allocation-case.schema.eure"
 
 @ targets.eval-policy-compaction-cases
 globs = ["eval-cases/modules/policy-compaction/**/*.eure"]
@@ -85,7 +85,7 @@ default-targets = [
   "eval-attention-schema-cases",
   "eval-surprise-cases",
   "eval-predict-cases",
-  "eval-allocation-controller-cases",
+  "eval-allocation-cases",
   "eval-policy-compaction-cases",
   "eval-modelsets",
 ]

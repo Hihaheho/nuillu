@@ -1,7 +1,7 @@
 $frontmatter {
   title: nuillu-server で挨拶に無反応になる問題の調査
   description: .tmp/server の runtime event trace と agent.db の LLM transcript を突合し、挨拶応答が欠落する原因をパイプライン段階ごとに分類した記録。eval 再現案と修正の優先順位付き。
-  tags = ["nuillu", "server", "speak", "sensory", "cognition-gate", "allocation-controller", "investigation", "eval"]
+  tags = ["nuillu", "server", "speak", "sensory", "cognition-gate", "allocation", "investigation", "eval"]
 }
 
 "#": nuillu-server で挨拶に無反応になる問題の調査
@@ -9,7 +9,7 @@ $frontmatter {
 "lead" = ````markdown
 visualizer 経由の `nuillu-server` セッションで、Peer からの `Hello` / `Hi` などの挨拶にエージェントがほとんど答えない、という報告が続いていた。`.tmp/server` に残る runtime event trace（10 セッション・4665 行）と `agent.db` の `llm_transcript_turns`（200 ターン）を突合して原因を分類した。
 
-結論として、**最近（2026-06-04）のセッションでは `speak` モジュールが一度も起動していない**ことが最大の要因である。その前段では、(1) `allocation-controller` の `reprioritize_modules` がスキーマ違反の JSON を返し speak の activation が上がらない、(2) `sensory` が履歴上の反復挨拶を `ignore_observations` する、(3) `cognition-gate` の tool turn 失敗や skip が重なる、という複合パターンが見つかった。
+結論として、**最近（2026-06-04）のセッションでは `speak` モジュールが一度も起動していない**ことが最大の要因である。その前段では、(1) `allocation` の `reprioritize_modules` がスキーマ違反の JSON を返し speak の activation が上がらない、(2) `sensory` が履歴上の反復挨拶を `ignore_observations` する、(3) `cognition-gate` の tool turn 失敗や skip が重なる、という複合パターンが見つかった。
 
 本記事は再現用 eval の設計と context engineering の優先順位付けのための調査メモである。実装変更はまだ行っていない。
 ````
@@ -61,7 +61,7 @@ visualizer 経由の `nuillu-server` セッションで、Peer からの `Hello`
 | memory-association | 36 |
 | memory-compaction | 32 |
 | cognition-gate | 30 |
-| allocation-controller | 27 |
+| allocation | 27 |
 | interoception | 18 |
 | sensory | 12 |
 | **speak** | **0** |
@@ -90,7 +90,7 @@ SensoryInput::OneShot
   → sensory（salience 付き ledger → memo または ignore）
   → cognition-gate（append_cognition / skip_cognition → cognition log）
   → CognitionLogUpdated（inbox）
-  → allocation-controller（reprioritize_modules → speak activation 引き上げ）
+  → allocation（reprioritize_modules → speak activation 引き上げ）
   → speak（should_speak → UtteranceWriter → visualizer）
 ```
 ````
@@ -190,7 +190,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
 | 件数 | message（先頭一致） |
 |-----:|---------------------|
 | 24×3 | `cognition-gate decision attempt N/3 failed: model finished without tool call or salvageable cognition text` |
-| 13+13 | `allocation-controller activation failed`（empty tool_calls / no decision） |
+| 13+13 | `allocation activation failed`（empty tool_calls / no decision） |
 
 6/2 session `…835b4` では `Hi` のあと **cognition-gate warning が 16 回**、speak は **122.6 秒後** にようやく起動。挨拶としては実質無応答。
 
@@ -202,7 +202,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
     "###": 観測
 
     "body" = ````markdown
-- cognition-gate の入力には `Held-in-mind notes`（他モジュール memo の束）が載り、allocation-controller の「low-arousal / no new salient memos」叙述と競合しやすい。
+- cognition-gate の入力には `Held-in-mind notes`（他モジュール memo の束）が載り、allocation の「low-arousal / no new salient memos」叙述と競合しやすい。
 - `finish_reason: Length` のターンが複数あり、compaction 直後の decision が不安定。
 ````
   }
@@ -221,7 +221,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
   "##": 分類 C — speak 未起動（6/4 の主因）
 
   @ "c1" {
-    "###": C-1: allocation-controller の `reprioritize_modules` が全件スキーマ違反
+    "###": C-1: allocation の `reprioritize_modules` が全件スキーマ違反
 
     "body" = ````markdown
 `agent.db` 内の `reprioritize_modules` 完了ターン **12 件すべて** で、`priority` 配列の要素が `PriorityEntry` ではなく、次のような **壊れたオブジェクト** になっていた。
@@ -242,7 +242,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
 ]
 ```
 
-`apply_reprioritize`（`crates/modules/allocation-controller/src/lib.rs`）は `entry.module_id` を `ModuleId::new` するため、上記キーはすべて **invalid module id として無視** され、`commands` は空のままになる。
+`apply_reprioritize`（`crates/modules/allocation/src/lib.rs`）は `entry.module_id` を `ModuleId::new` するため、上記キーはすべて **invalid module id として無視** され、`commands` は空のままになる。
 
 **統計: valid 0 / malformed 12**（DB 内の reprioritize 全体）
 ````
@@ -252,7 +252,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
     "###": C-2: memo は正しいが speak が上がらない — turn 419 の決定的例
 
     "body" = ````markdown
-6/4 session `…0ccea`、13:55:15 の `Hi` のあと allocation-controller turn **419** の自然言語 memo は、意図として正しい。
+6/4 session `…0ccea`、13:55:15 の `Hi` のあと allocation turn **419** の自然言語 memo は、意図として正しい。
 
 > The system has transitioned … triggered by Peer's direct greeting ("Hi"). … **'speak' must be activated** to address Peer …
 
@@ -262,8 +262,8 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
 
 ```text
 13:55:15  sensory memo_updated（Hi を記録）
-13:55:16  allocation-controller llm_accessed
-13:55:19  allocation-controller module_warning（empty tool_calls）
+13:55:16  allocation llm_accessed
+13:55:19  allocation module_warning（empty tool_calls）
 13:55:23  cognition-gate 複数 turn（完了はするが speak には至らない）
          … reprioritize turn 419 は「speak を上げろ」と書くが priority が無効 …
 ```
@@ -294,7 +294,7 @@ runtime trace では sensory batch に `Peer says, "Hello"` が載るが、**同
 | Hello | 13.8 s |
 | Hi | 122.6 s |
 
-要因として、allocation-controller / cognition-gate の **session compaction**、**module_batch_throttled**（全ログの約 35%）、複数モジュールの競合が重なる。ユーザー体感では「答えていない」に分類される。
+要因として、allocation / cognition-gate の **session compaction**、**module_batch_throttled**（全ログの約 35%）、複数モジュールの競合が重なる。ユーザー体感では「答えていない」に分類される。
 ````
 
   @ "speak-events" {
@@ -322,8 +322,8 @@ memo 34 文字は短い発話か、`should_speak` 段階のメモの可能性が
   "body" = ````markdown
 | 現象 | 影響 |
 |------|------|
-| allocation-controller の `NeedsTools` + empty `tool_calls` | reprioritize が適用されない回が増える |
-| cognition-gate / allocation-controller の `session_compaction_started` | decision 中にコンテキストが切れる |
+| allocation の `NeedsTools` + empty `tool_calls` | reprioritize が適用されない回が増える |
+| cognition-gate / allocation の `session_compaction_started` | decision 中にコンテキストが切れる |
 | `finish_reason: Length`（cognition-gate） | append/skip の tool stream が途切れる |
 | `module_batch_throttled` | 挨拶入力から speak までの wall time が伸びる |
 
@@ -366,7 +366,7 @@ speak は動くが 10〜120s 遅延
     "###": 修正・eval の優先順位（提案）
 
     "body" = ````markdown
-1. **allocation-controller** — `reprioritize_modules` の schema 準拠（モデル・ストリーミング復元・バリデーション reject + retry のいずれか）
+1. **allocation** — `reprioritize_modules` の schema 準拠（モデル・ストリーミング復元・バリデーション reject + retry のいずれか）
 2. **sensory** — 反復挨拶でも social one-shot を memo する条件（context engineering + 必要なら salience ルール）
 3. **cognition-gate** — 挨拶・直接質問に対する append の安定化
 4. **allocation 方針文** — 挨拶・`Peer says` への outward reply は speak 優先、という case-agnostic guidance
@@ -383,7 +383,7 @@ AGENTS.md の方針に従い、fixture 名や rubric 文言を production prompt
 ````
 
   @ "alloc" {
-    "###": 1. module-allocation-controller（最優先）
+    "###": 1. module-allocation（最優先）
 
     "body" = ````markdown
 - **入力**: sensory memo に `Peer says, "Hi"` を含む memo batch
@@ -417,7 +417,7 @@ AGENTS.md の方針に従い、fixture 名や rubric 文言を production prompt
 
     "body" = ````markdown
 - **入力**: `inputs[]` に `heard` で `Hello` または `Hi`（eval runner の `SensoryInput::OneShot` 経路）
-- **invariant**: N 秒以内の complete utterance（numeric range + utterance 非空）。`activate-allocation` で speak だけ seed しない（allocation-controller 経路を通す）
+- **invariant**: N 秒以内の complete utterance（numeric range + utterance 非空）。`activate-allocation` で speak だけ seed しない（allocation 経路を通す）
 - **ねらい**: エンドツーエンドの「挨拶無応答」
 ````
   }
@@ -460,7 +460,7 @@ rg 'Peer says' .tmp/server/logs -n
 # DB: reprioritize の priority 形状確認
 sqlite3 .tmp/server/agent.db \
   "SELECT id, substr(trace_json,1,400) FROM llm_transcript_turns \
-   WHERE owner_module='allocation-controller' AND trace_json LIKE '%reprioritize_modules%';"
+   WHERE owner_module='allocation' AND trace_json LIKE '%reprioritize_modules%';"
 ````
   }
 }
@@ -470,7 +470,7 @@ sqlite3 .tmp/server/agent.db \
 
   "body" = ````markdown
 1. 本調査をベースに **eval-case を追加**し、分類 C-1（malformed reprioritize）と分類 A（sensory ignore）を先に赤にする。
-2. 再現が取れたら **context engineering** — allocation-controller の tool schema / 例示、sensory の greeting 扱い、cognition-gate の held-in-mind と挨拶の優先順位 — を case-agnostic に修正する。
+2. 再現が取れたら **context engineering** — allocation の tool schema / 例示、sensory の greeting 扱い、cognition-gate の held-in-mind と挨拶の優先順位 — を case-agnostic に修正する。
 3. speak LLM が DB に残るよう、長セッション調査時は turn 上限（200）を意識するか、speak 専用の trace エクスポートを検討する。
 
 実装 PR は本 devlog とは別途。ここでは調査と eval 設計の境界までを scope とする。

@@ -44,11 +44,12 @@ use nuillu_types::{
     ReplicaCapRange, ReplicaIndex, SignedUnitF32, UnitF32, builtin,
 };
 use nuillu_visualizer_protocol::{
-    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, MemoView,
-    MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleSettingsView, ModuleStatusView,
-    TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView, VisualizerAction,
-    VisualizerClientMessage, VisualizerCommand, VisualizerErrorView, VisualizerEvent,
-    VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView, start_activation_action_id,
+    AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
+    MemoView, MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleSettingsView,
+    ModuleStatusView, TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView,
+    VisualizerAction, VisualizerClientMessage, VisualizerCommand, VisualizerErrorView,
+    VisualizerEvent, VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView,
+    start_activation_action_id,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -123,7 +124,7 @@ pub struct RunnerConfig {
 /// removing them breaks the basic observe → cognize → speak pipeline that the
 /// full-agent eval cases assume.
 pub const REQUIRED_FULL_AGENT_MODULES: &[EvalModule] = &[
-    EvalModule::AllocationController,
+    EvalModule::Allocation,
     EvalModule::Sensory,
     EvalModule::Speak,
 ];
@@ -2287,7 +2288,7 @@ async fn execute_module_case(
                                 )
                                 .await
                         }
-                        ModuleEvalTarget::AllocationController => {
+                        ModuleEvalTarget::Allocation => {
                             last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                                 .await
                                 .is_some()
@@ -2350,9 +2351,7 @@ async fn execute_module_case(
             .last_complete()
             .map(|utterance| utterance.text)
             .unwrap_or_default(),
-        ModuleEvalTarget::AllocationController => {
-            allocation_controller_artifact(&env.blackboard, &target_module).await
-        }
+        ModuleEvalTarget::Allocation => allocation_artifact(&env.blackboard, &target_module).await,
         _ => last_memo_log_content_for_module(&env.blackboard, &target_module)
             .await
             .unwrap_or_default(),
@@ -2595,7 +2594,7 @@ async fn activate_module_case_target(
                     .expect("module eval failed to publish CognitionLogUpdated");
             }
         }
-        ModuleEvalTarget::AllocationController => {
+        ModuleEvalTarget::Allocation => {
             let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
             let mut config = allocation.for_module(run_target_module);
             config.guidance = prompt.to_string();
@@ -2704,7 +2703,7 @@ async fn last_memo_log_content_for_module(
         .await
 }
 
-async fn allocation_controller_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {
+async fn allocation_artifact(blackboard: &Blackboard, module: &ModuleId) -> String {
     let memo = last_memo_log_content_for_module(blackboard, module)
         .await
         .unwrap_or_default();
@@ -3124,11 +3123,7 @@ async fn activate_gui_start_modules(
 ) {
     let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
     if activate_allocation.is_empty() {
-        apply_gui_activation(
-            &mut allocation,
-            builtin::allocation_controller(),
-            ActivationRatio::ONE,
-        );
+        apply_gui_activation(&mut allocation, builtin::allocation(), ActivationRatio::ONE);
         apply_gui_activation(&mut allocation, builtin::sensory(), ActivationRatio::ONE);
     } else {
         for activation in activate_allocation {
@@ -4534,7 +4529,7 @@ impl EvalRegistryExt for ModuleRegistry {
 fn hidden_from_attention_modules() -> Vec<ModuleId> {
     vec![
         nuillu_types::builtin::interoception(),
-        nuillu_types::builtin::homeostatic_controller(),
+        nuillu_types::builtin::homeostasis(),
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
         nuillu_types::builtin::memory_recombination(),
@@ -4641,7 +4636,7 @@ fn register_eval_module(
         // Expensive (premium tier in default model-set), heavy reasoning.
         // Should only fire on meaningful state shifts — slow base pace so
         // it doesn't burn budget reacting to every memo update.
-        EvalModule::AllocationController => registry
+        EvalModule::Allocation => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(3.0, 6.0)),
                 replica_hard_cap,
@@ -4650,24 +4645,22 @@ fn register_eval_module(
                     move |caps| {
                         let voluntary = voluntary.clone();
                         async move {
-                            Ok(
-                                nuillu_allocation_controller::AllocationControllerModule::new(
-                                    caps.memo_updated_inbox(),
-                                    caps.attention_control_inbox(),
-                                    caps.blackboard_reader(),
-                                    caps.cognition_log_reader(),
-                                    caps.allocation_reader(),
-                                    caps.interoception_reader(),
-                                    caps.allocation_writer(voluntary.clone(), Vec::new()),
-                                    caps.memo(),
-                                    caps.llm_access(),
-                                    caps.session("main")
-                                        .with_auto_compaction(
-                                            nuillu_allocation_controller::session_auto_compaction(),
-                                        )
-                                        .await?,
-                                ),
-                            )
+                            Ok(nuillu_allocation::AllocationModule::new(
+                                caps.memo_updated_inbox(),
+                                caps.attention_control_inbox(),
+                                caps.blackboard_reader(),
+                                caps.cognition_log_reader(),
+                                caps.allocation_reader(),
+                                caps.interoception_reader(),
+                                caps.allocation_writer(voluntary.clone(), Vec::new()),
+                                caps.memo(),
+                                caps.llm_access(),
+                                caps.session("main")
+                                    .with_auto_compaction(
+                                        nuillu_allocation::session_auto_compaction(),
+                                    )
+                                    .await?,
+                            ))
                         }
                     }
                 },
@@ -4870,21 +4863,19 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::HomeostaticController => registry
+        EvalModule::Homeostasis => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(6.0, 20.0)),
                 replica_hard_cap,
                 |caps| async move {
-                    Ok(
-                        nuillu_homeostatic_controller::HomeostaticControllerModule::new(
-                            caps.interoception_updated_inbox(),
-                            caps.interoception_reader(),
-                            caps.allocation_writer(
-                                homeostatic_drive_modules(),
-                                sleep_suppressed_modules(),
-                            ),
+                    Ok(nuillu_homeostasis::HomeostasisModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(
+                            homeostatic_drive_modules(),
+                            sleep_suppressed_modules(),
                         ),
-                    )
+                    ))
                 },
             )
             .expect("eval module registration should be unique"),
@@ -5055,7 +5046,7 @@ pub(crate) fn full_agent_allocation(
         let (activation, tier) = match module {
             EvalModule::Sensory => (1.0, ModelTier::Cheap),
             EvalModule::CognitionGate => (0.0, ModelTier::Cheap),
-            EvalModule::AllocationController => (1.0, ModelTier::Default),
+            EvalModule::Allocation => (1.0, ModelTier::Default),
             EvalModule::AttentionSchema => (0.0, ModelTier::Default),
             EvalModule::SelfModel => (0.0, ModelTier::Default),
             EvalModule::QueryMemory => (0.0, ModelTier::Cheap),
@@ -5064,7 +5055,7 @@ pub(crate) fn full_agent_allocation(
             EvalModule::MemoryAssociation => (0.0, ModelTier::Cheap),
             EvalModule::MemoryRecombination => (0.0, ModelTier::Cheap),
             EvalModule::Interoception => (1.0, ModelTier::Cheap),
-            EvalModule::HomeostaticController => (1.0, ModelTier::Cheap),
+            EvalModule::Homeostasis => (1.0, ModelTier::Cheap),
             EvalModule::Policy => (0.0, ModelTier::Default),
             EvalModule::PolicyCompaction => (0.0, ModelTier::Cheap),
             EvalModule::Reward => (0.0, ModelTier::Default),
@@ -5145,11 +5136,11 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::MemoryAssociation
         | EvalModule::MemoryRecombination
         | EvalModule::Interoception
-        | EvalModule::HomeostaticController
+        | EvalModule::Homeostasis
         | EvalModule::PolicyCompaction
         | EvalModule::Predict => ModelTier::Cheap,
         EvalModule::Speak => ModelTier::Premium,
-        EvalModule::AllocationController => ModelTier::Default,
+        EvalModule::Allocation => ModelTier::Default,
         EvalModule::AttentionSchema
         | EvalModule::SelfModel
         | EvalModule::Policy
@@ -5309,6 +5300,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 guidance: module.guidance.as_str().to_owned(),
             })
             .collect(),
+        interoception: interoception_view(bb.interoception()),
         module_policies: module_policy_views(bb),
         forced_disabled_modules: {
             let mut modules = bb
@@ -5359,6 +5351,19 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
             })
             .collect(),
         memory_metadata,
+    }
+}
+
+fn interoception_view(state: &nuillu_blackboard::InteroceptiveState) -> InteroceptionView {
+    InteroceptionView {
+        mode: interoceptive_mode_name(state.mode).to_owned(),
+        wake_arousal: state.wake_arousal,
+        nrem_pressure: state.nrem_pressure,
+        rem_pressure: state.rem_pressure,
+        affect_arousal: state.affect_arousal,
+        valence: state.valence,
+        emotion: state.emotion.clone(),
+        last_updated: state.last_updated,
     }
 }
 
@@ -8326,7 +8331,7 @@ id = "module-query-memory-special-memory"
         let dir = tempfile::tempdir().unwrap();
         let reporter = LiveReporter::new("test-run", dir.path()).unwrap();
         let sink = RecordingRuntimeEventSink::new("test-case".to_string(), None, reporter, None);
-        let owner = ModuleInstanceId::new(builtin::homeostatic_controller(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
 
         sink.on_event(RuntimeEvent::ModuleBatchThrottled {
             sequence: 0,
@@ -8365,7 +8370,7 @@ id = "module-query-memory-special-memory"
 
     #[test]
     fn scheduled_wait_remaining_tracks_throttle_and_rate_limit_deadlines() {
-        let owner = ModuleInstanceId::new(builtin::homeostatic_controller(), ReplicaIndex::ZERO);
+        let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
         let timed_events = vec![
             (
                 100,
@@ -8481,7 +8486,7 @@ id = "module-query-memory-special-memory"
         let blackboard = Blackboard::default();
         blackboard
             .apply(BlackboardCommand::SetModuleRunStatus {
-                owner: ModuleInstanceId::new(builtin::allocation_controller(), ReplicaIndex::ZERO),
+                owner: ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
                 status: ModuleRunStatus::Activating,
             })
             .await;
@@ -8832,10 +8837,7 @@ limits {
             .await;
         blackboard
             .apply(BlackboardCommand::RecordAllocationProposal {
-                controller: ModuleInstanceId::new(
-                    builtin::allocation_controller(),
-                    ReplicaIndex::ZERO,
-                ),
+                controller: ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO),
                 proposal: allocation,
             })
             .await;
@@ -8893,7 +8895,7 @@ limits {
                 },
             },
             "allocation_proposals": {
-                "allocation-controller": {
+                "allocation": {
                     "query-memory": {
                         "activation_ratio": 1.0,
                         "active_replicas": 0,
@@ -9018,9 +9020,9 @@ prompt = "Admit retrieved memory evidence only if it is load-bearing for the cur
     }
 
     #[tokio::test]
-    async fn allocation_controller_eval_bootstrap_guidance_is_not_completion() {
+    async fn allocation_eval_bootstrap_guidance_is_not_completion() {
         let blackboard = Blackboard::default();
-        let controller = builtin::allocation_controller();
+        let controller = builtin::allocation();
 
         let mut allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         let mut config = allocation.for_module(&controller);
@@ -9249,7 +9251,7 @@ prompt = "What am I attending to?"
         let modules = full_agent_case_modules(&case, &[EvalModule::QueryMemory]);
         assert!(!modules.contains(&EvalModule::QueryMemory));
         assert!(modules.contains(&EvalModule::Speak));
-        assert!(modules.contains(&EvalModule::AllocationController));
+        assert!(modules.contains(&EvalModule::Allocation));
     }
 
     #[test]
@@ -9268,7 +9270,7 @@ prompt = "What am I attending to?"
     async fn eval_registry_and_allocation_include_only_selected_modules() {
         let selected = [
             EvalModule::Sensory,
-            EvalModule::AllocationController,
+            EvalModule::Allocation,
             EvalModule::Speak,
         ];
         let allocation = full_agent_allocation(
@@ -9327,14 +9329,8 @@ prompt = "What am I attending to?"
             })
             .await;
 
-        assert_eq!(
-            replica_caps,
-            vec!["allocation-controller", "sensory", "speak"]
-        );
-        assert_eq!(
-            allocation_modules,
-            vec!["allocation-controller", "sensory", "speak"]
-        );
+        assert_eq!(replica_caps, vec!["allocation", "sensory", "speak"]);
+        assert_eq!(allocation_modules, vec!["allocation", "sensory", "speak"]);
     }
 
     #[test]
@@ -9364,11 +9360,11 @@ prompt = "What am I attending to?"
         );
 
         assert_eq!(
-            allocation.activation_for(&builtin::allocation_controller()),
+            allocation.activation_for(&builtin::allocation()),
             ActivationRatio::ONE
         );
         assert_eq!(
-            allocation.tier_for(&builtin::allocation_controller()),
+            allocation.tier_for(&builtin::allocation()),
             ModelTier::Default
         );
 
@@ -9381,11 +9377,11 @@ prompt = "What am I attending to?"
             ModelTier::Cheap
         );
         assert_eq!(
-            allocation.activation_for(&builtin::homeostatic_controller()),
+            allocation.activation_for(&builtin::homeostasis()),
             ActivationRatio::ONE
         );
         assert_eq!(
-            allocation.tier_for(&builtin::homeostatic_controller()),
+            allocation.tier_for(&builtin::homeostasis()),
             ModelTier::Cheap
         );
 
@@ -9475,7 +9471,7 @@ prompt = "What am I attending to?"
                 activation_ratio: 1.0,
             },
             ActivateAllocation {
-                module: EvalModule::HomeostaticController,
+                module: EvalModule::Homeostasis,
                 activation_ratio: 0.5,
             },
         ];
@@ -9492,7 +9488,7 @@ prompt = "What am I attending to?"
             ""
         );
         assert_eq!(
-            allocation.activation_for(&builtin::homeostatic_controller()),
+            allocation.activation_for(&builtin::homeostasis()),
             ActivationRatio::from_f64(0.5)
         );
         assert_eq!(
@@ -9500,7 +9496,7 @@ prompt = "What am I attending to?"
             ActivationRatio::ZERO
         );
         assert_eq!(
-            allocation.activation_for(&builtin::allocation_controller()),
+            allocation.activation_for(&builtin::allocation()),
             ActivationRatio::ZERO
         );
     }

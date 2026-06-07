@@ -21,11 +21,11 @@ lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-llm-trace-file = { workspace = true }
 nuillu-agent = { workspace = true }
-nuillu-allocation-controller = { workspace = true }
+nuillu-allocation = { workspace = true }
 nuillu-attention-schema = { workspace = true }
 nuillu-blackboard = { workspace = true }
 nuillu-cognition-gate = { workspace = true }
-nuillu-homeostatic-controller = { workspace = true }
+nuillu-homeostasis = { workspace = true }
 nuillu-memory = { workspace = true }
 nuillu-module = { workspace = true }
 nuillu-openai-embedding-adapter = { workspace = true }
