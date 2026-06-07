@@ -1532,19 +1532,22 @@ fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
 }
 
 fn latest_llm_output(module: &ModuleState) -> Option<String> {
-    let turn = module.turns.last()?;
-    if turn.status != ModuleSessionStatus::Running {
-        return None;
-    }
-    if let Some(output) = turn
-        .output
-        .iter()
-        .rev()
-        .find(|item| !item.content.trim().is_empty())
+    if let Some(turn) = module.turns.last()
+        && turn.status == ModuleSessionStatus::Running
+        && turn
+            .output
+            .iter()
+            .all(|item| item.content.trim().is_empty())
     {
-        return Some(output_text(output));
+        return Some("running: awaiting output".to_string());
     }
-    Some("running: awaiting output".to_string())
+    module.turns.iter().rev().find_map(|turn| {
+        turn.output
+            .iter()
+            .rev()
+            .find(|item| !item.content.trim().is_empty())
+            .map(output_text)
+    })
 }
 
 fn output_text(output: &LlmOutputItemState) -> String {
@@ -2447,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_llm_output_does_not_keep_completed_turn_output() {
+    fn latest_llm_output_keeps_completed_turn_output() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -2489,11 +2492,14 @@ mod tests {
         );
 
         let module = state.modules.get("sensory").expect("module exists");
-        assert_eq!(latest_llm_output(module), None);
+        assert_eq!(
+            latest_llm_output(module),
+            Some("text: old output".to_string())
+        );
     }
 
     #[test]
-    fn latest_llm_output_ignores_stale_running_turn_when_newer_turn_exists() {
+    fn latest_llm_output_falls_back_to_previous_output_when_newer_turn_is_empty() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -2549,7 +2555,10 @@ mod tests {
         );
 
         let module = state.modules.get("sensory").expect("module exists");
-        assert_eq!(latest_llm_output(module), None);
+        assert_eq!(
+            latest_llm_output(module),
+            Some("text: stale output".to_string())
+        );
     }
 
     #[test]
