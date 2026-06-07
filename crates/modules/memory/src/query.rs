@@ -24,7 +24,7 @@ const SYSTEM_PROMPT: &str = r#"You are the query-memory module.
 Retrieve memory evidence. Memory is not a fact table and retrieval must not decide current truth.
 Use search_memory for ordinary flat memory search. Search hits report linked_neighbor_count;
 when that count is greater than zero and linked context may help the question, call
-fetch_linked_memories for that hit index before writing the memo. Pass only the seed memory indexes;
+fetch_linked_memories for that hit index before broadcasting results. Pass only the seed memory indexes;
 the runtime applies default link direction, relation filter, and limit. Linked lookup is explicit; ordinary
 search results are flat and do not include hidden bundles.
 If the question contains allocation guidance or a speech evidence request, search for the concrete
@@ -34,27 +34,39 @@ question is available.
 You may call search_memory multiple times in the same turn when the input contains multiple
 distinct questions or evidence requests. Prefer multiple targeted searches in one turn over broad
 generic searches or later follow-up turns.
-If the requested facts are already covered by prior query-memory memo logs, previous tool results,
-or the cognition log, finish without calling tools; no memo will be written for a no-op turn.
-When retrieved evidence is useful, call write_retrieval_memo exactly once. Put flat search hit
+If the requested facts are already covered by prior query-memory broadcasts, previous tool results,
+or the cognition log, finish without calling tools; no new broadcast is needed for a no-op turn.
+When retrieved evidence is useful, call broadcast_search_results exactly once. Put flat search hit
 indexes in hit_indexes and fetch_linked_memories results in linked_hit_indexes. Search hits are
-candidates, not automatic memo content.
-You may summarize conflict or link structure only through retrieved tool evidence in the memo. Do
+candidates, not automatic broadcast content. Always copy the exact literal index string from the tool
+result; never use list positions or ordinal numbers as memory indexes.
+You may summarize conflict or link structure only through retrieved tool evidence in the broadcast. Do
 not produce user-facing answers, decide final truth, explain results from outside tool output, or
 use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve memo-log facts, query requests, memory
+Summarize only the prefix transcript you receive. Preserve broadcast facts, query requests, memory
 search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
 future retrieval should remember. Do not invent facts. Return plain text only."#;
 const TOOL_RESULT_CONTINUATION_PROMPT: &str = r#"Continue memory retrieval from the tool results above.
 If a search hit may answer the request and has linked_neighbor_count greater than zero, call
-fetch_linked_memories for the seed hit before writing a memo.
-If retrieved evidence is useful, call write_retrieval_memo with the selected flat hit_indexes and
+fetch_linked_memories for the seed hit before broadcasting results.
+If retrieved evidence is useful, call broadcast_search_results with the selected flat hit_indexes and
 linked_hit_indexes. If the tool results do not contain useful evidence and no targeted search
-remains, finish without assistant text."#;
+remains, finish without assistant text. Use exact literal index strings from tool results, never
+list positions."#;
+const FINALIZE_RETRIEVAL_PROMPT: &str = r#"Finalization turn. Call exactly one tool now.
+Do not write prose, reasoning, markdown, or a plain answer.
+Search and linked-memory fetch are closed. Use only existing tool results.
+The search_memory and fetch_linked_memories results already in this session are fresh pending
+retrieval evidence for this activation. Call broadcast_search_results when any pending retrieved
+evidence should be published as module output. Call dispose_search_results only when no pending
+retrieved evidence is useful enough to broadcast. Prior assistant prose is ignored by the runtime and
+does not count as a successful broadcast. Never call dispose_search_results just because assistant
+prose already summarized retrieved evidence. Use exact literal index strings from tool results,
+never list positions."#;
 
 pub fn query_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -136,9 +148,9 @@ pub struct QueryMemoryLinkedHit {
     pub link: MemoryLink,
 }
 
-#[lutum::tool_input(name = "write_retrieval_memo", output = WriteRetrievalMemoOutput)]
+#[lutum::tool_input(name = "broadcast_search_results", output = BroadcastSearchResultsOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct WriteRetrievalMemoArgs {
+pub struct BroadcastSearchResultsArgs {
     #[serde(default)]
     pub hit_indexes: Vec<MemoryIndex>,
     #[serde(default)]
@@ -146,11 +158,24 @@ pub struct WriteRetrievalMemoArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct WriteRetrievalMemoOutput {
-    pub written: bool,
+pub struct BroadcastSearchResultsOutput {
+    pub broadcasted: bool,
     pub selected_hits: usize,
     pub selected_linked_hits: usize,
     pub used_indexes: Vec<MemoryIndex>,
+    pub message: String,
+}
+
+#[lutum::tool_input(name = "dispose_search_results", output = DisposeSearchResultsOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DisposeSearchResultsArgs {
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DisposeSearchResultsOutput {
+    pub disposed: bool,
     pub message: String,
 }
 
@@ -205,7 +230,8 @@ struct QueryMemoryRetrieval {
 pub enum QueryMemoryTools {
     SearchMemory(SearchMemoryArgs),
     FetchLinkedMemories(FetchLinkedMemoriesArgs),
-    WriteRetrievalMemo(WriteRetrievalMemoArgs),
+    BroadcastSearchResults(BroadcastSearchResultsArgs),
+    DisposeSearchResults(DisposeSearchResultsArgs),
 }
 
 pub struct QueryMemoryModule {
@@ -295,23 +321,22 @@ impl QueryMemoryModule {
         self.search_with_memory(cx, &questions).await
     }
 
-    async fn write_retrieval_memo(
+    async fn broadcast_search_results(
         &self,
         requests: &[String],
         retrieval: &QueryMemoryRetrieval,
-        args: WriteRetrievalMemoArgs,
-        memo_written: &mut bool,
-    ) -> Result<WriteRetrievalMemoOutput> {
-        if *memo_written {
-            return Ok(WriteRetrievalMemoOutput {
-                written: false,
+        args: BroadcastSearchResultsArgs,
+        already_broadcasted: &mut bool,
+    ) -> Result<BroadcastSearchResultsOutput> {
+        if *already_broadcasted {
+            return Ok(BroadcastSearchResultsOutput {
+                broadcasted: false,
                 selected_hits: 0,
                 selected_linked_hits: 0,
                 used_indexes: Vec::new(),
-                message: "retrieval memo was already written for this activation".to_owned(),
+                message: "search results were already broadcast for this activation".to_owned(),
             });
         }
-        *memo_written = true;
 
         let selected_hits = select_hits(&retrieval.hits, &args.hit_indexes);
         let selected_linked_hits =
@@ -320,14 +345,15 @@ impl QueryMemoryModule {
         let linked_hits = self.fresh_linked_hits(&selected_linked_hits).await;
         let content = render_memo(requests, &retrieval.searches, &hits, &linked_hits);
         if content.is_empty() {
-            return Ok(WriteRetrievalMemoOutput {
-                written: false,
+            return Ok(BroadcastSearchResultsOutput {
+                broadcasted: false,
                 selected_hits: hits.len(),
                 selected_linked_hits: linked_hits.len(),
                 used_indexes: Vec::new(),
-                message: "no fresh selected evidence was available to write".to_owned(),
+                message: "no fresh selected evidence was available to broadcast".to_owned(),
             });
         }
+        *already_broadcasted = true;
         let payload = QueryMemoryMemo {
             requests: requests.to_vec(),
             searches: retrieval.searches.clone(),
@@ -371,12 +397,12 @@ impl QueryMemoryModule {
                     .then_some(target.index)
             })
             .collect();
-        Ok(WriteRetrievalMemoOutput {
-            written: true,
+        Ok(BroadcastSearchResultsOutput {
+            broadcasted: true,
             selected_hits: hits.len(),
             selected_linked_hits: linked_hits.len(),
             used_indexes,
-            message: "retrieval memo written".to_owned(),
+            message: "search results broadcast".to_owned(),
         })
     }
 
@@ -448,7 +474,8 @@ impl QueryMemoryModule {
             .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
 
         let mut retrieval = self.pending_retrieval.clone();
-        let mut memo_written = false;
+        let mut already_broadcasted = false;
+        let mut clear_pending_retrieval = false;
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
             let outcome = self
@@ -458,7 +485,7 @@ impl QueryMemoryModule {
                 .available_tools([
                     QueryMemoryToolsSelector::SearchMemory,
                     QueryMemoryToolsSelector::FetchLinkedMemories,
-                    QueryMemoryToolsSelector::WriteRetrievalMemo,
+                    QueryMemoryToolsSelector::BroadcastSearchResults,
                 ])
                 .collect(&lutum)
                 .await
@@ -467,12 +494,40 @@ impl QueryMemoryModule {
             match outcome {
                 TextStepOutcomeWithTools::Finished(result) => {
                     cx.compact_and_save(&mut self.session, result.usage).await?;
-                    self.pending_retrieval = retrieval;
+                    if !clear_pending_retrieval {
+                        clear_pending_retrieval = self
+                            .finalize_search_results(
+                                cx,
+                                questions,
+                                &retrieval,
+                                &mut already_broadcasted,
+                            )
+                            .await?;
+                    }
+                    self.pending_retrieval = if clear_pending_retrieval {
+                        QueryMemoryRetrieval::default()
+                    } else {
+                        retrieval
+                    };
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                     cx.compact_and_save(&mut self.session, result.usage).await?;
-                    self.pending_retrieval = retrieval;
+                    if !clear_pending_retrieval {
+                        clear_pending_retrieval = self
+                            .finalize_search_results(
+                                cx,
+                                questions,
+                                &retrieval,
+                                &mut already_broadcasted,
+                            )
+                            .await?;
+                    }
+                    self.pending_retrieval = if clear_pending_retrieval {
+                        QueryMemoryRetrieval::default()
+                    } else {
+                        retrieval
+                    };
                     return Ok(());
                 }
                 TextStepOutcomeWithTools::NeedsTools(round) => {
@@ -480,11 +535,25 @@ impl QueryMemoryModule {
                     nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     if round.tool_calls.is_empty() {
                         cx.compact_and_save(&mut self.session, usage).await?;
-                        self.pending_retrieval = retrieval;
+                        if !clear_pending_retrieval {
+                            clear_pending_retrieval = self
+                                .finalize_search_results(
+                                    cx,
+                                    questions,
+                                    &retrieval,
+                                    &mut already_broadcasted,
+                                )
+                                .await?;
+                        }
+                        self.pending_retrieval = if clear_pending_retrieval {
+                            QueryMemoryRetrieval::default()
+                        } else {
+                            retrieval
+                        };
                         return Ok(());
                     }
                     let mut tool_results: Vec<ToolResult> = Vec::new();
-                    let mut wrote_retrieval_memo = false;
+                    let mut broadcasted_search_results = false;
                     for call in round.tool_calls.iter().cloned() {
                         match call {
                             QueryMemoryToolsCall::SearchMemory(call) => {
@@ -519,21 +588,24 @@ impl QueryMemoryModule {
                                         .context("complete fetch_linked_memories tool call")?,
                                 );
                             }
-                            QueryMemoryToolsCall::WriteRetrievalMemo(call) => {
+                            QueryMemoryToolsCall::BroadcastSearchResults(call) => {
                                 let output = self
-                                    .write_retrieval_memo(
+                                    .broadcast_search_results(
                                         questions,
                                         &retrieval,
                                         call.input.clone(),
-                                        &mut memo_written,
+                                        &mut already_broadcasted,
                                     )
                                     .await
-                                    .context("run write_retrieval_memo tool")?;
-                                wrote_retrieval_memo |= output.written;
+                                    .context("run broadcast_search_results tool")?;
+                                broadcasted_search_results |= output.broadcasted;
                                 tool_results.push(
                                     call.complete(output)
-                                        .context("complete write_retrieval_memo tool call")?,
+                                        .context("complete broadcast_search_results tool call")?,
                                 );
+                            }
+                            QueryMemoryToolsCall::DisposeSearchResults(_) => {
+                                unreachable!("retrieval loop excludes dispose_search_results")
                             }
                         }
                     }
@@ -541,7 +613,7 @@ impl QueryMemoryModule {
                         .commit(&mut self.session, tool_results)
                         .context("commit query-memory tool round")?;
                     cx.compact_and_save(&mut self.session, usage).await?;
-                    if wrote_retrieval_memo {
+                    if broadcasted_search_results {
                         self.pending_retrieval = QueryMemoryRetrieval::default();
                         return Ok(());
                     }
@@ -551,8 +623,108 @@ impl QueryMemoryModule {
                 }
             }
         }
-        self.pending_retrieval = retrieval;
+        if !clear_pending_retrieval {
+            clear_pending_retrieval = self
+                .finalize_search_results(cx, questions, &retrieval, &mut already_broadcasted)
+                .await?;
+        }
+        self.pending_retrieval = if clear_pending_retrieval {
+            QueryMemoryRetrieval::default()
+        } else {
+            retrieval
+        };
         Ok(())
+    }
+
+    async fn finalize_search_results(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        questions: &[String],
+        retrieval: &QueryMemoryRetrieval,
+        already_broadcasted: &mut bool,
+    ) -> Result<bool> {
+        self.session.push_ephemeral_user(FINALIZE_RETRIEVAL_PROMPT);
+        for _ in 0..2 {
+            let lutum = self.llm.lutum().await;
+            let outcome = self
+                .session
+                .text_turn()
+                .tools::<QueryMemoryTools>()
+                .available_tools([
+                    QueryMemoryToolsSelector::BroadcastSearchResults,
+                    QueryMemoryToolsSelector::DisposeSearchResults,
+                ])
+                .collect(&lutum)
+                .await
+                .context("query-memory finalization text turn failed")?;
+
+            match outcome {
+                TextStepOutcomeWithTools::Finished(result) => {
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
+                    return Ok(false);
+                }
+                TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                    cx.compact_and_save(&mut self.session, result.usage).await?;
+                    return Ok(false);
+                }
+                TextStepOutcomeWithTools::NeedsTools(round) => {
+                    let usage = round.usage;
+                    nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                    if round.tool_calls.is_empty() {
+                        cx.compact_and_save(&mut self.session, usage).await?;
+                        return Ok(false);
+                    }
+
+                    let mut tool_results: Vec<ToolResult> = Vec::new();
+                    let mut broadcasted_search_results = false;
+                    let mut disposed_search_results = false;
+                    for call in round.tool_calls.iter().cloned() {
+                        match call {
+                            QueryMemoryToolsCall::BroadcastSearchResults(call) => {
+                                let output = self
+                                    .broadcast_search_results(
+                                        questions,
+                                        retrieval,
+                                        call.input.clone(),
+                                        already_broadcasted,
+                                    )
+                                    .await
+                                    .context("run final broadcast_search_results tool")?;
+                                broadcasted_search_results |= output.broadcasted;
+                                tool_results.push(call.complete(output).context(
+                                    "complete final broadcast_search_results tool call",
+                                )?);
+                            }
+                            QueryMemoryToolsCall::DisposeSearchResults(call) => {
+                                disposed_search_results = true;
+                                tool_results.push(
+                                    call.complete(DisposeSearchResultsOutput {
+                                        disposed: true,
+                                        message: "search results disposed for this activation"
+                                            .to_owned(),
+                                    })
+                                    .context("complete dispose_search_results tool call")?,
+                                );
+                            }
+                            QueryMemoryToolsCall::SearchMemory(_)
+                            | QueryMemoryToolsCall::FetchLinkedMemories(_) => {
+                                unreachable!("finalization toolset excludes retrieval tools")
+                            }
+                        }
+                    }
+                    round
+                        .commit(&mut self.session, tool_results)
+                        .context("commit query-memory finalization tool round")?;
+                    cx.compact_and_save(&mut self.session, usage).await?;
+
+                    if broadcasted_search_results || disposed_search_results {
+                        return Ok(true);
+                    }
+                    self.session.push_ephemeral_user(FINALIZE_RETRIEVAL_PROMPT);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn prior_query_memory_searches(&self) -> Option<String> {
@@ -564,7 +736,7 @@ impl QueryMemoryModule {
         for record in records {
             let data = record.data();
             out.push_str(&format!(
-                "\n- memo {} at {}",
+                "\n- broadcast {} at {}",
                 record.index,
                 record.written_at.to_rfc3339()
             ));
@@ -916,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_memo_puts_evidence_before_query_bookkeeping() {
+    fn broadcast_puts_evidence_before_query_bookkeeping() {
         let memo = render_memo(
             &["Find the useful rule.".to_owned()],
             &[QueryMemoryMemoSearch {

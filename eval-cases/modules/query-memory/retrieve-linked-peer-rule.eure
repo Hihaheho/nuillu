@@ -1,5 +1,5 @@
 id: module-query-memory-retrieve-linked-peer-rule
-description: Query-memory should expand a flat search hit through linked memories and memo linked evidence.
+description: Query-memory should expand a flat search hit through linked memories and broadcast linked evidence.
 modules = ["query-memory"]
 prompt: How should Nui approach Koro near food?
 context: Flat search should hit koro-approach-primary among the Koro-food memories; koro-signal-drill-linked is reachable only through fetch_linked_memories on that primary hit.
@@ -73,9 +73,9 @@ limits {
 
 @ checks[] {
   $variant: trace-tool-call
-  name: memos-linked-signal-index
+  name: broadcasts-linked-signal-index
   must-pass = true
-  tool-name: write_retrieval_memo
+  tool-name: broadcast_search_results
   args-json-contains = ```
   {"linked_hit_indexes": ["koro-signal-drill-linked"]}
   ```

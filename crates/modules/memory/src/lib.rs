@@ -46,11 +46,12 @@ pub use memory::{
     ReinforceMemoryOutput, session_auto_compaction,
 };
 pub use query::{
-    FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput, QueryMemoryBatch, QueryMemoryHit,
-    QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit, QueryMemoryMemoLinkedHit,
-    QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools, QueryMemoryToolsCall,
-    QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput, WriteRetrievalMemoArgs,
-    WriteRetrievalMemoOutput, query_session_auto_compaction,
+    BroadcastSearchResultsArgs, BroadcastSearchResultsOutput, DisposeSearchResultsArgs,
+    DisposeSearchResultsOutput, FetchLinkedMemoriesArgs, FetchLinkedMemoriesOutput,
+    QueryMemoryBatch, QueryMemoryHit, QueryMemoryLinkedHit, QueryMemoryMemo, QueryMemoryMemoHit,
+    QueryMemoryMemoLinkedHit, QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryTools,
+    QueryMemoryToolsCall, QueryMemoryToolsSelector, SearchMemoryArgs, SearchMemoryOutput,
+    query_session_auto_compaction,
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
