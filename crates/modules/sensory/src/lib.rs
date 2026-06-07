@@ -1037,6 +1037,8 @@ mod tests {
                 idle_threshold: Duration::from_millis(50),
                 activate_retries,
                 module_failure_limit: 3,
+                dependency_idle_timeout: Duration::from_secs(2),
+                dependency_hard_timeout: Duration::from_secs(10),
             },
             body,
         )
@@ -1482,6 +1484,8 @@ mod tests {
                         idle_threshold: Duration::from_millis(50),
                         activate_retries: 0,
                         module_failure_limit: 1,
+                        dependency_idle_timeout: Duration::from_secs(2),
+                        dependency_hard_timeout: Duration::from_secs(10),
                     },
                     async {
                         sensory

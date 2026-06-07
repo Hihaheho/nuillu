@@ -19,19 +19,18 @@ use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin}
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, spawn_local};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 use crate::kicks::{Kick, KickHandle, KickInbox};
-
-/// Silent window before nooping pending dependency kicks when no natural wake arrives.
-const KICK_SILENT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentEventLoopConfig {
     pub idle_threshold: Duration,
     pub activate_retries: u8,
     pub module_failure_limit: u8,
+    pub dependency_idle_timeout: Duration,
+    pub dependency_hard_timeout: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -440,6 +439,108 @@ impl DependencyTargets {
     }
 }
 
+struct DependencyWait {
+    owner: ModuleInstanceId,
+    completion: DependencyWaitCompletion,
+}
+
+enum DependencyWaitCompletion {
+    Kick(oneshot::Receiver<()>),
+    Inactive {
+        runtime: AgentRuntimeControl,
+        kick_handle: KickHandle,
+        sender: ModuleInstanceId,
+        activation_waiter: Option<oneshot::Receiver<()>>,
+        idle_timeout: Duration,
+    },
+}
+
+impl DependencyWait {
+    fn kick(owner: ModuleInstanceId, completion: oneshot::Receiver<()>) -> Self {
+        Self {
+            owner,
+            completion: DependencyWaitCompletion::Kick(completion),
+        }
+    }
+
+    fn inactive(
+        owner: ModuleInstanceId,
+        runtime: AgentRuntimeControl,
+        kick_handle: KickHandle,
+        sender: ModuleInstanceId,
+        activation_waiter: Option<oneshot::Receiver<()>>,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            owner,
+            completion: DependencyWaitCompletion::Inactive {
+                runtime,
+                kick_handle,
+                sender,
+                activation_waiter,
+                idle_timeout,
+            },
+        }
+    }
+
+    async fn wait(self) -> ModuleInstanceId {
+        let owner = self.owner;
+        match self.completion {
+            DependencyWaitCompletion::Kick(completion) => {
+                let _ = completion.await;
+            }
+            DependencyWaitCompletion::Inactive {
+                runtime,
+                kick_handle,
+                sender,
+                activation_waiter,
+                idle_timeout,
+            } => {
+                wait_for_inactive_dependency(
+                    owner.clone(),
+                    runtime,
+                    kick_handle,
+                    sender,
+                    activation_waiter,
+                    idle_timeout,
+                )
+                .await;
+            }
+        }
+        owner
+    }
+}
+
+async fn wait_for_inactive_dependency(
+    owner: ModuleInstanceId,
+    runtime: AgentRuntimeControl,
+    kick_handle: KickHandle,
+    sender: ModuleInstanceId,
+    activation_waiter: Option<oneshot::Receiver<()>>,
+    idle_timeout: Duration,
+) {
+    let mut activation = pin!(async move {
+        if let Some(waiter) = activation_waiter {
+            let _ = waiter.await;
+        }
+    });
+    let mut idle = pin!(sleep(idle_timeout));
+
+    tokio::select! {
+        biased;
+        _ = &mut activation => {
+            let completion = kick_handle.send(sender);
+            let _ = completion.await;
+        }
+        _ = &mut idle => {
+            if runtime.is_active(&owner).await {
+                let completion = kick_handle.send(sender);
+                let _ = completion.await;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn refresh_active_and_schedule(
     runtime: &AgentRuntimeControl,
@@ -504,10 +605,26 @@ async fn refresh_active_and_schedule(
                             subscriber,
                         );
                     } else {
-                        spawn_next_batch(tasks, index, module, kick_inbox, parent, subscriber);
+                        spawn_next_batch(
+                            tasks,
+                            index,
+                            module,
+                            kick_inbox,
+                            config.dependency_idle_timeout,
+                            parent,
+                            subscriber,
+                        );
                     }
                 } else {
-                    spawn_next_batch(tasks, index, module, kick_inbox, parent, subscriber);
+                    spawn_next_batch(
+                        tasks,
+                        index,
+                        module,
+                        kick_inbox,
+                        config.dependency_idle_timeout,
+                        parent,
+                        subscriber,
+                    );
                 }
             }
             ModuleState::Stored { .. } => {
@@ -1155,6 +1272,7 @@ async fn spawn_dependency_flush_or_activate(
         dependency_targets,
         owners,
         zero_windows,
+        config.dependency_idle_timeout,
     )
     .await;
     if completions.is_empty() {
@@ -1174,16 +1292,18 @@ async fn spawn_dependency_flush_or_activate(
         .await
     } else {
         runtime
-            .record_module_status(owner, ModuleRunStatus::PendingBatch)
+            .record_module_status(owner.clone(), ModuleRunStatus::PendingBatch)
             .await;
         spawn_dependency_flush_wait(
             tasks,
             index,
+            owner,
             module,
             kick_inbox,
             pending_kicks,
             batch,
             completions,
+            config.dependency_hard_timeout,
             parent,
             subscriber,
         );
@@ -1200,13 +1320,24 @@ async fn collect_dependency_flush_completions(
     dependency_targets: &DependencyTargets,
     owners: &[ModuleInstanceId],
     zero_windows: &mut ZeroReplicaWindows,
-) -> Vec<tokio::sync::oneshot::Receiver<()>> {
+    idle_timeout: Duration,
+) -> Vec<DependencyWait> {
     let mut completions = Vec::new();
     for target_index in dependency_targets.target_indexes(&sender.module) {
         if target_index == dependent_index {
             continue;
         }
-        if !scheduling_active(runtime, zero_windows, &owners[target_index]).await {
+        let target_owner = owners[target_index].clone();
+        if !scheduling_active(runtime, zero_windows, &target_owner).await {
+            let activation_waiter = runtime.activation_waiter(&target_owner).await;
+            completions.push(DependencyWait::inactive(
+                target_owner,
+                runtime.clone(),
+                kick_handles[target_index].clone(),
+                sender.clone(),
+                activation_waiter,
+                idle_timeout,
+            ));
             continue;
         }
         match &mut states[target_index] {
@@ -1214,13 +1345,14 @@ async fn collect_dependency_flush_completions(
             | ModuleState::Awaiting
             | ModuleState::PendingDependencyFlush
             | ModuleState::PendingActivationGate
-            | ModuleState::Activating => {
-                completions.push(kick_handles[target_index].send(sender.clone()))
-            }
+            | ModuleState::Activating => completions.push(DependencyWait::kick(
+                target_owner,
+                kick_handles[target_index].send(sender.clone()),
+            )),
             ModuleState::PendingBatch { pending_kicks, .. } => {
                 let (kick, completion) = Kick::new(sender.clone());
                 pending_kicks.push(kick);
-                completions.push(completion);
+                completions.push(DependencyWait::kick(target_owner, completion));
             }
             ModuleState::Stored { .. }
             | ModuleState::WaitingForActivation
@@ -1234,20 +1366,52 @@ async fn collect_dependency_flush_completions(
 fn spawn_dependency_flush_wait(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
+    owner: ModuleInstanceId,
     module: AllocatedModule,
     mut kick_inbox: KickInbox,
     mut pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
-    completions: Vec<tokio::sync::oneshot::Receiver<()>>,
+    completions: Vec<DependencyWait>,
+    hard_timeout: Duration,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            // Dependency activation can include LLM work, so this waits for
-            // kick completion/drop rather than applying a wall-clock timeout.
-            for completion in completions {
-                let _ = completion.await;
+            let started = Instant::now();
+            let mut remaining = completions
+                .iter()
+                .map(|completion| completion.owner.clone())
+                .collect::<Vec<_>>();
+            let mut completions = completions
+                .into_iter()
+                .map(DependencyWait::wait)
+                .collect::<FuturesUnordered<_>>();
+            let hard_deadline = sleep(hard_timeout);
+            tokio::pin!(hard_deadline);
+
+            while !completions.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = &mut hard_deadline => {
+                        tracing::warn!(
+                            dependent = %owner,
+                            remaining_dependencies = ?remaining,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            timeout_ms = hard_timeout.as_millis(),
+                            reason = "dependency_flush_hard_timeout",
+                            "dependency flush hard timeout; starting dependent without remaining dependencies"
+                        );
+                        break;
+                    }
+                    completed = completions.next() => {
+                        if let Some(completed) = completed {
+                            remaining.retain(|owner| owner != &completed);
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
             pending_kicks.extend(kick_inbox.drain_ready());
             TaskMessage::DependencyFlush {
@@ -1394,6 +1558,7 @@ fn spawn_next_batch(
     index: usize,
     mut module: AllocatedModule,
     mut kick_inbox: KickInbox,
+    dependency_idle_timeout: Duration,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
@@ -1416,7 +1581,7 @@ fn spawn_next_batch(
                                 kick_inbox_closed = true;
                             }
                         }
-                        _ = tokio::time::sleep(KICK_SILENT_TIMEOUT), if timeout_enabled => {
+                        _ = sleep(dependency_idle_timeout), if timeout_enabled => {
                             for kick in pending_kicks.drain(..) {
                                 kick.notify_finish();
                             }
@@ -1752,6 +1917,8 @@ mod tests {
             idle_threshold: std::time::Duration::from_millis(50),
             activate_retries: 2,
             module_failure_limit: 3,
+            dependency_idle_timeout: std::time::Duration::from_secs(2),
+            dependency_hard_timeout: std::time::Duration::from_secs(10),
         }
     }
 
@@ -4511,6 +4678,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 2,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         let _ = done_rx.await;
@@ -4561,6 +4730,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 1,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         loop {
@@ -4640,6 +4811,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 0,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         let _ = done_rx.await;
@@ -4705,6 +4878,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 0,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         let _ = done_rx.await;
@@ -4775,6 +4950,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(50),
                         activate_retries: 0,
                         module_failure_limit: 1,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         loop {
@@ -5079,7 +5256,7 @@ mod tests {
                         "dependent should wait for active dependency kick completions",
                     );
 
-                    tokio::time::advance(Duration::from_millis(999)).await;
+                    tokio::time::advance(Duration::from_millis(1999)).await;
                     for _ in 0..8 {
                         tokio::task::yield_now().await;
                     }
@@ -5190,6 +5367,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    Duration::from_secs(2),
                 )
                 .await;
 
@@ -5211,7 +5389,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
-    async fn inactive_dependency_targets_are_skipped_before_state_kick() {
+    async fn inactive_dependency_targets_wait_for_idle_timeout_without_state_kick() {
         use futures::FutureExt as _;
 
         let local = LocalSet::new();
@@ -5291,13 +5469,11 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    Duration::from_secs(2),
                 )
                 .await;
 
-                assert!(
-                    completions.is_empty(),
-                    "inactive dependency target should not block the dependent"
-                );
+                assert_eq!(completions.len(), 1);
                 assert!(
                     dependency_kick_inbox
                         .as_mut()
@@ -5387,7 +5563,7 @@ mod tests {
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }
-                    tokio::time::advance(Duration::from_secs(1)).await;
+                    tokio::time::advance(Duration::from_secs(2)).await;
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }
@@ -5554,7 +5730,15 @@ mod tests {
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let parent = tracing::Span::current();
 
-                super::spawn_next_batch(&mut tasks, 0, module, kick_inbox, &parent, &subscriber);
+                super::spawn_next_batch(
+                    &mut tasks,
+                    0,
+                    module,
+                    kick_inbox,
+                    Duration::from_secs(2),
+                    &parent,
+                    &subscriber,
+                );
                 tokio::task::yield_now().await;
                 let _ = release_tx.send(());
 
@@ -5674,6 +5858,7 @@ mod tests {
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
+                    Duration::from_secs(2),
                 )
                 .await;
                 assert_eq!(completions.len(), 1);
@@ -5684,11 +5869,13 @@ mod tests {
                 super::spawn_dependency_flush_wait(
                     &mut tasks,
                     dependent_index,
+                    dependent_owner.clone(),
                     dependent,
                     dependent_kick_inbox.unwrap(),
                     Vec::new(),
                     batch,
                     completions,
+                    Duration::from_secs(10),
                     &parent,
                     &subscriber,
                 );
@@ -5753,7 +5940,7 @@ mod tests {
                 let owner = module.owner().clone();
                 let batch = module.next_batch().await.unwrap();
                 let (kick_inbox, _) = crate::kicks::KickInbox::new();
-                let (kick, completion) = crate::kicks::Kick::new(owner);
+                let (kick, completion) = crate::kicks::Kick::new(owner.clone());
                 drop(kick);
 
                 let mut tasks = futures::stream::FuturesUnordered::new();
@@ -5762,11 +5949,13 @@ mod tests {
                 super::spawn_dependency_flush_wait(
                     &mut tasks,
                     0,
+                    owner.clone(),
                     module,
                     kick_inbox,
                     Vec::new(),
                     batch,
-                    vec![completion],
+                    vec![super::DependencyWait::kick(owner, completion)],
+                    Duration::from_secs(10),
                     &parent,
                     &subscriber,
                 );
@@ -5782,6 +5971,207 @@ mod tests {
                     }
                     _ => panic!("expected dependency flush task message"),
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn throttled_dependency_waits_for_hard_timeout_not_idle_timeout() {
+        use futures::{FutureExt as _, StreamExt as _};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dependency_id = ModuleId::new(SilentDependencyA::id()).unwrap();
+                let dependent_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(dependency_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
+                alloc.set(dependent_id.clone(), ModuleConfig::default());
+                alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
+
+                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| SilentDependencyA,
+                    )
+                    .unwrap()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| ImmediateDependentModule {
+                            batch_sent: false,
+                            on_done: None,
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(dependent_id.clone(), dependency_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, dependencies) = modules.into_parts_with_dependencies();
+                let mut zero_windows =
+                    super::ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
+                let owners = modules
+                    .iter()
+                    .map(|module| module.owner().clone())
+                    .collect::<Vec<_>>();
+                let dependency_index = owners
+                    .iter()
+                    .position(|owner| owner.module == dependency_id)
+                    .unwrap();
+                let dependent_index = owners
+                    .iter()
+                    .position(|owner| owner.module == dependent_id)
+                    .unwrap();
+                let mut dependent = modules.remove(dependent_index);
+                let dependent_owner = dependent.owner().clone();
+                let batch = dependent.next_batch().await.unwrap();
+
+                let mut dependent_kick_inbox = None;
+                let mut _dependency_kick_inbox = None;
+                let mut kick_handles = Vec::with_capacity(owners.len());
+                for index in 0..owners.len() {
+                    let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
+                    if index == dependent_index {
+                        dependent_kick_inbox = Some(kick_inbox);
+                    } else if index == dependency_index {
+                        _dependency_kick_inbox = Some(kick_inbox);
+                    }
+                    kick_handles.push(kick_handle);
+                }
+                let mut target_indexes_by_role = HashMap::new();
+                target_indexes_by_role.insert(dependency_id, vec![dependency_index]);
+                let dependency_targets = super::DependencyTargets {
+                    dependencies: Arc::new(dependencies),
+                    target_indexes_by_role: Arc::new(target_indexes_by_role),
+                };
+                let mut states = (0..owners.len())
+                    .map(|_| super::ModuleState::Awaiting)
+                    .collect::<Vec<_>>();
+                states[dependency_index] = super::ModuleState::Throttling;
+                let completions = super::collect_dependency_flush_completions(
+                    &runtime,
+                    dependent_index,
+                    &dependent_owner,
+                    &mut states,
+                    &kick_handles,
+                    &dependency_targets,
+                    &owners,
+                    &mut zero_windows,
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert_eq!(completions.len(), 1);
+
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                super::spawn_dependency_flush_wait(
+                    &mut tasks,
+                    dependent_index,
+                    dependent_owner,
+                    dependent,
+                    dependent_kick_inbox.unwrap(),
+                    Vec::new(),
+                    batch,
+                    completions,
+                    Duration::from_secs(3),
+                    &parent,
+                    &subscriber,
+                );
+
+                tokio::time::advance(Duration::from_secs(2)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    tasks.next().now_or_never().is_none(),
+                    "throttled dependency should not be released by idle timeout"
+                );
+
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("dependency flush task should finish at hard timeout")
+                    .expect("dependency flush task should not panic");
+                assert!(matches!(
+                    message,
+                    super::TaskMessage::DependencyFlush { .. }
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dependency_flush_waits_for_active_work_past_idle_timeout() {
+        use futures::{FutureExt as _, StreamExt as _};
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id, ActivationRatio::ONE);
+
+                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |_| ImmediateDependentModule {
+                            batch_sent: false,
+                            on_done: None,
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (_, mut modules, _) = modules.into_parts_with_dependencies();
+                let mut module = modules.pop().unwrap();
+                let owner = module.owner().clone();
+                let batch = module.next_batch().await.unwrap();
+                let dependency_owner = ModuleInstanceId::new(
+                    ModuleId::new("active-work").unwrap(),
+                    ReplicaIndex::ZERO,
+                );
+                let (kick, completion) = crate::kicks::Kick::new(dependency_owner.clone());
+                let (kick_inbox, _) = crate::kicks::KickInbox::new();
+
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                super::spawn_dependency_flush_wait(
+                    &mut tasks,
+                    0,
+                    owner,
+                    module,
+                    kick_inbox,
+                    Vec::new(),
+                    batch,
+                    vec![super::DependencyWait::kick(dependency_owner, completion)],
+                    Duration::from_secs(10),
+                    &parent,
+                    &subscriber,
+                );
+
+                tokio::time::advance(Duration::from_secs(2)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    tasks.next().now_or_never().is_none(),
+                    "active dependency work should not be released by idle timeout"
+                );
+
+                kick.notify_finish();
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("dependency flush task should finish after dependency completion")
+                    .expect("dependency flush task should not panic");
+                assert!(matches!(
+                    message,
+                    super::TaskMessage::DependencyFlush { .. }
+                ));
             })
             .await;
     }
@@ -5925,7 +6315,15 @@ mod tests {
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let parent = tracing::Span::current();
 
-                super::spawn_next_batch(&mut tasks, 0, module, kick_inbox, &parent, &subscriber);
+                super::spawn_next_batch(
+                    &mut tasks,
+                    0,
+                    module,
+                    kick_inbox,
+                    Duration::from_secs(2),
+                    &parent,
+                    &subscriber,
+                );
                 let mut first = kick_handle.send(owner.clone());
                 tokio::task::yield_now().await;
                 tokio::time::advance(Duration::from_millis(500)).await;
@@ -5993,6 +6391,8 @@ mod tests {
                         idle_threshold: std::time::Duration::from_millis(10),
                         activate_retries: 0,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: std::time::Duration::from_secs(2),
+                        dependency_hard_timeout: std::time::Duration::from_secs(10),
                     },
                     async move {
                         let _ = done_rx.await;

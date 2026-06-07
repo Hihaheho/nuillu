@@ -1767,6 +1767,8 @@ async fn execute_full_agent_case(
             idle_threshold: Duration::from_secs(1),
             activate_retries: 2,
             module_failure_limit: 3,
+            dependency_idle_timeout: Duration::from_secs(2),
+            dependency_hard_timeout: Duration::from_secs(10),
         },
         async move {
             if !gui_deferred_start {
@@ -2116,6 +2118,8 @@ async fn execute_module_case(
             idle_threshold: Duration::from_secs(1),
             activate_retries: 2,
             module_failure_limit: 3,
+            dependency_idle_timeout: Duration::from_secs(2),
+            dependency_hard_timeout: Duration::from_secs(10),
         },
         async move {
             let mut started = !gui_deferred_start;
@@ -9137,6 +9141,8 @@ prompt = "What am I attending to?"
                         idle_threshold: Duration::from_millis(50),
                         activate_retries: 1,
                         module_failure_limit: 3,
+                        dependency_idle_timeout: Duration::from_secs(2),
+                        dependency_hard_timeout: Duration::from_secs(10),
                     },
                     async {
                         let record = run_blackboard
