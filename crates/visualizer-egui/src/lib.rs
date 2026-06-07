@@ -15,11 +15,20 @@ pub use egui;
 pub use egui_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
+use font_kit::family_name::FamilyName;
+use font_kit::handle::Handle;
+use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
 use nuillu_module::RuntimeEvent;
 pub use nuillu_visualizer_protocol::*;
+
+const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
+const NOTO_SANS_JP_FAMILY_NAME: &str = "Noto Sans JP";
 
 pub struct VisualizerChannels {
     pub server_messages: Receiver<VisualizerServerMessage>,
@@ -35,7 +44,9 @@ pub struct VisualizerApp {
 }
 
 impl VisualizerApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
+        install_visualizer_fonts(&cc.egui_ctx);
+
         Self {
             server_messages: channels.server_messages,
             client_messages: channels.client_messages,
@@ -58,6 +69,55 @@ impl VisualizerApp {
             }
         }
     }
+}
+
+fn install_visualizer_fonts(ctx: &egui::Context) {
+    let Some(font_data) = load_noto_sans_jp() else {
+        eprintln!("warning: {NOTO_SANS_JP_FAMILY_NAME} was not loaded; using egui default fonts");
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(NOTO_SANS_JP_FONT_KEY.to_owned(), Arc::new(font_data));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, NOTO_SANS_JP_FONT_KEY.to_owned());
+    ctx.set_fonts(fonts);
+}
+
+fn load_noto_sans_jp() -> Option<egui::FontData> {
+    let handle = match SystemSource::new().select_best_match(
+        &[FamilyName::Title(NOTO_SANS_JP_FAMILY_NAME.to_owned())],
+        &Properties::new(),
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("warning: could not find {NOTO_SANS_JP_FAMILY_NAME}: {error}");
+            return None;
+        }
+    };
+
+    let (bytes, font_index) = match handle {
+        Handle::Memory { bytes, font_index } => (bytes.to_vec(), font_index),
+        Handle::Path { path, font_index } => match fs::read(&path) {
+            Ok(bytes) => (bytes, font_index),
+            Err(error) => {
+                eprintln!(
+                    "warning: could not read {NOTO_SANS_JP_FAMILY_NAME} from {}: {error}",
+                    path.display()
+                );
+                return None;
+            }
+        },
+    };
+
+    let mut font_data = egui::FontData::from_owned(bytes);
+    font_data.index = font_index;
+    Some(font_data)
 }
 
 impl eframe::App for VisualizerApp {
