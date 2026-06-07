@@ -3356,6 +3356,7 @@ dependencies = [
  "lutum-libsql-adapter",
  "lutum-model2vec-adapter",
  "lutum-openai",
+ "lutum-protocol",
  "lutum-trace",
  "nuillu-agent",
  "nuillu-allocation",
