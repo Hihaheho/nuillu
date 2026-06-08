@@ -1,0 +1,45 @@
+/// Server startup memory seed file schema.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+memories = [`$types.memory-seed`]
+memories.$optional = true
+
+@ $types.memory-rank
+$variant: union
+variants.short-term = { = "short-term", $variant => "literal" }
+variants.mid-term = { = "mid-term", $variant => "literal" }
+variants.long-term = { = "long-term", $variant => "literal" }
+variants.permanent = { = "permanent", $variant => "literal" }
+variants.identity = { = "identity", $variant => "literal" }
+
+@ $types.memory-kind
+$variant: union
+variants.episode = { = "episode", $variant => "literal" }
+variants.statement = { = "statement", $variant => "literal" }
+variants.reflection = { = "reflection", $variant => "literal" }
+variants.hypothesis = { = "hypothesis", $variant => "literal" }
+variants.dream = { = "dream", $variant => "literal" }
+variants.procedure = { = "procedure", $variant => "literal" }
+variants.plan = { = "plan", $variant => "literal" }
+
+@ $types.memory-seed
+index {
+  $variant: text
+  min-length = 1
+}
+rank = `$types.memory-rank`
+kind = `$types.memory-kind`
+kind.$optional = true
+occurred-at = `text`
+occurred-at.$optional = true
+decay-secs = `integer`
+decay-secs.$optional = true
+concepts = [`text`]
+concepts.$optional = true
+tags = [`text`]
+tags.$optional = true
+content {
+  $variant: text
+  min-length = 1
+}

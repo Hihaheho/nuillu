@@ -35,6 +35,7 @@ use super::config::{EmbeddingBackendConfig, LlmBackendConfig, ServerConfig};
 use super::gui::VisualizerEventSink;
 use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
+use super::memory_seed::seed_memory_from_state_dir;
 use super::runtime_event_log::{
     RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
 };
@@ -119,6 +120,12 @@ pub(super) async fn build_server_environment(
         memory.clone(),
         Vec::new(),
     );
+    let seeded_memories = seed_memory_from_state_dir(&config.state_dir, &memory_caps)
+        .await
+        .context("seed startup memories")?;
+    if seeded_memories > 0 {
+        eprintln!("nuillu-server seeded memory entries count={seeded_memories}");
+    }
     memory_caps
         .bootstrap_identity_memories()
         .await

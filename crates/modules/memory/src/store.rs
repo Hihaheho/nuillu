@@ -574,15 +574,45 @@ impl MemoryWriter {
         decay_secs: i64,
         occurred_at: Option<DateTime<Utc>>,
     ) -> Result<MemoryIndex, PortError> {
-        let mut new = NewMemory::statement(MemoryContent::new(content), rank, occurred_at);
-        self.stamp_interoception(&mut new).await;
+        let record = self
+            .put_seeded_entry(
+                index,
+                NewMemory::statement(MemoryContent::new(content), rank, occurred_at),
+                decay_secs,
+            )
+            .await?;
+        Ok(record.index)
+    }
+
+    pub async fn put_seeded_entry(
+        &self,
+        index: MemoryIndex,
+        mut new: NewMemory,
+        decay_secs: i64,
+    ) -> Result<MemoryRecord, PortError> {
         let now = self.clock.now();
+        let existing = self.primary_store.get(&index).await?;
+        let stored_at = existing
+            .as_ref()
+            .map(|record| record.stored_at)
+            .unwrap_or(now);
+        if let Some(existing) = existing {
+            new.affect_arousal = existing.affect_arousal;
+            new.valence = existing.valence;
+            new.emotion = existing.emotion;
+        } else {
+            new.affect_arousal = 0.0;
+            new.valence = 0.0;
+            new.emotion.clear();
+        }
+        let rank = new.rank;
+        let occurred_at = new.occurred_at;
         let record = MemoryRecord {
             index: index.clone(),
             content: new.content,
-            rank: new.rank,
-            occurred_at: new.occurred_at,
-            stored_at: now,
+            rank,
+            occurred_at,
+            stored_at,
             kind: new.kind,
             concepts: new.concepts,
             tags: new.tags,
@@ -618,7 +648,7 @@ impl MemoryWriter {
                 },
             })
             .await;
-        Ok(record.index)
+        Ok(record)
     }
 
     pub async fn insert_entry(
@@ -919,7 +949,7 @@ impl MemoryDeleter {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, collections::BTreeMap};
 
     use super::*;
     use nuillu_module::ports::Clock;
@@ -944,6 +974,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingMemoryStore {
         writes: Rc<RefCell<Vec<RecordedMemoryWrite>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct StatefulMemoryStore {
+        records: Rc<RefCell<BTreeMap<String, MemoryRecord>>>,
     }
 
     #[derive(Clone)]
@@ -971,6 +1006,105 @@ mod tests {
                 valence: mem.valence,
                 emotion: mem.emotion,
             }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl MemoryStore for StatefulMemoryStore {
+        async fn insert(
+            &self,
+            mem: NewMemory,
+            stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            let index = MemoryIndex::new(format!("memory-{}", self.records.borrow().len()));
+            let record = RecordingMemoryStore::record_from_new(index.clone(), mem, stored_at);
+            self.records
+                .borrow_mut()
+                .insert(index.as_str().to_owned(), record.clone());
+            Ok(record)
+        }
+
+        async fn put(&self, mem: IndexedMemory) -> Result<MemoryRecord, PortError> {
+            let record = MemoryRecord {
+                index: mem.index,
+                content: mem.content,
+                rank: mem.rank,
+                occurred_at: mem.occurred_at,
+                stored_at: mem.stored_at,
+                kind: mem.kind,
+                concepts: mem.concepts,
+                tags: mem.tags,
+                affect_arousal: mem.affect_arousal,
+                valence: mem.valence,
+                emotion: mem.emotion,
+            };
+            self.records
+                .borrow_mut()
+                .insert(record.index.as_str().to_owned(), record.clone());
+            Ok(record)
+        }
+
+        async fn compact(
+            &self,
+            mem: NewMemory,
+            _sources: &[MemoryIndex],
+            stored_at: DateTime<Utc>,
+        ) -> Result<MemoryRecord, PortError> {
+            self.insert(mem, stored_at).await
+        }
+
+        async fn put_compacted(
+            &self,
+            mem: IndexedMemory,
+            _sources: &[MemoryIndex],
+        ) -> Result<MemoryRecord, PortError> {
+            self.put(mem).await
+        }
+
+        async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError> {
+            Ok(self.records.borrow().get(index.as_str()).cloned())
+        }
+
+        async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(self
+                .records
+                .borrow()
+                .values()
+                .filter(|record| record.rank == rank)
+                .cloned()
+                .collect())
+        }
+
+        async fn search(&self, _q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
+            Ok(self.records.borrow().values().cloned().collect())
+        }
+
+        async fn linked(
+            &self,
+            _q: &LinkedMemoryQuery,
+        ) -> Result<Vec<LinkedMemoryRecord>, PortError> {
+            Ok(Vec::new())
+        }
+
+        async fn upsert_link(
+            &self,
+            link: NewMemoryLink,
+            updated_at: DateTime<Utc>,
+        ) -> Result<MemoryLink, PortError> {
+            Ok(MemoryLink {
+                from_memory: link.from_memory,
+                to_memory: link.to_memory,
+                relation: link.relation,
+                freeform_relation: link.freeform_relation,
+                strength: link.strength,
+                confidence: link.confidence,
+                updated_at,
+            })
+        }
+
+        async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError> {
+            self.records.borrow_mut().remove(index.as_str());
+            Ok(())
         }
     }
 
@@ -1264,6 +1398,118 @@ mod tests {
             panic!("expected insert write");
         };
         assert_eq!(new.occurred_at, Some(now));
+    }
+
+    #[tokio::test]
+    async fn seeded_writer_inserts_neutral_affect_without_interoception_stamp() {
+        let now = DateTime::from_timestamp(1_700_000_030, 0).unwrap();
+        let blackboard = Blackboard::new();
+        set_test_interoception(&blackboard).await;
+        let store = StatefulMemoryStore::default();
+        let writer = MemoryWriter::new(
+            Rc::new(store.clone()),
+            Vec::new(),
+            blackboard,
+            Rc::new(FixedClock(now)),
+        );
+
+        let record = writer
+            .put_seeded_entry(
+                MemoryIndex::new("seed-id"),
+                NewMemory {
+                    kind: MemoryKind::Reflection,
+                    concepts: vec![MemoryConcept::new("Ryo")],
+                    tags: vec![MemoryTag::operational("seed")],
+                    ..NewMemory::statement(
+                        MemoryContent::new("seeded memory"),
+                        MemoryRank::Identity,
+                        Some(now),
+                    )
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(record.index.as_str(), "seed-id");
+        assert_eq!(record.stored_at, now);
+        assert_eq!(record.affect_arousal, 0.0);
+        assert_eq!(record.valence, 0.0);
+        assert_eq!(record.emotion, "");
+        assert_eq!(record.kind, MemoryKind::Reflection);
+        assert_eq!(record.concepts, vec![MemoryConcept::new("Ryo")]);
+        assert_eq!(record.tags, vec![MemoryTag::operational("seed")]);
+    }
+
+    #[tokio::test]
+    async fn seeded_writer_overwrites_by_index_preserving_stored_at_and_affect() {
+        let stored_at = DateTime::from_timestamp(1_700_000_030, 0).unwrap();
+        let now = DateTime::from_timestamp(1_700_000_090, 0).unwrap();
+        let index = MemoryIndex::new("seed-id");
+        let store = StatefulMemoryStore::default();
+        store.records.borrow_mut().insert(
+            index.as_str().to_owned(),
+            MemoryRecord {
+                index: index.clone(),
+                content: MemoryContent::new("old seed"),
+                rank: MemoryRank::Identity,
+                occurred_at: Some(stored_at),
+                stored_at,
+                kind: MemoryKind::Statement,
+                concepts: vec![MemoryConcept::new("old")],
+                tags: vec![MemoryTag::operational("old")],
+                affect_arousal: 0.65,
+                valence: -0.25,
+                emotion: "settled".to_owned(),
+            },
+        );
+        let blackboard = Blackboard::new();
+        let writer = MemoryWriter::new(
+            Rc::new(store.clone()),
+            Vec::new(),
+            blackboard.clone(),
+            Rc::new(FixedClock(now)),
+        );
+
+        let record = writer
+            .put_seeded_entry(
+                index.clone(),
+                NewMemory {
+                    kind: MemoryKind::Procedure,
+                    concepts: vec![MemoryConcept::new("new")],
+                    tags: vec![MemoryTag::operational("updated")],
+                    ..NewMemory::statement(
+                        MemoryContent::new("new seed"),
+                        MemoryRank::Permanent,
+                        None,
+                    )
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.records.borrow().len(), 1);
+        assert_eq!(record.index, index);
+        assert_eq!(record.content.as_str(), "new seed");
+        assert_eq!(record.rank, MemoryRank::Permanent);
+        assert_eq!(record.occurred_at, None);
+        assert_eq!(record.stored_at, stored_at);
+        assert_eq!(record.kind, MemoryKind::Procedure);
+        assert_eq!(record.concepts, vec![MemoryConcept::new("new")]);
+        assert_eq!(record.tags, vec![MemoryTag::operational("updated")]);
+        assert_eq!(record.affect_arousal, 0.65);
+        assert_eq!(record.valence, -0.25);
+        assert_eq!(record.emotion, "settled");
+
+        let metadata = blackboard
+            .read(|bb| bb.memory_metadata().get(&record.index).cloned())
+            .await
+            .unwrap();
+        assert_eq!(metadata.rank, MemoryRank::Permanent);
+        assert_eq!(metadata.occurred_at, None);
+        assert_eq!(metadata.decay_remaining_secs, 0);
+        assert_eq!(metadata.last_accessed, now);
     }
 
     #[tokio::test]

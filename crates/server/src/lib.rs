@@ -4,6 +4,7 @@ pub mod environment;
 pub mod gui;
 pub mod llm_db_trace;
 pub mod llm_observer;
+mod memory_seed;
 pub mod model_set;
 pub mod registry;
 pub mod runtime;
