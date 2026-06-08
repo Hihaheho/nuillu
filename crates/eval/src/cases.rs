@@ -363,6 +363,7 @@ pub enum ModuleEvalTarget {
     MemoryCompaction,
     MemoryAssociation,
     MemoryRecombination,
+    Policy,
     PolicyCompaction,
     Allocation,
     Predict,
@@ -382,6 +383,7 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
             Self::MemoryRecombination => "memory-recombination",
+            Self::Policy => "policy",
             Self::PolicyCompaction => "policy-compaction",
             Self::Allocation => "allocation",
             Self::Predict => "predict",
@@ -401,6 +403,7 @@ impl ModuleEvalTarget {
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
             Self::MemoryRecombination => EvalModule::MemoryRecombination,
+            Self::Policy => EvalModule::Policy,
             Self::PolicyCompaction => EvalModule::PolicyCompaction,
             Self::Allocation => EvalModule::Allocation,
             Self::Predict => EvalModule::Predict,
@@ -422,6 +425,7 @@ impl ModuleEvalTarget {
                 "memory-compaction" => Some(Self::MemoryCompaction),
                 "memory-association" => Some(Self::MemoryAssociation),
                 "memory-recombination" => Some(Self::MemoryRecombination),
+                "policy" => Some(Self::Policy),
                 "policy-compaction" => Some(Self::PolicyCompaction),
                 "allocation" => Some(Self::Allocation),
                 "predict" => Some(Self::Predict),
@@ -777,6 +781,7 @@ pub enum RubricJudgeInput {
     MemoryDiff,
     MemoryMetadata,
     PolicyDiff,
+    PolicyConsiderations,
     MemoContents,
     Cognition,
     CognitionEntries,
@@ -1371,6 +1376,18 @@ fn validate_module_case_target(
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
             message: "allocation module case must include at least one memo seed".to_string(),
+        });
+    }
+    if target == ModuleEvalTarget::Policy
+        && case.memos.is_empty()
+        && step_memos_count == 0
+        && case.cognition_log.is_empty()
+        && step_cognition_count == 0
+    {
+        return Err(CaseFileError::Validation {
+            path: path.to_path_buf(),
+            message: "policy module case must include at least one memo or cognition-log seed"
+                .to_string(),
         });
     }
     if target == ModuleEvalTarget::PolicyCompaction && case.policies.is_empty() {

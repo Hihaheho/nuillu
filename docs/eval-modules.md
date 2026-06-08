@@ -188,6 +188,8 @@ Choose `judge-inputs` deliberately:
   cases.
 - `memory-metadata`: compact per-memory metadata such as reinforcement counts.
 - `policy-diff`: inserted/deleted/remaining policy indexes for policy cases.
+- `policy-considerations`: structured policy consideration payloads for policy
+  cases.
 - `cognition-entries`: cognition-log text only, with source metadata omitted.
 - `memo-contents`: memo content text only, with timing/source plumbing omitted.
 - `tool-calls`: structured tool names and arguments from the trace.

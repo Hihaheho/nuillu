@@ -133,6 +133,7 @@ variants.memory = { = "memory", $variant => "literal" }
 variants.memory-diff = { = "memory-diff", $variant => "literal" }
 variants.memory-metadata = { = "memory-metadata", $variant => "literal" }
 variants.policy-diff = { = "policy-diff", $variant => "literal" }
+variants.policy-considerations = { = "policy-considerations", $variant => "literal" }
 variants.memo-contents = { = "memo-contents", $variant => "literal" }
 variants.cognition = { = "cognition", $variant => "literal" }
 variants.cognition-entries = { = "cognition-entries", $variant => "literal" }

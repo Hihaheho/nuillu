@@ -2054,6 +2054,11 @@ async fn execute_module_case(
     } else {
         BTreeSet::new()
     };
+    let policy_consideration_baseline_len = if target == ModuleEvalTarget::Policy {
+        env.policy_caps.consideration_snapshots().len()
+    } else {
+        0
+    };
     let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
     let cognition_seed_records =
         seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
@@ -2105,8 +2110,10 @@ async fn execute_module_case(
     let utterances = env.utterances.clone();
     let memory = env.memory.clone();
     let policy_store = env.policy_store.clone();
+    let policy_caps_for_loop = env.policy_caps.clone();
     let memory_baseline_for_loop = memory_baseline.clone();
     let policy_baseline_for_loop = policy_baseline.clone();
+    let policy_consideration_baseline_len_for_loop = policy_consideration_baseline_len;
     let cognition_baseline_for_loop = cognition_baseline_for_target.clone();
     let clock = env.clock.clone();
     let case_id_for_gui = case_id.to_string();
@@ -2283,6 +2290,16 @@ async fn execute_module_case(
                                 )
                                 .await
                         }
+                        ModuleEvalTarget::Policy => {
+                            policy_caps_for_loop.consideration_snapshots().len()
+                                > policy_consideration_baseline_len_for_loop
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
                         ModuleEvalTarget::Speak => {
                             utterances.last_complete().is_some()
                                 || module_activation_finished(
@@ -2376,6 +2393,9 @@ async fn execute_module_case(
     if module_target_uses_policy_store_artifact(target) {
         add_policy_diff_observation(&mut artifact, &policy_baseline, env.policy_store.as_ref())
             .await?;
+    }
+    if target == ModuleEvalTarget::Policy {
+        add_policy_considerations_observation(&mut artifact, &env.policy_caps)?;
     }
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
@@ -2548,6 +2568,33 @@ async fn activate_module_case_target(
                 .publish(nuillu_module::InteroceptiveUpdated)
                 .await
                 .expect("module eval failed to publish InteroceptiveUpdated");
+        }
+        ModuleEvalTarget::Policy => {
+            let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+            blackboard
+                .append_cognition_log(
+                    source.clone(),
+                    CognitionLogEntry {
+                        at: clock.now(),
+                        text: prompt.to_string(),
+                    },
+                )
+                .await;
+            for record in memo_seed_records {
+                harness
+                    .memo_updated_mailbox()
+                    .publish(nuillu_module::MemoUpdated {
+                        owner: record.owner.clone(),
+                        index: record.index,
+                    })
+                    .await
+                    .expect("module eval failed to publish MemoUpdated");
+            }
+            harness
+                .cognition_log_updated_mailbox()
+                .publish(CognitionLogUpdated::EntryAppended { source })
+                .await
+                .expect("module eval failed to publish CognitionLogUpdated");
         }
         ModuleEvalTarget::Speak => {
             if has_cognition_log_seed {
@@ -3047,6 +3094,18 @@ async fn add_policy_diff_observation(
     artifact
         .observations
         .insert("policy_diff".to_owned(), value);
+    Ok(())
+}
+
+fn add_policy_considerations_observation(
+    artifact: &mut CaseArtifact,
+    policy_caps: &PolicyCapabilities,
+) -> Result<()> {
+    let value = serde_json::to_value(policy_caps.consideration_snapshots())
+        .context("serialize policy considerations observation")?;
+    artifact
+        .observations
+        .insert("policy_considerations".to_owned(), value);
     Ok(())
 }
 

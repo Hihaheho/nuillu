@@ -413,6 +413,13 @@ fn render_judge_input_section(
             "Policy diff JSON",
             render_observation_paths(&request.artifact, &[("policy_diff", &["policy_diff"])]),
         ),
+        RubricJudgeInput::PolicyConsiderations => section(
+            "Policy considerations JSON",
+            render_observation_paths(
+                &request.artifact,
+                &[("policy_considerations", &["policy_considerations"])],
+            ),
+        ),
         RubricJudgeInput::MemoContents => {
             section("Memo contents", render_memo_contents(&request.artifact))
         }

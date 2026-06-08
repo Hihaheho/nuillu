@@ -134,6 +134,13 @@ pub struct PolicyConsiderationEvicted {
     pub payload: PolicyConsiderationPayload,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PolicyConsiderationSnapshot {
+    pub key: PolicyConsiderationKey,
+    pub written_at: DateTime<Utc>,
+    pub payload: PolicyConsiderationPayload,
+}
+
 #[derive(Clone)]
 struct PolicyConsiderationLog {
     inner: Rc<RefCell<PolicyConsiderationLogInner>>,
@@ -210,6 +217,28 @@ impl PolicyConsiderationLog {
         let (sender, receiver) = mpsc::unbounded();
         self.inner.borrow_mut().subscribers.push(sender);
         PolicyConsiderationEvictedInbox { receiver }
+    }
+
+    fn snapshot(&self) -> Vec<PolicyConsiderationSnapshot> {
+        let inner = self.inner.borrow();
+        let mut records = inner
+            .records
+            .values()
+            .flat_map(|records| records.iter())
+            .map(|record| PolicyConsiderationSnapshot {
+                key: record.key.clone(),
+                written_at: record.written_at,
+                payload: record.payload.clone(),
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            let a_owner = a.key.owner.to_string();
+            let b_owner = b.key.owner.to_string();
+            a_owner
+                .cmp(&b_owner)
+                .then_with(|| a.key.memo_index.cmp(&b.key.memo_index))
+        });
+        records
     }
 
     fn publish(&self, evicted: PolicyConsiderationEvicted) -> usize {
@@ -627,6 +656,10 @@ impl PolicyCapabilities {
 
     pub fn consideration_evicted_inbox(&self) -> PolicyConsiderationEvictedInbox {
         self.considerations.subscribe()
+    }
+
+    pub fn consideration_snapshots(&self) -> Vec<PolicyConsiderationSnapshot> {
+        self.considerations.snapshot()
     }
 
     pub fn upserter(&self) -> PolicyUpserter {
