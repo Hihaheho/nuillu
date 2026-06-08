@@ -457,6 +457,7 @@ mod tests {
             premium_backend: test_backend_config(),
             model_dir: PathBuf::from("models/potion-base-8M"),
             embedding_backend: None,
+            deactivated_modules: Vec::new(),
             disabled_modules: Vec::new(),
             participants: Vec::new(),
         };

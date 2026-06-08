@@ -13,16 +13,18 @@ use super::config::RuntimeModule;
 
 pub(super) fn server_registry(
     modules: &[RuntimeModule],
+    deactivated_modules: &[RuntimeModule],
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
     utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
+    let active_modules = select_active_modules(modules, deactivated_modules);
     let mut registry = ModuleRegistry::new();
     for module in modules {
         registry = register_server_module(
             registry,
             *module,
-            modules,
+            &active_modules,
             memory_caps,
             policy_caps,
             utterance_sink,
@@ -31,6 +33,12 @@ pub(super) fn server_registry(
     apply_standard_dependencies(
         registry,
         modules.iter().copied().map(RuntimeModule::module_id),
+    )
+    .remove_modules(
+        deactivated_modules
+            .iter()
+            .copied()
+            .map(RuntimeModule::module_id),
     )
 }
 
@@ -226,7 +234,7 @@ fn register_server_module(
             })
         }
         RuntimeModule::Interoception => {
-            let suppressed = sleep_suppressed_modules();
+            let suppressed = sleep_suppressed_modules(all_modules);
             registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), move |caps| {
                 let suppressed = suppressed.clone();
                 async move {
@@ -246,12 +254,18 @@ fn register_server_module(
             })
         }
         RuntimeModule::Homeostasis => {
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), |caps| async move {
-                Ok(nuillu_homeostasis::HomeostasisModule::new(
-                    caps.interoception_updated_inbox(),
-                    caps.interoception_reader(),
-                    caps.allocation_writer(homeostatic_drive_modules(), sleep_suppressed_modules()),
-                ))
+            let drive_modules = homeostatic_drive_modules(all_modules);
+            let suppressed = sleep_suppressed_modules(all_modules);
+            registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), move |caps| {
+                let drive_modules = drive_modules.clone();
+                let suppressed = suppressed.clone();
+                async move {
+                    Ok(nuillu_homeostasis::HomeostasisModule::new(
+                        caps.interoception_updated_inbox(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(drive_modules, suppressed),
+                    ))
+                }
             })
         }
         RuntimeModule::Policy => {
@@ -409,43 +423,72 @@ fn policy(
     )
 }
 
-fn homeostatic_drive_modules() -> Vec<ModuleId> {
-    vec![
-        builtin::memory_compaction(),
-        builtin::memory_association(),
-        builtin::memory_recombination(),
-        builtin::policy_compaction(),
-    ]
+fn sleep_suppressed_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
+    retain_present_modules(
+        vec![
+            builtin::cognition_gate(),
+            builtin::attention_schema(),
+            builtin::self_model(),
+            builtin::query_memory(),
+            builtin::memory(),
+            builtin::policy(),
+            builtin::reward(),
+            builtin::predict(),
+            builtin::surprise(),
+            builtin::speak(),
+        ],
+        modules,
+    )
 }
 
-fn sleep_suppressed_modules() -> Vec<ModuleId> {
-    vec![
-        builtin::cognition_gate(),
-        builtin::attention_schema(),
-        builtin::self_model(),
-        builtin::query_memory(),
-        builtin::memory(),
-        builtin::policy(),
-        builtin::reward(),
-        builtin::predict(),
-        builtin::surprise(),
-        builtin::speak(),
-    ]
+fn homeostatic_drive_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
+    retain_present_modules(
+        vec![
+            builtin::memory_compaction(),
+            builtin::memory_association(),
+            builtin::memory_recombination(),
+            builtin::policy_compaction(),
+        ],
+        modules,
+    )
 }
 
-fn voluntary_modules(_modules: &[RuntimeModule]) -> Vec<ModuleId> {
-    vec![
-        builtin::cognition_gate(),
-        builtin::attention_schema(),
-        builtin::self_model(),
-        builtin::query_memory(),
-        builtin::memory(),
-        builtin::policy(),
-        builtin::reward(),
-        builtin::predict(),
-        builtin::surprise(),
-        builtin::speak(),
-    ]
+fn voluntary_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
+    retain_present_modules(
+        vec![
+            builtin::cognition_gate(),
+            builtin::attention_schema(),
+            builtin::self_model(),
+            builtin::query_memory(),
+            builtin::memory(),
+            builtin::policy(),
+            builtin::reward(),
+            builtin::predict(),
+            builtin::surprise(),
+            builtin::speak(),
+        ],
+        modules,
+    )
+}
+
+fn retain_present_modules(ids: Vec<ModuleId>, modules: &[RuntimeModule]) -> Vec<ModuleId> {
+    let present = modules
+        .iter()
+        .copied()
+        .map(RuntimeModule::module_id)
+        .collect::<std::collections::HashSet<_>>();
+    ids.into_iter().filter(|id| present.contains(id)).collect()
+}
+
+fn select_active_modules(
+    modules: &[RuntimeModule],
+    deactivated_modules: &[RuntimeModule],
+) -> Vec<RuntimeModule> {
+    modules
+        .iter()
+        .copied()
+        .filter(|module| !deactivated_modules.contains(module))
+        .collect()
 }
 
 fn set_allocation_module(

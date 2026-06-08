@@ -4,8 +4,8 @@ use anyhow::Context as _;
 use clap::Parser;
 use nuillu_server::{
     EmbeddingBackendConfig, EmbeddingRole, RuntimeModule, ServerConfig, default_server_session_id,
-    install_lutum_trace_subscriber, parse_model_set_file, resolve_llm_backends,
-    resolve_token_fields, run_server_with_visualizer,
+    install_lutum_trace_subscriber, load_server_boot_config, parse_model_set_file,
+    resolve_llm_backends, resolve_token_fields, run_server_with_visualizer,
 };
 
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
     let premium_backend = backends.premium;
     let embedding_backend = resolve_embedding(model_set.embedding.as_ref())?;
     let session_id = resolve_session_id(args.session_id, args.run_id);
+    let boot_config = load_server_boot_config(&args.state)?;
 
     run_server_with_visualizer(ServerConfig {
         state_dir: args.state,
@@ -70,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         premium_backend,
         model_dir: args.model_dir,
         embedding_backend,
+        deactivated_modules: boot_config.deactivate_modules,
         disabled_modules: args.disable_module,
         participants: args.participants,
     })

@@ -107,15 +107,20 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
 
     let modules = DEFAULT_MODULES.to_vec();
+    let active_modules = config.active_modules();
     let env = build_server_environment(
         &config,
-        full_agent_allocation(&modules),
+        full_agent_allocation(&active_modules),
         visualizer.event_sender(),
     )
     .await?;
     env.caps.scene().set(scene.participants());
     emit_scene_state(&scene, visualizer, &tab_id);
-    for module in &config.disabled_modules {
+    for module in config
+        .disabled_modules
+        .iter()
+        .filter(|module| active_modules.contains(module))
+    {
         env.blackboard
             .apply(BlackboardCommand::SetModuleForcedDisabled {
                 module: module.module_id(),
@@ -146,6 +151,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     loop {
         let allocated = server_registry(
             &modules,
+            &config.deactivated_modules,
             &env.memory_caps,
             &env.policy_caps,
             &env.utterance_sink,

@@ -1077,6 +1077,32 @@ impl ModuleRegistry {
         self
     }
 
+    /// Remove a registered module role and any dependency edges touching it.
+    ///
+    /// Removing an absent module is a no-op. This is intended for host boot
+    /// configuration that starts from a common registry and subtracts modules.
+    pub fn remove_module(self, module: ModuleId) -> Self {
+        self.remove_modules([module])
+    }
+
+    /// Remove registered module roles and any dependency edges touching them.
+    pub fn remove_modules<I>(mut self, modules: I) -> Self
+    where
+        I: IntoIterator<Item = ModuleId>,
+    {
+        let removed = modules.into_iter().collect::<HashSet<_>>();
+        if removed.is_empty() {
+            return self;
+        }
+
+        self.registrations
+            .retain(|registration| !removed.contains(&registration.module));
+        self.dependencies.retain(|(dependent, dependency)| {
+            !removed.contains(dependent) && !removed.contains(dependency)
+        });
+        self
+    }
+
     /// Register a module type with its boot-time policy. The module's identity
     /// and prompt/allocation catalogs come from [`Module::id`],
     /// [`Module::peer_context`], and [`Module::allocation_hint`].
@@ -1669,6 +1695,61 @@ mod tests {
             blackboard.allocation_hints().to_vec(),
             vec![(allocation_only, "test allocation hint")]
         );
+    }
+
+    #[tokio::test]
+    async fn remove_module_omits_build_policy_and_context_catalog() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard.clone());
+        let allocated = ModuleRegistry::new()
+            .register(test_policy(0..=1), noop_builder)
+            .unwrap()
+            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .unwrap()
+            .remove_module(nuillu_types::ModuleId::new(NoopModule::id()).unwrap())
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let noop = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
+        let allocation_only = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+
+        assert_eq!(allocated.len(), 1);
+        let has_noop_policy = blackboard
+            .read(|bb| bb.module_policies().contains_key(&noop))
+            .await;
+        assert!(!has_noop_policy);
+        let has_allocation_only_policy = blackboard
+            .read(|bb| bb.module_policies().contains_key(&allocation_only))
+            .await;
+        assert!(has_allocation_only_policy);
+        assert_eq!(blackboard.peer_contexts().to_vec(), Vec::new());
+        assert_eq!(
+            blackboard.allocation_hints().to_vec(),
+            vec![(allocation_only, "test allocation hint")]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_module_prunes_dependency_edges() {
+        let blackboard = Blackboard::default();
+        let caps = test_caps(blackboard);
+        let dependent = nuillu_types::ModuleId::new(NoopModule::id()).unwrap();
+        let dependency = nuillu_types::ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+        let allocated = ModuleRegistry::new()
+            .register(test_policy(0..=1), noop_builder)
+            .unwrap()
+            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .unwrap()
+            .depends_on(dependent.clone(), dependency.clone())
+            .remove_modules([dependency.clone()])
+            .build(&caps)
+            .await
+            .unwrap();
+
+        assert_eq!(allocated.len(), 1);
+        assert_eq!(allocated.dependencies().deps_of(&dependent), &[]);
+        assert_eq!(allocated.dependencies().dependents_of(&dependency), &[]);
     }
 
     #[tokio::test]
