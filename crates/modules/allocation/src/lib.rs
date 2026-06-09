@@ -494,27 +494,42 @@ impl AllocationModule {
             cx.warn(format!("allocation activation failed: {detail}"));
             anyhow::bail!("allocation {detail}");
         };
-        if applied.memo.is_empty() {
+        if applied.memo().is_empty() {
             let detail = "tool turn applied but memo field was empty";
             cx.warn(format!("allocation activation failed: {detail}"));
             anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
         }
 
-        self.allocation_writer.submit(applied.commands).await;
+        match applied {
+            AppliedDecision::Unchanged { .. } => {}
+            AppliedDecision::Reprioritize { commands, .. } => {
+                self.allocation_writer.submit(commands).await;
+            }
+        }
         Ok(())
     }
 }
 
-struct AppliedDecision {
-    memo: String,
-    commands: Vec<AllocationCommand>,
+enum AppliedDecision {
+    Unchanged {
+        memo: String,
+    },
+    Reprioritize {
+        memo: String,
+        commands: Vec<AllocationCommand>,
+    },
+}
+
+impl AppliedDecision {
+    fn memo(&self) -> &str {
+        match self {
+            Self::Unchanged { memo } | Self::Reprioritize { memo, .. } => memo,
+        }
+    }
 }
 
 fn apply_no_change(memo: String) -> AppliedDecision {
-    AppliedDecision {
-        memo,
-        commands: Vec::new(),
-    }
+    AppliedDecision::Unchanged { memo }
 }
 
 fn apply_reprioritize(
@@ -550,7 +565,7 @@ fn apply_reprioritize(
         ));
     }
 
-    AppliedDecision { memo, commands }
+    AppliedDecision::Reprioritize { memo, commands }
 }
 
 fn priority_level(rank: usize) -> AllocationEffectLevel {
@@ -674,13 +689,13 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
-        Blackboard, Bpm, ModuleConfig, ResourceAllocation, linear_ratio_fn,
+        Blackboard, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
     };
-    use nuillu_types::builtin;
+    use nuillu_types::{ReplicaCapRange, builtin};
 
     #[test]
     fn no_decision_failure_detail_includes_tool_names() {
@@ -805,12 +820,42 @@ mod tests {
         allocation
     }
 
-    fn test_policy() -> nuillu_blackboard::ModulePolicy {
-        nuillu_blackboard::ModulePolicy::new(
-            nuillu_types::ReplicaCapRange::new(0, 0).unwrap(),
+    fn policy_with_replicas(min: u8, max: u8) -> ModulePolicy {
+        ModulePolicy::new(
+            ReplicaCapRange::new(min, max).unwrap(),
             Bpm::from_f64(60.0)..=Bpm::from_f64(60.0),
             linear_ratio_fn,
         )
+    }
+
+    fn test_policy() -> ModulePolicy {
+        policy_with_replicas(0, 0)
+    }
+
+    fn always_active_policy() -> ModulePolicy {
+        policy_with_replicas(1, 1)
+    }
+
+    fn optionally_active_policy() -> ModulePolicy {
+        policy_with_replicas(0, 1)
+    }
+
+    fn allocation_no_change_base_allocation() -> ResourceAllocation {
+        let mut allocation = ResourceAllocation::default();
+        for module in [builtin::allocation(), builtin::sensory()] {
+            allocation.set(module.clone(), ModuleConfig::default());
+            allocation.set_activation(module, ActivationRatio::ONE);
+        }
+        for module in [
+            builtin::query_memory(),
+            builtin::memory(),
+            builtin::self_model(),
+            builtin::speak(),
+        ] {
+            allocation.set(module.clone(), ModuleConfig::default());
+            allocation.set_activation(module, ActivationRatio::ZERO);
+        }
+        allocation
     }
 
     macro_rules! noop_stub {
@@ -850,6 +895,10 @@ mod tests {
 
     noop_stub!(AllocationStub, "allocation");
     noop_stub!(SensoryStub, "sensory");
+    noop_stub!(QueryMemoryStub, "query-memory");
+    noop_stub!(MemoryStub, "memory");
+    noop_stub!(SelfModelStub, "self-model");
+    noop_stub!(SpeakStub, "speak");
 
     struct ControllerFixture {
         controller: AllocationModule,
@@ -911,6 +960,99 @@ mod tests {
         }
     }
 
+    struct AllocationNoChangeFixture {
+        controller: AllocationModule,
+        source_memo: Memo,
+        peer_contexts: Vec<(ModuleId, &'static str)>,
+        allocation_hints: Vec<(ModuleId, &'static str)>,
+    }
+
+    async fn allocation_no_change_fixture_with_turn_adapter<T>(
+        adapter: Arc<T>,
+    ) -> AllocationNoChangeFixture
+    where
+        T: TurnAdapter,
+    {
+        let blackboard = Blackboard::with_allocation(allocation_no_change_base_allocation());
+        let caps = test_caps_with_turn_adapter(blackboard, adapter);
+
+        let controller_cell = Rc::new(RefCell::new(None));
+        let source_memo_cell = Rc::new(RefCell::new(None));
+
+        let controller_sink = Rc::clone(&controller_cell);
+        let source_memo_sink = Rc::clone(&source_memo_cell);
+
+        let _modules = ModuleRegistry::new()
+            .register(always_active_policy(), move |caps| {
+                let controller_sink = Rc::clone(&controller_sink);
+                async move {
+                    *controller_sink.borrow_mut() = Some(AllocationModule::new(
+                        caps.memo_updated_inbox(),
+                        caps.attention_control_inbox(),
+                        caps.blackboard_reader(),
+                        caps.cognition_log_reader(),
+                        caps.allocation_reader(),
+                        caps.interoception_reader(),
+                        caps.allocation_writer(
+                            vec![
+                                builtin::query_memory(),
+                                builtin::memory(),
+                                builtin::self_model(),
+                                builtin::speak(),
+                            ],
+                            Vec::new(),
+                        ),
+                        caps.llm_access(),
+                        caps.session("main")
+                            .with_auto_compaction(session_auto_compaction())
+                            .await?,
+                    ));
+                    Ok(AllocationStub)
+                }
+            })
+            .unwrap()
+            .register(always_active_policy(), move |caps| {
+                let source_memo_sink = Rc::clone(&source_memo_sink);
+                async move {
+                    *source_memo_sink.borrow_mut() = Some(caps.memo());
+                    Ok(SensoryStub)
+                }
+            })
+            .unwrap()
+            .register(optionally_active_policy(), |_caps| async {
+                Ok(QueryMemoryStub)
+            })
+            .unwrap()
+            .register(optionally_active_policy(), |_caps| async { Ok(MemoryStub) })
+            .unwrap()
+            .register(optionally_active_policy(), |_caps| async {
+                Ok(SelfModelStub)
+            })
+            .unwrap()
+            .register(optionally_active_policy(), |_caps| async { Ok(SpeakStub) })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        AllocationNoChangeFixture {
+            controller: controller_cell.borrow_mut().take().unwrap(),
+            source_memo: source_memo_cell.borrow_mut().take().unwrap(),
+            peer_contexts: vec![
+                (builtin::query_memory(), "test stub"),
+                (builtin::memory(), "test stub"),
+                (builtin::self_model(), "test stub"),
+                (builtin::speak(), "test stub"),
+            ],
+            allocation_hints: vec![
+                (builtin::query_memory(), "test allocation target"),
+                (builtin::memory(), "test allocation target"),
+                (builtin::self_model(), "test allocation target"),
+                (builtin::speak(), "test allocation target"),
+            ],
+        }
+    }
+
     fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
@@ -950,6 +1092,34 @@ mod tests {
         })
     }
 
+    fn expect_reprioritize(applied: AppliedDecision) -> (String, Vec<AllocationCommand>) {
+        let AppliedDecision::Reprioritize { memo, commands } = applied else {
+            panic!("expected reprioritize decision");
+        };
+        (memo, commands)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SpeakAllocationSnapshot {
+        activation: ActivationRatio,
+        active_replicas: u8,
+        guidance: String,
+    }
+
+    async fn speak_allocation_snapshot(controller: &AllocationModule) -> SpeakAllocationSnapshot {
+        controller
+            .blackboard
+            .read(|bb| {
+                let allocation = bb.allocation();
+                SpeakAllocationSnapshot {
+                    activation: allocation.activation_for(&builtin::speak()),
+                    active_replicas: allocation.active_replicas(&builtin::speak()),
+                    guidance: allocation.for_module(&builtin::speak()).guidance,
+                }
+            })
+            .await
+    }
+
     fn message_with_role_contains(
         item: &ModelInputItem,
         expected_role: InputMessageRole,
@@ -987,7 +1157,7 @@ mod tests {
         // controller has no current target opinion for the module.
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
-        let applied = apply_reprioritize(
+        let (memo, commands) = expect_reprioritize(apply_reprioritize(
             &registered,
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
@@ -1005,25 +1175,19 @@ mod tests {
                     ("sensory".into(), "keep watching the food bowl".into()),
                 ]),
             },
-        );
+        ));
 
-        assert_eq!(applied.memo, "checked");
-        assert!(
-            last_target(
-                &applied.commands,
-                &ModuleId::new("invented-module").unwrap()
-            )
-            .is_none()
-        );
-        let speak = last_target(&applied.commands, &builtin::speak()).unwrap();
+        assert_eq!(memo, "checked");
+        assert!(last_target(&commands, &ModuleId::new("invented-module").unwrap()).is_none());
+        let speak = last_target(&commands, &builtin::speak()).unwrap();
         assert_eq!(speak.level, AllocationEffectLevel::High);
         assert_eq!(
             speak.guidance.as_deref(),
             Some("respond from cognition log when ready")
         );
-        let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
+        let sensory = last_target(&commands, &builtin::sensory()).unwrap();
         assert_eq!(sensory.level, AllocationEffectLevel::Normal);
-        assert!(last_target(&applied.commands, &builtin::cognition_gate()).is_none());
+        assert!(last_target(&commands, &builtin::cognition_gate()).is_none());
     }
 
     #[test]
@@ -1044,7 +1208,7 @@ mod tests {
         );
         current.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
 
-        let applied = apply_reprioritize(
+        let (_memo, commands) = expect_reprioritize(apply_reprioritize(
             &registered,
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
@@ -1054,16 +1218,14 @@ mod tests {
                     "inspect queued input".into(),
                 )]),
             },
-        );
+        ));
 
-        assert!(last_target(&applied.commands, &builtin::allocation()).is_none());
+        assert!(last_target(&commands, &builtin::allocation()).is_none());
         assert_eq!(
-            last_target(&applied.commands, &builtin::sensory())
-                .unwrap()
-                .level,
+            last_target(&commands, &builtin::sensory()).unwrap().level,
             AllocationEffectLevel::Max
         );
-        assert!(last_target(&applied.commands, &builtin::cognition_gate()).is_none());
+        assert!(last_target(&commands, &builtin::cognition_gate()).is_none());
     }
 
     #[test]
@@ -1072,18 +1234,18 @@ mod tests {
         registered.insert(builtin::speak());
         registered.insert(builtin::sensory());
 
-        let applied = apply_reprioritize(
+        let (_memo, commands) = expect_reprioritize(apply_reprioritize(
             &registered,
             ReprioritizeModulesArgs {
                 memo: "checked".into(),
                 priority_module_ids: vec!["speak".into(), "sensory".into()],
                 hints_by_module: BTreeMap::from([("speak".into(), "   ".into())]),
             },
-        );
+        ));
 
-        let speak = last_target(&applied.commands, &builtin::speak()).unwrap();
+        let speak = last_target(&commands, &builtin::speak()).unwrap();
         assert_eq!(speak.guidance, None);
-        let sensory = last_target(&applied.commands, &builtin::sensory()).unwrap();
+        let sensory = last_target(&commands, &builtin::sensory()).unwrap();
         assert_eq!(sensory.guidance, None);
     }
 
@@ -1162,6 +1324,73 @@ mod tests {
         );
         assert!(!input.contains("Never call leave_allocation_unchanged"));
         assert!(!input.contains("not instructions"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn leave_allocation_unchanged_preserves_previous_reprioritize_effects() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(tool_scenario(
+                "reprioritize_modules",
+                serde_json::json!({
+                    "memo": "Admit retrieval, memory, self-model framing, and speech.",
+                    "priority_module_ids": [
+                        "query-memory",
+                        "memory",
+                        "self-model",
+                        "speak"
+                    ],
+                    "hints_by_module": {
+                        "memory": "retrieve the developer identity fact",
+                        "self-model": "frame the answer correctly",
+                        "speak": "answer when grounded"
+                    }
+                })
+                .to_string(),
+                1,
+            ))
+            .with_text_scenario(leave_unchanged_scenario(
+                1,
+                "No allocation change is needed; keep the prior target effects.",
+            ));
+        let AllocationNoChangeFixture {
+            mut controller,
+            source_memo,
+            peer_contexts,
+            allocation_hints,
+        } = allocation_no_change_fixture_with_turn_adapter(Arc::new(adapter)).await;
+
+        let lutum = controller.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let compaction = nuillu_module::SessionCompactionRuntime::new(
+            lutum.lutum().clone(),
+            nuillu_module::LlmConcurrencyLimiter::new(None),
+            nuillu_types::ModelTier::Cheap,
+            nuillu_module::SessionCompactionPolicy::default(),
+        );
+        let cx = nuillu_module::ActivateCx::new(
+            &peer_contexts,
+            &allocation_hints,
+            &identity_memories,
+            &[],
+            compaction,
+            SystemClock.now(),
+        );
+
+        source_memo
+            .write("Ryo full-name query needs an answer.")
+            .await;
+        controller.activate_with(&cx, &[]).await.unwrap();
+        let first = speak_allocation_snapshot(&controller).await;
+        assert_eq!(first.activation, ActivationRatio::from_f64(0.15));
+        assert_eq!(first.active_replicas, 1);
+        assert_eq!(first.guidance, "answer when grounded");
+
+        source_memo
+            .write("Follow-up allocation turn should retain current posture.")
+            .await;
+        controller.activate_with(&cx, &[]).await.unwrap();
+        let second = speak_allocation_snapshot(&controller).await;
+        assert_eq!(second, first);
     }
 
     #[tokio::test(flavor = "current_thread")]
