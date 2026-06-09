@@ -51,17 +51,16 @@ turns but do not encode it as JSON, YAML, a code block, or any fixed schema."#;
 const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the allocation module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve memo-log facts, prior allocation
-decisions, allocation notes, guidance changes, and relevant cognition-log context needed for future
-allocation decisions. Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, prior allocation decisions,
+allocation notes, guidance changes, and relevant cognition-log context needed for future allocation
+decisions."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_ALLOCATION_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

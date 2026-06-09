@@ -6,8 +6,21 @@ use crate::llm::{LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
 
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
+pub const DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS: u32 = 800;
 const COMPACTION_SUMMARY_USER_INPUT: &str =
-    "Summarize the session history above per the system instructions.";
+    "Coarsely summarize the session history above per the shared compaction instructions.";
+const SHARED_SESSION_COMPACTION_PROMPT: &str = r#"You compact a module's persistent session history.
+Summarize only the prefix transcript you receive.
+
+Shared rules:
+- Do not copy, rewrite, or continue the transcript.
+- Produce a coarse summary, not a turn log.
+- Use at most 8 bullet points.
+- Aim for roughly 40 characters per bullet; exceed only to avoid losing a needed fact.
+- Preserve only state, decisions, outputs, constraints, corrections, and unresolved questions that could affect future turns.
+- Drop routine tool plumbing, repeated inputs, restated instructions, and dead branches.
+- Do not invent facts.
+- Return plain text bullets only."#;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SessionCompactionConfig {
@@ -144,6 +157,14 @@ pub fn session_compaction_cutoff(item_count: usize, prefix_ratio: f64) -> Option
     Some(cutoff.clamp(1, item_count.saturating_sub(1)))
 }
 
+fn format_session_compaction_prompt(compaction_focus: &str) -> String {
+    let compaction_focus = compaction_focus.trim();
+    if compaction_focus.is_empty() {
+        return SHARED_SESSION_COMPACTION_PROMPT.to_owned();
+    }
+    format!("{SHARED_SESSION_COMPACTION_PROMPT}\n\nModule-specific focus:\n{compaction_focus}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_session_if_needed(
     session: &mut Session,
@@ -153,7 +174,7 @@ pub async fn compact_session_if_needed(
     protected_prefix: SessionCompactionProtectedPrefix,
     module_name: &str,
     compacted_prefix: &str,
-    compaction_prompt: &str,
+    compaction_focus: &str,
 ) {
     let threshold = runtime.input_token_threshold();
     if input_tokens <= threshold {
@@ -166,7 +187,7 @@ pub async fn compact_session_if_needed(
         config,
         protected_prefix,
         compacted_prefix,
-        compaction_prompt,
+        compaction_focus,
     )
     .await
     {
@@ -187,7 +208,7 @@ pub async fn compact_session(
     config: SessionCompactionConfig,
     protected_prefix: SessionCompactionProtectedPrefix,
     compacted_prefix: &str,
-    compaction_prompt: &str,
+    compaction_focus: &str,
 ) -> Result<()> {
     let items = session.input().items();
     let protected_prefix_len = protected_prefix_len(items, protected_prefix);
@@ -202,10 +223,11 @@ pub async fn compact_session(
     let prefix = items[protected_prefix_len..cutoff].to_vec();
     let suffix = items[cutoff..].to_vec();
 
+    let system_prompt = format_session_compaction_prompt(compaction_focus);
     let mut summary_items = Vec::with_capacity(prefix.len().saturating_add(1));
     summary_items.push(ModelInputItem::text(
         InputMessageRole::System,
-        compaction_prompt,
+        system_prompt,
     ));
     summary_items.extend(prefix);
     // Responses API rejects inputs ending with two or more assistant messages; faculty
@@ -216,6 +238,7 @@ pub async fn compact_session(
     ));
     let summary = lutum
         .text_turn(ModelInput::from_items(summary_items))
+        .max_output_tokens(DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS)
         .collect()
         .await
         .context("summarize session prefix")?
@@ -291,6 +314,7 @@ mod tests {
     struct CapturingAdapter {
         inner: MockLlmAdapter,
         text_inputs: Arc<Mutex<Vec<ModelInput>>>,
+        text_turns: Arc<Mutex<Vec<AdapterTextTurn>>>,
     }
 
     impl CapturingAdapter {
@@ -298,11 +322,16 @@ mod tests {
             Self {
                 inner,
                 text_inputs: Arc::new(Mutex::new(Vec::new())),
+                text_turns: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn text_inputs(&self) -> Vec<ModelInput> {
             self.text_inputs.lock().unwrap().clone()
+        }
+
+        fn text_turns(&self) -> Vec<AdapterTextTurn> {
+            self.text_turns.lock().unwrap().clone()
         }
     }
 
@@ -314,6 +343,7 @@ mod tests {
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
             self.text_inputs.lock().unwrap().push(input.clone());
+            self.text_turns.lock().unwrap().push(turn.clone());
             self.inner.text_turn(input, turn).await
         }
 
@@ -388,6 +418,20 @@ mod tests {
         text
     }
 
+    fn system_text(item: &ModelInputItem) -> &str {
+        let ModelInputItem::Message {
+            role: InputMessageRole::System,
+            content,
+        } = item
+        else {
+            panic!("expected system message item");
+        };
+        let [MessageContent::Text(text)] = content.as_slice() else {
+            panic!("expected system text content");
+        };
+        text
+    }
+
     #[test]
     fn policy_resolves_threshold_by_module_tier() {
         let policy = SessionCompactionPolicy::new(11, 22, 33);
@@ -416,7 +460,7 @@ mod tests {
             SessionCompactionProtectedPrefix::None,
             "test-module",
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await;
 
@@ -447,7 +491,7 @@ mod tests {
             SessionCompactionProtectedPrefix::None,
             "test-module",
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await;
 
@@ -455,6 +499,47 @@ mod tests {
         assert_eq!(
             assistant_text(&session.input().items()[0]),
             "Compacted session:\nold history"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_uses_shared_prompt_focus_and_output_cap() {
+        let adapter = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(summary_scenario("- old history")),
+        );
+        let (lutum, observed) = lutum_with_adapter(adapter);
+        let mut session = Session::new();
+        session.push_user("history-0");
+        session.push_user("history-1");
+        session.push_user("history-2");
+
+        compact_session(
+            &mut session,
+            &lutum,
+            SessionCompactionConfig::default(),
+            SessionCompactionProtectedPrefix::None,
+            "Compacted session:",
+            "Preserve important test facts.",
+        )
+        .await
+        .unwrap();
+
+        let captured = observed.text_inputs();
+        assert_eq!(captured.len(), 1);
+        let summary_items = captured[0].items();
+        let prompt = system_text(&summary_items[0]);
+        assert!(prompt.contains("You compact a module's persistent session history."));
+        assert!(prompt.contains("Do not copy, rewrite, or continue the transcript."));
+        assert!(prompt.contains("Use at most 8 bullet points."));
+        assert!(prompt.contains("Aim for roughly 40 characters per bullet"));
+        assert!(prompt.contains("Module-specific focus:"));
+        assert!(prompt.contains("Preserve important test facts."));
+
+        let turns = observed.text_turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].config.generation.max_output_tokens,
+            Some(DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS)
         );
     }
 
@@ -479,7 +564,7 @@ mod tests {
             SessionCompactionConfig { prefix_ratio: 0.6 },
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await
         .unwrap();
@@ -550,7 +635,7 @@ mod tests {
             SessionCompactionConfig { prefix_ratio: 0.6 },
             SessionCompactionProtectedPrefix::None,
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await
         .unwrap();
@@ -579,7 +664,7 @@ mod tests {
             SessionCompactionConfig { prefix_ratio: 0.8 },
             SessionCompactionProtectedPrefix::Count(99),
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await
         .unwrap();
@@ -625,7 +710,7 @@ mod tests {
             SessionCompactionConfig { prefix_ratio: 0.6 },
             SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await
         .unwrap();
@@ -664,7 +749,7 @@ mod tests {
             SessionCompactionConfig { prefix_ratio: 1.0 },
             SessionCompactionProtectedPrefix::LeadingSystem,
             "Compacted session:",
-            "Summarize.",
+            "Preserve test facts.",
         )
         .await
         .unwrap();

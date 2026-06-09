@@ -28,17 +28,15 @@ any fixed schema."#;
 
 const COMPACTED_PREDICT_SESSION_PREFIX: &str = "Compacted predict session history:";
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the predict module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve prior predictions, their subjects,
-validity horizons, rationales, and cognition-log context needed for future prediction updates.
-Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior predictions, their subjects, validity
+horizons, rationales, and cognition-log context needed for future prediction updates."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_PREDICT_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

@@ -40,17 +40,16 @@ const ACTIVATION_INPUT: &str = "Assess whether the new cognition is surprising r
 const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the surprise module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve prior surprise assessments, predict memo
-log facts, significant events, memory preservation requests, and cognition-log context needed for
-future surprise checks. Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior surprise assessments, predict memo-log
+facts, significant events, memory preservation requests, and cognition-log context needed for future
+surprise checks."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_SURPRISE_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

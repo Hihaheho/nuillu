@@ -111,10 +111,10 @@ pub use session::{
     ensure_persistent_session_seeded, push_persistent_identity_seed_if_absent,
 };
 pub use session_compaction::{
-    DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_PREFIX_RATIO,
-    SessionCompactionConfig, SessionCompactionPolicy, SessionCompactionProtectedPrefix,
-    SessionCompactionRuntime, compact_session, compact_session_if_needed,
-    session_compaction_cutoff,
+    DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD, DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS,
+    DEFAULT_SESSION_COMPACTION_PREFIX_RATIO, SessionCompactionConfig, SessionCompactionPolicy,
+    SessionCompactionProtectedPrefix, SessionCompactionRuntime, compact_session,
+    compact_session_if_needed, session_compaction_cutoff,
 };
 pub use tiers::{LlmConcurrencyPool, LlmTierHandle, LutumTiers};
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};

@@ -46,10 +46,9 @@ use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the query-memory module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve broadcast facts, query requests, memory
-search arguments, useful memory hits, rejected broad searches, and allocation/cognition context that
-future retrieval should remember. Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve broadcast facts, query requests, memory search
+arguments, useful memory hits, rejected broad searches, and allocation/cognition context that future
+retrieval should remember."#;
 const TOOL_RESULT_CONTINUATION_PROMPT: &str = r#"Continue memory retrieval from the tool results above.
 If a search hit may answer the request and has linked_neighbor_count greater than zero, call
 fetch_linked_memories for the seed hit before broadcasting results.
@@ -73,7 +72,7 @@ pub fn query_session_auto_compaction() -> SessionAutoCompaction {
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_QUERY_MEMORY_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

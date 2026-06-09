@@ -28,18 +28,16 @@ details in memo text. Do not write to the cognition log, memory, or emit utteran
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
 
 const COMPACTED_SENSORY_SESSION_PREFIX: &str = "Compacted sensory session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the sensory module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve observed sensory facts, source/direction
-details, relative timing, salience/habituation cues, memo-log outputs written through tools,
-ignored/background context that may affect future salience, and uncertainty.
-Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve observed sensory facts, source/direction details,
+relative timing, salience/habituation cues, memo-log outputs written through tools,
+ignored/background context that may affect future salience, and uncertainty."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_SENSORY_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

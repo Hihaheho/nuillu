@@ -31,17 +31,16 @@ const POLICY_HIT_TEXT_CHARS: usize = 240;
 const POLICY_MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(6, 1_200, 4_200);
 const POLICY_COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
 const COMPACTED_POLICY_SESSION_PREFIX: &str = "Compacted policy session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the policy module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve reusable policy advice, existing policy
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve reusable policy advice, existing policy
 judgments, synthetic policy candidates, cautions, and reward-relevant rationale future policy
-decisions need. Do not invent policies or claim persistence. Return plain text only."#;
+decisions need."#;
 
 pub fn policy_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_POLICY_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

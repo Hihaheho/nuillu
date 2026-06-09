@@ -43,17 +43,15 @@ const WAKE_AROUSAL_SLEEP_LEVEL: f32 = 0.25;
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 800, 3_000);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
 const COMPACTED_INTEROCEPTION_SESSION_PREFIX: &str = "Compacted interoception session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the interoception module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve affect-state judgments, salient evidence,
-and wake/sleep pressure rationale future interoception decisions need. Do not invent observations.
-Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve affect-state judgments, salient evidence, and
+wake/sleep pressure rationale future interoception decisions need."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_INTEROCEPTION_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

@@ -81,7 +81,7 @@ pub struct SessionAutoCompaction {
     pub config: SessionCompactionConfig,
     pub protected_prefix: SessionCompactionProtectedPrefix,
     pub compacted_prefix: &'static str,
-    pub compaction_prompt: &'static str,
+    pub compaction_focus: &'static str,
 }
 
 impl SessionAutoCompaction {
@@ -89,13 +89,13 @@ impl SessionAutoCompaction {
         config: SessionCompactionConfig,
         protected_prefix: SessionCompactionProtectedPrefix,
         compacted_prefix: &'static str,
-        compaction_prompt: &'static str,
+        compaction_focus: &'static str,
     ) -> Self {
         Self {
             config,
             protected_prefix,
             compacted_prefix,
-            compaction_prompt,
+            compaction_focus,
         }
     }
 }

@@ -151,7 +151,7 @@ impl<'a> ActivateCx<'a> {
                 profile.config,
                 profile.protected_prefix,
                 profile.compacted_prefix,
-                profile.compaction_prompt,
+                profile.compaction_focus,
             )
             .await
             {

@@ -26,17 +26,16 @@ question/answer, but do not encode the memo as JSON, YAML, a code block, or any 
 const COMPACTED_SELF_MODEL_SESSION_PREFIX: &str = "Compacted self-model session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the self-model module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve self-descriptions, self-model questions
-and answers, memo-log facts about the agent, attention-schema first-person cognition, uncertainty,
-and corrections. Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve self-descriptions, self-model questions and
+answers, memo-log facts about the agent, attention-schema first-person cognition, uncertainty, and
+corrections."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_SELF_MODEL_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

@@ -78,11 +78,9 @@ output channel."#;
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the cognition-gate module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve information that future cognition-gate
-decisions need: memo-log facts, prior gate decisions, promoted events, rejected candidate events,
-allocation guidance, cognition-log context, and relevant memory metadata. Do not invent facts.
-Keep the summary concise, explicit, and faithful. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, prior gate decisions, promoted
+events, rejected candidate events, allocation guidance, cognition-log context, and relevant memory
+metadata needed for future cognition-gate decisions."#;
 const ACTIVATION_INPUT: &str = "Decide what, if anything, should enter conscious cognition now.";
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
@@ -90,7 +88,7 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_COGNITION_GATE_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

@@ -44,17 +44,16 @@ const REWARD_CONSIDERATION_CHARS: usize = 3_000;
 const REWARD_MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_000, 4_000);
 const REWARD_COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 600, 3_000);
 const COMPACTED_REWARD_SESSION_PREFIX: &str = "Compacted reward session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the reward module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve policy-consideration outcome evidence,
-reward channel judgments, candidate credit rationale, and policy update consequences future reward
-decisions need. Do not invent outcomes. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve policy-consideration outcome evidence, reward
+channel judgments, candidate credit rationale, and policy update consequences future reward
+decisions need."#;
 
 pub fn reward_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_REWARD_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

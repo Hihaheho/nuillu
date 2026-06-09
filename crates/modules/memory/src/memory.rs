@@ -60,17 +60,15 @@ const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600
 const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
-const SESSION_COMPACTION_PROMPT: &str = r#"You compact the memory module's persistent session history.
-Summarize only the prefix transcript you receive. Preserve cognition-log facts, memory requests,
-inserted memory content, rejected candidates, and deduplication decisions future memory decisions
-need. Do not invent facts. Return plain text only."#;
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve cognition-log facts, memory requests, inserted
+memory content, rejected candidates, and deduplication decisions future memory decisions need."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
         SessionCompactionConfig::default(),
         SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
         COMPACTED_MEMORY_SESSION_PREFIX,
-        SESSION_COMPACTION_PROMPT,
+        SESSION_COMPACTION_FOCUS,
     )
 }
 

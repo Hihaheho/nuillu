@@ -1817,7 +1817,7 @@ mod tests {
                 SessionCompactionConfig::default(),
                 SessionCompactionProtectedPrefix::LeadingSystem,
                 "Compacted session:",
-                "Summarize.",
+                "Preserve test facts.",
             ))
             .await
             .expect("session acquisition should succeed");
