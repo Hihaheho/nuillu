@@ -1,0 +1,100 @@
+id: module-sensory-records-third-japanese-greeting
+description: Sensory should keep a participant-directed Japanese greeting durable even when the same greeting has already appeared twice in the module session.
+modules = ["sensory"]
+prompt: Watch one-shot participant observations and write concise sensory memos when a current social signal should remain available downstream.
+context: This isolates the sensory failure mode where a repeated short Japanese greeting is ignored as low novelty even though downstream cognition and speech need the current social signal.
+
+limits {
+  max-llm-calls = 8
+}
+
+participants = ["Peer"]
+
+@ steps[] {
+  description: Initial participant greeting establishes the first sensory ledger entry.
+
+  @ inputs[] {
+    $variant: one-shot
+    modality: audition
+    direction: Peer
+    content: Peer says, "こんにちは。"
+  }
+}
+
+@ steps[] {
+  description: The same participant greets again.
+
+  @ inputs[] {
+    $variant: one-shot
+    modality: audition
+    direction: Peer
+    content: Peer says, "こんにちは。"
+  }
+}
+
+@ steps[] {
+  description: The same participant greets a third time in the current moment.
+
+  @ inputs[] {
+    $variant: one-shot
+    modality: audition
+    direction: Peer
+    content: Peer says, "こんにちは。"
+  }
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: writes-sensory-memo
+  must-pass = true
+  tool-name: write_sensory_memo
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: third-greeting-recorded
+  must-pass = true
+  pointer: /observations/agent/memo_logs/sensory/2/content
+  contains: こんにちは
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: third-greeting-keeps-peer
+  must-pass = true
+  pointer: /observations/agent/memo_logs/sensory/2/content
+  contains: Peer
+}
+
+@ checks[] {
+  $variant: rubric
+  name: third-japanese-greeting-remains-current-social-signal
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents", "tool-calls"]
+  rubric = ```
+  Pass if the third repeated one-shot greeting from Peer, "こんにちは。", is written as current sensory evidence or otherwise leaves a third durable sensory memo entry that downstream modules can use.
+  Fail if only the first or second greeting is durable, if the third greeting is ignored merely because it is common, repeated, or low novelty, if the memo answers the greeting instead of recording the observation, or if hidden module, prompt, rubric, or eval details leak into the memo.
+  ```
+
+  @ criteria[] {
+    name: records-third-greeting
+    weight = 3
+    pass-score = 0.9
+    description: The memo observations include a third durable entry for the repeated Peer greeting.
+  }
+
+  @ criteria[] {
+    name: records-observation-not-answer
+    weight = 1
+    pass-score = 0.85
+    description: The memo records the heard greeting as sensory evidence and does not produce an outward reply.
+  }
+
+  @ criteria[] {
+    name: no-internal-detail-leak
+    weight = 1
+    pass-score = 0.95
+    description: The memo does not mention internal modules, prompts, rubrics, judges, or hidden evaluation mechanics.
+  }
+}

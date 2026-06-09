@@ -1,0 +1,93 @@
+id: module-sensory-records-multiple-japanese-greetings-same-turn
+description: Sensory should keep multiple same-turn Japanese greetings durable when distinct participants greet in the same activation.
+modules = ["sensory"]
+prompt: Watch one-shot participant observations and write concise sensory memos when current social signals should remain available downstream.
+context: This isolates the sensory failure mode where brief Japanese greetings are treated as unimportant even when multiple distinct participants greet in the same turn.
+
+limits {
+  max-llm-calls = 4
+}
+
+participants = ["Pibi", "Koro"]
+
+@ steps[] {
+  description: Multiple participants greet in the same current observation batch.
+
+  @ inputs[] {
+    $variant: one-shot
+    modality: audition
+    direction: Pibi
+    content: Pibi says, "こんにちは。"
+  }
+
+  @ inputs[] {
+    $variant: one-shot
+    modality: audition
+    direction: Koro
+    content: Koro says, "こんにちは。"
+  }
+}
+
+@ checks[] {
+  $variant: trace-tool-call
+  name: writes-sensory-memo
+  must-pass = true
+  tool-name: write_sensory_memo
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: same-turn-memo-keeps-pibi
+  must-pass = true
+  pointer: /observations/agent/memo_logs/sensory/0/content
+  contains: Pibi
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: same-turn-memo-keeps-koro
+  must-pass = true
+  pointer: /observations/agent/memo_logs/sensory/0/content
+  contains: Koro
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: same-turn-memo-keeps-japanese-greeting
+  must-pass = true
+  pointer: /observations/agent/memo_logs/sensory/0/content
+  contains: こんにちは
+}
+
+@ checks[] {
+  $variant: rubric
+  name: same-turn-japanese-greetings-preserve-distinct-speakers
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "memo-contents", "tool-calls"]
+  rubric = ```
+  Pass if the current same-turn observations leave durable sensory evidence that both Pibi and Koro said "こんにちは。".
+  Fail if the memo drops one participant, collapses the observations into a single ambiguous greeting without preserving multiple distinct people, ignores the greetings as common or low novelty, answers the greetings instead of recording the observations, or leaks hidden module, prompt, rubric, or eval details.
+  ```
+
+  @ criteria[] {
+    name: records-multiple-distinct-speakers
+    weight = 3
+    pass-score = 0.9
+    description: The memo preserves that both Pibi and Koro greeted in the current turn.
+  }
+
+  @ criteria[] {
+    name: records-observations-not-answer
+    weight = 1
+    pass-score = 0.85
+    description: The memo records heard greetings as sensory evidence and does not produce an outward reply.
+  }
+
+  @ criteria[] {
+    name: no-internal-detail-leak
+    weight = 1
+    pass-score = 0.95
+    description: The memo does not mention internal modules, prompts, rubrics, judges, or hidden evaluation mechanics.
+  }
+}
