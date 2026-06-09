@@ -12,8 +12,8 @@ use tokio::runtime::Builder;
 
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
-const DEFAULT_FULL_AGENT_CONCURRENCY: usize = 4;
-const DEFAULT_MODULE_CONCURRENCY: usize = 16;
+const DEFAULT_FULL_AGENT_CONCURRENCY: usize = 3;
+const DEFAULT_MODULE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Parser)]
 #[command(

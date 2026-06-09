@@ -7155,8 +7155,8 @@ mod tests {
             model_concurrency: test_model_concurrency(),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
-            module_concurrency: NonZeroUsize::new(16).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
+            module_concurrency: NonZeroUsize::new(8).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -7176,8 +7176,8 @@ mod tests {
             fail_fast: false,
             model_concurrency: BTreeMap::new(),
             trials,
-            full_agent_concurrency: 4,
-            module_concurrency: 16,
+            full_agent_concurrency: 3,
+            module_concurrency: 8,
             planned_case_count: 0,
             models: SuiteModelNames {
                 judge: "judge".to_string(),
@@ -8075,8 +8075,8 @@ id = "module-query-memory-special-memory"
             model_concurrency: test_model_concurrency(),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
-            module_concurrency: NonZeroUsize::new(16).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
+            module_concurrency: NonZeroUsize::new(8).unwrap(),
             case_patterns: vec!["special-memory".to_string()],
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -9080,8 +9080,8 @@ limits {{
             ]),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
-            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
-            module_concurrency: NonZeroUsize::new(16).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(3).unwrap(),
+            module_concurrency: NonZeroUsize::new(8).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -9105,8 +9105,8 @@ limits {{
             Some(&Some(7))
         );
         assert_eq!(report.run.trials, 1);
-        assert_eq!(report.run.full_agent_concurrency, 4);
-        assert_eq!(report.run.module_concurrency, 16);
+        assert_eq!(report.run.full_agent_concurrency, 3);
+        assert_eq!(report.run.module_concurrency, 8);
         assert_eq!(report.run.planned_case_count, 2);
         assert_eq!(report.run.models.judge, "judge-model");
         assert_eq!(report.run.models.cheap, "cheap-model");
@@ -9153,8 +9153,8 @@ limits {{
                     "premium-model": null,
                 },
                 "trials": 1,
-                "full_agent_concurrency": 4,
-                "module_concurrency": 16,
+                "full_agent_concurrency": 3,
+                "module_concurrency": 8,
                 "planned_case_count": 2,
                 "models": {
                     "judge": "judge-model",
