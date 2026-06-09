@@ -26,6 +26,7 @@ an output channel. Do not write JSON, YAML, Markdown code fences, headings, or i
 details in memo text. Do not write to the cognition log, memory, or emit utterances."#;
 
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
 
 const COMPACTED_SENSORY_SESSION_PREFIX: &str = "Compacted sensory session history:";
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve observed sensory facts, source/direction details,
@@ -304,7 +305,8 @@ impl SensoryModule {
                     SensoryToolsSelector::WriteSensoryMemo,
                     SensoryToolsSelector::IgnoreObservations,
                 ])
-                .require_any_tool();
+                .require_any_tool()
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS);
             let outcome =
                 match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect(&lutum)).await {
                     Ok(result) => result.context("sensory text turn failed")?,
@@ -815,8 +817,10 @@ mod tests {
     use std::sync::Arc;
 
     use lutum::{
-        FinishReason, InputMessageRole, Lutum, MessageContent, MockLlmAdapter, MockTextScenario,
-        ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
+        MockLlmAdapter, MockTextScenario, ModelInputItem, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModuleRunStatus,
@@ -951,10 +955,13 @@ mod tests {
         test_caps_with_adapter_and_policy(adapter, RuntimePolicy::default())
     }
 
-    fn test_caps_with_adapter_and_policy(
-        adapter: MockLlmAdapter,
+    fn test_caps_with_adapter_and_policy<T>(
+        adapter: T,
         policy: RuntimePolicy,
-    ) -> (Blackboard, CapabilityProviders) {
+    ) -> (Blackboard, CapabilityProviders)
+    where
+        T: TurnAdapter,
+    {
         let blackboard = Blackboard::with_allocation(sensory_allocation());
         let adapter = Arc::new(adapter);
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
@@ -972,6 +979,45 @@ mod tests {
             },
         });
         (blackboard, caps)
+    }
+
+    #[derive(Clone)]
+    struct CapturingAdapter {
+        inner: MockLlmAdapter,
+        text_turns: Arc<std::sync::Mutex<Vec<AdapterTextTurn>>>,
+    }
+
+    impl CapturingAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                text_turns: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn text_turns(&self) -> Vec<AdapterTextTurn> {
+            self.text_turns.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingAdapter {
+        async fn text_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_turns.lock().unwrap().push(turn.clone());
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
     }
 
     fn test_policy() -> nuillu_blackboard::ModulePolicy {
@@ -1216,6 +1262,50 @@ mod tests {
         assert!(text.contains("Current ambient sensory field at 2026-05-07T12:00:00+00:00"));
         assert!(text.contains("[ambient-1] vision: lamp is on"));
         assert!(text.contains("[ambient-2] audition: fan hum"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_caps_tool_turn_output_tokens() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(
+                    MockLlmAdapter::new().with_text_scenario(ignore_scenario("background", 0)),
+                );
+                let observed = capture.clone();
+                let (_blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("fan hum continues"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_session_count(&recorder, 1).await;
+                })
+                .await;
+
+                let turns = observed.text_turns();
+                assert_eq!(turns.len(), 1);
+                assert_eq!(
+                    turns[0].config.generation.max_output_tokens,
+                    Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
+                );
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

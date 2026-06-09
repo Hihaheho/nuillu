@@ -57,6 +57,7 @@ const RELATED_MEMORY_SEARCH_LIMIT: usize = 4;
 const RELATED_MEMORY_CANDIDATE_CONTEXT_LIMIT: usize = 12;
 const RELATED_MEMORY_CONTENT_CHARS: usize = 800;
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const DEFAULT_MEMORY_BATCH_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_MEMORY_BATCH_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTED_MEMORY_SESSION_PREFIX: &str = "Compacted memory session history:";
@@ -248,6 +249,7 @@ impl MemoryModule {
                     MemoryToolsSelector::InsertMemory,
                     MemoryToolsSelector::ReinforceMemory,
                 ])
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                 .collect(&lutum)
                 .await
                 .context("memory text turn failed")?;

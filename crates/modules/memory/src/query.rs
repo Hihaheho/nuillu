@@ -46,6 +46,7 @@ use a final answer as a data channel."#;
 
 const COMPACTED_QUERY_MEMORY_SESSION_PREFIX: &str = "Compacted query-memory session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve broadcast facts, query requests, memory search
 arguments, useful memory hits, rejected broad searches, and allocation/cognition context that future
 retrieval should remember."#;
@@ -486,6 +487,7 @@ impl QueryMemoryModule {
                     QueryMemoryToolsSelector::FetchLinkedMemories,
                     QueryMemoryToolsSelector::BroadcastSearchResults,
                 ])
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                 .collect(&lutum)
                 .await
                 .context("query-memory text turn failed")?;
@@ -653,6 +655,7 @@ impl QueryMemoryModule {
                     QueryMemoryToolsSelector::BroadcastSearchResults,
                     QueryMemoryToolsSelector::DisposeSearchResults,
                 ])
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                 .collect(&lutum)
                 .await
                 .context("query-memory finalization text turn failed")?;

@@ -39,6 +39,7 @@ const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
     "Compacted attention-schema session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
 prior appended first-person attention experiences, rejected candidates, allocation guidance, and
 cognition-log context needed for future attention updates."#;
@@ -187,6 +188,7 @@ impl AttentionSchemaModule {
                     AttentionSchemaToolsSelector::LeaveAttentionUnchanged,
                 ])
                 .require_any_tool()
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                 .collect(&lutum)
                 .await
                 .context("attention-schema attention experience turn failed")?

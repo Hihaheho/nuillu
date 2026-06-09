@@ -40,6 +40,7 @@ const ACTIVATION_INPUT: &str = "Assess whether the new cognition is surprising r
 const COMPACTED_SURPRISE_SESSION_PREFIX: &str = "Compacted surprise session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior surprise assessments, predict memo-log
 facts, significant events, memory preservation requests, and cognition-log context needed for future
 surprise checks."#;
@@ -196,6 +197,7 @@ impl SurpriseModule {
                     SurpriseToolsSelector::MarkExpectedEvent,
                 ])
                 .require_any_tool()
+                .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                 .collect(&lutum)
                 .await
                 .map_err(|error| {
@@ -374,11 +376,12 @@ impl Module for SurpriseModule {
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use lutum::{
-        FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
-        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
+        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockTextScenario,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModuleConfig,
@@ -400,7 +403,10 @@ mod tests {
         Blackboard::with_allocation(allocation)
     }
 
-    fn test_caps(blackboard: Blackboard, adapter: Arc<MockLlmAdapter>) -> CapabilityProviders {
+    fn test_caps<T>(blackboard: Blackboard, adapter: Arc<T>) -> CapabilityProviders
+    where
+        T: TurnAdapter,
+    {
         let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
         let lutum = Lutum::new(adapter, budget);
         CapabilityProviders::new(CapabilityProviderPorts {
@@ -409,6 +415,45 @@ mod tests {
             clock: Rc::new(SystemClock),
             tiers: LutumTiers::from_shared_lutum(lutum),
         })
+    }
+
+    #[derive(Clone)]
+    struct CapturingAdapter {
+        inner: MockLlmAdapter,
+        text_turns: Arc<Mutex<Vec<AdapterTextTurn>>>,
+    }
+
+    impl CapturingAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                text_turns: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn text_turns(&self) -> Vec<AdapterTextTurn> {
+            self.text_turns.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingAdapter {
+        async fn text_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_turns.lock().unwrap().push(turn.clone());
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: lutum::ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
     }
 
     fn test_policy() -> nuillu_blackboard::ModulePolicy {
@@ -458,7 +503,10 @@ mod tests {
         attention_requests: nuillu_module::AttentionControlRequestInbox,
     }
 
-    async fn surprise_fixture(adapter: Arc<MockLlmAdapter>) -> SurpriseFixture {
+    async fn surprise_fixture<T>(adapter: Arc<T>) -> SurpriseFixture
+    where
+        T: TurnAdapter,
+    {
         let blackboard = test_blackboard();
         let caps = test_caps(blackboard.clone(), adapter);
         let module_cell = Rc::new(RefCell::new(None));
@@ -693,6 +741,29 @@ mod tests {
         assert_eq!(
             latest_surprise_memo(&fixture.blackboard).await,
             "Surprise assessment: expected\nNo memory preservation requested.\nReason: Fits pending prediction."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_caps_tool_turn_output_tokens() {
+        let args = MarkExpectedEventArgs {
+            reason: "Fits pending prediction.".into(),
+        };
+        let capture = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(expected_scenario(&args, 1)),
+        );
+        let observed = capture.clone();
+        let mut fixture = surprise_fixture(Arc::new(capture)).await;
+        seed_surprise_inputs(&fixture.blackboard).await;
+
+        let cx = activate_cx(&fixture.module).await;
+        fixture.module.activate(&cx).await.unwrap();
+
+        let turns = observed.text_turns();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].config.generation.max_output_tokens,
+            Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
         );
     }
 

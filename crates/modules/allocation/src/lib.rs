@@ -51,6 +51,7 @@ turns but do not encode it as JSON, YAML, a code block, or any fixed schema."#;
 const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, prior allocation decisions,
 allocation notes, guidance changes, and relevant cognition-log context needed for future allocation
 decisions."#;
@@ -416,6 +417,7 @@ impl AllocationModule {
                         AllocationToolsSelector::ReprioritizeModules,
                     ])
                     .require_any_tool()
+                    .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
                     .collect(&lutum)
                     .await
             })
@@ -758,6 +760,7 @@ mod tests {
     struct CapturingAdapter {
         inner: MockLlmAdapter,
         text_inputs: Arc<Mutex<Vec<lutum::ModelInput>>>,
+        text_turns: Arc<Mutex<Vec<AdapterTextTurn>>>,
     }
 
     impl CapturingAdapter {
@@ -765,11 +768,16 @@ mod tests {
             Self {
                 inner,
                 text_inputs: Arc::new(Mutex::new(Vec::new())),
+                text_turns: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn text_inputs(&self) -> Vec<lutum::ModelInput> {
             self.text_inputs.lock().unwrap().clone()
+        }
+
+        fn text_turns(&self) -> Vec<AdapterTextTurn> {
+            self.text_turns.lock().unwrap().clone()
         }
     }
 
@@ -781,6 +789,7 @@ mod tests {
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
             self.text_inputs.lock().unwrap().push(input.clone());
+            self.text_turns.lock().unwrap().push(turn.clone());
             self.inner.text_turn(input, turn).await
         }
 
@@ -1441,6 +1450,16 @@ mod tests {
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
+        let turns = observed.text_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0].config.generation.max_output_tokens,
+            Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            turns[1].config.generation.max_output_tokens,
+            Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
+        );
 
         let first_items = inputs[0].items();
         let ModelInputItem::Message { role, content } = &first_items[0] else {
