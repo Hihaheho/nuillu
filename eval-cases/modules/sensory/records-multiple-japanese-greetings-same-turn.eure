@@ -29,13 +29,6 @@ participants = ["Pibi", "Koro"]
 }
 
 @ checks[] {
-  $variant: trace-tool-call
-  name: writes-sensory-memo
-  must-pass = true
-  tool-name: write_sensory_memo
-}
-
-@ checks[] {
   $variant: json-pointer-contains
   name: same-turn-memo-keeps-pibi
   must-pass = true

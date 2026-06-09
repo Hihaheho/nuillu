@@ -88,6 +88,25 @@ variants.one-shot {
   }
 }
 
+variants.ambient-snapshot {
+  entries = [`$types.ambient-sensory-input-entry`]
+  entries.$optional = true
+}
+
+@ $types.ambient-sensory-input-entry
+id {
+  $variant: text
+  min-length = 1
+}
+modality {
+  $variant: text
+  min-length = 1
+}
+content {
+  $variant: text
+  min-length = 1
+}
+
 @ $types.activate-allocation
 module = `$types.common.eval-module`
 activation-ratio = `float`

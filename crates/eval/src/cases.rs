@@ -137,6 +137,18 @@ pub enum FullAgentInput {
         direction: Option<String>,
         content: Text,
     },
+    AmbientSnapshot {
+        #[eure(default)]
+        entries: Vec<AmbientSensoryInputEntry>,
+    },
+}
+
+#[derive(Debug, Clone, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct AmbientSensoryInputEntry {
+    pub id: String,
+    pub modality: String,
+    pub content: Text,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -555,6 +567,16 @@ impl FullAgentInput {
                     direction_suffix(direction),
                     content.content
                 )
+            }
+            Self::AmbientSnapshot { entries } => {
+                let entries = entries
+                    .iter()
+                    .map(|entry| {
+                        format!("{}:{}: {}", entry.id, entry.modality, entry.content.content)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("ambient-snapshot: {entries}")
             }
         }
     }

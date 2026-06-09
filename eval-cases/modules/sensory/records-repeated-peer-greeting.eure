@@ -33,13 +33,6 @@ participants = ["Peer"]
 }
 
 @ checks[] {
-  $variant: trace-tool-call
-  name: writes-sensory-memo
-  must-pass = true
-  tool-name: write_sensory_memo
-}
-
-@ checks[] {
   $variant: json-pointer-contains
   name: second-greeting-recorded
   must-pass = true

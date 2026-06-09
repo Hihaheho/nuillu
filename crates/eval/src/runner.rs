@@ -31,11 +31,11 @@ use nuillu_memory::{
 };
 use nuillu_module::ports::{Clock, PortError, SystemClock};
 use nuillu_module::{
-    CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, CognitionLogUpdated, InternalHarnessIo, InteroceptionRuntimePolicy,
-    LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
-    SceneRegistry, SensoryInput, SensoryInputMailbox, SensoryModality, SessionCompactionPolicy,
-    apply_standard_dependencies,
+    AmbientSensoryEntry, CapabilityProviderConfig, CapabilityProviderPorts,
+    CapabilityProviderRuntime, CapabilityProviders, CognitionLogUpdated, InternalHarnessIo,
+    InteroceptionRuntimePolicy, LlmConcurrencyPool, ModuleRegistry, Participant, RuntimeEvent,
+    RuntimeEventSink, RuntimePolicy, SceneRegistry, SensoryInput, SensoryInputMailbox,
+    SensoryModality, SessionCompactionPolicy, apply_standard_dependencies,
 };
 use nuillu_reward::{IndexedPolicy, PolicyCapabilities, PolicyRecord, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink, UtteranceWriter};
@@ -3517,6 +3517,17 @@ async fn publish_full_agent_inputs(
                 content: content.content.clone(),
                 observed_at: now,
             },
+            FullAgentInput::AmbientSnapshot { entries } => SensoryInput::AmbientSnapshot {
+                entries: entries
+                    .iter()
+                    .map(|entry| AmbientSensoryEntry {
+                        id: entry.id.clone(),
+                        modality: SensoryModality::parse(&entry.modality),
+                        content: entry.content.content.clone(),
+                    })
+                    .collect(),
+                observed_at: now,
+            },
         };
         sensory
             .publish(body.clone())
@@ -4911,24 +4922,33 @@ fn register_eval_module(
     match module {
         // Input-driven and bursty: bursts of inputs need a fast active pace
         // so observations are normalized within the same tick window.
-        EvalModule::Sensory => registry
-            .register_eval(
-                eval_policy(0..=1, Bpm::range(6.0, 18.0)),
-                replica_hard_cap,
-                |caps| async move {
-                    Ok(nuillu_sensory::SensoryModule::new(
-                        caps.sensory_input_inbox(),
-                        caps.allocation_reader(),
-                        caps.memo(),
-                        caps.clock(),
-                        caps.llm_access(),
-                        caps.session("main")
-                            .with_auto_compaction(nuillu_sensory::session_auto_compaction())
-                            .await?,
-                    ))
-                },
-            )
-            .expect("eval module registration should be unique"),
+        EvalModule::Sensory => {
+            registry
+                .register_eval(
+                    eval_policy(0..=1, Bpm::range(6.0, 18.0)),
+                    replica_hard_cap,
+                    |caps| async move {
+                        Ok(nuillu_sensory::SensoryModule::new(
+                            caps.sensory_input_inbox(),
+                            caps.allocation_reader(),
+                            caps.memo(),
+                            caps.clock(),
+                            caps.llm_access(),
+                            caps.session("one-shot")
+                                .with_auto_compaction(
+                                    nuillu_sensory::one_shot_session_auto_compaction(),
+                                )
+                                .await?,
+                            caps.session("ambient")
+                                .with_auto_compaction(
+                                    nuillu_sensory::ambient_session_auto_compaction(),
+                                )
+                                .await?,
+                        ))
+                    },
+                )
+                .expect("eval module registration should be unique")
+        }
         // Must re-fire fast as memos accumulate so the cognition log is
         // current by the time speak considers it.
         EvalModule::CognitionGate => registry

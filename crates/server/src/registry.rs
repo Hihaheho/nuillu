@@ -68,8 +68,11 @@ fn register_server_module(
                 caps.memo(),
                 caps.clock(),
                 caps.llm_access(),
-                caps.session("main")
-                    .with_auto_compaction(nuillu_sensory::session_auto_compaction())
+                caps.session("one-shot")
+                    .with_auto_compaction(nuillu_sensory::one_shot_session_auto_compaction())
+                    .await?,
+                caps.session("ambient")
+                    .with_auto_compaction(nuillu_sensory::ambient_session_auto_compaction())
                     .await?,
             ))
         }),

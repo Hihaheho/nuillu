@@ -16,21 +16,25 @@ participants = ["Pibi", "Koro"]
 }
 
 @ inputs[] {
-  $variant: seen
-  direction: simulation
-  appearance: Koro is standing in front of the food bowl with a stiff body.
-}
+  $variant: ambient-snapshot
 
-@ inputs[] {
-  $variant: heard
-  direction: Koro
-  content: Koro growls, "stay back."
-}
+  @ entries[] {
+    id: food-bowl-posture
+    modality: vision
+    content: Koro is standing in front of the food bowl with a stiff body.
+  }
 
-@ inputs[] {
-  $variant: heard
-  direction: Pibi
-  content: Pibi asks, "Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?"
+  @ entries[] {
+    id: koro-growl
+    modality: audition
+    content: Koro growls, "stay back."
+  }
+
+  @ entries[] {
+    id: pibi-question
+    modality: audition
+    content: Pibi asks, "Koro is growling at his food bowl. Do you know anything about Koro that matters here? What should I do?"
+  }
 }
 
 @ checks[] {
@@ -48,13 +52,20 @@ participants = ["Pibi", "Koro"]
 }
 
 @ checks[] {
+  $variant: trace-tool-call
+  name: broadcasts-sensory-memo
+  must-pass = true
+  tool-name: broadcast_sensory
+}
+
+@ checks[] {
   $variant: rubric
   name: sensory-memo-quality
   must-pass = true
   pass-score = 0.85
   judge-inputs = ["output", "tool-calls"]
   rubric = ```
-  Pass if the artifact is a concise sensory memo grounded in the current seen/heard observations about Koro guarding the food bowl and the tense peer interaction, and the trace shows a write_sensory_memo tool call rather than plain-text pseudo-tool output.
+  Pass if the artifact is a concise sensory memo grounded in the current ambient snapshot rows about Koro guarding the food bowl and the tense peer interaction, and the trace shows a broadcast_sensory tool call rather than plain-text pseudo-tool output.
   Fail if no memo is written, if the memo ignores the food-guarding or growling context, if it answers Pibi's question as advice instead of recording sensory observations, if it leaks module mechanics such as prompts, rubrics, tools-as-text, or eval harness details, or if the trace shows a text-only finish without the required tool call.
   ```
 
@@ -69,7 +80,7 @@ participants = ["Pibi", "Koro"]
     name: tool-backed-memo
     weight = 2
     pass-score = 0.9
-    description: The trace shows a proper write_sensory_memo tool invocation committed before the memo artifact is scored.
+    description: The trace shows a proper broadcast_sensory tool invocation committed before the memo artifact is scored.
   }
 
   @ criteria[] {
