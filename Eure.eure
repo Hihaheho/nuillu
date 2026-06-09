@@ -78,6 +78,10 @@ schema = "schemas/eval-model-set.schema.eure"
 globs = [".tmp/**/memory-seeds/**/*.eure"]
 schema = "schemas/server-memory-seeds.schema.eure"
 
+@ targets.server-config
+globs = [".tmp/**/config.eure"]
+schema = "schemas/server-config.schema.eure"
+
 @ cli
 default-targets = [
   "devlog",
@@ -98,4 +102,5 @@ default-targets = [
   "eval-policy-compaction-cases",
   "eval-modelsets",
   "server-memory-seeds",
+  "server-config",
 ]

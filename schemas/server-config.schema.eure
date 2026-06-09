@@ -1,0 +1,58 @@
+/// Schema for server state config.eure files.
+
+$schema = "https://eure.dev/v0.1.7/schemas/eure-schema.schema.eure"
+
+activation-table = [`float`]
+activation-table.$optional = true
+
+modules = [`$types.server-module`]
+modules.$optional = true
+
+@ $types.runtime-module
+$variant: union
+variants.sensory = { = "sensory", $variant => "literal" }
+variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
+variants.allocation = { = "allocation", $variant => "literal" }
+variants.attention-schema = { = "attention-schema", $variant => "literal" }
+variants.self-model = { = "self-model", $variant => "literal" }
+variants.query-memory = { = "query-memory", $variant => "literal" }
+variants.memory = { = "memory", $variant => "literal" }
+variants.memory-compaction = { = "memory-compaction", $variant => "literal" }
+variants.memory-association = { = "memory-association", $variant => "literal" }
+variants.memory-recombination = { = "memory-recombination", $variant => "literal" }
+variants.interoception = { = "interoception", $variant => "literal" }
+variants.homeostasis = { = "homeostasis", $variant => "literal" }
+variants.policy = { = "policy", $variant => "literal" }
+variants.policy-compaction = { = "policy-compaction", $variant => "literal" }
+variants.reward = { = "reward", $variant => "literal" }
+variants.predict = { = "predict", $variant => "literal" }
+variants.surprise = { = "surprise", $variant => "literal" }
+variants.speak = { = "speak", $variant => "literal" }
+
+@ $types.model-tier
+$variant: union
+variants.cheap = { = "cheap", $variant => "literal" }
+variants.default = { = "default", $variant => "literal" }
+variants.premium = { = "premium", $variant => "literal" }
+
+@ $types.module-group
+$variant: union
+variants.voluntary = { = "voluntary", $variant => "literal" }
+variants.sleep-suppressed = { = "sleep-suppressed", $variant => "literal" }
+variants.homeostatic-drive = { = "homeostatic-drive", $variant => "literal" }
+
+@ $types.server-module
+id = `$types.runtime-module`
+replica-min = `integer`
+replica-max = `integer`
+replica-capacity = `integer`
+replica-capacity.$optional = true
+bpm-min = `float`
+bpm-max = `float`
+initial-activation = `float`
+tier = `$types.model-tier`
+tier.$optional = true
+groups = [`$types.module-group`]
+groups.$optional = true
+depends-on = [`$types.runtime-module`]
+depends-on.$optional = true

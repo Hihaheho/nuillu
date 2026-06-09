@@ -4,101 +4,91 @@ use nuillu_blackboard::{
     ActivationRatio, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
 };
 use nuillu_memory::MemoryCapabilities;
-use nuillu_module::{ModuleRegistry, apply_standard_dependencies};
+use nuillu_module::ModuleRegistry;
 use nuillu_reward::PolicyCapabilities;
 use nuillu_speak::{UtteranceSink, UtteranceWriter};
-use nuillu_types::{ModelTier, ModuleId, ReplicaCapRange, builtin};
+use nuillu_types::{ModelTier, ModuleId};
 
-use super::config::RuntimeModule;
+use super::config::{RuntimeModule, ServerBootConfig, ServerModuleGroup, ServerModuleSpec};
 
 pub(super) fn server_registry(
-    modules: &[RuntimeModule],
-    deactivated_modules: &[RuntimeModule],
+    boot_config: &ServerBootConfig,
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
     utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
-    let active_modules = select_active_modules(modules, deactivated_modules);
     let mut registry = ModuleRegistry::new();
-    for module in modules {
+    for module in &boot_config.modules {
         registry = register_server_module(
             registry,
-            *module,
-            &active_modules,
+            module,
+            boot_config,
             memory_caps,
             policy_caps,
             utterance_sink,
         );
     }
-    apply_standard_dependencies(
-        registry,
-        modules.iter().copied().map(RuntimeModule::module_id),
-    )
-    .remove_modules(
-        deactivated_modules
-            .iter()
-            .copied()
-            .map(RuntimeModule::module_id),
-    )
+    configured_dependency_edges(boot_config)
+        .into_iter()
+        .fold(registry, |registry, (dependent, dependency)| {
+            registry.depends_on(dependent, dependency)
+        })
 }
 
 trait ServerRegistryExt {
-    fn register_server<B>(self, policy: ModulePolicy, builder: B) -> ModuleRegistry
+    fn register_server<B>(self, spec: &ServerModuleSpec, builder: B) -> ModuleRegistry
     where
         B: nuillu_module::ModuleRegisterer + 'static;
 }
 
 impl ServerRegistryExt for ModuleRegistry {
-    fn register_server<B>(self, policy: ModulePolicy, builder: B) -> ModuleRegistry
+    fn register_server<B>(self, spec: &ServerModuleSpec, builder: B) -> ModuleRegistry
     where
         B: nuillu_module::ModuleRegisterer + 'static,
     {
-        self.register_with_replica_capacity(policy, ReplicaCapRange::V1_MAX, builder)
+        self.register_with_replica_capacity(policy(spec), spec.replica_capacity, builder)
             .expect("server module registration should be unique")
     }
 }
 
 fn register_server_module(
     registry: ModuleRegistry,
-    module: RuntimeModule,
-    all_modules: &[RuntimeModule],
+    spec: &ServerModuleSpec,
+    boot_config: &ServerBootConfig,
     memory_caps: &MemoryCapabilities,
     policy_caps: &PolicyCapabilities,
     utterance_sink: &Rc<dyn UtteranceSink>,
 ) -> ModuleRegistry {
+    let module = spec.id;
     match module {
-        RuntimeModule::Sensory => {
-            registry.register_server(policy(1..=1, Bpm::range(3.0, 8.0)), |caps| async move {
-                Ok(nuillu_sensory::SensoryModule::new(
-                    caps.sensory_input_inbox(),
-                    caps.allocation_reader(),
-                    caps.memo(),
-                    caps.clock(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_sensory::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
-        RuntimeModule::CognitionGate => {
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 12.0)), |caps| async move {
-                Ok(nuillu_cognition_gate::CognitionGateModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.cognition_writer(),
-                    caps.time_division(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
+        RuntimeModule::Sensory => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_sensory::SensoryModule::new(
+                caps.sensory_input_inbox(),
+                caps.allocation_reader(),
+                caps.memo(),
+                caps.clock(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_sensory::session_auto_compaction())
+                    .await?,
+            ))
+        }),
+        RuntimeModule::CognitionGate => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_cognition_gate::CognitionGateModule::new(
+                caps.memo_updated_inbox(),
+                caps.blackboard_reader(),
+                caps.allocation_reader(),
+                caps.cognition_writer(),
+                caps.time_division(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())
+                    .await?,
+            ))
+        }),
         RuntimeModule::Allocation => {
-            let voluntary = voluntary_modules(all_modules);
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 6.0)), move |caps| {
+            let voluntary = group_modules(boot_config, ServerModuleGroup::Voluntary);
+            registry.register_server(spec, move |caps| {
                 let voluntary = voluntary.clone();
                 async move {
                     Ok(nuillu_allocation::AllocationModule::new(
@@ -117,40 +107,36 @@ fn register_server_module(
                 }
             })
         }
-        RuntimeModule::AttentionSchema => {
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| async move {
-                Ok(nuillu_attention_schema::AttentionSchemaModule::new(
-                    caps.memo_updated_inbox(),
-                    caps.cognition_log_updated_inbox(),
-                    caps.blackboard_reader(),
-                    caps.allocation_reader(),
-                    caps.cognition_log_reader(),
-                    caps.cognition_writer(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
-        RuntimeModule::SelfModel => {
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), |caps| async move {
-                Ok(nuillu_self_model::SelfModelModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_self_model::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
+        RuntimeModule::AttentionSchema => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_attention_schema::AttentionSchemaModule::new(
+                caps.memo_updated_inbox(),
+                caps.cognition_log_updated_inbox(),
+                caps.blackboard_reader(),
+                caps.allocation_reader(),
+                caps.cognition_log_reader(),
+                caps.cognition_writer(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())
+                    .await?,
+            ))
+        }),
+        RuntimeModule::SelfModel => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_self_model::SelfModelModule::new(
+                caps.cognition_log_updated_inbox(),
+                caps.allocation_reader(),
+                caps.blackboard_reader(),
+                caps.cognition_log_reader(),
+                caps.memo(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_self_model::session_auto_compaction())
+                    .await?,
+            ))
+        }),
         RuntimeModule::QueryMemory => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 15.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::QueryMemoryModule::new(
@@ -170,7 +156,7 @@ fn register_server_module(
         }
         RuntimeModule::Memory => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 18.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryModule::new(
@@ -189,7 +175,7 @@ fn register_server_module(
         }
         RuntimeModule::MemoryCompaction => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryCompactionModule::new(
@@ -203,7 +189,7 @@ fn register_server_module(
         }
         RuntimeModule::MemoryAssociation => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryAssociationModule::new(
@@ -219,7 +205,7 @@ fn register_server_module(
         }
         RuntimeModule::MemoryRecombination => {
             let memory_caps = memory_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let memory_caps = memory_caps.clone();
                 async move {
                     Ok(nuillu_memory::MemoryRecombinationModule::new(
@@ -234,8 +220,8 @@ fn register_server_module(
             })
         }
         RuntimeModule::Interoception => {
-            let suppressed = sleep_suppressed_modules(all_modules);
-            registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), move |caps| {
+            let suppressed = group_modules(boot_config, ServerModuleGroup::SleepSuppressed);
+            registry.register_server(spec, move |caps| {
                 let suppressed = suppressed.clone();
                 async move {
                     Ok(nuillu_interoception::InteroceptionModule::new(
@@ -254,9 +240,9 @@ fn register_server_module(
             })
         }
         RuntimeModule::Homeostasis => {
-            let drive_modules = homeostatic_drive_modules(all_modules);
-            let suppressed = sleep_suppressed_modules(all_modules);
-            registry.register_server(policy(1..=1, Bpm::range(6.0, 20.0)), move |caps| {
+            let drive_modules = group_modules(boot_config, ServerModuleGroup::HomeostaticDrive);
+            let suppressed = group_modules(boot_config, ServerModuleGroup::SleepSuppressed);
+            registry.register_server(spec, move |caps| {
                 let drive_modules = drive_modules.clone();
                 let suppressed = suppressed.clone();
                 async move {
@@ -270,7 +256,7 @@ fn register_server_module(
         }
         RuntimeModule::Policy => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
                     let consideration_writer =
@@ -295,7 +281,7 @@ fn register_server_module(
         }
         RuntimeModule::PolicyCompaction => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(0..=1, Bpm::range(2.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
                     Ok(nuillu_reward::PolicyCompactionModule::new(
@@ -310,7 +296,7 @@ fn register_server_module(
         }
         RuntimeModule::Reward => {
             let policy_caps = policy_caps.clone();
-            registry.register_server(policy(1..=1, Bpm::range(1.0, 2.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let policy_caps = policy_caps.clone();
                 async move {
                     Ok(nuillu_reward::RewardModule::new(
@@ -330,38 +316,34 @@ fn register_server_module(
                 }
             })
         }
-        RuntimeModule::Predict => {
-            registry.register_server(policy(1..=1, Bpm::range(1.0, 6.0)), |caps| async move {
-                Ok(nuillu_predict::PredictModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_predict::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
-        RuntimeModule::Surprise => {
-            registry.register_server(policy(1..=1, Bpm::range(1.0, 3.0)), |caps| async move {
-                Ok(nuillu_surprise::SurpriseModule::new(
-                    caps.cognition_log_updated_inbox(),
-                    caps.cognition_log_reader(),
-                    caps.allocation_reader(),
-                    caps.blackboard_reader(),
-                    caps.attention_control_mailbox(),
-                    caps.memo(),
-                    caps.llm_access(),
-                    caps.session("main")
-                        .with_auto_compaction(nuillu_surprise::session_auto_compaction())
-                        .await?,
-                ))
-            })
-        }
+        RuntimeModule::Predict => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_predict::PredictModule::new(
+                caps.cognition_log_updated_inbox(),
+                caps.cognition_log_reader(),
+                caps.memo(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_predict::session_auto_compaction())
+                    .await?,
+            ))
+        }),
+        RuntimeModule::Surprise => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_surprise::SurpriseModule::new(
+                caps.cognition_log_updated_inbox(),
+                caps.cognition_log_reader(),
+                caps.allocation_reader(),
+                caps.blackboard_reader(),
+                caps.attention_control_mailbox(),
+                caps.memo(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_surprise::session_auto_compaction())
+                    .await?,
+            ))
+        }),
         RuntimeModule::Speak => {
             let utterance_sink = utterance_sink.clone();
-            registry.register_server(policy(0..=1, Bpm::range(3.0, 6.0)), move |caps| {
+            registry.register_server(spec, move |caps| {
                 let utterance_sink = utterance_sink.clone();
                 async move {
                     Ok(nuillu_speak::SpeakModule::new(
@@ -383,112 +365,56 @@ fn register_server_module(
     }
 }
 
-pub(super) fn full_agent_allocation(modules: &[RuntimeModule]) -> ResourceAllocation {
+pub(super) fn full_agent_allocation(boot_config: &ServerBootConfig) -> ResourceAllocation {
     let mut allocation = ResourceAllocation::default();
-    allocation.set_activation_table(activation_table());
-    for module in modules {
-        let (activation, tier) = match module {
-            RuntimeModule::Sensory => (1.0, ModelTier::Cheap),
-            RuntimeModule::CognitionGate => (1.0, ModelTier::Default),
-            RuntimeModule::Allocation => (1.0, ModelTier::Default),
-            RuntimeModule::AttentionSchema => (0.0, ModelTier::Default),
-            RuntimeModule::SelfModel => (0.0, ModelTier::Default),
-            RuntimeModule::QueryMemory => (0.0, ModelTier::Cheap),
-            RuntimeModule::Memory => (0.0, ModelTier::Cheap),
-            RuntimeModule::MemoryCompaction => (0.0, ModelTier::Cheap),
-            RuntimeModule::MemoryAssociation => (0.0, ModelTier::Cheap),
-            RuntimeModule::MemoryRecombination => (0.0, ModelTier::Cheap),
-            RuntimeModule::Interoception => (1.0, ModelTier::Cheap),
-            RuntimeModule::Homeostasis => (1.0, ModelTier::Cheap),
-            RuntimeModule::Policy => (0.0, ModelTier::Default),
-            RuntimeModule::PolicyCompaction => (0.0, ModelTier::Cheap),
-            RuntimeModule::Reward => (0.0, ModelTier::Default),
-            RuntimeModule::Predict => (0.0, ModelTier::Cheap),
-            RuntimeModule::Surprise => (0.0, ModelTier::Default),
-            RuntimeModule::Speak => (0.0, ModelTier::Premium),
-        };
-        set_allocation_module(&mut allocation, module.module_id(), activation, tier);
+    allocation.set_activation_table(
+        boot_config
+            .activation_table
+            .iter()
+            .copied()
+            .map(ActivationRatio::from_f64)
+            .collect(),
+    );
+    for module in &boot_config.modules {
+        set_allocation_module(
+            &mut allocation,
+            module.module_id(),
+            module.initial_activation,
+            module.tier(),
+        );
     }
     allocation
 }
 
-fn policy(
-    replicas_range: std::ops::RangeInclusive<u8>,
-    rate_limit_range: std::ops::RangeInclusive<Bpm>,
-) -> ModulePolicy {
+fn configured_dependency_edges(boot_config: &ServerBootConfig) -> Vec<(ModuleId, ModuleId)> {
+    let active = boot_config.active_module_ids();
+    let mut edges = Vec::new();
+    for module in &boot_config.modules {
+        let dependent = module.module_id();
+        for dependency in &module.depends_on {
+            let dependency = dependency.module_id();
+            if active.contains(&dependency) {
+                edges.push((dependent.clone(), dependency));
+            }
+        }
+    }
+    edges
+}
+
+fn group_modules(boot_config: &ServerBootConfig, group: ServerModuleGroup) -> Vec<ModuleId> {
+    boot_config
+        .specs_in_group(group)
+        .into_iter()
+        .map(ServerModuleSpec::module_id)
+        .collect()
+}
+
+fn policy(module: &ServerModuleSpec) -> ModulePolicy {
     ModulePolicy::new(
-        ReplicaCapRange::new(*replicas_range.start(), *replicas_range.end()).unwrap(),
-        rate_limit_range,
+        module.replica_range(),
+        Bpm::range(module.bpm_min, module.bpm_max),
         linear_ratio_fn,
     )
-}
-
-fn sleep_suppressed_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
-    retain_present_modules(
-        vec![
-            builtin::cognition_gate(),
-            builtin::attention_schema(),
-            builtin::self_model(),
-            builtin::query_memory(),
-            builtin::memory(),
-            builtin::policy(),
-            builtin::reward(),
-            builtin::predict(),
-            builtin::surprise(),
-            builtin::speak(),
-        ],
-        modules,
-    )
-}
-
-fn homeostatic_drive_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
-    retain_present_modules(
-        vec![
-            builtin::memory_compaction(),
-            builtin::memory_association(),
-            builtin::memory_recombination(),
-            builtin::policy_compaction(),
-        ],
-        modules,
-    )
-}
-
-fn voluntary_modules(modules: &[RuntimeModule]) -> Vec<ModuleId> {
-    retain_present_modules(
-        vec![
-            builtin::cognition_gate(),
-            builtin::attention_schema(),
-            builtin::self_model(),
-            builtin::query_memory(),
-            builtin::memory(),
-            builtin::policy(),
-            builtin::reward(),
-            builtin::predict(),
-            builtin::surprise(),
-            builtin::speak(),
-        ],
-        modules,
-    )
-}
-
-fn retain_present_modules(ids: Vec<ModuleId>, modules: &[RuntimeModule]) -> Vec<ModuleId> {
-    let present = modules
-        .iter()
-        .copied()
-        .map(RuntimeModule::module_id)
-        .collect::<std::collections::HashSet<_>>();
-    ids.into_iter().filter(|id| present.contains(id)).collect()
-}
-
-fn select_active_modules(
-    modules: &[RuntimeModule],
-    deactivated_modules: &[RuntimeModule],
-) -> Vec<RuntimeModule> {
-    modules
-        .iter()
-        .copied()
-        .filter(|module| !deactivated_modules.contains(module))
-        .collect()
 }
 
 fn set_allocation_module(
@@ -502,9 +428,65 @@ fn set_allocation_module(
     allocation.set_activation(id, ActivationRatio::from_f64(activation_ratio));
 }
 
-fn activation_table() -> Vec<ActivationRatio> {
-    [1.0, 0.85, 0.7, 0.5, 0.3, 0.0]
-        .into_iter()
-        .map(ActivationRatio::from_f64)
-        .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use nuillu_types::builtin;
+
+    #[test]
+    fn configured_dependencies_ignore_absent_modules() {
+        let mut boot_config = ServerBootConfig::default();
+        boot_config
+            .modules
+            .retain(|module| module.id != RuntimeModule::Policy);
+
+        let edges = configured_dependency_edges(&boot_config);
+
+        assert!(!edges.contains(&(builtin::cognition_gate(), builtin::policy())));
+        assert!(edges.contains(&(builtin::cognition_gate(), builtin::sensory())));
+    }
+
+    #[test]
+    fn group_modules_are_data_driven() {
+        let boot_config = ServerBootConfig::default();
+
+        let voluntary = group_modules(&boot_config, ServerModuleGroup::Voluntary);
+        let drive = group_modules(&boot_config, ServerModuleGroup::HomeostaticDrive);
+
+        assert!(voluntary.contains(&builtin::speak()));
+        assert!(!voluntary.contains(&builtin::sensory()));
+        assert!(drive.contains(&builtin::memory_compaction()));
+        assert!(drive.contains(&builtin::policy_compaction()));
+    }
+
+    #[test]
+    fn full_agent_allocation_uses_boot_config_module_specs() {
+        let mut boot_config = ServerBootConfig::default();
+        boot_config.activation_table = vec![1.0, 0.25, 0.0];
+        boot_config
+            .modules
+            .retain(|module| module.id == RuntimeModule::Speak);
+        boot_config.modules[0].initial_activation = 0.75;
+
+        let allocation = full_agent_allocation(&boot_config);
+
+        assert_eq!(
+            allocation.activation_table(),
+            &[
+                ActivationRatio::from_f64(1.0),
+                ActivationRatio::from_f64(0.25),
+                ActivationRatio::from_f64(0.0),
+            ]
+        );
+        assert_eq!(
+            allocation.activation_for(&builtin::speak()),
+            ActivationRatio::from_f64(0.75)
+        );
+        assert_eq!(
+            allocation.tier_for(&builtin::speak()),
+            nuillu_types::ModelTier::Premium
+        );
+        assert_eq!(allocation.get(&builtin::policy()), None);
+    }
 }

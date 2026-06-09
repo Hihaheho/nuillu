@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         premium_backend,
         model_dir: args.model_dir,
         embedding_backend,
-        deactivated_modules: boot_config.deactivate_modules,
+        boot_config,
         disabled_modules: args.disable_module,
         participants: args.participants,
     })

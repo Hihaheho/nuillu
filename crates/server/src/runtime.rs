@@ -12,7 +12,7 @@ use crate::SERVER_TAB_ID;
 use crate::commands::{
     apply_persisted_module_settings, drive_server_until_shutdown, emit_scene_state,
 };
-use crate::config::{DEFAULT_MODULES, ServerConfig};
+use crate::config::ServerConfig;
 use crate::environment::build_server_environment;
 use crate::gui::{
     VisualizerHook, accept_visualizer_connection, spawn_visualizer_gui,
@@ -106,11 +106,10 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     let mut module_settings =
         ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
 
-    let modules = DEFAULT_MODULES.to_vec();
     let active_modules = config.active_modules();
     let env = build_server_environment(
         &config,
-        full_agent_allocation(&active_modules),
+        full_agent_allocation(&config.boot_config),
         visualizer.event_sender(),
     )
     .await?;
@@ -150,8 +149,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     let mut restart_count = 0_u64;
     loop {
         let allocated = server_registry(
-            &modules,
-            &config.deactivated_modules,
+            &config.boot_config,
             &env.memory_caps,
             &env.policy_caps,
             &env.utterance_sink,

@@ -430,7 +430,7 @@ mod tests {
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
     use super::*;
-    use crate::config::DEFAULT_MODULES;
+    use crate::config::{DEFAULT_MODULES, ServerBootConfig};
     use crate::registry::full_agent_allocation;
 
     fn test_backend_config() -> LlmBackendConfig {
@@ -457,7 +457,7 @@ mod tests {
             premium_backend: test_backend_config(),
             model_dir: PathBuf::from("models/potion-base-8M"),
             embedding_backend: None,
-            deactivated_modules: Vec::new(),
+            boot_config: ServerBootConfig::default(),
             disabled_modules: Vec::new(),
             participants: Vec::new(),
         };
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn server_allocation_limits_keep_fifth_positive_priority_slot_active() {
-        let mut allocation = full_agent_allocation(DEFAULT_MODULES);
+        let mut allocation = full_agent_allocation(&ServerBootConfig::default());
         let table = allocation.activation_table().to_vec();
         let priority_modules = [
             builtin::attention_schema(),
