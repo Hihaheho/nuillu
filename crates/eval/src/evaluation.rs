@@ -194,6 +194,8 @@ pub struct SuiteRunReport {
     pub fail_fast: bool,
     pub model_concurrency: BTreeMap<String, Option<usize>>,
     pub trials: usize,
+    pub full_agent_concurrency: usize,
+    pub module_concurrency: usize,
     pub planned_case_count: usize,
     pub models: SuiteModelNames,
     pub module_filters: Vec<String>,

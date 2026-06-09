@@ -12,6 +12,8 @@ use tokio::runtime::Builder;
 
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
+const DEFAULT_FULL_AGENT_CONCURRENCY: usize = 4;
+const DEFAULT_MODULE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,6 +127,10 @@ fn main() -> anyhow::Result<()> {
         model_concurrency,
         llm_concurrency_pool: LlmConcurrencyPool::default(),
         trials: args.trials,
+        full_agent_concurrency: std::num::NonZeroUsize::new(DEFAULT_FULL_AGENT_CONCURRENCY)
+            .expect("default full-agent concurrency is non-zero"),
+        module_concurrency: std::num::NonZeroUsize::new(DEFAULT_MODULE_CONCURRENCY)
+            .expect("default module concurrency is non-zero"),
         case_patterns: args.patterns,
         module_filters: args.module_filter,
         disabled_modules: args.disable_module,

@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::{self, Write},
     num::NonZeroUsize,
@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
 use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
@@ -113,6 +113,8 @@ pub struct RunnerConfig {
     pub model_concurrency: BTreeMap<String, Option<NonZeroUsize>>,
     pub llm_concurrency_pool: LlmConcurrencyPool,
     pub trials: NonZeroUsize,
+    pub full_agent_concurrency: NonZeroUsize,
+    pub module_concurrency: NonZeroUsize,
     pub case_patterns: Vec<String>,
     pub module_filters: Vec<EvalModule>,
     pub disabled_modules: Vec<EvalModule>,
@@ -382,6 +384,51 @@ struct CaseIdentity {
     id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalWorkKind {
+    FullAgent,
+    Module,
+}
+
+impl EvalWorkKind {
+    fn for_path(path: &Path) -> Self {
+        if is_full_agent_case_path(path) {
+            Self::FullAgent
+        } else {
+            Self::Module
+        }
+    }
+
+    fn concurrency(self, config: &RunnerConfig) -> usize {
+        match self {
+            Self::FullAgent => config.full_agent_concurrency.get(),
+            Self::Module => config.module_concurrency.get(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EvalWorkItem {
+    case_order: usize,
+    case_path: PathBuf,
+    case: EvalCase,
+    id: String,
+    case_output_dir: PathBuf,
+    output_dir: PathBuf,
+    runtime_id: String,
+    trial_number: usize,
+    trial_count: usize,
+    kind: EvalWorkKind,
+}
+
+#[derive(Debug, Clone)]
+struct EvalWorkOutput {
+    item: EvalWorkItem,
+    output: CaseRunOutput,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
 #[derive(Debug, Deserialize)]
 struct FailedOnlySuiteReport {
     cases: Vec<FailedOnlyCaseSummary>,
@@ -443,32 +490,15 @@ pub async fn run_suite_with_hooks(
         path: run_dir.clone(),
         source,
     })?;
-    let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
-    reporter.emit(
-        None,
-        "suite_started",
-        serde_json::json!({
-            "cases": case_paths.len(),
-            "output_dir": run_dir.display().to_string(),
-            "backends": {
-                "judge": backend_report(&config.judge_backend),
-                "cheap": backend_report(&config.cheap_backend),
-                "default": backend_report(&config.default_backend),
-                "premium": backend_report(&config.premium_backend),
-            },
-            "model_concurrency": config.model_concurrency.iter().map(|(model, limit)| {
-                (model.clone(), limit.map(NonZeroUsize::get))
-            }).collect::<BTreeMap<_, _>>(),
-            "trials": config.trials.get(),
-        }),
-        format!(
-            "🚀 eval suite start run={} cases={} trials={} output={}",
-            config.run_id,
-            case_paths.len(),
-            config.trials.get(),
-            run_dir.display()
-        ),
-    )?;
+    eprintln!(
+        "🚀 eval suite start run={} cases={} trials={} full_agent_concurrency={} module_concurrency={} output={}",
+        config.run_id,
+        case_paths.len(),
+        config.trials.get(),
+        config.full_agent_concurrency.get(),
+        config.module_concurrency.get(),
+        run_dir.display()
+    );
 
     let judge_handle = build_model_handle(
         &config.judge_backend,
@@ -483,23 +513,11 @@ pub async fn run_suite_with_hooks(
     })?;
     let judge = LlmRubricJudge::with_concurrency(judge_handle.lutum, judge_handle.concurrency);
 
-    let mut cases = Vec::new();
-    for path in case_paths {
-        let output =
-            run_case_detailed_with_reporter(&path, config, Some(&judge), &reporter, hooks).await?;
-        let failed = !output.summary.passed || output.summary.invalid;
-        cases.push(output.summary);
-        if hooks
-            .visualizer
-            .as_ref()
-            .is_some_and(VisualizerHook::shutdown_requested)
-        {
-            break;
-        }
-        if failed && config.fail_fast {
-            break;
-        }
-    }
+    let cases = if hooks.visualizer.is_some() {
+        run_suite_cases_sequential(case_paths, config, Some(&judge), hooks).await?
+    } else {
+        run_suite_cases_parallel(case_paths, config, Some(&judge)).await?
+    };
 
     let mut report = aggregate_suite(run_report, cases);
     report.timing = SuiteTiming {
@@ -508,44 +526,21 @@ pub async fn run_suite_with_hooks(
     let suite_path = run_dir.join("suite-report.json");
     write_json_file(&suite_path, &report)?;
     eprintln!("\n════════════════════════════════════════════════════════════");
-    reporter.emit(
-        None,
-        "suite_finished",
-        serde_json::json!({
-            "case_count": report.case_count,
-            "passed_cases": report.passed_cases,
-            "failed_cases": report.failed_cases,
-            "invalid_cases": report.invalid_cases,
-            "mean_score": report.mean_score,
-            "metrics": report.metrics,
-            "elapsed_ms": report.timing.elapsed_ms,
-        }),
-        format!(
-            "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3} elapsed_ms={}{}",
-            config.run_id,
-            report.passed_cases,
-            report.failed_cases,
-            report.invalid_cases,
-            report.mean_score,
-            report.timing.elapsed_ms,
-            format_suite_metrics_inline(&report.metrics)
-        ),
-    )?;
+    eprintln!(
+        "🏁 eval suite end run={} ✅passed={} ❌failed={} 💥invalid={} mean_score={:.3} elapsed_ms={}{}",
+        config.run_id,
+        report.passed_cases,
+        report.failed_cases,
+        report.invalid_cases,
+        report.mean_score,
+        report.timing.elapsed_ms,
+        format_suite_metrics_inline(&report.metrics)
+    );
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         eprintln!("eval suite finished; visualizer remains open until its window is closed");
         visualizer.drain_cached_commands_until_shutdown();
     }
     Ok(report)
-}
-
-fn backend_report(backend: &LlmBackendConfig) -> serde_json::Value {
-    serde_json::json!({
-        "endpoint": backend.endpoint.as_str(),
-        "model": backend.model.as_str(),
-        "reasoning_effort": backend.reasoning_effort,
-        "use_responses_api": backend.use_responses_api,
-        "compaction_input_token_threshold": backend.compaction_input_token_threshold,
-    })
 }
 
 fn suite_run_report(
@@ -568,6 +563,8 @@ fn suite_run_report(
             .map(|(model, limit)| (model.clone(), limit.map(NonZeroUsize::get)))
             .collect(),
         trials: config.trials.get(),
+        full_agent_concurrency: config.full_agent_concurrency.get(),
+        module_concurrency: config.module_concurrency.get(),
         planned_case_count,
         models: SuiteModelNames {
             judge: config.judge_backend.model.clone(),
@@ -590,6 +587,221 @@ fn suite_run_report(
     }
 }
 
+async fn run_suite_cases_sequential(
+    case_paths: Vec<PathBuf>,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+    hooks: &mut RunnerHooks,
+) -> Result<Vec<CaseSummary>, RunnerError> {
+    let mut cases = Vec::new();
+    for path in case_paths {
+        let output = run_case_detailed_sequential(&path, config, judge, hooks).await?;
+        let failed = !output.summary.passed || output.summary.invalid;
+        cases.push(output.summary);
+        if hooks
+            .visualizer
+            .as_ref()
+            .is_some_and(VisualizerHook::shutdown_requested)
+        {
+            break;
+        }
+        if failed && config.fail_fast {
+            break;
+        }
+    }
+    Ok(cases)
+}
+
+async fn run_suite_cases_parallel(
+    case_paths: Vec<PathBuf>,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+) -> Result<Vec<CaseSummary>, RunnerError> {
+    let items = plan_eval_work_items(case_paths, config)?;
+    let mut pending_full_agent = VecDeque::new();
+    let mut pending_module = VecDeque::new();
+    for item in items {
+        match item.kind {
+            EvalWorkKind::FullAgent => pending_full_agent.push_back(item),
+            EvalWorkKind::Module => pending_module.push_back(item),
+        }
+    }
+
+    let full_agent_limit = (EvalWorkKind::FullAgent).concurrency(config);
+    let module_limit = (EvalWorkKind::Module).concurrency(config);
+    let mut running_full_agent = 0usize;
+    let mut running_module = 0usize;
+    let mut stop_launching = false;
+    let mut running = FuturesUnordered::new();
+    let mut outputs = Vec::new();
+
+    loop {
+        if !stop_launching {
+            while running_full_agent < full_agent_limit {
+                let Some(item) = pending_full_agent.pop_front() else {
+                    break;
+                };
+                running_full_agent += 1;
+                running.push(run_eval_work_item(item, config, judge));
+            }
+            while running_module < module_limit {
+                let Some(item) = pending_module.pop_front() else {
+                    break;
+                };
+                running_module += 1;
+                running.push(run_eval_work_item(item, config, judge));
+            }
+        }
+
+        let Some(output) = running.next().await else {
+            break;
+        };
+        let output = output?;
+        match output.item.kind {
+            EvalWorkKind::FullAgent => running_full_agent = running_full_agent.saturating_sub(1),
+            EvalWorkKind::Module => running_module = running_module.saturating_sub(1),
+        }
+        if config.fail_fast && (!output.output.summary.passed || output.output.summary.invalid) {
+            stop_launching = true;
+        }
+        outputs.push(output);
+    }
+
+    aggregate_parallel_case_outputs(outputs)
+}
+
+async fn run_eval_work_item(
+    item: EvalWorkItem,
+    config: &RunnerConfig,
+    judge: Option<&dyn RubricJudge>,
+) -> Result<EvalWorkOutput, RunnerError> {
+    let started_at = Instant::now();
+    let reporter = LiveReporter::new(&config.run_id, &item.output_dir)?;
+    let mut hooks = RunnerHooks::none();
+    eprintln!("\n────────────────────────────────────────────────────────────");
+    if item.trial_count == 1 {
+        reporter.emit(
+            Some(&item.id),
+            "case_started",
+            serde_json::json!({
+                "path": item.case_path.display().to_string(),
+                "output_dir": item.output_dir.display().to_string(),
+                "trials": item.trial_count,
+            }),
+            format!(
+                "▶️  eval case start id={} path={} trials={} output={}",
+                item.id,
+                item.case_path.display(),
+                item.trial_count,
+                item.output_dir.display()
+            ),
+        )?;
+    } else {
+        reporter.emit(
+            Some(&item.runtime_id),
+            "trial_started",
+            serde_json::json!({
+                "path": item.case_path.display().to_string(),
+                "output_dir": item.output_dir.display().to_string(),
+                "trial": item.trial_number,
+                "trials": item.trial_count,
+            }),
+            format!(
+                "▶️  eval trial start id={} trial={}/{} output={}",
+                item.id,
+                item.trial_number,
+                item.trial_count,
+                item.output_dir.display()
+            ),
+        )?;
+    }
+
+    let output = run_case_trial_with_timeout(
+        &item.case_path,
+        config,
+        judge,
+        &reporter,
+        &mut hooks,
+        &item.case,
+        &item.id,
+        &item.runtime_id,
+        &item.output_dir,
+        item.trial_number,
+    )
+    .await?;
+    if item.trial_count == 1 {
+        emit_case_finished(&reporter, &output.summary, output.events.len())?;
+    } else {
+        emit_trial_finished(
+            &reporter,
+            &item.runtime_id,
+            &output.summary,
+            output.events.len(),
+        )?;
+    }
+    Ok(EvalWorkOutput {
+        item,
+        output,
+        started_at,
+        completed_at: Instant::now(),
+    })
+}
+
+fn aggregate_parallel_case_outputs(
+    mut outputs: Vec<EvalWorkOutput>,
+) -> Result<Vec<CaseSummary>, RunnerError> {
+    outputs.sort_by_key(|output| (output.item.case_order, output.item.trial_number));
+    let mut grouped: BTreeMap<usize, Vec<EvalWorkOutput>> = BTreeMap::new();
+    for output in outputs {
+        grouped
+            .entry(output.item.case_order)
+            .or_default()
+            .push(output);
+    }
+
+    let mut cases = Vec::with_capacity(grouped.len());
+    for (_case_order, mut outputs) in grouped {
+        outputs.sort_by_key(|output| output.item.trial_number);
+        let first = outputs
+            .first()
+            .expect("grouped parallel case output is never empty");
+        if first.item.trial_count == 1 {
+            cases.push(first.output.summary.clone());
+            continue;
+        }
+
+        let event_count = outputs
+            .iter()
+            .map(|output| output.output.events.len())
+            .sum::<usize>();
+        let started_at = outputs
+            .iter()
+            .map(|output| output.started_at)
+            .min()
+            .expect("grouped parallel case output has a start time");
+        let completed_at = outputs
+            .iter()
+            .map(|output| output.completed_at)
+            .max()
+            .expect("grouped parallel case output has a completion time");
+        let trial_outputs = outputs
+            .iter()
+            .map(|output| output.output.clone())
+            .collect::<Vec<_>>();
+        let summary = aggregate_case_summary(
+            &first.item.case_path,
+            &first.item.case,
+            &first.item.id,
+            &trial_outputs,
+            duration_millis_u64(completed_at.duration_since(started_at)),
+        );
+        write_json_file(&first.item.case_output_dir.join("report.json"), &summary)?;
+        eprintln!("{}", case_finished_message(&summary, event_count));
+        cases.push(summary);
+    }
+    Ok(cases)
+}
+
 pub async fn run_case_detailed(
     case_path: &Path,
     config: &RunnerConfig,
@@ -597,14 +809,8 @@ pub async fn run_case_detailed(
 ) -> Result<CaseRunOutput, RunnerError> {
     install_trace_subscriber_for_runner()?;
     validate_disabled_modules(&config.disabled_modules)?;
-    let run_dir = config.output_root.join(&config.run_id);
-    std::fs::create_dir_all(&run_dir).map_err(|source| RunnerError::WriteOutput {
-        path: run_dir.clone(),
-        source,
-    })?;
-    let reporter = LiveReporter::new(&config.run_id, &run_dir)?;
     let mut hooks = RunnerHooks::none();
-    run_case_detailed_with_reporter(case_path, config, judge, &reporter, &mut hooks).await
+    run_case_detailed_sequential(case_path, config, judge, &mut hooks).await
 }
 
 fn select_case_paths(config: &RunnerConfig, gui_only: bool) -> Result<CaseSelection, RunnerError> {
@@ -919,6 +1125,48 @@ fn filter_gui_case_paths(case_paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, Runne
     Ok(full_agent_paths)
 }
 
+fn plan_eval_work_items(
+    case_paths: Vec<PathBuf>,
+    config: &RunnerConfig,
+) -> Result<Vec<EvalWorkItem>, RunnerError> {
+    let trial_count = config.trials.get();
+    let mut items = Vec::with_capacity(case_paths.len().saturating_mul(trial_count));
+    for (case_order, case_path) in case_paths.into_iter().enumerate() {
+        let case = parse_case_file(&case_path)?;
+        let id = case_id(&case_path, &case);
+        let case_output_dir = config
+            .output_root
+            .join(&config.run_id)
+            .join(sanitize_id(&id));
+        let kind = EvalWorkKind::for_path(&case_path);
+        for trial_number in 1..=trial_count {
+            let output_dir = if trial_count == 1 {
+                case_output_dir.clone()
+            } else {
+                case_output_dir.join(trial_dir_name(trial_number))
+            };
+            let runtime_id = if trial_count == 1 {
+                id.clone()
+            } else {
+                trial_runtime_id(&id, trial_number)
+            };
+            items.push(EvalWorkItem {
+                case_order,
+                case_path: case_path.clone(),
+                case: case.clone(),
+                id: id.clone(),
+                case_output_dir: case_output_dir.clone(),
+                output_dir,
+                runtime_id,
+                trial_number,
+                trial_count,
+                kind,
+            });
+        }
+    }
+    Ok(items)
+}
+
 fn normalize_case_pattern(value: &str) -> String {
     value
         .chars()
@@ -930,11 +1178,10 @@ fn normalize_case_pattern(value: &str) -> String {
         .collect::<String>()
 }
 
-async fn run_case_detailed_with_reporter(
+async fn run_case_detailed_sequential(
     case_path: &Path,
     config: &RunnerConfig,
     judge: Option<&dyn RubricJudge>,
-    reporter: &LiveReporter,
     hooks: &mut RunnerHooks,
 ) -> Result<CaseRunOutput, RunnerError> {
     let case = parse_case_file(case_path)?;
@@ -948,32 +1195,33 @@ async fn run_case_detailed_with_reporter(
         source,
     })?;
     eprintln!("\n────────────────────────────────────────────────────────────");
-    reporter.emit(
-        Some(&id),
-        "case_started",
-        serde_json::json!({
-            "path": case_path.display().to_string(),
-            "output_dir": output_dir.display().to_string(),
-            "trials": config.trials.get(),
-        }),
-        format!(
-            "▶️  eval case start id={} path={} trials={} output={}",
-            id,
-            case_path.display(),
-            config.trials.get(),
-            output_dir.display()
-        ),
-    )?;
     emit_visualizer_open_tab(hooks, &id);
 
     let trial_count = config.trials.get();
     let case_started = Instant::now();
     if trial_count == 1 {
+        let reporter = LiveReporter::new(&config.run_id, &output_dir)?;
+        reporter.emit(
+            Some(&id),
+            "case_started",
+            serde_json::json!({
+                "path": case_path.display().to_string(),
+                "output_dir": output_dir.display().to_string(),
+                "trials": trial_count,
+            }),
+            format!(
+                "▶️  eval case start id={} path={} trials={} output={}",
+                id,
+                case_path.display(),
+                trial_count,
+                output_dir.display()
+            ),
+        )?;
         let output = run_case_trial_with_timeout(
             case_path,
             config,
             judge,
-            reporter,
+            &reporter,
             hooks,
             &case,
             &id,
@@ -982,7 +1230,7 @@ async fn run_case_detailed_with_reporter(
             1,
         )
         .await?;
-        emit_case_finished(reporter, &output.summary, output.events.len())?;
+        emit_case_finished(&reporter, &output.summary, output.events.len())?;
         emit_visualizer_case_status(hooks, &output.summary);
         return Ok(output);
     }
@@ -991,6 +1239,7 @@ async fn run_case_detailed_with_reporter(
     for trial_number in 1..=trial_count {
         let runtime_id = trial_runtime_id(&id, trial_number);
         let trial_output_dir = output_dir.join(trial_dir_name(trial_number));
+        let reporter = LiveReporter::new(&config.run_id, &trial_output_dir)?;
         reporter.emit(
             Some(&runtime_id),
             "trial_started",
@@ -1012,7 +1261,7 @@ async fn run_case_detailed_with_reporter(
             case_path,
             config,
             judge,
-            reporter,
+            &reporter,
             hooks,
             &case,
             &id,
@@ -1021,7 +1270,7 @@ async fn run_case_detailed_with_reporter(
             trial_number,
         )
         .await?;
-        emit_trial_finished(reporter, &runtime_id, &output.summary, output.events.len())?;
+        emit_trial_finished(&reporter, &runtime_id, &output.summary, output.events.len())?;
         trial_outputs.push(output);
     }
 
@@ -1037,7 +1286,7 @@ async fn run_case_detailed_with_reporter(
         duration_millis_u64(case_started.elapsed()),
     );
     write_json_file(&output_dir.join("report.json"), &summary)?;
-    emit_case_finished(reporter, &summary, event_count)?;
+    eprintln!("{}", case_finished_message(&summary, event_count));
 
     let artifact = trial_outputs
         .first()
@@ -1496,11 +1745,7 @@ fn empty_trace_snapshot() -> TraceSnapshot {
     }
 }
 
-fn emit_case_finished(
-    reporter: &LiveReporter,
-    summary: &CaseSummary,
-    event_count: usize,
-) -> Result<(), RunnerError> {
+fn case_finished_message(summary: &CaseSummary, event_count: usize) -> String {
     let status_icon = if summary.invalid {
         "💥"
     } else if summary.passed {
@@ -1508,7 +1753,7 @@ fn emit_case_finished(
     } else {
         "❌"
     };
-    let case_finished_message = if let Some(runtime_failure) = &summary.report.runtime_failure {
+    if let Some(runtime_failure) = &summary.report.runtime_failure {
         format!(
             "{status_icon} eval case end id={} passed={} invalid={} score={:.3} elapsed_ms={} events={} failure={}",
             summary.id,
@@ -1529,7 +1774,15 @@ fn emit_case_finished(
             summary.timing.elapsed_ms,
             event_count
         )
-    };
+    }
+}
+
+fn emit_case_finished(
+    reporter: &LiveReporter,
+    summary: &CaseSummary,
+    event_count: usize,
+) -> Result<(), RunnerError> {
+    let case_finished_message = case_finished_message(summary, event_count);
     reporter.emit(
         Some(&summary.id),
         "case_finished",
@@ -6045,6 +6298,10 @@ impl LiveReporter {
         log_prefix: &str,
         log_scope: &str,
     ) -> Result<Self, RunnerError> {
+        std::fs::create_dir_all(run_dir).map_err(|source| RunnerError::WriteOutput {
+            path: run_dir.to_path_buf(),
+            source,
+        })?;
         let path = run_dir.join("events.jsonl");
         let file = OpenOptions::new()
             .create(true)
@@ -6898,6 +7155,8 @@ mod tests {
             model_concurrency: test_model_concurrency(),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
+            module_concurrency: NonZeroUsize::new(16).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -6917,6 +7176,8 @@ mod tests {
             fail_fast: false,
             model_concurrency: BTreeMap::new(),
             trials,
+            full_agent_concurrency: 4,
+            module_concurrency: 16,
             planned_case_count: 0,
             models: SuiteModelNames {
                 judge: "judge".to_string(),
@@ -7018,6 +7279,136 @@ mod tests {
             trace: empty_trace_snapshot(),
             raw_trace: RawTraceSnapshot::default(),
         }
+    }
+
+    #[test]
+    fn plan_eval_work_items_expands_trials_and_classifies_by_case_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_dir = dir.path().join("eval-cases/full-agent");
+        let module_dir = dir.path().join("eval-cases/modules/query-memory");
+        std::fs::create_dir_all(&full_dir).unwrap();
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let full_path = full_dir.join("full.eure");
+        let module_path = module_dir.join("module.eure");
+        std::fs::write(
+            &full_path,
+            r#"
+id = "full-case"
+
+@ inputs[] {
+  $variant: heard
+  content = "What changed?"
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &module_path,
+            r#"
+id = "module-case"
+prompt = "What do you remember?"
+"#,
+        )
+        .unwrap();
+        let mut config = test_runner_config(dir.path());
+        config.trials = NonZeroUsize::new(2).unwrap();
+        config.full_agent_concurrency = NonZeroUsize::new(3).unwrap();
+        config.module_concurrency = NonZeroUsize::new(5).unwrap();
+
+        let items =
+            plan_eval_work_items(vec![full_path.clone(), module_path.clone()], &config).unwrap();
+
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == EvalWorkKind::FullAgent)
+                .count(),
+            2
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == EvalWorkKind::Module)
+                .count(),
+            2
+        );
+        assert_eq!((EvalWorkKind::FullAgent).concurrency(&config), 3);
+        assert_eq!((EvalWorkKind::Module).concurrency(&config), 5);
+        assert_eq!(items[0].runtime_id, "full-case/trial-001");
+        assert_eq!(items[1].runtime_id, "full-case/trial-002");
+        assert_eq!(items[2].runtime_id, "module-case/trial-001");
+        assert_eq!(items[3].runtime_id, "module-case/trial-002");
+    }
+
+    #[test]
+    fn aggregate_parallel_case_outputs_restores_case_and_trial_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-memory");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let case_path = case_dir.join("aggregate-order.eure");
+        std::fs::write(
+            &case_path,
+            r#"
+id = "aggregate-order"
+prompt = "What do you remember?"
+"#,
+        )
+        .unwrap();
+        let mut config = test_runner_config(dir.path());
+        config.trials = NonZeroUsize::new(2).unwrap();
+        let items = plan_eval_work_items(vec![case_path], &config).unwrap();
+        std::fs::create_dir_all(&items[0].case_output_dir).unwrap();
+        let now = Instant::now();
+        let summaries = aggregate_parallel_case_outputs(vec![
+            EvalWorkOutput {
+                item: items[1].clone(),
+                output: test_case_run_output("aggregate-order", 2, false, true, 0.0),
+                started_at: now,
+                completed_at: now + Duration::from_millis(20),
+            },
+            EvalWorkOutput {
+                item: items[0].clone(),
+                output: test_case_run_output("aggregate-order", 1, false, true, 0.0),
+                started_at: now,
+                completed_at: now + Duration::from_millis(10),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "aggregate-order");
+        assert_eq!(summaries[0].trials[0].trial, 1);
+        assert_eq!(summaries[0].trials[1].trial, 2);
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(items[0].case_output_dir.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["trials"][0]["trial"], serde_json::json!(1));
+        assert_eq!(report["trials"][1]["trial"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn llm_concurrency_pool_reuses_one_semaphore_for_matching_model_key() {
+        let pool = LlmConcurrencyPool::default();
+        let max = NonZeroUsize::new(1).unwrap();
+        let first = pool.limiter_for("shared-model", Some(max));
+        let second = pool.limiter_for("shared-model", Some(max));
+        let first_permit = first.acquire().await;
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _second_permit = second.acquire().await;
+            let _ = acquired_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut acquired_rx)
+                .await
+                .is_err()
+        );
+        drop(first_permit);
+        acquired_rx.await.unwrap();
+        task.await.unwrap();
     }
 
     fn assert_metric_values(actual: &[KMetricReport], expected: &[(usize, f64)]) {
@@ -7684,6 +8075,8 @@ id = "module-query-memory-special-memory"
             model_concurrency: test_model_concurrency(),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
+            module_concurrency: NonZeroUsize::new(16).unwrap(),
             case_patterns: vec!["special-memory".to_string()],
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -8687,6 +9080,8 @@ limits {{
             ]),
             llm_concurrency_pool: LlmConcurrencyPool::default(),
             trials: NonZeroUsize::new(1).unwrap(),
+            full_agent_concurrency: NonZeroUsize::new(4).unwrap(),
+            module_concurrency: NonZeroUsize::new(16).unwrap(),
             case_patterns: Vec::new(),
             module_filters: Vec::new(),
             disabled_modules: Vec::new(),
@@ -8710,6 +9105,8 @@ limits {{
             Some(&Some(7))
         );
         assert_eq!(report.run.trials, 1);
+        assert_eq!(report.run.full_agent_concurrency, 4);
+        assert_eq!(report.run.module_concurrency, 16);
         assert_eq!(report.run.planned_case_count, 2);
         assert_eq!(report.run.models.judge, "judge-model");
         assert_eq!(report.run.models.cheap, "cheap-model");
@@ -8735,6 +9132,7 @@ limits {{
         assert_metric_values(&report.metrics.pass_hat, &[(1, 0.0)]);
 
         assert!(run_dir.join("suite-report.json").exists());
+        assert!(!run_dir.join("events.jsonl").exists());
         let suite_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(run_dir.join("suite-report.json")).unwrap())
                 .unwrap();
@@ -8755,6 +9153,8 @@ limits {{
                     "premium-model": null,
                 },
                 "trials": 1,
+                "full_agent_concurrency": 4,
+                "module_concurrency": 16,
                 "planned_case_count": 2,
                 "models": {
                     "judge": "judge-model",
@@ -8772,6 +9172,7 @@ limits {{
             let output_dir = run_dir.join(sanitize_id(&summary.id));
             assert!(output_dir.join("report.json").exists());
             assert!(output_dir.join("artifact.json").exists());
+            assert!(output_dir.join("events.jsonl").exists());
             assert!(output_dir.join("raw-trace.json").exists());
             assert!(!output_dir.join("trial-001").exists());
             let events: serde_json::Value =
@@ -8779,6 +9180,51 @@ limits {{
                     .unwrap();
             assert_eq!(events, serde_json::json!([]));
         }
+    }
+
+    #[tokio::test]
+    async fn parallel_fail_fast_drains_running_cases_without_launching_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("eval-cases/modules/query-memory");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        for id in ["fail-a", "fail-b", "fail-c"] {
+            std::fs::write(
+                case_dir.join(format!("{id}.eure")),
+                format!(
+                    r#"
+id = "{id}"
+prompt = "Who are you?"
+
+limits {{
+  max-llm-calls = 1
+}}
+"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut config = test_runner_config(dir.path());
+        config.run_id = "parallel-fail-fast".to_string();
+        config.fail_fast = true;
+        config.module_concurrency = NonZeroUsize::new(2).unwrap();
+
+        let report = run_suite(&config).await.unwrap();
+
+        assert_eq!(report.run.planned_case_count, 3);
+        assert_eq!(report.case_count, 2);
+        assert_eq!(
+            report
+                .cases
+                .iter()
+                .map(|case| case.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fail-a", "fail-b"]
+        );
+        let run_dir = config.output_root.join(&config.run_id);
+        assert!(run_dir.join("fail-a/events.jsonl").exists());
+        assert!(run_dir.join("fail-b/events.jsonl").exists());
+        assert!(!run_dir.join("fail-c").exists());
+        assert!(!run_dir.join("events.jsonl").exists());
     }
 
     #[tokio::test]
@@ -8826,11 +9272,14 @@ limits {
             .join("multi-trial")
             .join(sanitize_id(&summary.id));
         assert!(output_dir.join("report.json").exists());
+        assert!(!output_dir.parent().unwrap().join("events.jsonl").exists());
+        assert!(!output_dir.join("events.jsonl").exists());
         assert!(!output_dir.join("artifact.json").exists());
         for trial in ["trial-001", "trial-002"] {
             let trial_dir = output_dir.join(trial);
             assert!(trial_dir.join("report.json").exists());
             assert!(trial_dir.join("artifact.json").exists());
+            assert!(trial_dir.join("events.jsonl").exists());
             assert!(trial_dir.join("raw-trace.json").exists());
         }
 
