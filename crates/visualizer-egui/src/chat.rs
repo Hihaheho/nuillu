@@ -167,6 +167,48 @@ impl SceneUiState {
         ));
         self.activity.push(message);
     }
+
+    fn send_person_message_commands(
+        &mut self,
+        tab_id: &VisualizerTabId,
+        row_id: &str,
+    ) -> Vec<VisualizerClientMessage> {
+        let message = self
+            .person_message_drafts
+            .get(row_id)
+            .map(|draft| draft.trim().to_string())
+            .unwrap_or_default();
+        if message.is_empty() {
+            return Vec::new();
+        }
+        let Some(row) = self
+            .scene
+            .people
+            .iter()
+            .find(|row| row.id == row_id)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        if let Some(draft) = self.person_message_drafts.get_mut(row_id) {
+            draft.clear();
+        }
+        vec![
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::UpdateSceneRow {
+                    tab_id: tab_id.clone(),
+                    row: SceneRowView::Person(row),
+                },
+            },
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SendScenePersonMessage {
+                    tab_id: tab_id.clone(),
+                    row_id: row_id.to_string(),
+                    message,
+                },
+            },
+        ]
+    }
 }
 
 pub fn ui(
@@ -218,10 +260,30 @@ fn people_section_ui(
                 .clicked();
             {
                 let row = &mut state.scene.people[index];
-                send_update |= text_field(ui, &mut row.name, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.state, LONG_FIELD_WIDTH);
+                send_update |= text_field_with_id(
+                    ui,
+                    &mut row.name,
+                    SHORT_FIELD_WIDTH,
+                    ("person-name", tab_id.as_str(), row_id.as_str()),
+                );
+                send_update |= text_field_with_id(
+                    ui,
+                    &mut row.direction,
+                    SHORT_FIELD_WIDTH,
+                    ("person-direction", tab_id.as_str(), row_id.as_str()),
+                );
+                send_update |= text_field_with_id(
+                    ui,
+                    &mut row.distance,
+                    SHORT_FIELD_WIDTH,
+                    ("person-distance", tab_id.as_str(), row_id.as_str()),
+                );
+                send_update |= text_field_with_id(
+                    ui,
+                    &mut row.state,
+                    LONG_FIELD_WIDTH,
+                    ("person-state", tab_id.as_str(), row_id.as_str()),
+                );
             }
             let draft = state
                 .person_message_drafts
@@ -229,7 +291,9 @@ fn people_section_ui(
                 .or_default();
             let message_response = ui.add_sized(
                 [MESSAGE_FIELD_WIDTH, FIELD_HEIGHT],
-                egui::TextEdit::singleline(draft).desired_width(MESSAGE_FIELD_WIDTH),
+                egui::TextEdit::singleline(draft)
+                    .desired_width(MESSAGE_FIELD_WIDTH)
+                    .id_salt(("person-message", tab_id.as_str(), row_id.as_str())),
             );
             let send_clicked = ui
                 .add_sized([56.0, FIELD_HEIGHT], egui::Button::new("Send"))
@@ -259,22 +323,8 @@ fn people_section_ui(
                 });
             }
             if send_clicked {
-                let message = state
-                    .person_message_drafts
-                    .get(&row_id)
-                    .map(|draft| draft.trim().to_string())
-                    .unwrap_or_default();
-                if !message.is_empty() {
-                    let _ = commands.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::SendScenePersonMessage {
-                            tab_id: tab_id.clone(),
-                            row_id: row_id.clone(),
-                            message,
-                        },
-                    });
-                    if let Some(draft) = state.person_message_drafts.get_mut(&row_id) {
-                        draft.clear();
-                    }
+                for command in state.send_person_message_commands(tab_id, &row_id) {
+                    let _ = commands.send(command);
                 }
             }
             ui.end_row();
@@ -571,5 +621,131 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, width: f32) -> bool {
         [width, FIELD_HEIGHT],
         egui::TextEdit::singleline(value).desired_width(width),
     )
-    .lost_focus()
+    .changed()
+}
+
+fn text_field_with_id(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    width: f32,
+    id_salt: impl std::hash::Hash,
+) -> bool {
+    ui.add_sized(
+        [width, FIELD_HEIGHT],
+        egui::TextEdit::singleline(value)
+            .desired_width(width)
+            .id_salt(id_salt),
+    )
+    .changed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ScenePersonRowView;
+
+    #[test]
+    fn person_message_send_flushes_target_row_before_message() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state
+            .person_message_drafts
+            .insert("person-1".to_string(), "hello one".to_string());
+        state
+            .person_message_drafts
+            .insert("person-2".to_string(), " hello two ".to_string());
+
+        let commands = state.send_person_message_commands(&tab_id, "person-2");
+
+        assert_eq!(commands.len(), 2);
+        let update_row = match &commands[0] {
+            VisualizerClientMessage::Command {
+                command:
+                    VisualizerCommand::UpdateSceneRow {
+                        tab_id: command_tab,
+                        row: SceneRowView::Person(row),
+                    },
+            } => {
+                assert_eq!(command_tab, &tab_id);
+                row
+            }
+            other => panic!("expected target row update, got {other:?}"),
+        };
+        assert_eq!(update_row.id, "person-2");
+        assert_eq!(update_row.name, "Koro");
+
+        match &commands[1] {
+            VisualizerClientMessage::Command {
+                command:
+                    VisualizerCommand::SendScenePersonMessage {
+                        tab_id: command_tab,
+                        row_id,
+                        message,
+                    },
+            } => {
+                assert_eq!(command_tab, &tab_id);
+                assert_eq!(row_id, "person-2");
+                assert_eq!(message, "hello two");
+            }
+            other => panic!("expected target person message, got {other:?}"),
+        }
+        assert_eq!(
+            state
+                .person_message_drafts
+                .get("person-1")
+                .map(String::as_str),
+            Some("hello one")
+        );
+        assert_eq!(
+            state
+                .person_message_drafts
+                .get("person-2")
+                .map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn empty_person_message_does_not_create_commands_or_clear_draft() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state
+            .person_message_drafts
+            .insert("person-2".to_string(), "   ".to_string());
+
+        let commands = state.send_person_message_commands(&tab_id, "person-2");
+
+        assert!(commands.is_empty());
+        assert_eq!(
+            state
+                .person_message_drafts
+                .get("person-2")
+                .map(String::as_str),
+            Some("   ")
+        );
+    }
+
+    fn scene_with_two_people() -> SceneUiState {
+        let mut state = SceneUiState::default();
+        state.set_scene_state(SceneStateView {
+            people: vec![
+                ScenePersonRowView {
+                    id: "person-1".to_string(),
+                    name: "Pibi".to_string(),
+                    direction: "front".to_string(),
+                    distance: "2m".to_string(),
+                    state: "watching Nui".to_string(),
+                },
+                ScenePersonRowView {
+                    id: "person-2".to_string(),
+                    name: "Koro".to_string(),
+                    direction: "left".to_string(),
+                    distance: "1m".to_string(),
+                    state: "waiting".to_string(),
+                },
+            ],
+            ..SceneStateView::default()
+        });
+        state
+    }
 }
