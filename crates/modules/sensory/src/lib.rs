@@ -44,7 +44,6 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
 
 const DEFAULT_BURST_SILENT_WINDOW: Duration = Duration::from_millis(100);
 const DEFAULT_BURST_BUDGET: Duration = Duration::from_secs(1);
-const USER_DIRECTED_DIRECTIONS: &[&str] = &["user", "front"];
 
 #[derive(Clone, Debug)]
 struct PreparedSensoryObservation {
@@ -99,7 +98,6 @@ struct SalienceFeatures {
     repeated: bool,
     repetition_count: u32,
     seconds_since_previous: Option<i64>,
-    user_directed: bool,
     novelty_score: f32,
     salience_score: f32,
 }
@@ -559,16 +557,13 @@ impl SensoryModule {
             .as_ref()
             .map(|state| (observed_at - state.last_observed_at).num_seconds().max(0));
         let repeated = previous.is_some();
-        let user_directed = direction.map(is_user_directed_direction).unwrap_or(false);
         let novelty_score = if repeated { 0.15 } else { 0.85 };
         let repetition_penalty = if repeated {
             (repetition_count.saturating_sub(1) as f32 * 0.15).min(0.45)
         } else {
             0.0
         };
-        let salience_score = (novelty_score + if user_directed { 0.2 } else { 0.0 }
-            - repetition_penalty)
-            .clamp(0.0, 1.0);
+        let salience_score = (novelty_score - repetition_penalty).clamp(0.0, 1.0);
 
         self.stimuli.insert(
             signature.clone(),
@@ -583,7 +578,6 @@ impl SensoryModule {
             repeated,
             repetition_count,
             seconds_since_previous,
-            user_directed,
             novelty_score,
             salience_score,
         }
@@ -669,11 +663,6 @@ fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-fn is_user_directed_direction(direction: &str) -> bool {
-    let direction = direction.to_ascii_lowercase();
-    USER_DIRECTED_DIRECTIONS.contains(&direction.as_str())
-}
-
 fn format_sensory_ledger(observations: &[PreparedSensoryObservation]) -> String {
     let mut out = String::from("New sensory session ledger entries:");
     if observations.is_empty() {
@@ -707,7 +696,7 @@ fn format_sensory_ledger(observations: &[PreparedSensoryObservation]) -> String 
                 observation.content.trim()
             ));
             out.push_str(&format!(
-                "\n  salience: signature={}; repeated={}; repetition_count={}; seconds_since_previous={}; user_directed={}; novelty_score={:.2}; salience_score={:.2}",
+                "\n  salience: signature={}; repeated={}; repetition_count={}; seconds_since_previous={}; novelty_score={:.2}; salience_score={:.2}",
                 observation.salience.signature,
                 if observation.salience.repeated { "yes" } else { "no" },
                 observation.salience.repetition_count,
@@ -716,7 +705,6 @@ fn format_sensory_ledger(observations: &[PreparedSensoryObservation]) -> String 
                     .seconds_since_previous
                     .map(|secs| secs.to_string())
                     .unwrap_or_else(|| "none".to_owned()),
-                if observation.salience.user_directed { "yes" } else { "no" },
                 observation.salience.novelty_score,
                 observation.salience.salience_score,
             ));
@@ -1164,15 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn user_directed_direction_is_generic_not_username_specific() {
-        assert!(is_user_directed_direction("user"));
-        assert!(is_user_directed_direction("front"));
-        assert!(is_user_directed_direction("USER"));
-        assert!(!is_user_directed_direction("ryo"));
-        assert!(!is_user_directed_direction("left"));
-    }
-
-    #[test]
     fn sensory_modality_round_trips_known_and_custom_strings() {
         let known = serde_json::to_string(&SensoryModality::Audition).unwrap();
         assert_eq!(known, "\"audition\"");
@@ -1201,7 +1180,6 @@ mod tests {
                 repeated: false,
                 repetition_count: 1,
                 seconds_since_previous: None,
-                user_directed: false,
                 novelty_score: 0.85,
                 salience_score: 0.85,
             },
@@ -1233,7 +1211,6 @@ mod tests {
                 repeated: false,
                 repetition_count: 1,
                 seconds_since_previous: None,
-                user_directed: false,
                 novelty_score: 0.85,
                 salience_score: 0.85,
             },
