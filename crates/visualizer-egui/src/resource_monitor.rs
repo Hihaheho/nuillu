@@ -83,6 +83,9 @@ impl ResourceMonitorState {
                     counts.activations_failed += 1;
                 }
             }
+            RuntimeEvent::ModuleActivationAttemptFailed { .. } => {
+                counts.activations_failed += 1;
+            }
             RuntimeEvent::SessionCompactionStarted { .. } => counts.compactions_started += 1,
             RuntimeEvent::SessionCompactionCompleted { .. } => counts.compactions_completed += 1,
             RuntimeEvent::SessionCompactionFailed { .. } => counts.compactions_failed += 1,
@@ -707,6 +710,7 @@ fn runtime_event_module(event: &RuntimeEvent) -> String {
         | RuntimeEvent::ModuleBatchThrottled { owner, .. }
         | RuntimeEvent::ModuleBatchReady { owner, .. }
         | RuntimeEvent::ModuleActivationCompleted { owner, .. }
+        | RuntimeEvent::ModuleActivationAttemptFailed { owner, .. }
         | RuntimeEvent::ModuleTaskFailed { owner, .. }
         | RuntimeEvent::ModuleWarning { owner, .. }
         | RuntimeEvent::SessionCompactionStarted { owner, .. }

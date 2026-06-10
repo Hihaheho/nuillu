@@ -1822,12 +1822,19 @@ async fn activate_with_retries(
         match activation_result {
             Ok(()) => return (module, Ok(())),
             Err(error) if retries < activate_retries => {
+                let message = format!("{error:#}");
+                runtime.record_module_activation_attempt_failed(
+                    module.owner().clone(),
+                    activation_attempt,
+                    u32::from(activate_retries) + 1,
+                    message.clone(),
+                );
                 retries = retries.saturating_add(1);
                 tracing::warn!(
                     owner = %module.owner(),
                     retries,
                     max_retries = activate_retries,
-                    error = %error,
+                    error = %message,
                     "module activation failed; retrying"
                 );
             }
@@ -1874,7 +1881,7 @@ mod tests {
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
         CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, Memo,
         Module, ModuleCapabilityFactory, ModuleDependencies, ModuleRegistry, ModuleRegistryError,
-        RuntimePolicy, SessionCompactionPolicy,
+        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
@@ -1883,7 +1890,27 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    use crate::testing::{test_caps, test_caps_with_policy, test_caps_with_real_clock};
+    use crate::testing::{
+        test_caps, test_caps_with_event_sink, test_caps_with_policy, test_caps_with_real_clock,
+    };
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntimeEventSink {
+        events: Rc<RefCell<Vec<RuntimeEvent>>>,
+    }
+
+    impl RecordingRuntimeEventSink {
+        fn events(&self) -> Vec<RuntimeEvent> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl RuntimeEventSink for RecordingRuntimeEventSink {
+        fn on_event(&self, event: RuntimeEvent) -> Result<(), nuillu_module::ports::PortError> {
+            self.events.borrow_mut().push(event);
+            Ok(())
+        }
+    }
 
     trait TestModuleRegistryExt {
         fn register_sync<M, F>(
@@ -4649,7 +4676,8 @@ mod tests {
                 alloc.set_activation(retry_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
-                let caps = test_caps(blackboard.clone());
+                let event_sink = Rc::new(RecordingRuntimeEventSink::default());
+                let caps = test_caps_with_event_sink(blackboard.clone(), event_sink.clone());
                 let attempts = Rc::new(Cell::new(0));
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
@@ -4694,6 +4722,29 @@ mod tests {
                     record.owner.module == retry_id
                         && record.content == "attempt 3 handled stable-batch"
                 }));
+                let attempt_failures = event_sink
+                    .events()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        RuntimeEvent::ModuleActivationAttemptFailed {
+                            owner,
+                            activation_attempt,
+                            max_attempts,
+                            message,
+                            ..
+                        } if owner.module == retry_id => {
+                            Some((activation_attempt, max_attempts, message))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    attempt_failures,
+                    vec![
+                        (1, 3, "transient activation failure".to_string()),
+                        (2, 3, "transient activation failure".to_string()),
+                    ]
+                );
             })
             .await;
     }

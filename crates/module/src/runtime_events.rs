@@ -54,6 +54,13 @@ pub enum RuntimeEvent {
         duration: Duration,
         succeeded: bool,
     },
+    ModuleActivationAttemptFailed {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        activation_attempt: u32,
+        max_attempts: u32,
+        message: String,
+    },
     ModuleTaskFailed {
         sequence: u64,
         owner: ModuleInstanceId,
@@ -211,6 +218,22 @@ impl RuntimeEventEmitter {
             owner,
             duration,
             succeeded,
+        });
+    }
+
+    pub(crate) fn module_activation_attempt_failed(
+        &self,
+        owner: ModuleInstanceId,
+        activation_attempt: u32,
+        max_attempts: u32,
+        message: String,
+    ) {
+        self.emit(|sequence| RuntimeEvent::ModuleActivationAttemptFailed {
+            sequence,
+            owner,
+            activation_attempt,
+            max_attempts,
+            message,
         });
     }
 

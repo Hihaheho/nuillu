@@ -485,6 +485,21 @@ impl AgentRuntimeControl {
             .module_activation_completed(owner, duration, succeeded);
     }
 
+    pub fn record_module_activation_attempt_failed(
+        &self,
+        owner: ModuleInstanceId,
+        activation_attempt: u32,
+        max_attempts: u32,
+        message: impl Into<String>,
+    ) {
+        self.runtime_events.module_activation_attempt_failed(
+            owner,
+            activation_attempt,
+            max_attempts,
+            message.into(),
+        );
+    }
+
     pub fn record_module_task_failed(
         &self,
         owner: ModuleInstanceId,

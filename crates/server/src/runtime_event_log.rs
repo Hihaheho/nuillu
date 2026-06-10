@@ -109,6 +109,15 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
             "nuillu-server module-activation-completed tab={tab_id} owner={owner} duration_ms={} succeeded={succeeded}",
             duration.as_millis()
         ),
+        RuntimeEvent::ModuleActivationAttemptFailed {
+            owner,
+            activation_attempt,
+            max_attempts,
+            message,
+            ..
+        } => format!(
+            "nuillu-server module-activation-attempt-failed tab={tab_id} owner={owner} attempt={activation_attempt}/{max_attempts} error={message}"
+        ),
         RuntimeEvent::ModuleTaskFailed {
             owner,
             phase,

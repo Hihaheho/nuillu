@@ -245,7 +245,28 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             if *succeeded {
                 let module = module_mut_for_owner(state, owner);
                 module.last_execution_failed = false;
+                if module
+                    .runtime_status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("Retrying activation "))
+                {
+                    module.runtime_status = Some("Activated".to_string());
+                }
             }
+        }
+        RuntimeEvent::ModuleActivationAttemptFailed {
+            owner,
+            activation_attempt,
+            max_attempts,
+            message,
+            ..
+        } => {
+            let module = module_mut_for_owner(state, owner);
+            module.runtime_status = Some(format!(
+                "Retrying activation {activation_attempt}/{max_attempts}: {message}"
+            ));
+            module.error_count = module.error_count.saturating_add(1);
+            module.last_execution_failed = true;
         }
         RuntimeEvent::ModuleTaskFailed {
             owner,

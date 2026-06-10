@@ -10,7 +10,7 @@ use nuillu_blackboard::Blackboard;
 use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, LutumTiers, RuntimePolicy,
+    CapabilityProviders, LutumTiers, RuntimeEventSink, RuntimePolicy,
 };
 
 /// Test clock whose `now()` is the wall clock but whose `sleep_until` returns
@@ -49,9 +49,38 @@ pub(crate) fn test_caps_with_policy(
     test_caps_inner(blackboard, policy, Rc::new(InstantSleepClock))
 }
 
+pub(crate) fn test_caps_with_event_sink(
+    blackboard: Blackboard,
+    event_sink: Rc<dyn RuntimeEventSink>,
+) -> CapabilityProviders {
+    test_caps_inner_with_runtime(
+        blackboard,
+        CapabilityProviderRuntime {
+            event_sink,
+            ..CapabilityProviderRuntime::default()
+        },
+        Rc::new(InstantSleepClock),
+    )
+}
+
 fn test_caps_inner(
     blackboard: Blackboard,
     policy: RuntimePolicy,
+    clock: Rc<dyn Clock>,
+) -> CapabilityProviders {
+    test_caps_inner_with_runtime(
+        blackboard,
+        CapabilityProviderRuntime {
+            policy,
+            ..CapabilityProviderRuntime::default()
+        },
+        clock,
+    )
+}
+
+fn test_caps_inner_with_runtime(
+    blackboard: Blackboard,
+    runtime: CapabilityProviderRuntime,
     clock: Rc<dyn Clock>,
 ) -> CapabilityProviders {
     let adapter = Arc::new(MockLlmAdapter::new());
@@ -64,9 +93,6 @@ fn test_caps_inner(
             clock,
             tiers: LutumTiers::from_shared_lutum(lutum),
         },
-        runtime: CapabilityProviderRuntime {
-            policy,
-            ..CapabilityProviderRuntime::default()
-        },
+        runtime,
     })
 }
