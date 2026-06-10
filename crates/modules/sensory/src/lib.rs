@@ -1285,20 +1285,19 @@ mod tests {
         modules: nuillu_module::AllocatedModules,
         body: F,
     ) {
-        run_modules_with_retries(modules, 2, body).await;
+        run_modules_with_max_activation_attempts(modules, 3, body).await;
     }
 
-    async fn run_modules_with_retries<F: std::future::Future<Output = ()>>(
+    async fn run_modules_with_max_activation_attempts<F: std::future::Future<Output = ()>>(
         modules: nuillu_module::AllocatedModules,
-        activate_retries: u8,
+        max_activation_attempts: u8,
         body: F,
     ) {
         nuillu_agent::run(
             modules,
             nuillu_agent::AgentEventLoopConfig {
                 idle_threshold: Duration::from_millis(50),
-                activate_retries,
-                module_failure_limit: 3,
+                max_activation_attempts,
                 dependency_idle_timeout: Duration::from_secs(2),
                 dependency_hard_timeout: Duration::from_secs(10),
             },
@@ -1776,8 +1775,7 @@ mod tests {
                     modules,
                     nuillu_agent::AgentEventLoopConfig {
                         idle_threshold: Duration::from_millis(50),
-                        activate_retries: 0,
-                        module_failure_limit: 1,
+                        max_activation_attempts: 1,
                         dependency_idle_timeout: Duration::from_secs(2),
                         dependency_hard_timeout: Duration::from_secs(10),
                     },

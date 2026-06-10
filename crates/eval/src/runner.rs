@@ -2032,8 +2032,7 @@ async fn execute_full_agent_case(
         modules,
         AgentEventLoopConfig {
             idle_threshold: Duration::from_secs(1),
-            activate_retries: 2,
-            module_failure_limit: 3,
+            max_activation_attempts: 3,
             dependency_idle_timeout: Duration::from_secs(2),
             dependency_hard_timeout: Duration::from_secs(10),
         },
@@ -2390,8 +2389,7 @@ async fn execute_module_case(
         modules,
         AgentEventLoopConfig {
             idle_threshold: Duration::from_secs(1),
-            activate_retries: 2,
-            module_failure_limit: 3,
+            max_activation_attempts: 3,
             dependency_idle_timeout: Duration::from_secs(2),
             dependency_hard_timeout: Duration::from_secs(10),
         },
@@ -9798,8 +9796,7 @@ prompt = "What am I attending to?"
                     modules,
                     AgentEventLoopConfig {
                         idle_threshold: Duration::from_millis(50),
-                        activate_retries: 1,
-                        module_failure_limit: 3,
+                        max_activation_attempts: 2,
                         dependency_idle_timeout: Duration::from_secs(2),
                         dependency_hard_timeout: Duration::from_secs(10),
                     },

@@ -163,8 +163,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
             allocated,
             AgentEventLoopConfig {
                 idle_threshold: Duration::from_secs(1),
-                activate_retries: 2,
-                module_failure_limit: 3,
+                max_activation_attempts: 5,
                 dependency_idle_timeout: Duration::from_secs(2),
                 dependency_hard_timeout: Duration::from_secs(10),
             },
