@@ -15,7 +15,10 @@ use nuillu_memory::{
     NewMemory, NewMemoryLink,
 };
 pub use nuillu_module::ports::Embedder;
-use nuillu_module::{PersistedSessionSnapshot, SessionKey, SessionStore, ports::PortError};
+use nuillu_module::{
+    AllocationStore, PersistedAllocationSnapshot, PersistedSessionSnapshot, SessionKey,
+    SessionStore, ports::PortError,
+};
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
@@ -149,6 +152,11 @@ pub struct LibsqlSessionStore {
 }
 
 #[derive(Clone)]
+pub struct LibsqlAllocationStore {
+    conn: Connection,
+}
+
+#[derive(Clone)]
 pub struct LibsqlLlmTranscriptStore {
     conn: Connection,
 }
@@ -233,10 +241,78 @@ impl LibsqlAgentStore {
         }
     }
 
+    pub fn allocation_store(&self) -> LibsqlAllocationStore {
+        LibsqlAllocationStore {
+            conn: self.conn.clone(),
+        }
+    }
+
     pub fn llm_transcript_store(&self) -> LibsqlLlmTranscriptStore {
         LibsqlLlmTranscriptStore {
             conn: self.conn.clone(),
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl AllocationStore for LibsqlAllocationStore {
+    async fn load_all(&self) -> Result<Vec<PersistedAllocationSnapshot>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT owner_module, owner_replica, snapshot_json
+                   FROM allocation_snapshots
+                  ORDER BY owner_module, owner_replica",
+                (),
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut snapshots = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let owner_module: String = row.get(0).map_err(map_libsql_error)?;
+            let owner_replica: i64 = row.get(1).map_err(map_libsql_error)?;
+            let json: String = row.get(2).map_err(map_libsql_error)?;
+            let snapshot: PersistedAllocationSnapshot = serde_json::from_str(&json)
+                .map_err(|error| PortError::InvalidData(error.to_string()))?;
+            snapshot.validate_version()?;
+            if snapshot.owner.module.as_str() != owner_module
+                || i64::from(snapshot.owner.replica.get()) != owner_replica
+            {
+                return Err(PortError::InvalidData(format!(
+                    "allocation snapshot owner mismatch: row={owner_module}[{owner_replica}] snapshot={}",
+                    snapshot.owner
+                )));
+            }
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
+    }
+
+    async fn save(&self, snapshot: &PersistedAllocationSnapshot) -> Result<(), PortError> {
+        snapshot.validate_version()?;
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO allocation_snapshots (
+                    owner_module,
+                    owner_replica,
+                    snapshot_json,
+                    updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(owner_module, owner_replica) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    snapshot.owner.module.as_str(),
+                    i64::from(snapshot.owner.replica.get()),
+                    snapshot_json,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
     }
 }
 
@@ -2802,6 +2878,7 @@ mod tests {
         assert_eq!(memories, 0);
         assert_eq!(policies, 0);
         assert!(table_exists(&store.conn, "llm_sessions").await);
+        assert!(table_exists(&store.conn, "allocation_snapshots").await);
         assert!(table_exists(&store.conn, "llm_transcript_turns").await);
         assert_eq!(
             version,
@@ -2861,6 +2938,28 @@ mod tests {
             serde_json::to_value(store.load(&owner, &key).await.unwrap().unwrap()).unwrap(),
             serde_json::to_value(&second).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn allocation_store_upserts_by_owner_replica() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.allocation_store();
+        let first = test_allocation_snapshot(0, "first priority");
+        let second = test_allocation_snapshot(0, "second priority");
+        let other_replica = test_allocation_snapshot(1, "replica one priority");
+
+        assert!(store.load_all().await.unwrap().is_empty());
+        store.save(&first).await.unwrap();
+        store.save(&other_replica).await.unwrap();
+        store.save(&second).await.unwrap();
+
+        assert_eq!(store.load_all().await.unwrap(), vec![second, other_replica]);
     }
 
     #[tokio::test]
@@ -3140,7 +3239,7 @@ mod tests {
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "affect_arousal").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "valence").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 2);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 3);
     }
 
     #[tokio::test]
@@ -4164,6 +4263,27 @@ mod tests {
             version,
             items: Vec::new(),
         }
+    }
+
+    fn test_allocation_snapshot(replica: u8, guidance: &str) -> PersistedAllocationSnapshot {
+        let owner = nuillu_types::ModuleInstanceId::new(
+            nuillu_types::ModuleId::new("allocation").unwrap(),
+            nuillu_types::ReplicaIndex::new(replica),
+        );
+        let target = nuillu_types::ModuleId::new("cognition-gate").unwrap();
+        let mut targets = nuillu_blackboard::ResourceAllocation::default();
+        targets.set_activation(target.clone(), nuillu_blackboard::ActivationRatio::ONE);
+        targets.set(
+            target,
+            nuillu_blackboard::ModuleConfig {
+                guidance: guidance.to_owned(),
+            },
+        );
+        PersistedAllocationSnapshot::new(
+            owner,
+            targets,
+            nuillu_blackboard::ResourceAllocation::default(),
+        )
     }
 
     async fn count_rows(store: &LibsqlMemoryStore, table: &str) -> i64 {

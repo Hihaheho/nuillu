@@ -11,3 +11,8 @@ next-minor = 1
   tag = "llm-transcripts"
   file = "dev/v0.1.llm-transcripts.sql"
 }
+
+@ tasks[] {
+  tag = "allocation-snapshots"
+  file = "dev/v0.1.allocation-snapshots.sql"
+}

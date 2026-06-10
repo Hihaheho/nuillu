@@ -84,6 +84,7 @@ pub(super) async fn build_server_environment(
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let session_store = Rc::new(agent_store.session_store());
+    let allocation_store = Rc::new(agent_store.allocation_store());
     let llm_transcript_store = agent_store.llm_transcript_store();
     let db_trace_sink =
         DbLlmTraceSink::new(config.session_id.clone(), llm_transcript_store.clone());
@@ -114,6 +115,7 @@ pub(super) async fn build_server_environment(
             event_sink,
             policy: server_runtime_policy(config),
             session_store,
+            allocation_store,
         },
     });
 

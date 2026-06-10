@@ -25,3 +25,6 @@ uuid = { workspace = true }
 
 [build-dependencies]
 eure = { workspace = true }
+
+[dev-dependencies]
+nuillu-blackboard = { workspace = true }

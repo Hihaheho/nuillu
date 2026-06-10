@@ -59,18 +59,19 @@ impl HomeostasisModule {
             self.last_phase_entered_at = Some(cx.now());
         }
         if should_emit {
-            self.emit_phase(next).await;
+            self.emit_phase(next).await?;
         }
         Ok(())
     }
 
-    async fn emit_phase(&self, phase: HomeostaticPhase) {
+    async fn emit_phase(&self, phase: HomeostaticPhase) -> Result<()> {
         let mut commands = drive_commands(phase, self.allocation.allowed_target_modules());
         commands.extend(suppression_commands(
             phase,
             self.allocation.allowed_suppression_modules(),
         ));
-        self.allocation.submit(commands).await;
+        self.allocation.submit(commands).await?;
+        Ok(())
     }
 
     async fn next_batch(&mut self) -> Result<()> {

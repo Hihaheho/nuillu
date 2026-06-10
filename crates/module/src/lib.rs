@@ -23,6 +23,7 @@ pub use nuillu_blackboard::{
 };
 
 mod activation_gate;
+mod allocation_persistence;
 mod allocation_writer;
 mod capabilities;
 mod channels;
@@ -53,6 +54,9 @@ mod test_support;
 
 pub use activation_gate::{
     ActivationGate, ActivationGateEvent, ActivationGateRecvError, ActivationGateVote,
+};
+pub use allocation_persistence::{
+    AllocationStore, NoopAllocationStore, PersistedAllocationSnapshot,
 };
 pub use allocation_writer::AllocationWriter;
 pub use capabilities::{

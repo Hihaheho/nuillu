@@ -2989,6 +2989,7 @@ dependencies = [
  "chrono",
  "eure",
  "libsql",
+ "nuillu-blackboard",
  "nuillu-memory",
  "nuillu-module",
  "nuillu-reward",

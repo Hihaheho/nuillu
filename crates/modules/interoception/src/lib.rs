@@ -233,7 +233,7 @@ impl InteroceptionModule {
         let mut next_state = current.clone();
         next_state.apply_patch(patch.clone(), cx.now());
         self.interoception.update(patch).await;
-        self.emit_suppression(&next_state).await;
+        self.emit_suppression(&next_state).await?;
         Ok(())
     }
 
@@ -389,7 +389,7 @@ fn next_interoception_patch(
 }
 
 impl InteroceptionModule {
-    async fn emit_suppression(&self, state: &InteroceptiveState) {
+    async fn emit_suppression(&self, state: &InteroceptiveState) -> Result<()> {
         let level = suppression_level(state);
         let commands = self
             .allocation_writer
@@ -398,7 +398,8 @@ impl InteroceptionModule {
             .cloned()
             .map(|id| AllocationCommand::suppression(id, level))
             .collect::<Vec<_>>();
-        self.allocation_writer.submit(commands).await;
+        self.allocation_writer.submit(commands).await?;
+        Ok(())
     }
 }
 

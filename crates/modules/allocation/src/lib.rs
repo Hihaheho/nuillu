@@ -482,6 +482,16 @@ impl AllocationModule {
                         }
                     }
                 }
+                let Some(applied_decision) = applied.as_ref() else {
+                    let detail = no_decision_failure_detail(&decision_tool_names);
+                    cx.warn(format!("allocation activation failed: {detail}"));
+                    anyhow::bail!("allocation {detail}");
+                };
+                if applied_decision.memo().is_empty() {
+                    let detail = "tool turn applied but memo field was empty";
+                    cx.warn(format!("allocation activation failed: {detail}"));
+                    anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
+                }
                 push_formatted_memo_log_batch(
                     &mut self.session,
                     &unread_memos,
@@ -491,6 +501,12 @@ impl AllocationModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit allocation tool round")?;
+                if let Some(AppliedDecision::Reprioritize { commands, .. }) = applied.as_ref() {
+                    self.allocation_writer
+                        .submit(commands.clone())
+                        .await
+                        .context("persist allocation decision")?;
+                }
                 cx.compact_and_save(&mut self.session, usage).await?;
             }
         };
@@ -499,18 +515,7 @@ impl AllocationModule {
             cx.warn(format!("allocation activation failed: {detail}"));
             anyhow::bail!("allocation {detail}");
         };
-        if applied.memo().is_empty() {
-            let detail = "tool turn applied but memo field was empty";
-            cx.warn(format!("allocation activation failed: {detail}"));
-            anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
-        }
-
-        match applied {
-            AppliedDecision::Unchanged { .. } => {}
-            AppliedDecision::Reprioritize { commands, .. } => {
-                self.allocation_writer.submit(commands).await;
-            }
-        }
+        debug_assert!(!applied.memo().is_empty());
         Ok(())
     }
 }

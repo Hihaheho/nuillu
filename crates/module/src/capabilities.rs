@@ -26,15 +26,16 @@ use crate::session::{
 use crate::tiers::{LlmTierHandle, LutumTiers};
 use crate::r#trait::ErasedModule;
 use crate::{
-    AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    AttentionControlRequestMailbox, BlackboardReader, CognitionLogEvictedInbox,
-    CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox,
-    CognitionLogUpdatedMailbox, CognitionWriter, InteroceptionRuntimePolicy, InteroceptiveReader,
-    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
-    InteroceptiveWriter, LlmAccess, Memo, MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated,
-    MemoUpdatedInbox, MemoUpdatedMailbox, MemoryMetadataReader, Module, ModuleBatch,
-    ModuleStatusReader, SensoryInput, SensoryInputInbox, SensoryInputMailbox,
-    SessionCompactionPolicy, TimeDivision, TopicInbox, TopicMailbox, TypedMemo,
+    AllocationReader, AllocationStore, AllocationWriter, AttentionControlRequest,
+    AttentionControlRequestInbox, AttentionControlRequestMailbox, BlackboardReader,
+    CognitionLogEvictedInbox, CognitionLogEvictedMailbox, CognitionLogReader, CognitionLogUpdated,
+    CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, CognitionWriter,
+    InteroceptionRuntimePolicy, InteroceptiveReader, InteroceptiveUpdated,
+    InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox, InteroceptiveWriter, LlmAccess, Memo,
+    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox,
+    MemoryMetadataReader, Module, ModuleBatch, ModuleStatusReader, NoopAllocationStore,
+    SensoryInput, SensoryInputInbox, SensoryInputMailbox, SessionCompactionPolicy, TimeDivision,
+    TopicInbox, TopicMailbox, TypedMemo,
 };
 
 /// Provides [capabilities](crate) at agent boot.
@@ -66,6 +67,7 @@ struct CapabilityProvidersInner {
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
     session_store: Rc<dyn SessionStore>,
+    allocation_store: Rc<dyn AllocationStore>,
 }
 
 /// Required external services for the root capability provider set.
@@ -83,6 +85,7 @@ pub struct CapabilityProviderRuntime {
     pub event_sink: Rc<dyn RuntimeEventSink>,
     pub policy: RuntimePolicy,
     pub session_store: Rc<dyn SessionStore>,
+    pub allocation_store: Rc<dyn AllocationStore>,
 }
 
 impl Default for CapabilityProviderRuntime {
@@ -91,6 +94,7 @@ impl Default for CapabilityProviderRuntime {
             event_sink: Rc::new(NoopRuntimeEventSink),
             policy: RuntimePolicy::default(),
             session_store: Rc::new(NoopSessionStore),
+            allocation_store: Rc::new(NoopAllocationStore),
         }
     }
 }
@@ -124,6 +128,7 @@ impl CapabilityProviders {
             event_sink,
             policy,
             session_store,
+            allocation_store,
         } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
@@ -189,6 +194,7 @@ impl CapabilityProviders {
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
                 session_store,
+                allocation_store,
             }),
         }
     }
@@ -289,6 +295,23 @@ impl CapabilityProviders {
 
     pub fn allocation_reader(&self) -> AllocationReader {
         AllocationReader::new(self.inner.blackboard.clone())
+    }
+
+    pub async fn restore_allocation_snapshots(&self) -> Result<usize, PortError> {
+        let snapshots = self.inner.allocation_store.load_all().await?;
+        let count = snapshots.len();
+        for snapshot in snapshots {
+            snapshot.validate_version()?;
+            self.inner
+                .blackboard
+                .apply(BlackboardCommand::RecordAllocationEffects {
+                    writer: snapshot.owner,
+                    targets: snapshot.targets,
+                    suppressions: snapshot.suppressions,
+                })
+                .await;
+        }
+        Ok(count)
     }
 
     pub fn module_status_reader(&self) -> ModuleStatusReader {
@@ -798,6 +821,7 @@ impl ModuleCapabilityFactory {
             allowed_target_modules,
             allowed_suppression_modules,
             self.root.inner.runtime_policy.allocation_effects.clone(),
+            self.root.inner.allocation_store.clone(),
         )
     }
 
@@ -1205,6 +1229,9 @@ impl ModuleRegistry {
                 .collect(),
         )
         .await;
+        caps.restore_allocation_snapshots()
+            .await
+            .map_err(ModuleRegistryError::AllocationRestore)?;
         // Install the post-boot module catalogs before any module is constructed
         // so module constructors can read peers from `caps.peer_contexts()`
         // synchronously when they assemble their system prompts.
@@ -1380,6 +1407,8 @@ pub enum ModuleRegistryError {
         key: SessionKey,
         source: PortError,
     },
+    #[error("failed to restore persisted allocation snapshots: {0}")]
+    AllocationRestore(PortError),
 }
 
 #[cfg(test)]
@@ -1393,10 +1422,11 @@ mod tests {
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
-        CognitionLogEntry, ResourceAllocation,
+        CognitionLogEntry, ModuleConfig, ResourceAllocation,
     };
-    use nuillu_types::{ReplicaCapRange, builtin};
+    use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
+    use crate::allocation_persistence::PersistedAllocationSnapshot;
     use crate::ports::{CognitionLogRepository, PortError, SystemClock};
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
     use crate::session::{
@@ -1481,6 +1511,37 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingAllocationStore {
+        snapshots: Rc<RefCell<Vec<PersistedAllocationSnapshot>>>,
+        saves: Rc<RefCell<Vec<PersistedAllocationSnapshot>>>,
+    }
+
+    impl RecordingAllocationStore {
+        fn with_snapshots(snapshots: Vec<PersistedAllocationSnapshot>) -> Self {
+            Self {
+                snapshots: Rc::new(RefCell::new(snapshots)),
+                saves: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn saves(&self) -> Vec<PersistedAllocationSnapshot> {
+            self.saves.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::AllocationStore for RecordingAllocationStore {
+        async fn load_all(&self) -> Result<Vec<PersistedAllocationSnapshot>, PortError> {
+            Ok(self.snapshots.borrow().clone())
+        }
+
+        async fn save(&self, snapshot: &PersistedAllocationSnapshot) -> Result<(), PortError> {
+            self.saves.borrow_mut().push(snapshot.clone());
+            Ok(())
+        }
+    }
+
     #[async_trait(?Send)]
     impl CognitionLogRepository for RecordingCognitionLogRepository {
         async fn append(
@@ -1542,6 +1603,27 @@ mod tests {
             },
             runtime: CapabilityProviderRuntime {
                 session_store,
+                ..CapabilityProviderRuntime::default()
+            },
+        })
+    }
+
+    fn test_caps_with_allocation_store(
+        blackboard: Blackboard,
+        allocation_store: Rc<dyn crate::AllocationStore>,
+    ) -> CapabilityProviders {
+        let adapter = Arc::new(lutum::MockLlmAdapter::new());
+        let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
+        let lutum = lutum::Lutum::new(adapter, budget);
+        CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port: Rc::new(crate::ports::NoopCognitionLogRepository),
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum),
+            },
+            runtime: CapabilityProviderRuntime {
+                allocation_store,
                 ..CapabilityProviderRuntime::default()
             },
         })
@@ -2132,12 +2214,94 @@ mod tests {
             Some("promote current sensory memo into attention".into()),
         )];
 
-        writer.submit(commands).await;
+        writer.submit(commands).await.unwrap();
 
         let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         assert_eq!(
             allocation.for_module(&builtin::cognition_gate()).guidance,
             "promote current sensory memo into attention"
+        );
+    }
+
+    #[tokio::test]
+    async fn allocation_writer_persists_owner_scoped_snapshot() {
+        let blackboard = Blackboard::default();
+        let store = RecordingAllocationStore::default();
+        let caps = test_caps_with_allocation_store(blackboard, Rc::new(store.clone()));
+        let owner = ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO);
+        let controller = caps.scoped(owner.clone());
+        let writer =
+            controller.allocation_writer(vec![builtin::cognition_gate()], vec![builtin::speak()]);
+
+        writer
+            .submit([
+                AllocationCommand::target(
+                    builtin::cognition_gate(),
+                    AllocationEffectLevel::Max,
+                    Some("promote current sensory memo into attention".into()),
+                ),
+                AllocationCommand::suppression(builtin::speak(), AllocationEffectLevel::High),
+            ])
+            .await
+            .unwrap();
+
+        let mut targets = ResourceAllocation::default();
+        targets.set_activation(builtin::cognition_gate(), ActivationRatio::ONE);
+        targets.set(
+            builtin::cognition_gate(),
+            ModuleConfig {
+                guidance: "promote current sensory memo into attention".to_owned(),
+            },
+        );
+        let mut suppressions = ResourceAllocation::default();
+        suppressions.set_activation(builtin::speak(), ActivationRatio::from_f64(0.10));
+
+        assert_eq!(
+            store.saves(),
+            vec![PersistedAllocationSnapshot::new(
+                owner,
+                targets,
+                suppressions
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_build_restores_persisted_allocation_snapshots() {
+        let owner =
+            ModuleInstanceId::new(ModuleId::new(NoopModule::id()).unwrap(), ReplicaIndex::ZERO);
+        let target = ModuleId::new(AllocationHintOnlyModule::id()).unwrap();
+        let mut targets = ResourceAllocation::default();
+        targets.set_activation(target.clone(), ActivationRatio::ONE);
+        targets.set(
+            target.clone(),
+            ModuleConfig {
+                guidance: "restore this priority".to_owned(),
+            },
+        );
+        let snapshot =
+            PersistedAllocationSnapshot::new(owner.clone(), targets, ResourceAllocation::default());
+        let store = RecordingAllocationStore::with_snapshots(vec![snapshot]);
+        let mut base = ResourceAllocation::default();
+        base.set_activation(owner.module.clone(), ActivationRatio::ONE);
+        base.set_activation(target.clone(), ActivationRatio::ZERO);
+        let blackboard = Blackboard::with_allocation(base);
+        let caps = test_caps_with_allocation_store(blackboard.clone(), Rc::new(store));
+
+        ModuleRegistry::new()
+            .register(test_policy(0..=1), noop_builder)
+            .unwrap()
+            .register(test_policy(0..=1), allocation_hint_only_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
+        assert_eq!(allocation.activation_for(&target), ActivationRatio::ONE);
+        assert_eq!(
+            allocation.for_module(&target).guidance,
+            "restore this priority"
         );
     }
 
@@ -2204,7 +2368,8 @@ mod tests {
                 ),
                 AllocationCommand::suppression(builtin::speak(), AllocationEffectLevel::Max),
             ])
-            .await;
+            .await
+            .unwrap();
 
         let allocation = blackboard.read(|bb| bb.allocation().clone()).await;
         assert_eq!(

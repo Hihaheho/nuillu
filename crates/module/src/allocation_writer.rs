@@ -1,10 +1,14 @@
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use nuillu_blackboard::{
     AllocationCommand, AllocationEffectKind, AllocationEffectPolicy, Blackboard, BlackboardCommand,
     ModuleConfig, ResourceAllocation,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId};
+
+use crate::allocation_persistence::{AllocationStore, PersistedAllocationSnapshot};
+use crate::ports::PortError;
 
 /// Submit owner-stamped allocation effect commands.
 ///
@@ -17,6 +21,7 @@ pub struct AllocationWriter {
     allowed_target_modules: Vec<ModuleId>,
     allowed_suppression_modules: Vec<ModuleId>,
     effect_policy: AllocationEffectPolicy,
+    store: Rc<dyn AllocationStore>,
 }
 
 impl AllocationWriter {
@@ -26,6 +31,7 @@ impl AllocationWriter {
         allowed_target_modules: Vec<ModuleId>,
         allowed_suppression_modules: Vec<ModuleId>,
         effect_policy: AllocationEffectPolicy,
+        store: Rc<dyn AllocationStore>,
     ) -> Self {
         Self {
             owner,
@@ -33,6 +39,7 @@ impl AllocationWriter {
             allowed_target_modules,
             allowed_suppression_modules,
             effect_policy,
+            store,
         }
     }
 
@@ -41,7 +48,10 @@ impl AllocationWriter {
     /// The command payload is semantic: modules choose an effect kind and
     /// level, while runtime policy resolves those levels to concrete activation
     /// ratios before the blackboard deterministically combines active writers.
-    pub async fn submit(&self, commands: impl IntoIterator<Item = AllocationCommand>) {
+    pub async fn submit(
+        &self,
+        commands: impl IntoIterator<Item = AllocationCommand>,
+    ) -> Result<(), PortError> {
         let mut targets = ResourceAllocation::default();
         let mut suppressions = ResourceAllocation::default();
 
@@ -83,10 +93,17 @@ impl AllocationWriter {
         self.blackboard
             .apply(BlackboardCommand::RecordAllocationEffects {
                 writer: self.owner.clone(),
-                targets,
-                suppressions,
+                targets: targets.clone(),
+                suppressions: suppressions.clone(),
             })
             .await;
+        self.store
+            .save(&PersistedAllocationSnapshot::new(
+                self.owner.clone(),
+                targets,
+                suppressions,
+            ))
+            .await
     }
 
     pub fn allowed_target_modules(&self) -> &[ModuleId] {
