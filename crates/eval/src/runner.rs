@@ -4975,9 +4975,7 @@ fn register_eval_module(
                     Ok(nuillu_cognition_gate::CognitionGateModule::new(
                         caps.memo_updated_inbox(),
                         caps.blackboard_reader(),
-                        caps.allocation_reader(),
                         caps.cognition_writer(),
-                        caps.time_division(),
                         caps.llm_access(),
                         caps.session("main")
                             .with_auto_compaction(nuillu_cognition_gate::session_auto_compaction())

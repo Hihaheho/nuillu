@@ -2,12 +2,10 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolResult, Usage};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow,
-    MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, TimeDivision, ensure_persistent_session_seeded,
-    format_bounded_memo_log_batch, format_current_attention_guidance, format_faculty_system_prompt,
-    format_memory_trace_inventory, format_stuckness, format_time_division_guidance,
-    memory_rank_counts, push_formatted_cognition_log_batch,
+    BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, format_bounded_memo_log_batch, format_faculty_system_prompt,
+    push_formatted_cognition_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,18 +18,17 @@ workspace: it is what other cognitive modules read when they decide how to think
 speak. Every entry you promote becomes part of the agent's first-person awareness for this
 moment.
 
-Your job is to judge, given the situation and the attention controller's current priority,
+Your job is to judge, given the recent conscious workspace and new cognition candidates,
 what the conscious mind needs to know in order to act. From that judgment two duties follow.
 
 1. Admit everything currently load-bearing.
-Read the attention controller's current priority direction together with the recent contents
-of the conscious workspace to infer what the agent is presently trying to do, attend to, or
-respond to. Then pull into consciousness every subconscious fact that could change that
-decision — specific safety constraints, peer-model rules, sensory details, recalled
-episodes, body or world facts. Preserve specifics: a concrete actionable rule must enter
-the workspace as the rule it actually is, not as a flattened summary that drops the
-operative detail. Generic paraphrases are not equivalents.
-New candidates are newly reported occurrences, facts, or updates for this turn. Evaluate
+Read the recent contents of the conscious workspace to infer what the agent is presently
+trying to do, attend to, or respond to. Then pull into consciousness every subconscious
+fact that could change that decision — specific safety constraints, peer-model rules,
+sensory details, recalled episodes, body or world facts. Preserve specifics: a concrete
+actionable rule must enter the workspace as the rule it actually is, not as a flattened
+summary that drops the operative detail. Generic paraphrases are not equivalents.
+New cognition candidates are newly reported occurrences, facts, or updates. Evaluate
 each candidate against the current situation and prior conscious context. Use
 promote_to_cognition when a candidate changes what the agent should be aware of, say, do, or
 keep tracking now. Never call promote_to_cognition for a mere restatement or tense-shifted
@@ -73,20 +70,19 @@ plumbing.
 
 Voice and form.
 Write entries in plain inner-experience prose, as if the agent itself were noticing,
-recalling, or realizing. Use the supplied time tags for past observations. When candidates
-should enter conscious cognition, call promote_to_cognition exactly once. When cognition
-should stay unchanged, call leave_cognition_unchanged exactly once. Do not use final
-assistant text as an output channel."#;
+recalling, or realizing. Use age tags supplied on candidates and cognition history for
+past observations. When candidates should enter conscious cognition, call
+promote_to_cognition exactly once. When cognition should stay unchanged, call
+leave_cognition_unchanged exactly once. Do not use final assistant text as an output
+channel."#;
 
 const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate decisions, promoted
-events, rejected candidate events, allocation guidance, cognition context, and relevant memory
-metadata needed for future cognition-gate decisions."#;
-const ACTIVATION_INPUT: &str = "Decide what, if anything, should enter conscious cognition now.";
-const NEW_CANDIDATE_HEADER: &str = "New candidates this turn:";
-const PRIOR_CANDIDATE_HEADER: &str = "Earlier candidate context already considered:";
+events, rejected candidate events, cognition context, and relevant memory evidence needed for
+future cognition-gate decisions."#;
+const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -95,28 +91,6 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
         COMPACTED_COGNITION_GATE_SESSION_PREFIX,
         SESSION_COMPACTION_FOCUS,
     )
-}
-
-fn format_cognition_gate_context(
-    rank_counts: &nuillu_module::MemoryRankCounts,
-    allocation: &nuillu_module::ResourceAllocation,
-    time_division: &TimeDivision,
-    stuckness: Option<&nuillu_module::AgenticDeadlockMarker>,
-) -> String {
-    let mut sections = vec![
-        "Cognition-gate context for deciding what should enter conscious cognition now:".to_owned(),
-    ];
-    if let Some(section) = format_memory_trace_inventory(rank_counts) {
-        sections.push(section);
-    }
-    if let Some(section) = format_current_attention_guidance(allocation) {
-        sections.push(section);
-    }
-    sections.push(format_time_division_guidance(time_division));
-    if let Some(stuckness) = stuckness {
-        sections.push(format_stuckness(stuckness));
-    }
-    sections.join("\n\n")
 }
 
 fn retitle_candidate_batch(formatted: String, header: &str) -> Option<String> {
@@ -201,9 +175,7 @@ pub struct CognitionGateModule {
     owner: nuillu_types::ModuleId,
     memo_updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
-    allocation: AllocationReader,
     cognition: CognitionWriter,
-    time_division: TimeDivision,
     llm: LlmAccess,
     session: Session,
     system_prompt: std::sync::OnceLock<String>,
@@ -214,9 +186,7 @@ impl CognitionGateModule {
     pub fn new(
         memo_updates: MemoUpdatedInbox,
         blackboard: BlackboardReader,
-        allocation: AllocationReader,
         cognition: CognitionWriter,
-        time_division: TimeDivision,
         llm: LlmAccess,
         session: Session,
     ) -> Self {
@@ -225,9 +195,7 @@ impl CognitionGateModule {
                 .expect("cognition-gate id is valid"),
             memo_updates,
             blackboard,
-            allocation,
             cognition,
-            time_division,
             llm,
             session,
             system_prompt: std::sync::OnceLock::new(),
@@ -263,22 +231,6 @@ impl CognitionGateModule {
             self.last_seen_cognition_index = Some(index);
         }
         let unread_memos = self.blackboard.unread_memo_logs().await;
-        let (rank_counts, stuckness) = self
-            .blackboard
-            .read(|bb| {
-                (
-                    memory_rank_counts(bb.memory_metadata()),
-                    bb.agentic_deadlock_marker().cloned(),
-                )
-            })
-            .await;
-        let allocation = self.allocation.snapshot().await;
-        let context = format_cognition_gate_context(
-            &rank_counts,
-            &allocation,
-            &self.time_division,
-            stuckness.as_ref(),
-        );
         push_formatted_cognition_log_batch(
             &mut self.session,
             &unread_cognition,
@@ -289,19 +241,11 @@ impl CognitionGateModule {
             format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
                 .and_then(|batch| retitle_candidate_batch(batch, NEW_CANDIDATE_HEADER))
         {
-            self.session.push_ephemeral_user(candidate_notes);
+            self.session.push_user(candidate_notes);
         }
-        self.session.push_ephemeral_system(context);
-        self.session.push_ephemeral_developer(ACTIVATION_INPUT);
 
         let lutum = self.llm.lutum().await;
         let result = self.run_decision_turn(&lutum, cx).await;
-        if let Some(prior_candidates) =
-            format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
-                .and_then(|batch| retitle_candidate_batch(batch, PRIOR_CANDIDATE_HEADER))
-        {
-            self.session.push_system(prior_candidates);
-        }
         cx.compact_and_save(&mut self.session, Usage::zero())
             .await?;
         result?;
@@ -865,9 +809,7 @@ mod tests {
                     *gate_sink.borrow_mut() = Some(CognitionGateModule::new(
                         caps.memo_updated_inbox(),
                         caps.blackboard_reader(),
-                        caps.allocation_reader(),
                         caps.cognition_writer(),
-                        caps.time_division(),
                         caps.llm_access(),
                         caps.session("main")
                             .with_auto_compaction(session_auto_compaction())
@@ -1121,7 +1063,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_sends_new_candidates_as_ephemeral_user_and_persists_after_turn() {
+    async fn activation_sends_new_candidates_as_persistent_user() {
         let adapter = MockLlmAdapter::new().with_text_scenario(leave_cognition_unchanged_scenario(
             "candidate A adds no current situational value",
             1,
@@ -1160,14 +1102,28 @@ mod tests {
         assert!(!candidate_input.contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert!(!candidate_input.contains(ACTIVATION_INPUT));
         let developer_messages =
             message_texts_with_role(request_items, InputMessageRole::Developer);
-        assert_eq!(developer_messages, vec![ACTIVATION_INPUT]);
-        assert!(has_message_with_role_containing(
+        assert!(developer_messages.is_empty());
+        assert!(!has_message_with_role_containing(
             request_items,
             InputMessageRole::System,
             "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!has_message_with_role_containing(
+            request_items,
+            InputMessageRole::System,
+            "Memory trace inventory"
+        ));
+        assert!(!has_message_with_role_containing(
+            request_items,
+            InputMessageRole::System,
+            "Current attention guidance"
+        ));
+        assert!(!has_message_with_role_containing(
+            request_items,
+            InputMessageRole::System,
+            "Sense of time"
         ));
         assert!(!has_message_with_role_containing(
             request_items,
@@ -1187,12 +1143,12 @@ mod tests {
         assert!(items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message {
-                role: InputMessageRole::System,
+                role: InputMessageRole::User,
                 content,
             } if matches!(
                 content.as_slice(),
                 [MessageContent::Text(text)]
-                    if text.contains(PRIOR_CANDIDATE_HEADER)
+                    if text.contains(NEW_CANDIDATE_HEADER)
                         && text.contains("sensory detail A")
                         && !text.contains("memo")
                         && !text.contains("Held-in-mind notes")
@@ -1205,9 +1161,14 @@ mod tests {
             1,
             "explicit leave_cognition_unchanged decision must persist a tool turn"
         );
-        assert!(!has_message_with_role_containing(
+        assert!(has_message_with_role_containing(
             &items,
             InputMessageRole::User,
+            "sensory detail A"
+        ));
+        assert!(!has_message_with_role_containing(
+            &items,
+            InputMessageRole::System,
             "sensory detail A"
         ));
     }
@@ -1325,17 +1286,17 @@ mod tests {
         assert!(err.to_string().contains("decision turn failed"));
 
         let items = fixture.gate.session.input().items().to_vec();
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             &items,
             InputMessageRole::System,
-            PRIOR_CANDIDATE_HEADER
+            "Earlier candidate context already considered"
         ));
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             &items,
             InputMessageRole::System,
             "sensory detail A"
         ));
-        assert!(!has_message_with_role_containing(
+        assert!(has_message_with_role_containing(
             &items,
             InputMessageRole::User,
             "sensory detail A"
@@ -1395,12 +1356,8 @@ mod tests {
         assert!(!first_user_messages[0].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert!(!first_user_messages[0].contains(ACTIVATION_INPUT));
-        assert_eq!(
-            message_texts_with_role(first_items, InputMessageRole::Developer),
-            vec![ACTIVATION_INPUT]
-        );
-        assert!(has_message_with_role_containing(
+        assert!(message_texts_with_role(first_items, InputMessageRole::Developer).is_empty());
+        assert!(!has_message_with_role_containing(
             first_items,
             InputMessageRole::System,
             "Cognition-gate context for deciding what should enter conscious cognition now"
@@ -1408,17 +1365,23 @@ mod tests {
         assert!(!has_message_with_role_containing(
             first_items,
             InputMessageRole::System,
+            "Memory trace inventory"
+        ));
+        assert!(!has_message_with_role_containing(
+            first_items,
+            InputMessageRole::System,
+            "Current attention guidance"
+        ));
+        assert!(!has_message_with_role_containing(
+            first_items,
+            InputMessageRole::System,
+            "Sense of time"
+        ));
+        assert!(!has_message_with_role_containing(
+            first_items,
+            InputMessageRole::System,
             "sensory detail A"
         ));
-        assert!(first_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(
-                    content.as_slice(),
-                    [MessageContent::Text(text)]
-                        if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
-                )
-        )));
 
         let second_items = inputs[1].items();
         let ModelInputItem::Message { role, content } = &second_items[0] else {
@@ -1429,28 +1392,41 @@ mod tests {
             panic!("expected second input system prompt text");
         };
         assert!(system.contains("You are the cognition-gate module"));
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             second_items,
             InputMessageRole::System,
             "sensory detail A"
         ));
         let second_user_messages = message_texts_with_role(second_items, InputMessageRole::User);
-        assert_eq!(second_user_messages.len(), 1);
+        assert_eq!(second_user_messages.len(), 2);
         assert!(second_user_messages[0].contains(NEW_CANDIDATE_HEADER));
-        assert!(second_user_messages[0].contains("sensory detail B"));
-        assert!(!second_user_messages[0].contains("memo"));
-        assert!(!second_user_messages[0].contains(
+        assert!(second_user_messages[0].contains("sensory detail A"));
+        assert!(second_user_messages[1].contains(NEW_CANDIDATE_HEADER));
+        assert!(second_user_messages[1].contains("sensory detail B"));
+        assert!(!second_user_messages[1].contains("memo"));
+        assert!(!second_user_messages[1].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert!(!second_user_messages[0].contains(ACTIVATION_INPUT));
-        assert_eq!(
-            message_texts_with_role(second_items, InputMessageRole::Developer),
-            vec![ACTIVATION_INPUT]
-        );
-        assert!(has_message_with_role_containing(
+        assert!(message_texts_with_role(second_items, InputMessageRole::Developer).is_empty());
+        assert!(!has_message_with_role_containing(
             second_items,
             InputMessageRole::System,
             "Cognition-gate context for deciding what should enter conscious cognition now"
+        ));
+        assert!(!has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "Memory trace inventory"
+        ));
+        assert!(!has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "Current attention guidance"
+        ));
+        assert!(!has_message_with_role_containing(
+            second_items,
+            InputMessageRole::System,
+            "Sense of time"
         ));
         assert!(!has_message_with_role_containing(
             second_items,
@@ -1479,28 +1455,24 @@ mod tests {
                     .is_some_and(|call| call.name.as_str() == "promote_to_cognition")
             })
         }));
-        assert!(second_items.iter().any(|item| matches!(
-            item,
-            ModelInputItem::Message { content, .. }
-                if matches!(
-                    content.as_slice(),
-                    [MessageContent::Text(text)]
-                        if text.contains("Cognition-gate context for deciding what should enter conscious cognition now")
-                )
-        )));
 
         let session_after_second = fixture.gate.session.input().items().to_vec();
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             &session_after_second,
             InputMessageRole::System,
             "sensory detail A"
         ));
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             &session_after_second,
             InputMessageRole::System,
             "sensory detail B"
         ));
-        assert!(!has_message_with_role_containing(
+        assert!(has_message_with_role_containing(
+            &session_after_second,
+            InputMessageRole::User,
+            "sensory detail A"
+        ));
+        assert!(has_message_with_role_containing(
             &session_after_second,
             InputMessageRole::User,
             "sensory detail B"
