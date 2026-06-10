@@ -10,11 +10,10 @@ use nuillu_blackboard::{
 };
 use nuillu_module::ports::{Clock, PortError};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess,
-    LlmContextWindow, Memo, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, compact_llm_context_text, ensure_persistent_session_seeded,
-    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
-    format_current_attention_guidance, format_identity_system_prompt,
+    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
+    Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
+    format_bounded_memo_log_batch, format_identity_system_prompt,
 };
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -382,7 +381,6 @@ pub struct RewardModule {
     policy_evictions: PolicyConsiderationEvictedInbox,
     blackboard: BlackboardReader,
     cognition: CognitionLogReader,
-    allocation: AllocationReader,
     interoception: InteroceptiveReader,
     searcher: PolicySearcher,
     upserter: PolicyUpserter,
@@ -399,7 +397,6 @@ impl RewardModule {
         policy_evictions: PolicyConsiderationEvictedInbox,
         blackboard: BlackboardReader,
         cognition: CognitionLogReader,
-        allocation: AllocationReader,
         interoception: InteroceptiveReader,
         searcher: PolicySearcher,
         upserter: PolicyUpserter,
@@ -411,7 +408,6 @@ impl RewardModule {
             policy_evictions,
             blackboard,
             cognition,
-            allocation,
             interoception,
             searcher,
             upserter,
@@ -610,12 +606,11 @@ impl RewardModule {
         let memos =
             reward_memo_evidence(self.blackboard.recent_memo_logs().await, evicted.written_at);
         let cognition = reward_cognition_evidence(self.cognition.snapshot().await, evicted);
-        let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
         let lutum = self.llm.lutum().await;
         let semantic = {
             self.session.push_ephemeral_user(format!(
-                "Evicted policy consideration written at {}:\n{}\n\nOutcome memo evidence since consideration:\n{}\n\nOutcome cognition evidence since consideration:\n{}\n\nAllocation:\n{}\n\nInteroception:\naffect_arousal={:.2}; valence={:.2}; emotion={}",
+                "Evicted policy consideration written at {}:\n{}\n\nOutcome memo evidence since consideration:\n{}\n\nOutcome cognition evidence since consideration:\n{}\n\nInteroception:\naffect_arousal={:.2}; valence={:.2}; emotion={}",
                 evicted.written_at.to_rfc3339(),
                 compact_llm_context_text(
                     &serde_json::to_string(&evicted.payload)
@@ -630,7 +625,6 @@ impl RewardModule {
                     REWARD_COGNITION_CONTEXT_WINDOW,
                 )
                 .unwrap_or_else(|| "none".to_owned()),
-                format_current_attention_guidance(&allocation).unwrap_or_else(|| "none".to_owned()),
                 interoception.affect_arousal,
                 interoception.valence,
                 if interoception.emotion.trim().is_empty() {
@@ -1032,7 +1026,6 @@ mod tests {
                         policy_caps.consideration_evicted_inbox(),
                         caps.blackboard_reader(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
                         caps.interoception_reader(),
                         policy_caps.searcher(),
                         policy_caps.upserter(),

@@ -9,8 +9,8 @@ use nuillu_module::{
     AllocationReader, CognitionLogEntryRecord, CognitionLogEvictedInbox, LlmAccess,
     LlmContextWindow, MemoryMetadataReader, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, compact_llm_context_text, ensure_persistent_session_seeded,
-    format_current_attention_guidance, format_memory_trace_inventory, memory_rank_counts,
-    push_formatted_cognition_log_batch, render_memory_for_llm,
+    format_memory_trace_inventory, memory_rank_counts, push_formatted_cognition_log_batch,
+    render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -73,15 +73,9 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-fn format_memory_decision_context(
-    rank_counts: &nuillu_module::MemoryRankCounts,
-    allocation: &nuillu_module::ResourceAllocation,
-) -> String {
+fn format_memory_decision_context(rank_counts: &nuillu_module::MemoryRankCounts) -> String {
     let mut sections = vec!["Memory-write decision context:".to_owned()];
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
-        sections.push(section);
-    }
-    if let Some(section) = format_current_attention_guidance(allocation) {
         sections.push(section);
     }
     sections.join("\n\n")
@@ -237,7 +231,7 @@ impl MemoryModule {
             self.session.push_ephemeral_user(candidate_context);
         }
         self.session
-            .push_ephemeral_system(format_memory_decision_context(&rank_counts, &allocation));
+            .push_ephemeral_system(format_memory_decision_context(&rank_counts));
 
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;

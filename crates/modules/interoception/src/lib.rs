@@ -13,8 +13,7 @@ use nuillu_module::{
     InteroceptiveWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_current_attention_guidance,
-    format_identity_system_prompt,
+    format_bounded_memo_log_batch, format_identity_system_prompt,
 };
 use nuillu_types::builtin;
 use schemars::JsonSchema;
@@ -165,7 +164,7 @@ impl InteroceptionModule {
         } else {
             Vec::new()
         };
-        let (current, unread_cognition, total_remember_tokens, allocation) = self
+        let (current, unread_cognition, total_remember_tokens) = self
             .blackboard
             .read(|bb| {
                 let unread = bb.unread_cognition_log_entries(self.last_seen_cognition_index);
@@ -174,12 +173,7 @@ impl InteroceptionModule {
                     .values()
                     .map(|metadata| metadata.remember_tokens)
                     .sum::<u32>();
-                (
-                    bb.interoception().clone(),
-                    unread,
-                    total,
-                    bb.allocation().clone(),
-                )
+                (bb.interoception().clone(), unread, total)
             })
             .await;
         if let Some(index) = unread_cognition.last().map(|record| record.index) {
@@ -226,7 +220,7 @@ impl InteroceptionModule {
         );
         if batch.affect_candidate && (!unread_memos.is_empty() || !unread_cognition.is_empty()) {
             let affect = self
-                .estimate_affect(cx, &current, &unread_memos, &unread_cognition, &allocation)
+                .estimate_affect(cx, &current, &unread_memos, &unread_cognition)
                 .await?;
             merge_affect_patch(&mut patch, &current, affect, &self.policy);
         }
@@ -260,13 +254,12 @@ impl InteroceptionModule {
         current: &InteroceptiveState,
         unread_memos: &[MemoLogRecord],
         unread_cognition: &[CognitionLogEntryRecord],
-        allocation: &nuillu_blackboard::ResourceAllocation,
     ) -> Result<AffectAssessment> {
         self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let semantic = {
             self.session.push_ephemeral_user(format!(
-                "Current interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nAttention guidance:\n{}",
+                "Current interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}",
                 serde_json::to_string(current).unwrap_or_default(),
                 format_bounded_memo_log_batch(unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
                     .unwrap_or_else(|| "none".to_owned()),
@@ -276,7 +269,6 @@ impl InteroceptionModule {
                     COGNITION_CONTEXT_WINDOW,
                 )
                 .unwrap_or_else(|| "none".to_owned()),
-                format_current_attention_guidance(allocation).unwrap_or_else(|| "none".to_owned()),
             ));
             let result = self
                 .session

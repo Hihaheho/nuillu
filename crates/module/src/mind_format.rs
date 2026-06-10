@@ -239,7 +239,10 @@ pub fn format_memory_trace_inventory(counts: &MemoryRankCounts) -> Option<String
     Some(out)
 }
 
-pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Option<String> {
+fn format_current_allocation_lines(
+    allocation: &ResourceAllocation,
+    header: &'static str,
+) -> Option<String> {
     let mut entries = BTreeMap::<&str, (ActivationRatio, &str)>::new();
     for (id, config) in allocation.iter() {
         entries
@@ -268,7 +271,7 @@ pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Opt
             .then_with(|| left_id.cmp(right_id))
     });
 
-    let mut out = String::from("Current attention guidance:");
+    let mut out = String::from(header);
     for (id, (ratio, guidance)) in &entries {
         out.push_str("\n- ");
         out.push_str(id);
@@ -282,6 +285,14 @@ pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Opt
         }
     }
     Some(out)
+}
+
+pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Option<String> {
+    format_current_allocation_lines(allocation, "Current attention guidance:")
+}
+
+pub fn format_current_allocation_state(allocation: &ResourceAllocation) -> Option<String> {
+    format_current_allocation_lines(allocation, "Current allocation state:")
 }
 
 pub fn format_available_faculties(faculties: &[(ModuleId, &'static str)]) -> Option<String> {
@@ -690,6 +701,10 @@ mod tests {
         assert_eq!(
             format_current_attention_guidance(&allocation),
             Some("Current attention guidance:\n- sensory (strong): keep watching".to_owned())
+        );
+        assert_eq!(
+            format_current_allocation_state(&allocation),
+            Some("Current allocation state:\n- sensory (strong): keep watching".to_owned())
         );
         assert_eq!(
             format_available_faculties(&[(builtin::sensory(), "observes the world")]),

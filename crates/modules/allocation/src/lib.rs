@@ -9,9 +9,9 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow,
     MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, format_available_faculties,
-    format_bounded_memo_log_batch, format_current_attention_guidance,
-    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
+    format_bounded_memo_log_batch, format_current_allocation_state, format_memory_trace_inventory,
+    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -77,7 +77,7 @@ fn format_allocation_context(
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
         sections.push(section);
     }
-    if let Some(section) = format_current_attention_guidance(current) {
+    if let Some(section) = format_current_allocation_state(current) {
         sections.push(section);
     }
     sections.push(format!(
@@ -1501,6 +1501,8 @@ mod tests {
                     content.as_slice(),
                     [MessageContent::Text(text)]
                         if text.contains("Allocation context for assigning the next activation priorities")
+                            && text.contains("Current allocation state:")
+                            && !text.contains("Current attention guidance:")
                 )
         )));
 
@@ -1554,6 +1556,8 @@ mod tests {
                     content.as_slice(),
                     [MessageContent::Text(text)]
                         if text.contains("Allocation context for assigning the next activation priorities")
+                            && text.contains("Current allocation state:")
+                            && !text.contains("Current attention guidance:")
                 )
         )));
         assert!(second_items.iter().any(|item| matches!(

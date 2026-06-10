@@ -5075,7 +5075,6 @@ fn register_eval_module(
                         async move {
                             Ok(nuillu_memory::QueryMemoryModule::new(
                                 caps.cognition_log_updated_inbox(),
-                                caps.allocation_reader(),
                                 caps.blackboard_reader(),
                                 memory_caps.retriever(),
                                 memory_caps.content_reader(),
@@ -5294,7 +5293,6 @@ fn register_eval_module(
                                 policy_caps.consideration_evicted_inbox(),
                                 caps.blackboard_reader(),
                                 caps.cognition_log_reader(),
-                                caps.allocation_reader(),
                                 caps.interoception_reader(),
                                 policy_caps.searcher(),
                                 policy_caps.upserter(),
@@ -5339,7 +5337,6 @@ fn register_eval_module(
                     Ok(nuillu_surprise::SurpriseModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.attention_control_mailbox(),
                         caps.memo(),

@@ -5,11 +5,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
-    Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    TypedMemo, ensure_persistent_session_seeded, format_current_attention_guidance,
-    format_memory_trace_inventory, memory_rank_counts, push_formatted_memo_log_batch,
-    render_memory_for_llm,
+    BlackboardReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Module,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix, TypedMemo,
+    ensure_persistent_session_seeded, format_memory_trace_inventory, memory_rank_counts,
+    push_formatted_memo_log_batch, render_memory_for_llm,
 };
 use nuillu_types::{MemoryIndex, MemoryRank};
 use schemars::JsonSchema;
@@ -77,15 +76,9 @@ pub fn query_session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-fn format_memory_context(
-    rank_counts: &nuillu_module::MemoryRankCounts,
-    allocation: &nuillu_module::ResourceAllocation,
-) -> String {
+fn format_memory_context(rank_counts: &nuillu_module::MemoryRankCounts) -> String {
     let mut sections = vec!["Memory retrieval context:".to_owned()];
     if let Some(section) = format_memory_trace_inventory(rank_counts) {
-        sections.push(section);
-    }
-    if let Some(section) = format_current_attention_guidance(allocation) {
         sections.push(section);
     }
     sections.join("\n\n")
@@ -237,7 +230,6 @@ pub enum QueryMemoryTools {
 pub struct QueryMemoryModule {
     owner: nuillu_types::ModuleId,
     cognition_updates: CognitionLogUpdatedInbox,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     memory: MemoryRetriever,
     linked_memory: MemoryContentReader,
@@ -252,7 +244,6 @@ impl QueryMemoryModule {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cognition_updates: CognitionLogUpdatedInbox,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         memory: MemoryRetriever,
         linked_memory: MemoryContentReader,
@@ -264,7 +255,6 @@ impl QueryMemoryModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("query-memory id is valid"),
             cognition_updates,
-            allocation,
             blackboard,
             memory,
             linked_memory,
@@ -459,7 +449,6 @@ impl QueryMemoryModule {
             .blackboard
             .read(|bb| memory_rank_counts(bb.memory_metadata()))
             .await;
-        let allocation = self.allocation.snapshot().await;
         push_formatted_memo_log_batch(
             &mut self.session,
             &unread_memo_logs,
@@ -471,7 +460,7 @@ impl QueryMemoryModule {
             self.session.push_ephemeral_user(prior);
         }
         self.session
-            .push_ephemeral_system(format_memory_context(&rank_counts, &allocation));
+            .push_ephemeral_system(format_memory_context(&rank_counts));
 
         let mut retrieval = self.pending_retrieval.clone();
         let mut already_broadcasted = false;

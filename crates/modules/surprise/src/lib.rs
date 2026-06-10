@@ -2,10 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader,
-    CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
-    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_current_attention_guidance,
+    AttentionControlRequest, AttentionControlRequestMailbox, BlackboardReader, CognitionLogReader,
+    CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module, SessionAutoCompaction,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
 };
 use schemars::JsonSchema;
@@ -52,12 +51,6 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
         COMPACTED_SURPRISE_SESSION_PREFIX,
         SESSION_COMPACTION_FOCUS,
     )
-}
-
-fn format_surprise_context(allocation: &nuillu_module::ResourceAllocation) -> Option<String> {
-    format_current_attention_guidance(allocation).map(|attention| {
-        format!("Surprise context for assessing unexpected cognition:\n\n{attention}")
-    })
 }
 
 const HIGH_SURPRISE_THRESHOLD: f32 = 0.75;
@@ -108,7 +101,6 @@ pub enum SurpriseTools {
 pub struct SurpriseModule {
     updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
-    allocation: AllocationReader,
     blackboard: BlackboardReader,
     attention_control: AttentionControlRequestMailbox,
     memo: Memo,
@@ -122,7 +114,6 @@ impl SurpriseModule {
     pub fn new(
         updates: CognitionLogUpdatedInbox,
         cognition_log: CognitionLogReader,
-        allocation: AllocationReader,
         blackboard: BlackboardReader,
         attention_control: AttentionControlRequestMailbox,
         memo: Memo,
@@ -132,7 +123,6 @@ impl SurpriseModule {
         Self {
             updates,
             cognition_log,
-            allocation,
             blackboard,
             attention_control,
             memo,
@@ -169,7 +159,6 @@ impl SurpriseModule {
 
         let unread_cognition = self.cognition_log.unread_events().await;
         let unread_memo_logs = self.blackboard.unread_memo_logs().await;
-        let allocation = self.allocation.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let outcome = {
@@ -185,9 +174,6 @@ impl SurpriseModule {
                 cx.now(),
                 COGNITION_CONTEXT_WINDOW,
             );
-            if let Some(context) = format_surprise_context(&allocation) {
-                self.session.push_ephemeral_system(context);
-            }
             self.session.push_ephemeral_developer(ACTIVATION_INPUT);
             self.session
                 .text_turn()
@@ -525,7 +511,6 @@ mod tests {
                     *module_sink.borrow_mut() = Some(SurpriseModule::new(
                         caps.cognition_log_updated_inbox(),
                         caps.cognition_log_reader(),
-                        caps.allocation_reader(),
                         caps.blackboard_reader(),
                         caps.attention_control_mailbox(),
                         caps.memo(),

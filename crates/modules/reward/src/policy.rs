@@ -8,8 +8,7 @@ use nuillu_module::{
     InteroceptiveReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_current_attention_guidance,
-    format_identity_system_prompt,
+    format_bounded_memo_log_batch, format_identity_system_prompt,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
 use schemars::JsonSchema;
@@ -291,14 +290,10 @@ impl PolicyModule {
         context: &PolicyActivationContext,
         hits: &[PolicySearchHit],
     ) -> Result<Option<PolicyConsiderationDecision>> {
-        let allocation = self.allocation.snapshot().await;
         let interoception = self.interoception.snapshot().await;
 
         let lutum = self.llm.lutum().await;
         let result = {
-            if let Some(guidance) = format_current_attention_guidance(&allocation) {
-                self.session.push_ephemeral_system(guidance);
-            }
             self.session.push_ephemeral_system(format!(
                 "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
                 interoception.affect_arousal,
