@@ -132,6 +132,7 @@ pub struct ModuleOverviewRow {
     pub forced_disabled: bool,
     pub runtime_status: String,
     pub llm_status: String,
+    pub llm_streaming: bool,
     pub activation_ratio: Option<f64>,
     pub active_replicas: Option<u8>,
     pub tier: Option<String>,
@@ -156,6 +157,13 @@ pub enum ModuleOverviewAction {
 enum ActiveReplicaHighlight {
     AllocationDriven,
     MinReplicaDriven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverviewRowFill {
+    Failed,
+    LlmStreaming,
+    Zebra,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -438,6 +446,7 @@ pub fn overview_rows(
             row.runtime_status = runtime_status.clone();
         }
         row.llm_status = status_label(module.status).to_string();
+        row.llm_streaming = module_llm_in_flight(module);
         if row.tier.is_none() {
             row.tier = module.last_tier.clone();
         }
@@ -1026,11 +1035,7 @@ fn overview_row(
     actions: &mut Vec<ModuleOverviewAction>,
     open_config: &mut Option<OpenModuleConfig>,
 ) {
-    let fill = if row.last_execution_failed {
-        Some(ui.visuals().error_fg_color.linear_multiply(0.18))
-    } else {
-        (index % 2 == 1).then(|| ui.visuals().faint_bg_color)
-    };
+    let fill = overview_row_fill(row, index, ui.visuals());
     let frame = fill.map_or_else(egui::Frame::new, |fill| egui::Frame::new().fill(fill));
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -1073,7 +1078,7 @@ fn overview_row(
                 TIER_COLUMN_WIDTH,
             );
             overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
-            overview_label_cell(ui, &row.llm_status, None, LLM_COLUMN_WIDTH);
+            overview_llm_status_cell(ui, row);
             overview_label_cell(ui, &row.error_count.to_string(), None, ERRORS_COLUMN_WIDTH);
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
             overview_latest_output_cell(ui, output, row.latest_llm_output.as_deref());
@@ -1088,6 +1093,33 @@ fn overview_header_cell(ui: &mut egui::Ui, text: &str, width: f32) {
             .halign(egui::Align::Min)
             .truncate(),
     );
+}
+
+fn overview_row_fill(
+    row: &ModuleOverviewRow,
+    index: usize,
+    visuals: &egui::Visuals,
+) -> Option<egui::Color32> {
+    match overview_row_fill_kind(row, index) {
+        Some(OverviewRowFill::Failed) => Some(visuals.error_fg_color.linear_multiply(0.18)),
+        Some(OverviewRowFill::LlmStreaming) => {
+            Some(visuals.selection.bg_fill.linear_multiply(0.22))
+        }
+        Some(OverviewRowFill::Zebra) => Some(visuals.faint_bg_color),
+        None => None,
+    }
+}
+
+fn overview_row_fill_kind(row: &ModuleOverviewRow, index: usize) -> Option<OverviewRowFill> {
+    if row.last_execution_failed {
+        Some(OverviewRowFill::Failed)
+    } else if row.llm_streaming {
+        Some(OverviewRowFill::LlmStreaming)
+    } else if index % 2 == 1 {
+        Some(OverviewRowFill::Zebra)
+    } else {
+        None
+    }
 }
 
 fn overview_disable_cell(
@@ -1372,6 +1404,23 @@ fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width
     }
 }
 
+fn overview_llm_status_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
+    let text = if row.llm_streaming {
+        egui::RichText::new(&row.llm_status).strong()
+    } else {
+        egui::RichText::new(&row.llm_status)
+    };
+    let response = ui.add_sized(
+        [LLM_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
+        egui::Label::new(text)
+            .truncate()
+            .show_tooltip_when_elided(true),
+    );
+    if row.llm_streaming {
+        response.on_hover_text("LLM request in flight");
+    }
+}
+
 fn overview_latest_output_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>) {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(LATEST_OUTPUT_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT),
@@ -1460,6 +1509,7 @@ fn upsert_overview_row<'a>(
             forced_disabled: false,
             runtime_status: "not reported".to_string(),
             llm_status: status_label(ModuleSessionStatus::Idle).to_string(),
+            llm_streaming: false,
             activation_ratio: None,
             active_replicas: None,
             tier: None,
@@ -1516,6 +1566,14 @@ fn active_replica_highlight(row: &ModuleOverviewRow) -> Option<ActiveReplicaHigh
     } else {
         Some(ActiveReplicaHighlight::MinReplicaDriven)
     }
+}
+
+fn module_llm_in_flight(module: &ModuleState) -> bool {
+    module.status == ModuleSessionStatus::Running
+        || module
+            .turns
+            .iter()
+            .any(|turn| turn.status != ModuleSessionStatus::Failed && turn_is_streaming(turn))
 }
 
 fn apply_module_status(state: &mut ModulesState, status: &ModuleStatusView) {
@@ -1964,6 +2022,7 @@ mod tests {
             forced_disabled: false,
             runtime_status: "Activating".to_string(),
             llm_status: "idle".to_string(),
+            llm_streaming: false,
             activation_ratio,
             active_replicas: active.then_some(1),
             tier: Some("Default".to_string()),
@@ -2002,6 +2061,22 @@ mod tests {
         assert_eq!(
             active_replica_highlight(&row),
             Some(ActiveReplicaHighlight::AllocationDriven)
+        );
+    }
+
+    #[test]
+    fn failed_row_fill_takes_priority_over_llm_streaming_highlight() {
+        let mut row = overview_row_for_highlight(true, Some(0.75));
+        row.llm_streaming = true;
+        assert_eq!(
+            overview_row_fill_kind(&row, 0),
+            Some(OverviewRowFill::LlmStreaming)
+        );
+
+        row.last_execution_failed = true;
+        assert_eq!(
+            overview_row_fill_kind(&row, 1),
+            Some(OverviewRowFill::Failed)
         );
     }
 
@@ -2447,6 +2522,52 @@ mod tests {
             latest_llm_output(module),
             Some("running: awaiting output".to_string())
         );
+    }
+
+    #[test]
+    fn overview_rows_mark_llm_streaming_from_model_input_until_completion() {
+        let mut state = ModulesState::default();
+        let owner = "sensory".to_string();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "turn-streaming".to_string(),
+                owner: owner.clone(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Cheap".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].llm_streaming);
+
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Completed {
+                turn_id: "turn-streaming".to_string(),
+                request_id: None,
+                finish_reason: "stop".to_string(),
+                usage: LlmUsageView {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].llm_streaming);
+        assert_eq!(rows[0].owner, owner);
     }
 
     #[test]
@@ -3211,6 +3332,7 @@ mod tests {
                 forced_disabled: false,
                 runtime_status: "Activating".to_string(),
                 llm_status: "running".to_string(),
+                llm_streaming: true,
                 activation_ratio: Some(0.75),
                 active_replicas: Some(1),
                 tier: Some("Premium".to_string()),
@@ -3236,6 +3358,7 @@ mod tests {
             forced_disabled: false,
             runtime_status: "Activating".to_string(),
             llm_status: "running".to_string(),
+            llm_streaming: false,
             activation_ratio: Some(1.0),
             active_replicas: Some(2),
             tier: Some("Default".to_string()),
