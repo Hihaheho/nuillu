@@ -577,17 +577,13 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState, memos: &[MemoView]
     let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
     ui.horizontal(|ui| {
         ui.set_min_height(body_height);
-        ui.vertical(|ui| {
-            ui.set_width(190.0);
+        render_fixed_pane(ui, MODULE_SELECTOR_WIDTH, body_height, |ui| {
             ui.strong("Views");
             ui.separator();
             render_module_selector(ui, module, &selected_panel, &mut next_panel);
         });
-
         ui.separator();
-
-        ui.vertical(|ui| {
-            ui.set_min_width((ui.available_width() - 8.0).max(260.0));
+        render_remaining_pane(ui, body_height, |ui| {
             if next_panel == MODULE_MEMOS_SELECTION {
                 render_module_memos(ui, module, &module_memos);
             } else if let Some(turn_id) = next_panel.strip_prefix(MODULE_TURN_SELECTION_PREFIX)
@@ -624,17 +620,13 @@ pub fn render_llm_turns(
     let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
     ui.horizontal(|ui| {
         ui.set_min_height(body_height);
-        ui.vertical(|ui| {
-            ui.set_width(220.0);
+        render_fixed_pane(ui, LLM_TURN_SELECTOR_WIDTH, body_height, |ui| {
             ui.strong("Turns");
             ui.separator();
             render_llm_turn_selector(ui, &rows, &mut selected_turn_id);
         });
-
         ui.separator();
-
-        ui.vertical(|ui| {
-            ui.set_min_width((ui.available_width() - 8.0).max(300.0));
+        render_remaining_pane(ui, body_height, |ui| {
             if rows.is_empty() {
                 ui.label("No LLM turns yet.");
             } else if let Some(turn_id) = selected_turn_id.as_deref()
@@ -657,8 +649,33 @@ pub fn window_title(module: &ModuleState) -> String {
 }
 
 const MODULE_BODY_MIN_HEIGHT: f32 = 160.0;
+const MODULE_SELECTOR_WIDTH: f32 = 190.0;
+const LLM_TURN_SELECTOR_WIDTH: f32 = 220.0;
 const MODULE_MEMOS_SELECTION: &str = "memos";
 const MODULE_TURN_SELECTION_PREFIX: &str = "turn:";
+
+fn render_fixed_pane(
+    ui: &mut egui::Ui,
+    width: f32,
+    body_height: f32,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    let width = width.min(ui.available_width()).max(1.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, body_height),
+        egui::Layout::top_down(egui::Align::Min),
+        content,
+    );
+}
+
+fn render_remaining_pane(ui: &mut egui::Ui, body_height: f32, content: impl FnOnce(&mut egui::Ui)) {
+    let width = ui.available_width().max(1.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, body_height),
+        egui::Layout::top_down(egui::Align::Min),
+        content,
+    );
+}
 
 fn render_module_selector(
     ui: &mut egui::Ui,
@@ -1084,16 +1101,19 @@ fn overview_header(ui: &mut egui::Ui) {
 }
 
 fn render_turn_error_banner(ui: &mut egui::Ui, message: &str) {
+    let display = hard_wrap_long_segments(message, 96);
     egui::Frame::new()
         .fill(ui.visuals().error_fg_color.linear_multiply(0.16))
         .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(egui::RichText::new("error").color(ui.visuals().error_fg_color));
-                wrapped_label(ui, message);
-            });
+            ui.strong(egui::RichText::new("error").color(ui.visuals().error_fg_color));
+            ui.add(
+                egui::Label::new(egui::RichText::new(display).monospace())
+                    .wrap()
+                    .selectable(true),
+            );
         });
 }
 
@@ -3225,6 +3245,69 @@ mod tests {
                 .filter(|turn| turn.status == ModuleSessionStatus::Failed)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn failed_turn_error_banner_does_not_grow_llm_turns_window_each_frame() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Failed {
+                turn_id: "predict-turn".to_string(),
+                message: format!("request failed: {}", "x".repeat(1600)),
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let mut filter = ModuleFilterState::default();
+        let modules = state.module_names();
+        let mut widths = Vec::new();
+
+        for frame in 0..6 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                ..egui::RawInput::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let response = egui::Window::new("LLM Turns")
+                    .id(egui::Id::new("failed-turn-growth-test"))
+                    .default_size(egui::vec2(520.0, 360.0))
+                    .show(ui.ctx(), |ui| {
+                        render_llm_turns(ui, &state, &mut filter, &modules);
+                    })
+                    .expect("window is open");
+                widths.push(response.response.rect.width());
+            });
+        }
+
+        let settled_widths = &widths[2..];
+        let min = settled_widths.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = settled_widths
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max - min <= 1.0,
+            "window width should settle instead of growing: {widths:?}"
         );
     }
 
