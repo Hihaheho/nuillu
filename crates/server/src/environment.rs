@@ -8,7 +8,6 @@ use lutum::{
     Lutum, ModelName, RawTelemetryConfig, RequestExtensions, SharedPoolBudgetManager,
     SharedPoolBudgetOptions,
 };
-use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{
     EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlLlmTranscriptStore,
 };
@@ -85,6 +84,7 @@ pub(super) async fn build_server_environment(
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let session_store = Rc::new(agent_store.session_store());
     let allocation_store = Rc::new(agent_store.allocation_store());
+    let cognition_log_repository = Rc::new(agent_store.cognition_log_repository());
     let llm_transcript_store = agent_store.llm_transcript_store();
     let db_trace_sink =
         DbLlmTraceSink::new(config.session_id.clone(), llm_transcript_store.clone());
@@ -99,7 +99,7 @@ pub(super) async fn build_server_environment(
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: Rc::new(InMemoryCognitionLogRepository::new()),
+            cognition_log_port: cognition_log_repository,
             clock: clock.clone(),
             tiers: build_tiers(
                 &config.cheap_backend,

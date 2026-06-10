@@ -314,6 +314,34 @@ impl CapabilityProviders {
         Ok(count)
     }
 
+    pub async fn restore_cognition_log_entries(&self) -> Result<usize, PortError> {
+        let already_hydrated = self
+            .inner
+            .blackboard
+            .read(|bb| !bb.cognition_log().is_empty())
+            .await;
+        if already_hydrated {
+            return Ok(0);
+        }
+
+        let records = self
+            .inner
+            .cognition_log_port
+            .recent(self.inner.runtime_policy.cognition_log_retained_entries)
+            .await?;
+        let count = records.len();
+        for record in records {
+            self.inner
+                .blackboard
+                .apply(BlackboardCommand::AppendCognitionLog {
+                    source: record.source,
+                    entry: record.entry,
+                })
+                .await;
+        }
+        Ok(count)
+    }
+
     pub fn module_status_reader(&self) -> ModuleStatusReader {
         ModuleStatusReader::new(self.inner.blackboard.clone())
     }
@@ -1232,6 +1260,9 @@ impl ModuleRegistry {
         caps.restore_allocation_snapshots()
             .await
             .map_err(ModuleRegistryError::AllocationRestore)?;
+        caps.restore_cognition_log_entries()
+            .await
+            .map_err(ModuleRegistryError::CognitionLogRestore)?;
         // Install the post-boot module catalogs before any module is constructed
         // so module constructors can read peers from `caps.peer_contexts()`
         // synchronously when they assemble their system prompts.
@@ -1409,6 +1440,8 @@ pub enum ModuleRegistryError {
     },
     #[error("failed to restore persisted allocation snapshots: {0}")]
     AllocationRestore(PortError),
+    #[error("failed to restore persisted cognition log entries: {0}")]
+    CognitionLogRestore(PortError),
 }
 
 #[cfg(test)]
@@ -1427,7 +1460,9 @@ mod tests {
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
     use crate::allocation_persistence::PersistedAllocationSnapshot;
-    use crate::ports::{CognitionLogRepository, PortError, SystemClock};
+    use crate::ports::{
+        CognitionLogRepository, PersistedCognitionLogEntry, PortError, SystemClock,
+    };
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
     use crate::session::{
         NoopSessionStore, PersistedSessionSnapshot, SessionAutoCompaction, SessionKey,
@@ -1453,6 +1488,12 @@ mod tests {
     }
 
     impl RecordingCognitionLogRepository {
+        fn with_records(records: Vec<(ModuleInstanceId, CognitionLogEntry)>) -> Self {
+            Self {
+                records: Arc::new(std::sync::Mutex::new(records)),
+            }
+        }
+
         fn records(&self) -> Vec<(ModuleInstanceId, CognitionLogEntry)> {
             self.records.lock().expect("records mutex poisoned").clone()
         }
@@ -1570,20 +1611,55 @@ mod tests {
                 .map(|(_, entry)| entry.clone())
                 .collect())
         }
+
+        async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let mut records = self
+                .records
+                .lock()
+                .expect("records mutex poisoned")
+                .iter()
+                .rev()
+                .take(limit)
+                .map(|(source, entry)| PersistedCognitionLogEntry {
+                    source: source.clone(),
+                    entry: entry.clone(),
+                })
+                .collect::<Vec<_>>();
+            records.reverse();
+            Ok(records)
+        }
     }
 
     fn test_caps_with_cognition_repo(
         blackboard: Blackboard,
         cognition_log_port: Rc<dyn CognitionLogRepository>,
     ) -> CapabilityProviders {
+        test_caps_with_cognition_repo_and_runtime(
+            blackboard,
+            cognition_log_port,
+            CapabilityProviderRuntime::default(),
+        )
+    }
+
+    fn test_caps_with_cognition_repo_and_runtime(
+        blackboard: Blackboard,
+        cognition_log_port: Rc<dyn CognitionLogRepository>,
+        runtime: CapabilityProviderRuntime,
+    ) -> CapabilityProviders {
         let adapter = Arc::new(lutum::MockLlmAdapter::new());
         let budget = lutum::SharedPoolBudgetManager::new(lutum::SharedPoolBudgetOptions::default());
         let lutum = lutum::Lutum::new(adapter, budget);
-        CapabilityProviders::new(CapabilityProviderPorts {
-            blackboard,
-            cognition_log_port,
-            clock: Rc::new(SystemClock),
-            tiers: LutumTiers::from_shared_lutum(lutum),
+        CapabilityProviders::new(CapabilityProviderConfig {
+            ports: CapabilityProviderPorts {
+                blackboard,
+                cognition_log_port,
+                clock: Rc::new(SystemClock),
+                tiers: LutumTiers::from_shared_lutum(lutum),
+            },
+            runtime,
         })
     }
 
@@ -2303,6 +2379,103 @@ mod tests {
             allocation.for_module(&target).guidance,
             "restore this priority"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_build_restores_recent_cognition_log_entries() {
+        let blackboard = Blackboard::default();
+        let owner_a = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let owner_b = ModuleInstanceId::new(builtin::attention_schema(), ReplicaIndex::ZERO);
+        let now = Utc::now();
+        let repo = RecordingCognitionLogRepository::with_records(vec![
+            (
+                owner_a.clone(),
+                CognitionLogEntry {
+                    at: now - chrono::Duration::seconds(3),
+                    text: "old cognition".to_owned(),
+                },
+            ),
+            (
+                owner_b,
+                CognitionLogEntry {
+                    at: now - chrono::Duration::seconds(2),
+                    text: "recent cognition".to_owned(),
+                },
+            ),
+            (
+                owner_a,
+                CognitionLogEntry {
+                    at: now - chrono::Duration::seconds(1),
+                    text: "newest cognition".to_owned(),
+                },
+            ),
+        ]);
+        let caps = test_caps_with_cognition_repo_and_runtime(
+            blackboard.clone(),
+            Rc::new(repo),
+            CapabilityProviderRuntime {
+                policy: RuntimePolicy {
+                    cognition_log_retained_entries: 2,
+                    ..RuntimePolicy::default()
+                },
+                ..CapabilityProviderRuntime::default()
+            },
+        );
+
+        ModuleRegistry::new()
+            .register(test_policy(0..=1), noop_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let entries = blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent cognition", "newest cognition"]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_build_skips_cognition_restore_when_blackboard_is_not_empty() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let now = Utc::now();
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: owner.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "seeded cognition".to_owned(),
+                },
+            })
+            .await;
+        let repo = RecordingCognitionLogRepository::with_records(vec![(
+            owner,
+            CognitionLogEntry {
+                at: now - chrono::Duration::seconds(1),
+                text: "persisted cognition".to_owned(),
+            },
+        )]);
+        let caps = test_caps_with_cognition_repo(blackboard.clone(), Rc::new(repo));
+
+        ModuleRegistry::new()
+            .register(test_policy(0..=1), noop_builder)
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+
+        let entries = blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "seeded cognition");
     }
 
     #[tokio::test]

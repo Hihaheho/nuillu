@@ -40,6 +40,12 @@ pub trait Embedder {
 }
 
 /// Append-only persistence for the cognition log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedCognitionLogEntry {
+    pub source: ModuleInstanceId,
+    pub entry: CognitionLogEntry,
+}
+
 #[async_trait(?Send)]
 pub trait CognitionLogRepository {
     async fn append(
@@ -52,6 +58,7 @@ pub trait CognitionLogRepository {
         source: &ModuleInstanceId,
         from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError>;
+    async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError>;
 }
 
 /// Time source plus sleep. Indirected so tests can fully inject time —
@@ -114,6 +121,10 @@ impl CognitionLogRepository for NoopCognitionLogRepository {
         _source: &ModuleInstanceId,
         _from: DateTime<Utc>,
     ) -> Result<Vec<CognitionLogEntry>, PortError> {
+        Ok(Vec::new())
+    }
+
+    async fn recent(&self, _limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError> {
         Ok(Vec::new())
     }
 }

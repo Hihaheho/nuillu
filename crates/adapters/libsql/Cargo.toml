@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+nuillu-blackboard = { workspace = true }
 nuillu-memory = { workspace = true }
 nuillu-module = { workspace = true }
 nuillu-reward = { workspace = true }
@@ -25,6 +26,3 @@ uuid = { workspace = true }
 
 [build-dependencies]
 eure = { workspace = true }
-
-[dev-dependencies]
-nuillu-blackboard = { workspace = true }

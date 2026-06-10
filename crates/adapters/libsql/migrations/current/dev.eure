@@ -16,3 +16,8 @@ next-minor = 1
   tag = "allocation-snapshots"
   file = "dev/v0.1.allocation-snapshots.sql"
 }
+
+@ tasks[] {
+  tag = "cognition-log"
+  file = "dev/v0.1.cognition-log.sql"
+}

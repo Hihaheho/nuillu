@@ -14,7 +14,6 @@ clap = { workspace = true }
 eure = { workspace = true }
 eure-document = { workspace = true }
 lutum = { workspace = true }
-lutum-in-memory-adapter = { workspace = true }
 lutum-libsql-adapter = { workspace = true }
 lutum-model2vec-adapter = { workspace = true }
 lutum-openai = { workspace = true }

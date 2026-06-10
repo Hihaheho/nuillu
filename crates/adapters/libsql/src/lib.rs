@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, Value, params, params_from_iter};
+use nuillu_blackboard::CognitionLogEntry;
 use nuillu_memory::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryKind, MemoryLink,
     MemoryLinkDirection, MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag,
@@ -17,13 +18,15 @@ use nuillu_memory::{
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::{
     AllocationStore, PersistedAllocationSnapshot, PersistedSessionSnapshot, SessionKey,
-    SessionStore, ports::PortError,
+    SessionStore,
+    ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError},
 };
 use nuillu_reward::{
     IndexedPolicy, NewPolicy, PolicyQuery, PolicyRecord, PolicySearchHit, PolicyStore,
 };
 use nuillu_types::{
-    MemoryContent, MemoryIndex, MemoryRank, PolicyIndex, PolicyRank, SignedUnitF32, UnitF32,
+    MemoryContent, MemoryIndex, MemoryRank, ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank,
+    ReplicaIndex, SignedUnitF32, UnitF32,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -157,6 +160,11 @@ pub struct LibsqlAllocationStore {
 }
 
 #[derive(Clone)]
+pub struct LibsqlCognitionLogRepository {
+    conn: Connection,
+}
+
+#[derive(Clone)]
 pub struct LibsqlLlmTranscriptStore {
     conn: Connection,
 }
@@ -247,10 +255,116 @@ impl LibsqlAgentStore {
         }
     }
 
+    pub fn cognition_log_repository(&self) -> LibsqlCognitionLogRepository {
+        LibsqlCognitionLogRepository {
+            conn: self.conn.clone(),
+        }
+    }
+
     pub fn llm_transcript_store(&self) -> LibsqlLlmTranscriptStore {
         LibsqlLlmTranscriptStore {
             conn: self.conn.clone(),
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl CognitionLogRepository for LibsqlCognitionLogRepository {
+    async fn append(
+        &self,
+        source: ModuleInstanceId,
+        entry: CognitionLogEntry,
+    ) -> Result<(), PortError> {
+        self.conn
+            .execute(
+                "INSERT INTO cognition_log_entries (
+                    owner_module,
+                    owner_replica,
+                    occurred_at_ms,
+                    text,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    source.module.as_str(),
+                    i64::from(source.replica.get()),
+                    entry.at.timestamp_millis(),
+                    entry.text,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(())
+    }
+
+    async fn since(
+        &self,
+        source: &ModuleInstanceId,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CognitionLogEntry>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT occurred_at_ms, text
+                   FROM cognition_log_entries
+                  WHERE owner_module = ?1
+                    AND owner_replica = ?2
+                    AND occurred_at_ms >= ?3
+                  ORDER BY occurred_at_ms ASC, id ASC",
+                params![
+                    source.module.as_str(),
+                    i64::from(source.replica.get()),
+                    from.timestamp_millis(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let occurred_at_ms: i64 = row.get(0).map_err(map_libsql_error)?;
+            let text: String = row.get(1).map_err(map_libsql_error)?;
+            entries.push(CognitionLogEntry {
+                at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
+                text,
+            });
+        }
+        Ok(entries)
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT owner_module, owner_replica, occurred_at_ms, text
+                   FROM (
+                        SELECT owner_module, owner_replica, occurred_at_ms, text, id
+                          FROM cognition_log_entries
+                         ORDER BY id DESC
+                         LIMIT ?1
+                   )
+                  ORDER BY id ASC",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            let owner_module: String = row.get(0).map_err(map_libsql_error)?;
+            let owner_replica: i64 = row.get(1).map_err(map_libsql_error)?;
+            let occurred_at_ms: i64 = row.get(2).map_err(map_libsql_error)?;
+            let text: String = row.get(3).map_err(map_libsql_error)?;
+            entries.push(PersistedCognitionLogEntry {
+                source: module_instance_from_row(owner_module, owner_replica)?,
+                entry: CognitionLogEntry {
+                    at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
+                    text,
+                },
+            });
+        }
+        Ok(entries)
     }
 }
 
@@ -2775,6 +2889,28 @@ fn limit_to_i64(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn module_instance_from_row(
+    owner_module: String,
+    owner_replica: i64,
+) -> Result<ModuleInstanceId, PortError> {
+    let module = ModuleId::new(owner_module)
+        .map_err(|error| PortError::InvalidData(format!("invalid cognition log owner: {error}")))?;
+    let replica = u8::try_from(owner_replica).map_err(|_| {
+        PortError::InvalidData(format!(
+            "invalid cognition log owner replica: {owner_replica}"
+        ))
+    })?;
+    Ok(ModuleInstanceId::new(module, ReplicaIndex::new(replica)))
+}
+
+fn datetime_from_millis(
+    label: &str,
+    timestamp_ms: i64,
+) -> Result<chrono::DateTime<chrono::Utc>, PortError> {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .ok_or_else(|| PortError::InvalidData(format!("invalid {label} timestamp: {timestamp_ms}")))
+}
+
 fn hex_string(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -3239,7 +3375,11 @@ mod tests {
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "affect_arousal").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "valence").await);
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 3);
+        assert!(column_exists(&store, "cognition_log_entries", "owner_module").await);
+        assert!(column_exists(&store, "cognition_log_entries", "owner_replica").await);
+        assert!(column_exists(&store, "cognition_log_entries", "occurred_at_ms").await);
+        assert!(column_exists(&store, "cognition_log_entries", "text").await);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 4);
     }
 
     #[tokio::test]
@@ -4182,6 +4322,94 @@ mod tests {
         assert_eq!(record.rank, PolicyRank::Tentative);
     }
 
+    #[tokio::test]
+    async fn cognition_log_since_filters_by_owner_and_time() {
+        let repo = cognition_log_repository().await;
+        let owner_a =
+            ModuleInstanceId::new(ModuleId::new("cognition-gate").unwrap(), ReplicaIndex::ZERO);
+        let owner_b = ModuleInstanceId::new(
+            ModuleId::new("attention-schema").unwrap(),
+            ReplicaIndex::ZERO,
+        );
+        let old = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        let cutoff = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 1, 0).unwrap();
+        let new = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 2, 0).unwrap();
+
+        repo.append(
+            owner_a.clone(),
+            CognitionLogEntry {
+                at: old,
+                text: "old owner a".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        repo.append(
+            owner_b,
+            CognitionLogEntry {
+                at: new,
+                text: "new owner b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        repo.append(
+            owner_a.clone(),
+            CognitionLogEntry {
+                at: new,
+                text: "new owner a".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let entries = repo.since(&owner_a, cutoff).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![CognitionLogEntry {
+                at: new,
+                text: "new owner a".to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn cognition_log_recent_returns_latest_entries_in_append_order() {
+        let repo = cognition_log_repository().await;
+        let owner_a =
+            ModuleInstanceId::new(ModuleId::new("cognition-gate").unwrap(), ReplicaIndex::ZERO);
+        let owner_b = ModuleInstanceId::new(
+            ModuleId::new("attention-schema").unwrap(),
+            ReplicaIndex::new(1),
+        );
+        let at = chrono::Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+
+        for (owner, text) in [
+            (owner_a.clone(), "first"),
+            (owner_b.clone(), "second"),
+            (owner_a.clone(), "third"),
+        ] {
+            repo.append(
+                owner,
+                CognitionLogEntry {
+                    at,
+                    text: text.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let entries = repo.recent(2).await.unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|record| (record.source.clone(), record.entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(owner_b, "second"), (owner_a, "third")]
+        );
+    }
+
     async fn store() -> LibsqlMemoryStore {
         LibsqlAgentStore::connect(
             LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
@@ -4191,6 +4419,17 @@ mod tests {
         .await
         .unwrap()
         .memory_store()
+    }
+
+    async fn cognition_log_repository() -> LibsqlCognitionLogRepository {
+        LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap()
+        .cognition_log_repository()
     }
 
     fn new_memory(

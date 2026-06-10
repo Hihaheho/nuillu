@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nuillu_blackboard::CognitionLogEntry;
-use nuillu_module::ports::{CognitionLogRepository, PortError};
+use nuillu_module::ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError};
 use nuillu_types::ModuleInstanceId;
 
 #[derive(Debug, Default)]
@@ -47,6 +47,27 @@ impl CognitionLogRepository for InMemoryCognitionLogRepository {
             .filter(|(owner, entry)| owner == source && entry.at >= from)
             .map(|(_, entry)| entry.clone())
             .collect())
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<PersistedCognitionLogEntry>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| PortError::Backend("cognition log repository lock poisoned".into()))?;
+        let mut records = events
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|(source, entry)| PersistedCognitionLogEntry {
+                source: source.clone(),
+                entry: entry.clone(),
+            })
+            .collect::<Vec<_>>();
+        records.reverse();
+        Ok(records)
     }
 }
 

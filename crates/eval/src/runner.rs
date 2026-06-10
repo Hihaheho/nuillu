@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Utc};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use lutum_eval::{RawTraceSnapshot, TraceSnapshot};
-use lutum_in_memory_adapter::InMemoryCognitionLogRepository;
 use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
@@ -4439,6 +4438,7 @@ pub(crate) async fn build_eval_environment(
     let agent_store = connect_agent_store(output_dir, config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
+    let cognition_log_repository = Rc::new(agent_store.cognition_log_repository());
     let memory_caps = MemoryCapabilities::new(
         blackboard.clone(),
         clock.clone(),
@@ -4491,7 +4491,7 @@ pub(crate) async fn build_eval_environment(
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
             blackboard: blackboard.clone(),
-            cognition_log_port: Rc::new(InMemoryCognitionLogRepository::new()),
+            cognition_log_port: cognition_log_repository,
             clock: clock.clone(),
             tiers,
         },
