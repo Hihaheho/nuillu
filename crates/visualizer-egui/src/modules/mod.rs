@@ -89,6 +89,7 @@ pub struct LlmTurnState {
     pub request_id: Option<String>,
     pub finish_reason: Option<String>,
     pub usage: Option<LlmUsageView>,
+    pub error_message: Option<String>,
     pub batch: Option<ModuleBatchDebugState>,
     pub input: Vec<LlmInputItemView>,
     pub output: Vec<LlmOutputItemState>,
@@ -111,6 +112,7 @@ pub struct LlmTurnListRow {
     pub turn_number: usize,
     pub label: String,
     pub streaming: bool,
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -374,7 +376,9 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
         } => {
             if let Some(turn) = turn_mut(state, &turn_id) {
                 append_output_delta(turn, kind, delta, None);
-                turn.status = ModuleSessionStatus::Running;
+                if turn.status != ModuleSessionStatus::Failed {
+                    turn.status = ModuleSessionStatus::Running;
+                }
             }
         }
         LlmObservationEvent::ToolCallChunk {
@@ -423,10 +427,32 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
                 for row in &mut turn.output {
                     row.streaming = false;
                 }
-                turn.status = ModuleSessionStatus::Completed;
+                if turn.status != ModuleSessionStatus::Failed {
+                    turn.status = ModuleSessionStatus::Completed;
+                }
             }
             if let Some(owner) = owner {
-                module_mut(state, owner).status = ModuleSessionStatus::Completed;
+                let module = module_mut(state, owner);
+                if module.status != ModuleSessionStatus::Failed {
+                    module.status = ModuleSessionStatus::Completed;
+                }
+            }
+        }
+        LlmObservationEvent::Failed { turn_id, message } => {
+            let owner = state.turn_to_owner.get(&turn_id).cloned();
+            if let Some(turn) = turn_mut(state, &turn_id) {
+                turn.error_message = Some(message.clone());
+                for row in &mut turn.output {
+                    row.streaming = false;
+                }
+                turn.status = ModuleSessionStatus::Failed;
+            }
+            if let Some(owner) = owner {
+                let module = module_mut(state, owner);
+                module.status = ModuleSessionStatus::Failed;
+                module.runtime_status = Some(format!("LLM turn failed: {message}"));
+                module.error_count = module.error_count.saturating_add(1);
+                module.last_execution_failed = true;
             }
         }
     }
@@ -668,12 +694,14 @@ fn render_module_selector(
                 let panel_id = turn_selection_id(&turn.turn_id);
                 let selected = panel_id == selected_panel;
                 ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
-                    let response = ui
-                        .selectable_label(selected, turn_selector_label(index, turn))
-                        .on_hover_text(turn_selector_hover(turn));
-                    if response.clicked() {
-                        *next_panel = panel_id;
-                    }
+                    failed_turn_frame(ui, turn.status).show(ui, |ui| {
+                        let response = ui
+                            .selectable_label(selected, turn_selector_label(index, turn))
+                            .on_hover_text(turn_selector_hover(turn));
+                        if response.clicked() {
+                            *next_panel = panel_id;
+                        }
+                    });
                 });
             }
         });
@@ -690,15 +718,32 @@ fn render_llm_turn_selector(
             for (index, row) in rows.iter().enumerate() {
                 let selected = selected_turn_id.as_deref() == Some(row.turn_id.as_str());
                 ui.push_id(("llm-turn-row", index, row.turn_id.as_str()), |ui| {
-                    let response = ui
-                        .selectable_label(selected, &row.label)
-                        .on_hover_text(llm_turn_row_hover(row));
-                    if response.clicked() {
-                        *selected_turn_id = Some(row.turn_id.clone());
-                    }
+                    let status = if row.failed {
+                        ModuleSessionStatus::Failed
+                    } else {
+                        ModuleSessionStatus::Idle
+                    };
+                    failed_turn_frame(ui, status).show(ui, |ui| {
+                        let response = ui
+                            .selectable_label(selected, &row.label)
+                            .on_hover_text(llm_turn_row_hover(row));
+                        if response.clicked() {
+                            *selected_turn_id = Some(row.turn_id.clone());
+                        }
+                    });
                 });
             }
         });
+}
+
+fn failed_turn_frame(ui: &egui::Ui, status: ModuleSessionStatus) -> egui::Frame {
+    if status == ModuleSessionStatus::Failed {
+        egui::Frame::new()
+            .fill(ui.visuals().error_fg_color.linear_multiply(0.14))
+            .inner_margin(egui::Margin::symmetric(2, 0))
+    } else {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(2, 0))
+    }
 }
 
 fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoView]) {
@@ -740,6 +785,10 @@ fn render_active_turn(
 }
 
 fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmTurnState) {
+    if let Some(message) = &turn.error_message {
+        render_turn_error_banner(ui, message);
+        ui.add_space(6.0);
+    }
     ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} turn {}",
@@ -1047,6 +1096,20 @@ fn overview_header(ui: &mut egui::Ui) {
         overview_header_cell(ui, "Errors", ERRORS_COLUMN_WIDTH);
         overview_header_cell(ui, "Latest LLM out", LATEST_OUTPUT_COLUMN_WIDTH);
     });
+}
+
+fn render_turn_error_banner(ui: &mut egui::Ui, message: &str) {
+    egui::Frame::new()
+        .fill(ui.visuals().error_fg_color.linear_multiply(0.16))
+        .stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(egui::RichText::new("error").color(ui.visuals().error_fg_color));
+                wrapped_label(ui, message);
+            });
+        });
 }
 
 fn overview_row(
@@ -1727,6 +1790,7 @@ pub fn llm_turn_rows(
                         streaming,
                     ),
                     streaming,
+                    failed: turn.status == ModuleSessionStatus::Failed,
                 }
             })
         })
@@ -1871,6 +1935,7 @@ fn ensure_turn(
         request_id: None,
         finish_reason: None,
         usage: None,
+        error_message: None,
         batch,
         input: Vec::new(),
         output: Vec::new(),
@@ -2713,6 +2778,7 @@ mod tests {
                 turn_number: 1,
                 label: "sensory 1 turn".to_string(),
                 streaming: false,
+                failed: false,
             },
             LlmTurnListRow {
                 owner: "memory".to_string(),
@@ -2721,6 +2787,7 @@ mod tests {
                 turn_number: 1,
                 label: "* memory 1 turn".to_string(),
                 streaming: true,
+                failed: false,
             },
             LlmTurnListRow {
                 owner: "allocation".to_string(),
@@ -2729,6 +2796,7 @@ mod tests {
                 turn_number: 1,
                 label: "* allocation 1 turn".to_string(),
                 streaming: true,
+                failed: false,
             },
         ];
 
@@ -3013,6 +3081,7 @@ mod tests {
                 input: Vec::new(),
                 output: Vec::new(),
                 status: ModuleSessionStatus::Running,
+                error_message: None,
             }],
             ..ModuleState::default()
         };
@@ -3039,6 +3108,7 @@ mod tests {
             input: Vec::new(),
             output: Vec::new(),
             status: ModuleSessionStatus::Running,
+            error_message: None,
         };
 
         assert_eq!(turn_selector_label(0, &turn), "turn 1");
@@ -3116,6 +3186,61 @@ mod tests {
         assert!(!rows[0].streaming);
         assert_eq!(rows[1].label, "* memory 1 turn");
         assert!(rows[1].streaming);
+    }
+
+    #[test]
+    fn failed_llm_observation_marks_turn_failed_and_keeps_it_listed() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamDelta {
+                turn_id: "predict-turn".to_string(),
+                kind: "text".to_string(),
+                delta: "partial output".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Failed {
+                turn_id: "predict-turn".to_string(),
+                message: "request timed out".to_string(),
+            },
+        );
+
+        let module = state.modules.get("predict").expect("module exists");
+        let turn = module.turns.first().expect("turn exists");
+        assert_eq!(turn.status, ModuleSessionStatus::Failed);
+        assert_eq!(turn.error_message.as_deref(), Some("request timed out"));
+        assert_eq!(turn.output.len(), 1);
+        assert_eq!(module.status, ModuleSessionStatus::Failed);
+
+        let rows = llm_turn_rows(&state, |_| true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id, "predict-turn");
+        assert!(rows[0].failed);
+        assert!(!rows[0].streaming);
+        assert_eq!(
+            module
+                .turns
+                .iter()
+                .filter(|turn| turn.status == ModuleSessionStatus::Failed)
+                .count(),
+            1
+        );
     }
 
     #[test]

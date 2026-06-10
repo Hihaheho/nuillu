@@ -73,11 +73,7 @@ pub(super) async fn build_server_environment(
         "nuillu-server runtime-event-log path={}",
         runtime_event_log.path().display()
     );
-    let event_sink = Rc::new(ServerRuntimeEventSink::new(
-        SERVER_TAB_ID.to_string(),
-        visualizer.clone(),
-        runtime_event_log,
-    ));
+    let visualizer_for_events = visualizer.clone();
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
@@ -91,6 +87,13 @@ pub(super) async fn build_server_environment(
     let llm_transcript_store = agent_store.llm_transcript_store();
     let db_trace_sink =
         DbLlmTraceSink::new(config.session_id.clone(), llm_transcript_store.clone());
+    let event_sink = Rc::new(ServerRuntimeEventSink::new(
+        SERVER_TAB_ID.to_string(),
+        visualizer_for_events,
+        runtime_event_log,
+        llm_observer.clone(),
+        db_trace_sink.clone(),
+    ));
     let llm_concurrency_pool = LlmConcurrencyPool::default();
     let caps = CapabilityProviders::new(CapabilityProviderConfig {
         ports: CapabilityProviderPorts {
@@ -334,11 +337,12 @@ async fn configured_reasoning_effort(
         .map(|value| value.0)
 }
 
-#[derive(Debug)]
 struct ServerRuntimeEventSink {
     tab_id: String,
     visualizer: VisualizerEventSink,
     runtime_event_log: RuntimeEventLogWriter,
+    llm_observer: VisualizerLlmObserver,
+    db_trace_sink: DbLlmTraceSink,
 }
 
 impl ServerRuntimeEventSink {
@@ -346,17 +350,43 @@ impl ServerRuntimeEventSink {
         tab_id: String,
         visualizer: VisualizerEventSink,
         runtime_event_log: RuntimeEventLogWriter,
+        llm_observer: VisualizerLlmObserver,
+        db_trace_sink: DbLlmTraceSink,
     ) -> Self {
         Self {
             tab_id,
             visualizer,
             runtime_event_log,
+            llm_observer,
+            db_trace_sink,
         }
     }
 }
 
 impl RuntimeEventSink for ServerRuntimeEventSink {
     fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
+        if let RuntimeEvent::ModuleActivationAttemptFailed {
+            owner,
+            activation_attempt,
+            message,
+            ..
+        } = &event
+        {
+            self.llm_observer.mark_activation_attempt_failed(
+                owner,
+                *activation_attempt,
+                message.clone(),
+            );
+            let db_trace_sink = self.db_trace_sink.clone();
+            let owner = owner.clone();
+            let activation_attempt = *activation_attempt;
+            let message = message.clone();
+            tokio::task::spawn_local(async move {
+                db_trace_sink
+                    .mark_activation_attempt_failed(owner, activation_attempt, message)
+                    .await;
+            });
+        }
         let message = runtime_event_message(&self.tab_id, &event);
         eprintln!("{message}");
         if let Err(error) = self.runtime_event_log.append(&message, &event) {

@@ -312,6 +312,15 @@ impl LibsqlLlmTranscriptStore {
             .map_err(|error| PortError::InvalidData(error.to_string()))?;
         self.conn
             .execute(
+                "DELETE FROM llm_transcript_turns
+                  WHERE server_session_id = ?1
+                    AND turn_id = ?2",
+                params![turn.server_session_id.clone(), turn.turn_id.clone()],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        self.conn
+            .execute(
                 "INSERT INTO llm_transcript_turns (
                     server_session_id,
                     turn_id,
@@ -2901,6 +2910,47 @@ mod tests {
                 .map(|record| record.turn_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["turn-1", "turn-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_transcript_store_replaces_existing_turn_id() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.llm_transcript_store();
+
+        for (completed_at_ms, status) in [(11, "completed"), (12, "failed")] {
+            store
+                .insert_completed_turn(NewLlmTranscriptTurn {
+                    server_session_id: "server-session".to_owned(),
+                    turn_id: "turn-replaced".to_owned(),
+                    owner: "memory#0".to_owned(),
+                    owner_module: "memory".to_owned(),
+                    owner_replica: 0,
+                    tier: "cheap".to_owned(),
+                    source: "module_turn".to_owned(),
+                    session_key: Some("main".to_owned()),
+                    operation: "text-turn".to_owned(),
+                    started_at_ms: 10,
+                    completed_at_ms,
+                    trace_json: serde_json::json!({ "status": status }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let recent = store.recent_completed_turns(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].turn_id, "turn-replaced");
+        assert_eq!(recent[0].completed_at_ms, 12);
+        assert_eq!(
+            recent[0].trace_json,
+            serde_json::json!({ "status": "failed" })
         );
     }
 

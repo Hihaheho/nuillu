@@ -314,6 +314,10 @@ pub enum LlmObservationEvent {
         finish_reason: String,
         usage: LlmUsageView,
     },
+    Failed {
+        turn_id: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

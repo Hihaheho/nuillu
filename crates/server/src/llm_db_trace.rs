@@ -12,6 +12,7 @@ use lutum::{
 };
 use lutum_libsql_adapter::{LibsqlLlmTranscriptStore, NewLlmTranscriptTurn};
 use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
+use nuillu_types::ModuleInstanceId;
 use nuillu_visualizer_protocol::{
     LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, VisualizerEvent,
     VisualizerTabId,
@@ -35,11 +36,15 @@ struct DbLlmTraceSinkInner {
     store: LibsqlLlmTranscriptStore,
     next_turn: AtomicU64,
     turns: Mutex<BTreeMap<usize, CompletedTurnTrace>>,
+    activation_attempt_turns: Mutex<BTreeMap<(String, u32), String>>,
+    terminal_turns: Mutex<BTreeMap<String, CompletedTurnTrace>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletedTurnTrace {
     version: u32,
+    #[serde(default = "default_turn_status")]
+    status: TranscriptTurnStatus,
     turn_id: String,
     owner: String,
     module: String,
@@ -59,6 +64,20 @@ pub struct CompletedTurnTrace {
     structured_output: Option<String>,
     finish_reason: Option<String>,
     usage: Option<LlmUsageView>,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TranscriptTurnStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+fn default_turn_status() -> TranscriptTurnStatus {
+    TranscriptTurnStatus::Completed
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,6 +102,8 @@ impl DbLlmTraceSink {
                 store,
                 next_turn: AtomicU64::new(0),
                 turns: Mutex::new(BTreeMap::new()),
+                activation_attempt_turns: Mutex::new(BTreeMap::new()),
+                terminal_turns: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -116,6 +137,7 @@ impl DbLlmTraceSink {
             let now = Utc::now().timestamp_millis();
             CompletedTurnTrace {
                 version: 1,
+                status: TranscriptTurnStatus::InProgress,
                 turn_id,
                 owner: metadata.owner.to_string(),
                 module: metadata.owner.module.to_string(),
@@ -134,8 +156,19 @@ impl DbLlmTraceSink {
                 structured_output: None,
                 finish_reason: None,
                 usage: None,
+                error_message: None,
             }
         });
+        if let Some(activation_attempt) = metadata.activation_attempt {
+            self.inner
+                .activation_attempt_turns
+                .lock()
+                .expect("DB LLM trace activation turn map lock poisoned")
+                .insert(
+                    (metadata.owner.to_string(), activation_attempt),
+                    trace.turn_id.clone(),
+                );
+        }
         update(trace);
         trace.clone()
     }
@@ -146,6 +179,15 @@ impl DbLlmTraceSink {
             .lock()
             .expect("DB LLM trace turn map lock poisoned")
             .remove(&extension_key(extensions));
+        self.persist_terminal_trace(trace).await;
+    }
+
+    async fn persist_terminal_trace(&self, trace: CompletedTurnTrace) {
+        self.inner
+            .terminal_turns
+            .lock()
+            .expect("DB LLM trace terminal turn map lock poisoned")
+            .insert(trace.turn_id.clone(), trace.clone());
         let trace_json = match serde_json::to_value(&trace) {
             Ok(value) => value,
             Err(error) => {
@@ -185,6 +227,49 @@ impl DbLlmTraceSink {
         {
             tracing::warn!(?error, "failed to prune completed LLM traces");
         }
+    }
+
+    pub async fn mark_activation_attempt_failed(
+        &self,
+        owner: ModuleInstanceId,
+        activation_attempt: u32,
+        message: String,
+    ) {
+        let turn_id = self
+            .inner
+            .activation_attempt_turns
+            .lock()
+            .expect("DB LLM trace activation turn map lock poisoned")
+            .remove(&(owner.to_string(), activation_attempt));
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+
+        let active_trace = {
+            let mut turns = self
+                .inner
+                .turns
+                .lock()
+                .expect("DB LLM trace turn map lock poisoned");
+            let key = turns
+                .iter()
+                .find_map(|(key, trace)| (trace.turn_id == turn_id).then_some(*key));
+            key.and_then(|key| turns.remove(&key))
+        };
+        let mut trace = active_trace.or_else(|| {
+            self.inner
+                .terminal_turns
+                .lock()
+                .expect("DB LLM trace terminal turn map lock poisoned")
+                .get(&turn_id)
+                .cloned()
+        });
+        let Some(mut trace) = trace.take() else {
+            return;
+        };
+
+        mark_trace_failed(&mut trace, message);
+        self.persist_terminal_trace(trace).await;
     }
 }
 
@@ -303,10 +388,16 @@ impl CompletedTurnTrace {
         }
         if let (Some(finish_reason), Some(usage)) = (&self.finish_reason, self.usage) {
             events.push(LlmObservationEvent::Completed {
-                turn_id: restored_turn_id,
+                turn_id: restored_turn_id.clone(),
                 request_id: self.request_id.clone(),
                 finish_reason: finish_reason.clone(),
                 usage,
+            });
+        }
+        if self.status == TranscriptTurnStatus::Failed {
+            events.push(LlmObservationEvent::Failed {
+                turn_id: restored_turn_id,
+                message: self.error_message.clone().unwrap_or_default(),
             });
         }
         events
@@ -350,10 +441,17 @@ fn apply_completed(
     finish_reason: &impl std::fmt::Debug,
     usage: Usage,
 ) {
+    trace.status = TranscriptTurnStatus::Completed;
     trace.request_id = request_id.clone().or_else(|| trace.request_id.clone());
     trace.completed_at_ms = Some(Utc::now().timestamp_millis());
     trace.finish_reason = Some(format!("{finish_reason:?}"));
     trace.usage = Some(usage_view(usage));
+}
+
+fn mark_trace_failed(trace: &mut CompletedTurnTrace, message: String) {
+    trace.status = TranscriptTurnStatus::Failed;
+    trace.completed_at_ms = Some(Utc::now().timestamp_millis());
+    trace.error_message = Some(message);
 }
 
 fn push_delta(trace: &mut CompletedTurnTrace, kind: &str, delta: &str) {
@@ -503,5 +601,198 @@ fn source_label(source: LlmObservationSource) -> &'static str {
     match source {
         LlmObservationSource::ModuleTurn => "module_turn",
         LlmObservationSource::SessionCompaction => "session_compaction",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
+    use nuillu_module::ports::{Embedder, PortError};
+    use nuillu_types::{ReplicaIndex, builtin};
+    use nuillu_visualizer_protocol::VisualizerServerMessage;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct TestEmbedder {
+        dims: usize,
+    }
+
+    impl TestEmbedder {
+        fn boxed(dims: usize) -> Box<dyn Embedder> {
+            Box::new(Self { dims })
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Embedder for TestEmbedder {
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, PortError> {
+            Ok(vec![0.0; self.dims])
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_active_turn_is_inserted_into_transcript_db() {
+        let store = test_transcript_store().await;
+        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+        let trace = test_trace(&owner, "turn-active", TranscriptTurnStatus::InProgress);
+
+        sink.inner
+            .turns
+            .lock()
+            .expect("turn map lock poisoned")
+            .insert(1, trace);
+        sink.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("activation turn map lock poisoned")
+            .insert((owner.to_string(), 5), "turn-active".to_string());
+
+        sink.mark_activation_attempt_failed(owner, 5, "activation failed".to_string())
+            .await;
+
+        let recent = store.recent_completed_turns(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].turn_id, "turn-active");
+        assert_eq!(recent[0].trace_json["status"], "failed");
+        assert_eq!(recent[0].trace_json["error_message"], "activation failed");
+        assert!(recent[0].trace_json["completed_at_ms"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn completed_turn_can_be_updated_and_replayed_as_failed() {
+        let store = test_transcript_store().await;
+        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+        let trace = test_trace(&owner, "turn-completed", TranscriptTurnStatus::Completed);
+
+        sink.persist_terminal_trace(trace).await;
+        sink.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("activation turn map lock poisoned")
+            .insert((owner.to_string(), 3), "turn-completed".to_string());
+
+        sink.mark_activation_attempt_failed(owner, 3, "module failed after output".to_string())
+            .await;
+
+        let recent = store.recent_completed_turns(10).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        let restored: CompletedTurnTrace =
+            serde_json::from_value(recent[0].trace_json.clone()).unwrap();
+        assert_eq!(restored.status, TranscriptTurnStatus::Failed);
+        assert_eq!(
+            restored.error_message.as_deref(),
+            Some("module failed after output")
+        );
+        assert_eq!(restored.finish_reason.as_deref(), Some("Stop"));
+        assert!(restored.usage.is_some());
+
+        let direct_events = restored.to_observation_events("restored".to_string());
+        assert!(matches!(
+            direct_events.last(),
+            Some(LlmObservationEvent::Failed { message, .. })
+                if message == "module failed after output"
+        ));
+        assert!(direct_events.iter().any(|event| {
+            matches!(event, LlmObservationEvent::Completed { turn_id, .. } if turn_id == "restored")
+        }));
+
+        let (tx, rx) = mpsc::channel();
+        let visualizer = VisualizerEventSink::new(tx);
+        emit_persisted_llm_transcripts(&store, "server", &visualizer).await;
+        let replayed = rx.try_iter().collect::<Vec<_>>();
+        assert!(replayed.iter().any(|message| matches!(
+            message,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::LlmObserved {
+                    event: LlmObservationEvent::Failed { message, .. },
+                    ..
+                }
+            } if message == "module failed after output"
+        )));
+    }
+
+    async fn test_transcript_store() -> LibsqlLlmTranscriptStore {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        agent.llm_transcript_store()
+    }
+
+    fn test_trace(
+        owner: &ModuleInstanceId,
+        turn_id: &str,
+        status: TranscriptTurnStatus,
+    ) -> CompletedTurnTrace {
+        CompletedTurnTrace {
+            version: 1,
+            status,
+            turn_id: turn_id.to_string(),
+            owner: owner.to_string(),
+            module: owner.module.to_string(),
+            replica: owner.replica.get(),
+            tier: "Default".to_string(),
+            source: LlmObservationSource::ModuleTurn,
+            session_key: Some("session".to_string()),
+            operation: "text_turn".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: (status != TranscriptTurnStatus::InProgress).then_some(20),
+            input: vec![LlmInputItemView {
+                role: "user".to_string(),
+                kind: "text".to_string(),
+                content: "hello".to_string(),
+                ephemeral: false,
+                source: None,
+            }],
+            request_id: Some("request".to_string()),
+            model: Some("model".to_string()),
+            deltas: vec![DeltaTrace {
+                kind: "text".to_string(),
+                delta: "partial".to_string(),
+            }],
+            tool_calls: Vec::new(),
+            structured_output: None,
+            finish_reason: (status == TranscriptTurnStatus::Completed)
+                .then_some("Stop".to_string()),
+            usage: (status == TranscriptTurnStatus::Completed).then_some(LlmUsageView {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+                cost_micros_usd: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            }),
+            error_message: None,
+        }
+    }
+
+    fn test_db_path() -> PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join("server-llm-db-trace-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("agent.db")
     }
 }

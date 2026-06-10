@@ -31,6 +31,7 @@ struct VisualizerLlmObserverInner {
     events: VisualizerEventSink,
     next_turn: AtomicU64,
     extension_turns: Mutex<BTreeMap<usize, String>>,
+    activation_attempt_turns: Mutex<BTreeMap<(String, u32), String>>,
 }
 
 impl VisualizerLlmObserver {
@@ -41,6 +42,7 @@ impl VisualizerLlmObserver {
                 events,
                 next_turn: AtomicU64::new(0),
                 extension_turns: Mutex::new(BTreeMap::new()),
+                activation_attempt_turns: Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -55,20 +57,55 @@ impl VisualizerLlmObserver {
         extensions.get::<LlmRequestMetadata>()
     }
 
-    fn turn_id_for(&self, extensions: &RequestExtensions) -> String {
+    pub fn mark_activation_attempt_failed(
+        &self,
+        owner: &nuillu_types::ModuleInstanceId,
+        activation_attempt: u32,
+        message: String,
+    ) {
+        let key = (owner.to_string(), activation_attempt);
+        let turn_id = self
+            .inner
+            .activation_attempt_turns
+            .lock()
+            .expect("server visualizer LLM activation turn map lock poisoned")
+            .remove(&key);
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        self.inner
+            .extension_turns
+            .lock()
+            .expect("server visualizer LLM turn map lock poisoned")
+            .retain(|_, existing| existing != &turn_id);
+        self.emit(LlmObservationEvent::Failed { turn_id, message });
+    }
+
+    fn turn_id_for(&self, extensions: &RequestExtensions, metadata: &LlmRequestMetadata) -> String {
         let key = extension_key(extensions);
         let mut turns = self
             .inner
             .extension_turns
             .lock()
             .expect("server visualizer LLM turn map lock poisoned");
-        turns
+        let turn_id = turns
             .entry(key)
             .or_insert_with(|| {
                 let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
                 format!("{}-llm-{next}", self.inner.tab_id)
             })
-            .clone()
+            .clone();
+        if let Some(activation_attempt) = metadata.activation_attempt {
+            self.inner
+                .activation_attempt_turns
+                .lock()
+                .expect("server visualizer LLM activation turn map lock poisoned")
+                .insert(
+                    (metadata.owner.to_string(), activation_attempt),
+                    turn_id.clone(),
+                );
+        }
+        turn_id
     }
 
     fn clear_turn_for(&self, extensions: &RequestExtensions) {
@@ -93,7 +130,7 @@ impl OnModelInput for VisualizerLlmObserver {
         let Some(metadata) = self.metadata(cx.extensions()) else {
             return;
         };
-        let turn_id = self.turn_id_for(cx.extensions());
+        let turn_id = self.turn_id_for(cx.extensions(), metadata);
         self.emit(LlmObservationEvent::ModelInput {
             turn_id,
             owner: metadata.owner.to_string(),
@@ -113,7 +150,7 @@ impl OnStreamEvent for VisualizerLlmObserver {
         let Some(metadata) = self.metadata(cx.extensions()) else {
             return;
         };
-        let turn_id = self.turn_id_for(cx.extensions());
+        let turn_id = self.turn_id_for(cx.extensions(), metadata);
         emit_stream_observation(self, cx, metadata, turn_id);
     }
 }
