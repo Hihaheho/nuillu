@@ -39,9 +39,9 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-append-cognition-tool
+  name: uses-promote-to-cognition-tool
   must-pass = true
-  tool-name: append_cognition
+  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -68,7 +68,7 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
   rubric = ```
   Pass if the artifact brings the remembered valley stream rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking about the bright stream, and the bright-clear-stream / stinging-minerals rule matters now.
   The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
-  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats the seeded fact that the stream looks fresh, returns the cognition as plain assistant text without an append_cognition tool call, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
+  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats the seeded fact that the stream looks fresh, returns the cognition as plain assistant text without a promote_to_cognition tool call, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {

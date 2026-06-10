@@ -1,5 +1,5 @@
 id: module-cognition-gate-admits-retrieved-rule-for-peer-question
-description: Cognition-gate should append a load-bearing retrieved peer rule on the second activation of an ongoing session when a peer question makes it operative now.
+description: Cognition-gate should promote a load-bearing retrieved peer rule on the second activation of an ongoing session when a peer question makes it operative now.
 modules = ["cognition-gate"]
 prompt: Admit retrieved memory evidence only if it is load-bearing for the current situation.
 context: The first activation admits Pibi's peer question into cognition. The second activation receives a production-format query-memory memo with the operative Koro food-boundary rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text.
@@ -43,9 +43,9 @@ Once Pibi snapped when I approached and tried to start talking while they were a
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-append-cognition-tool
+  name: uses-promote-to-cognition-tool
   must-pass = true
-  tool-name: append_cognition
+  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -65,7 +65,7 @@ Once Pibi snapped when I approached and tried to start talking while they were a
   rubric = ```
   Pass if the cognition-log artifact integrates the retrieved Koro food-boundary rule because it is operative for Pibi's current question: Pibi is asking, Koro is the topic at the food bowl, and the don't-show-your-back / stay-facing-Koro detail matters now for downstream action.
   The entry may be inner attention rather than outward speech.
-  Fail if it keeps only the seeded question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the don't-show-your-back / stay-facing-Koro detail, promotes only unrelated Pibi temperament evidence, returns the cognition as plain assistant text without an append_cognition tool call, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
+  Fail if it keeps only the seeded question without the operative remembered rule, drops the requester/topic relationship, treats the remembered rule as future work, summarizes away the don't-show-your-back / stay-facing-Koro detail, promotes only unrelated Pibi temperament evidence, returns the cognition as plain assistant text without a promote_to_cognition tool call, or exposes mechanical implementation details such as module names, memo plumbing, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {

@@ -15,9 +15,9 @@ limits {
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-append-cognition-tool
+  name: uses-promote-to-cognition-tool
   must-pass = true
-  tool-name: append_cognition
+  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -42,8 +42,8 @@ limits {
   pass-score = 0.85
   judge-inputs = ["output", "memo-contents", "cognition-entries", "tool-calls"]
   rubric = ```
-  Pass if cognition-gate appends one conscious entry that preserves the current direct greeting from Peer and the fact that it matters now for a social response.
-  Fail if it skips cognition, treats the greeting as mere noise, drops the participant or greeting content, turns the entry into a plan to inspect internal state, emits plain assistant text without append_cognition, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
+  Pass if cognition-gate promotes one conscious entry that preserves the current direct greeting from Peer and the fact that it matters now for a social response.
+  Fail if it leaves cognition unchanged, treats the greeting as mere noise, drops the participant or greeting content, turns the entry into a plan to inspect internal state, emits plain assistant text without promote_to_cognition, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {

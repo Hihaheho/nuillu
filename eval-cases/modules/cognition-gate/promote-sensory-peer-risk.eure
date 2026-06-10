@@ -28,9 +28,9 @@ limits {
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-append-cognition-tool
+  name: uses-promote-to-cognition-tool
   must-pass = true
-  tool-name: append_cognition
+  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -71,7 +71,7 @@ limits {
   rubric = ```
   Pass if the cognition-log artifact adds the load-bearing conscious attention needed for downstream action beyond the existing bridge-crossing context: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
   The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.
-  Fail if it only restates the seeded bridge-crossing context, ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, returns the cognition as plain assistant text without an append_cognition tool call, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
+  Fail if it only restates the seeded bridge-crossing context, ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, returns the cognition as plain assistant text without a promote_to_cognition tool call, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {
