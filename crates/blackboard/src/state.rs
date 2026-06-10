@@ -153,11 +153,6 @@ pub enum ModuleRunStatus {
         phase: String,
         message: String,
     },
-    Stopped {
-        phase: String,
-        message: String,
-        consecutive_failures: u32,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

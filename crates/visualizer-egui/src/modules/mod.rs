@@ -286,21 +286,6 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             let module = module_mut_for_owner(state, owner);
             module.runtime_status = Some(format!("Warning: {message}"));
         }
-        RuntimeEvent::ModuleRestarted { owner, .. } => {
-            let module = module_mut_for_owner(state, owner);
-            module.runtime_status = Some("Restarted".to_string());
-        }
-        RuntimeEvent::ModuleStopped {
-            owner,
-            phase,
-            message,
-            ..
-        } => {
-            let module = module_mut_for_owner(state, owner);
-            module.status = ModuleSessionStatus::Failed;
-            module.runtime_status = Some(format!("Stopped {phase}: {message}"));
-            module.last_execution_failed = true;
-        }
         RuntimeEvent::SessionCompactionStarted {
             owner, session_key, ..
         } => {
@@ -3383,34 +3368,6 @@ mod tests {
             .expect("module exists");
         assert_eq!(module.error_count, 1);
         assert!(!module.last_execution_failed);
-    }
-
-    #[test]
-    fn stopped_event_keeps_module_highlighted() {
-        let mut state = ModulesState::default();
-        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
-
-        apply_runtime_event(
-            &mut state,
-            &RuntimeEvent::ModuleStopped {
-                sequence: 4,
-                owner: owner.clone(),
-                phase: "activate".to_string(),
-                message: "permanent failure".to_string(),
-                consecutive_failures: 3,
-            },
-        );
-
-        let module = state
-            .modules
-            .get(&owner.to_string())
-            .expect("module exists");
-        assert_eq!(module.status, ModuleSessionStatus::Failed);
-        assert_eq!(
-            module.runtime_status.as_deref(),
-            Some("Stopped activate: permanent failure")
-        );
-        assert!(module.last_execution_failed);
     }
 
     #[test]

@@ -99,19 +99,6 @@ pub enum RuntimeEvent {
         tier: ModelTier,
         message: String,
     },
-    ModuleRestarted {
-        sequence: u64,
-        owner: ModuleInstanceId,
-        consecutive_failures: u32,
-        failure_limit: u32,
-    },
-    ModuleStopped {
-        sequence: u64,
-        owner: ModuleInstanceId,
-        phase: String,
-        message: String,
-        consecutive_failures: u32,
-    },
 }
 
 pub trait RuntimeEventSink {
@@ -316,36 +303,6 @@ impl RuntimeEventEmitter {
             threshold,
             tier,
             message,
-        });
-    }
-
-    pub(crate) fn module_restarted(
-        &self,
-        owner: ModuleInstanceId,
-        consecutive_failures: u32,
-        failure_limit: u32,
-    ) {
-        self.emit(|sequence| RuntimeEvent::ModuleRestarted {
-            sequence,
-            owner,
-            consecutive_failures,
-            failure_limit,
-        });
-    }
-
-    pub(crate) fn module_stopped(
-        &self,
-        owner: ModuleInstanceId,
-        phase: String,
-        message: String,
-        consecutive_failures: u32,
-    ) {
-        self.emit(|sequence| RuntimeEvent::ModuleStopped {
-            sequence,
-            owner,
-            phase,
-            message,
-            consecutive_failures,
         });
     }
 

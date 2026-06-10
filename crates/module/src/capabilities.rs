@@ -510,31 +510,6 @@ impl AgentRuntimeControl {
             .module_task_failed(owner, phase.into(), message.into());
     }
 
-    pub fn record_module_restarted(
-        &self,
-        owner: ModuleInstanceId,
-        consecutive_failures: u32,
-        failure_limit: u32,
-    ) {
-        self.runtime_events
-            .module_restarted(owner, consecutive_failures, failure_limit);
-    }
-
-    pub fn record_module_stopped(
-        &self,
-        owner: ModuleInstanceId,
-        phase: impl Into<String>,
-        message: impl Into<String>,
-        consecutive_failures: u32,
-    ) {
-        self.runtime_events.module_stopped(
-            owner,
-            phase.into(),
-            message.into(),
-            consecutive_failures,
-        );
-    }
-
     pub async fn record_agentic_deadlock_marker(&self, idle_for: Duration) {
         self.blackboard
             .apply(BlackboardCommand::RecordAgenticDeadlockMarker(

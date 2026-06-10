@@ -6255,23 +6255,6 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
             owner,
             message,
         } => format!("seq={sequence} module_warning owner={owner} message={message}"),
-        RuntimeEvent::ModuleRestarted {
-            sequence,
-            owner,
-            consecutive_failures,
-            failure_limit,
-        } => format!(
-            "seq={sequence} module_restarted owner={owner} failures={consecutive_failures} limit={failure_limit}"
-        ),
-        RuntimeEvent::ModuleStopped {
-            sequence,
-            owner,
-            phase,
-            message,
-            consecutive_failures,
-        } => format!(
-            "seq={sequence} module_stopped owner={owner} phase={phase} failures={consecutive_failures} message={message}"
-        ),
         RuntimeEvent::SessionCompactionStarted {
             sequence,
             owner,
@@ -6776,9 +6759,7 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         | RuntimeEvent::SessionCompactionCompleted { .. }
         | RuntimeEvent::SessionCompactionFailed { .. }
         | RuntimeEvent::ModuleActivationAttemptFailed { .. }
-        | RuntimeEvent::ModuleTaskFailed { .. }
-        | RuntimeEvent::ModuleRestarted { .. }
-        | RuntimeEvent::ModuleStopped { .. } => true,
+        | RuntimeEvent::ModuleTaskFailed { .. } => true,
         RuntimeEvent::RateLimitDelayed { .. }
         | RuntimeEvent::ModuleBatchThrottled { .. }
         | RuntimeEvent::ModuleBatchReady { .. }
@@ -6802,8 +6783,6 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleActivationAttemptFailed { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
             RuntimeEvent::ModuleWarning { .. } => false,
-            RuntimeEvent::ModuleRestarted { .. } => false,
-            RuntimeEvent::ModuleStopped { .. } => false,
             RuntimeEvent::SessionCompactionStarted { .. } => false,
             RuntimeEvent::SessionCompactionCompleted { .. } => false,
             RuntimeEvent::SessionCompactionFailed { .. } => false,
@@ -6928,34 +6907,6 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.reporter.log_prefix(),
                 self.reporter.log_scope(&self.case_id),
                 owner,
-                message
-            ),
-            RuntimeEvent::ModuleRestarted {
-                owner,
-                consecutive_failures,
-                failure_limit,
-                ..
-            } => format!(
-                "{} module-restarted {} owner={} failures={} limit={}",
-                self.reporter.log_prefix(),
-                self.reporter.log_scope(&self.case_id),
-                owner,
-                consecutive_failures,
-                failure_limit
-            ),
-            RuntimeEvent::ModuleStopped {
-                owner,
-                phase,
-                message,
-                consecutive_failures,
-                ..
-            } => format!(
-                "{} module-stopped {} owner={} phase={} failures={} error={}",
-                self.reporter.log_prefix(),
-                self.reporter.log_scope(&self.case_id),
-                owner,
-                phase,
-                consecutive_failures,
                 message
             ),
             RuntimeEvent::SessionCompactionStarted {

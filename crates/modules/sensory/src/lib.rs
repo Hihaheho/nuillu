@@ -1795,15 +1795,15 @@ mod tests {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                         for _ in 0..50 {
-                            let stopped = shutdown_blackboard
+                            let failed = shutdown_blackboard
                                 .read(|bb| {
                                     matches!(
                                         bb.module_status_for_instance(&sensory_owner),
-                                        Some(ModuleRunStatus::Stopped { .. })
+                                        Some(ModuleRunStatus::Failed { .. })
                                     )
                                 })
                                 .await;
-                            if stopped {
+                            if failed {
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1816,8 +1816,8 @@ mod tests {
                     .read(|bb| bb.module_status_for_instance(&sensory_owner).cloned())
                     .await;
                 assert!(
-                    matches!(status, Some(ModuleRunStatus::Stopped { .. })),
-                    "plain text finish should stop sensory after activation failure; result={result:?} batches={:?} logs={logs:?} status={status:?}",
+                    matches!(status, Some(ModuleRunStatus::Failed { .. })),
+                    "plain text finish should fail sensory activation; result={result:?} batches={:?} logs={logs:?} status={status:?}",
                     recorder.batches.borrow().as_slice(),
                 );
 

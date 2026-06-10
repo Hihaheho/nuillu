@@ -91,9 +91,7 @@ impl ResourceMonitorState {
             RuntimeEvent::SessionCompactionFailed { .. } => counts.compactions_failed += 1,
             RuntimeEvent::MemoUpdated { .. }
             | RuntimeEvent::ModuleTaskFailed { .. }
-            | RuntimeEvent::ModuleWarning { .. }
-            | RuntimeEvent::ModuleRestarted { .. }
-            | RuntimeEvent::ModuleStopped { .. } => {}
+            | RuntimeEvent::ModuleWarning { .. } => {}
         }
         self.prune(now_secs);
     }
@@ -715,9 +713,7 @@ fn runtime_event_module(event: &RuntimeEvent) -> String {
         | RuntimeEvent::ModuleWarning { owner, .. }
         | RuntimeEvent::SessionCompactionStarted { owner, .. }
         | RuntimeEvent::SessionCompactionCompleted { owner, .. }
-        | RuntimeEvent::SessionCompactionFailed { owner, .. }
-        | RuntimeEvent::ModuleRestarted { owner, .. }
-        | RuntimeEvent::ModuleStopped { owner, .. } => owner.module.as_str().to_owned(),
+        | RuntimeEvent::SessionCompactionFailed { owner, .. } => owner.module.as_str().to_owned(),
     }
 }
 

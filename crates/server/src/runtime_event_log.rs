@@ -157,23 +157,6 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
         } => format!(
             "nuillu-server session-compaction-failed tab={tab_id} owner={owner} session={session_key} input_tokens={input_tokens} error={message}"
         ),
-        RuntimeEvent::ModuleRestarted {
-            owner,
-            consecutive_failures,
-            failure_limit,
-            ..
-        } => format!(
-            "nuillu-server module-restarted tab={tab_id} owner={owner} failures={consecutive_failures} limit={failure_limit}"
-        ),
-        RuntimeEvent::ModuleStopped {
-            owner,
-            phase,
-            message,
-            consecutive_failures,
-            ..
-        } => format!(
-            "nuillu-server module-stopped tab={tab_id} owner={owner} phase={phase} failures={consecutive_failures} error={message}"
-        ),
     }
 }
 

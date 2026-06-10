@@ -4873,12 +4873,6 @@ mod tests {
                 assert!(logs.iter().any(|record| {
                     record.owner == owner && record.content == "fresh opportunity activated"
                 }));
-                assert!(!matches!(
-                    blackboard
-                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
-                        .await,
-                    Some(ModuleRunStatus::Stopped { .. })
-                ));
             })
             .await;
     }
@@ -5032,12 +5026,6 @@ mod tests {
                 .expect("scheduler should continue after parked next_batch failure");
 
                 assert_eq!(constructions.get(), 1);
-                assert!(!matches!(
-                    blackboard
-                        .read(|bb| bb.module_status_for_instance(&owner).cloned())
-                        .await,
-                    Some(ModuleRunStatus::Stopped { .. })
-                ));
             })
             .await;
     }
