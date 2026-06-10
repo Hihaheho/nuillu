@@ -33,6 +33,14 @@ impl LlmLogContext {
             namespace: namespace.into_iter().collect(),
         }
     }
+
+    pub fn namespace_dir(&self) -> PathBuf {
+        let mut path = self.root.clone();
+        for segment in &self.namespace {
+            path.push(sanitize_segment(segment));
+        }
+        path
+    }
 }
 
 #[derive(Clone)]
@@ -943,6 +951,11 @@ mod tests {
     fn eval_turn_dir_sanitizes_namespace_module_and_pads_turn() {
         let root = Path::new("llm-logs");
         let namespace = vec!["run/../1".to_string(), "case one".to_string()];
+        let context = LlmLogContext::new(root, namespace.clone());
+        assert_eq!(
+            context.namespace_dir(),
+            PathBuf::from("llm-logs/run-1/case-one")
+        );
         assert_eq!(
             FileLlmTraceSink::turn_dir_for_test(root, &namespace, "module/name", 7),
             PathBuf::from("llm-logs/run-1/case-one/module-name/000007")

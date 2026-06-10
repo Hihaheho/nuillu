@@ -370,6 +370,7 @@ struct CaseOutputContext<'a> {
     runtime_id: &'a str,
     trial_number: usize,
     reporter: &'a LiveReporter,
+    llm_log_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1378,6 +1379,7 @@ async fn run_case_trial_with_timeout(
                     runtime_id,
                     trial_number,
                     reporter,
+                    llm_log_directory: Some(eval_llm_log_directory(config, runtime_id)),
                 },
                 message,
                 empty_trace_snapshot(),
@@ -1448,6 +1450,7 @@ async fn run_case_detailed_body(
                     runtime_id,
                     trial_number,
                     reporter,
+                    llm_log_directory: Some(eval_llm_log_directory(config, runtime_id)),
                 },
                 message,
                 trace,
@@ -1472,6 +1475,7 @@ async fn run_case_detailed_body(
                     runtime_id,
                     trial_number,
                     reporter,
+                    llm_log_directory: Some(eval_llm_log_directory(config, runtime_id)),
                 },
                 message,
                 trace,
@@ -1524,10 +1528,18 @@ fn write_runtime_failure_case_output(
     trace: TraceSnapshot,
     raw_trace: RawTraceSnapshot,
 ) -> Result<CaseRunOutput, RunnerError> {
-    let artifact = CaseArtifact::failed(message.clone());
+    let llm_log_directory = ctx
+        .llm_log_directory
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let mut artifact = CaseArtifact::failed(message.clone());
+    if let Some(directory) = &llm_log_directory {
+        artifact = artifact.with_observation("llm_log_directory", directory.clone());
+    }
     let events = Vec::new();
     let report = CaseReport {
         runtime_failure: Some(message.clone()),
+        llm_log_directory: llm_log_directory.clone(),
         checks: Vec::new(),
         modules_checks: Vec::new(),
         invalid: true,
@@ -1563,6 +1575,7 @@ fn write_runtime_failure_case_output(
         serde_json::json!({
             "path": summary.path.as_str(),
             "error": message,
+            "llm_log_directory": llm_log_directory,
         }),
         format!("eval case error id={} error={}", summary.id, message),
     )?;
@@ -1715,6 +1728,7 @@ fn aggregate_case_report(
                 trial_outputs.len()
             )
         }),
+        llm_log_directory: None,
         checks: Vec::new(),
         modules_checks: Vec::new(),
         invalid,
@@ -4514,6 +4528,10 @@ pub(crate) fn eval_llm_log_context(config: &RunnerConfig, case_id: &str) -> LlmL
     )
 }
 
+pub(crate) fn eval_llm_log_directory(config: &RunnerConfig, case_id: &str) -> PathBuf {
+    eval_llm_log_context(config, case_id).namespace_dir()
+}
+
 fn session_compaction_policy(config: &RunnerConfig) -> SessionCompactionPolicy {
     SessionCompactionPolicy::new(
         config.cheap_backend.compaction_input_token_threshold,
@@ -6217,6 +6235,15 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
             "seq={sequence} module_activation_completed owner={owner} duration_ms={} succeeded={succeeded}",
             duration_millis_u64(*duration)
         ),
+        RuntimeEvent::ModuleActivationAttemptFailed {
+            sequence,
+            owner,
+            activation_attempt,
+            max_attempts,
+            message,
+        } => format!(
+            "seq={sequence} module_activation_attempt_failed owner={owner} attempt={activation_attempt}/{max_attempts} message={message}"
+        ),
         RuntimeEvent::ModuleTaskFailed {
             sequence,
             owner,
@@ -6750,6 +6777,7 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         | RuntimeEvent::SessionCompactionStarted { .. }
         | RuntimeEvent::SessionCompactionCompleted { .. }
         | RuntimeEvent::SessionCompactionFailed { .. }
+        | RuntimeEvent::ModuleActivationAttemptFailed { .. }
         | RuntimeEvent::ModuleTaskFailed { .. }
         | RuntimeEvent::ModuleRestarted { .. }
         | RuntimeEvent::ModuleStopped { .. } => true,
@@ -6773,6 +6801,7 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
             RuntimeEvent::ModuleBatchReady { .. } => false,
             RuntimeEvent::ModuleActivationCompleted { .. } => false,
+            RuntimeEvent::ModuleActivationAttemptFailed { .. } => false,
             RuntimeEvent::ModuleTaskFailed { .. } => false,
             RuntimeEvent::ModuleWarning { .. } => false,
             RuntimeEvent::ModuleRestarted { .. } => false,
@@ -6867,6 +6896,21 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 owner,
                 duration.as_millis(),
                 succeeded
+            ),
+            RuntimeEvent::ModuleActivationAttemptFailed {
+                owner,
+                activation_attempt,
+                max_attempts,
+                message,
+                ..
+            } => format!(
+                "{} module-activation-attempt-failed {} owner={} attempt={}/{} error={}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                activation_attempt,
+                max_attempts,
+                message
             ),
             RuntimeEvent::ModuleTaskFailed {
                 owner,
@@ -6987,23 +7031,45 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 tab_id: VisualizerTabId::new(self.case_id.clone()),
                 event: event.clone(),
             });
-            if let RuntimeEvent::ModuleTaskFailed {
-                owner,
-                phase,
-                message,
-                ..
-            } = &event
-            {
-                visualizer.send(VisualizerEvent::Error {
-                    tab_id: VisualizerTabId::new(self.case_id.clone()),
-                    error: VisualizerErrorView {
-                        at: Utc::now(),
-                        source: "runtime".to_string(),
-                        phase: phase.clone(),
-                        owner: Some(owner.to_string()),
-                        message: message.clone(),
-                    },
-                });
+            match &event {
+                RuntimeEvent::ModuleTaskFailed {
+                    owner,
+                    phase,
+                    message,
+                    ..
+                } => {
+                    visualizer.send(VisualizerEvent::Error {
+                        tab_id: VisualizerTabId::new(self.case_id.clone()),
+                        error: VisualizerErrorView {
+                            at: Utc::now(),
+                            source: "runtime".to_string(),
+                            phase: phase.clone(),
+                            owner: Some(owner.to_string()),
+                            message: message.clone(),
+                        },
+                    });
+                }
+                RuntimeEvent::ModuleActivationAttemptFailed {
+                    owner,
+                    activation_attempt,
+                    max_attempts,
+                    message,
+                    ..
+                } => {
+                    visualizer.send(VisualizerEvent::Error {
+                        tab_id: VisualizerTabId::new(self.case_id.clone()),
+                        error: VisualizerErrorView {
+                            at: Utc::now(),
+                            source: "runtime".to_string(),
+                            phase: format!(
+                                "activate-attempt-{activation_attempt}-of-{max_attempts}"
+                            ),
+                            owner: Some(owner.to_string()),
+                            message: message.clone(),
+                        },
+                    });
+                }
+                _ => {}
             }
         }
         if should_stop && !self.stop.swap(true, Ordering::Relaxed) {
@@ -7215,6 +7281,7 @@ mod tests {
     fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
         CaseReport {
             runtime_failure: invalid.then(|| "invalid".to_string()),
+            llm_log_directory: None,
             checks: Vec::new(),
             modules_checks: Vec::new(),
             invalid,
@@ -7542,6 +7609,19 @@ id = "{id}"
 
         assert_eq!(context.root, dir.path().join("llm-logs"));
         assert_eq!(context.namespace, vec!["run-1", "case-1"]);
+        assert_eq!(
+            context.namespace_dir(),
+            dir.path().join("llm-logs").join("run-1").join("case-1")
+        );
+
+        let trial_context = eval_llm_log_context(&config, "case-1/trial-001");
+        assert_eq!(
+            trial_context.namespace_dir(),
+            dir.path()
+                .join("llm-logs")
+                .join("run-1")
+                .join("case-1-trial-001")
+        );
     }
 
     #[test]
@@ -8834,15 +8914,27 @@ id = "module-query-memory-special-memory"
         assert_eq!(sink.event_count(), 3);
         assert_eq!(sink.progress_event_count(), 0);
 
-        sink.on_event(RuntimeEvent::MemoUpdated {
+        sink.on_event(RuntimeEvent::ModuleActivationAttemptFailed {
             sequence: 3,
-            owner,
-            char_count: 42,
+            owner: owner.clone(),
+            activation_attempt: 1,
+            max_attempts: 3,
+            message: "transient activation failure".to_string(),
         })
         .unwrap();
 
         assert_eq!(sink.event_count(), 4);
         assert_eq!(sink.progress_event_count(), 1);
+
+        sink.on_event(RuntimeEvent::MemoUpdated {
+            sequence: 4,
+            owner,
+            char_count: 42,
+        })
+        .unwrap();
+
+        assert_eq!(sink.event_count(), 5);
+        assert_eq!(sink.progress_event_count(), 2);
     }
 
     #[test]
@@ -9190,11 +9282,32 @@ limits {{
         );
         for summary in &report.cases {
             let output_dir = run_dir.join(sanitize_id(&summary.id));
+            let expected_llm_log_directory = eval_llm_log_directory(&config, &summary.id)
+                .display()
+                .to_string();
+            assert_eq!(
+                summary.report.llm_log_directory.as_deref(),
+                Some(expected_llm_log_directory.as_str())
+            );
             assert!(output_dir.join("report.json").exists());
             assert!(output_dir.join("artifact.json").exists());
             assert!(output_dir.join("events.jsonl").exists());
             assert!(output_dir.join("raw-trace.json").exists());
             assert!(!output_dir.join("trial-001").exists());
+            let report_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output_dir.join("report.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                report_json["report"]["llm_log_directory"],
+                serde_json::json!(expected_llm_log_directory.as_str())
+            );
+            let artifact_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output_dir.join("artifact.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                artifact_json["observations"]["llm_log_directory"],
+                serde_json::json!(expected_llm_log_directory.as_str())
+            );
             let events: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(output_dir.join("events.json")).unwrap())
                     .unwrap();
@@ -9297,10 +9410,28 @@ limits {
         assert!(!output_dir.join("artifact.json").exists());
         for trial in ["trial-001", "trial-002"] {
             let trial_dir = output_dir.join(trial);
+            let runtime_id = format!("{}/{trial}", summary.id);
+            let expected_llm_log_directory = eval_llm_log_directory(&config, &runtime_id)
+                .display()
+                .to_string();
             assert!(trial_dir.join("report.json").exists());
             assert!(trial_dir.join("artifact.json").exists());
             assert!(trial_dir.join("events.jsonl").exists());
             assert!(trial_dir.join("raw-trace.json").exists());
+            let report_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(trial_dir.join("report.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                report_json["report"]["llm_log_directory"],
+                serde_json::json!(expected_llm_log_directory.as_str())
+            );
+            let artifact_json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(trial_dir.join("artifact.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                artifact_json["observations"]["llm_log_directory"],
+                serde_json::json!(expected_llm_log_directory.as_str())
+            );
         }
 
         let suite_json: serde_json::Value = serde_json::from_slice(

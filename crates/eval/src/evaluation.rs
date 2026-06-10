@@ -124,6 +124,8 @@ pub struct CheckOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub struct CaseReport {
     pub runtime_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_log_directory: Option<String>,
     pub checks: Vec<CheckOutcome>,
     pub modules_checks: Vec<ModuleChecksReport>,
     pub invalid: bool,
@@ -318,6 +320,11 @@ impl PureEval for CaseEval {
 
         let mut report = CaseReport {
             runtime_failure: artifact.failure.clone(),
+            llm_log_directory: artifact
+                .observations
+                .get("llm_log_directory")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
             checks,
             modules_checks: Vec::new(),
             invalid: false,
@@ -1377,6 +1384,7 @@ mod tests {
     fn test_report(passed: bool, invalid: bool, score: f64) -> CaseReport {
         CaseReport {
             runtime_failure: invalid.then(|| "invalid".to_string()),
+            llm_log_directory: None,
             checks: Vec::new(),
             modules_checks: Vec::new(),
             invalid,
