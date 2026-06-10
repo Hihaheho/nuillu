@@ -19,8 +19,9 @@ use nuillu_module::RuntimeEvent;
 
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
-    LlmObservationSource, LlmUsageView, MemoView, ModulePolicyView, ModuleSettingsView,
-    ModuleStatusView, ZeroReplicaWindowView, memos, module_filter,
+    LlmObservationSource, LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, MemoView,
+    ModulePolicyView, ModuleSettingsView, ModuleStatusView, ZeroReplicaWindowView, memos,
+    module_filter,
     module_filter::ModuleFilterState,
     text::{hard_wrap_long_segments, wrapped_label},
 };
@@ -441,6 +442,56 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             }
         }
     }
+}
+
+pub fn apply_llm_transcript_snapshot(state: &mut ModulesState, turns: Vec<LlmTranscriptTurnView>) {
+    for turn in turns {
+        apply_llm_transcript_turn(state, turn);
+    }
+}
+
+fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnView) {
+    let LlmTranscriptTurnView {
+        turn_id,
+        owner,
+        module,
+        replica,
+        tier,
+        source,
+        session_key: _,
+        operation,
+        input,
+        output,
+        request_id,
+        model,
+        finish_reason,
+        usage,
+        status,
+        error_message,
+    } = turn;
+
+    record_turn_owner(state, &turn_id, &owner);
+    let module_state = module_mut_with_metadata(state, owner, module, replica);
+    let turn_state = ensure_turn(module_state, turn_id, operation, source, tier, None);
+    turn_state.input = input;
+    turn_state.output = output
+        .into_iter()
+        .map(|item| LlmOutputItemState {
+            kind: item.kind,
+            content: item.content,
+            streaming: false,
+            source: item.source,
+        })
+        .collect();
+    turn_state.request_id = request_id;
+    turn_state.model = model;
+    turn_state.finish_reason = finish_reason;
+    turn_state.usage = usage;
+    turn_state.error_message = error_message;
+    turn_state.status = match status {
+        LlmTranscriptTurnStatus::Completed => ModuleSessionStatus::Completed,
+        LlmTranscriptTurnStatus::Failed => ModuleSessionStatus::Failed,
+    };
 }
 
 pub fn overview_rows(
@@ -2098,7 +2149,10 @@ fn status_label(status: ModuleSessionStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmObservationSource, LlmUsageView};
+    use crate::{
+        LlmObservationSource, LlmOutputItemView, LlmTranscriptTurnStatus, LlmTranscriptTurnView,
+        LlmUsageView,
+    };
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
 
     fn overview_row_for_highlight(
@@ -3246,6 +3300,67 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn transcript_snapshot_failed_turn_does_not_mark_module_currently_failed() {
+        let mut state = ModulesState::default();
+
+        apply_llm_transcript_snapshot(
+            &mut state,
+            vec![LlmTranscriptTurnView {
+                turn_id: "persisted-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: Some("session".to_string()),
+                operation: "text_turn".to_string(),
+                input: Vec::new(),
+                output: vec![LlmOutputItemView {
+                    kind: "text".to_string(),
+                    content: "partial output".to_string(),
+                    source: None,
+                }],
+                request_id: Some("req-1".to_string()),
+                model: Some("model-a".to_string()),
+                finish_reason: Some("Stop".to_string()),
+                usage: Some(LlmUsageView {
+                    input_tokens: 3,
+                    output_tokens: 5,
+                    total_tokens: 8,
+                    cost_micros_usd: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                }),
+                status: LlmTranscriptTurnStatus::Failed,
+                error_message: Some("request timed out".to_string()),
+            }],
+        );
+
+        let module = state.modules.get("predict").expect("module exists");
+        assert_eq!(module.status, ModuleSessionStatus::Idle);
+        assert_eq!(module.runtime_status, None);
+        assert_eq!(module.error_count, 0);
+        assert!(!module.last_execution_failed);
+        assert_eq!(module.last_tier, None);
+
+        let turn = module.turns.first().expect("turn exists");
+        assert_eq!(turn.status, ModuleSessionStatus::Failed);
+        assert_eq!(turn.error_message.as_deref(), Some("request timed out"));
+        assert_eq!(turn.output.len(), 1);
+
+        let turn_rows = llm_turn_rows(&state, |_| true);
+        assert_eq!(turn_rows.len(), 1);
+        assert!(turn_rows[0].failed);
+
+        let overview = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(overview.len(), 1);
+        assert_eq!(overview[0].llm_status, "idle");
+        assert_eq!(overview[0].error_count, 0);
+        assert!(!overview[0].last_execution_failed);
+        assert_eq!(overview_row_fill_kind(&overview[0], 0), None);
     }
 
     #[test]

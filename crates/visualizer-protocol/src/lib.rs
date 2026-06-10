@@ -159,6 +159,10 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         event: LlmObservationEvent,
     },
+    LlmTranscriptSnapshot {
+        tab_id: VisualizerTabId,
+        turns: Vec<LlmTranscriptTurnView>,
+    },
     BlackboardSnapshot {
         tab_id: VisualizerTabId,
         snapshot: BlackboardSnapshot,
@@ -318,6 +322,41 @@ pub enum LlmObservationEvent {
         turn_id: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmTranscriptTurnView {
+    pub turn_id: String,
+    pub owner: String,
+    pub module: String,
+    pub replica: u8,
+    pub tier: String,
+    pub source: LlmObservationSource,
+    #[serde(default)]
+    pub session_key: Option<String>,
+    pub operation: String,
+    pub input: Vec<LlmInputItemView>,
+    pub output: Vec<LlmOutputItemView>,
+    pub request_id: Option<String>,
+    pub model: Option<String>,
+    pub finish_reason: Option<String>,
+    pub usage: Option<LlmUsageView>,
+    pub status: LlmTranscriptTurnStatus,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmTranscriptTurnStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmOutputItemView {
+    pub kind: String,
+    pub content: String,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

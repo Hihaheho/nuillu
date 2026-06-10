@@ -14,8 +14,8 @@ use lutum_libsql_adapter::{LibsqlLlmTranscriptStore, NewLlmTranscriptTurn};
 use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
 use nuillu_types::ModuleInstanceId;
 use nuillu_visualizer_protocol::{
-    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, VisualizerEvent,
-    VisualizerTabId,
+    LlmInputItemView, LlmObservationSource, LlmOutputItemView, LlmTranscriptTurnStatus,
+    LlmTranscriptTurnView, LlmUsageView, VisualizerEvent, VisualizerTabId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -315,93 +315,143 @@ pub async fn emit_persisted_llm_transcripts(
         }
     };
     let tab_id = VisualizerTabId::new(tab_id.to_string());
+    let mut turns = Vec::new();
     for record in records {
         let Ok(trace) = serde_json::from_value::<CompletedTurnTrace>(record.trace_json) else {
             tracing::warn!(id = record.id, "failed to parse persisted LLM transcript");
             continue;
         };
-        for event in trace.to_observation_events(format!("server-persisted-{}", record.id)) {
-            visualizer.send(VisualizerEvent::LlmObserved {
-                tab_id: tab_id.clone(),
-                event,
-            });
-        }
+        turns.push(trace.to_transcript_turn_view(format!("server-persisted-{}", record.id)));
+    }
+    if !turns.is_empty() {
+        visualizer.send(VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns });
     }
 }
 
 impl CompletedTurnTrace {
-    fn to_observation_events(&self, restored_turn_id: String) -> Vec<LlmObservationEvent> {
-        let mut events = vec![
-            LlmObservationEvent::ModelInput {
-                turn_id: restored_turn_id.clone(),
-                owner: self.owner.clone(),
-                module: self.module.clone(),
-                replica: self.replica,
-                tier: self.tier.clone(),
-                source: self.source,
-                session_key: self.session_key.clone(),
-                operation: self.operation.clone(),
-                items: self.input.clone(),
+    fn to_transcript_turn_view(&self, restored_turn_id: String) -> LlmTranscriptTurnView {
+        LlmTranscriptTurnView {
+            turn_id: restored_turn_id,
+            owner: self.owner.clone(),
+            module: self.module.clone(),
+            replica: self.replica,
+            tier: self.tier.clone(),
+            source: self.source,
+            session_key: self.session_key.clone(),
+            operation: self.operation.clone(),
+            input: self.input.clone(),
+            output: transcript_output_items(self),
+            request_id: self.request_id.clone(),
+            model: self.model.clone(),
+            finish_reason: self.finish_reason.clone(),
+            usage: self.usage,
+            status: match self.status {
+                TranscriptTurnStatus::Failed => LlmTranscriptTurnStatus::Failed,
+                TranscriptTurnStatus::InProgress | TranscriptTurnStatus::Completed => {
+                    LlmTranscriptTurnStatus::Completed
+                }
             },
-            LlmObservationEvent::StreamStarted {
-                turn_id: restored_turn_id.clone(),
-                owner: self.owner.clone(),
-                module: self.module.clone(),
-                replica: self.replica,
-                tier: self.tier.clone(),
-                source: self.source,
-                session_key: self.session_key.clone(),
-                operation: self.operation.clone(),
-                request_id: self.request_id.clone(),
-                model: self.model.clone().unwrap_or_default(),
-            },
-        ];
-        for delta in &self.deltas {
-            events.push(LlmObservationEvent::StreamDelta {
-                turn_id: restored_turn_id.clone(),
-                kind: delta.kind.clone(),
-                delta: delta.delta.clone(),
-            });
+            error_message: self.error_message.clone(),
         }
-        for tool in &self.tool_calls {
-            if let Some(arguments_json) = &tool.arguments_json {
-                events.push(LlmObservationEvent::ToolCallReady {
-                    turn_id: restored_turn_id.clone(),
-                    id: tool.id.clone(),
-                    name: tool.name.clone(),
-                    arguments_json: arguments_json.clone(),
-                });
-            } else {
-                events.push(LlmObservationEvent::ToolCallChunk {
-                    turn_id: restored_turn_id.clone(),
-                    id: tool.id.clone(),
-                    name: tool.name.clone(),
-                    arguments_json_delta: tool.arguments_json_delta.clone(),
-                });
-            }
-        }
-        if let Some(json) = &self.structured_output {
-            events.push(LlmObservationEvent::StructuredReady {
-                turn_id: restored_turn_id.clone(),
-                json: json.clone(),
-            });
-        }
-        if let (Some(finish_reason), Some(usage)) = (&self.finish_reason, self.usage) {
-            events.push(LlmObservationEvent::Completed {
-                turn_id: restored_turn_id.clone(),
-                request_id: self.request_id.clone(),
-                finish_reason: finish_reason.clone(),
-                usage,
-            });
-        }
-        if self.status == TranscriptTurnStatus::Failed {
-            events.push(LlmObservationEvent::Failed {
-                turn_id: restored_turn_id,
-                message: self.error_message.clone().unwrap_or_default(),
-            });
-        }
-        events
     }
+}
+
+fn transcript_output_items(trace: &CompletedTurnTrace) -> Vec<LlmOutputItemView> {
+    let mut output = Vec::new();
+    for delta in &trace.deltas {
+        append_transcript_output_delta(&mut output, delta.kind.clone(), delta.delta.clone(), None);
+    }
+    for tool in &trace.tool_calls {
+        let source = transcript_tool_call_source(&tool.name, &tool.id);
+        if let Some(arguments_json) = &tool.arguments_json {
+            apply_transcript_tool_call_ready(&mut output, source, arguments_json.clone());
+        } else {
+            append_transcript_output_delta(
+                &mut output,
+                "tool_call".to_string(),
+                tool.arguments_json_delta.clone(),
+                Some(source),
+            );
+        }
+    }
+    if let Some(json) = &trace.structured_output {
+        apply_transcript_structured_ready(&mut output, json.clone());
+    }
+    output
+}
+
+fn append_transcript_output_delta(
+    output: &mut Vec<LlmOutputItemView>,
+    kind: String,
+    delta: String,
+    source: Option<String>,
+) {
+    if let Some(index) = output
+        .iter()
+        .rposition(|row| row.kind == kind && row.source == source)
+    {
+        let mut row = output.remove(index);
+        row.content.push_str(&delta);
+        output.push(row);
+        return;
+    }
+    output.push(LlmOutputItemView {
+        kind,
+        content: delta,
+        source,
+    });
+}
+
+fn apply_transcript_tool_call_ready(
+    output: &mut Vec<LlmOutputItemView>,
+    source: String,
+    arguments_json: String,
+) {
+    if let Some(index) = output
+        .iter()
+        .rposition(|row| row.kind == "tool_call" && row.source.as_deref() == Some(source.as_str()))
+    {
+        let mut row = output.remove(index);
+        row.kind = "tool_call_ready".to_string();
+        row.content = arguments_json;
+        row.source = Some(source);
+        output.push(row);
+        return;
+    }
+    output.push(LlmOutputItemView {
+        kind: "tool_call_ready".to_string(),
+        content: arguments_json,
+        source: Some(source),
+    });
+}
+
+fn apply_transcript_structured_ready(output: &mut Vec<LlmOutputItemView>, json: String) {
+    if let Some(row) = output
+        .iter_mut()
+        .rev()
+        .find(|row| row.kind == "structured_ready")
+    {
+        row.content = json;
+        row.source = None;
+        return;
+    }
+    if let Some(index) = output.iter().rposition(|row| row.kind == "structured") {
+        let mut row = output.remove(index);
+        row.kind = "structured_ready".to_string();
+        row.content = json;
+        row.source = None;
+        output.push(row);
+        return;
+    }
+    output.push(LlmOutputItemView {
+        kind: "structured_ready".to_string(),
+        content: json,
+        source: None,
+    });
+}
+
+fn transcript_tool_call_source(name: &str, id: &str) -> String {
+    format!("{name}({id})")
 }
 
 fn extension_key(extensions: &RequestExtensions) -> usize {
@@ -699,29 +749,34 @@ mod tests {
         assert_eq!(restored.finish_reason.as_deref(), Some("Stop"));
         assert!(restored.usage.is_some());
 
-        let direct_events = restored.to_observation_events("restored".to_string());
-        assert!(matches!(
-            direct_events.last(),
-            Some(LlmObservationEvent::Failed { message, .. })
-                if message == "module failed after output"
-        ));
-        assert!(direct_events.iter().any(|event| {
-            matches!(event, LlmObservationEvent::Completed { turn_id, .. } if turn_id == "restored")
-        }));
+        let direct_turn = restored.to_transcript_turn_view("restored".to_string());
+        assert_eq!(direct_turn.turn_id, "restored");
+        assert_eq!(direct_turn.status, LlmTranscriptTurnStatus::Failed);
+        assert_eq!(
+            direct_turn.error_message.as_deref(),
+            Some("module failed after output")
+        );
+        assert_eq!(direct_turn.finish_reason.as_deref(), Some("Stop"));
+        assert!(direct_turn.usage.is_some());
 
         let (tx, rx) = mpsc::channel();
         let visualizer = VisualizerEventSink::new(tx);
         emit_persisted_llm_transcripts(&store, "server", &visualizer).await;
-        let replayed = rx.try_iter().collect::<Vec<_>>();
-        assert!(replayed.iter().any(|message| matches!(
-            message,
-            VisualizerServerMessage::Event {
-                event: VisualizerEvent::LlmObserved {
-                    event: LlmObservationEvent::Failed { message, .. },
-                    ..
-                }
-            } if message == "module failed after output"
-        )));
+        let snapshot = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(snapshot.len(), 1);
+        let VisualizerServerMessage::Event {
+            event: VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns },
+        } = &snapshot[0]
+        else {
+            panic!("expected LLM transcript snapshot event");
+        };
+        assert_eq!(tab_id.as_str(), "server");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].status, LlmTranscriptTurnStatus::Failed);
+        assert_eq!(
+            turns[0].error_message.as_deref(),
+            Some("module failed after output")
+        );
     }
 
     async fn test_transcript_store() -> LibsqlLlmTranscriptStore {

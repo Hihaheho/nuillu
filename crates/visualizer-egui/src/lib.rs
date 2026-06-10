@@ -290,6 +290,9 @@ impl VisualizerState {
             VisualizerEvent::LlmObserved { tab_id, event } => {
                 modules::apply_llm_observation(&mut self.tab_mut(tab_id).modules, event);
             }
+            VisualizerEvent::LlmTranscriptSnapshot { tab_id, turns } => {
+                modules::apply_llm_transcript_snapshot(&mut self.tab_mut(tab_id).modules, turns);
+            }
             VisualizerEvent::BlackboardSnapshot { tab_id, snapshot } => {
                 let tab = self.tab_mut(tab_id);
                 tab.record_snapshot_for_monitor(&snapshot);
