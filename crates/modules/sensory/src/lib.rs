@@ -396,14 +396,21 @@ impl SensoryModule {
                 .tools::<OneShotSensoryTools>()
                 .available_tools([OneShotSensoryToolsSelector::DisposeSensory])
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS);
-            let outcome =
-                match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect(&lutum)).await {
-                    Ok(result) => result.context("one-shot sensory text turn failed")?,
-                    Err(_) => anyhow::bail!(
-                        "one-shot sensory LLM turn timed out after {}s",
-                        SENSORY_LLM_TURN_TIMEOUT.as_secs()
-                    ),
-                };
+            let outcome = match tokio::time::timeout(
+                SENSORY_LLM_TURN_TIMEOUT,
+                turn.collect_controlled_with(
+                    &lutum,
+                    nuillu_module::AbortOnAvailableToolNameInText::new(),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result.context("one-shot sensory text turn failed")?,
+                Err(_) => anyhow::bail!(
+                    "one-shot sensory LLM turn timed out after {}s",
+                    SENSORY_LLM_TURN_TIMEOUT.as_secs()
+                ),
+            };
             (outcome, session_len_after_user)
         };
 
@@ -499,14 +506,21 @@ impl SensoryModule {
                 ])
                 .require_any_tool()
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS);
-            let outcome =
-                match tokio::time::timeout(SENSORY_LLM_TURN_TIMEOUT, turn.collect(&lutum)).await {
-                    Ok(result) => result.context("ambient sensory text turn failed")?,
-                    Err(_) => anyhow::bail!(
-                        "ambient sensory LLM turn timed out after {}s",
-                        SENSORY_LLM_TURN_TIMEOUT.as_secs()
-                    ),
-                };
+            let outcome = match tokio::time::timeout(
+                SENSORY_LLM_TURN_TIMEOUT,
+                turn.collect_controlled_with(
+                    &lutum,
+                    nuillu_module::AbortOnAvailableToolNameInText::new(),
+                ),
+            )
+            .await
+            {
+                Ok(result) => result.context("ambient sensory text turn failed")?,
+                Err(_) => anyhow::bail!(
+                    "ambient sensory LLM turn timed out after {}s",
+                    SENSORY_LLM_TURN_TIMEOUT.as_secs()
+                ),
+            };
             (outcome, session_len_before_turn)
         };
 

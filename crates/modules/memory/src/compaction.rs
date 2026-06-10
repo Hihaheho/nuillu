@@ -133,7 +133,7 @@ impl MemoryCompactionModule {
                     CompactionToolsSelector::GetMemories,
                     CompactionToolsSelector::MergeMemories,
                 ])
-                .collect()
+                .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
                 .await
                 .context("memory-compaction text turn failed")?;
 

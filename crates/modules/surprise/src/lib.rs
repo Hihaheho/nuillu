@@ -198,7 +198,10 @@ impl SurpriseModule {
                 ])
                 .require_any_tool()
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
-                .collect(&lutum)
+                .collect_controlled_with(
+                    &lutum,
+                    nuillu_module::AbortOnAvailableToolNameInText::new(),
+                )
                 .await
                 .map_err(|error| {
                     if error

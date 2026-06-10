@@ -416,7 +416,7 @@ impl SpeakModule {
                     .text_turn(input)
                     .tools::<SpeakTools>()
                     .available_tools([SpeakToolsSelector::ShouldSpeak])
-                    .collect()
+                    .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
                     .await
                     .context("speak should_speak turn failed")
             })

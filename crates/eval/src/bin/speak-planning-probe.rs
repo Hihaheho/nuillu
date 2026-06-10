@@ -704,11 +704,7 @@ fn build_trial_report<T, F>(
     started: Instant,
     outcome: Result<
         TextStepOutcomeWithTools<T>,
-        lutum::CollectError<
-            std::convert::Infallible,
-            lutum::TextTurnReductionError,
-            lutum::TextTurnStateWithTools<T>,
-        >,
+        lutum::CollectError<lutum::TextTurnReductionError, lutum::TextTurnStateWithTools<T>>,
     >,
     extract_decision: F,
 ) -> TrialReport

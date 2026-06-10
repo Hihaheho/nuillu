@@ -164,7 +164,7 @@ impl PolicyCompactionModule {
                     PolicyCompactionToolsSelector::GetPolicies,
                     PolicyCompactionToolsSelector::CompactDuplicatePolicies,
                 ])
-                .collect()
+                .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
                 .await
                 .context("policy-compaction text turn failed")?;
 

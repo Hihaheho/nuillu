@@ -323,7 +323,7 @@ impl CognitionGateModule {
             ])
             .require_any_tool()
             .max_output_tokens(768)
-            .collect(lutum)
+            .collect_controlled_with(lutum, nuillu_module::AbortOnAvailableToolNameInText::new())
             .await
             .map_err(|error| {
                 if missing_required_tool_call(&error) {

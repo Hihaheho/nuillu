@@ -3530,6 +3530,7 @@ dependencies = [
  "eure",
  "futures",
  "lutum",
+ "lutum-protocol",
  "nuillu-blackboard",
  "nuillu-types",
  "schemars",

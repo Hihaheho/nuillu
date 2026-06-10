@@ -488,7 +488,10 @@ impl QueryMemoryModule {
                     QueryMemoryToolsSelector::BroadcastSearchResults,
                 ])
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
-                .collect(&lutum)
+                .collect_controlled_with(
+                    &lutum,
+                    nuillu_module::AbortOnAvailableToolNameInText::new(),
+                )
                 .await
                 .context("query-memory text turn failed")?;
 
@@ -656,7 +659,10 @@ impl QueryMemoryModule {
                     QueryMemoryToolsSelector::DisposeSearchResults,
                 ])
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS)
-                .collect(&lutum)
+                .collect_controlled_with(
+                    &lutum,
+                    nuillu_module::AbortOnAvailableToolNameInText::new(),
+                )
                 .await
                 .context("query-memory finalization text turn failed")?;
 

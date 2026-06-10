@@ -130,7 +130,7 @@ impl MemoryRecombinationModule {
             .text_turn(input.clone())
             .tools::<RecombinationTools>()
             .available_tools([RecombinationToolsSelector::AppendRecombination])
-            .collect()
+            .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
             .await
             .context("memory-recombination text turn failed")?;
 

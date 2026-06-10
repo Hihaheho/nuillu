@@ -167,7 +167,7 @@ impl MemoryAssociationModule {
                     AssociationToolsSelector::WriteAssociationSummary,
                     AssociationToolsSelector::WriteMemoryLinks,
                 ])
-                .collect()
+                .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
                 .await
                 .context("memory-association text turn failed")?;
 

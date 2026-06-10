@@ -44,6 +44,7 @@ mod session;
 mod session_compaction;
 mod tiers;
 mod time_division;
+mod tool_text_guard;
 mod tool_trace;
 mod r#trait;
 
@@ -118,5 +119,6 @@ pub use session_compaction::{
 };
 pub use tiers::{LlmConcurrencyPool, LlmTierHandle, LutumTiers};
 pub use time_division::{TimeDivision, TimeDivisionBucket, TimeDivisionError};
+pub use tool_text_guard::{AbortOnAvailableToolNameInText, ToolNameInAssistantText};
 pub use tool_trace::emit_trace_tool_calls;
 pub use r#trait::{ActivateCx, ErasedModule, Module, ModuleBatch};
