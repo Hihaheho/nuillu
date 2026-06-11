@@ -410,6 +410,8 @@ impl AllocationModule {
                         requests,
                     ));
                 self.session
+                    .push_ephemeral_user(nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER);
+                self.session
                     .text_turn()
                     .tools::<AllocationTools>()
                     .available_tools([
@@ -1489,6 +1491,11 @@ mod tests {
             InputMessageRole::Developer,
             "sensory memo A"
         ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::User,
+            nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER
+        ));
         assert!(!any_message_with_role_contains(
             first_items,
             InputMessageRole::Developer,
@@ -1529,6 +1536,11 @@ mod tests {
             second_items,
             InputMessageRole::Developer,
             "sensory memo B"
+        ));
+        assert!(any_message_with_role_contains(
+            second_items,
+            InputMessageRole::User,
+            nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER
         ));
         assert!(second_items.iter().any(|item| {
             let ModelInputItem::Turn(turn) = item else {

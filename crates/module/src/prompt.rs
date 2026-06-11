@@ -4,6 +4,10 @@ use nuillu_types::ModuleId;
 
 use crate::render_memory_for_llm;
 
+pub const REQUIRED_FUNCTION_CALL_REMINDER: &str =
+    "Use function calling only. Exactly one available function. Empty assistant content.";
+pub const OPTIONAL_FUNCTION_CALL_REMINDER: &str = "Use function calling only when taking an action. If no action is warranted, empty assistant content.";
+
 /// Build a system prompt that prepends peer-context entries for every other
 /// module registered in the agent. The owner module is excluded so each
 /// module's prompt only lists its peers.

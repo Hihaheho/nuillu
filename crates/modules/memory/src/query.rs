@@ -49,6 +49,11 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve broadcast facts, query requests, memory search
 arguments, useful memory hits, rejected broad searches, and allocation/cognition context that future
 retrieval should remember."#;
+const RETRIEVAL_TURN_FINAL_REMINDER: &str = concat!(
+    "Output instruction: call search_memory, fetch_linked_memories, or broadcast_search_results ",
+    "only when retrieval or broadcast is needed. If no memory action is needed, finish without ",
+    "assistant text. Do not write a plain answer.",
+);
 const TOOL_RESULT_CONTINUATION_PROMPT: &str = r#"Continue memory retrieval from the tool results above.
 If a search hit may answer the request and has linked_neighbor_count greater than zero, call
 fetch_linked_memories for the seed hit before broadcasting results.
@@ -56,7 +61,8 @@ If retrieved evidence is useful, call broadcast_search_results with the selected
 linked_hit_indexes. If the tool results do not contain useful evidence and no targeted search
 remains, finish without assistant text. Use exact literal index strings from tool results, never
 list positions."#;
-const FINALIZE_RETRIEVAL_PROMPT: &str = r#"Finalization turn. Call exactly one tool now.
+const FINALIZE_RETRIEVAL_PROMPT: &str = r#"Use function calling only. Exactly one available function. Empty assistant content.
+Finalization turn. Use broadcast_search_results or dispose_search_results.
 Do not write prose, reasoning, markdown, or a plain answer.
 Search and linked-memory fetch are closed. Use only existing tool results.
 The search_memory and fetch_linked_memories results already in this session are fresh pending
@@ -467,6 +473,8 @@ impl QueryMemoryModule {
         let mut clear_pending_retrieval = false;
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;
+            self.session
+                .push_ephemeral_user(RETRIEVAL_TURN_FINAL_REMINDER);
             let outcome = self
                 .session
                 .text_turn()

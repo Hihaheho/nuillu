@@ -155,7 +155,8 @@ impl MemoryAssociationModule {
 
         let mut input = ModelInput::new()
             .system(self.system_prompt(cx))
-            .user(format_association_context(&memory_metadata));
+            .user(format_association_context(&memory_metadata))
+            .user(nuillu_module::OPTIONAL_FUNCTION_CALL_REMINDER);
 
         for _ in 0..6 {
             let lutum = self.llm.lutum().await;

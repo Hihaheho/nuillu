@@ -43,6 +43,7 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior surprise assessments, predict memo-log
 facts, significant events, memory preservation requests, and cognition-log context needed for future
 surprise checks."#;
+const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -175,6 +176,7 @@ impl SurpriseModule {
                 COGNITION_CONTEXT_WINDOW,
             );
             self.session.push_ephemeral_developer(ACTIVATION_INPUT);
+            self.session.push_ephemeral_user(FINAL_TOOL_CALL_REMINDER);
             self.session
                 .text_turn()
                 .tools::<SurpriseTools>()
@@ -369,8 +371,9 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, Lutum, MockLlmAdapter, MockTextScenario,
-        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
+        MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModuleConfig,
@@ -409,6 +412,7 @@ mod tests {
     #[derive(Clone)]
     struct CapturingAdapter {
         inner: MockLlmAdapter,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
         text_turns: Arc<Mutex<Vec<AdapterTextTurn>>>,
     }
 
@@ -416,8 +420,13 @@ mod tests {
         fn new(inner: MockLlmAdapter) -> Self {
             Self {
                 inner,
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
                 text_turns: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn text_inputs(&self) -> Vec<ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
         }
 
         fn text_turns(&self) -> Vec<AdapterTextTurn> {
@@ -429,9 +438,10 @@ mod tests {
     impl TurnAdapter for CapturingAdapter {
         async fn text_turn(
             &self,
-            input: lutum::ModelInput,
+            input: ModelInput,
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
             self.text_turns.lock().unwrap().push(turn.clone());
             self.inner.text_turn(input, turn).await
         }
@@ -753,6 +763,18 @@ mod tests {
             turns[0].config.generation.max_output_tokens,
             Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
         );
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].items().iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                content,
+            } if matches!(
+                content.as_slice(),
+                [MessageContent::Text(text)] if text == FINAL_TOOL_CALL_REMINDER
+            )
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -83,10 +83,7 @@ const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate d
 events, rejected candidate events, cognition context, and relevant memory evidence needed for
 future cognition-gate decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
-const FINAL_TOOL_CALL_REMINDER: &str = concat!(
-    "Output instruction: call exactly one available function now: ",
-    "promote_to_cognition or leave_cognition_unchanged. Do not write any assistant text.",
-);
+const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(

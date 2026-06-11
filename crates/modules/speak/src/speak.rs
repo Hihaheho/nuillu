@@ -29,7 +29,8 @@ For self-directed cognition, transform only the listener-relevant implication in
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
-const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Decide whether to speak now from the current cognition log. If outward speech is warranted, use the speech tool; otherwise finish without calling a tool.";
+const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Decide whether to speak now from the current cognition log. If outward speech is warranted, call should_speak; otherwise finish without calling a function.";
+const PLANNING_TURN_FINAL_REMINDER: &str = nuillu_module::OPTIONAL_FUNCTION_CALL_REMINDER;
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -238,6 +239,7 @@ fn build_planning_input(plan_prompt: &str, cognition_context: &str) -> ModelInpu
             InputMessageRole::Developer,
             PLANNING_TURN_DEVELOPER_INSTRUCTION,
         ),
+        ModelInputItem::text(InputMessageRole::User, PLANNING_TURN_FINAL_REMINDER),
     ])
 }
 
@@ -1129,14 +1131,14 @@ mod tests {
     }
 
     #[test]
-    fn planning_input_uses_user_cognition_then_final_developer_instruction() {
+    fn planning_input_uses_user_cognition_developer_instruction_and_final_reminder() {
         let input = build_planning_input(
             "planning prompt",
             "- Peer greeted me with \"Hi\"; brief acknowledgement is warranted.\n",
         );
         let items = input.items();
 
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
         assert_message_text(&items[0], InputMessageRole::System, "planning prompt");
         assert_message_text(
             &items[1],
@@ -1147,6 +1149,11 @@ mod tests {
             &items[2],
             InputMessageRole::Developer,
             PLANNING_TURN_DEVELOPER_INSTRUCTION,
+        );
+        assert_message_text(
+            &items[3],
+            InputMessageRole::User,
+            PLANNING_TURN_FINAL_REMINDER,
         );
     }
 

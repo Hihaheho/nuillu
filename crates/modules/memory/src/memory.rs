@@ -232,6 +232,8 @@ impl MemoryModule {
         }
         self.session
             .push_ephemeral_system(format_memory_decision_context(&rank_counts));
+        self.session
+            .push_ephemeral_user(nuillu_module::OPTIONAL_FUNCTION_CALL_REMINDER);
 
         for _ in 0..4 {
             let lutum = self.llm.lutum().await;

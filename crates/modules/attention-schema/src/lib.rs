@@ -43,6 +43,7 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
 prior appended first-person attention experiences, rejected candidates, allocation guidance, and
 cognition-log context needed for future attention updates."#;
+const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -180,6 +181,7 @@ impl AttentionSchemaModule {
             }
             self.session
                 .push_ephemeral_developer("Update the attention schema from the new notes above.");
+            self.session.push_ephemeral_user(FINAL_TOOL_CALL_REMINDER);
             self.session
                 .text_turn()
                 .tools::<AttentionSchemaTools>()

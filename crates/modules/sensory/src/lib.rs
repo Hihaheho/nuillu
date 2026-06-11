@@ -20,7 +20,7 @@ You receive one-shot sensory events from the environment. A one-shot event is an
 that occurred at its own observed_at time; it is not a snapshot, a diff, or a code-labeled repeated
 stimulus. Use the session history to understand temporal context, but evaluate the current event as
 its own occurrence. Call dispose_sensory only for current one-shot events that should not become
-durable sensory memo-log output. If no current event should be disposed, finish without tool calls
+durable sensory memo-log output. If no current event should be disposed, finish without function calls
 and without assistant text. Do not write memo text yourself; kept events are recorded by the
 runtime. Do not write to the cognition log, memory, or emit utterances."#;
 
@@ -35,6 +35,11 @@ utterances."#;
 
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
+const ONE_SHOT_FINAL_REMINDER: &str = concat!(
+    "Output instruction: call dispose_sensory only for current event ids that should be discarded. ",
+    "If no current event should be discarded, finish without assistant text.",
+);
+const AMBIENT_FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 const COMPACTED_ONE_SHOT_SESSION_PREFIX: &str = "Compacted one-shot sensory session history:";
 const COMPACTED_AMBIENT_SESSION_PREFIX: &str = "Compacted ambient sensory session history:";
@@ -390,6 +395,8 @@ impl SensoryModule {
             let session_len_after_user = self.one_shot_session.input().items().len();
             self.one_shot_session
                 .push_ephemeral_developer(format_one_shot_decision_context(&guidance));
+            self.one_shot_session
+                .push_ephemeral_user(ONE_SHOT_FINAL_REMINDER);
             let turn = self
                 .one_shot_session
                 .text_turn()
@@ -496,6 +503,8 @@ impl SensoryModule {
                 ));
             self.ambient_session
                 .push_ephemeral_developer(format_ambient_decision_context(&guidance));
+            self.ambient_session
+                .push_ephemeral_user(AMBIENT_FINAL_TOOL_CALL_REMINDER);
             let turn = self
                 .ambient_session
                 .text_turn()
@@ -941,7 +950,7 @@ fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTim
 
 fn format_one_shot_decision_context(guidance: &str) -> String {
     let mut out = String::from(
-        "Evaluate the current one-shot events. Call dispose_sensory only for event ids that should not become durable sensory memo-log output. If no current event should be disposed, finish without tool calls and without assistant text.",
+        "Evaluate the current one-shot events. Call dispose_sensory only for event ids that should not become durable sensory memo-log output. If no current event should be disposed, finish without function calls and without assistant text.",
     );
     out.push_str("\nCurrent sensory guidance: ");
     let guidance = guidance.trim();
@@ -1016,15 +1025,15 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ModuleRunStatus,
-        ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, ModuleConfig, ResourceAllocation,
+        linear_ratio_fn,
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
         CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
     };
-    use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::builtin;
     use tokio::task::LocalSet;
 
     fn reference_now() -> DateTime<Utc> {
@@ -1305,6 +1314,26 @@ mod tests {
         )
         .await
         .expect("sensory test runtime should not fail");
+    }
+
+    fn test_activate_cx(now: DateTime<Utc>) -> nuillu_module::ActivateCx<'static> {
+        let lutum = Lutum::new(
+            Arc::new(MockLlmAdapter::new()),
+            SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
+        );
+        nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            &[],
+            nuillu_module::SessionCompactionRuntime::new(
+                lutum,
+                nuillu_module::LlmConcurrencyLimiter::new(None),
+                nuillu_types::ModelTier::Cheap,
+                SessionCompactionPolicy::default(),
+            ),
+            now,
+        )
     }
 
     fn heard(content: &str) -> SensoryInput {
@@ -1626,6 +1655,7 @@ mod tests {
                 );
                 assert_eq!(count_message_role(first_session, InputMessageRole::User), 1);
                 let first_user_texts = user_texts(first_session);
+                assert!(!first_user_texts.contains(&ONE_SHOT_FINAL_REMINDER));
                 assert!(
                     first_user_texts.iter().any(|text| {
                         text.contains("One-shot sensory events received")
@@ -1672,6 +1702,7 @@ mod tests {
                     count_message_role(second_session, InputMessageRole::User),
                     2
                 );
+                assert!(!user_texts(second_session).contains(&ONE_SHOT_FINAL_REMINDER));
             })
             .await;
     }
@@ -1739,8 +1770,8 @@ mod tests {
                 let ephemeral_indices = observed.observed_ephemeral_indices();
                 assert_eq!(ephemeral_indices.len(), 1);
                 assert!(
-                    ephemeral_indices.iter().all(|indices| indices.len() == 1),
-                    "ambient sensory LLM turn should carry decision context as an ephemeral item"
+                    ephemeral_indices.iter().all(|indices| indices.len() == 2),
+                    "ambient sensory LLM turn should carry decision context and final reminder as ephemeral items"
                 );
             })
             .await;
@@ -1753,9 +1784,10 @@ mod tests {
             .run_until(async {
                 let adapter = MockLlmAdapter::new()
                     .with_text_scenario(text_scenario("plain response without tool call", 0));
+                let observed = adapter.clone();
                 let (blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
-                let modules = build_recording_sensory(
+                let allocated = build_recording_sensory(
                     &caps,
                     recorder.clone(),
                     SensoryBurstConfig {
@@ -1767,62 +1799,43 @@ mod tests {
                 )
                 .await;
                 let sensory = caps.host_io().sensory_input_mailbox();
-                let sensory_owner =
-                    ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
-                let shutdown_blackboard = blackboard.clone();
+                let (_runtime, mut modules) = allocated.into_parts();
+                let mut module = modules.pop().expect("sensory module should be built");
 
-                let result = nuillu_agent::run(
-                    modules,
-                    nuillu_agent::AgentEventLoopConfig {
-                        idle_threshold: Duration::from_millis(50),
-                        max_activation_attempts: 1,
-                        dependency_idle_timeout: Duration::from_secs(2),
-                        dependency_hard_timeout: Duration::from_secs(10),
-                    },
-                    async {
-                        sensory
-                            .publish(ambient(vec![ambient_entry(
-                                "ambient-1",
-                                SensoryModality::Audition,
-                                "unexpected plain text path",
-                            )]))
-                            .await
-                            .expect("sensory subscriber exists");
-                        for _ in 0..50 {
-                            if !recorder.batches.borrow().is_empty() {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                        for _ in 0..50 {
-                            let failed = shutdown_blackboard
-                                .read(|bb| {
-                                    matches!(
-                                        bb.module_status_for_instance(&sensory_owner),
-                                        Some(ModuleRunStatus::Failed { .. })
-                                    )
-                                })
-                                .await;
-                            if failed {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        }
-                    },
-                )
-                .await;
+                sensory
+                    .publish(ambient(vec![ambient_entry(
+                        "ambient-1",
+                        SensoryModality::Audition,
+                        "unexpected plain text path",
+                    )]))
+                    .await
+                    .expect("sensory subscriber exists");
+                let batch = module
+                    .next_batch()
+                    .await
+                    .expect("sensory batch should be ready");
+                let cx = test_activate_cx(reference_now());
+                let error = module
+                    .activate(&cx, &batch)
+                    .await
+                    .expect_err("plain text finish should fail sensory activation");
                 let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
-                let status = blackboard
-                    .read(|bb| bb.module_status_for_instance(&sensory_owner).cloned())
-                    .await;
+                let message = format!("{error:#}");
                 assert!(
-                    matches!(status, Some(ModuleRunStatus::Failed { .. })),
-                    "plain text finish should fail sensory activation; result={result:?} batches={:?} logs={logs:?} status={status:?}",
-                    recorder.batches.borrow().as_slice(),
+                    message.contains("ambient sensory text turn failed")
+                        || message
+                            .contains("ambient sensory text turn finished without required tool calls"),
+                    "unexpected activation error: {message}"
                 );
 
                 assert!(logs.is_empty());
                 assert_eq!(recorder.batches.borrow().as_slice(), &[1]);
+                let ephemeral_indices = observed.observed_ephemeral_indices();
+                assert_eq!(ephemeral_indices.len(), 1);
+                assert!(
+                    ephemeral_indices.iter().all(|indices| indices.len() == 2),
+                    "ambient sensory LLM turn should carry decision context and final reminder as ephemeral items"
+                );
             })
             .await;
     }
