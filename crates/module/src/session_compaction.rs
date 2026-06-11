@@ -695,7 +695,7 @@ mod tests {
         session.push_assistant_text(
             "What I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
         );
-        session.push_assistant_text("My cognition at 2026-05-11T06:23:00Z:\n- door open");
+        session.push_assistant_text("Auxiliary assistant context:\n- door open");
         session.input_mut().push(ModelInputItem::turn(Arc::new(
             AssistantTurnView::from_items(&[AssistantTurnItem::Text(
                 "skip cognition this cycle".into(),

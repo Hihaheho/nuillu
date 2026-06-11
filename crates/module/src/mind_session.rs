@@ -30,7 +30,7 @@ pub fn push_formatted_cognition_log_batch(
     window: LlmContextWindow,
 ) {
     if let Some(batch) = format_bounded_cognition_log_batch(records, now, window) {
-        session.push_assistant_text(batch);
+        session.push_user(batch);
     }
 }
 
@@ -114,10 +114,14 @@ mod tests {
         };
         assert!(identity.contains("What I already remember about myself"));
 
-        let ModelInputItem::Assistant(AssistantInputItem::Text(cognition)) = &items[2] else {
-            panic!("expected cognition batch assistant text third");
+        let ModelInputItem::Message { role, content } = &items[2] else {
+            panic!("expected cognition batch user text third");
         };
-        assert!(cognition.contains("My cognition at 2026-05-11T06:23:00Z"));
+        assert_eq!(role, &InputMessageRole::User);
+        let [MessageContent::Text(cognition)] = content.as_slice() else {
+            panic!("expected cognition batch text");
+        };
+        assert!(cognition.contains("Current cognition log at 2026-05-11T06:23:00Z"));
 
         let ModelInputItem::Message { role, content } = &items[3] else {
             panic!("expected memo batch system message fourth");

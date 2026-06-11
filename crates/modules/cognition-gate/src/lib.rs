@@ -83,6 +83,10 @@ const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate d
 events, rejected candidate events, cognition context, and relevant memory evidence needed for
 future cognition-gate decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
+const FINAL_TOOL_CALL_REMINDER: &str = concat!(
+    "Output instruction: call exactly one available function now: ",
+    "promote_to_cognition or leave_cognition_unchanged. Do not write any assistant text.",
+);
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -257,6 +261,7 @@ impl CognitionGateModule {
         lutum: &Lutum,
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
+        self.session.push_ephemeral_user(FINAL_TOOL_CALL_REMINDER);
         let outcome = self
             .session
             .text_turn()
@@ -457,12 +462,8 @@ fn salvage_cognition_from_plain_output(output: &str) -> Option<String> {
         after
     } else if let Some(index) = output.rfind("promote_to_cognition") {
         &output[index + "promote_to_cognition".len()..]
-    } else if let Some(index) = output.find("My cognition at") {
-        let after_header = &output[index..];
-        after_header
-            .split_once(':')
-            .map(|(_, after)| after)
-            .unwrap_or(after_header)
+    } else if let Some(after) = plain_cognition_header_suffix(output) {
+        after
     } else {
         return None;
     };
@@ -490,6 +491,7 @@ fn sanitize_plain_cognition_line(raw: &str) -> Option<String> {
     }
     let normalized = line.to_ascii_lowercase();
     if normalized.starts_with("my cognition at")
+        || normalized.starts_with("current cognition log at")
         || normalized.starts_with("reason:")
         || normalized.contains("leave_cognition_unchanged")
         || normalized.contains("promote_to_cognition")
@@ -502,6 +504,19 @@ fn sanitize_plain_cognition_line(raw: &str) -> Option<String> {
         return None;
     }
     Some(line.to_owned())
+}
+
+fn plain_cognition_header_suffix(output: &str) -> Option<&str> {
+    ["Current cognition log at", "My cognition at"]
+        .into_iter()
+        .filter_map(|header| output.find(header).map(|index| &output[index..]))
+        .min_by_key(|suffix| output.len() - suffix.len())
+        .map(|after_header| {
+            after_header
+                .split_once(':')
+                .map(|(_, after)| after)
+                .unwrap_or(after_header)
+        })
 }
 
 fn ensure_plain_cognition_text(text: &str) -> Result<()> {
@@ -1091,7 +1106,7 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         let request_items = inputs[0].items();
         let user_messages = message_texts_with_role(request_items, InputMessageRole::User);
-        assert_eq!(user_messages.len(), 1);
+        assert_eq!(user_messages.len(), 2);
         let candidate_input = user_messages[0];
         assert!(candidate_input.contains(NEW_CANDIDATE_HEADER));
         assert!(candidate_input.contains("- candidate 1"));
@@ -1102,6 +1117,7 @@ mod tests {
         assert!(!candidate_input.contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
+        assert_eq!(user_messages[1], FINAL_TOOL_CALL_REMINDER);
         let developer_messages =
             message_texts_with_role(request_items, InputMessageRole::Developer);
         assert!(developer_messages.is_empty());
@@ -1168,6 +1184,11 @@ mod tests {
         ));
         assert!(!has_message_with_role_containing(
             &items,
+            InputMessageRole::User,
+            FINAL_TOOL_CALL_REMINDER
+        ));
+        assert!(!has_message_with_role_containing(
+            &items,
             InputMessageRole::System,
             "sensory detail A"
         ));
@@ -1203,12 +1224,17 @@ mod tests {
 
     #[test]
     fn plain_cognition_text_is_salvaged_from_plain_output() {
-        let text = salvage_cognition_from_plain_output(
-            "My cognition at 2026-05-28T01:42:34Z:\n- Once Koro lunged when I turned away from his growl, I should not show my back to a threatening Koro.",
-        )
-        .expect("salvageable cognition text");
-        assert!(text.contains("should not show my back"));
-        ensure_plain_cognition_text(&text).unwrap();
+        for header in [
+            "Current cognition log at 2026-05-28T01:42:34Z:",
+            "My cognition at 2026-05-28T01:42:34Z:",
+        ] {
+            let text = salvage_cognition_from_plain_output(&format!(
+                "{header}\n- Once Koro lunged when I turned away from his growl, I should not show my back to a threatening Koro."
+            ))
+            .expect("salvageable cognition text");
+            assert!(text.contains("should not show my back"));
+            ensure_plain_cognition_text(&text).unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1301,6 +1327,11 @@ mod tests {
             InputMessageRole::User,
             "sensory detail A"
         ));
+        assert!(!has_message_with_role_containing(
+            &items,
+            InputMessageRole::User,
+            FINAL_TOOL_CALL_REMINDER
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1349,13 +1380,14 @@ mod tests {
         assert!(system.contains("You are the cognition-gate module"));
 
         let first_user_messages = message_texts_with_role(first_items, InputMessageRole::User);
-        assert_eq!(first_user_messages.len(), 1);
+        assert_eq!(first_user_messages.len(), 2);
         assert!(first_user_messages[0].contains(NEW_CANDIDATE_HEADER));
         assert!(first_user_messages[0].contains("sensory detail A"));
         assert!(!first_user_messages[0].contains("memo"));
         assert!(!first_user_messages[0].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
+        assert_eq!(first_user_messages[1], FINAL_TOOL_CALL_REMINDER);
         assert!(message_texts_with_role(first_items, InputMessageRole::Developer).is_empty());
         assert!(!has_message_with_role_containing(
             first_items,
@@ -1398,15 +1430,18 @@ mod tests {
             "sensory detail A"
         ));
         let second_user_messages = message_texts_with_role(second_items, InputMessageRole::User);
-        assert_eq!(second_user_messages.len(), 2);
+        assert_eq!(second_user_messages.len(), 4);
         assert!(second_user_messages[0].contains(NEW_CANDIDATE_HEADER));
         assert!(second_user_messages[0].contains("sensory detail A"));
-        assert!(second_user_messages[1].contains(NEW_CANDIDATE_HEADER));
-        assert!(second_user_messages[1].contains("sensory detail B"));
-        assert!(!second_user_messages[1].contains("memo"));
-        assert!(!second_user_messages[1].contains(
+        assert!(second_user_messages[1].contains("Current cognition log at"));
+        assert!(second_user_messages[1].contains("The agent noticed the north door is blocked."));
+        assert!(second_user_messages[2].contains(NEW_CANDIDATE_HEADER));
+        assert!(second_user_messages[2].contains("sensory detail B"));
+        assert!(!second_user_messages[2].contains("memo"));
+        assert!(!second_user_messages[2].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
+        assert_eq!(second_user_messages[3], FINAL_TOOL_CALL_REMINDER);
         assert!(message_texts_with_role(second_items, InputMessageRole::Developer).is_empty());
         assert!(!has_message_with_role_containing(
             second_items,
@@ -1433,11 +1468,10 @@ mod tests {
             InputMessageRole::System,
             "sensory detail B"
         ));
-        assert!(second_items.iter().any(|item| matches!(
+        assert!(!second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
-                if text.contains("My cognition at")
-                    && text.contains("The agent noticed the north door is blocked.")
+                if text.contains("Current cognition log at")
         )));
         assert!(
             inputs[1]
@@ -1477,10 +1511,19 @@ mod tests {
             InputMessageRole::User,
             "sensory detail B"
         ));
-        assert!(session_after_second.iter().any(|item| matches!(
+        let session_user_messages =
+            message_texts_with_role(&session_after_second, InputMessageRole::User);
+        assert!(
+            session_user_messages
+                .iter()
+                .any(|text| text.contains("Current cognition log at")
+                    && text.contains("The agent noticed the north door is blocked."))
+        );
+        assert!(!session_user_messages.contains(&FINAL_TOOL_CALL_REMINDER));
+        assert!(!session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
-                if text.contains("The agent noticed the north door is blocked.")
+                if text.contains("Current cognition log at")
         )));
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
