@@ -83,7 +83,7 @@ pub fn format_cognition_log_batch(
         return None;
     }
 
-    let mut output = format!("My cognition at {}:", base_time(now));
+    let mut output = format!("Current cognition log at {}:", base_time(now));
     for record in records {
         output.push('\n');
         output.push_str("- ");
@@ -132,7 +132,7 @@ pub fn format_bounded_cognition_log_batch(
         .collect::<Vec<_>>();
     format_bounded_lines(
         "cognition_log_batch",
-        format!("My cognition at {}:", base_time(now)),
+        format!("Current cognition log at {}:", base_time(now)),
         lines,
         window.max_total_chars,
     )
@@ -477,10 +477,11 @@ pub fn compact_llm_context_text(text: &str, max_chars: usize) -> String {
 
     let mut out = normalized.chars().take(max_chars).collect::<String>();
     let next_char = normalized.chars().nth(max_chars);
-    if next_char.is_some_and(|ch| !ch.is_whitespace()) && !out.ends_with(char::is_whitespace) {
-        if let Some((boundary, _)) = out.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
-            out.truncate(boundary);
-        }
+    if next_char.is_some_and(|ch| !ch.is_whitespace())
+        && !out.ends_with(char::is_whitespace)
+        && let Some((boundary, _)) = out.char_indices().rev().find(|(_, ch)| ch.is_whitespace())
+    {
+        out.truncate(boundary);
     }
     let out = out.trim_end().to_owned();
     tracing::warn!(
@@ -591,7 +592,7 @@ mod tests {
         assert_eq!(
             format_cognition_log_batch(&records, now()),
             Some(
-                "My cognition at 2026-05-11T06:23:00Z:\n- About 4 minutes ago: older\n- Just now: newer"
+                "Current cognition log at 2026-05-11T06:23:00Z:\n- About 4 minutes ago: older\n- Just now: newer"
                     .to_owned()
             )
         );

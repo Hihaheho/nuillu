@@ -665,7 +665,7 @@ pub fn render_llm_turns(
     ui.separator();
 
     let rows = llm_turn_rows(state, |module| filter.is_selected(module));
-    let persisted_selection = ui.use_persisted_state(|| String::new(), "llm-turns-selection");
+    let persisted_selection = ui.use_persisted_state(String::new, "llm-turns-selection");
     let mut selected_turn_id = selected_llm_turn_id(persisted_selection.as_str(), &rows);
 
     let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);

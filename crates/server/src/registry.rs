@@ -460,8 +460,10 @@ mod tests {
 
     #[test]
     fn full_agent_allocation_uses_boot_config_module_specs() {
-        let mut boot_config = ServerBootConfig::default();
-        boot_config.activation_table = vec![1.0, 0.25, 0.0];
+        let mut boot_config = ServerBootConfig {
+            activation_table: vec![1.0, 0.25, 0.0],
+            ..Default::default()
+        };
         boot_config
             .modules
             .retain(|module| module.id == RuntimeModule::Speak);

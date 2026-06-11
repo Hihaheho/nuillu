@@ -91,10 +91,10 @@ impl LlmConcurrencyPool {
             .inner
             .lock()
             .expect("LlmConcurrencyPool mutex poisoned");
-        if let Some(existing) = semaphores.get(model_key) {
-            if existing.max_concurrent_calls() == max_concurrent_llm_calls {
-                return existing.clone();
-            }
+        if let Some(existing) = semaphores.get(model_key)
+            && existing.max_concurrent_calls() == max_concurrent_llm_calls
+        {
+            return existing.clone();
         }
         let limiter = LlmConcurrencyLimiter::new(max_concurrent_llm_calls);
         semaphores.insert(model_key.to_string(), limiter.clone());
