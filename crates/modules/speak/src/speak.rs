@@ -4,14 +4,18 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use lutum::{
-    InputMessageRole, ModelInput, ModelInputItem, StructuredTurnOutcome, TextStepOutcomeWithTools,
-    TextTurnEvent,
+    InputMessageRole, ModelInput, ModelInputItem, Session, StructuredTurnOutcome,
+    TextStepOutcomeWithTools, TextTurnEvent, Usage,
 };
+use nuillu_blackboard::{CognitionLogEntryRecord, CognitionLogRecord};
 use nuillu_module::{
-    CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, Memo, Module,
-    SceneReader, UtteranceProgress,
+    CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
+    Memo, Module, SceneReader, SessionAutoCompaction, SessionCompactionConfig,
+    SessionCompactionProtectedPrefix, UtteranceProgress, ensure_persistent_session_seeded,
+    format_bounded_cognition_log_batch,
 };
 
 use crate::utterance::UtteranceWriter;
@@ -41,6 +45,46 @@ Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or
 const PARTIAL_CONTINUATION_PROMPT: &str = "Continue the partial utterance from where it stopped.";
 
 const ABORT_JUDGE_PROMPT: &str = r#"A speech is in progress. Set inform_now=true only if the new cognition entries contradict the speech, shift the safety/peer/task constraint, or change who should be addressed."#;
+const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
+const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
+    "Compacted speak generation session history:";
+const COMPACTED_SPEAK_ABORT_JUDGE_SESSION_PREFIX: &str =
+    "Compacted speak abort-judge session history:";
+const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target decisions,
+selected targets, rejected/no-speech decisions, and cognition-log context needed for future speak
+planning."#;
+const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances,
+their addressees, speech substance, and cognition-log context needed for future utterance rendering."#;
+const ABORT_JUDGE_SESSION_COMPACTION_FOCUS: &str = r#"Preserve speech abort judgements, the
+speech-start cognition context, new contradicting cognition, and whether interruption was needed."#;
+
+pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_SPEAK_PLANNING_SESSION_PREFIX,
+        PLANNING_SESSION_COMPACTION_FOCUS,
+    )
+}
+
+pub fn generation_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_SPEAK_GENERATION_SESSION_PREFIX,
+        GENERATION_SESSION_COMPACTION_FOCUS,
+    )
+}
+
+pub fn abort_judge_session_auto_compaction() -> SessionAutoCompaction {
+    SessionAutoCompaction::new(
+        SessionCompactionConfig::default(),
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed,
+        COMPACTED_SPEAK_ABORT_JUDGE_SESSION_PREFIX,
+        ABORT_JUDGE_SESSION_COMPACTION_FOCUS,
+    )
+}
 
 tokio::task_local! {
     /// JSON Schema for `ShouldSpeakArgs.target` derived from the live
@@ -170,7 +214,7 @@ fn format_generation_input(
     draft: &GenerationDraft,
 ) -> String {
     format!(
-        "Current cognition log:\n{}\n\nSpeak to: {}\n\nSubstance to express:\n{}",
+        "{}\n\nSpeak to: {}\n\nSubstance to express:\n{}",
         cognition_context.trim(),
         draft.target.trim(),
         args.speech_content.trim()
@@ -191,76 +235,66 @@ fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
 }
 
 fn push_generation_context(
-    input: &mut ModelInput,
+    session: &mut Session,
     cognition_context: &str,
     args: &ShouldSpeakArgs,
     draft: &GenerationDraft,
-    generation_prompt: &str,
 ) {
-    input.push(lutum::ModelInputItem::text(
-        lutum::InputMessageRole::System,
-        generation_prompt,
-    ));
-    input.push(lutum::ModelInputItem::text(
-        lutum::InputMessageRole::User,
-        format_generation_input(cognition_context, args, draft),
-    ));
+    session.push_user(format_generation_input(cognition_context, args, draft));
     if !draft.accumulated.is_empty() {
-        input.push(lutum::ModelInputItem::text(
-            lutum::InputMessageRole::System,
-            PARTIAL_CONTINUATION_PROMPT,
-        ));
-        input.push(lutum::ModelInputItem::assistant_text(
-            draft.accumulated.clone(),
-        ));
+        session.push_ephemeral_system(PARTIAL_CONTINUATION_PROMPT);
+        session.push_ephemeral_assistant_text(draft.accumulated.clone());
     }
 }
 
-fn finish_speech_cognition_context(lines: Vec<String>, idle_for_secs: Option<u64>) -> String {
-    let mut lines = lines;
+fn cognition_context_fallback(now: DateTime<Utc>) -> String {
+    format!(
+        "Current cognition log at {}:\n- none",
+        now.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
+fn append_idle_context(mut cognition_context: String, idle_for_secs: Option<u64>) -> String {
     if let Some(seconds) = idle_for_secs {
-        lines.push(format!("- I have been idle for {seconds} seconds."));
+        cognition_context.push_str(&format!("\n- I have been idle for {seconds} seconds."));
     }
-    if lines.is_empty() {
-        "none".to_owned()
-    } else {
-        lines.join("\n")
-    }
+    cognition_context
 }
 
-fn build_planning_input(plan_prompt: &str, cognition_context: &str) -> ModelInput {
-    ModelInput::from_items(vec![
-        ModelInputItem::text(InputMessageRole::System, plan_prompt),
-        ModelInputItem::text(
-            InputMessageRole::User,
-            format!("Current cognition log:\n{}", cognition_context.trim()),
-        ),
-        ModelInputItem::text(
-            InputMessageRole::Developer,
-            PLANNING_TURN_DEVELOPER_INSTRUCTION,
-        ),
-        ModelInputItem::text(InputMessageRole::User, PLANNING_TURN_FINAL_REMINDER),
-    ])
+fn cognition_entry_records(logs: &[CognitionLogRecord]) -> Vec<CognitionLogEntryRecord> {
+    let mut records = Vec::new();
+    for log in logs
+        .iter()
+        .filter(|record| record.source.module != builtin::memory_recombination())
+    {
+        for entry in &log.entries {
+            records.push(CognitionLogEntryRecord {
+                index: records.len() as u64,
+                source: log.source.clone(),
+                entry: entry.clone(),
+            });
+        }
+    }
+    records
 }
 
-fn format_abort_judge_input(cognition_context_at_start: &str, new_entries: &[String]) -> String {
+fn push_planning_context(session: &mut Session, cognition_context: &str) {
+    session.push_user(cognition_context.trim().to_owned());
+    session.push_ephemeral_developer(PLANNING_TURN_DEVELOPER_INSTRUCTION);
+    session.push_ephemeral_user(PLANNING_TURN_FINAL_REMINDER);
+}
+
+fn format_abort_judge_input(
+    cognition_context_at_start: &str,
+    new_cognition_context: &str,
+) -> String {
     let mut out = format!(
         "Cognition log at the start of the current speech attempt:\n{}",
         cognition_context_at_start.trim()
     );
     out.push_str("\n\nNew cognition entries since speech started:");
-    if new_entries.is_empty() {
-        out.push_str("\n- none");
-    } else {
-        for entry in new_entries
-            .iter()
-            .map(|entry| entry.trim())
-            .filter(|entry| !entry.is_empty())
-        {
-            out.push_str("\n- ");
-            out.push_str(entry);
-        }
-    }
+    out.push('\n');
+    out.push_str(new_cognition_context.trim());
     out
 }
 
@@ -270,9 +304,17 @@ enum GenerationStreamOutcome {
     Aborted,
 }
 
-type AbortJudgeFuture = Pin<Box<dyn Future<Output = Result<bool>> + 'static>>;
+struct AbortJudgeResult {
+    inform_now: bool,
+    input: ModelInput,
+    usage: Usage,
+}
 
-async fn poll_pending_abort_judge(pending: &mut Option<AbortJudgeFuture>) -> Result<bool> {
+type AbortJudgeFuture = Pin<Box<dyn Future<Output = Result<AbortJudgeResult>> + 'static>>;
+
+async fn poll_pending_abort_judge(
+    pending: &mut Option<AbortJudgeFuture>,
+) -> Result<AbortJudgeResult> {
     pending
         .as_mut()
         .expect("pending abort judge is only polled when present")
@@ -287,6 +329,9 @@ pub struct SpeakModule {
     utterance: UtteranceWriter,
     llm: LlmAccess,
     scene: SceneReader,
+    planning_session: Session,
+    generation_session: Session,
+    abort_judge_session: Session,
     plan_prompt: std::sync::OnceLock<String>,
     generation_prompt: std::sync::OnceLock<String>,
     abort_judge_prompt: std::sync::OnceLock<String>,
@@ -300,6 +345,9 @@ impl SpeakModule {
         utterance: UtteranceWriter,
         llm: LlmAccess,
         scene: SceneReader,
+        planning_session: Session,
+        generation_session: Session,
+        abort_judge_session: Session,
     ) -> Self {
         Self {
             cognition_updates,
@@ -308,6 +356,9 @@ impl SpeakModule {
             utterance,
             llm,
             scene,
+            planning_session,
+            generation_session,
+            abort_judge_session,
             plan_prompt: std::sync::OnceLock::new(),
             generation_prompt: std::sync::OnceLock::new(),
             abort_judge_prompt: std::sync::OnceLock::new(),
@@ -347,6 +398,36 @@ impl SpeakModule {
         })
     }
 
+    fn ensure_planning_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.plan_prompt(cx).to_owned();
+        ensure_persistent_session_seeded(
+            &mut self.planning_session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+    }
+
+    fn ensure_generation_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.generation_prompt(cx).to_owned();
+        ensure_persistent_session_seeded(
+            &mut self.generation_session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+    }
+
+    fn ensure_abort_judge_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
+        let system_prompt = self.abort_judge_prompt(cx).to_owned();
+        ensure_persistent_session_seeded(
+            &mut self.abort_judge_session,
+            system_prompt,
+            cx.identity_memories(),
+            cx.now(),
+        );
+    }
+
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(
         &mut self,
@@ -354,7 +435,7 @@ impl SpeakModule {
         batch: &SpeakBatch,
     ) -> Result<()> {
         let _update_count = batch.updates.len();
-        let mut cognition_context = self.speech_cognition_context().await;
+        let mut cognition_context = self.speech_cognition_context(cx.now()).await;
         let Some(mut plan) = self.plan_speech(cx, &cognition_context).await? else {
             return Ok(());
         };
@@ -368,10 +449,10 @@ impl SpeakModule {
             {
                 GenerationStreamOutcome::Completed => return Ok(()),
                 GenerationStreamOutcome::Retry => {
-                    cognition_context = self.speech_cognition_context().await;
+                    cognition_context = self.speech_cognition_context(cx.now()).await;
                 }
                 GenerationStreamOutcome::Aborted => {
-                    cognition_context = self.speech_cognition_context().await;
+                    cognition_context = self.speech_cognition_context(cx.now()).await;
                     let Some(new_plan) = self.plan_speech(cx, &cognition_context).await? else {
                         return Ok(());
                     };
@@ -382,24 +463,16 @@ impl SpeakModule {
         }
     }
 
-    async fn speech_cognition_context(&self) -> String {
+    async fn speech_cognition_context(&self, now: DateTime<Utc>) -> String {
         let snapshot = self.cognition_log.snapshot().await;
-        let mut lines = Vec::new();
-        for record in snapshot.logs() {
-            if record.source.module == builtin::memory_recombination() {
-                continue;
-            }
-            for entry in &record.entries {
-                let text = entry.text.trim();
-                if !text.is_empty() {
-                    lines.push(format!("- {text}"));
-                }
-            }
-        }
+        let records = cognition_entry_records(snapshot.logs());
+        let cognition_context =
+            format_bounded_cognition_log_batch(&records, now, COGNITION_CONTEXT_WINDOW)
+                .unwrap_or_else(|| cognition_context_fallback(now));
         let idle_for_secs = snapshot
             .agentic_deadlock_marker()
             .map(|marker| marker.idle_for.as_secs());
-        finish_speech_cognition_context(lines, idle_for_secs)
+        append_idle_context(cognition_context, idle_for_secs)
     }
 
     async fn plan_speech(
@@ -407,43 +480,67 @@ impl SpeakModule {
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
     ) -> Result<Option<PlannedSpeech>> {
-        let input = build_planning_input(self.plan_prompt(cx), cognition_context);
+        self.ensure_planning_session_seeded(cx);
+        push_planning_context(&mut self.planning_session, cognition_context);
 
         let lutum = self.llm.lutum().await;
         let target_schema = self.scene.target_schema();
         let validation_schema = target_schema.clone();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
-                lutum
-                    .text_turn(input)
+                self.planning_session
+                    .text_turn()
                     .tools::<SpeakTools>()
                     .available_tools([SpeakToolsSelector::ShouldSpeak])
-                    .collect_controlled_with(nuillu_module::AbortOnAvailableToolNameInText::new())
+                    .collect_controlled_with(
+                        &lutum,
+                        nuillu_module::AbortOnAvailableToolNameInText::new(),
+                    )
                     .await
                     .context("speak should_speak turn failed")
             })
             .await?;
-        let TextStepOutcomeWithTools::NeedsTools(round) = outcome else {
-            return Ok(None);
-        };
 
-        nuillu_module::emit_trace_tool_calls(&round.tool_calls);
-        let mut selected = None;
-        for call in round.tool_calls.iter().cloned() {
-            let SpeakToolsCall::ShouldSpeak(call) = call;
-            if selected.is_none() {
-                selected = Some(call.input.clone());
+        match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                cx.compact_and_save(&mut self.planning_session, result.usage)
+                    .await?;
+                Ok(None)
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                cx.compact_and_save(&mut self.planning_session, result.usage)
+                    .await?;
+                Ok(None)
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let usage = round.usage;
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                let mut selected = None;
+                let mut results = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    let SpeakToolsCall::ShouldSpeak(call) = call;
+                    let target = call.input.target.as_str().trim().to_owned();
+                    let accepted = selected.is_none()
+                        && is_target_allowed_by_schema(&validation_schema, &target);
+                    if accepted {
+                        selected = Some(PlannedSpeech {
+                            args: call.input.clone(),
+                            target,
+                        });
+                    }
+                    results.push(
+                        call.complete(ShouldSpeakOutput { accepted })
+                            .context("complete should_speak tool call")?,
+                    );
+                }
+                round
+                    .commit(&mut self.planning_session, results)
+                    .context("commit speak planning tool round")?;
+                cx.compact_and_save(&mut self.planning_session, usage)
+                    .await?;
+                Ok(selected)
             }
         }
-        let Some(args) = selected else {
-            return Ok(None);
-        };
-        let target = args.target.as_str();
-        let target = target.trim().to_owned();
-        if !is_target_allowed_by_schema(&validation_schema, &target) {
-            return Ok(None);
-        }
-        Ok(Some(PlannedSpeech { args, target }))
     }
 
     async fn stream_generation(
@@ -456,19 +553,19 @@ impl SpeakModule {
         let stream_started_at = cx.now();
         let cognition_context_at_start = cognition_context.clone();
 
-        let mut input = ModelInput::new();
+        self.ensure_generation_session_seeded(cx);
         push_generation_context(
-            &mut input,
+            &mut self.generation_session,
             &cognition_context,
             args,
             draft,
-            self.generation_prompt(cx),
         );
 
         let lutum = self.llm.lutum().await;
-        let mut stream = lutum
-            .text_turn(input)
-            .stream()
+        let mut stream = self
+            .generation_session
+            .text_turn()
+            .stream(&lutum)
             .await
             .context("speak generation stream failed")?;
         let mut pending_judge: Option<AbortJudgeFuture> = None;
@@ -480,7 +577,10 @@ impl SpeakModule {
 
                 verdict = poll_pending_abort_judge(&mut pending_judge), if pending_judge.is_some() => {
                     pending_judge = None;
-                    if verdict? {
+                    let verdict = verdict?;
+                    self.merge_abort_judge_session(verdict.input);
+                    cx.compact_and_save(&mut self.abort_judge_session, verdict.usage).await?;
+                    if verdict.inform_now {
                         return Ok(GenerationStreamOutcome::Aborted);
                     }
                     let next_entries = std::mem::take(&mut buffered_entries);
@@ -509,7 +609,27 @@ impl SpeakModule {
                         Some(Ok(TextTurnEvent::WillRetry { .. })) => {
                             return Ok(GenerationStreamOutcome::Retry);
                         }
-                        Some(Ok(TextTurnEvent::Completed { .. })) | None => {
+                        Some(Ok(TextTurnEvent::Completed { committed_turn, usage, .. })) => {
+                            self.generation_session
+                                .input_mut()
+                                .push(ModelInputItem::turn(committed_turn));
+                            cx.compact_and_save(&mut self.generation_session, usage).await?;
+                            let text = draft.accumulated.trim().to_owned();
+                            self.memo.write(render_completed_utterance_memo(draft, &text)).await;
+                            self.utterance
+                                .record_progress(UtteranceProgress::completed(
+                                    draft.generation_id,
+                                    draft.sequence,
+                                    draft.target.clone(),
+                                    text.clone(),
+                                ))
+                                .await;
+                            if !text.is_empty() {
+                                self.utterance.emit(draft.target.clone(), text).await;
+                            }
+                            return Ok(GenerationStreamOutcome::Completed);
+                        }
+                        None => {
                             let text = draft.accumulated.trim().to_owned();
                             self.memo.write(render_completed_utterance_memo(draft, &text)).await;
                             self.utterance
@@ -557,59 +677,54 @@ impl SpeakModule {
 
     async fn new_cognition_entries_since(
         &self,
-        threshold: chrono::DateTime<chrono::Utc>,
-    ) -> Vec<String> {
+        threshold: DateTime<Utc>,
+    ) -> Vec<CognitionLogEntryRecord> {
         let snapshot = self.cognition_log.snapshot().await;
-        snapshot
-            .logs()
-            .iter()
-            .filter(|record| record.source.module != builtin::memory_recombination())
-            .flat_map(|record| record.entries.iter())
-            .filter(|entry| entry.at > threshold)
-            .map(|entry| entry.text.clone())
+        cognition_entry_records(snapshot.logs())
+            .into_iter()
+            .filter(|record| record.entry.at > threshold)
             .collect()
     }
 
     fn start_abort_judge(
-        &self,
+        &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context_at_start: &str,
-        new_entries: Vec<String>,
+        new_entries: Vec<CognitionLogEntryRecord>,
     ) -> AbortJudgeFuture {
+        self.ensure_abort_judge_session_seeded(cx);
         let llm = self.llm.clone();
-        let abort_judge_prompt = self.abort_judge_prompt(cx).to_owned();
-        let cognition_context_at_start = cognition_context_at_start.to_owned();
-        Box::pin(Self::judge_abort_owned(
-            llm,
-            abort_judge_prompt,
-            cognition_context_at_start,
-            new_entries,
-        ))
+        let new_cognition_context =
+            format_bounded_cognition_log_batch(&new_entries, cx.now(), COGNITION_CONTEXT_WINDOW)
+                .unwrap_or_else(|| cognition_context_fallback(cx.now()));
+        let mut input = self.abort_judge_session.input().clone();
+        input.push(ModelInputItem::text(
+            InputMessageRole::User,
+            format_abort_judge_input(cognition_context_at_start, &new_cognition_context),
+        ));
+        Box::pin(Self::judge_abort_owned(llm, input))
     }
 
-    async fn judge_abort_owned(
-        llm: LlmAccess,
-        abort_judge_prompt: String,
-        cognition_context_at_start: String,
-        new_entries: Vec<String>,
-    ) -> Result<bool> {
-        let input = ModelInput::new()
-            .system(abort_judge_prompt)
-            .user(format_abort_judge_input(
-                &cognition_context_at_start,
-                &new_entries,
-            ));
-
+    async fn judge_abort_owned(llm: LlmAccess, input: ModelInput) -> Result<AbortJudgeResult> {
+        let mut session = Session::from_input(input);
         let lutum = llm.lutum().await;
-        let result = lutum
-            .structured_turn::<AbortJudgement>(input)
-            .collect()
+        let result = session
+            .structured_turn::<AbortJudgement>()
+            .collect(&lutum)
             .await
             .context("speak abort-judge turn failed")?;
         let StructuredTurnOutcome::Structured(judgement) = result.semantic else {
             anyhow::bail!("speak abort-judge turn refused");
         };
-        Ok(judgement.inform_now)
+        Ok(AbortJudgeResult {
+            inform_now: judgement.inform_now,
+            input: session.into_input(),
+            usage: result.usage,
+        })
+    }
+
+    fn merge_abort_judge_session(&mut self, input: ModelInput) {
+        *self.abort_judge_session.input_mut() = input;
     }
 
     async fn record_streaming_progress(&self, draft: &GenerationDraft) {
@@ -1018,6 +1133,15 @@ mod tests {
                         ),
                         caps.llm_access(),
                         caps.scene_reader(),
+                        caps.session("planning")
+                            .with_auto_compaction(planning_session_auto_compaction())
+                            .await?,
+                        caps.session("generation")
+                            .with_auto_compaction(generation_session_auto_compaction())
+                            .await?,
+                        caps.session("abort-judge")
+                            .with_auto_compaction(abort_judge_session_auto_compaction())
+                            .await?,
                     ));
                     Ok(SpeakStub)
                 }
@@ -1119,74 +1243,76 @@ mod tests {
             .await
     }
 
-    fn assert_message_text(item: &ModelInputItem, expected_role: InputMessageRole, expected: &str) {
-        let ModelInputItem::Message { role, content } = item else {
-            panic!("expected message item");
-        };
-        assert_eq!(*role, expected_role);
-        let [MessageContent::Text(text)] = content.as_slice() else {
-            panic!("expected one text content item");
-        };
-        assert_eq!(text, expected);
+    fn session_turn_texts(session: &Session) -> Vec<String> {
+        session
+            .list_turns()
+            .filter_map(|turn| {
+                turn.item_at(0)
+                    .and_then(|item| item.as_text())
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 
-    #[test]
-    fn planning_input_uses_user_cognition_developer_instruction_and_final_reminder() {
-        let input = build_planning_input(
-            "planning prompt",
-            "- Peer greeted me with \"Hi\"; brief acknowledgement is warranted.\n",
-        );
-        let items = input.items();
+    #[tokio::test(flavor = "current_thread")]
+    async fn speech_cognition_context_uses_shared_formatter() {
+        let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (module, _caps) = speak_module_with_turn_adapter(
+            blackboard.clone(),
+            Arc::new(MockLlmAdapter::new()),
+            sink,
+        )
+        .await;
+        let now = SystemClock.now();
+        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source,
+                entry: CognitionLogEntry {
+                    at: now - chrono::Duration::minutes(4),
+                    text: "Koro asks Nuillu for help.".into(),
+                },
+            })
+            .await;
 
-        assert_eq!(items.len(), 4);
-        assert_message_text(&items[0], InputMessageRole::System, "planning prompt");
-        assert_message_text(
-            &items[1],
-            InputMessageRole::User,
-            "Current cognition log:\n- Peer greeted me with \"Hi\"; brief acknowledgement is warranted.",
-        );
-        assert_message_text(
-            &items[2],
-            InputMessageRole::Developer,
-            PLANNING_TURN_DEVELOPER_INSTRUCTION,
-        );
-        assert_message_text(
-            &items[3],
-            InputMessageRole::User,
-            PLANNING_TURN_FINAL_REMINDER,
-        );
+        let context = module.speech_cognition_context(now).await;
+
+        assert!(context.contains("Current cognition log at "));
+        assert!(context.contains("About 4 minutes ago: Koro asks Nuillu for help."));
     }
 
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
         let args = test_should_speak_args("Koro");
-        let mut input = ModelInput::new();
+        let mut session = Session::new();
 
-        push_generation_context(&mut input, "none", &args, &draft, GENERATION_PROMPT);
-        let items = input.items();
+        push_generation_context(
+            &mut session,
+            "Current cognition log at 2026-05-11T06:23:00Z:\n- none",
+            &args,
+            &draft,
+        );
+        let items = session.input().items();
 
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
-        assert_eq!(items.len(), 2);
-        assert!(matches!(
-            &items[0],
-            ModelInputItem::Message {
-                role: InputMessageRole::System,
-                ..
-            }
-        ));
+        assert_eq!(items.len(), 1);
         let ModelInputItem::Message {
             role: InputMessageRole::User,
             content,
-        } = &items[1]
+        } = &items[0]
         else {
             panic!("expected user generation context");
         };
         let [MessageContent::Text(text)] = content.as_slice() else {
             panic!("expected one text content item");
         };
-        assert!(text.contains("Current cognition log:\nnone"));
+        assert!(text.contains("Current cognition log at 2026-05-11T06:23:00Z:\n- none"));
         assert!(text.contains("Speak to: Koro"));
         assert!(text.contains("Substance to express:"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
@@ -1270,6 +1396,15 @@ mod tests {
                         ),
                         caps.llm_access(),
                         caps.scene_reader(),
+                        caps.session("planning")
+                            .with_auto_compaction(planning_session_auto_compaction())
+                            .await?,
+                        caps.session("generation")
+                            .with_auto_compaction(generation_session_auto_compaction())
+                            .await?,
+                        caps.session("abort-judge")
+                            .with_auto_compaction(abort_judge_session_auto_compaction())
+                            .await?,
                     ));
                     Ok(SpeakStub)
                 }
@@ -1329,6 +1464,11 @@ mod tests {
             .unwrap();
         assert_eq!(progress.target, "Koro");
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
+        assert_eq!(module.planning_session.list_turns().count(), 1);
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            vec!["Koro, stay close.".to_string()]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1506,64 +1646,70 @@ mod tests {
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
         let args = test_should_speak_args("Koro");
-        let stream = module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
-        tokio::pin!(stream);
 
-        tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                panic!("stream ended before text generation started");
+        {
+            let stream =
+                module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
+            tokio::pin!(stream);
+
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before text generation started");
+                }
+                result = text_started_rx => {
+                    result.expect("text generation should start");
+                }
             }
-            result = text_started_rx => {
-                result.expect("text generation should start");
+
+            publish_cognition_update(
+                &blackboard,
+                &caps,
+                now + chrono::Duration::milliseconds(1),
+                "Koro notices the first new hazard.",
+            )
+            .await;
+
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before first abort judge started");
+                }
+                result = first_judge_started_rx => {
+                    result.expect("first abort judge should start");
+                }
             }
+
+            publish_cognition_update(
+                &blackboard,
+                &caps,
+                now + chrono::Duration::milliseconds(2),
+                "Koro notices a second, more urgent hazard.",
+            )
+            .await;
+            first_judge_gate.release();
+
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before buffered cognition triggered a second judge");
+                }
+                result = tokio::time::timeout(Duration::from_millis(100), second_judge_started_rx) => {
+                    result
+                        .expect("buffered cognition should start a second judge")
+                        .expect("second abort judge should start");
+                }
+            }
+
+            second_judge_gate.release();
+            let outcome = tokio::time::timeout(Duration::from_millis(100), &mut stream)
+                .await
+                .expect("second judge should finish the stream")
+                .unwrap();
+            assert!(matches!(outcome, GenerationStreamOutcome::Aborted));
         }
 
-        publish_cognition_update(
-            &blackboard,
-            &caps,
-            now + chrono::Duration::milliseconds(1),
-            "Koro notices the first new hazard.",
-        )
-        .await;
-
-        tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                panic!("stream ended before first abort judge started");
-            }
-            result = first_judge_started_rx => {
-                result.expect("first abort judge should start");
-            }
-        }
-
-        publish_cognition_update(
-            &blackboard,
-            &caps,
-            now + chrono::Duration::milliseconds(2),
-            "Koro notices a second, more urgent hazard.",
-        )
-        .await;
-        first_judge_gate.release();
-
-        tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                panic!("stream ended before buffered cognition triggered a second judge");
-            }
-            result = tokio::time::timeout(Duration::from_millis(100), second_judge_started_rx) => {
-                result
-                    .expect("buffered cognition should start a second judge")
-                    .expect("second abort judge should start");
-            }
-        }
-
-        second_judge_gate.release();
-        let outcome = tokio::time::timeout(Duration::from_millis(100), &mut stream)
-            .await
-            .expect("second judge should finish the stream")
-            .unwrap();
-        assert!(matches!(outcome, GenerationStreamOutcome::Aborted));
+        assert_eq!(module.abort_judge_session.list_turns().count(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1645,39 +1791,37 @@ mod tests {
     fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
         let mut draft = GenerationDraft::new(11, "Koro");
         let args = test_should_speak_args("Koro");
-        let mut input = ModelInput::new();
+        let mut session = Session::new();
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        push_generation_context(&mut input, "none", &args, &draft, GENERATION_PROMPT);
-        let items = input.items();
+        push_generation_context(
+            &mut session,
+            "Current cognition log at 2026-05-11T06:23:00Z:\n- none",
+            &args,
+            &draft,
+        );
+        let items = session.input().items();
 
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 3);
         assert!(matches!(
             &items[0],
-            ModelInputItem::Message {
-                role: InputMessageRole::System,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &items[1],
             ModelInputItem::Message {
                 role: InputMessageRole::User,
                 ..
             }
         ));
         assert!(matches!(
-            &items[2],
+            &items[1],
             ModelInputItem::Message {
                 role: InputMessageRole::System,
                 ..
             }
         ));
-        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[3] else {
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
             panic!("expected assistant prefill");
         };
         assert_eq!(text, "hello world");

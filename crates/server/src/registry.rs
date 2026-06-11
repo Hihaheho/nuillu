@@ -344,19 +344,36 @@ fn register_server_module(
             registry.register_server(spec, move |caps| {
                 let utterance_sink = utterance_sink.clone();
                 async move {
-                    Ok(nuillu_speak::SpeakModule::new(
-                        caps.cognition_log_updated_inbox(),
-                        caps.cognition_log_reader(),
-                        caps.memo(),
-                        UtteranceWriter::new(
-                            caps.owner().clone(),
-                            caps.blackboard(),
-                            utterance_sink.clone(),
-                            caps.clock(),
+                    Ok(
+                        nuillu_speak::SpeakModule::new(
+                            caps.cognition_log_updated_inbox(),
+                            caps.cognition_log_reader(),
+                            caps.memo(),
+                            UtteranceWriter::new(
+                                caps.owner().clone(),
+                                caps.blackboard(),
+                                utterance_sink.clone(),
+                                caps.clock(),
+                            ),
+                            caps.llm_access(),
+                            caps.scene_reader(),
+                            caps.session("planning")
+                                .with_auto_compaction(
+                                    nuillu_speak::planning_session_auto_compaction(),
+                                )
+                                .await?,
+                            caps.session("generation")
+                                .with_auto_compaction(
+                                    nuillu_speak::generation_session_auto_compaction(),
+                                )
+                                .await?,
+                            caps.session("abort-judge")
+                                .with_auto_compaction(
+                                    nuillu_speak::abort_judge_session_auto_compaction(),
+                                )
+                                .await?,
                         ),
-                        caps.llm_access(),
-                        caps.scene_reader(),
-                    ))
+                    )
                 }
             })
         }

@@ -5371,6 +5371,21 @@ fn register_eval_module(
                                 ),
                                 caps.llm_access(),
                                 caps.scene_reader(),
+                                caps.session("planning")
+                                    .with_auto_compaction(
+                                        nuillu_speak::planning_session_auto_compaction(),
+                                    )
+                                    .await?,
+                                caps.session("generation")
+                                    .with_auto_compaction(
+                                        nuillu_speak::generation_session_auto_compaction(),
+                                    )
+                                    .await?,
+                                caps.session("abort-judge")
+                                    .with_auto_compaction(
+                                        nuillu_speak::abort_judge_session_auto_compaction(),
+                                    )
+                                    .await?,
                             ))
                         }
                     }

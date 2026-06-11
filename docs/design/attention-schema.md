@@ -307,7 +307,9 @@ the tool selects the addressee and starts generation; not calling it means no us
 is needed and the activation completes silently. During generation it records targeted utterance
 progress, writes the completed targeted utterance to its memo log, and emits through
 `UtteranceWriter` so the application or eval harness can collect the utterance as an artifact. It
-does not read blackboard memo logs, allocation guidance, or module status.
+also persists speech planning, generated utterances, and abort judgements in separate LLM sessions
+(`planning`, `generation`, `abort-judge`) so those turns remain inspectable without mixing their
+contexts. It does not read blackboard memo logs, allocation guidance, or module status.
 
 Speak is not a planner, router, or inner-speech module. It does not publish query or self-model work,
 and it does not make resource-allocation decisions. Completed utterance memo-log entries wake the
