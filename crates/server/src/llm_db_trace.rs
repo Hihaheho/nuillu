@@ -25,6 +25,8 @@ use crate::llm_observer::{
 };
 
 const LLM_TRANSCRIPT_RETAINED_TURNS: usize = 200;
+const SUPERSEDED_TRACE_MESSAGE: &str =
+    "superseded by a new LLM model input before terminal stream event";
 
 #[derive(Clone)]
 pub struct DbLlmTraceSink {
@@ -126,39 +128,80 @@ impl DbLlmTraceSink {
         update: impl FnOnce(&mut CompletedTurnTrace),
     ) -> CompletedTurnTrace {
         let key = extension_key(extensions);
-        let mut turns = self
+        let trace = {
+            let mut turns = self
+                .inner
+                .turns
+                .lock()
+                .expect("DB LLM trace turn map lock poisoned");
+            let trace = turns
+                .entry(key)
+                .or_insert_with(|| self.new_trace(extensions, metadata, operation));
+            update(trace);
+            trace.clone()
+        };
+        self.record_activation_attempt_turn(metadata, &trace.turn_id);
+        trace
+    }
+
+    fn start_trace_for_model_input(
+        &self,
+        extensions: &RequestExtensions,
+        metadata: &LlmRequestMetadata,
+        operation: OperationKind,
+        input: Vec<LlmInputItemView>,
+    ) -> Option<CompletedTurnTrace> {
+        let key = extension_key(extensions);
+        let trace = self.new_trace(extensions, metadata, operation);
+        let turn_id = trace.turn_id.clone();
+        let superseded = self
             .inner
             .turns
             .lock()
-            .expect("DB LLM trace turn map lock poisoned");
-        let trace = turns.entry(key).or_insert_with(|| {
-            let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
-            let turn_id = format!("{}-db-llm-{next}", self.inner.server_session_id);
-            let now = Utc::now().timestamp_millis();
-            CompletedTurnTrace {
-                version: 1,
-                status: TranscriptTurnStatus::InProgress,
-                turn_id,
-                owner: metadata.owner.to_string(),
-                module: metadata.owner.module.to_string(),
-                replica: metadata.owner.replica.get(),
-                tier: format!("{:?}", metadata.tier),
-                source: observation_source(metadata.source),
-                session_key: observation_session_key(extensions, metadata),
-                operation: operation_kind_label(operation).to_string(),
-                started_at_ms: now,
-                completed_at_ms: None,
-                input: Vec::new(),
-                request_id: None,
-                model: None,
-                deltas: Vec::new(),
-                tool_calls: Vec::new(),
-                structured_output: None,
-                finish_reason: None,
-                usage: None,
-                error_message: None,
-            }
-        });
+            .expect("DB LLM trace turn map lock poisoned")
+            .insert(key, CompletedTurnTrace { input, ..trace });
+        if let Some(superseded) = &superseded {
+            self.remove_activation_mappings_for_turn(&superseded.turn_id);
+        }
+        self.record_activation_attempt_turn(metadata, &turn_id);
+        superseded
+    }
+
+    fn new_trace(
+        &self,
+        extensions: &RequestExtensions,
+        metadata: &LlmRequestMetadata,
+        operation: OperationKind,
+    ) -> CompletedTurnTrace {
+        let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
+        let turn_id = format!("{}-db-llm-{next}", self.inner.server_session_id);
+        let now = Utc::now().timestamp_millis();
+        CompletedTurnTrace {
+            version: 1,
+            status: TranscriptTurnStatus::InProgress,
+            turn_id,
+            owner: metadata.owner.to_string(),
+            module: metadata.owner.module.to_string(),
+            replica: metadata.owner.replica.get(),
+            tier: format!("{:?}", metadata.tier),
+            source: observation_source(metadata.source),
+            session_key: observation_session_key(extensions, metadata),
+            operation: operation_kind_label(operation).to_string(),
+            started_at_ms: now,
+            completed_at_ms: None,
+            input: Vec::new(),
+            request_id: None,
+            model: None,
+            deltas: Vec::new(),
+            tool_calls: Vec::new(),
+            structured_output: None,
+            finish_reason: None,
+            usage: None,
+            error_message: None,
+        }
+    }
+
+    fn record_activation_attempt_turn(&self, metadata: &LlmRequestMetadata, turn_id: &str) {
         if let Some(activation_attempt) = metadata.activation_attempt {
             self.inner
                 .activation_attempt_turns
@@ -166,11 +209,17 @@ impl DbLlmTraceSink {
                 .expect("DB LLM trace activation turn map lock poisoned")
                 .insert(
                     (metadata.owner.to_string(), activation_attempt),
-                    trace.turn_id.clone(),
+                    turn_id.to_string(),
                 );
         }
-        update(trace);
-        trace.clone()
+    }
+
+    fn remove_activation_mappings_for_turn(&self, turn_id: &str) {
+        self.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("DB LLM trace activation turn map lock poisoned")
+            .retain(|_, existing| existing != turn_id);
     }
 
     async fn complete_trace(&self, extensions: &RequestExtensions, trace: CompletedTurnTrace) {
@@ -278,9 +327,16 @@ impl OnModelInput for DbLlmTraceSink {
         let Some(metadata) = Self::metadata(cx.extensions()) else {
             return;
         };
-        self.update_trace(cx.extensions(), metadata, cx.kind(), |trace| {
-            trace.input = model_input_views(cx.input().items());
-        });
+        let superseded = self.start_trace_for_model_input(
+            cx.extensions(),
+            metadata,
+            cx.kind(),
+            model_input_views(cx.input().items()),
+        );
+        if let Some(mut trace) = superseded {
+            mark_trace_failed(&mut trace, SUPERSEDED_TRACE_MESSAGE.to_string());
+            self.persist_terminal_trace(trace).await;
+        }
     }
 }
 
@@ -662,9 +718,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
 
+    use lutum::{FinishReason, ModelInput};
     use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
-    use nuillu_module::ports::{Embedder, PortError};
-    use nuillu_types::{ReplicaIndex, builtin};
+    use nuillu_module::{
+        LlmRequestSource,
+        ports::{Embedder, PortError},
+    };
+    use nuillu_types::{ModelTier, ReplicaIndex, builtin};
     use nuillu_visualizer_protocol::VisualizerServerMessage;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -779,6 +839,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_input_supersedes_stale_active_trace_and_keeps_completed_turn_distinct() {
+        let store = test_transcript_store().await;
+        let sink = DbLlmTraceSink::new("server-session".to_string(), store.clone());
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+        let mut extensions = RequestExtensions::new();
+        extensions.insert(request_metadata(&owner, 1));
+
+        let first_input = ModelInput::new().user("first");
+        let first_cx =
+            ModelInputHookContext::new(&extensions, OperationKind::Completion, &first_input);
+        OnModelInput::call(&sink, &first_cx).await;
+        let first_turn_id = active_trace_turn_id(&sink, &extensions);
+
+        extensions.insert(request_metadata(&owner, 2));
+        let second_input = ModelInput::new().user("second");
+        let second_cx =
+            ModelInputHookContext::new(&extensions, OperationKind::Completion, &second_input);
+        OnModelInput::call(&sink, &second_cx).await;
+        let second_turn_id = active_trace_turn_id(&sink, &extensions);
+
+        assert_ne!(first_turn_id, second_turn_id);
+        let activation_turns = sink
+            .inner
+            .activation_attempt_turns
+            .lock()
+            .expect("activation turn map lock poisoned")
+            .clone();
+        assert!(!activation_turns.contains_key(&(owner.to_string(), 1)));
+        assert_eq!(
+            activation_turns.get(&(owner.to_string(), 2)),
+            Some(&second_turn_id)
+        );
+
+        let completed = CompletionEvent::Completed {
+            request_id: Some("req-2".to_string()),
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                input_tokens: 7,
+                output_tokens: 11,
+                total_tokens: 18,
+                ..Usage::zero()
+            },
+        };
+        let completed_cx = StreamEventHookContext::new(
+            &extensions,
+            OperationKind::Completion,
+            LutumStreamEvent::Completion(&completed),
+        );
+        OnStreamEvent::call(&sink, &completed_cx).await;
+
+        let recent = store.recent_completed_turns(10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].turn_id, first_turn_id);
+        assert_eq!(recent[0].trace_json["status"], "failed");
+        assert_eq!(
+            recent[0].trace_json["error_message"],
+            SUPERSEDED_TRACE_MESSAGE
+        );
+        assert_eq!(recent[0].trace_json["input"][0]["content"], "first");
+
+        assert_eq!(recent[1].turn_id, second_turn_id);
+        assert_eq!(recent[1].trace_json["status"], "completed");
+        assert_eq!(recent[1].trace_json["input"][0]["content"], "second");
+        assert_eq!(recent[1].trace_json["request_id"], "req-2");
+        assert_eq!(recent[1].trace_json["usage"]["total_tokens"], 18);
+    }
+
     async fn test_transcript_store() -> LibsqlLlmTranscriptStore {
         let agent = LibsqlAgentStore::connect(
             LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
@@ -788,6 +916,28 @@ mod tests {
         .await
         .unwrap();
         agent.llm_transcript_store()
+    }
+
+    fn request_metadata(owner: &ModuleInstanceId, activation_attempt: u32) -> LlmRequestMetadata {
+        LlmRequestMetadata {
+            owner: owner.clone(),
+            tier: ModelTier::Default,
+            source: LlmRequestSource::ModuleTurn,
+            session_key: None,
+            activation_attempt: Some(activation_attempt),
+            batch: None,
+        }
+    }
+
+    fn active_trace_turn_id(sink: &DbLlmTraceSink, extensions: &RequestExtensions) -> String {
+        sink.inner
+            .turns
+            .lock()
+            .expect("turn map lock poisoned")
+            .get(&extension_key(extensions))
+            .expect("active trace exists")
+            .turn_id
+            .clone()
     }
 
     fn test_trace(

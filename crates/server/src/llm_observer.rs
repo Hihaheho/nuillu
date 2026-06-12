@@ -21,6 +21,9 @@ use nuillu_visualizer_protocol::{
 
 use crate::gui::VisualizerEventSink;
 
+const SUPERSEDED_TURN_MESSAGE: &str =
+    "superseded by a new LLM model input before terminal stream event";
+
 #[derive(Clone)]
 pub struct VisualizerLlmObserver {
     inner: Arc<VisualizerLlmObserverInner>,
@@ -83,18 +86,20 @@ impl VisualizerLlmObserver {
 
     fn turn_id_for(&self, extensions: &RequestExtensions, metadata: &LlmRequestMetadata) -> String {
         let key = extension_key(extensions);
-        let mut turns = self
-            .inner
-            .extension_turns
-            .lock()
-            .expect("server visualizer LLM turn map lock poisoned");
-        let turn_id = turns
-            .entry(key)
-            .or_insert_with(|| {
-                let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
-                format!("{}-llm-{next}", self.inner.tab_id)
-            })
-            .clone();
+        let turn_id = {
+            let mut turns = self
+                .inner
+                .extension_turns
+                .lock()
+                .expect("server visualizer LLM turn map lock poisoned");
+            turns
+                .entry(key)
+                .or_insert_with(|| {
+                    let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
+                    format!("{}-llm-{next}", self.inner.tab_id)
+                })
+                .clone()
+        };
         if let Some(activation_attempt) = metadata.activation_attempt {
             self.inner
                 .activation_attempt_turns
@@ -108,6 +113,36 @@ impl VisualizerLlmObserver {
         turn_id
     }
 
+    fn start_turn_for_model_input(
+        &self,
+        extensions: &RequestExtensions,
+        metadata: &LlmRequestMetadata,
+    ) -> (Option<String>, String) {
+        let key = extension_key(extensions);
+        let next = self.inner.next_turn.fetch_add(1, Ordering::Relaxed);
+        let turn_id = format!("{}-llm-{next}", self.inner.tab_id);
+        let superseded = self
+            .inner
+            .extension_turns
+            .lock()
+            .expect("server visualizer LLM turn map lock poisoned")
+            .insert(key, turn_id.clone());
+        if let Some(superseded) = &superseded {
+            self.remove_activation_mappings_for_turn(superseded);
+        }
+        if let Some(activation_attempt) = metadata.activation_attempt {
+            self.inner
+                .activation_attempt_turns
+                .lock()
+                .expect("server visualizer LLM activation turn map lock poisoned")
+                .insert(
+                    (metadata.owner.to_string(), activation_attempt),
+                    turn_id.clone(),
+                );
+        }
+        (superseded, turn_id)
+    }
+
     fn clear_turn_for(&self, extensions: &RequestExtensions) {
         let key = extension_key(extensions);
         self.inner
@@ -115,6 +150,14 @@ impl VisualizerLlmObserver {
             .lock()
             .expect("server visualizer LLM turn map lock poisoned")
             .remove(&key);
+    }
+
+    fn remove_activation_mappings_for_turn(&self, turn_id: &str) {
+        self.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("server visualizer LLM activation turn map lock poisoned")
+            .retain(|_, existing| existing != turn_id);
     }
 
     fn emit(&self, event: LlmObservationEvent) {
@@ -130,7 +173,13 @@ impl OnModelInput for VisualizerLlmObserver {
         let Some(metadata) = self.metadata(cx.extensions()) else {
             return;
         };
-        let turn_id = self.turn_id_for(cx.extensions(), metadata);
+        let (superseded, turn_id) = self.start_turn_for_model_input(cx.extensions(), metadata);
+        if let Some(turn_id) = superseded {
+            self.emit(LlmObservationEvent::Failed {
+                turn_id,
+                message: SUPERSEDED_TURN_MESSAGE.to_string(),
+            });
+        }
         self.emit(LlmObservationEvent::ModelInput {
             turn_id,
             owner: metadata.owner.to_string(),
@@ -645,5 +694,106 @@ pub(crate) fn usage_view(usage: Usage) -> LlmUsageView {
         cost_micros_usd: usage.cost_micros_usd,
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::mpsc;
+
+    use lutum::ModelInput;
+    use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_visualizer_protocol::VisualizerServerMessage;
+
+    #[tokio::test]
+    async fn model_input_supersedes_stale_turn_before_starting_new_turn() {
+        let (tx, rx) = mpsc::channel();
+        let observer =
+            VisualizerLlmObserver::new("server".to_string(), VisualizerEventSink::new(tx));
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+        let mut extensions = RequestExtensions::new();
+        extensions.insert(metadata(&owner, 1));
+
+        let first_input = ModelInput::new().user("first");
+        let first_cx =
+            ModelInputHookContext::new(&extensions, OperationKind::Completion, &first_input);
+        OnModelInput::call(&observer, &first_cx).await;
+
+        extensions.insert(metadata(&owner, 2));
+        let second_input = ModelInput::new().user("second");
+        let second_cx =
+            ModelInputHookContext::new(&extensions, OperationKind::Completion, &second_input);
+        OnModelInput::call(&observer, &second_cx).await;
+
+        let events = observed_events(&rx);
+        assert_eq!(events.len(), 3);
+
+        let first_turn_id = model_input_turn_id(&events[0]);
+        let failed_turn_id = failed_turn_id(&events[1]);
+        let second_turn_id = model_input_turn_id(&events[2]);
+
+        assert_eq!(failed_turn_id, first_turn_id);
+        assert_ne!(second_turn_id, first_turn_id);
+        assert_eq!(
+            failed_message(&events[1]).as_deref(),
+            Some(SUPERSEDED_TURN_MESSAGE)
+        );
+
+        let activation_turns = observer
+            .inner
+            .activation_attempt_turns
+            .lock()
+            .expect("activation turn map lock poisoned")
+            .clone();
+        assert!(!activation_turns.contains_key(&(owner.to_string(), 1)));
+        assert_eq!(
+            activation_turns.get(&(owner.to_string(), 2)),
+            Some(&second_turn_id)
+        );
+    }
+
+    fn metadata(owner: &ModuleInstanceId, activation_attempt: u32) -> LlmRequestMetadata {
+        LlmRequestMetadata {
+            owner: owner.clone(),
+            tier: ModelTier::Default,
+            source: LlmRequestSource::ModuleTurn,
+            session_key: None,
+            activation_attempt: Some(activation_attempt),
+            batch: None,
+        }
+    }
+
+    fn observed_events(rx: &mpsc::Receiver<VisualizerServerMessage>) -> Vec<LlmObservationEvent> {
+        rx.try_iter()
+            .map(|message| match message {
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::LlmObserved { event, .. },
+                } => event,
+                other => panic!("unexpected visualizer message: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn model_input_turn_id(event: &LlmObservationEvent) -> String {
+        match event {
+            LlmObservationEvent::ModelInput { turn_id, .. } => turn_id.clone(),
+            other => panic!("expected model input event: {other:?}"),
+        }
+    }
+
+    fn failed_turn_id(event: &LlmObservationEvent) -> String {
+        match event {
+            LlmObservationEvent::Failed { turn_id, .. } => turn_id.clone(),
+            other => panic!("expected failed event: {other:?}"),
+        }
+    }
+
+    fn failed_message(event: &LlmObservationEvent) -> Option<String> {
+        match event {
+            LlmObservationEvent::Failed { message, .. } => Some(message.clone()),
+            _ => None,
+        }
     }
 }
