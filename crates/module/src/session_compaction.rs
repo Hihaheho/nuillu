@@ -303,8 +303,9 @@ mod tests {
     use async_trait::async_trait;
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, MessageContent, MockLlmAdapter, MockTextScenario,
-        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+        ErasedTextTurnEventStream, FinishReason, MaxOutputTokens, MessageContent, MockLlmAdapter,
+        MockTextScenario, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
+        TurnAdapter, Usage,
     };
     use nuillu_types::ModelTier;
 
@@ -539,7 +540,9 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].config.generation.max_output_tokens,
-            Some(DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS)
+            Some(MaxOutputTokens::new(
+                DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS
+            ))
         );
     }
 

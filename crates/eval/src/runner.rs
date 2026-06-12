@@ -91,7 +91,7 @@ const EVAL_MEMO_RETAINED_PER_OWNER: usize = 8;
 const EVAL_COGNITION_LOG_RETAINED_ENTRIES: usize = 16;
 
 pub use nuillu_server::{
-    EmbeddingBackendConfig, LlmBackendConfig, model_concurrency_from_backends,
+    EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, model_concurrency_from_backends,
 };
 
 #[derive(Debug, Clone)]
@@ -7167,6 +7167,7 @@ mod tests {
             token: "local".to_string(),
             model: model.to_string(),
             reasoning_effort: None,
+            generation: LlmGenerationConfig::default(),
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
             max_concurrent_llm_calls: None,

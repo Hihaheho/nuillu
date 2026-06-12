@@ -15,9 +15,10 @@ pub mod state;
 pub const SERVER_TAB_ID: &str = "server";
 
 pub use config::{
-    DEFAULT_MODULES, EmbeddingBackendConfig, LlmBackendConfig, RuntimeModule, ServerBootConfig,
-    ServerConfig, ServerModelTier, ServerModuleGroup, ServerModuleSpec, default_run_id,
-    default_server_session_id, install_lutum_trace_subscriber, load_server_boot_config,
+    DEFAULT_MODULES, EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, RuntimeModule,
+    ServerBootConfig, ServerConfig, ServerModelTier, ServerModuleGroup, ServerModuleSpec,
+    default_run_id, default_server_session_id, install_lutum_trace_subscriber,
+    load_server_boot_config,
 };
 pub use environment::{
     build_embedder, build_lutum, build_model_handle, build_tiers, server_llm_log_context,

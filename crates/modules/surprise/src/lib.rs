@@ -371,9 +371,9 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
-        MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem, RawTextTurnEvent,
-        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MaxOutputTokens,
+        MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModuleConfig,
@@ -761,7 +761,7 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(
             turns[0].config.generation.max_output_tokens,
-            Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
+            Some(MaxOutputTokens::new(TOOL_TURN_MAX_OUTPUT_TOKENS))
         );
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 1);

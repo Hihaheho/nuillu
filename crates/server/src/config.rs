@@ -36,9 +36,31 @@ pub struct LlmBackendConfig {
     pub token: String,
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub generation: LlmGenerationConfig,
     pub use_responses_api: bool,
     pub compaction_input_token_threshold: u64,
     pub max_concurrent_llm_calls: Option<NonZeroUsize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, FromEure)]
+#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+pub struct LlmGenerationConfig {
+    #[eure(default)]
+    pub temperature: Option<f64>,
+    #[eure(default)]
+    pub top_p: Option<f64>,
+    #[eure(default)]
+    pub top_k: Option<u32>,
+    #[eure(default)]
+    pub frequency_penalty: Option<f64>,
+    #[eure(default)]
+    pub presence_penalty: Option<f64>,
+    #[eure(default)]
+    pub max_output_tokens: Option<u32>,
+    #[eure(default)]
+    pub seed: Option<u64>,
+    #[eure(default)]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]

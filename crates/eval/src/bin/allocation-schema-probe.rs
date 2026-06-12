@@ -10,8 +10,8 @@ use anyhow::Context as _;
 use clap::{Parser, ValueEnum};
 use futures::{StreamExt, stream};
 use lutum::{
-    GenerationParams, InputMessageRole, ModelInput, ModelInputItem, Temperature,
-    TextStepOutcomeWithTools,
+    GenerationParams, InputMessageRole, MaxOutputTokens, ModelInput, ModelInputItem, Seed,
+    Temperature, TextStepOutcomeWithTools,
 };
 use nuillu_eval::{install_lutum_trace_subscriber, parse_model_set_file, resolve_llm_backends};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -402,11 +402,9 @@ async fn main() -> anyhow::Result<()> {
     let concurrency_limit = backend
         .max_concurrent_llm_calls
         .map_or(1, NonZeroUsize::get);
-    let generation = GenerationParams {
-        temperature: Some(temperature),
-        max_output_tokens: Some(args.max_output_tokens),
-        seed: None,
-    };
+    let mut generation = GenerationParams::default();
+    generation.temperature = Some(temperature);
+    generation.max_output_tokens = Some(MaxOutputTokens::new(args.max_output_tokens));
 
     let module_schema = module_target_id_schema();
     let mut trials = Vec::new();
@@ -418,7 +416,7 @@ async fn main() -> anyhow::Result<()> {
         let module_schema = module_schema.clone();
         let lutum = &lutum;
         let mut generation = generation.clone();
-        generation.seed = Some(args.seed_base.saturating_add(trial as u64));
+        generation.seed = Some(Seed::new(args.seed_base.saturating_add(trial as u64)));
         async move {
             MODULE_TARGET_ID_SCHEMA
                 .scope(module_schema, run_trial(schema, trial, generation, lutum))

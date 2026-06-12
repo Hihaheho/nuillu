@@ -12,7 +12,7 @@ use nuillu_module::DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::config::LlmBackendConfig;
+use crate::config::{LlmBackendConfig, LlmGenerationConfig};
 
 const DEFAULT_OPENAI_COMPAT_ENDPOINT: &str = "http://localhost:11434/v1";
 const DEFAULT_OPENAI_COMPAT_TOKEN: &str = "local";
@@ -68,6 +68,8 @@ pub struct ModelDefinition {
     pub model: Option<String>,
     #[eure(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[eure(flatten)]
+    pub generation: LlmGenerationConfig,
     #[eure(default)]
     pub use_responses_api: Option<bool>,
     #[eure(default)]
@@ -94,6 +96,8 @@ pub struct TierBinding {
     pub model: String,
     #[eure(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[eure(flatten)]
+    pub generation: LlmGenerationConfig,
     #[eure(default)]
     pub compaction_input_token_threshold: Option<u64>,
 }
@@ -280,6 +284,7 @@ fn resolve_tier(
         (None, Some(model_key)) => Some(TierBinding {
             model: model_key.to_string(),
             reasoning_effort: None,
+            generation: LlmGenerationConfig::default(),
             compaction_input_token_threshold: None,
         }),
         (None, None) => return Ok(None),
@@ -305,7 +310,14 @@ fn resolve_tier(
         .ok_or_else(|| anyhow::anyhow!("models.{}.model must be set", binding.model))?
         .to_string();
     let reasoning_effort = binding.reasoning_effort.or(definition.reasoning_effort);
+    let generation = resolve_generation_config(&binding.generation, &definition.generation);
     let use_responses_api = definition.use_responses_api.unwrap_or(false);
+    if use_responses_api && generation.top_k.is_some() {
+        anyhow::bail!(
+            "{label} uses Responses API model `{}` with top-k",
+            binding.model
+        );
+    }
     let compaction_input_token_threshold = binding
         .compaction_input_token_threshold
         .or(definition.compaction_input_token_threshold)
@@ -318,10 +330,30 @@ fn resolve_tier(
         token,
         model: api_model,
         reasoning_effort,
+        generation,
         use_responses_api,
         compaction_input_token_threshold,
         max_concurrent_llm_calls: definition.max_concurrent_llm_calls(),
     }))
+}
+
+fn resolve_generation_config(
+    binding: &LlmGenerationConfig,
+    definition: &LlmGenerationConfig,
+) -> LlmGenerationConfig {
+    LlmGenerationConfig {
+        temperature: binding.temperature.or(definition.temperature),
+        top_p: binding.top_p.or(definition.top_p),
+        top_k: binding.top_k.or(definition.top_k),
+        frequency_penalty: binding.frequency_penalty.or(definition.frequency_penalty),
+        presence_penalty: binding.presence_penalty.or(definition.presence_penalty),
+        max_output_tokens: binding.max_output_tokens.or(definition.max_output_tokens),
+        seed: binding.seed.or(definition.seed),
+        stop_sequences: binding
+            .stop_sequences
+            .clone()
+            .or_else(|| definition.stop_sequences.clone()),
+    }
 }
 
 pub fn resolve_token_fields(
@@ -390,24 +422,28 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
         TierRole::Judge,
         model_set.judge.as_ref(),
         model_set.judge_model.as_deref(),
+        &model_set.models,
     )?;
     validate_tier_binding(
         path,
         TierRole::Cheap,
         model_set.cheap.as_ref(),
         model_set.cheap_model.as_deref(),
+        &model_set.models,
     )?;
     validate_tier_binding(
         path,
         TierRole::Default,
         model_set.default.as_ref(),
         model_set.default_model.as_deref(),
+        &model_set.models,
     )?;
     validate_tier_binding(
         path,
         TierRole::Premium,
         model_set.premium.as_ref(),
         model_set.premium_model.as_deref(),
+        &model_set.models,
     )?;
     validate_embedding_role(path, model_set.embedding.as_ref())
 }
@@ -449,6 +485,7 @@ fn validate_model_definition(
         &format!("{prefix}.model"),
         definition.model.as_deref(),
     )?;
+    validate_generation_config(path, &prefix, &definition.generation)?;
     if let Some(value) = definition.max_concurrent_llm_calls {
         if value == 0 {
             return Err(ModelSetError::Validation {
@@ -481,6 +518,7 @@ fn validate_tier_binding(
     role: TierRole,
     binding: Option<&TierBinding>,
     model_ref: Option<&str>,
+    models: &HashMap<String, ModelDefinition>,
 ) -> Result<(), ModelSetError> {
     let label = tier_label(role);
     if binding.is_some() && model_ref.is_some() {
@@ -491,6 +529,7 @@ fn validate_tier_binding(
     }
     let Some(binding) = binding else {
         validate_optional_text(path, &format!("{label}-model"), model_ref)?;
+        validate_responses_top_k(path, label, model_ref, None, models)?;
         return Ok(());
     };
     validate_optional_text(
@@ -498,12 +537,132 @@ fn validate_tier_binding(
         &format!("{label}.model"),
         Some(binding.model.as_str()),
     )?;
+    validate_generation_config(path, label, &binding.generation)?;
+    validate_responses_top_k(
+        path,
+        label,
+        Some(binding.model.as_str()),
+        Some(binding),
+        models,
+    )?;
     if binding.compaction_input_token_threshold == Some(0) {
         return Err(ModelSetError::Validation {
             path: path.to_path_buf(),
             message: format!(
                 "{label}.compaction-input-token-threshold must be greater than zero when set"
             ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_generation_config(
+    path: &Path,
+    prefix: &str,
+    generation: &LlmGenerationConfig,
+) -> Result<(), ModelSetError> {
+    validate_optional_float_range(
+        path,
+        &format!("{prefix}.temperature"),
+        generation.temperature,
+        0.0,
+        2.0,
+    )?;
+    validate_optional_float_range(path, &format!("{prefix}.top-p"), generation.top_p, 0.0, 1.0)?;
+    validate_optional_nonzero_u32(path, &format!("{prefix}.top-k"), generation.top_k)?;
+    validate_optional_float_range(
+        path,
+        &format!("{prefix}.frequency-penalty"),
+        generation.frequency_penalty,
+        -2.0,
+        2.0,
+    )?;
+    validate_optional_float_range(
+        path,
+        &format!("{prefix}.presence-penalty"),
+        generation.presence_penalty,
+        -2.0,
+        2.0,
+    )?;
+    validate_optional_nonzero_u32(
+        path,
+        &format!("{prefix}.max-output-tokens"),
+        generation.max_output_tokens,
+    )?;
+    if let Some(sequences) = generation.stop_sequences.as_ref() {
+        if sequences.is_empty() {
+            return Err(ModelSetError::Validation {
+                path: path.to_path_buf(),
+                message: format!("{prefix}.stop-sequences must not be empty when present"),
+            });
+        }
+        for (index, sequence) in sequences.iter().enumerate() {
+            validate_optional_text(
+                path,
+                &format!("{prefix}.stop-sequences[{index}]"),
+                Some(sequence.as_str()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_float_range(
+    path: &Path,
+    field: &str,
+    value: Option<f64>,
+    min: f64,
+    max: f64,
+) -> Result<(), ModelSetError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || value < min || value > max {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{field} must be in the range [{min}, {max}]"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_nonzero_u32(
+    path: &Path,
+    field: &str,
+    value: Option<u32>,
+) -> Result<(), ModelSetError> {
+    if value == Some(0) {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{field} must be greater than zero when set"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_responses_top_k(
+    path: &Path,
+    label: &str,
+    model_ref: Option<&str>,
+    binding: Option<&TierBinding>,
+    models: &HashMap<String, ModelDefinition>,
+) -> Result<(), ModelSetError> {
+    let Some(model_key) = model_ref else {
+        return Ok(());
+    };
+    let Some(definition) = models.get(model_key) else {
+        return Ok(());
+    };
+    if definition.use_responses_api != Some(true) {
+        return Ok(());
+    }
+    let resolved_top_k = binding
+        .and_then(|binding| binding.generation.top_k)
+        .or(definition.generation.top_k);
+    if resolved_top_k.is_some() {
+        return Err(ModelSetError::Validation {
+            path: path.to_path_buf(),
+            message: format!("{label} uses Responses API model `{model_key}` with top-k"),
         });
     }
     Ok(())
@@ -644,6 +803,157 @@ premium {
             resolved.cheap.max_concurrent_llm_calls,
             NonZeroUsize::new(2)
         );
+    }
+
+    #[test]
+    fn parses_model_generation_defaults() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    temperature = 0.2
+    top-p = 0.9
+    top-k = 40
+    frequency-penalty = 0.1
+    presence-penalty = -0.2
+    max-output-tokens = 256
+    seed = 42
+    stop-sequences = ["END", "STOP"]
+  }
+}
+
+cheap-model = "gemma4"
+default-model = "gemma4"
+premium-model = "gemma4"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(
+            resolved.cheap.generation,
+            LlmGenerationConfig {
+                temperature: Some(0.2),
+                top_p: Some(0.9),
+                top_k: Some(40),
+                frequency_penalty: Some(0.1),
+                presence_penalty: Some(-0.2),
+                max_output_tokens: Some(256),
+                seed: Some(42),
+                stop_sequences: Some(vec!["END".to_string(), "STOP".to_string()]),
+            }
+        );
+    }
+
+    #[test]
+    fn tier_generation_defaults_override_model_definition() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    temperature = 0.7
+    top-p = 0.8
+    max-output-tokens = 512
+  }
+}
+
+cheap {
+  model = "gemma4"
+  temperature = 0.1
+  max-output-tokens = 128
+}
+
+default-model = "gemma4"
+premium-model = "gemma4"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert_eq!(resolved.cheap.generation.temperature, Some(0.1));
+        assert_eq!(resolved.cheap.generation.top_p, Some(0.8));
+        assert_eq!(resolved.cheap.generation.max_output_tokens, Some(128));
+        assert_eq!(resolved.default.generation.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn rejects_generation_default_out_of_range() {
+        let error = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    top-p = 1.5
+  }
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("models.gemma4.top-p must be in the range")
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_generation_stop_sequences() {
+        let error = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+    stop-sequences = []
+  }
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("models.gemma4.stop-sequences must not be empty")
+        ));
+    }
+
+    #[test]
+    fn rejects_responses_api_tier_with_top_k() {
+        let error = parse_model_set(
+            r#"
+models {
+  gpt5-nano {
+    endpoint = "https://api.openai.com/v1"
+    token = "local"
+    model = "gpt-5.4-nano"
+    use-responses-api = true
+  }
+}
+
+cheap {
+  model = "gpt5-nano"
+  top-k = 40
+}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("cheap uses Responses API model `gpt5-nano` with top-k")
+        ));
     }
 
     #[test]

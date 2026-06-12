@@ -1020,8 +1020,8 @@ mod tests {
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MessageContent,
-        MockLlmAdapter, MockTextScenario, ModelInputItem, RawTextTurnEvent,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, Lutum, MaxOutputTokens,
+        MessageContent, MockLlmAdapter, MockTextScenario, ModelInputItem, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
@@ -1528,7 +1528,7 @@ mod tests {
                 assert_eq!(turns.len(), 1);
                 assert_eq!(
                     turns[0].config.generation.max_output_tokens,
-                    Some(TOOL_TURN_MAX_OUTPUT_TOKENS)
+                    Some(MaxOutputTokens::new(TOOL_TURN_MAX_OUTPUT_TOKENS))
                 );
             })
             .await;

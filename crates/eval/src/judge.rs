@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lutum::{
-    GenerationParams, Lutum, ModelInput, RequestBudget, StructuredTurnOutcome, Temperature,
+    GenerationParams, Lutum, MaxOutputTokens, ModelInput, RequestBudget, StructuredTurnOutcome,
+    Temperature,
 };
 use lutum_eval::{FieldValue, TraceSnapshot};
 use schemars::JsonSchema;
@@ -123,7 +124,7 @@ impl RubricJudge for LlmRubricJudge {
             request.judge_max_output_tokens
         };
         let mut generation = GenerationParams::default();
-        generation.max_output_tokens = Some(max_output_tokens);
+        generation.max_output_tokens = Some(MaxOutputTokens::new(max_output_tokens));
         if let Some(temperature) = self.options.temperature {
             let temperature = Temperature::new(temperature)
                 .map_err(|_| RubricJudgeError::InvalidTemperature(temperature))?;

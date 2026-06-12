@@ -5,14 +5,15 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use lutum::{
-    Lutum, ModelName, RawTelemetryConfig, RequestExtensions, SharedPoolBudgetManager,
-    SharedPoolBudgetOptions,
+    FrequencyPenalty, Lutum, MaxOutputTokens, ModelName, PresencePenalty, RawTelemetryConfig,
+    RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
+    Temperature, TopK, TopP,
 };
 use lutum_libsql_adapter::{
     EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlLlmTranscriptStore,
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
-use lutum_openai::{OpenAiAdapter, OpenAiReasoningEffort};
+use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
 use nuillu_memory::{MemoryCapabilities, MemoryStore};
@@ -30,7 +31,7 @@ use nuillu_visualizer_protocol::{
 };
 
 use super::SERVER_TAB_ID;
-use super::config::{EmbeddingBackendConfig, LlmBackendConfig, ServerConfig};
+use super::config::{EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, ServerConfig};
 use super::gui::VisualizerEventSink;
 use super::llm_db_trace::DbLlmTraceSink;
 use super::llm_observer::VisualizerLlmObserver;
@@ -292,9 +293,12 @@ pub fn build_lutum_with_file_trace(
     file_trace_sink: Option<FileLlmTraceSink>,
     db_trace_sink: Option<DbLlmTraceSink>,
 ) -> anyhow::Result<Lutum> {
+    let feature_flags = FeatureFlags::OPENAI
+        .with_top_k(config.generation.top_k.is_some() && !config.use_responses_api);
     let adapter = OpenAiAdapter::new(config.token.clone())
         .with_base_url(config.endpoint.clone())
         .with_default_model(ModelName::new(&config.model)?)
+        .with_feature_flags(feature_flags)
         .with_resolve_reasoning_effort(ConfiguredReasoningEffort);
     let adapter = if config.use_responses_api {
         adapter
@@ -315,12 +319,57 @@ pub fn build_lutum_with_file_trace(
     if let Some(observer) = llm_observer {
         lutum.extend_hooks(observer.hook_set());
     }
+    let lutum = apply_generation_defaults(lutum, &config.generation)?;
     Ok(match config.reasoning_effort {
         Some(reasoning_effort) => {
             lutum.with_extension(ReasoningEffortConfig(reasoning_effort.into()))
         }
         None => lutum,
     })
+}
+
+fn apply_generation_defaults(
+    mut lutum: Lutum,
+    generation: &LlmGenerationConfig,
+) -> anyhow::Result<Lutum> {
+    if let Some(value) = generation.temperature {
+        lutum = lutum.with_generation_param(
+            Temperature::new(value as f32)
+                .with_context(|| format!("invalid temperature {value}"))?,
+        );
+    }
+    if let Some(value) = generation.top_p {
+        lutum = lutum.with_generation_param(
+            TopP::new(value as f32).with_context(|| format!("invalid top-p {value}"))?,
+        );
+    }
+    if let Some(value) = generation.top_k {
+        lutum = lutum.with_generation_param(
+            TopK::new(value).with_context(|| format!("invalid top-k {value}"))?,
+        );
+    }
+    if let Some(value) = generation.frequency_penalty {
+        lutum = lutum.with_generation_param(
+            FrequencyPenalty::new(value as f32)
+                .with_context(|| format!("invalid frequency-penalty {value}"))?,
+        );
+    }
+    if let Some(value) = generation.presence_penalty {
+        lutum = lutum.with_generation_param(
+            PresencePenalty::new(value as f32)
+                .with_context(|| format!("invalid presence-penalty {value}"))?,
+        );
+    }
+    if let Some(value) = generation.max_output_tokens {
+        lutum = lutum.with_generation_param(MaxOutputTokens::new(value));
+    }
+    if let Some(value) = generation.seed {
+        lutum = lutum.with_generation_param(Seed::new(value));
+    }
+    if let Some(value) = generation.stop_sequences.as_ref() {
+        lutum = lutum.with_generation_param(StopSequences::new(value.clone()));
+    }
+    Ok(lutum)
 }
 
 pub fn server_llm_log_context(config: &ServerConfig) -> LlmLogContext {
@@ -472,6 +521,7 @@ mod tests {
             token: "local".to_string(),
             model: "model".to_string(),
             reasoning_effort: None,
+            generation: LlmGenerationConfig::default(),
             use_responses_api: false,
             compaction_input_token_threshold: 16_000,
             max_concurrent_llm_calls: None,
@@ -498,6 +548,50 @@ mod tests {
 
         assert_eq!(context.root, PathBuf::from("llm-logs"));
         assert_eq!(context.namespace, vec!["session-1"]);
+    }
+
+    #[test]
+    fn build_lutum_attaches_generation_defaults() {
+        let mut backend = test_backend_config();
+        backend.generation = LlmGenerationConfig {
+            temperature: Some(0.3),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(-0.1),
+            max_output_tokens: Some(256),
+            seed: Some(7),
+            stop_sequences: Some(vec!["END".to_string()]),
+        };
+
+        let lutum = build_lutum(&backend, None).unwrap();
+        let extensions = lutum.default_extensions();
+
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::Temperature>>(),
+            Some(lutum::GenerationSetting::Set(value)) if value.get() == 0.3
+        ));
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::TopP>>(),
+            Some(lutum::GenerationSetting::Set(value)) if value.get() == 0.8
+        ));
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::TopK>>(),
+            Some(lutum::GenerationSetting::Set(value)) if value.get() == 40
+        ));
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::MaxOutputTokens>>(),
+            Some(lutum::GenerationSetting::Set(value)) if value.get() == 256
+        ));
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::Seed>>(),
+            Some(lutum::GenerationSetting::Set(value)) if value.get() == 7
+        ));
+        assert!(matches!(
+            extensions.get::<lutum::GenerationSetting<lutum::StopSequences>>(),
+            Some(lutum::GenerationSetting::Set(value))
+                if value.as_slice().len() == 1 && value.as_slice()[0] == "END"
+        ));
     }
 
     #[test]
