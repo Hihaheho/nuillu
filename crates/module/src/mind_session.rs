@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub const REASONING_SYSTEM_PROMPT: &str =
-    "Reason extremely concisely. Keep reasoning within 128 tokens.";
+    "Reason extremely concisely in at most 4 sentences and within 128 tokens.";
 
 pub fn format_persistent_system_seed(
     system_prompt: impl Into<String>,
