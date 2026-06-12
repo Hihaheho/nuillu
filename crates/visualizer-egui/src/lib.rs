@@ -77,16 +77,22 @@ fn install_visualizer_fonts(ctx: &egui::Context) {
         return;
     };
 
+    ctx.set_fonts(visualizer_font_definitions(font_data));
+}
+
+fn visualizer_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
         .insert(NOTO_SANS_JP_FONT_KEY.to_owned(), Arc::new(font_data));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, NOTO_SANS_JP_FONT_KEY.to_owned());
+    }
     fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, NOTO_SANS_JP_FONT_KEY.to_owned());
-    ctx.set_fonts(fonts);
 }
 
 fn load_noto_sans_jp() -> Option<egui::FontData> {
@@ -1056,5 +1062,22 @@ mod tests {
             tab.scene.scene_view().derived_ambient[0].id,
             "scene:person:person-1"
         );
+    }
+
+    #[test]
+    fn visualizer_fonts_prioritize_noto_for_proportional_and_monospace_text() {
+        let fonts = visualizer_font_definitions(egui::FontData::from_owned(Vec::new()));
+
+        assert!(fonts.font_data.contains_key(NOTO_SANS_JP_FONT_KEY));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            assert_eq!(
+                fonts
+                    .families
+                    .get(&family)
+                    .and_then(|families| families.first())
+                    .map(String::as_str),
+                Some(NOTO_SANS_JP_FONT_KEY)
+            );
+        }
     }
 }
