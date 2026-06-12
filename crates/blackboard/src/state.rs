@@ -166,6 +166,7 @@ pub struct ModuleRunStatusRecord {
 pub enum UtteranceProgressState {
     Streaming,
     Completed,
+    Aborted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -205,6 +206,21 @@ impl UtteranceProgress {
             sequence,
             target: target.into(),
             partial_utterance: utterance.into(),
+        }
+    }
+
+    pub fn aborted(
+        generation_id: u64,
+        sequence: u32,
+        target: impl Into<String>,
+        partial_utterance: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: UtteranceProgressState::Aborted,
+            generation_id,
+            sequence,
+            target: target.into(),
+            partial_utterance: partial_utterance.into(),
         }
     }
 }

@@ -5360,32 +5360,32 @@ fn register_eval_module(
                         let utterance_sink = utterance_sink.clone();
                         async move {
                             Ok(nuillu_speak::SpeakModule::new(
-                                caps.cognition_log_updated_inbox(),
-                                caps.cognition_log_reader(),
-                                caps.memo(),
-                                UtteranceWriter::new(
-                                    caps.owner().clone(),
-                                    caps.blackboard(),
-                                    utterance_sink.clone(),
-                                    caps.clock(),
-                                ),
-                                caps.llm_access(),
-                                caps.scene_reader(),
-                                caps.session("planning")
-                                    .with_auto_compaction(
-                                        nuillu_speak::planning_session_auto_compaction(),
-                                    )
-                                    .await?,
-                                caps.session("generation")
-                                    .with_auto_compaction(
-                                        nuillu_speak::generation_session_auto_compaction(),
-                                    )
-                                    .await?,
-                                caps.session("abort-judge")
-                                    .with_auto_compaction(
-                                        nuillu_speak::abort_judge_session_auto_compaction(),
-                                    )
-                                    .await?,
+                                nuillu_speak::SpeakModuleParts {
+                                    cognition_updates: caps.cognition_log_updated_inbox(),
+                                    cognition_log: caps.cognition_log_reader(),
+                                    memo: caps.memo(),
+                                    utterance: UtteranceWriter::new(
+                                        caps.owner().clone(),
+                                        caps.blackboard(),
+                                        utterance_sink.clone(),
+                                        caps.clock(),
+                                    ),
+                                    llm: caps.llm_access(),
+                                    scene: caps.scene_reader(),
+                                    clock: caps.clock(),
+                                    planning_session: caps
+                                        .session("planning")
+                                        .with_auto_compaction(
+                                            nuillu_speak::planning_session_auto_compaction(),
+                                        )
+                                        .await?,
+                                    generation_session: caps
+                                        .session("generation")
+                                        .with_auto_compaction(
+                                            nuillu_speak::generation_session_auto_compaction(),
+                                        )
+                                        .await?,
+                                },
                             ))
                         }
                     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use lutum::{
-    FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent, Session,
+    FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
     SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
 };
 use nuillu_blackboard::Blackboard;
@@ -13,10 +13,6 @@ use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
 use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, Module};
 
 use crate::utterance::{Utterance, UtteranceSink};
-
-pub(crate) fn test_session() -> Session {
-    Session::new()
-}
 
 pub(crate) fn test_caps_with_adapter(
     blackboard: Blackboard,
