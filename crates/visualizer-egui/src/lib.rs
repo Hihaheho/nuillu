@@ -365,6 +365,7 @@ pub struct RuntimeTab {
     resource_monitor: resource_monitor::ResourceMonitorState,
     runtime_events: VecDeque<RuntimeEvent>,
     errors: VecDeque<VisualizerErrorView>,
+    session_error_count: u32,
     logs: VecDeque<String>,
     window_open: BTreeMap<String, bool>,
     window_requests: BTreeMap<String, bool>,
@@ -401,6 +402,7 @@ impl RuntimeTab {
             resource_monitor: resource_monitor::ResourceMonitorState::default(),
             runtime_events: VecDeque::new(),
             errors: VecDeque::new(),
+            session_error_count: 0,
             logs: VecDeque::new(),
             window_open: BTreeMap::new(),
             window_requests: BTreeMap::new(),
@@ -625,7 +627,14 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&errors_id))
             .default_pos(24.0, 1020.0)
             .default_size(640.0, 360.0)
-            .show(ui, |ui| errors::ui(ui, &mut self.errors));
+            .show(ui, |ui| {
+                errors::ui(
+                    ui,
+                    &mut self.errors,
+                    self.session_error_count,
+                    self.modules.session_request_count(),
+                )
+            });
         self.record_window_open(errors_id, open);
 
         let logs_id = format!("{base}:logs");
@@ -772,6 +781,7 @@ impl RuntimeTab {
     }
 
     fn push_error(&mut self, error: VisualizerErrorView) {
+        self.session_error_count = self.session_error_count.saturating_add(1);
         self.errors.push_back(error);
         if self.errors.len() > 256 {
             self.errors.pop_front();
@@ -1011,6 +1021,7 @@ mod tests {
 
         let tab = state.tabs().get(&tab_id).expect("tab exists");
         assert_eq!(tab.errors.len(), 1);
+        assert_eq!(tab.session_error_count, 1);
         assert_eq!(state.selected.as_ref(), Some(&tab_id));
         assert_eq!(tab.window_requests.get("case-1:errors"), Some(&true));
     }

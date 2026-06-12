@@ -31,6 +31,7 @@ pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
     turn_to_owner: BTreeMap<String, String>,
     turn_order: Vec<String>,
+    session_request_count: u32,
 }
 
 impl ModulesState {
@@ -50,6 +51,10 @@ impl ModulesState {
             .into_iter()
             .collect()
     }
+
+    pub fn session_request_count(&self) -> u32 {
+        self.session_request_count
+    }
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +69,7 @@ pub struct ModuleState {
     pub last_throttle: Option<ThrottleSummary>,
     pub latest_batch: Option<ModuleBatchDebugState>,
     pub error_count: u32,
+    pub session_request_count: u32,
     pub last_execution_failed: bool,
 }
 
@@ -148,6 +154,7 @@ pub struct ModuleOverviewRow {
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
     pub error_count: u32,
+    pub session_request_count: u32,
     pub last_execution_failed: bool,
 }
 
@@ -327,8 +334,15 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             items,
             ..
         } => {
-            record_turn_owner(state, &turn_id, &owner);
+            let new_turn = record_turn_owner(state, &turn_id, &owner);
+            if new_turn {
+                state.session_request_count = state.session_request_count.saturating_add(1);
+            }
             let module_state = module_mut_with_metadata(state, owner, module, replica);
+            if new_turn {
+                module_state.session_request_count =
+                    module_state.session_request_count.saturating_add(1);
+            }
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
             let batch = module_state.latest_batch.clone();
@@ -564,6 +578,7 @@ pub fn overview_rows(
         row.throttle = module.last_throttle.as_ref().map(throttle_label);
         row.latest_llm_output = latest_llm_output(module);
         row.error_count = module.error_count;
+        row.session_request_count = module.session_request_count;
         row.last_execution_failed = module.last_execution_failed;
     }
 
@@ -1156,7 +1171,7 @@ const TIER_COLUMN_WIDTH: f32 = 60.0;
 const BPM_COLUMN_WIDTH: f32 = 30.0;
 const PERIOD_COLUMN_WIDTH: f32 = 40.0;
 const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
-const ERRORS_COLUMN_WIDTH: f32 = 44.0;
+const ERRORS_COLUMN_WIDTH: f32 = 64.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
 const CONFIG_POPUP_WIDTH: f32 = 310.0;
 const CONFIG_POPUP_ESTIMATED_HEIGHT: f32 = 160.0;
@@ -1248,7 +1263,17 @@ fn overview_row(
             );
             overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
             overview_llm_status_cell(ui, row);
-            overview_label_cell(ui, &row.error_count.to_string(), None, ERRORS_COLUMN_WIDTH);
+            let error_count_label = overview_error_count_label(row);
+            let error_count_hover = format!(
+                "{} errors / {} module LLM requests in this visualizer session",
+                row.error_count, row.session_request_count
+            );
+            overview_label_cell(
+                ui,
+                &error_count_label,
+                Some(&error_count_hover),
+                ERRORS_COLUMN_WIDTH,
+            );
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
             overview_latest_output_cell(ui, output, row.latest_llm_output.as_deref());
         });
@@ -1689,6 +1714,7 @@ fn upsert_overview_row<'a>(
             throttle: None,
             latest_llm_output: None,
             error_count: 0,
+            session_request_count: 0,
             last_execution_failed: false,
         });
     if !module.is_empty() {
@@ -1723,6 +1749,10 @@ fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
         || row.error_count > 0
         || row.last_execution_failed
         || !matches!(row.runtime_status.as_str(), "Inactive" | "not reported")
+}
+
+fn overview_error_count_label(row: &ModuleOverviewRow) -> String {
+    format!("{}/{}", row.error_count, row.session_request_count)
 }
 
 fn active_replica_highlight(row: &ModuleOverviewRow) -> Option<ActiveReplicaHighlight> {
@@ -1958,13 +1988,15 @@ fn tool_call_source(name: &str, id: &str) -> String {
     format!("{name}({id})")
 }
 
-fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) {
-    if !state.turn_to_owner.contains_key(turn_id) {
+fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) -> bool {
+    let new_turn = !state.turn_to_owner.contains_key(turn_id);
+    if new_turn {
         state.turn_order.push(turn_id.to_string());
     }
     state
         .turn_to_owner
         .insert(turn_id.to_string(), owner.to_string());
+    new_turn
 }
 
 fn module_turn_label_module(module: &ModuleState) -> String {
@@ -2233,6 +2265,7 @@ mod tests {
             throttle: None,
             latest_llm_output: None,
             error_count: 0,
+            session_request_count: 0,
             last_execution_failed: false,
         }
     }
@@ -3419,6 +3452,113 @@ mod tests {
     }
 
     #[test]
+    fn model_input_events_count_module_and_session_requests() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamStarted {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                request_id: Some("req-1".to_string()),
+                model: "model-a".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "memory-turn".to_string(),
+                owner: "memory".to_string(),
+                module: "memory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+
+        assert_eq!(state.session_request_count(), 2);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::LlmAccessed {
+                sequence: 0,
+                call: 0,
+                owner: ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO),
+                tier: nuillu_types::ModelTier::Default,
+            },
+        );
+        assert_eq!(state.session_request_count(), 2);
+
+        let snapshot = BlackboardSnapshot {
+            allocation: vec![AllocationView {
+                module: "sensory".to_string(),
+                activation_ratio: 0.25,
+                active_replicas: 1,
+                bpm: None,
+                period_ms: None,
+                tier: "Default".to_string(),
+                guidance: String::new(),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+        let rows = overview_rows(&state, &snapshot);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == "predict")
+                .map(|row| row.session_request_count),
+            Some(1)
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == "memory")
+                .map(|row| row.session_request_count),
+            Some(1)
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == "sensory")
+                .map(|row| row.session_request_count),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn transcript_snapshot_failed_turn_does_not_mark_module_currently_failed() {
         let mut state = ModulesState::default();
 
@@ -3459,6 +3599,7 @@ mod tests {
         assert_eq!(module.status, ModuleSessionStatus::Idle);
         assert_eq!(module.runtime_status, None);
         assert_eq!(module.error_count, 0);
+        assert_eq!(state.session_request_count(), 0);
         assert!(!module.last_execution_failed);
         assert_eq!(module.last_tier, None);
 
@@ -3477,6 +3618,7 @@ mod tests {
         assert_eq!(overview.len(), 1);
         assert_eq!(overview[0].llm_status, "idle");
         assert_eq!(overview[0].error_count, 0);
+        assert_eq!(overview[0].session_request_count, 0);
         assert!(!overview[0].last_execution_failed);
         assert_eq!(overview_row_fill_kind(&overview[0], 0), None);
     }
@@ -3762,6 +3904,7 @@ mod tests {
                 throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
                 error_count: 0,
+                session_request_count: 1,
                 last_execution_failed: false,
             }]
         );
@@ -3788,6 +3931,7 @@ mod tests {
             throttle: None,
             latest_llm_output: None,
             error_count: 0,
+            session_request_count: 0,
             last_execution_failed: false,
         };
 

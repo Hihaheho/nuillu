@@ -4,18 +4,25 @@ use nuillu_visualizer_protocol::VisualizerErrorView;
 
 use crate::text::wrapped_label;
 
-pub fn ui(ui: &mut egui::Ui, errors: &mut VecDeque<VisualizerErrorView>) {
+pub fn ui(
+    ui: &mut egui::Ui,
+    errors: &mut VecDeque<VisualizerErrorView>,
+    session_error_count: u32,
+    request_count: u32,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.heading("Errors");
-        ui.label(format!("count: {}", errors.len()));
-        if ui.button("Clear").clicked() {
+        ui.label(format!("session: {session_error_count}/{request_count}"))
+            .on_hover_text("errors / LLM requests in this visualizer session");
+        ui.label(format!("shown: {}", errors.len()));
+        if ui.button("Clear list").clicked() {
             errors.clear();
         }
     });
     ui.separator();
 
     if errors.is_empty() {
-        ui.label("No errors reported.");
+        ui.label("No errors shown.");
         return;
     }
 
