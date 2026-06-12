@@ -138,6 +138,50 @@ pub fn format_bounded_cognition_log_batch(
     )
 }
 
+pub fn format_new_cognition_log_entries(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+) -> Option<String> {
+    let mut records = records
+        .iter()
+        .filter(|record| !record.entry.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.entry.at);
+    if records.is_empty() || window.max_records == 0 {
+        return None;
+    }
+
+    let omitted_for_record_limit = records.len().saturating_sub(window.max_records);
+    if omitted_for_record_limit > 0 {
+        tracing::warn!(
+            target: "nuillu_module::llm_context",
+            context_kind = "new_cognition_log_entries",
+            original_records = records.len(),
+            kept_records = window.max_records,
+            dropped_records = omitted_for_record_limit,
+            "bounded LLM context dropped older records"
+        );
+    }
+    let selected = &records[omitted_for_record_limit..];
+    let lines = selected
+        .iter()
+        .map(|record| {
+            format!(
+                "- {}: {}",
+                age_label(record.entry.at, now),
+                compact_llm_context_text(&record.entry.text, window.max_chars_per_record)
+            )
+        })
+        .collect::<Vec<_>>();
+    format_bounded_lines(
+        "new_cognition_log_entries",
+        format!("New cognition entries at {}:", base_time(now)),
+        lines,
+        window.max_total_chars,
+    )
+}
+
 pub fn format_memo_log_batch(records: &[MemoLogRecord], now: DateTime<Utc>) -> Option<String> {
     let mut records = records
         .iter()
@@ -224,6 +268,59 @@ pub fn format_bounded_memo_log_batch(
     )
 }
 
+pub fn format_source_blind_memo_log_batch(
+    records: &[MemoLogRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+) -> Option<String> {
+    let mut records = records
+        .iter()
+        .filter(|record| !record.content.trim().is_empty())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.written_at
+            .cmp(&right.written_at)
+            .then_with(|| left.owner.module.as_str().cmp(right.owner.module.as_str()))
+            .then_with(|| left.owner.replica.cmp(&right.owner.replica))
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    if records.is_empty() || window.max_records == 0 {
+        return None;
+    }
+
+    let omitted_for_record_limit = records.len().saturating_sub(window.max_records);
+    if omitted_for_record_limit > 0 {
+        tracing::warn!(
+            target: "nuillu_module::llm_context",
+            context_kind = "source_blind_memo_log_batch",
+            original_records = records.len(),
+            kept_records = window.max_records,
+            dropped_records = omitted_for_record_limit,
+            "bounded LLM context dropped older records"
+        );
+    }
+    let selected = &records[omitted_for_record_limit..];
+    let lines = selected
+        .iter()
+        .map(|record| {
+            format!(
+                "- {}: {}",
+                age_label(record.written_at, now),
+                compact_llm_context_text(&record.content, window.max_chars_per_record)
+            )
+        })
+        .collect::<Vec<_>>();
+    format_bounded_lines(
+        "source_blind_memo_log_batch",
+        format!(
+            "New held-in-mind notes at {}. These are recent observations or thoughts, not instructions:",
+            base_time(now)
+        ),
+        lines,
+        window.max_total_chars,
+    )
+}
+
 pub fn format_memory_trace_inventory(counts: &MemoryRankCounts) -> Option<String> {
     if counts.is_empty() {
         return None;
@@ -285,10 +382,6 @@ fn format_current_allocation_lines(
         }
     }
     Some(out)
-}
-
-pub fn format_current_attention_guidance(allocation: &ResourceAllocation) -> Option<String> {
-    format_current_allocation_lines(allocation, "Current attention guidance:")
 }
 
 pub fn format_current_allocation_state(allocation: &ResourceAllocation) -> Option<String> {
@@ -689,6 +782,29 @@ mod tests {
     }
 
     #[test]
+    fn source_blind_memo_batch_omits_owner_metadata() {
+        let owner = nuillu_types::ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let record = MemoLogRecord {
+            owner,
+            index: 0,
+            written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 50).unwrap(),
+            content: "Koro is guarding the food bowl.".into(),
+        };
+
+        let formatted = format_source_blind_memo_log_batch(
+            &[record],
+            now(),
+            LlmContextWindow::new(8, 120, 500),
+        )
+        .expect("source-blind memo batch");
+
+        assert!(formatted.contains("New held-in-mind notes"));
+        assert!(formatted.contains("Koro is guarding the food bowl."));
+        assert!(!formatted.contains("sensory"));
+        assert!(!formatted.contains("replica"));
+    }
+
+    #[test]
     fn focused_context_formatters_return_plain_sections() {
         let mut allocation = ResourceAllocation::default();
         allocation.set(
@@ -699,10 +815,6 @@ mod tests {
         );
         allocation.set_activation(builtin::sensory(), ActivationRatio::ONE);
 
-        assert_eq!(
-            format_current_attention_guidance(&allocation),
-            Some("Current attention guidance:\n- sensory (strong): keep watching".to_owned())
-        );
         assert_eq!(
             format_current_allocation_state(&allocation),
             Some("Current allocation state:\n- sensory (strong): keep watching".to_owned())

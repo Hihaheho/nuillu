@@ -165,7 +165,7 @@ admitted surface rather than racing ahead of late evidence memos.
 | sensory | — | — | ✓ | ✓ | ✓ | ✓ | `SensoryInputInbox` |
 | cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
 | allocation | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `InteroceptiveReader`, `AllocationWriter` |
-| attention-schema | ✓ | ✓ | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
+| attention-schema | ✓ | ✓ | — | — | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemorySearcher` |
 | memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
@@ -181,7 +181,7 @@ admitted surface rather than racing ahead of late evidence memos.
 
 Notable absences:
 
-- The attention schema module has no memo, self-model inbox, allocation-write path, or memory-write path. Its durable output is limited to first-person attention experience entries in the cognition log.
+- The attention schema module has no memo, self-model inbox, allocation-read/write path, or memory-write path. Its durable output is limited to first-person attention experience entries in the cognition log.
 - The self-model module handles controller self-model guidance, but has no cognition-log-write, allocation-write, or memory-write path.
 - Query modules receive controller guidance, not self-model requests, and do not perform self-model integration.
 - The sensory module is the app-facing observation boundary; it cannot write cognition-log entries, publish work requests, or emit utterances.
@@ -241,9 +241,9 @@ Allocation uses guidance rather than request/response correlation. For example, 
 
 ### Attention Schema
 
-Reads unread memo-log entries into a persistent LLM session, plus current allocation and cognition log, to decide whether the current attention state should become admitted cognitive evidence. When a new, claimable, cognitively useful attention experience exists, it appends a concise first-person cognition-log entry through a plaintext tool call. When nothing new should be admitted, it calls no tool and writes nothing.
+Reads only the unread memo-log and cognition-log deltas collected for the current activation into a persistent LLM session. Those deltas are rendered source-blind: module owners, replicas, and allocation guidance are not shown. The persistent session history carries prior attention context, while each new activation turn contains only newly collected notes and cognition entries. When a new, claimable, cognitively useful attention experience exists, it appends a concise first-person cognition-log entry through a plaintext tool call. When nothing new should be admitted, it calls the no-change tool and writes nothing.
 
-The attention schema is not a self-model and does not answer self-model guidance. It assumes a non-physical experiencer that can direct attention to any target and freely control that attention, but its appended text should avoid mechanical internals and decision noise. It may diverge from the controller's internal allocation state; that gap is part of the architecture.
+The attention schema is not a self-model and does not answer self-model guidance. It assumes a non-physical experiencer that can direct attention to any target and freely control that attention, but its appended text should avoid mechanical internals and decision noise. It may diverge from the controller's internal allocation state because it does not inspect allocation guidance directly; that gap is part of the architecture.
 
 ### Self Model
 

@@ -44,7 +44,7 @@ crates/
     sensory/                  # observations -> deterministic salience + LLM-filtered memo logs
     cognition-gate/           # non-cognitive snapshot -> cognition log
     allocation/     # cognition log -> resource allocation
-    attention-schema/         # memo logs/allocation/cognition log -> first-person attention cognition-log entries
+    attention-schema/         # source-blind memo/cognition deltas -> first-person attention cognition-log entries
     self-model/               # attention-schema cognition log + memo logs -> self-model memo logs
     query-memory/             # blackboard/vector memory RAG -> query-memory memo logs
     memory/                   # blackboard snapshot -> memory inserts (access-reinforced; rank elevation owned by MemoryStore)
@@ -563,9 +563,9 @@ This is not a request/response wait and not a query-completion correlation proto
 
 ### Attention Schema
 
-Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `AllocationReader`, `CognitionLogReader`, `CognitionWriter`, `LlmAccess`.
+Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`, `CognitionLogReader`, `CognitionWriter`, `LlmAccess`.
 
-Reads unread memo-log entries into a persistent `Session`, plus allocation state and cognition-log set, to decide whether the current attention state should become admitted cognitive evidence. Its tool set offers a single append operation whose input payload contains plaintext; calling the tool appends a concise first-person attention experience to this replica's cognition log, while not calling the tool means no new attention experience should be admitted. It does not receive `Memo`, attention-control inbox, allocation-write, or memory-write capabilities.
+Reads only the unread memo-log and cognition-log deltas collected for the current activation into a persistent `Session`. The activation turn renders those deltas source-blind, without module owner, replica, or allocation guidance metadata; previous context is retained only through session history and compaction. Its tool set offers an append operation whose input payload contains plaintext and a no-change operation. Appending writes a concise first-person attention experience to this replica's cognition log; no-change writes nothing. It does not receive `AllocationReader`, `Memo`, attention-control inbox, allocation-write, or memory-write capabilities.
 
 ### Self Model
 
@@ -749,7 +749,7 @@ Full-agent boundary eval cases live under `eval-cases/full-agent/**/*.eure`. The
 
 Full-agent eval boot uses a minimal bootstrap allocation rather than waking every module. Sensory and allocation start with positive activation ratios; cognition-gate starts low and is raised by controller guidance after sensory memo writes; lower-priority speak, query-memory, memory, memory-compaction, policy, reward, prediction, surprise, attention-schema, and self-model modules start at zero activation ratio until the allocation proposes an effective allocation. This keeps full-agent evals testing the controller path instead of bypassing it with an all-on static schedule.
 
-Module eval cases live under `eval-cases/modules/{query-memory,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. The runner may seed the target module's allocation guidance with the module prompt, but guidance is durable context only; it does not wake the module. The runner then publishes the target module's natural trigger, such as cognition-log or memo input, and scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `tool-calls` as a rubric `judge-inputs[]` value.
+Module eval cases live under `eval-cases/modules/{query-memory,attention-schema,self-model}/**/*.eure`. They are explicit internal harnesses, not app-facing scenarios. For target modules that read allocation, the runner may seed the target module's allocation guidance with the module prompt, but guidance is durable context only; it does not wake the module. The runner then publishes the target module's natural trigger, such as cognition-log or memo input, and scores the target module's memo-log entries as the artifact. Attention-schema module cases instead score attention-schema cognition-log entries as the artifact and do not receive allocation guidance as LLM context. Module cases may seed `cognition-log[]` entries for cognition-log consumers, and may seed `memos[]` entries as input syntax; those seeds append memo-log entries rather than latest snapshots. Query evals statically check that retrieved content reached the artifact, while rubrics can judge generated search/tool arguments by opting into `tool-calls` as a rubric `judge-inputs[]` value.
 
 Rubric checks choose their judge evidence with data-driven `judge-inputs[]` enum values in the `.eure` case. The broad compatibility inputs are `output`, `utterance`, `failure`, `trace`, `memory`, `memos`, and `cognition`; new cases should prefer granular inputs such as `memory-diff`, `memory-metadata`, `policy-diff`, `memo-contents`, `cognition-entries`, `tool-calls`, and `tool-results`. `memo-contents` and `cognition-entries` intentionally omit source/timing metadata so judges grade the visible entry content rather than harness plumbing. The rubric text and criteria are always included; the selected judge inputs control only evidence sections. This keeps full-agent rubrics focused on utterance/memory state and query rubrics focused on output plus tool-call evidence without always passing the whole artifact observation payload.
 
@@ -792,7 +792,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Cognition-log inboxes filter self writes | `CognitionLogUpdatedInbox` is constructed with the same self-exclusion policy as `MemoUpdatedInbox` |
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
 | Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to allocation registrations; runtime computes effective allocation |
-| Attention schema models attention only | it receives memo and cognition-log wake capabilities, allocation/cognition-log read capabilities, `CognitionWriter`, and `LlmAccess`, not `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
+| Attention schema models attention only | it receives memo and cognition-log wake capabilities, blackboard/cognition-log read capabilities, `CognitionWriter`, and `LlmAccess`, not `AllocationReader`, `Memo`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | allocation writes self-model guidance; self-model receives `CognitionLogUpdatedInbox`, reads allocation as context, and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema cognition-log entries and current memo-log context |
 | Query memory is memory/RAG only | it receives `MemorySearcher`, not policy or self-model capabilities |

@@ -18,8 +18,8 @@
 
 pub use nuillu_blackboard::{
     AgenticDeadlockMarker, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
-    AllocationEffectPolicy, CognitionLogEntryRecord, ModuleRunStatus, ModuleRunStatusRecord,
-    ResourceAllocation, UtteranceProgress, UtteranceProgressState,
+    AllocationEffectPolicy, CognitionLogEntryRecord, MemoLogRecord, ModuleRunStatus,
+    ModuleRunStatusRecord, ResourceAllocation, UtteranceProgress, UtteranceProgressState,
 };
 
 mod activation_gate;
@@ -87,9 +87,10 @@ pub use memory_render::render_memory_for_llm;
 pub use mind_format::{
     LlmContextWindow, MemoryRankCounts, compact_llm_context_text, format_available_faculties,
     format_bounded_cognition_log_batch, format_bounded_memo_log_batch, format_cognition_log_batch,
-    format_current_allocation_state, format_current_attention_guidance,
-    format_identity_memory_seed, format_memo_log_batch, format_memory_trace_inventory,
-    format_stuckness, format_time_division_guidance, memory_rank_counts,
+    format_current_allocation_state, format_identity_memory_seed, format_memo_log_batch,
+    format_memory_trace_inventory, format_new_cognition_log_entries,
+    format_source_blind_memo_log_batch, format_stuckness, format_time_division_guidance,
+    memory_rank_counts,
 };
 pub use mind_session::{
     push_formatted_cognition_log_batch, push_formatted_memo_log_batch,

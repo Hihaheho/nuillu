@@ -4,27 +4,27 @@ use crate::AttentionSchemaModule;
 
 #[derive(Debug, Default)]
 pub struct NextBatch {
-    pub(crate) update_model: bool,
+    pub(crate) memo_logs: Vec<nuillu_module::MemoLogRecord>,
+    pub(crate) cognition_log: Vec<nuillu_module::CognitionLogEntryRecord>,
 }
 
 impl NextBatch {
-    fn model_update() -> Self {
-        Self { update_model: true }
-    }
-
-    fn mark_model_update(&mut self) {
-        self.update_model = true;
+    pub(crate) fn has_updates(&self) -> bool {
+        !self.memo_logs.is_empty() || !self.cognition_log.is_empty()
     }
 }
 
 impl AttentionSchemaModule {
     pub(crate) async fn next_batch(&mut self) -> Result<NextBatch> {
-        let mut batch = self.await_first_batch().await?;
-        self.collect_ready_events_into_batch(&mut batch)?;
-        Ok(batch)
+        self.await_first_batch().await?;
+        self.collect_ready_events_into_batch()?;
+        Ok(NextBatch {
+            memo_logs: self.blackboard.unread_memo_logs().await,
+            cognition_log: self.cognition_log.unread_events().await,
+        })
     }
 
-    async fn await_first_batch(&mut self) -> Result<NextBatch> {
+    async fn await_first_batch(&mut self) -> Result<()> {
         tokio::select! {
             update = self.memo_updates.next_item() => {
                 let _ = update?;
@@ -33,16 +33,12 @@ impl AttentionSchemaModule {
                 let _ = update?;
             }
         }
-        Ok(NextBatch::model_update())
+        Ok(())
     }
 
-    fn collect_ready_events_into_batch(&mut self, batch: &mut NextBatch) -> Result<()> {
-        if !self.memo_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_model_update();
-        }
-        if !self.cognition_updates.take_ready_items()?.items.is_empty() {
-            batch.mark_model_update();
-        }
+    fn collect_ready_events_into_batch(&mut self) -> Result<()> {
+        let _ = self.memo_updates.take_ready_items()?;
+        let _ = self.cognition_updates.take_ready_items()?;
         Ok(())
     }
 }
@@ -52,10 +48,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multiple_model_inputs_collapse_to_one_model_update() {
-        let mut batch = NextBatch::model_update();
-        batch.mark_model_update();
+    fn batch_has_updates_when_any_delta_is_present() {
+        let empty = NextBatch::default();
+        let with_cognition = NextBatch {
+            memo_logs: Vec::new(),
+            cognition_log: vec![nuillu_module::CognitionLogEntryRecord {
+                index: 0,
+                source: nuillu_types::ModuleInstanceId::new(
+                    nuillu_types::builtin::cognition_gate(),
+                    nuillu_types::ReplicaIndex::ZERO,
+                ),
+                entry: nuillu_blackboard::CognitionLogEntry {
+                    at: chrono::Utc::now(),
+                    text: "attention shifted".into(),
+                },
+            }],
+        };
 
-        assert!(batch.update_model);
+        assert!(!empty.has_updates());
+        assert!(with_cognition.has_updates());
     }
 }

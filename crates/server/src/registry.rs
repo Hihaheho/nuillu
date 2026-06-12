@@ -113,7 +113,6 @@ fn register_server_module(
                 caps.memo_updated_inbox(),
                 caps.cognition_log_updated_inbox(),
                 caps.blackboard_reader(),
-                caps.allocation_reader(),
                 caps.cognition_log_reader(),
                 caps.cognition_writer(),
                 caps.llm_access(),
