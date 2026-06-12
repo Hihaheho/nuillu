@@ -7,8 +7,7 @@ use crate::{
     format_identity_memory_seed,
 };
 
-pub const REASONING_SYSTEM_PROMPT: &str =
-    "Reason extremely concisely in at most 4 sentences and within 128 tokens.";
+pub const REASONING_SYSTEM_PROMPT: &str = "During reasoning, reason extremely concisely: use at most 4 short sentences or 128 tokens of internal deliberation before deciding.";
 
 pub fn format_persistent_system_seed(
     system_prompt: impl Into<String>,
