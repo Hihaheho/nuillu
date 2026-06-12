@@ -15,12 +15,13 @@ const DEFAULT_OUTPUT_DIR: &str = ".tmp/speak-planning-probe";
 const TARGET_PEER: &str = "Peer";
 const COGNITION_CONTEXT: &str = r#"Peer greeted me with "Hi"; brief acknowledgement is warranted."#;
 const FINAL_INSTRUCTION: &str =
-    "Decide whether to speak now. For this current greeting, choose the outward speech path.";
-const DECISION_CONTRACT: &str = r#"Direct greetings, questions, and requests from a participant usually warrant a brief outward response to that participant. If speech is warranted, use the speech tool. If silence is warranted, use the silence path only when the cognition log does not call for an outward response."#;
+    "Speak has already been allocated. For this current greeting, choose the outward speech path.";
+const DECISION_CONTRACT: &str = r#"Direct greetings, questions, and requests from a participant usually warrant a brief outward response to that participant. Use decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible despite allocation."#;
 
-const PLAN_PROMPT: &str = r#"Decide whether the agent should speak now.
-Use only the cognition log and the available target schema. If speech is not warranted, finish without calling a tool.
-If speaking is warranted, call should_speak exactly once. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+const PLAN_PROMPT: &str = r#"Plan outward speech after allocation has raised the speak module.
+Use only the cognition log and the available target schema. Do not casually re-decide whether speak should have been allocated.
+Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible despite allocation, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
@@ -235,12 +236,12 @@ impl JsonSchema for SpeechTarget {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct ShouldSpeakOutput {
+struct PrepareSpeechOutput {
     accepted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-struct StaySilentOutput {
+struct DeclineSpeechNowOutput {
     accepted: bool,
 }
 
@@ -252,39 +253,39 @@ struct DecideSpeechOutput {
 mod current_schema {
     use super::*;
 
-    #[lutum::tool_input(name = "should_speak", output = ShouldSpeakOutput)]
+    #[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-    pub(super) struct ShouldSpeakArgs {
+    pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
         pub(super) speech_content: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
     pub(super) enum Tools {
-        ShouldSpeak(ShouldSpeakArgs),
+        PrepareSpeech(PrepareSpeechArgs),
     }
 }
 
 mod required_with_silent_schema {
     use super::*;
 
-    #[lutum::tool_input(name = "should_speak", output = ShouldSpeakOutput)]
+    #[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-    pub(super) struct ShouldSpeakArgs {
+    pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
         pub(super) speech_content: String,
     }
 
-    #[lutum::tool_input(name = "stay_silent", output = StaySilentOutput)]
+    #[lutum::tool_input(name = "decline_speech_now", output = DeclineSpeechNowOutput)]
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-    pub(super) struct StaySilentArgs {
-        pub(super) reason: String,
+    pub(super) struct DeclineSpeechNowArgs {
+        pub(super) blocking_reason: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
     pub(super) enum Tools {
-        ShouldSpeak(ShouldSpeakArgs),
-        StaySilent(StaySilentArgs),
+        PrepareSpeech(PrepareSpeechArgs),
+        DeclineSpeechNow(DeclineSpeechNowArgs),
     }
 }
 
@@ -294,7 +295,7 @@ mod single_decision_schema {
     #[lutum::tool_input(name = "decide_speech", output = DecideSpeechOutput)]
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
     pub(super) struct DecideSpeechArgs {
-        pub(super) should_speak: bool,
+        pub(super) prepare_speech: bool,
         #[serde(default)]
         pub(super) target: Option<SpeechTarget>,
         #[serde(default)]
@@ -590,7 +591,7 @@ async fn run_current_trial(
     let builder = lutum
         .text_turn(probe_input(context))
         .tools::<current_schema::Tools>()
-        .available_tools([current_schema::ToolsSelector::ShouldSpeak])
+        .available_tools([current_schema::ToolsSelector::PrepareSpeech])
         .generation_config(generation);
     let outcome = if require_tool {
         builder.require_any_tool().collect().await
@@ -604,7 +605,7 @@ async fn run_current_trial(
         started,
         outcome,
         |call| match call {
-            current_schema::ToolsCall::ShouldSpeak(call) => Some(CandidateDecision::Speak {
+            current_schema::ToolsCall::PrepareSpeech(call) => Some(CandidateDecision::Speak {
                 target: call.input.target.as_str().to_owned(),
                 speech_content: call.input.speech_content.clone(),
             }),
@@ -623,8 +624,8 @@ async fn run_required_with_silent_trial(
         .text_turn(probe_input(context))
         .tools::<required_with_silent_schema::Tools>()
         .available_tools([
-            required_with_silent_schema::ToolsSelector::ShouldSpeak,
-            required_with_silent_schema::ToolsSelector::StaySilent,
+            required_with_silent_schema::ToolsSelector::PrepareSpeech,
+            required_with_silent_schema::ToolsSelector::DeclineSpeechNow,
         ])
         .require_any_tool()
         .generation_config(generation)
@@ -637,15 +638,15 @@ async fn run_required_with_silent_trial(
         started,
         outcome,
         |call| match call {
-            required_with_silent_schema::ToolsCall::ShouldSpeak(call) => {
+            required_with_silent_schema::ToolsCall::PrepareSpeech(call) => {
                 Some(CandidateDecision::Speak {
                     target: call.input.target.as_str().to_owned(),
                     speech_content: call.input.speech_content.clone(),
                 })
             }
-            required_with_silent_schema::ToolsCall::StaySilent(call) => {
+            required_with_silent_schema::ToolsCall::DeclineSpeechNow(call) => {
                 Some(CandidateDecision::Silent {
-                    reason: call.input.reason.clone(),
+                    reason: call.input.blocking_reason.clone(),
                 })
             }
         },
@@ -675,7 +676,7 @@ async fn run_single_decision_trial(
         outcome,
         |call| match call {
             single_decision_schema::ToolsCall::DecideSpeech(call) => {
-                if call.input.should_speak {
+                if call.input.prepare_speech {
                     Some(CandidateDecision::Speak {
                         target: call
                             .input
@@ -939,8 +940,8 @@ fn looks_like_pseudo_tool(text: &str) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    normalized.contains("should_speak")
-        || normalized.contains("stay_silent")
+    normalized.contains("prepare_speech")
+        || normalized.contains("decline_speech_now")
         || normalized.contains("decide_speech")
         || (normalized.starts_with('{') && normalized.ends_with('}'))
 }
@@ -1369,7 +1370,7 @@ mod tests {
     #[test]
     fn pseudo_tool_detection_catches_textual_tool_forms() {
         assert!(looks_like_pseudo_tool(
-            r#"should_speak(target="Peer", speech_content="Hi")"#
+            r#"prepare_speech(target="Peer", speech_content="Hi")"#
         ));
         assert!(looks_like_pseudo_tool(r#"{"target":"Peer"}"#));
         assert!(!looks_like_pseudo_tool("Hello, Peer."));

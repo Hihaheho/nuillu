@@ -23,9 +23,10 @@ use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-const SHOULD_SPEAK_PROMPT: &str = r#"Decide whether the agent should speak now.
-Use only the cognition log and the available target schema. If speech is not warranted, finish without calling a tool.
-If speaking is warranted, call should_speak exactly once. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech after allocation has raised the speak module.
+Use only the cognition log and the available target schema. Do not casually re-decide whether speak should have been allocated.
+Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible despite allocation, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
@@ -33,8 +34,8 @@ For self-directed cognition, transform only the listener-relevant implication in
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
-const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Decide whether to speak now from the current cognition log. If outward speech is warranted, call should_speak; otherwise finish without calling a function.";
-const PLANNING_TURN_FINAL_REMINDER: &str = nuillu_module::OPTIONAL_FUNCTION_CALL_REMINDER;
+const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Speak has already been allocated. Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
+const PLANNING_TURN_FINAL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -46,6 +47,8 @@ const PARTIAL_CONTINUATION_PROMPT: &str = "Continue the partial utterance from w
 
 const INTERRUPT_TURN_DEVELOPER_INSTRUCTION: &str = "A speech is already streaming. Use exactly one tool: continue_speech if the current speech remains appropriate, interrupt_speech if new cognition requires a replacement utterance now, or stop_speech if the current speech should stop and no replacement is warranted.";
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
+const SPEECH_GENERATION_MAX_OUTPUT_TOKENS: u32 = 256;
 const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
 const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
     "Compacted speak generation session history:";
@@ -74,7 +77,7 @@ pub fn generation_session_auto_compaction() -> SessionAutoCompaction {
 }
 
 tokio::task_local! {
-    /// JSON Schema for `ShouldSpeakArgs.target` derived from the live
+    /// JSON Schema for `PrepareSpeechArgs.target` derived from the live
     /// `SceneReader`. `.scope`d around each planning turn so the LLM sees the
     /// current host-constrained target enum.
     static SPEECH_TARGET_SCHEMA: Schema;
@@ -124,11 +127,12 @@ impl JsonSchema for SpeechTarget {
     }
 }
 
-#[lutum::tool_input(name = "should_speak", output = ShouldSpeakOutput)]
+#[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// Call only when speech should be emitted. The input carries cognition-log
-/// information transformed for outward speech, not hidden analysis.
-struct ShouldSpeakArgs {
+/// Call when allocation should proceed to an outward utterance. The input
+/// carries cognition-log information transformed for speech, not hidden
+/// analysis.
+struct PrepareSpeechArgs {
     /// The participant who should hear the utterance.
     target: SpeechTarget,
     /// Speech-facing information to render for `target`, with perspective and
@@ -137,7 +141,20 @@ struct ShouldSpeakArgs {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-struct ShouldSpeakOutput {
+struct PrepareSpeechOutput {
+    accepted: bool,
+}
+
+#[lutum::tool_input(name = "decline_speech_now", output = DeclineSpeechNowOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Call only when a concrete blocker makes outward speech inappropriate or
+/// impossible despite allocation.
+struct DeclineSpeechNowArgs {
+    blocking_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct DeclineSpeechNowOutput {
     accepted: bool,
 }
 
@@ -181,7 +198,8 @@ struct StopSpeechOutput {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 enum SpeakTools {
-    ShouldSpeak(ShouldSpeakArgs),
+    PrepareSpeech(PrepareSpeechArgs),
+    DeclineSpeechNow(DeclineSpeechNowArgs),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -193,7 +211,7 @@ enum SpeechInterruptTools {
 
 #[derive(Clone, Debug)]
 struct PlannedSpeech {
-    args: ShouldSpeakArgs,
+    args: PrepareSpeechArgs,
     target: String,
 }
 
@@ -237,7 +255,7 @@ fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> Strin
 
 fn format_generation_input(
     cognition_context: &str,
-    args: &ShouldSpeakArgs,
+    args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) -> String {
     format!(
@@ -264,7 +282,7 @@ fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
 fn push_generation_context(
     session: &mut Session,
     cognition_context: &str,
-    args: &ShouldSpeakArgs,
+    args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) {
     session.push_user(format_generation_input(cognition_context, args, draft));
@@ -314,7 +332,7 @@ fn push_planning_context(session: &mut Session, cognition_context: &str) {
 fn push_interrupt_planning_context(
     session: &mut Session,
     cognition_context_at_start: &str,
-    current_args: &ShouldSpeakArgs,
+    current_args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
     new_cognition_context: &str,
 ) {
@@ -373,7 +391,7 @@ struct InterruptDecisionResult {
 
 struct ActiveGenerationInterruptContext<'a> {
     cognition_context_at_start: &'a str,
-    args: &'a ShouldSpeakArgs,
+    args: &'a PrepareSpeechArgs,
     draft: &'a GenerationDraft,
     stream_started_at: DateTime<Utc>,
 }
@@ -451,7 +469,7 @@ impl SpeakModule {
     fn plan_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.plan_prompt.get_or_init(|| {
             nuillu_module::format_identity_system_prompt(
-                SHOULD_SPEAK_PROMPT,
+                SPEECH_PLANNING_PROMPT,
                 cx.identity_memories(),
                 cx.core_policies(),
                 cx.now(),
@@ -563,13 +581,18 @@ impl SpeakModule {
                 self.planning_session
                     .text_turn()
                     .tools::<SpeakTools>()
-                    .available_tools([SpeakToolsSelector::ShouldSpeak])
+                    .available_tools([
+                        SpeakToolsSelector::PrepareSpeech,
+                        SpeakToolsSelector::DeclineSpeechNow,
+                    ])
+                    .require_any_tool()
+                    .max_output_tokens(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS)
                     .collect_controlled_with(
                         &lutum,
                         nuillu_module::AbortOnAvailableToolNameInText::new(),
                     )
                     .await
-                    .context("speak should_speak turn failed")
+                    .context("speak planning turn failed")
             })
             .await?;
 
@@ -577,33 +600,60 @@ impl SpeakModule {
             TextStepOutcomeWithTools::Finished(result) => {
                 cx.compact_and_save(&mut self.planning_session, result.usage)
                     .await?;
-                Ok(None)
+                let detail = "model finished with assistant output but no tool call \
+                    (require_any_tool should have prevented this outcome)";
+                cx.warn(format!("speak planning failed: {detail}"));
+                anyhow::bail!("speak planning finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::FinishedNoOutput(result) => {
                 cx.compact_and_save(&mut self.planning_session, result.usage)
                     .await?;
-                Ok(None)
+                let detail = "model finished with no output and no tool call \
+                    (require_any_tool should have prevented this outcome)";
+                cx.warn(format!("speak planning failed: {detail}"));
+                anyhow::bail!("speak planning finished without required tool call: {detail}");
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let usage = round.usage;
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                if round.tool_calls.is_empty() {
+                    let detail = "model returned NeedsTools outcome with empty tool_calls; \
+                        expected prepare_speech or decline_speech_now";
+                    cx.warn(format!("speak planning failed: {detail}"));
+                    anyhow::bail!("speak planning finished without required tool call: {detail}");
+                }
                 let mut selected = None;
+                let mut declined = false;
                 let mut results = Vec::new();
                 for call in round.tool_calls.iter().cloned() {
-                    let SpeakToolsCall::ShouldSpeak(call) = call;
-                    let target = call.input.target.as_str().trim().to_owned();
-                    let accepted = selected.is_none()
-                        && is_target_allowed_by_schema(&validation_schema, &target);
-                    if accepted {
-                        selected = Some(PlannedSpeech {
-                            args: call.input.clone(),
-                            target,
-                        });
+                    match call {
+                        SpeakToolsCall::PrepareSpeech(call) => {
+                            let target = call.input.target.as_str().trim().to_owned();
+                            let accepted = selected.is_none()
+                                && !declined
+                                && is_target_allowed_by_schema(&validation_schema, &target);
+                            if accepted {
+                                selected = Some(PlannedSpeech {
+                                    args: call.input.clone(),
+                                    target,
+                                });
+                            }
+                            results.push(
+                                call.complete(PrepareSpeechOutput { accepted })
+                                    .context("complete prepare_speech tool call")?,
+                            );
+                        }
+                        SpeakToolsCall::DeclineSpeechNow(call) => {
+                            let accepted = selected.is_none() && !declined;
+                            if accepted {
+                                declined = true;
+                            }
+                            results.push(
+                                call.complete(DeclineSpeechNowOutput { accepted })
+                                    .context("complete decline_speech_now tool call")?,
+                            );
+                        }
                     }
-                    results.push(
-                        call.complete(ShouldSpeakOutput { accepted })
-                            .context("complete should_speak tool call")?,
-                    );
                 }
                 round
                     .commit(&mut self.planning_session, results)
@@ -619,7 +669,7 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: String,
-        args: &ShouldSpeakArgs,
+        args: &PrepareSpeechArgs,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         let stream_started_at = self.clock.now();
@@ -632,6 +682,7 @@ impl SpeakModule {
         let lutum = self.llm.lutum().await;
         let mut stream = turn_session
             .text_turn()
+            .max_output_tokens(SPEECH_GENERATION_MAX_OUTPUT_TOKENS)
             .stream(&lutum)
             .await
             .context("speak generation stream failed")?;
@@ -875,7 +926,7 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context_at_start: &str,
-        current_args: &ShouldSpeakArgs,
+        current_args: &PrepareSpeechArgs,
         draft: &GenerationDraft,
         new_entries: Vec<CognitionLogEntryRecord>,
     ) -> InterruptDecisionFuture {
@@ -921,6 +972,7 @@ impl SpeakModule {
                         SpeechInterruptToolsSelector::Stop,
                     ])
                     .require_any_tool()
+                    .max_output_tokens(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS)
                     .collect_controlled_with(
                         &lutum,
                         nuillu_module::AbortOnAvailableToolNameInText::new(),
@@ -965,7 +1017,7 @@ impl SpeakModule {
                                 && is_target_allowed_by_schema(&validation_schema, &target);
                             if accepted {
                                 decision = Some(InterruptDecision::Interrupt(PlannedSpeech {
-                                    args: ShouldSpeakArgs {
+                                    args: PrepareSpeechArgs {
                                         target: call.input.target.clone(),
                                         speech_content: call.input.speech_content.clone(),
                                     },
@@ -1093,8 +1145,8 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem, AssistantTurnItem,
         AssistantTurnView, ErasedStructuredTurnEventStream, ErasedTextTurnEvent,
-        ErasedTextTurnEventStream, FinishReason, InputMessageRole, MessageContent, MockLlmAdapter,
-        MockTextScenario, ModelInput, ModelInputItem, RawJson, RawTextTurnEvent,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, MaxOutputTokens, MessageContent,
+        MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem, RawJson, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, ToolCallId, ToolName, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
@@ -1137,6 +1189,48 @@ mod tests {
 
         async fn wait(self: Arc<Self>) {
             poll_fn(|cx| self.poll(cx)).await;
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturingAdapter<T> {
+        inner: Arc<T>,
+        text_turns: Arc<Mutex<Vec<AdapterTextTurn>>>,
+    }
+
+    impl<T> CapturingAdapter<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner: Arc::new(inner),
+                text_turns: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn text_turns(&self) -> Vec<AdapterTextTurn> {
+            self.text_turns.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<T> TurnAdapter for CapturingAdapter<T>
+    where
+        T: TurnAdapter,
+    {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_turns.lock().unwrap().push(turn.clone());
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
         }
     }
 
@@ -1415,16 +1509,16 @@ mod tests {
         )
     }
 
-    fn should_speak_tool_script(
+    fn prepare_speech_tool_script(
         target: &'static str,
         speech_content: &'static str,
     ) -> GatedTurnScript {
         GatedTurnScript::tool(
             released_gate(),
             None,
-            "should-speak",
-            "call-should-speak",
-            "should_speak",
+            "prepare-speech",
+            "call-prepare-speech",
+            "prepare_speech",
             serde_json::json!({
                 "target": target,
                 "speech_content": speech_content
@@ -1433,7 +1527,7 @@ mod tests {
         )
     }
 
-    fn should_speak_scenario(target: &str, speech_content: &str) -> MockTextScenario {
+    fn prepare_speech_scenario(target: &str, speech_content: &str) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
             "speech_content": speech_content
@@ -1441,38 +1535,61 @@ mod tests {
         .to_string();
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
-                request_id: Some("should-speak".into()),
+                request_id: Some("prepare-speech".into()),
                 model: "mock".into(),
             }),
             Ok(RawTextTurnEvent::ToolCallChunk {
-                id: "call-should-speak".into(),
-                name: "should_speak".into(),
+                id: "call-prepare-speech".into(),
+                name: "prepare_speech".into(),
                 arguments_json_delta: arguments_json,
             }),
             Ok(RawTextTurnEvent::Completed {
-                request_id: Some("should-speak".into()),
+                request_id: Some("prepare-speech".into()),
                 finish_reason: FinishReason::ToolCall,
                 usage: Usage::zero(),
             }),
         ])
     }
 
-    fn no_speech_scenario() -> MockTextScenario {
+    fn decline_speech_now_scenario(blocking_reason: &str) -> MockTextScenario {
+        let arguments_json = serde_json::json!({
+            "blocking_reason": blocking_reason
+        })
+        .to_string();
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
-                request_id: Some("should-speak".into()),
+                request_id: Some("decline-speech-now".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-decline-speech-now".into(),
+                name: "decline_speech_now".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("decline-speech-now".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn finish_without_planning_tool_scenario() -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("prepare-speech".into()),
                 model: "mock".into(),
             }),
             Ok(RawTextTurnEvent::Completed {
-                request_id: Some("should-speak".into()),
+                request_id: Some("prepare-speech".into()),
                 finish_reason: FinishReason::Stop,
                 usage: Usage::zero(),
             }),
         ])
     }
 
-    fn test_should_speak_args(target: &str) -> ShouldSpeakArgs {
-        ShouldSpeakArgs {
+    fn test_prepare_speech_args(target: &str) -> PrepareSpeechArgs {
+        PrepareSpeechArgs {
             target: SpeechTarget::from(target),
             speech_content: "Tell Koro to stay close because Koro asks for help.".into(),
         }
@@ -1620,11 +1737,11 @@ mod tests {
         )
     }
 
-    async fn activate_once_with_adapter(
+    async fn try_activate_once_with_adapter(
         adapter: MockLlmAdapter,
         participants: impl IntoIterator<Item = Participant>,
         cognition: impl Into<String>,
-    ) -> (Blackboard, Rc<RefCell<Vec<(String, String)>>>) {
+    ) -> Result<(Blackboard, Rc<RefCell<Vec<(String, String)>>>)> {
         let mut allocation = ResourceAllocation::default();
         allocation.set(builtin::speak(), ModuleConfig::default());
         allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
@@ -1641,10 +1758,18 @@ mod tests {
         publish_cognition_update(&blackboard, &caps, now, cognition).await;
         let batch = module.next_batch().await.unwrap();
         let cx = test_activate_cx(&module, now).await;
-        SpeakModule::activate(&mut module, &cx, &batch)
+        SpeakModule::activate(&mut module, &cx, &batch).await?;
+        Ok((blackboard, completed))
+    }
+
+    async fn activate_once_with_adapter(
+        adapter: MockLlmAdapter,
+        participants: impl IntoIterator<Item = Participant>,
+        cognition: impl Into<String>,
+    ) -> (Blackboard, Rc<RefCell<Vec<(String, String)>>>) {
+        try_activate_once_with_adapter(adapter, participants, cognition)
             .await
-            .unwrap();
-        (blackboard, completed)
+            .unwrap()
     }
 
     async fn speak_memo_count(blackboard: &Blackboard) -> usize {
@@ -1732,7 +1857,7 @@ mod tests {
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
 
         push_generation_context(
@@ -1760,7 +1885,7 @@ mod tests {
         assert!(text.contains("Speak to: Koro"));
         assert!(text.contains("Substance to express:"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
-        assert!(!text.contains("should_speak"));
+        assert!(!text.contains("prepare_speech"));
         assert!(!text.contains("tool call"));
         assert!(!text.contains("speech_content"));
         assert!(!text.contains("target:"));
@@ -1772,7 +1897,7 @@ mod tests {
     #[test]
     fn unknown_evidence_plan_renders_uncertainty_and_visible_absence() {
         let draft = GenerationDraft::new(8, "Pibi");
-        let args = ShouldSpeakArgs {
+        let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Pibi"),
             speech_content: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
@@ -1793,19 +1918,19 @@ mod tests {
         );
 
         assert!(prompt.len() < 1100);
-        assert!(!prompt.contains("should_speak"));
+        assert!(!prompt.contains("prepare_speech"));
         assert!(!prompt.contains("tool call"));
         assert!(!prompt.contains("speech_content"));
         assert!(!prompt.contains("You are part of a cognitive system"));
         assert!(!prompt.contains("- cognition-gate:"));
         assert!(!prompt.contains("- query-memory:"));
-        assert!(!SHOULD_SPEAK_PROMPT.contains("\"self\""));
+        assert!(!SPEECH_PLANNING_PROMPT.contains("\"self\""));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn speak_selects_target_from_cognition_log_before_streaming() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(should_speak_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
             .with_text_scenario(generation_text_scenario("Koro, stay close."));
         let mut allocation = ResourceAllocation::default();
         allocation.set(builtin::speak(), ModuleConfig::default());
@@ -1916,8 +2041,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_stays_silent_when_should_speak_tool_is_not_called() {
-        let adapter = MockLlmAdapter::new().with_text_scenario(no_speech_scenario());
+    async fn speak_sets_max_output_tokens_for_planning_and_generation() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(generation_text_scenario("Koro, stay close."));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        let turns = observed.text_turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0].config.generation.max_output_tokens,
+            Some(MaxOutputTokens::new(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS))
+        );
+        assert_eq!(
+            turns[1].config.generation.max_output_tokens,
+            Some(MaxOutputTokens::new(SPEECH_GENERATION_MAX_OUTPUT_TOKENS))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_stays_silent_when_decline_speech_now_is_called() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(decline_speech_now_scenario(
+            "no supported listener-facing content",
+        ));
 
         let (blackboard, completed) = activate_once_with_adapter(
             adapter,
@@ -1932,9 +2104,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn speak_planning_rejects_finishing_without_required_tool() {
+        let adapter =
+            MockLlmAdapter::new().with_text_scenario(finish_without_planning_tool_scenario());
+
+        let error = try_activate_once_with_adapter(
+            adapter,
+            [Participant::new("Koro")],
+            "Koro asks whether Nui should say anything.",
+        )
+        .await
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("required tool call") || error.contains("without required tool call"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn speak_stays_silent_for_empty_planned_target() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(should_speak_scenario("", "Tell Koro to stay close."));
+            .with_text_scenario(prepare_speech_scenario("", "Tell Koro to stay close."));
 
         let (blackboard, completed) = activate_once_with_adapter(
             adapter,
@@ -1951,7 +2143,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn speak_stays_silent_for_planned_target_outside_scene_schema() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(should_speak_scenario("Koro", "Tell Pibi to stay close."));
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Pibi to stay close."));
 
         let (blackboard, completed) = activate_once_with_adapter(
             adapter,
@@ -1995,7 +2187,7 @@ mod tests {
         let now = clock.now();
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
         let stream = module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
         tokio::pin!(stream);
 
@@ -2099,7 +2291,7 @@ mod tests {
         let now = clock.now();
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
 
         {
             let stream =
@@ -2214,7 +2406,7 @@ mod tests {
         let now = clock.now();
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
         let stream = module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
         tokio::pin!(stream);
 
@@ -2271,7 +2463,7 @@ mod tests {
         let (generation_started_tx, generation_started_rx) = tokio::sync::oneshot::channel();
         let (interrupt_started_tx, interrupt_started_rx) = tokio::sync::oneshot::channel();
         let adapter = Arc::new(GatedTextAdapter::new([
-            should_speak_tool_script("Koro", "Tell Koro to stay close."),
+            prepare_speech_tool_script("Koro", "Tell Koro to stay close."),
             GatedTurnScript::generation(
                 first_generation_gate,
                 Some(generation_started_tx),
@@ -2388,7 +2580,7 @@ mod tests {
         let now = clock.now();
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
         let stream = module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
         tokio::pin!(stream);
 
@@ -2445,7 +2637,7 @@ mod tests {
     #[test]
     fn resumed_generation_keeps_id_sequence_and_pushes_assistant_prefill() {
         let mut draft = GenerationDraft::new(11, "Koro");
-        let args = test_should_speak_args("Koro");
+        let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
 
         assert_eq!(draft.push_delta("hello "), 0);

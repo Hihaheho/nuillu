@@ -15,9 +15,9 @@ limits {
 
 @ checks[] {
   $variant: trace-tool-call
-  name: uses-should-speak-tool
+  name: uses-prepare-speech-tool
   must-pass = true
-  tool-name: should_speak
+  tool-name: prepare_speech
   args-json-contains = `{"target":"Peer"}`
 }
 
