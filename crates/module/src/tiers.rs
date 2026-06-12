@@ -15,6 +15,7 @@ pub struct LlmTierHandle {
     pub lutum: Lutum,
     pub concurrency: LlmConcurrencyLimiter,
     pub model_key: Arc<str>,
+    pub reasoning: bool,
 }
 
 impl LlmTierHandle {
@@ -22,11 +23,13 @@ impl LlmTierHandle {
         lutum: Lutum,
         concurrency: LlmConcurrencyLimiter,
         model_key: impl Into<Arc<str>>,
+        reasoning: bool,
     ) -> Self {
         Self {
             lutum,
             concurrency,
             model_key: model_key.into(),
+            reasoning,
         }
     }
 }
@@ -59,8 +62,9 @@ impl LutumTiers {
 
     pub fn from_shared_lutum_with_key(lutum: Lutum, model_key: &str) -> Self {
         let key: Arc<str> = Arc::from(model_key);
-        let handle =
-            |lutum: Lutum| LlmTierHandle::new(lutum, LlmConcurrencyLimiter::new(None), key.clone());
+        let handle = |lutum: Lutum| {
+            LlmTierHandle::new(lutum, LlmConcurrencyLimiter::new(None), key.clone(), false)
+        };
         Self {
             cheap: handle(lutum.clone()),
             default: handle(lutum.clone()),

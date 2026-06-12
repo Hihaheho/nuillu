@@ -14,7 +14,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::ports::PortError;
 use crate::session_compaction::{SessionCompactionConfig, SessionCompactionProtectedPrefix};
-use crate::{format_identity_memory_seed, seed_persistent_faculty_session};
+use crate::{
+    REASONING_SYSTEM_PROMPT, format_identity_memory_seed, format_persistent_system_seed,
+    seed_persistent_faculty_session,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -113,6 +116,7 @@ pub(crate) struct PersistentSessionMetadata {
     pub auto_compaction: Option<SessionAutoCompaction>,
     pub restored: bool,
     pub seeded: bool,
+    pub reasoning: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +131,7 @@ pub(crate) fn attach_persistent_session_metadata(
     key: SessionKey,
     auto_compaction: Option<SessionAutoCompaction>,
     restored: bool,
+    reasoning: bool,
 ) {
     session.extensions_mut().insert(ModuleSessionMetadata {
         owner: owner.clone(),
@@ -138,6 +143,7 @@ pub(crate) fn attach_persistent_session_metadata(
         auto_compaction,
         restored,
         seeded: restored,
+        reasoning,
     });
 }
 
@@ -170,6 +176,10 @@ pub fn ensure_persistent_session_seeded(
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) {
+    let system_prompt = system_prompt.into();
+    let reasoning = persistent_session_metadata(session)
+        .map(|metadata| metadata.reasoning)
+        .unwrap_or(false);
     let should_seed = match persistent_session_metadata_mut(session) {
         Some(metadata) if metadata.seeded || metadata.restored => {
             metadata.seeded = true;
@@ -178,12 +188,66 @@ pub fn ensure_persistent_session_seeded(
         Some(_) | None => true,
     };
     if !should_seed {
+        ensure_combined_system_seed(session, &system_prompt, reasoning, identity_memories, now);
         return;
     }
-    seed_persistent_faculty_session(session, system_prompt, identity_memories, now);
+    seed_persistent_faculty_session(session, system_prompt, reasoning, identity_memories, now);
     if let Some(metadata) = persistent_session_metadata_mut(session) {
         metadata.seeded = true;
     }
+}
+
+fn ensure_combined_system_seed(
+    session: &mut Session,
+    system_prompt: &str,
+    reasoning: bool,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+) {
+    let items = session.input_mut().items_mut();
+    let has_leading_system = leading_system_text(items).is_some();
+    let has_reasoning = leading_system_text(items)
+        .map(|text| text.contains(REASONING_SYSTEM_PROMPT))
+        .unwrap_or(false);
+    let has_legacy_identity = legacy_identity_seed_at(items, 1);
+    if has_leading_system && !has_legacy_identity && (!reasoning || has_reasoning) {
+        return;
+    }
+
+    let seed = ModelInputItem::text(
+        InputMessageRole::System,
+        format_persistent_system_seed(system_prompt.to_owned(), reasoning, identity_memories, now),
+    );
+    if has_leading_system {
+        items[0] = seed;
+    } else {
+        items.insert(0, seed);
+    }
+    if legacy_identity_seed_at(items, 1) {
+        items.remove(1);
+    }
+}
+
+fn leading_system_text(items: &[ModelInputItem]) -> Option<&str> {
+    let Some(ModelInputItem::Message {
+        role: InputMessageRole::System,
+        content,
+    }) = items.first()
+    else {
+        return None;
+    };
+    match content.as_slice() {
+        [MessageContent::Text(text)] => Some(text),
+        _ => None,
+    }
+}
+
+fn legacy_identity_seed_at(items: &[ModelInputItem], index: usize) -> bool {
+    matches!(
+        items.get(index),
+        Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
+            if text.starts_with("What I already remember about myself")
+    )
 }
 
 pub fn push_persistent_identity_seed_if_absent(
@@ -197,9 +261,18 @@ pub fn push_persistent_identity_seed_if_absent(
     {
         return;
     }
-    if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
-        session.push_assistant_text(seed);
+    let Some(seed) = format_identity_memory_seed(identity_memories, now) else {
+        return;
+    };
+    let items = session.input_mut().items_mut();
+    if let Some(system) = leading_system_text(items).map(str::to_owned) {
+        if !system.contains("What I already remember about myself") {
+            items[0] =
+                ModelInputItem::text(InputMessageRole::System, format!("{system}\n\n{seed}"));
+        }
+        return;
     }
+    session.push_system(seed);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -620,7 +693,109 @@ impl SessionStore for NoopSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
     use lutum::{AssistantTurnItem, AssistantTurnView, RawJson};
+    use nuillu_types::{MemoryContent, MemoryIndex, ReplicaIndex, builtin};
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap()
+    }
+
+    fn identity_memory() -> IdentityMemoryRecord {
+        IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-1"),
+            content: MemoryContent::new("The agent is named Nuillu."),
+            occurred_at: None,
+        }
+    }
+
+    fn attach_test_metadata(session: &mut Session, restored: bool, reasoning: bool) {
+        attach_persistent_session_metadata(
+            session,
+            ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO),
+            SessionKey::new("main").unwrap(),
+            None,
+            restored,
+            reasoning,
+        );
+    }
+
+    fn leading_system_text_for_test(session: &Session) -> &str {
+        let ModelInputItem::Message {
+            role: InputMessageRole::System,
+            content,
+        } = &session.input().items()[0]
+        else {
+            panic!("expected leading system message");
+        };
+        let [MessageContent::Text(text)] = content.as_slice() else {
+            panic!("expected leading system text");
+        };
+        text
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn reasoning_session_seeds_combined_system_message() {
+        let mut session = Session::new();
+        attach_test_metadata(&mut session, false, true);
+
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+
+        let items = session.input().items();
+        assert_eq!(items.len(), 1);
+        let system = leading_system_text_for_test(&session);
+        assert!(system.starts_with("SYSTEM\n\n"));
+        assert!(system.contains(REASONING_SYSTEM_PROMPT));
+        assert!(system.contains("What I already remember about myself"));
+        assert!(system.contains("The agent is named Nuillu."));
+    }
+
+    #[test]
+    fn non_reasoning_session_omits_reasoning_prompt() {
+        let mut session = Session::new();
+        attach_test_metadata(&mut session, false, false);
+
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+
+        let system = leading_system_text_for_test(&session);
+        assert!(!system.contains(REASONING_SYSTEM_PROMPT));
+        assert!(system.contains("What I already remember about myself"));
+    }
+
+    #[test]
+    fn restored_reasoning_session_backfills_without_duplication() {
+        let mut session = Session::new();
+        session.push_system("SYSTEM");
+        session.push_assistant_text(
+            "What I already remember about myself at 2026-05-11T06:23:00Z:\n- old identity",
+        );
+        session.push_user("history");
+        attach_test_metadata(&mut session, true, true);
+
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+
+        let items = session.input().items();
+        let system = leading_system_text_for_test(&session);
+        assert_eq!(occurrences(system, REASONING_SYSTEM_PROMPT), 1);
+        assert!(system.contains("The agent is named Nuillu."));
+        assert!(!matches!(
+            items.get(1),
+            Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
+                if text.starts_with("What I already remember about myself")
+        ));
+        assert!(matches!(
+            items.get(1),
+            Some(ModelInputItem::Message {
+                role: InputMessageRole::User,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn session_snapshot_round_trips_basic_items_and_turns() {

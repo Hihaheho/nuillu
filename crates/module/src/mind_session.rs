@@ -7,20 +7,41 @@ use crate::{
     format_identity_memory_seed,
 };
 
+pub const REASONING_SYSTEM_PROMPT: &str =
+    "Reason extremely concisely. Keep reasoning within 128 tokens.";
+
+pub fn format_persistent_system_seed(
+    system_prompt: impl Into<String>,
+    reasoning: bool,
+    identity_memories: &[IdentityMemoryRecord],
+    now: DateTime<Utc>,
+) -> String {
+    let mut sections = vec![system_prompt.into().trim_end().to_owned()];
+    if reasoning {
+        sections.push(REASONING_SYSTEM_PROMPT.to_owned());
+    }
+    if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
+        sections.push(seed);
+    }
+    sections
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub fn seed_persistent_faculty_session(
     session: &mut Session,
     system_prompt: impl Into<String>,
+    reasoning: bool,
     identity_memories: &[IdentityMemoryRecord],
     now: DateTime<Utc>,
 ) {
-    let mut seed_items = vec![ModelInputItem::text(
+    let seed_item = ModelInputItem::text(
         InputMessageRole::System,
-        system_prompt,
-    )];
-    if let Some(seed) = format_identity_memory_seed(identity_memories, now) {
-        seed_items.push(ModelInputItem::assistant_text(seed));
-    }
-    session.input_mut().items_mut().splice(0..0, seed_items);
+        format_persistent_system_seed(system_prompt, reasoning, identity_memories, now),
+    );
+    session.input_mut().items_mut().insert(0, seed_item);
 }
 
 pub fn push_formatted_cognition_log_batch(
@@ -53,7 +74,7 @@ mod tests {
     use nuillu_blackboard::{CognitionLogEntry, MemoLogRecord};
     use nuillu_types::{MemoryContent, MemoryIndex, ReplicaIndex, builtin};
 
-    use lutum::{AssistantInputItem, InputMessageRole, MessageContent, ModelInputItem};
+    use lutum::{InputMessageRole, MessageContent, ModelInputItem};
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap()
@@ -67,6 +88,7 @@ mod tests {
         seed_persistent_faculty_session(
             &mut session,
             "SYSTEM",
+            true,
             &[IdentityMemoryRecord {
                 index: MemoryIndex::new("identity-1"),
                 content: MemoryContent::new("The agent is named Nuillu."),
@@ -107,15 +129,12 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected system text");
         };
-        assert_eq!(system, "SYSTEM");
+        assert!(system.starts_with("SYSTEM\n\n"));
+        assert!(system.contains(REASONING_SYSTEM_PROMPT));
+        assert!(system.contains("What I already remember about myself"));
 
-        let ModelInputItem::Assistant(AssistantInputItem::Text(identity)) = &items[1] else {
-            panic!("expected identity seed assistant text second");
-        };
-        assert!(identity.contains("What I already remember about myself"));
-
-        let ModelInputItem::Message { role, content } = &items[2] else {
-            panic!("expected cognition batch user text third");
+        let ModelInputItem::Message { role, content } = &items[1] else {
+            panic!("expected cognition batch user text second");
         };
         assert_eq!(role, &InputMessageRole::User);
         let [MessageContent::Text(cognition)] = content.as_slice() else {
@@ -123,8 +142,8 @@ mod tests {
         };
         assert!(cognition.contains("Current cognition log at 2026-05-11T06:23:00Z"));
 
-        let ModelInputItem::Message { role, content } = &items[3] else {
-            panic!("expected memo batch system message fourth");
+        let ModelInputItem::Message { role, content } = &items[2] else {
+            panic!("expected memo batch system message third");
         };
         assert_eq!(role, &InputMessageRole::System);
         let [MessageContent::Text(memos)] = content.as_slice() else {
@@ -138,7 +157,7 @@ mod tests {
         let mut session = Session::new();
         session.push_user("history before seed");
 
-        seed_persistent_faculty_session(&mut session, "SYSTEM", &[], now());
+        seed_persistent_faculty_session(&mut session, "SYSTEM", false, &[], now());
 
         let items = session.input().items();
         let ModelInputItem::Message { role, content } = &items[0] else {

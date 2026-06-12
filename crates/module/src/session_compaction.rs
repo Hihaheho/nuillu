@@ -547,15 +547,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn protects_system_and_identity_and_summarizes_tail_only() {
+    async fn protects_combined_system_seed_and_summarizes_tail_only() {
         let adapter = CapturingAdapter::new(
             MockLlmAdapter::new().with_text_scenario(summary_scenario("history summarized")),
         );
         let (lutum, observed) = lutum_with_adapter(adapter);
         let mut session = Session::new();
-        session.push_system("SYSTEM PROMPT");
-        session.push_assistant_text(
-            "What I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
+        session.push_system(
+            "SYSTEM PROMPT\n\nWhat I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
         );
         for index in 0..5 {
             session.push_user(format!("history-{index}"));
@@ -583,10 +582,10 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected system prompt text");
         };
-        assert_eq!(system, "SYSTEM PROMPT");
-        assert!(assistant_text(&items[1]).starts_with("What I already remember about myself"));
+        assert!(system.starts_with("SYSTEM PROMPT"));
+        assert!(system.contains("What I already remember about myself"));
         assert_eq!(
-            assistant_text(&items[2]),
+            assistant_text(&items[1]),
             "Compacted session:\nhistory summarized"
         );
         assert_eq!(text_of_user_messages(items), vec!["history-3", "history-4"]);
@@ -610,7 +609,7 @@ mod tests {
             ModelInputItem::Message {
                 role: InputMessageRole::System,
                 content,
-            } if matches!(content.as_slice(), [MessageContent::Text(text)] if text == "SYSTEM PROMPT")
+            } if matches!(content.as_slice(), [MessageContent::Text(text)] if text.starts_with("SYSTEM PROMPT"))
         )));
         assert!(!summary_items.iter().any(|item| {
             matches!(

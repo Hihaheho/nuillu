@@ -67,6 +67,8 @@ pub struct ModelDefinition {
     #[eure(default)]
     pub model: Option<String>,
     #[eure(default)]
+    pub reasoning: bool,
+    #[eure(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[eure(flatten)]
     pub generation: LlmGenerationConfig,
@@ -329,6 +331,7 @@ fn resolve_tier(
         endpoint,
         token,
         model: api_model,
+        reasoning: definition.reasoning,
         reasoning_effort,
         generation,
         use_responses_api,
@@ -735,6 +738,7 @@ models {
     token = "local"
     model = "gemma4:e4b"
     max-concurrent-llm-calls = 4
+    reasoning = true
     reasoning-effort = "none"
   }
 }
@@ -754,10 +758,36 @@ premium-model = "gemma4"
             resolved.cheap.max_concurrent_llm_calls,
             NonZeroUsize::new(4)
         );
+        assert!(resolved.cheap.reasoning);
         assert_eq!(
             resolved.model_concurrency.get("gemma4"),
             Some(&NonZeroUsize::new(4))
         );
+    }
+
+    #[test]
+    fn omitted_model_reasoning_defaults_false() {
+        let model_set = parse_model_set(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+  }
+}
+
+cheap-model = "gemma4"
+default-model = "gemma4"
+premium-model = "gemma4"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_llm_backends(&model_set).unwrap();
+        assert!(!resolved.cheap.reasoning);
+        assert!(!resolved.default.reasoning);
+        assert!(!resolved.premium.reasoning);
     }
 
     #[test]

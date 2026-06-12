@@ -35,6 +35,7 @@ pub struct LlmBackendConfig {
     pub endpoint: String,
     pub token: String,
     pub model: String,
+    pub reasoning: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub generation: LlmGenerationConfig,
     pub use_responses_api: bool,

@@ -923,12 +923,20 @@ impl IntoFuture for SessionCapabilityRequest {
             let mut session = snapshot
                 .map(crate::PersistedSessionSnapshot::into_session)
                 .unwrap_or_else(Session::new);
+            let tier = self
+                .root
+                .inner
+                .blackboard
+                .read(|bb| bb.allocation().tier_for(&self.owner.module))
+                .await;
+            let reasoning = self.root.inner.tiers.pick_handle(tier).reasoning;
             attach_persistent_session_metadata(
                 &mut session,
                 self.owner,
                 key,
                 self.auto_compaction,
                 restored,
+                reasoning,
             );
             Ok(session)
         })

@@ -93,8 +93,8 @@ pub use mind_format::{
     memory_rank_counts,
 };
 pub use mind_session::{
-    push_formatted_cognition_log_batch, push_formatted_memo_log_batch,
-    seed_persistent_faculty_session,
+    REASONING_SYSTEM_PROMPT, format_persistent_system_seed, push_formatted_cognition_log_batch,
+    push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;

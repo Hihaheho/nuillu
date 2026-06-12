@@ -267,6 +267,7 @@ fn build_tier_handle(
         lutum,
         concurrency,
         config.model_key.clone(),
+        config.reasoning,
     ))
 }
 
@@ -520,6 +521,7 @@ mod tests {
             endpoint: "http://localhost:11434/v1".to_string(),
             token: "local".to_string(),
             model: "model".to_string(),
+            reasoning: false,
             reasoning_effort: None,
             generation: LlmGenerationConfig::default(),
             use_responses_api: false,
