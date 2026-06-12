@@ -99,8 +99,7 @@ pub use mind_session::{
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
 pub use prompt::{
-    OPTIONAL_FUNCTION_CALL_REMINDER, REQUIRED_FUNCTION_CALL_REMINDER, format_faculty_system_prompt,
-    format_identity_system_prompt, format_system_prompt,
+    format_faculty_system_prompt, format_identity_system_prompt, format_system_prompt,
 };
 pub use rate_limit::{
     ActivitySnapshot, CapabilityKind, InteroceptionRuntimePolicy, RateLimitConfig,

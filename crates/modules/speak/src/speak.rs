@@ -36,7 +36,6 @@ Do not invent policy, actions, or facts not supported by the cognition log. If t
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
 const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Speak has already been allocated. Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
-const PLANNING_TURN_FINAL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -343,7 +342,6 @@ fn cognition_entry_records(logs: &[CognitionLogRecord]) -> Vec<CognitionLogEntry
 fn push_planning_context(session: &mut Session, cognition_context: &str) {
     session.push_user(cognition_context.trim().to_owned());
     session.push_ephemeral_developer(PLANNING_TURN_DEVELOPER_INSTRUCTION);
-    session.push_ephemeral_user(PLANNING_TURN_FINAL_REMINDER);
 }
 
 fn push_interrupt_planning_context(
@@ -376,7 +374,6 @@ fn push_interrupt_planning_context(
     out.push_str(new_cognition_context.trim());
     session.push_user(out);
     session.push_ephemeral_developer(INTERRUPT_TURN_DEVELOPER_INSTRUCTION);
-    session.push_ephemeral_user(nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER);
 }
 
 #[derive(Debug)]
@@ -2785,7 +2782,6 @@ mod tests {
         assert_eq!(module.planning_session.list_turns().count(), 2);
         let planning_text = session_input_text(&module.planning_session);
         assert!(!planning_text.contains(INTERRUPT_TURN_DEVELOPER_INSTRUCTION));
-        assert!(!planning_text.contains(nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER));
     }
 
     #[tokio::test(flavor = "current_thread")]

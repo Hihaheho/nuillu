@@ -39,7 +39,6 @@ const ONE_SHOT_FINAL_REMINDER: &str = concat!(
     "Output instruction: call dispose_sensory only for current event ids that should be discarded. ",
     "If no current event should be discarded, finish without assistant text.",
 );
-const AMBIENT_FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 const COMPACTED_ONE_SHOT_SESSION_PREFIX: &str = "Compacted one-shot sensory session history:";
 const COMPACTED_AMBIENT_SESSION_PREFIX: &str = "Compacted ambient sensory session history:";
@@ -503,8 +502,6 @@ impl SensoryModule {
                 ));
             self.ambient_session
                 .push_ephemeral_developer(format_ambient_decision_context(&guidance));
-            self.ambient_session
-                .push_ephemeral_user(AMBIENT_FINAL_TOOL_CALL_REMINDER);
             let turn = self
                 .ambient_session
                 .text_turn()
@@ -1770,8 +1767,8 @@ mod tests {
                 let ephemeral_indices = observed.observed_ephemeral_indices();
                 assert_eq!(ephemeral_indices.len(), 1);
                 assert!(
-                    ephemeral_indices.iter().all(|indices| indices.len() == 2),
-                    "ambient sensory LLM turn should carry decision context and final reminder as ephemeral items"
+                    ephemeral_indices.iter().all(|indices| indices.len() == 1),
+                    "ambient sensory LLM turn should carry decision context as an ephemeral item"
                 );
             })
             .await;
@@ -1823,8 +1820,9 @@ mod tests {
                 let message = format!("{error:#}");
                 assert!(
                     message.contains("ambient sensory text turn failed")
-                        || message
-                            .contains("ambient sensory text turn finished without required tool calls"),
+                        || message.contains(
+                            "ambient sensory text turn finished without required tool calls"
+                        ),
                     "unexpected activation error: {message}"
                 );
 
@@ -1833,8 +1831,8 @@ mod tests {
                 let ephemeral_indices = observed.observed_ephemeral_indices();
                 assert_eq!(ephemeral_indices.len(), 1);
                 assert!(
-                    ephemeral_indices.iter().all(|indices| indices.len() == 2),
-                    "ambient sensory LLM turn should carry decision context and final reminder as ephemeral items"
+                    ephemeral_indices.iter().all(|indices| indices.len() == 1),
+                    "ambient sensory LLM turn should carry decision context as an ephemeral item"
                 );
             })
             .await;

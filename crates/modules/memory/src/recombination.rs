@@ -123,8 +123,7 @@ impl MemoryRecombinationModule {
                 cx.core_policies(),
                 cx.now(),
             ))
-            .user(format_recombination_context(cx, &recent, &related))
-            .user(nuillu_module::OPTIONAL_FUNCTION_CALL_REMINDER);
+            .user(format_recombination_context(cx, &recent, &related));
 
         let lutum = self.llm.lutum().await;
         let outcome = lutum

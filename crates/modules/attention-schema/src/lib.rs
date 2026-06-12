@@ -46,7 +46,6 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
 prior appended first-person attention experiences, rejected candidates, and cognition-log context
 needed for future attention updates."#;
-const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -75,9 +74,10 @@ fn format_attention_schema_update_input(
     if sections.is_empty() {
         return None;
     }
-    sections.push(format!(
-        "Instruction: Update the attention schema from only the new notes and cognition entries above.\n{FINAL_TOOL_CALL_REMINDER}"
-    ));
+    sections.push(
+        "Instruction: Update the attention schema from only the new notes and cognition entries above."
+            .to_owned(),
+    );
     Some(sections.join("\n\n"))
 }
 
@@ -546,7 +546,9 @@ mod tests {
         assert_eq!(first_user_messages.len(), 1);
         let first_user = first_user_messages[0];
         assert!(first_user.contains("first fresh note about Koro"));
-        assert!(first_user.contains(FINAL_TOOL_CALL_REMINDER));
+        assert!(first_user.contains(
+            "Instruction: Update the attention schema from only the new notes and cognition entries above."
+        ));
         assert!(!first_user.contains("sensory"));
         assert!(!first_user.contains("Current attention guidance"));
         assert!(!first_user.contains("allocation guidance"));

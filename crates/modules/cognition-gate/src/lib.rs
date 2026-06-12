@@ -83,7 +83,6 @@ const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate d
 events, rejected candidate events, cognition context, and relevant memory evidence needed for
 future cognition-gate decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
-const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -258,7 +257,6 @@ impl CognitionGateModule {
         lutum: &Lutum,
         cx: &nuillu_module::ActivateCx<'_>,
     ) -> Result<()> {
-        self.session.push_ephemeral_user(FINAL_TOOL_CALL_REMINDER);
         let outcome = self
             .session
             .text_turn()
@@ -1103,7 +1101,7 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         let request_items = inputs[0].items();
         let user_messages = message_texts_with_role(request_items, InputMessageRole::User);
-        assert_eq!(user_messages.len(), 2);
+        assert_eq!(user_messages.len(), 1);
         let candidate_input = user_messages[0];
         assert!(candidate_input.contains(NEW_CANDIDATE_HEADER));
         assert!(candidate_input.contains("- candidate 1"));
@@ -1114,7 +1112,6 @@ mod tests {
         assert!(!candidate_input.contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert_eq!(user_messages[1], FINAL_TOOL_CALL_REMINDER);
         let developer_messages =
             message_texts_with_role(request_items, InputMessageRole::Developer);
         assert!(developer_messages.is_empty());
@@ -1178,11 +1175,6 @@ mod tests {
             &items,
             InputMessageRole::User,
             "sensory detail A"
-        ));
-        assert!(!has_message_with_role_containing(
-            &items,
-            InputMessageRole::User,
-            FINAL_TOOL_CALL_REMINDER
         ));
         assert!(!has_message_with_role_containing(
             &items,
@@ -1324,11 +1316,6 @@ mod tests {
             InputMessageRole::User,
             "sensory detail A"
         ));
-        assert!(!has_message_with_role_containing(
-            &items,
-            InputMessageRole::User,
-            FINAL_TOOL_CALL_REMINDER
-        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1377,14 +1364,13 @@ mod tests {
         assert!(system.contains("You are the cognition-gate module"));
 
         let first_user_messages = message_texts_with_role(first_items, InputMessageRole::User);
-        assert_eq!(first_user_messages.len(), 2);
+        assert_eq!(first_user_messages.len(), 1);
         assert!(first_user_messages[0].contains(NEW_CANDIDATE_HEADER));
         assert!(first_user_messages[0].contains("sensory detail A"));
         assert!(!first_user_messages[0].contains("memo"));
         assert!(!first_user_messages[0].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert_eq!(first_user_messages[1], FINAL_TOOL_CALL_REMINDER);
         assert!(message_texts_with_role(first_items, InputMessageRole::Developer).is_empty());
         assert!(!has_message_with_role_containing(
             first_items,
@@ -1427,7 +1413,7 @@ mod tests {
             "sensory detail A"
         ));
         let second_user_messages = message_texts_with_role(second_items, InputMessageRole::User);
-        assert_eq!(second_user_messages.len(), 4);
+        assert_eq!(second_user_messages.len(), 3);
         assert!(second_user_messages[0].contains(NEW_CANDIDATE_HEADER));
         assert!(second_user_messages[0].contains("sensory detail A"));
         assert!(second_user_messages[1].contains("Current cognition log at"));
@@ -1438,7 +1424,6 @@ mod tests {
         assert!(!second_user_messages[2].contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
         ));
-        assert_eq!(second_user_messages[3], FINAL_TOOL_CALL_REMINDER);
         assert!(message_texts_with_role(second_items, InputMessageRole::Developer).is_empty());
         assert!(!has_message_with_role_containing(
             second_items,
@@ -1516,7 +1501,6 @@ mod tests {
                 .any(|text| text.contains("Current cognition log at")
                     && text.contains("The agent noticed the north door is blocked."))
         );
-        assert!(!session_user_messages.contains(&FINAL_TOOL_CALL_REMINDER));
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
@@ -1535,7 +1519,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_seeds_identity_memories_as_assistant_text() {
+    async fn activation_seeds_identity_memories_in_system_prompt() {
         let adapter = MockLlmAdapter::new().with_text_scenario(leave_cognition_unchanged_scenario(
             "no load-bearing cognition",
             1,
@@ -1561,11 +1545,18 @@ mod tests {
         fixture.gate.activate(&cx).await.unwrap();
 
         let items = fixture.gate.session.input().items().to_vec();
-        let ModelInputItem::Assistant(lutum::AssistantInputItem::Text(identity)) = &items[1] else {
-            panic!("expected identity memories as assistant text");
+        let ModelInputItem::Message {
+            role: InputMessageRole::System,
+            content,
+        } = &items[0]
+        else {
+            panic!("expected leading system prompt");
         };
-        assert!(identity.contains("What I already remember about myself at"));
-        assert!(identity.contains("- The agent is named Nuillu."));
-        assert!(!identity.contains("<self-memory>"));
+        let [MessageContent::Text(system)] = content.as_slice() else {
+            panic!("expected system prompt text");
+        };
+        assert!(system.contains("What I already remember about myself at"));
+        assert!(system.contains("- The agent is named Nuillu."));
+        assert!(!system.contains("<self-memory>"));
     }
 }

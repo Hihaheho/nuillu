@@ -61,8 +61,7 @@ If retrieved evidence is useful, call broadcast_search_results with the selected
 linked_hit_indexes. If the tool results do not contain useful evidence and no targeted search
 remains, finish without assistant text. Use exact literal index strings from tool results, never
 list positions."#;
-const FINALIZE_RETRIEVAL_PROMPT: &str = r#"Use function calling only. Exactly one available function. Empty assistant content.
-Finalization turn. Use broadcast_search_results or dispose_search_results.
+const FINALIZE_RETRIEVAL_PROMPT: &str = r#"Finalization turn. Use broadcast_search_results or dispose_search_results.
 Do not write prose, reasoning, markdown, or a plain answer.
 Search and linked-memory fetch are closed. Use only existing tool results.
 The search_memory and fetch_linked_memories results already in this session are fresh pending

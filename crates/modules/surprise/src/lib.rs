@@ -43,7 +43,6 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior surprise assessments, predict memo-log
 facts, significant events, memory preservation requests, and cognition-log context needed for future
 surprise checks."#;
-const FINAL_TOOL_CALL_REMINDER: &str = nuillu_module::REQUIRED_FUNCTION_CALL_REMINDER;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -176,7 +175,6 @@ impl SurpriseModule {
                 COGNITION_CONTEXT_WINDOW,
             );
             self.session.push_ephemeral_developer(ACTIVATION_INPUT);
-            self.session.push_ephemeral_user(FINAL_TOOL_CALL_REMINDER);
             self.session
                 .text_turn()
                 .tools::<SurpriseTools>()
@@ -768,11 +766,11 @@ mod tests {
         assert!(inputs[0].items().iter().any(|item| matches!(
             item,
             ModelInputItem::Message {
-                role: InputMessageRole::User,
+                role: InputMessageRole::Developer,
                 content,
             } if matches!(
                 content.as_slice(),
-                [MessageContent::Text(text)] if text == FINAL_TOOL_CALL_REMINDER
+                [MessageContent::Text(text)] if text == ACTIVATION_INPUT
             )
         )));
     }
