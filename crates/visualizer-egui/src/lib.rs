@@ -633,7 +633,7 @@ impl RuntimeTab {
                     ui,
                     &mut self.errors,
                     self.session_error_count,
-                    self.modules.session_request_count(),
+                    self.modules.session_live_llm_turn_count(),
                 )
             });
         self.record_window_open(errors_id, open);

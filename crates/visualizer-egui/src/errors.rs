@@ -8,12 +8,14 @@ pub fn ui(
     ui: &mut egui::Ui,
     errors: &mut VecDeque<VisualizerErrorView>,
     session_error_count: u32,
-    request_count: u32,
+    live_llm_turn_count: u32,
 ) {
     ui.horizontal_wrapped(|ui| {
         ui.heading("Errors");
-        ui.label(format!("session: {session_error_count}/{request_count}"))
-            .on_hover_text("errors / LLM requests in this visualizer session");
+        ui.label(format!(
+            "session: {session_error_count}/{live_llm_turn_count}"
+        ))
+        .on_hover_text("session errors / live LLM turns in this visualizer session");
         ui.label(format!("shown: {}", errors.len()));
         if ui.button("Clear list").clicked() {
             errors.clear();

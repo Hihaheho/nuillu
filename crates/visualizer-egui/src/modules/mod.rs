@@ -31,7 +31,6 @@ pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
     turn_to_owner: BTreeMap<String, String>,
     turn_order: Vec<String>,
-    session_request_count: u32,
 }
 
 impl ModulesState {
@@ -52,8 +51,11 @@ impl ModulesState {
             .collect()
     }
 
-    pub fn session_request_count(&self) -> u32 {
-        self.session_request_count
+    pub fn session_live_llm_turn_count(&self) -> u32 {
+        self.modules
+            .values()
+            .map(|module| llm_turn_counts(module).total)
+            .fold(0_u32, u32::saturating_add)
     }
 }
 
@@ -68,8 +70,8 @@ pub struct ModuleState {
     pub last_tier: Option<String>,
     pub last_throttle: Option<ThrottleSummary>,
     pub latest_batch: Option<ModuleBatchDebugState>,
-    pub error_count: u32,
-    pub session_request_count: u32,
+    pub activation_error_count: u32,
+    pub activation_attempt_count: u32,
     pub last_execution_failed: bool,
 }
 
@@ -102,6 +104,7 @@ pub struct LlmTurnState {
     pub input: Vec<LlmInputItemView>,
     pub output: Vec<LlmOutputItemState>,
     pub status: ModuleSessionStatus,
+    pub counted_in_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,8 +156,10 @@ pub struct ModuleOverviewRow {
     pub policy: Option<ModulePolicyView>,
     pub throttle: Option<String>,
     pub latest_llm_output: Option<String>,
-    pub error_count: u32,
-    pub session_request_count: u32,
+    pub activation_error_count: u32,
+    pub activation_attempt_count: u32,
+    pub llm_error_count: u32,
+    pub llm_turn_count: u32,
     pub last_execution_failed: bool,
 }
 
@@ -254,8 +259,9 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
         RuntimeEvent::ModuleActivationCompleted {
             owner, succeeded, ..
         } => {
+            let module = module_mut_for_owner(state, owner);
             if *succeeded {
-                let module = module_mut_for_owner(state, owner);
+                module.activation_attempt_count = module.activation_attempt_count.saturating_add(1);
                 module.last_execution_failed = false;
                 if module
                     .runtime_status
@@ -277,7 +283,8 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             module.runtime_status = Some(format!(
                 "Retrying activation {activation_attempt}/{max_attempts}: {message}"
             ));
-            module.error_count = module.error_count.saturating_add(1);
+            module.activation_error_count = module.activation_error_count.saturating_add(1);
+            module.activation_attempt_count = module.activation_attempt_count.saturating_add(1);
             module.last_execution_failed = true;
         }
         RuntimeEvent::ModuleTaskFailed {
@@ -289,7 +296,6 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             let module = module_mut_for_owner(state, owner);
             module.status = ModuleSessionStatus::Failed;
             module.runtime_status = Some(format!("Failed {phase}: {message}"));
-            module.error_count = module.error_count.saturating_add(1);
             module.last_execution_failed = true;
         }
         RuntimeEvent::ModuleWarning { owner, message, .. } => {
@@ -334,15 +340,8 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             items,
             ..
         } => {
-            let new_turn = record_turn_owner(state, &turn_id, &owner);
-            if new_turn {
-                state.session_request_count = state.session_request_count.saturating_add(1);
-            }
+            record_turn_owner(state, &turn_id, &owner);
             let module_state = module_mut_with_metadata(state, owner, module, replica);
-            if new_turn {
-                module_state.session_request_count =
-                    module_state.session_request_count.saturating_add(1);
-            }
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
             let batch = module_state.latest_batch.clone();
@@ -357,6 +356,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             );
             turn.input = items;
             turn.status = ModuleSessionStatus::Running;
+            turn.counted_in_session = true;
         }
         LlmObservationEvent::StreamStarted {
             turn_id,
@@ -471,7 +471,6 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
                 let module = module_mut(state, owner);
                 module.status = ModuleSessionStatus::Failed;
                 module.runtime_status = Some(format!("LLM turn failed: {message}"));
-                module.error_count = module.error_count.saturating_add(1);
                 module.last_execution_failed = true;
             }
         }
@@ -577,8 +576,11 @@ pub fn overview_rows(
         }
         row.throttle = module.last_throttle.as_ref().map(throttle_label);
         row.latest_llm_output = latest_llm_output(module);
-        row.error_count = module.error_count;
-        row.session_request_count = module.session_request_count;
+        row.activation_error_count = module.activation_error_count;
+        row.activation_attempt_count = module.activation_attempt_count;
+        let llm_counts = llm_turn_counts(module);
+        row.llm_error_count = llm_counts.failed;
+        row.llm_turn_count = llm_counts.total;
         row.last_execution_failed = module.last_execution_failed;
     }
 
@@ -1171,7 +1173,8 @@ const TIER_COLUMN_WIDTH: f32 = 60.0;
 const BPM_COLUMN_WIDTH: f32 = 30.0;
 const PERIOD_COLUMN_WIDTH: f32 = 40.0;
 const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
-const ERRORS_COLUMN_WIDTH: f32 = 64.0;
+const ACTIVATION_ERRORS_COLUMN_WIDTH: f32 = 64.0;
+const LLM_ERRORS_COLUMN_WIDTH: f32 = 64.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
 const CONFIG_POPUP_WIDTH: f32 = 310.0;
 const CONFIG_POPUP_ESTIMATED_HEIGHT: f32 = 160.0;
@@ -1190,7 +1193,8 @@ fn overview_header(ui: &mut egui::Ui) {
         overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
         overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
         overview_header_cell(ui, "LLM", LLM_COLUMN_WIDTH);
-        overview_header_cell(ui, "Errors", ERRORS_COLUMN_WIDTH);
+        overview_header_cell(ui, "Act Err", ACTIVATION_ERRORS_COLUMN_WIDTH);
+        overview_header_cell(ui, "LLM Err", LLM_ERRORS_COLUMN_WIDTH);
         overview_header_cell(ui, "Latest LLM out", LATEST_OUTPUT_COLUMN_WIDTH);
     });
 }
@@ -1263,16 +1267,27 @@ fn overview_row(
             );
             overview_label_cell(ui, &row.runtime_status, None, STATUS_COLUMN_WIDTH);
             overview_llm_status_cell(ui, row);
-            let error_count_label = overview_error_count_label(row);
-            let error_count_hover = format!(
-                "{} errors / {} module LLM requests in this visualizer session",
-                row.error_count, row.session_request_count
+            let activation_error_label = overview_activation_error_label(row);
+            let activation_error_hover = format!(
+                "{} activation errors / {} activation attempts in this visualizer session",
+                row.activation_error_count, row.activation_attempt_count
             );
             overview_label_cell(
                 ui,
-                &error_count_label,
-                Some(&error_count_hover),
-                ERRORS_COLUMN_WIDTH,
+                &activation_error_label,
+                Some(&activation_error_hover),
+                ACTIVATION_ERRORS_COLUMN_WIDTH,
+            );
+            let llm_error_label = overview_llm_error_label(row);
+            let llm_error_hover = format!(
+                "{} LLM errors / {} live LLM turns in this visualizer session",
+                row.llm_error_count, row.llm_turn_count
+            );
+            overview_label_cell(
+                ui,
+                &llm_error_label,
+                Some(&llm_error_hover),
+                LLM_ERRORS_COLUMN_WIDTH,
             );
             let output = row.latest_llm_output.as_deref().unwrap_or("-");
             overview_latest_output_cell(ui, output, row.latest_llm_output.as_deref());
@@ -1713,8 +1728,10 @@ fn upsert_overview_row<'a>(
             policy: None,
             throttle: None,
             latest_llm_output: None,
-            error_count: 0,
-            session_request_count: 0,
+            activation_error_count: 0,
+            activation_attempt_count: 0,
+            llm_error_count: 0,
+            llm_turn_count: 0,
             last_execution_failed: false,
         });
     if !module.is_empty() {
@@ -1746,13 +1763,21 @@ fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
     row.llm_status != status_label(ModuleSessionStatus::Idle)
         || row.latest_llm_output.is_some()
         || row.throttle.is_some()
-        || row.error_count > 0
+        || row.activation_error_count > 0
+        || row.llm_error_count > 0
         || row.last_execution_failed
         || !matches!(row.runtime_status.as_str(), "Inactive" | "not reported")
 }
 
-fn overview_error_count_label(row: &ModuleOverviewRow) -> String {
-    format!("{}/{}", row.error_count, row.session_request_count)
+fn overview_activation_error_label(row: &ModuleOverviewRow) -> String {
+    format!(
+        "{}/{}",
+        row.activation_error_count, row.activation_attempt_count
+    )
+}
+
+fn overview_llm_error_label(row: &ModuleOverviewRow) -> String {
+    format!("{}/{}", row.llm_error_count, row.llm_turn_count)
 }
 
 fn active_replica_highlight(row: &ModuleOverviewRow) -> Option<ActiveReplicaHighlight> {
@@ -2046,6 +2071,26 @@ fn turn_is_streaming(turn: &LlmTurnState) -> bool {
     turn.status == ModuleSessionStatus::Running || turn.output.iter().any(|item| item.streaming)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LlmTurnCounts {
+    failed: u32,
+    total: u32,
+}
+
+fn llm_turn_counts(module: &ModuleState) -> LlmTurnCounts {
+    module
+        .turns
+        .iter()
+        .filter(|turn| turn.counted_in_session)
+        .fold(LlmTurnCounts::default(), |mut counts, turn| {
+            counts.total = counts.total.saturating_add(1);
+            if turn.status == ModuleSessionStatus::Failed {
+                counts.failed = counts.failed.saturating_add(1);
+            }
+            counts
+        })
+}
+
 fn ensure_turn(
     module: &mut ModuleState,
     turn_id: String,
@@ -2083,6 +2128,7 @@ fn ensure_turn(
         input: Vec::new(),
         output: Vec::new(),
         status: ModuleSessionStatus::Running,
+        counted_in_session: false,
     });
     module.turns.last_mut().expect("turn inserted")
 }
@@ -2264,8 +2310,10 @@ mod tests {
             policy: None,
             throttle: None,
             latest_llm_output: None,
-            error_count: 0,
-            session_request_count: 0,
+            activation_error_count: 0,
+            activation_attempt_count: 0,
+            llm_error_count: 0,
+            llm_turn_count: 0,
             last_execution_failed: false,
         }
     }
@@ -3233,6 +3281,7 @@ mod tests {
                 output: Vec::new(),
                 status: ModuleSessionStatus::Running,
                 error_message: None,
+                counted_in_session: false,
             }],
             ..ModuleState::default()
         };
@@ -3261,6 +3310,7 @@ mod tests {
             output: Vec::new(),
             status: ModuleSessionStatus::Running,
             error_message: None,
+            counted_in_session: false,
         };
 
         assert_eq!(turn_selector_label(1, &turn), "main 1");
@@ -3452,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn model_input_events_count_module_and_session_requests() {
+    fn model_input_events_count_live_llm_turns_by_module_and_session() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -3500,6 +3550,20 @@ mod tests {
         apply_llm_observation(
             &mut state,
             LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
                 turn_id: "memory-turn".to_string(),
                 owner: "memory".to_string(),
                 module: "memory".to_string(),
@@ -3511,8 +3575,23 @@ mod tests {
                 items: Vec::new(),
             },
         );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::StreamStarted {
+                turn_id: "sensory-turn".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                request_id: Some("req-2".to_string()),
+                model: "model-a".to_string(),
+            },
+        );
 
-        assert_eq!(state.session_request_count(), 2);
+        assert_eq!(state.session_live_llm_turn_count(), 2);
 
         apply_runtime_event(
             &mut state,
@@ -3523,7 +3602,7 @@ mod tests {
                 tier: nuillu_types::ModelTier::Default,
             },
         );
-        assert_eq!(state.session_request_count(), 2);
+        assert_eq!(state.session_live_llm_turn_count(), 2);
 
         let snapshot = BlackboardSnapshot {
             allocation: vec![AllocationView {
@@ -3541,20 +3620,151 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == "predict")
-                .map(|row| row.session_request_count),
-            Some(1)
+                .map(|row| (row.llm_error_count, row.llm_turn_count)),
+            Some((0, 1))
         );
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == "memory")
-                .map(|row| row.session_request_count),
-            Some(1)
+                .map(|row| (row.llm_error_count, row.llm_turn_count)),
+            Some((0, 1))
         );
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == "sensory")
-                .map(|row| row.session_request_count),
-            Some(0)
+                .map(|row| (row.llm_error_count, row.llm_turn_count)),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn failed_live_llm_turns_count_as_llm_errors() {
+        let mut state = ModulesState::default();
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: "predict".to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Failed {
+                turn_id: "predict-turn".to_string(),
+                message: "request timed out".to_string(),
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == "predict")
+                .map(|row| (row.llm_error_count, row.llm_turn_count)),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
+    fn activation_events_count_errors_and_attempts() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationAttemptFailed {
+                sequence: 0,
+                owner: owner.clone(),
+                activation_attempt: 1,
+                max_attempts: 3,
+                message: "temporary failure".to_string(),
+            },
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 1,
+                owner: owner.clone(),
+                duration: Duration::from_millis(42),
+                succeeded: true,
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == owner.to_string())
+                .map(|row| (row.activation_error_count, row.activation_attempt_count)),
+            Some((1, 2))
+        );
+
+        let mut state = ModulesState::default();
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationAttemptFailed {
+                sequence: 0,
+                owner: owner.clone(),
+                activation_attempt: 1,
+                max_attempts: 2,
+                message: "first failure".to_string(),
+            },
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationAttemptFailed {
+                sequence: 1,
+                owner: owner.clone(),
+                activation_attempt: 2,
+                max_attempts: 2,
+                message: "second failure".to_string(),
+            },
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 2,
+                owner: owner.clone(),
+                duration: Duration::from_millis(42),
+                succeeded: false,
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == owner.to_string())
+                .map(|row| (row.activation_error_count, row.activation_attempt_count)),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn module_task_failed_does_not_count_as_activation_error() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleTaskFailed {
+                sequence: 0,
+                owner: owner.clone(),
+                phase: "activate".to_string(),
+                message: "task failed".to_string(),
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.owner == owner.to_string())
+                .map(|row| (row.activation_error_count, row.activation_attempt_count)),
+            Some((0, 0))
         );
     }
 
@@ -3598,8 +3808,9 @@ mod tests {
         let module = state.modules.get("predict").expect("module exists");
         assert_eq!(module.status, ModuleSessionStatus::Idle);
         assert_eq!(module.runtime_status, None);
-        assert_eq!(module.error_count, 0);
-        assert_eq!(state.session_request_count(), 0);
+        assert_eq!(module.activation_error_count, 0);
+        assert_eq!(module.activation_attempt_count, 0);
+        assert_eq!(state.session_live_llm_turn_count(), 0);
         assert!(!module.last_execution_failed);
         assert_eq!(module.last_tier, None);
 
@@ -3617,8 +3828,10 @@ mod tests {
         let overview = overview_rows(&state, &BlackboardSnapshot::default());
         assert_eq!(overview.len(), 1);
         assert_eq!(overview[0].llm_status, "idle");
-        assert_eq!(overview[0].error_count, 0);
-        assert_eq!(overview[0].session_request_count, 0);
+        assert_eq!(overview[0].activation_error_count, 0);
+        assert_eq!(overview[0].activation_attempt_count, 0);
+        assert_eq!(overview[0].llm_error_count, 0);
+        assert_eq!(overview[0].llm_turn_count, 0);
         assert!(!overview[0].last_execution_failed);
         assert_eq!(overview_row_fill_kind(&overview[0], 0), None);
     }
@@ -3787,17 +4000,21 @@ mod tests {
             module.runtime_status.as_deref(),
             Some("Failed activate: llm request failed")
         );
-        assert_eq!(module.error_count, 1);
+        assert_eq!(module.activation_error_count, 0);
+        assert_eq!(module.activation_attempt_count, 0);
         assert!(module.last_execution_failed);
 
         let rows = overview_rows(&state, &BlackboardSnapshot::default());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].error_count, 1);
+        assert_eq!(rows[0].activation_error_count, 0);
+        assert_eq!(rows[0].activation_attempt_count, 0);
+        assert_eq!(rows[0].llm_error_count, 0);
+        assert_eq!(rows[0].llm_turn_count, 0);
         assert!(rows[0].last_execution_failed);
     }
 
     #[test]
-    fn successful_activation_clears_failed_highlight_without_resetting_errors() {
+    fn successful_activation_clears_failed_highlight_without_counting_task_failure() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
 
@@ -3824,7 +4041,8 @@ mod tests {
             .modules
             .get(&owner.to_string())
             .expect("module exists");
-        assert_eq!(module.error_count, 1);
+        assert_eq!(module.activation_error_count, 0);
+        assert_eq!(module.activation_attempt_count, 1);
         assert!(!module.last_execution_failed);
     }
 
@@ -3903,8 +4121,10 @@ mod tests {
                 policy: None,
                 throttle: Some("500ms".to_string()),
                 latest_llm_output: Some("text: filtered observation".to_string()),
-                error_count: 0,
-                session_request_count: 1,
+                activation_error_count: 0,
+                activation_attempt_count: 0,
+                llm_error_count: 0,
+                llm_turn_count: 1,
                 last_execution_failed: false,
             }]
         );
@@ -3930,8 +4150,10 @@ mod tests {
             policy: None,
             throttle: None,
             latest_llm_output: None,
-            error_count: 0,
-            session_request_count: 0,
+            activation_error_count: 0,
+            activation_attempt_count: 0,
+            llm_error_count: 0,
+            llm_turn_count: 0,
             last_execution_failed: false,
         };
 
