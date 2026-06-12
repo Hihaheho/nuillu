@@ -167,11 +167,6 @@ impl eframe::App for VisualizerApp {
                 if self.remote && self.state.disconnected {
                     ui.colored_label(ui.visuals().error_fg_color, "Eval disconnected");
                 }
-                if ui.button("Shutdown").clicked() {
-                    let _ = self.client_messages.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::Shutdown,
-                    });
-                }
             });
         });
 
@@ -901,9 +896,12 @@ mod tests {
         state.apply_server_message(VisualizerServerMessage::OfferAction {
             action: VisualizerAction::start_activation(tab_id.clone()),
         });
+        state.apply_server_message(VisualizerServerMessage::OfferAction {
+            action: VisualizerAction::stop_runtime(tab_id.clone()),
+        });
 
         let actions = state.visible_actions();
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 3);
         assert!(
             actions
                 .iter()
@@ -914,13 +912,27 @@ mod tests {
                 .iter()
                 .any(|action| action.id == start_activation_action_id(&tab_id))
         );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.id == stop_runtime_action_id(&tab_id))
+        );
 
         state.apply_server_message(VisualizerServerMessage::RevokeAction {
             action_id: start_activation_action_id(&tab_id),
         });
         let actions = state.visible_actions();
-        assert_eq!(actions.len(), 1);
-        assert_eq!(actions[0].id, START_SUITE_ACTION_ID);
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.id == START_SUITE_ACTION_ID)
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.id == stop_runtime_action_id(&tab_id))
+        );
     }
 
     #[test]

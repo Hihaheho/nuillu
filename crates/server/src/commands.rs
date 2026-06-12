@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use nuillu_agent::AgentRunController;
 use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
 };
@@ -8,12 +9,14 @@ use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, Sens
 use nuillu_types::{MemoryIndex, ModuleId, ReplicaCapRange};
 use nuillu_visualizer_protocol::{
     ModuleSettingsView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
-    VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
+    VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records, run_runtime_action_id,
+    stop_runtime_action_id,
 };
 
 use crate::SERVER_TAB_ID;
 use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
+use crate::runtime::set_runtime_running;
 use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, list_all_memories,
     memory_record_view,
@@ -29,6 +32,7 @@ pub(super) async fn drive_server_until_shutdown(
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
+    run_controller: &AgentRunController,
 ) {
     publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
     loop {
@@ -44,6 +48,7 @@ pub(super) async fn drive_server_until_shutdown(
                 module_settings,
                 sensory,
                 env,
+                run_controller,
             )
             .await
             {
@@ -67,10 +72,18 @@ async fn handle_server_visualizer_message(
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
+    run_controller: &AgentRunController,
 ) -> bool {
     let command = match message {
         VisualizerClientMessage::Hello { .. } => return false,
-        VisualizerClientMessage::InvokeAction { .. } => return false,
+        VisualizerClientMessage::InvokeAction { action_id } => {
+            if action_id == run_runtime_action_id(tab_id) {
+                resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
+            } else if action_id == stop_runtime_action_id(tab_id) {
+                set_runtime_running(visualizer, tab_id, run_controller, false);
+            }
+            return false;
+        }
         VisualizerClientMessage::Command { command } => command,
     };
     match command {
@@ -82,6 +95,9 @@ async fn handle_server_visualizer_message(
             tab_id: command_tab,
             input,
         } if command_tab == *tab_id => {
+            if !run_controller.is_running() {
+                resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
+            }
             let body = SensoryInput::OneShot {
                 modality: SensoryModality::parse(input.modality),
                 direction: input.direction,
@@ -102,7 +118,15 @@ async fn handle_server_visualizer_message(
             disabled,
         } if command_tab == *tab_id => {
             scene.create_legacy_ambient(modality, content, disabled);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::UpdateAmbientSensoryRow {
@@ -110,7 +134,15 @@ async fn handle_server_visualizer_message(
             row,
         } if command_tab == *tab_id => {
             scene.update_legacy_ambient(row);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::RemoveAmbientSensoryRow {
@@ -118,7 +150,15 @@ async fn handle_server_visualizer_message(
             row_id,
         } if command_tab == *tab_id => {
             scene.remove_legacy_ambient(&row_id);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::CreateSceneRow {
@@ -126,7 +166,15 @@ async fn handle_server_visualizer_message(
             kind,
         } if command_tab == *tab_id => {
             scene.create(kind);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::UpdateSceneRow {
@@ -134,7 +182,15 @@ async fn handle_server_visualizer_message(
             row,
         } if command_tab == *tab_id => {
             scene.update(row);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::RemoveSceneRow {
@@ -143,7 +199,15 @@ async fn handle_server_visualizer_message(
             row_id,
         } if command_tab == *tab_id => {
             scene.remove(kind, &row_id);
-            persist_and_emit_scene(scene, visualizer, tab_id, sensory, env).await;
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
             false
         }
         VisualizerCommand::SendScenePersonMessage {
@@ -151,6 +215,9 @@ async fn handle_server_visualizer_message(
             row_id,
             message,
         } if command_tab == *tab_id => {
+            if !run_controller.is_running() {
+                resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
+            }
             send_scene_person_message(scene, &row_id, message, visualizer, tab_id, sensory, env)
                 .await;
             false
@@ -310,6 +377,7 @@ async fn persist_and_emit_scene(
     tab_id: &VisualizerTabId,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
+    publish_snapshot: bool,
 ) {
     if let Err(error) = scene.save() {
         visualizer.send_event(VisualizerEvent::Log {
@@ -319,6 +387,20 @@ async fn persist_and_emit_scene(
     }
     env.caps.scene().set(scene.participants());
     emit_scene_state(scene, visualizer, tab_id);
+    if publish_snapshot {
+        publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
+    }
+}
+
+async fn resume_runtime(
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    scene: &SceneState,
+    sensory: &SensoryInputMailbox,
+    env: &ServerEnvironment,
+    run_controller: &AgentRunController,
+) {
+    set_runtime_running(visualizer, tab_id, run_controller, true);
     publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
 }
 

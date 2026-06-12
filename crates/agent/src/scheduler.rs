@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -17,7 +18,7 @@ use nuillu_module::{
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
@@ -30,6 +31,80 @@ pub struct AgentEventLoopConfig {
     pub max_activation_attempts: u8,
     pub dependency_idle_timeout: Duration,
     pub dependency_hard_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRunMode {
+    Running,
+    Paused,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRunController {
+    mode: watch::Sender<AgentRunMode>,
+    running: Arc<AtomicBool>,
+}
+
+impl AgentRunController {
+    pub fn new() -> (Self, AgentRunControl) {
+        let (sender, receiver) = watch::channel(AgentRunMode::Running);
+        let running = Arc::new(AtomicBool::new(true));
+        (
+            Self {
+                mode: sender,
+                running: Arc::clone(&running),
+            },
+            AgentRunControl {
+                mode: Some(receiver),
+                running: Some(running),
+            },
+        )
+    }
+
+    pub fn pause(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = self.mode.send(AgentRunMode::Paused);
+    }
+
+    pub fn resume(&self) {
+        self.running.store(true, Ordering::SeqCst);
+        let _ = self.mode.send(AgentRunMode::Running);
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentRunControl {
+    mode: Option<watch::Receiver<AgentRunMode>>,
+    running: Option<Arc<AtomicBool>>,
+}
+
+impl AgentRunControl {
+    pub fn always_running() -> Self {
+        Self {
+            mode: None,
+            running: None,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_none_or(|running| running.load(Ordering::SeqCst))
+    }
+
+    async fn changed(&mut self) {
+        let Some(mode) = &mut self.mode else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        if mode.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +130,20 @@ pub enum SchedulerError {
 pub async fn run(
     modules: AllocatedModules,
     config: AgentEventLoopConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), SchedulerError> {
+    run_controlled(modules, config, AgentRunControl::always_running(), shutdown).await
+}
+
+/// Run the agent event loop with an external Run/Stop control.
+///
+/// Pausing prevents new module activations from being scheduled. Already
+/// running module tasks continue to completion, so in-flight LLM calls are not
+/// aborted by a pause.
+pub async fn run_controlled(
+    modules: AllocatedModules,
+    config: AgentEventLoopConfig,
+    control: AgentRunControl,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), SchedulerError> {
     let (runtime, modules, dependencies) = modules.into_parts_with_dependencies();
@@ -99,27 +188,35 @@ pub async fn run(
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let parent = tracing::Span::current();
 
-    refresh_active_and_schedule(
-        &runtime,
-        &owners,
-        &mut active,
-        &mut states,
-        &mut tasks,
-        &mut kick_inboxes,
-        &mut zero_window_wakers,
-        &mut zero_windows,
-        config,
-        &parent,
-        &subscriber,
-    )
-    .await;
+    let mut control = control;
+    if control.is_running() {
+        refresh_active_and_schedule(
+            &runtime,
+            &owners,
+            &mut active,
+            &mut states,
+            &mut tasks,
+            &mut kick_inboxes,
+            &mut zero_window_wakers,
+            &mut zero_windows,
+            config,
+            &parent,
+            &subscriber,
+        )
+        .await;
+    }
 
     let mut shutdown = pin!(shutdown);
     let mut idle_since: Option<Instant> = None;
     let mut idle_marker_sent = false;
 
     loop {
-        let idle_now = is_idle(&active, &states);
+        let running = control.is_running();
+        if !running {
+            idle_since = None;
+            idle_marker_sent = false;
+        }
+        let idle_now = running && is_idle(&active, &states);
         if idle_now {
             idle_since.get_or_insert_with(Instant::now);
         } else {
@@ -154,6 +251,7 @@ pub async fn run(
                             &replica_zero_index_by_role,
                             &mut zero_windows,
                             &mut consecutive_failures,
+                            control.is_running(),
                             config,
                             &parent,
                             &subscriber,
@@ -161,20 +259,22 @@ pub async fn run(
                             abort_tasks(&mut tasks).await;
                             return Err(error);
                         }
-                        refresh_active_and_schedule(
-                            &runtime,
-                            &owners,
-                            &mut active,
-                            &mut states,
-                            &mut tasks,
-                            &mut kick_inboxes,
-                            &mut zero_window_wakers,
-                            &mut zero_windows,
-                            config,
-                            &parent,
-                            &subscriber,
-                        )
-                        .await;
+                        if control.is_running() {
+                            refresh_active_and_schedule(
+                                &runtime,
+                                &owners,
+                                &mut active,
+                                &mut states,
+                                &mut tasks,
+                                &mut kick_inboxes,
+                                &mut zero_window_wakers,
+                                &mut zero_windows,
+                                config,
+                                &parent,
+                                &subscriber,
+                            )
+                            .await;
+                        }
                     }
                     Some(Err(e)) => {
                         let message = e.to_string();
@@ -197,7 +297,25 @@ pub async fn run(
                     .unwrap_or(config.idle_threshold);
                 runtime.record_agentic_deadlock_marker(idle_for).await;
                 idle_marker_sent = true;
-            }
+            },
+            _ = control.changed() => {
+                if control.is_running() {
+                    refresh_active_and_schedule(
+                        &runtime,
+                        &owners,
+                        &mut active,
+                        &mut states,
+                        &mut tasks,
+                        &mut kick_inboxes,
+                        &mut zero_window_wakers,
+                        &mut zero_windows,
+                        config,
+                        &parent,
+                        &subscriber,
+                    )
+                    .await;
+                }
+            },
         }
     }
 }
@@ -877,6 +995,7 @@ async fn handle_task_message(
     replica_zero_index_by_role: &HashMap<ModuleId, usize>,
     zero_windows: &mut ZeroReplicaWindows,
     consecutive_failures: &mut [u32],
+    scheduling_enabled: bool,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -904,7 +1023,9 @@ async fn handle_task_message(
             result,
         } => match result {
             Ok((batch, pending_kicks)) => {
-                if scheduling_active(runtime, zero_windows, &owners[index]).await {
+                if scheduling_enabled
+                    && scheduling_active(runtime, zero_windows, &owners[index]).await
+                {
                     zero_windows.mark_batch_accepted(&owners[index]);
                     let scheduled = spawn_dependency_flush_or_activate(
                         runtime,
@@ -966,7 +1087,8 @@ async fn handle_task_message(
             mut pending_kicks,
         } => {
             pending_kicks.extend(kick_inbox.drain_ready());
-            if scheduling_active(runtime, zero_windows, &owners[index]).await {
+            if scheduling_enabled && scheduling_active(runtime, zero_windows, &owners[index]).await
+            {
                 let scheduled = spawn_activation_gate_or_activate(
                     runtime,
                     tasks,
@@ -1040,7 +1162,7 @@ async fn handle_task_message(
                         next_batch_throttle,
                     };
                     zero_windows.finish(&owners[index]);
-                    if owners[index].module == builtin::allocation() {
+                    if scheduling_enabled && owners[index].module == builtin::allocation() {
                         let opened = zero_windows.record_controller_activation(runtime).await;
                         wake_zero_window_modules(
                             opened,
@@ -1078,7 +1200,9 @@ async fn handle_task_message(
             outcome,
         } => {
             if outcome.allowed() {
-                if scheduling_active(runtime, zero_windows, &owners[index]).await {
+                if scheduling_enabled
+                    && scheduling_active(runtime, zero_windows, &owners[index]).await
+                {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
@@ -2906,6 +3030,99 @@ mod tests {
         }
     }
 
+    struct PauseBlockingModule {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        done: Option<oneshot::Sender<()>>,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for PauseBlockingModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "pause-blocking"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test pause blocking module")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(())
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct BlockingAllocationModule {
+        attention_control_inbox: AttentionControlRequestInbox,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        done: Option<oneshot::Sender<()>>,
+        batch_sent: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingAllocationModule {
+        type Batch = AttentionControlRequest;
+
+        fn id() -> &'static str {
+            "allocation"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test blocking allocation")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            if self.batch_sent {
+                std::future::pending().await
+            } else {
+                self.batch_sent = true;
+                Ok(self.attention_control_inbox.next_item().await?.body)
+            }
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            if let Some(done) = self.done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
     struct PendingDependencyModule {
         release: Option<oneshot::Receiver<()>>,
         activations: Rc<Cell<u8>>,
@@ -3338,6 +3555,215 @@ mod tests {
                         );
                     })
                     .await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn run_control_pauses_queued_work_until_resumed() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(echo_id(), ModuleConfig::default());
+                alloc.set_activation(echo_id(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (done_tx, mut done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let (controller, control) = super::AgentRunController::new();
+                controller.pause();
+
+                super::run_controlled(modules, test_config(), control, async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("paused ping"))
+                        .await
+                        .expect("attention request should queue");
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_oneshot_pending(
+                        &mut done_rx,
+                        "paused scheduler should not activate queued work",
+                    );
+
+                    controller.resume();
+                    done_rx
+                        .await
+                        .expect("queued work should activate after resume");
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("scheduler returned err");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn run_control_does_not_abort_in_flight_activation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new("pause-blocking").unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id, ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let (done_tx, mut done_rx) = oneshot::channel();
+                let entered_tx = Rc::new(RefCell::new(Some(entered_tx)));
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync(test_policy(0..=1, fast_bpm()), {
+                        let entered_tx = Rc::clone(&entered_tx);
+                        let release_rx = Rc::clone(&release_rx);
+                        let done_tx = Rc::clone(&done_tx);
+                        move |_caps| PauseBlockingModule {
+                            entered: entered_tx.borrow_mut().take(),
+                            release: release_rx.borrow_mut().take(),
+                            done: done_tx.borrow_mut().take(),
+                            batch_sent: false,
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (controller, control) = super::AgentRunController::new();
+
+                super::run_controlled(modules, test_config(), control, async move {
+                    entered_rx.await.expect("activation should start");
+                    controller.pause();
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_oneshot_pending(
+                        &mut done_rx,
+                        "blocking activation should still be in flight while paused",
+                    );
+
+                    release_tx
+                        .send(())
+                        .expect("activation release receiver should remain alive");
+                    done_rx
+                        .await
+                        .expect("in-flight activation should complete while paused");
+                })
+                .await
+                .expect("scheduler returned err");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn paused_allocation_completion_does_not_open_zero_replica_window() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let target_id = ModuleId::new("zero-window-target").unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(builtin::allocation(), ModuleConfig::default());
+                alloc.set_activation(builtin::allocation(), ActivationRatio::ONE);
+                alloc.set(target_id.clone(), ModuleConfig::default());
+                alloc.set_activation(target_id, ActivationRatio::ZERO);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let (done_tx, done_rx) = oneshot::channel();
+                let entered_tx = Rc::new(RefCell::new(Some(entered_tx)));
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let target_activations = Rc::new(Cell::new(0_u32));
+                let target_batches = Rc::new(RefCell::new(Vec::new()));
+                let mut target_policy = test_policy(0..=1, fast_bpm());
+                target_policy.zero_replica_window =
+                    ZeroReplicaWindowPolicy::EveryControllerActivations(1);
+                let modules = ModuleRegistry::new()
+                    .register_sync(test_policy(0..=1, fast_bpm()), {
+                        let entered_tx = Rc::clone(&entered_tx);
+                        let release_rx = Rc::clone(&release_rx);
+                        let done_tx = Rc::clone(&done_tx);
+                        move |caps| BlockingAllocationModule {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            entered: entered_tx.borrow_mut().take(),
+                            release: release_rx.borrow_mut().take(),
+                            done: done_tx.borrow_mut().take(),
+                            batch_sent: false,
+                        }
+                    })
+                    .unwrap()
+                    .register_sync(target_policy, {
+                        let target_activations = Rc::clone(&target_activations);
+                        let target_batches = Rc::clone(&target_batches);
+                        move |caps| ZeroWindowTarget {
+                            attention_control_inbox: caps.attention_control_inbox(),
+                            activations: Rc::clone(&target_activations),
+                            batches: Rc::clone(&target_batches),
+                        }
+                    })
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let (controller, control) = super::AgentRunController::new();
+
+                super::run_controlled(modules, test_config(), control, async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("allocation tick"))
+                        .await
+                        .expect("attention request should route to allocation");
+                    entered_rx
+                        .await
+                        .expect("allocation activation should start");
+                    controller.pause();
+                    release_tx
+                        .send(())
+                        .expect("allocation release receiver should remain alive");
+                    done_rx
+                        .await
+                        .expect("allocation activation should complete");
+                    for _ in 0..4 {
+                        tokio::task::yield_now().await;
+                    }
+
+                    controller.resume();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    assert_eq!(
+                        target_activations.get(),
+                        0,
+                        "paused allocation completion must not open a zero-replica window"
+                    );
+                    assert!(target_batches.borrow().is_empty());
+                })
+                .await
+                .expect("scheduler returned err");
             })
             .await;
     }
@@ -6403,6 +6829,7 @@ mod tests {
                     &HashMap::new(),
                     &mut zero_windows,
                     &mut consecutive_failures,
+                    true,
                     test_config(),
                     &parent,
                     &subscriber,

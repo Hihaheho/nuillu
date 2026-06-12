@@ -11,4 +11,6 @@ pub mod scheduler;
 #[cfg(test)]
 mod testing;
 
-pub use scheduler::{AgentEventLoopConfig, SchedulerError, run};
+pub use scheduler::{
+    AgentEventLoopConfig, AgentRunControl, AgentRunController, SchedulerError, run, run_controlled,
+};

@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Context as _;
 use nuillu_visualizer_protocol::{
-    VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
+    VisualizerAction, VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
 };
 
 #[derive(Clone, Debug)]
@@ -53,6 +53,18 @@ impl VisualizerHook {
 
     pub fn send_event(&self, event: VisualizerEvent) {
         let _ = self.events.send(VisualizerServerMessage::event(event));
+    }
+
+    pub fn offer_action(&self, action: VisualizerAction) {
+        let _ = self
+            .events
+            .send(VisualizerServerMessage::OfferAction { action });
+    }
+
+    pub fn revoke_action(&self, action_id: String) {
+        let _ = self
+            .events
+            .send(VisualizerServerMessage::RevokeAction { action_id });
     }
 
     pub fn request_shutdown(&mut self) {

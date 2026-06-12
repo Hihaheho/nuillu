@@ -19,6 +19,14 @@ pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
     format!("tab:{}:start-activation", tab_id.as_str())
 }
 
+pub fn run_runtime_action_id(tab_id: &VisualizerTabId) -> String {
+    format!("tab:{}:run-runtime", tab_id.as_str())
+}
+
+pub fn stop_runtime_action_id(tab_id: &VisualizerTabId) -> String {
+    format!("tab:{}:stop-runtime", tab_id.as_str())
+}
+
 #[derive(Debug, Error)]
 pub enum VisualizerProtocolError {
     #[error("visualizer transport disconnected")]
@@ -105,6 +113,24 @@ impl VisualizerAction {
             kind: VisualizerActionKind::StartActivation,
         }
     }
+
+    pub fn run_runtime(tab_id: VisualizerTabId) -> Self {
+        Self {
+            id: run_runtime_action_id(&tab_id),
+            label: "Run".to_string(),
+            scope: VisualizerActionScope::Tab { tab_id },
+            kind: VisualizerActionKind::RunRuntime,
+        }
+    }
+
+    pub fn stop_runtime(tab_id: VisualizerTabId) -> Self {
+        Self {
+            id: stop_runtime_action_id(&tab_id),
+            label: "Stop".to_string(),
+            scope: VisualizerActionScope::Tab { tab_id },
+            kind: VisualizerActionKind::StopRuntime,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +145,8 @@ pub enum VisualizerActionScope {
 pub enum VisualizerActionKind {
     StartSuite,
     StartActivation,
+    RunRuntime,
+    StopRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -908,6 +936,39 @@ mod tests {
         assert_eq!(action.id, start_activation_action_id(&tab_id));
         assert_eq!(action.scope, VisualizerActionScope::Tab { tab_id });
         assert_eq!(action.kind, VisualizerActionKind::StartActivation);
+    }
+
+    #[test]
+    fn run_stop_actions_round_trip_through_json() {
+        let tab_id = VisualizerTabId::new("live");
+        for (action, expected_id, expected_kind) in [
+            (
+                VisualizerAction::run_runtime(tab_id.clone()),
+                run_runtime_action_id(&tab_id),
+                VisualizerActionKind::RunRuntime,
+            ),
+            (
+                VisualizerAction::stop_runtime(tab_id.clone()),
+                stop_runtime_action_id(&tab_id),
+                VisualizerActionKind::StopRuntime,
+            ),
+        ] {
+            let message = VisualizerServerMessage::OfferAction { action };
+            let json = serde_json::to_string(&message).unwrap();
+            let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+
+            let VisualizerServerMessage::OfferAction { action } = actual else {
+                panic!("expected action");
+            };
+            assert_eq!(action.id, expected_id);
+            assert_eq!(
+                action.scope,
+                VisualizerActionScope::Tab {
+                    tab_id: tab_id.clone()
+                }
+            );
+            assert_eq!(action.kind, expected_kind);
+        }
     }
 
     #[test]

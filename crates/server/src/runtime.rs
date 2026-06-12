@@ -1,10 +1,11 @@
 use std::{fs, net::TcpListener, time::Duration};
 
 use anyhow::Context as _;
-use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
+use nuillu_agent::{AgentEventLoopConfig, AgentRunController, run_controlled as run_agent};
 use nuillu_blackboard::BlackboardCommand;
 use nuillu_visualizer_protocol::{
-    TabStatus, VisualizerEvent, VisualizerServerMessage, VisualizerServerPort, VisualizerTabId,
+    TabStatus, VisualizerAction, VisualizerEvent, VisualizerServerMessage, VisualizerServerPort,
+    VisualizerTabId, run_runtime_action_id, stop_runtime_action_id,
 };
 use tokio::{runtime::Builder, task::LocalSet};
 
@@ -146,6 +147,8 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     .await;
 
     let sensory = env.caps.host_io().sensory_input_mailbox();
+    let (run_controller, run_control) = AgentRunController::new();
+    set_runtime_running(visualizer, &tab_id, &run_controller, true);
     let mut restart_count = 0_u64;
     loop {
         let allocated = server_registry(
@@ -167,6 +170,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 dependency_idle_timeout: Duration::from_secs(2),
                 dependency_hard_timeout: Duration::from_secs(10),
             },
+            run_control.clone(),
             drive_server_until_shutdown(
                 visualizer,
                 &tab_id,
@@ -174,6 +178,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 &mut module_settings,
                 &sensory,
                 &env,
+                &run_controller,
             ),
         )
         .await;
@@ -213,4 +218,93 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         status: TabStatus::Stopped,
     });
     Ok(())
+}
+
+pub(crate) fn set_runtime_running(
+    visualizer: &VisualizerHook,
+    tab_id: &VisualizerTabId,
+    controller: &AgentRunController,
+    running: bool,
+) {
+    if running {
+        controller.resume();
+        visualizer.send_event(VisualizerEvent::SetTabStatus {
+            tab_id: tab_id.clone(),
+            status: TabStatus::Running,
+        });
+        visualizer.revoke_action(run_runtime_action_id(tab_id));
+        visualizer.offer_action(VisualizerAction::stop_runtime(tab_id.clone()));
+    } else {
+        controller.pause();
+        visualizer.send_event(VisualizerEvent::SetTabStatus {
+            tab_id: tab_id.clone(),
+            status: TabStatus::Stopped,
+        });
+        visualizer.revoke_action(stop_runtime_action_id(tab_id));
+        visualizer.offer_action(VisualizerAction::run_runtime(tab_id.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use nuillu_visualizer_protocol::VisualizerClientMessage;
+
+    use super::*;
+
+    #[test]
+    fn set_runtime_running_updates_controller_status_and_actions() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_command_tx, command_rx) = mpsc::channel::<VisualizerClientMessage>();
+        let visualizer = VisualizerHook::new(event_tx, command_rx);
+        let tab_id = VisualizerTabId::new("server");
+        let (controller, _control) = AgentRunController::new();
+
+        set_runtime_running(&visualizer, &tab_id, &controller, false);
+        assert!(!controller.is_running());
+        let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &messages[0],
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SetTabStatus {
+                    status: TabStatus::Stopped,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            &messages[1],
+            VisualizerServerMessage::RevokeAction { action_id }
+                if action_id == &stop_runtime_action_id(&tab_id)
+        ));
+        assert!(matches!(
+            &messages[2],
+            VisualizerServerMessage::OfferAction { action }
+                if action.id == run_runtime_action_id(&tab_id)
+        ));
+
+        set_runtime_running(&visualizer, &tab_id, &controller, true);
+        assert!(controller.is_running());
+        let messages = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            &messages[0],
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SetTabStatus {
+                    status: TabStatus::Running,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            &messages[1],
+            VisualizerServerMessage::RevokeAction { action_id }
+                if action_id == &run_runtime_action_id(&tab_id)
+        ));
+        assert!(matches!(
+            &messages[2],
+            VisualizerServerMessage::OfferAction { action }
+                if action.id == stop_runtime_action_id(&tab_id)
+        ));
+    }
 }
