@@ -125,6 +125,13 @@ impl CognitionLogReader {
         self.blackboard.read(|bb| bb.cognition_log_set()).await
     }
 
+    pub async fn peek_unread_events(&self) -> Vec<CognitionLogEntryRecord> {
+        let last_seen = self.last_seen_cognition_index.get();
+        self.blackboard
+            .read(|bb| bb.unread_cognition_log_entries(last_seen))
+            .await
+    }
+
     pub async fn unread_events(&self) -> Vec<CognitionLogEntryRecord> {
         let last_seen = self.last_seen_cognition_index.get();
         let records = self
@@ -368,5 +375,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
         );
+    }
+
+    #[tokio::test]
+    async fn peek_unread_cognition_log_entries_does_not_advance_reader_cursor() {
+        let blackboard = Blackboard::default();
+        let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let reader = CognitionLogReader::new(blackboard.clone());
+
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: stream.clone(),
+                entry: CognitionLogEntry {
+                    at: Utc.timestamp_opt(0, 0).unwrap(),
+                    text: "first".into(),
+                },
+            })
+            .await;
+
+        let peeked = reader.peek_unread_events().await;
+        assert_eq!(
+            peeked
+                .iter()
+                .map(|record| (record.index, record.entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "first")]
+        );
+        assert_eq!(
+            reader
+                .peek_unread_events()
+                .await
+                .iter()
+                .map(|record| (record.index, record.entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "first")]
+        );
+        assert_eq!(
+            reader
+                .unread_events()
+                .await
+                .iter()
+                .map(|record| (
+                    record.index,
+                    record.source.clone(),
+                    record.entry.text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, stream, "first")]
+        );
+        assert!(reader.unread_events().await.is_empty());
     }
 }

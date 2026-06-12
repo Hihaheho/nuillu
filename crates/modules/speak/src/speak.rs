@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -435,6 +436,7 @@ pub struct SpeakModule {
     clock: Rc<dyn Clock>,
     planning_session: Session,
     generation_session: Session,
+    generation_reflected_cognition_indices: HashSet<u64>,
     plan_prompt: std::sync::OnceLock<String>,
     generation_prompt: std::sync::OnceLock<String>,
 }
@@ -475,6 +477,7 @@ impl SpeakModule {
             clock,
             planning_session,
             generation_session,
+            generation_reflected_cognition_indices: HashSet::new(),
             plan_prompt: std::sync::OnceLock::new(),
             generation_prompt: std::sync::OnceLock::new(),
         }
@@ -537,6 +540,12 @@ impl SpeakModule {
             return Ok(());
         };
         let Some(mut plan) = self.plan_speech(cx, &cognition_context).await? else {
+            self.reflect_generation_cognition_entries(
+                cx,
+                &batch.cognition_entries,
+                self.clock.now(),
+            )
+            .await?;
             return Ok(());
         };
         let mut draft = GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
@@ -547,16 +556,31 @@ impl SpeakModule {
                 .stream_generation(cx, cognition_context.clone(), &plan.args, &mut draft)
                 .await?
             {
-                GenerationStreamOutcome::Completed => return Ok(()),
+                GenerationStreamOutcome::Completed => {
+                    self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
+                    return Ok(());
+                }
                 GenerationStreamOutcome::Retry => {}
                 GenerationStreamOutcome::Interrupted(interruption) => match interruption {
                     GenerationInterruption::Planned(new_plan) => {
+                        self.reflect_generation_cognition_entries(
+                            cx,
+                            &batch.cognition_entries,
+                            self.clock.now(),
+                        )
+                        .await?;
                         cognition_context = self.speech_cognition_context(self.clock.now()).await;
                         plan = new_plan;
                         draft =
                             GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
                     }
                     GenerationInterruption::NeedsFreshPlan => {
+                        self.reflect_generation_cognition_entries(
+                            cx,
+                            &batch.cognition_entries,
+                            self.clock.now(),
+                        )
+                        .await?;
                         cognition_context = self.speech_cognition_context(self.clock.now()).await;
                         let Some(new_plan) = self.plan_speech(cx, &cognition_context).await? else {
                             return Ok(());
@@ -565,7 +589,15 @@ impl SpeakModule {
                         draft =
                             GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
                     }
-                    GenerationInterruption::Stop => return Ok(()),
+                    GenerationInterruption::Stop => {
+                        self.reflect_generation_cognition_entries(
+                            cx,
+                            &batch.cognition_entries,
+                            self.clock.now(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 },
             }
         }
@@ -769,6 +801,7 @@ impl SpeakModule {
                             if let Some(outcome) = self
                                 .resolve_interrupts_before_completion(
                                     cx,
+                                    &mut turn_session,
                                     &mut pending_decision,
                                     &mut buffered_entries,
                                     ActiveGenerationInterruptContext {
@@ -793,6 +826,7 @@ impl SpeakModule {
                             if let Some(outcome) = self
                                 .resolve_interrupts_before_completion(
                                     cx,
+                                    &mut turn_session,
                                     &mut pending_decision,
                                     &mut buffered_entries,
                                     ActiveGenerationInterruptContext {
@@ -806,6 +840,8 @@ impl SpeakModule {
                             {
                                 return Ok(outcome);
                             }
+                            self.reflect_generation_cognition_context(cx, &cognition_context)
+                                .await?;
                             let text = draft.accumulated.trim().to_owned();
                             self.record_completed_generation(cx, draft, &text).await?;
                             return Ok(GenerationStreamOutcome::Completed);
@@ -824,6 +860,13 @@ impl SpeakModule {
                         .await;
                     if new_entries.is_empty() {
                         continue;
+                    }
+
+                    if let Some(context) = self
+                        .reflect_generation_cognition_entries(cx, &new_entries, self.clock.now())
+                        .await?
+                    {
+                        turn_session.push_user(context);
                     }
 
                     if pending_decision.is_some() {
@@ -845,6 +888,7 @@ impl SpeakModule {
     async fn resolve_interrupts_before_completion(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
+        turn_session: &mut Session,
         pending_decision: &mut Option<InterruptDecisionFuture>,
         buffered_entries: &mut Vec<CognitionLogEntryRecord>,
         active: ActiveGenerationInterruptContext<'_>,
@@ -898,6 +942,16 @@ impl SpeakModule {
                         .new_cognition_entries_since(active.stream_started_at)
                         .await;
                     if !new_entries.is_empty() {
+                        if let Some(context) = self
+                            .reflect_generation_cognition_entries(
+                                cx,
+                                &new_entries,
+                                self.clock.now(),
+                            )
+                            .await?
+                        {
+                            turn_session.push_user(context);
+                        }
                         *buffered_entries = new_entries;
                     }
                 }
@@ -907,12 +961,68 @@ impl SpeakModule {
         Ok(None)
     }
 
+    fn unreflected_generation_cognition_entries(
+        &self,
+        entries: &[CognitionLogEntryRecord],
+    ) -> Vec<CognitionLogEntryRecord> {
+        entries
+            .iter()
+            .filter(|record| {
+                !self
+                    .generation_reflected_cognition_indices
+                    .contains(&record.index)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn mark_generation_cognition_entries_reflected(&mut self, entries: &[CognitionLogEntryRecord]) {
+        for record in entries {
+            self.generation_reflected_cognition_indices
+                .insert(record.index);
+        }
+    }
+
+    async fn reflect_generation_cognition_entries(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        entries: &[CognitionLogEntryRecord],
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        let entries = self.unreflected_generation_cognition_entries(entries);
+        let Some(context) = speech_cognition_context_from_entries(&entries, now) else {
+            return Ok(None);
+        };
+        self.reflect_generation_cognition_context(cx, &context)
+            .await?;
+        self.mark_generation_cognition_entries_reflected(&entries);
+        Ok(Some(context.trim().to_owned()))
+    }
+
+    async fn reflect_generation_cognition_context(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        cognition_context: &str,
+    ) -> Result<()> {
+        let cognition_context = cognition_context.trim();
+        if cognition_context.is_empty() {
+            return Ok(());
+        }
+        self.ensure_generation_session_seeded(cx);
+        self.generation_session
+            .push_user(cognition_context.to_owned());
+        cx.compact_and_save(&mut self.generation_session, Usage::zero())
+            .await?;
+        Ok(())
+    }
+
     async fn new_cognition_entries_since(
         &self,
         threshold: DateTime<Utc>,
     ) -> Vec<CognitionLogEntryRecord> {
-        let snapshot = self.cognition_log.snapshot().await;
-        cognition_entry_records(snapshot.logs())
+        self.cognition_log
+            .peek_unread_events()
+            .await
             .into_iter()
             .filter(|record| record.entry.at > threshold)
             .collect()
@@ -1957,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn planning_context_uses_new_entries_for_each_batch() {
+    async fn planning_and_generation_context_use_new_entries_for_each_batch() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(decline_speech_now_scenario("not enough to say yet"))
             .with_text_scenario(decline_speech_now_scenario("still not enough to say"));
@@ -2005,6 +2115,19 @@ mod tests {
         assert!(!contexts[1].contains("first cognition"));
         assert!(!contexts[0].contains("Current cognition log at"));
         assert!(!contexts[1].contains("Current cognition log at"));
+
+        let generation_contexts =
+            session_message_texts(&module.generation_session, InputMessageRole::User)
+                .into_iter()
+                .filter(|text| text.starts_with("New cognition entries at "))
+                .collect::<Vec<_>>();
+        assert_eq!(generation_contexts.len(), 2);
+        assert!(generation_contexts[0].contains("first cognition"));
+        assert!(!generation_contexts[0].contains("second cognition"));
+        assert!(generation_contexts[1].contains("second cognition"));
+        assert!(!generation_contexts[1].contains("first cognition"));
+        assert!(!generation_contexts[0].contains("Current cognition log at"));
+        assert!(!generation_contexts[1].contains("Current cognition log at"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2229,7 +2352,11 @@ mod tests {
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
         assert_eq!(module.planning_session.list_turns().count(), 1);
         let planning_text = session_input_text(&module.planning_session);
+        assert!(planning_text.contains("Koro asks Nuillu to help them stay safe."));
         assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
+        let generation_text = session_input_text(&module.generation_session);
+        assert!(generation_text.contains("New cognition entries at "));
+        assert!(generation_text.contains("Koro asks Nuillu to help them stay safe."));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -2384,63 +2511,161 @@ mod tests {
         let cx = test_activate_cx(&module, now).await;
         let mut draft = GenerationDraft::new(0, "Koro");
         let args = test_prepare_speech_args("Koro");
-        let stream = module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
-        tokio::pin!(stream);
+        {
+            let stream =
+                module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
+            tokio::pin!(stream);
 
-        tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                panic!("stream ended before text generation started");
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before text generation started");
+                }
+                result = text_started_rx => {
+                    result.expect("text generation should start");
+                }
             }
-            result = text_started_rx => {
-                result.expect("text generation should start");
+
+            publish_cognition_update(
+                &blackboard,
+                &caps,
+                now + chrono::Duration::milliseconds(1),
+                "Koro notices a new hazard while speech is in progress.",
+            )
+            .await;
+
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before interrupt decision started");
+                }
+                result = decision_started_rx => {
+                    result.expect("interrupt decision should start");
+                }
             }
+
+            text_delta_gate.release();
+            let delta = tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    deltas
+                        .borrow()
+                        .first()
+                        .cloned()
+                        .expect("stream ended before emitting the gated text delta")
+                }
+                result = tokio::time::timeout(Duration::from_millis(100), delta_rx) => {
+                    result
+                        .expect("text delta should be emitted while interrupt decision is pending")
+                        .expect("delta sink should send the first delta")
+                }
+            };
+
+            assert_eq!(
+                delta,
+                ("Koro".to_string(), 0, 0, "Koro, stay close.".to_string())
+            );
+            assert_eq!(
+                deltas.borrow().as_slice(),
+                &[("Koro".to_string(), 0, 0, "Koro, stay close.".to_string())]
+            );
+            decision_release_gate.release();
+            let outcome = tokio::time::timeout(Duration::from_millis(100), &mut stream)
+                .await
+                .expect("continue decision should let the stream finish")
+                .unwrap();
+            assert!(
+                matches!(outcome, GenerationStreamOutcome::Completed),
+                "unexpected outcome: {outcome:?}"
+            );
+        }
+        let generation_text = session_input_text(&module.generation_session);
+        assert!(generation_text.contains("New cognition entries at "));
+        assert!(generation_text.contains("Koro notices a new hazard while speech is in progress."));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn speak_stream_peeks_pre_stream_cognition_without_consuming_next_batch() {
+        let text_delta_gate = Arc::new(PollGate::default());
+        let (text_started_tx, text_started_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(GatedTextAdapter::new([GatedTurnScript::generation(
+            text_delta_gate.clone(),
+            Some(text_started_tx),
+            "Koro, stay close.",
+        )]));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::new(RefCell::new(Vec::new())),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), adapter, sink).await;
+
+        let clock = SystemClock;
+        let now = clock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now - chrono::Duration::milliseconds(1),
+            "Planning-time cognition should remain unread.",
+        )
+        .await;
+
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+        {
+            let stream =
+                module.stream_generation(&cx, "- initial awareness".into(), &args, &mut draft);
+            tokio::pin!(stream);
+
+            tokio::select! {
+                result = &mut stream => {
+                    let _ = result;
+                    panic!("stream ended before text generation started");
+                }
+                result = text_started_rx => {
+                    result.expect("text generation should start");
+                }
+            }
+            tokio::time::timeout(Duration::from_millis(10), &mut stream)
+                .await
+                .expect_err("stream should wait for text delta after peeking stale cognition");
+
+            text_delta_gate.release();
+            let outcome = tokio::time::timeout(Duration::from_millis(100), &mut stream)
+                .await
+                .expect("stream should complete after text delta")
+                .unwrap();
+            assert!(
+                matches!(outcome, GenerationStreamOutcome::Completed),
+                "unexpected outcome: {outcome:?}"
+            );
         }
 
         publish_cognition_update(
             &blackboard,
             &caps,
-            now + chrono::Duration::milliseconds(1),
-            "Koro notices a new hazard while speech is in progress.",
+            now + chrono::Duration::seconds(1),
+            "Later cognition wakes the next batch.",
         )
         .await;
 
-        tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                panic!("stream ended before interrupt decision started");
-            }
-            result = decision_started_rx => {
-                result.expect("interrupt decision should start");
-            }
-        }
-
-        text_delta_gate.release();
-        let delta = tokio::select! {
-            result = &mut stream => {
-                let _ = result;
-                deltas
-                    .borrow()
-                    .first()
-                    .cloned()
-                    .expect("stream ended before emitting the gated text delta")
-            }
-            result = tokio::time::timeout(Duration::from_millis(100), delta_rx) => {
-                result
-                    .expect("text delta should be emitted while interrupt decision is pending")
-                    .expect("delta sink should send the first delta")
-            }
-        };
-
+        let batch = module.next_batch().await.unwrap();
         assert_eq!(
-            delta,
-            ("Koro".to_string(), 0, 0, "Koro, stay close.".to_string())
+            batch
+                .cognition_entries
+                .iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Planning-time cognition should remain unread.",
+                "Later cognition wakes the next batch.",
+            ]
         );
-        assert_eq!(
-            deltas.borrow().as_slice(),
-            &[("Koro".to_string(), 0, 0, "Koro, stay close.".to_string())]
-        );
-        decision_release_gate.release();
     }
 
     #[tokio::test(flavor = "current_thread")]
