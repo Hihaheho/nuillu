@@ -15,7 +15,7 @@ use nuillu_module::{
     CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
     Memo, Module, SceneReader, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, UtteranceProgress, ensure_persistent_session_seeded,
-    format_bounded_cognition_log_batch, ports::Clock,
+    format_bounded_cognition_log_batch, format_new_cognition_log_entries, ports::Clock,
 };
 
 use crate::utterance::UtteranceWriter;
@@ -53,8 +53,8 @@ const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning 
 const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
     "Compacted speak generation session history:";
 const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target decisions,
-selected targets, rejected/no-speech decisions, interruption decisions, and cognition-log context
-needed for future speak planning."#;
+selected targets, rejected/no-speech decisions, completed outward utterances, interruption
+decisions, and cognition-log context needed for future speak planning."#;
 const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances,
 their addressees, speech substance, and cognition-log context needed for future utterance rendering."#;
 
@@ -218,6 +218,7 @@ struct PlannedSpeech {
 #[derive(Debug)]
 pub struct SpeakBatch {
     pub(crate) updates: Vec<CognitionLogUpdated>,
+    pub(crate) cognition_entries: Vec<CognitionLogEntryRecord>,
 }
 
 struct GenerationDraft {
@@ -248,6 +249,14 @@ impl GenerationDraft {
 fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> String {
     format!(
         "Completed utterance to {}:\n{}",
+        draft.target.trim(),
+        text.trim(),
+    )
+}
+
+fn render_completed_utterance_planning_record(draft: &GenerationDraft, text: &str) -> String {
+    format!(
+        "Completed outward utterance to {}:\n{}",
         draft.target.trim(),
         text.trim(),
     )
@@ -297,6 +306,13 @@ fn cognition_context_fallback(now: DateTime<Utc>) -> String {
         "Current cognition log at {}:\n- none",
         now.to_rfc3339_opts(SecondsFormat::Secs, true)
     )
+}
+
+fn speech_cognition_context_from_entries(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+) -> Option<String> {
+    format_new_cognition_log_entries(records, now, COGNITION_CONTEXT_WINDOW)
 }
 
 fn append_idle_context(mut cognition_context: String, idle_for_secs: Option<u64>) -> String {
@@ -515,7 +531,11 @@ impl SpeakModule {
         batch: &SpeakBatch,
     ) -> Result<()> {
         let _update_count = batch.updates.len();
-        let mut cognition_context = self.speech_cognition_context(self.clock.now()).await;
+        let Some(mut cognition_context) =
+            speech_cognition_context_from_entries(&batch.cognition_entries, self.clock.now())
+        else {
+            return Ok(());
+        };
         let Some(mut plan) = self.plan_speech(cx, &cognition_context).await? else {
             return Ok(());
         };
@@ -528,9 +548,7 @@ impl SpeakModule {
                 .await?
             {
                 GenerationStreamOutcome::Completed => return Ok(()),
-                GenerationStreamOutcome::Retry => {
-                    cognition_context = self.speech_cognition_context(self.clock.now()).await;
-                }
+                GenerationStreamOutcome::Retry => {}
                 GenerationStreamOutcome::Interrupted(interruption) => match interruption {
                     GenerationInterruption::Planned(new_plan) => {
                         cognition_context = self.speech_cognition_context(self.clock.now()).await;
@@ -768,18 +786,7 @@ impl SpeakModule {
                             *self.generation_session.input_mut() = turn_session.into_input();
                             cx.compact_and_save(&mut self.generation_session, usage).await?;
                             let text = draft.accumulated.trim().to_owned();
-                            self.memo.write(render_completed_utterance_memo(draft, &text)).await;
-                            self.utterance
-                                .record_progress(UtteranceProgress::completed(
-                                    draft.generation_id,
-                                    draft.sequence,
-                                    draft.target.clone(),
-                                    text.clone(),
-                                ))
-                                .await;
-                            if !text.is_empty() {
-                                self.utterance.emit(draft.target.clone(), text).await;
-                            }
+                            self.record_completed_generation(cx, draft, &text).await?;
                             return Ok(GenerationStreamOutcome::Completed);
                         }
                         None => {
@@ -800,18 +807,7 @@ impl SpeakModule {
                                 return Ok(outcome);
                             }
                             let text = draft.accumulated.trim().to_owned();
-                            self.memo.write(render_completed_utterance_memo(draft, &text)).await;
-                            self.utterance
-                                .record_progress(UtteranceProgress::completed(
-                                    draft.generation_id,
-                                    draft.sequence,
-                                    draft.target.clone(),
-                                    text.clone(),
-                                ))
-                                .await;
-                            if !text.is_empty() {
-                                self.utterance.emit(draft.target.clone(), text).await;
-                            }
+                            self.record_completed_generation(cx, draft, &text).await?;
                             return Ok(GenerationStreamOutcome::Completed);
                         }
                         Some(Ok(_)) => {}
@@ -936,7 +932,7 @@ impl SpeakModule {
         let validation_schema = target_schema.clone();
         let now = self.clock.now();
         let new_cognition_context =
-            format_bounded_cognition_log_batch(&new_entries, now, COGNITION_CONTEXT_WINDOW)
+            format_new_cognition_log_entries(&new_entries, now, COGNITION_CONTEXT_WINDOW)
                 .unwrap_or_else(|| cognition_context_fallback(now));
         let mut session = Session::from_input(self.planning_session.input().clone());
         push_interrupt_planning_context(
@@ -1056,6 +1052,38 @@ impl SpeakModule {
         }
     }
 
+    async fn record_completed_generation(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        draft: &GenerationDraft,
+        text: &str,
+    ) -> Result<()> {
+        self.memo
+            .write(render_completed_utterance_memo(draft, text))
+            .await;
+        self.utterance
+            .record_progress(UtteranceProgress::completed(
+                draft.generation_id,
+                draft.sequence,
+                draft.target.clone(),
+                text.to_owned(),
+            ))
+            .await;
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        self.utterance
+            .emit(draft.target.clone(), text.to_owned())
+            .await;
+        self.ensure_planning_session_seeded(cx);
+        self.planning_session
+            .push_system(render_completed_utterance_planning_record(draft, text));
+        cx.compact_and_save(&mut self.planning_session, Usage::zero())
+            .await?;
+        Ok(())
+    }
+
     fn merge_planning_session(&mut self, input: ModelInput) {
         *self.planning_session.input_mut() = input;
     }
@@ -1124,8 +1152,12 @@ impl SpeakModule {
                 .into_iter()
                 .map(|envelope| envelope.body),
         );
+        let cognition_entries = self.cognition_log.unread_events().await;
 
-        Ok(SpeakBatch { updates })
+        Ok(SpeakBatch {
+            updates,
+            cognition_entries,
+        })
     }
 }
 
@@ -1823,6 +1855,32 @@ mod tests {
         out
     }
 
+    fn session_message_texts(session: &Session, expected_role: InputMessageRole) -> Vec<String> {
+        session
+            .input()
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let ModelInputItem::Message { role, content } = item else {
+                    return None;
+                };
+                if role != &expected_role {
+                    return None;
+                }
+                let text = content
+                    .as_slice()
+                    .iter()
+                    .filter_map(|content| match content {
+                        MessageContent::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(text)
+            })
+            .collect()
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn speech_cognition_context_uses_shared_formatter() {
         let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
@@ -1852,6 +1910,142 @@ mod tests {
 
         assert!(context.contains("Current cognition log at "));
         assert!(context.contains("About 4 minutes ago: Koro asks Nuillu for help."));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_batch_captures_only_unread_cognition_entries() {
+        let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) = speak_module_with_turn_adapter(
+            blackboard.clone(),
+            Arc::new(MockLlmAdapter::new()),
+            sink,
+        )
+        .await;
+        let now = SystemClock.now();
+
+        publish_cognition_update(&blackboard, &caps, now, "first cognition").await;
+        let first = module.next_batch().await.unwrap();
+        assert_eq!(
+            first
+                .cognition_entries
+                .iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first cognition"]
+        );
+
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now + chrono::Duration::seconds(1),
+            "second cognition",
+        )
+        .await;
+        let second = module.next_batch().await.unwrap();
+        assert_eq!(
+            second
+                .cognition_entries
+                .iter()
+                .map(|record| record.entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second cognition"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn planning_context_uses_new_entries_for_each_batch() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(decline_speech_now_scenario("not enough to say yet"))
+            .with_text_scenario(decline_speech_now_scenario("still not enough to say"));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+
+        publish_cognition_update(&blackboard, &caps, now, "first cognition").await;
+        let first_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &first_batch)
+            .await
+            .unwrap();
+
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now + chrono::Duration::seconds(1),
+            "second cognition",
+        )
+        .await;
+        let second_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(1)).await;
+        SpeakModule::activate(&mut module, &cx, &second_batch)
+            .await
+            .unwrap();
+
+        let contexts = session_message_texts(&module.planning_session, InputMessageRole::User)
+            .into_iter()
+            .filter(|text| text.starts_with("New cognition entries at "))
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts[0].contains("first cognition"));
+        assert!(!contexts[0].contains("second cognition"));
+        assert!(contexts[1].contains("second cognition"));
+        assert!(!contexts[1].contains("first cognition"));
+        assert!(!contexts[0].contains("Current cognition log at"));
+        assert!(!contexts[1].contains("Current cognition log at"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_unread_batch_does_not_plan_from_snapshot() {
+        let blackboard = Blackboard::with_allocation(ResourceAllocation::default());
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) = speak_module_with_turn_adapter(
+            blackboard.clone(),
+            Arc::new(MockLlmAdapter::new()),
+            sink,
+        )
+        .await;
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            SystemClock.now(),
+            "old cognition that should not be replanned",
+        )
+        .await;
+        let old_batch = module.next_batch().await.unwrap();
+        assert_eq!(old_batch.cognition_entries.len(), 1);
+
+        caps.internal_harness_io()
+            .cognition_log_updated_mailbox()
+            .publish(CognitionLogUpdated::AgenticDeadlockMarker)
+            .await
+            .unwrap();
+
+        let batch = module.next_batch().await.unwrap();
+        assert!(batch.cognition_entries.is_empty());
+        let cx = test_activate_cx(&module, SystemClock.now()).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert!(module.planning_session.input().items().is_empty());
+        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        assert!(!speak_progress_exists(&blackboard).await);
     }
 
     #[test]
@@ -2034,6 +2228,8 @@ mod tests {
         assert_eq!(progress.target, "Koro");
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
         assert_eq!(module.planning_session.list_turns().count(), 1);
+        let planning_text = session_input_text(&module.planning_session);
+        assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -2678,6 +2874,7 @@ mod tests {
     fn speak_batch_keeps_drained_updates() {
         let batch = SpeakBatch {
             updates: vec![CognitionLogUpdated::AgenticDeadlockMarker],
+            cognition_entries: Vec::new(),
         };
 
         assert_eq!(
