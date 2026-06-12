@@ -85,6 +85,7 @@ pub struct LlmTurnState {
     pub turn_id: String,
     pub operation: String,
     pub source: LlmObservationSource,
+    pub session_key: Option<String>,
     pub tier: String,
     pub model: Option<String>,
     pub request_id: Option<String>,
@@ -110,6 +111,7 @@ pub struct LlmTurnListRow {
     pub owner: String,
     pub module: String,
     pub turn_id: String,
+    pub session_key: Option<String>,
     pub turn_number: usize,
     pub label: String,
     pub streaming: bool,
@@ -320,6 +322,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             replica,
             tier,
             source,
+            session_key,
             operation,
             items,
             ..
@@ -329,7 +332,15 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
             let batch = module_state.latest_batch.clone();
-            let turn = ensure_turn(module_state, turn_id, operation, source, tier, batch);
+            let turn = ensure_turn(
+                module_state,
+                turn_id,
+                operation,
+                source,
+                session_key,
+                tier,
+                batch,
+            );
             turn.input = items;
             turn.status = ModuleSessionStatus::Running;
         }
@@ -340,6 +351,7 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             replica,
             tier,
             source,
+            session_key,
             operation,
             request_id,
             model,
@@ -350,7 +362,15 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
             let batch = module_state.latest_batch.clone();
-            let turn = ensure_turn(module_state, turn_id, operation, source, tier, batch);
+            let turn = ensure_turn(
+                module_state,
+                turn_id,
+                operation,
+                source,
+                session_key,
+                tier,
+                batch,
+            );
             turn.model = Some(model);
             turn.request_id = request_id;
             turn.status = ModuleSessionStatus::Running;
@@ -458,7 +478,7 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
         replica,
         tier,
         source,
-        session_key: _,
+        session_key,
         operation,
         input,
         output,
@@ -472,7 +492,15 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
 
     record_turn_owner(state, &turn_id, &owner);
     let module_state = module_mut_with_metadata(state, owner, module, replica);
-    let turn_state = ensure_turn(module_state, turn_id, operation, source, tier, None);
+    let turn_state = ensure_turn(
+        module_state,
+        turn_id,
+        operation,
+        source,
+        session_key,
+        tier,
+        None,
+    );
     turn_state.input = input;
     turn_state.output = output
         .into_iter()
@@ -746,10 +774,11 @@ fn render_module_selector(
             for (index, turn) in module.turns.iter().enumerate() {
                 let panel_id = turn_selection_id(&turn.turn_id);
                 let selected = panel_id == selected_panel;
+                let turn_number = session_turn_number(module, index);
                 ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
                     failed_turn_frame(ui, turn.status).show(ui, |ui| {
                         let response = ui
-                            .selectable_label(selected, turn_selector_label(index, turn))
+                            .selectable_label(selected, turn_selector_label(turn_number, turn))
                             .on_hover_text(turn_selector_hover(turn));
                         if response.clicked() {
                             *next_panel = panel_id;
@@ -1835,14 +1864,17 @@ pub fn llm_turn_rows(
             let module_name = module_name(module);
             module_selected(&module_name).then(|| {
                 let streaming = turn_is_streaming(turn);
+                let turn_number = session_turn_number(module, turn_index);
                 LlmTurnListRow {
                     owner: module.owner.clone(),
                     module: module_name,
                     turn_id: turn.turn_id.clone(),
-                    turn_number: turn_index + 1,
+                    session_key: turn.session_key.clone(),
+                    turn_number,
                     label: llm_turn_row_label(
                         module_turn_label_module(module),
-                        turn_index,
+                        turn_session_label(turn),
+                        turn_number,
                         streaming,
                     ),
                     streaming,
@@ -1895,8 +1927,8 @@ fn turn_selection_id(turn_id: &str) -> String {
     format!("{MODULE_TURN_SELECTION_PREFIX}{turn_id}")
 }
 
-fn turn_selector_label(index: usize, turn: &LlmTurnState) -> String {
-    let label = format!("turn {}", index + 1);
+fn turn_selector_label(turn_number: usize, turn: &LlmTurnState) -> String {
+    let label = format!("{} {turn_number}", turn_session_label(turn));
     if let Some(usage) = &turn.usage {
         return format!("{label} ({})", turn_usage_tokens(usage));
     }
@@ -1905,8 +1937,9 @@ fn turn_selector_label(index: usize, turn: &LlmTurnState) -> String {
 
 fn turn_selector_hover(turn: &LlmTurnState) -> String {
     let mut hover = format!(
-        "{} {} {} ({})",
+        "{} {} {} {} ({})",
         status_label(turn.status),
+        turn_session_label(turn),
         turn.operation,
         turn.source.label(),
         turn.turn_id
@@ -1942,8 +1975,25 @@ fn module_turn_label_module(module: &ModuleState) -> String {
     }
 }
 
-fn llm_turn_row_label(module: String, turn_index: usize, streaming: bool) -> String {
-    let label = format!("{module} {} turn", turn_index + 1);
+fn turn_session_label(turn: &LlmTurnState) -> &str {
+    turn.session_key.as_deref().unwrap_or("turn")
+}
+
+fn session_turn_number(module: &ModuleState, turn_index: usize) -> usize {
+    let session_key = &module.turns[turn_index].session_key;
+    module.turns[..=turn_index]
+        .iter()
+        .filter(|turn| &turn.session_key == session_key)
+        .count()
+}
+
+fn llm_turn_row_label(
+    module: String,
+    session_label: &str,
+    turn_number: usize,
+    streaming: bool,
+) -> String {
+    let label = format!("{module}.{session_label} {turn_number}");
     if streaming {
         format!("* {label}")
     } else {
@@ -1969,6 +2019,7 @@ fn ensure_turn(
     turn_id: String,
     operation: String,
     source: LlmObservationSource,
+    session_key: Option<String>,
     tier: String,
     batch: Option<ModuleBatchDebugState>,
 ) -> &mut LlmTurnState {
@@ -1976,6 +2027,9 @@ fn ensure_turn(
         let turn = &mut module.turns[index];
         turn.operation = operation;
         turn.source = source;
+        if session_key.is_some() {
+            turn.session_key = session_key;
+        }
         turn.tier = tier;
         if turn.batch.is_none() {
             turn.batch = batch;
@@ -1986,6 +2040,7 @@ fn ensure_turn(
         turn_id,
         operation,
         source,
+        session_key,
         tier,
         model: None,
         request_id: None,
@@ -2834,8 +2889,9 @@ mod tests {
                 owner: "sensory".to_string(),
                 module: "sensory".to_string(),
                 turn_id: "turn-1".to_string(),
+                session_key: None,
                 turn_number: 1,
-                label: "sensory 1 turn".to_string(),
+                label: "sensory.turn 1".to_string(),
                 streaming: false,
                 failed: false,
             },
@@ -2843,8 +2899,9 @@ mod tests {
                 owner: "memory".to_string(),
                 module: "memory".to_string(),
                 turn_id: "turn-2".to_string(),
+                session_key: None,
                 turn_number: 1,
-                label: "* memory 1 turn".to_string(),
+                label: "* memory.turn 1".to_string(),
                 streaming: true,
                 failed: false,
             },
@@ -2852,8 +2909,9 @@ mod tests {
                 owner: "allocation".to_string(),
                 module: "allocation".to_string(),
                 turn_id: "turn-3".to_string(),
+                session_key: None,
                 turn_number: 1,
-                label: "* allocation 1 turn".to_string(),
+                label: "* allocation.turn 1".to_string(),
                 streaming: true,
                 failed: false,
             },
@@ -3131,6 +3189,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 operation: "text_turn".to_string(),
                 source: LlmObservationSource::ModuleTurn,
+                session_key: None,
                 tier: "Default".to_string(),
                 model: None,
                 request_id: None,
@@ -3158,6 +3217,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             operation: "text_turn".to_string(),
             source: LlmObservationSource::ModuleTurn,
+            session_key: Some("main".to_string()),
             tier: "Default".to_string(),
             model: None,
             request_id: None,
@@ -3170,7 +3230,7 @@ mod tests {
             error_message: None,
         };
 
-        assert_eq!(turn_selector_label(0, &turn), "turn 1");
+        assert_eq!(turn_selector_label(1, &turn), "main 1");
 
         turn.usage = Some(LlmUsageView {
             input_tokens: 2,
@@ -3181,7 +3241,8 @@ mod tests {
             cache_read_tokens: 0,
         });
 
-        assert_eq!(turn_selector_label(0, &turn), "turn 1 (5)");
+        assert_eq!(turn_selector_label(1, &turn), "main 1 (5)");
+        assert!(turn_selector_hover(&turn).contains("main"));
         assert!(turn_selector_hover(&turn).contains("tokens: 5"));
     }
 
@@ -3241,10 +3302,65 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sensory-turn", "memory-turn"]
         );
-        assert_eq!(rows[0].label, "sensory 1 turn");
+        assert_eq!(rows[0].label, "sensory.turn 1");
         assert!(!rows[0].streaming);
-        assert_eq!(rows[1].label, "* memory 1 turn");
+        assert_eq!(rows[1].label, "* memory.turn 1");
         assert!(rows[1].streaming);
+    }
+
+    #[test]
+    fn llm_turn_labels_count_by_session_key() {
+        let mut state = ModulesState::default();
+        for (turn_id, session_key) in [
+            ("speak-planning-1", "planning"),
+            ("speak-generation-1", "generation"),
+            ("speak-planning-2", "planning"),
+            ("speak-generation-2", "generation"),
+        ] {
+            apply_llm_observation(
+                &mut state,
+                LlmObservationEvent::ModelInput {
+                    turn_id: turn_id.to_string(),
+                    owner: "speak".to_string(),
+                    module: "speak".to_string(),
+                    replica: 0,
+                    tier: "Default".to_string(),
+                    source: LlmObservationSource::ModuleTurn,
+                    session_key: Some(session_key.to_string()),
+                    operation: "text_turn".to_string(),
+                    items: Vec::new(),
+                },
+            );
+        }
+
+        let module = state.modules.get("speak").expect("module exists");
+        let module_labels = module
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| turn_selector_label(session_turn_number(module, index), turn))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            module_labels,
+            vec!["planning 1", "generation 1", "planning 2", "generation 2"]
+        );
+
+        let rows = llm_turn_rows(&state, |_| true);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "* speak.planning 1",
+                "* speak.generation 1",
+                "* speak.planning 2",
+                "* speak.generation 2"
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.turn_number).collect::<Vec<_>>(),
+            vec![1, 1, 2, 2]
+        );
     }
 
     #[test]
@@ -3347,12 +3463,14 @@ mod tests {
         assert_eq!(module.last_tier, None);
 
         let turn = module.turns.first().expect("turn exists");
+        assert_eq!(turn.session_key.as_deref(), Some("session"));
         assert_eq!(turn.status, ModuleSessionStatus::Failed);
         assert_eq!(turn.error_message.as_deref(), Some("request timed out"));
         assert_eq!(turn.output.len(), 1);
 
         let turn_rows = llm_turn_rows(&state, |_| true);
         assert_eq!(turn_rows.len(), 1);
+        assert_eq!(turn_rows[0].label, "predict.session 1");
         assert!(turn_rows[0].failed);
 
         let overview = overview_rows(&state, &BlackboardSnapshot::default());
