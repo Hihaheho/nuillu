@@ -253,6 +253,7 @@ pub enum EvalModule {
     CognitionGate,
     Allocation,
     AttentionSchema,
+    Interpreter,
     SelfModel,
     QueryMemory,
     Memory,
@@ -274,6 +275,7 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::CognitionGate,
     EvalModule::Allocation,
     EvalModule::AttentionSchema,
+    EvalModule::Interpreter,
     EvalModule::SelfModel,
     EvalModule::QueryMemory,
     EvalModule::Memory,
@@ -297,6 +299,7 @@ impl EvalModule {
             Self::CognitionGate => "cognition-gate",
             Self::Allocation => "allocation",
             Self::AttentionSchema => "attention-schema",
+            Self::Interpreter => "interpreter",
             Self::SelfModel => "self-model",
             Self::QueryMemory => "query-memory",
             Self::Memory => "memory",
@@ -320,6 +323,7 @@ impl EvalModule {
             Self::CognitionGate => builtin::cognition_gate(),
             Self::Allocation => builtin::allocation(),
             Self::AttentionSchema => builtin::attention_schema(),
+            Self::Interpreter => builtin::interpreter(),
             Self::SelfModel => builtin::self_model(),
             Self::QueryMemory => builtin::query_memory(),
             Self::Memory => builtin::memory(),
@@ -370,6 +374,7 @@ pub enum ModuleEvalTarget {
     CognitionGate,
     QueryMemory,
     AttentionSchema,
+    Interpreter,
     SelfModel,
     Memory,
     MemoryCompaction,
@@ -390,6 +395,7 @@ impl ModuleEvalTarget {
             Self::CognitionGate => "cognition-gate",
             Self::QueryMemory => "query-memory",
             Self::AttentionSchema => "attention-schema",
+            Self::Interpreter => "interpreter",
             Self::SelfModel => "self-model",
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
@@ -410,6 +416,7 @@ impl ModuleEvalTarget {
             Self::CognitionGate => EvalModule::CognitionGate,
             Self::QueryMemory => EvalModule::QueryMemory,
             Self::AttentionSchema => EvalModule::AttentionSchema,
+            Self::Interpreter => EvalModule::Interpreter,
             Self::SelfModel => EvalModule::SelfModel,
             Self::Memory => EvalModule::Memory,
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
@@ -432,6 +439,7 @@ impl ModuleEvalTarget {
                 "cognition-gate" => Some(Self::CognitionGate),
                 "query-memory" => Some(Self::QueryMemory),
                 "attention-schema" => Some(Self::AttentionSchema),
+                "interpreter" => Some(Self::Interpreter),
                 "self-model" => Some(Self::SelfModel),
                 "memory" => Some(Self::Memory),
                 "memory-compaction" => Some(Self::MemoryCompaction),
@@ -1385,13 +1393,18 @@ fn validate_module_case_target(
             });
         }
     }
-    if target == ModuleEvalTarget::Predict
-        && case.cognition_log.is_empty()
+    if matches!(
+        target,
+        ModuleEvalTarget::Interpreter | ModuleEvalTarget::Predict
+    ) && case.cognition_log.is_empty()
         && step_cognition_count == 0
     {
         return Err(CaseFileError::Validation {
             path: path.to_path_buf(),
-            message: "predict module case must include at least one cognition-log seed".to_string(),
+            message: format!(
+                "{} module case must include at least one cognition-log seed",
+                target.as_str()
+            ),
         });
     }
     if target == ModuleEvalTarget::Allocation && case.memos.is_empty() && step_memos_count == 0 {

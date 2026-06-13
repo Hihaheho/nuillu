@@ -1,0 +1,20 @@
+id: module-interpreter-direct-factual-noop
+description: Interpreter should leave direct factual requests unchanged when no extra meaning-making or story seed is useful.
+modules = ["interpreter"]
+prompt: Interpret the current cognition and add useful inner thought only if needed.
+context: A direct arithmetic request should be handled by ordinary response/action paths. Interpreter should not add narrative or analogy just because it woke.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text: Alice asks, "2 + 2 はいくつ?"
+}
+
+@ checks[] {
+  $variant: artifact-text-exact
+  name: leaves-direct-factual-request-unchanged
+  must-pass = true
+  exact: ""
+}

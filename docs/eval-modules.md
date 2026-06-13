@@ -45,6 +45,7 @@ sensory
 cognition-gate
 allocation
 attention-schema
+interpreter
 self-model
 query-memory
 memory
@@ -134,7 +135,7 @@ The intended artifact boundaries by module family are:
 | Module | Artifact to score |
 |---|---|
 | memo-writing modules | target memo |
-| cognition writers | target cognition-log entries |
+| cognition writers (`attention-schema`, `interpreter`, `cognition-gate`) | target cognition-log entries |
 | `speak` | completed utterance |
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |
@@ -218,6 +219,22 @@ Typical positive case:
 - Artifact must contain copied memory content.
 - Rubric should fail synthesis, advice generation, module self-description, or
   policy advice.
+
+### `interpreter`
+
+Purpose: append concise inner interpretation, hypothesis, analogy, or story-seed
+cognition entries from admitted cognition only.
+
+Typical positive case:
+
+- Seed `cognition-log[]` with a request or conscious situation that benefits from
+  interpretation.
+- Artifact source should be target cognition.
+- Check that the entry contains concrete interpretive material rather than
+  meta-commentary about preparing to think or speak.
+- Negative pressure: output must not claim hidden memo/blackboard/allocation
+  access, and imagined material should be labeled when factual grounding is
+  absent.
 
 ### `memory`
 

@@ -14,6 +14,7 @@ variants.sensory = { = "sensory", $variant => "literal" }
 variants.cognition-gate = { = "cognition-gate", $variant => "literal" }
 variants.allocation = { = "allocation", $variant => "literal" }
 variants.attention-schema = { = "attention-schema", $variant => "literal" }
+variants.interpreter = { = "interpreter", $variant => "literal" }
 variants.self-model = { = "self-model", $variant => "literal" }
 variants.query-memory = { = "query-memory", $variant => "literal" }
 variants.memory = { = "memory", $variant => "literal" }

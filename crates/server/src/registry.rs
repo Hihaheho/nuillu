@@ -121,6 +121,17 @@ fn register_server_module(
                     .await?,
             ))
         }),
+        RuntimeModule::Interpreter => registry.register_server(spec, |caps| async move {
+            Ok(nuillu_interpreter::InterpreterModule::new(
+                caps.cognition_log_updated_inbox(),
+                caps.cognition_log_reader(),
+                caps.cognition_writer(),
+                caps.llm_access(),
+                caps.session("main")
+                    .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
+                    .await?,
+            ))
+        }),
         RuntimeModule::SelfModel => registry.register_server(spec, |caps| async move {
             Ok(nuillu_self_model::SelfModelModule::new(
                 caps.cognition_log_updated_inbox(),
@@ -445,7 +456,24 @@ fn set_allocation_module(
 mod tests {
     use super::*;
 
+    use lutum::Session;
+    use nuillu_module::{CognitionLogReader, CognitionLogUpdatedInbox, CognitionWriter, LlmAccess};
     use nuillu_types::builtin;
+
+    type InterpreterConstructor = fn(
+        CognitionLogUpdatedInbox,
+        CognitionLogReader,
+        CognitionWriter,
+        LlmAccess,
+        Session,
+    ) -> nuillu_interpreter::InterpreterModule;
+
+    #[test]
+    fn interpreter_constructor_uses_only_direct_cognition_capabilities() {
+        fn accepts_direct_cognition_signature(_constructor: InterpreterConstructor) {}
+
+        accepts_direct_cognition_signature(nuillu_interpreter::InterpreterModule::new);
+    }
 
     #[test]
     fn configured_dependencies_ignore_absent_modules() {
@@ -468,6 +496,7 @@ mod tests {
         let drive = group_modules(&boot_config, ServerModuleGroup::HomeostaticDrive);
 
         assert!(voluntary.contains(&builtin::speak()));
+        assert!(voluntary.contains(&builtin::interpreter()));
         assert!(!voluntary.contains(&builtin::sensory()));
         assert!(drive.contains(&builtin::memory_compaction()));
         assert!(drive.contains(&builtin::policy_compaction()));

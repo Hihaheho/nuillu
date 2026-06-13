@@ -243,6 +243,10 @@ fn parses_added_speak_and_self_model_module_cases() {
             "../../eval-cases/modules/allocation/prioritizes-speak-for-peer-question.eure",
             EvalModule::Allocation,
         ),
+        (
+            "../../eval-cases/modules/interpreter/interesting-story-seed.eure",
+            EvalModule::Interpreter,
+        ),
     ];
 
     for (path, expected_module) in cases {

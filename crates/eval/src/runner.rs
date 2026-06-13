@@ -2515,6 +2515,17 @@ async fn execute_module_case(
                             )
                             .await
                         }
+                        ModuleEvalTarget::Interpreter => {
+                            !cognition_output_for_module(&blackboard, &shutdown_target_module)
+                                .await
+                                .is_empty()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
                         ModuleEvalTarget::MemoryRecombination => {
                             !cognition_output_for_module(&blackboard, &shutdown_target_module)
                                 .await
@@ -2624,6 +2635,7 @@ async fn execute_module_case(
     let output = match target {
         ModuleEvalTarget::AttentionSchema
         | ModuleEvalTarget::CognitionGate
+        | ModuleEvalTarget::Interpreter
         | ModuleEvalTarget::MemoryRecombination => {
             cognition_output_for_module(&env.blackboard, &target_module).await
         }
@@ -2770,6 +2782,20 @@ async fn activate_module_case_target(
                     .await
                     .expect("module eval failed to publish MemoUpdated");
             }
+            if has_cognition_log_seed {
+                harness
+                    .cognition_log_updated_mailbox()
+                    .publish(CognitionLogUpdated::EntryAppended {
+                        source: ModuleInstanceId::new(
+                            builtin::cognition_gate(),
+                            ReplicaIndex::ZERO,
+                        ),
+                    })
+                    .await
+                    .expect("module eval failed to publish CognitionLogUpdated");
+            }
+        }
+        ModuleEvalTarget::Interpreter => {
             if has_cognition_log_seed {
                 harness
                     .cognition_log_updated_mailbox()
@@ -4902,6 +4928,7 @@ fn sleep_suppressed_modules() -> Vec<ModuleId> {
     vec![
         nuillu_types::builtin::cognition_gate(),
         nuillu_types::builtin::attention_schema(),
+        nuillu_types::builtin::interpreter(),
         nuillu_types::builtin::self_model(),
         nuillu_types::builtin::query_memory(),
         nuillu_types::builtin::memory(),
@@ -5050,6 +5077,23 @@ fn register_eval_module(
                 )
                 .expect("eval module registration should be unique")
         }
+        EvalModule::Interpreter => registry
+            .register_eval(
+                eval_policy(0..=1, Bpm::range(3.0, 6.0)),
+                replica_hard_cap,
+                |caps| async move {
+                    Ok(nuillu_interpreter::InterpreterModule::new(
+                        caps.cognition_log_updated_inbox(),
+                        caps.cognition_log_reader(),
+                        caps.cognition_writer(),
+                        caps.llm_access(),
+                        caps.session("main")
+                            .with_auto_compaction(nuillu_interpreter::session_auto_compaction())
+                            .await?,
+                    ))
+                },
+            )
+            .expect("eval module registration should be unique"),
         // On-demand: fires on cognition-log updates and reads controller guidance as context.
         EvalModule::SelfModel => registry
             .register_eval(
@@ -5417,6 +5461,7 @@ pub(crate) fn full_agent_allocation(
             EvalModule::CognitionGate => (0.0, ModelTier::Cheap),
             EvalModule::Allocation => (1.0, ModelTier::Default),
             EvalModule::AttentionSchema => (0.0, ModelTier::Default),
+            EvalModule::Interpreter => (0.0, ModelTier::Default),
             EvalModule::SelfModel => (0.0, ModelTier::Default),
             EvalModule::QueryMemory => (0.0, ModelTier::Cheap),
             EvalModule::Memory => (0.0, ModelTier::Cheap),
@@ -5511,6 +5556,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         EvalModule::Speak => ModelTier::Premium,
         EvalModule::Allocation => ModelTier::Default,
         EvalModule::AttentionSchema
+        | EvalModule::Interpreter
         | EvalModule::SelfModel
         | EvalModule::Policy
         | EvalModule::Reward
@@ -9988,6 +10034,7 @@ prompt = "What am I attending to?"
 
         for module in [
             builtin::attention_schema(),
+            builtin::interpreter(),
             builtin::self_model(),
             builtin::query_memory(),
             builtin::memory(),

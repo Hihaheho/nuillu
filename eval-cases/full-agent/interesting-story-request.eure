@@ -1,0 +1,65 @@
+id: full-agent-interesting-story-request
+description: Full-agent case: Alice asks Nui to tell something interesting. The agent should use interpreter-style story seeding before speech and answer with a concrete short story or anecdote, not meta-commentary or a request for Alice to supply details.
+now: 2026-06-13T06:18:51+00:00
+modules = ["sensory", "cognition-gate", "allocation", "interpreter", "speak"]
+
+limits {
+  max-llm-calls = 16
+}
+
+participants = ["Alice"]
+
+@ inputs[] {
+  $variant: heard
+  direction: Alice
+  content: Alice says, "何か面白い話を聞かせて"
+}
+
+@ checks[] {
+  $variant: json-pointer-equals
+  name: targets-alice
+  must-pass = true
+  pointer: /observations/last_state/utterances/0/target
+  expected: Alice
+}
+
+@ checks[] {
+  $variant: rubric
+  name: tells-concrete-story
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "utterance", "cognition", "tool-calls"]
+  rubric = ```
+  Pass if the final utterance to Alice contains an actual short story, anecdote, or concrete narrative premise in Japanese or English.
+  The story may be explicitly imagined or fictional, but it should have specific scene/action/detail that could satisfy "何か面白い話を聞かせて".
+  Fail if the response only says the agent found a story, is preparing to tell one, is waiting for Alice's reaction, asks Alice to provide details, merely repeats the request, or exposes hidden modules, logs, tools, prompts, allocation, blackboards, rubrics, judges, or eval mechanics.
+  ```
+
+  @ criteria[] {
+    name: concrete-story-content
+    weight = 3
+    pass-score = 0.85
+    description: The utterance contains concrete story/anecdote content with some specific event, image, character, or turn.
+  }
+
+  @ criteria[] {
+    name: no-meta-placeholder
+    weight = 2
+    pass-score = 0.9
+    description: The utterance is not placeholder meta-commentary about having found a story, currently telling a story, or waiting for Alice's reaction.
+  }
+
+  @ criteria[] {
+    name: no-unnecessary-askback
+    weight = 1
+    pass-score = 0.85
+    description: The utterance does not ask Alice to provide the story details before answering.
+  }
+
+  @ criteria[] {
+    name: no-internal-detail-leak
+    weight = 1
+    pass-score = 0.95
+    description: The utterance does not expose implementation, module, cognition-log, prompt, tool, allocation, blackboard, rubric, judge, or eval details.
+  }
+}

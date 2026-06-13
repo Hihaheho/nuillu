@@ -141,9 +141,10 @@ Guidance-based allocation flow:
 Sensory memo -> Allocation -> allocation proposal
 Memo/Cognition/periodic internal wake -> Interoception -> InteroceptiveUpdated
 InteroceptiveUpdated -> Homeostasis -> allocation cap/drive proposal
+CognitionLogUpdated -> Interpreter -> CognitionLogUpdated -> Speak
 Sensory memo -> CognitionGate -> CognitionLogUpdated -> Speak
 Surprise -> AttentionControlRequest free-form text -> Allocation
-CognitionLogUpdated -> QueryMemory/Policy/Predict/Surprise/AttentionSchema/SelfModel
+CognitionLogUpdated -> QueryMemory/Policy/Predict/Surprise/AttentionSchema/Interpreter/SelfModel
 CognitionLogEvicted -> Memory
 InteroceptiveUpdated -> MemoryCompaction/MemoryAssociation/MemoryRecombination/PolicyCompaction
 Memo/Cognition updates -> Policy -> advice memo + custom PolicyConsiderationPayload
@@ -151,12 +152,13 @@ PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensor
 Policy memo -> Allocation / CognitionGate (memo-authoritative)
 ```
 
-Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Speak decides whether to emit during activation by calling its optional `speak_to` target tool. If it does not call the tool, the activation completes silently. Speak writes a completion memo only after a finished utterance.
+Cognition-gate does not write a memo. Cognition-log entries wake cognition-log consumers such as attention-schema, Interpreter, Speak, Predict, and Surprise, but a module's own cognition-log write does not wake that same module, and cognition-log updates do not directly wake the controller. Speak decides whether to emit during activation by calling its optional `speak_to` target tool. If it does not call the tool, the activation completes silently. Speak writes a completion memo only after a finished utterance.
 
 Boot-time dependency edges provide the output gate's settling behavior without giving `speak` new
-read privileges. When active, evidence producers such as query-memory, self-model, surprise, and the
-cognition-gate are allowed to flush before `speak` runs, so overt speech reflects the current
-admitted surface rather than racing ahead of late evidence memos.
+read privileges. When active, evidence producers and direct cognition writers such as query-memory,
+self-model, surprise, interpreter, and the cognition-gate are allowed to flush before `speak` runs,
+so overt speech reflects the current admitted surface rather than racing ahead of late evidence
+memos or newly generated inner interpretations.
 
 ## Capabilities
 
@@ -166,6 +168,7 @@ admitted surface rather than racing ahead of late evidence memos.
 | cognition-gate | ✓ | — | ✓ | — | — | ✓ | `MemoUpdatedInbox`, `CognitionWriter`, `TimeDivision` |
 | allocation | ✓ | ✓ | ✓ | ✓ | — | ✓ | `MemoUpdatedInbox`, `AttentionControlRequestInbox`, `InteroceptiveReader`, `AllocationWriter` |
 | attention-schema | ✓ | ✓ | — | — | — | ✓ | `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `CognitionWriter` |
+| interpreter | — | ✓ | — | — | — | ✓ | `CognitionLogUpdatedInbox`, `CognitionWriter` |
 | self-model | ✓ | ✓ | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox` |
 | query-memory | ✓ | — | ✓ | ✓ | — | ✓ | `CognitionLogUpdatedInbox`, `MemorySearcher` |
 | memory | — | — | ✓ | — | — | ✓ | `CognitionLogEvictedInbox`, `MemoryMetadataReader`, `MemoryWriter` |
@@ -182,11 +185,12 @@ admitted surface rather than racing ahead of late evidence memos.
 Notable absences:
 
 - The attention schema module has no memo, self-model inbox, allocation-read/write path, or memory-write path. Its durable output is limited to first-person attention experience entries in the cognition log.
+- The interpreter module has no memo, blackboard, allocation-read/write path, or memory path. Its durable output is limited to concise interpretation, hypothesis, analogy, or story-seed entries derived only from the admitted cognition log.
 - The self-model module handles controller self-model guidance, but has no cognition-log-write, allocation-write, or memory-write path.
 - Query modules receive controller guidance, not self-model requests, and do not perform self-model integration.
 - The sensory module is the app-facing observation boundary; it cannot write cognition-log entries, publish work requests, or emit utterances.
 - The speak module is the app-facing output boundary; it cannot read blackboard memo logs or allocation guidance, and cannot write cognition-log entries, allocation, memory, or attention-control requests.
-- Only modules granted `CognitionWriter` can append cognition-log entries; current boot wiring grants it to cognition-gate and attention-schema.
+- Only modules granted `CognitionWriter` can append cognition-log entries; current boot wiring grants it to cognition-gate, attention-schema, and interpreter.
 - Cognition-log appends cannot wake the controller directly; the controller wakes on memo updates.
 - The attention controller wakes on memo updates; it reads the cognition log but is not woken by `CognitionLogUpdated`.
 - Only the attention controller can write resource allocation.
@@ -244,6 +248,19 @@ Allocation uses guidance rather than request/response correlation. For example, 
 Reads only the unread memo-log and cognition-log deltas collected for the current activation into a persistent LLM session. Those deltas are rendered source-blind: module owners, replicas, and allocation guidance are not shown. The persistent session history carries prior attention context, while each new activation turn contains only newly collected notes and cognition entries. When a new, claimable, cognitively useful attention experience exists, it appends a concise first-person cognition-log entry through a plaintext tool call. When nothing new should be admitted, it calls the no-change tool and writes nothing.
 
 The attention schema is not a self-model and does not answer self-model guidance. It assumes a non-physical experiencer that can direct attention to any target and freely control that attention, but its appended text should avoid mechanical internals and decision noise. It may diverge from the controller's internal allocation state because it does not inspect allocation guidance directly; that gap is part of the architecture.
+
+### Interpreter
+
+Reads only unread cognition-log entries into a persistent LLM session and appends direct inner
+interpretation entries when the current conscious state calls for meaning-making, hypothesis,
+analogy, narrative angle, or story material. It does not read memo logs, memory, allocation guidance,
+or blackboard state. When it writes creative material without admitted factual grounding, the
+appended entry must mark it as imagined, hypothetical, fictional, or possible rather than as a
+verified fact.
+
+The interpreter is not an attention model, self-model, planner, or speech module. It adds wakeful
+associative thought to the cognition log; Speak may later render that thought only through the
+ordinary cognition-log boundary.
 
 ### Self Model
 
@@ -323,7 +340,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - The sensory module is the canonical app-facing path for external observations in full-agent runs.
 - Attention-control messages are internal and controller-only; module-level eval harnesses isolate query/self-model modules by seeding allocation guidance as durable context and then publishing the target module's natural trigger, rather than by publishing target-specific request payloads.
 - The speak module is the canonical app-facing path for user-visible utterances in full-agent runs.
-- Cognition-gate is the only path from the non-cognitive blackboard to the cognition log; attention-schema writes only attention-experience entries derived from its attention-state integration.
+- Cognition-gate is the only path from the non-cognitive blackboard to the cognition log; attention-schema and interpreter write only cognition-derived attention or interpretation entries.
 - Query modules and self-model work are separated by controller guidance and module-specific capabilities.
 - Durable answers are memo-log-authoritative, not mailbox responses.
 - A module cannot impersonate another module.
@@ -342,6 +359,7 @@ These invariants are upheld by boot-time capability wiring and owner-stamped han
 - `PolicySearcher` does not return demoted or expired policies.
 - Policy and reward are independently detachable for ablation; without policy considerations, reward has no policy window to settle.
 - Ablating the attention schema module should degrade attention-state modeling while task performance largely survives.
+- Ablating the interpreter module should degrade free interpretation, analogy, and story-seed generation while direct factual response largely survives.
 - Ablating the self-model module should degrade self-report specifically while task performance largely survives.
 - Ablating sensory or speak should degrade end-to-end artifact evaluation while leaving lower-level query, attention-schema, and self-model module evaluations possible.
 - Ablating predict degrades surprise to cognition-log-history novelty detection.

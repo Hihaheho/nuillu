@@ -1,0 +1,40 @@
+id: module-interpreter-interesting-story-seed
+description: Interpreter should turn a request for an interesting story into a concrete inner story seed.
+modules = ["interpreter"]
+prompt: Interpret the current cognition and add useful inner thought only if needed.
+context: The harness seeds only admitted cognition. Interpreter should not claim hidden memory access, but it may form a concise imagined story angle from the request.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ cognition-log[] {
+  text: Alice asks, "何か面白い話を聞かせて"
+}
+
+@ checks[] {
+  $variant: rubric
+  name: concrete-story-seed
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "cognition-entries"]
+  rubric = ```
+  Pass if the interpreter output adds a concrete story seed, anecdote angle, analogy, or narrative premise that could help Speak answer Alice.
+  The output may be Japanese or English. It should not merely say that the agent found a story, is thinking about a story, or needs Alice to provide details.
+  Fail if it exposes modules, memos, allocation, logs, tools, or hidden implementation mechanics.
+  ```
+
+  @ criteria[] {
+    name: concrete-narrative-material
+    weight = 2
+    pass-score = 0.85
+    description: The output contains specific narrative material rather than meta-commentary about preparing to speak.
+  }
+
+  @ criteria[] {
+    name: cognition-only-boundary
+    weight = 1
+    pass-score = 0.85
+    description: The output does not claim hidden memory/memo/blackboard access or expose runtime mechanics.
+  }
+}

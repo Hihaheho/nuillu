@@ -31,6 +31,7 @@ pub fn standard_dependency_edges() -> Vec<(ModuleId, ModuleId)> {
         (builtin::cognition_gate(), builtin::surprise()),
         (builtin::speak(), builtin::query_memory()),
         (builtin::speak(), builtin::self_model()),
+        (builtin::speak(), builtin::interpreter()),
         (builtin::speak(), builtin::surprise()),
         (builtin::speak(), builtin::cognition_gate()),
         (builtin::reward(), builtin::policy()),
@@ -70,6 +71,7 @@ mod tests {
 
         assert!(edges.contains(&(builtin::speak(), builtin::query_memory())));
         assert!(edges.contains(&(builtin::speak(), builtin::self_model())));
+        assert!(edges.contains(&(builtin::speak(), builtin::interpreter())));
         assert!(edges.contains(&(builtin::speak(), builtin::surprise())));
         assert!(edges.contains(&(builtin::speak(), builtin::cognition_gate())));
     }

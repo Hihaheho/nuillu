@@ -174,6 +174,7 @@ pub mod builtin {
         cognition_gate        => "cognition-gate",
         allocation => "allocation",
         attention_schema      => "attention-schema",
+        interpreter           => "interpreter",
         self_model            => "self-model",
         query_memory          => "query-memory",
         memory                => "memory",
