@@ -14,6 +14,10 @@ use nuillu_visualizer_protocol::{
     VisualizerAction, VisualizerClientMessage, VisualizerEvent, VisualizerServerMessage,
 };
 
+const VISUALIZER_GUI_BIN_ENV: &str = "NUILLU_VISUALIZER_GUI_BIN";
+const VISUALIZER_GUI_PACKAGE: &str = "nuillu-visualizer-egui";
+const VISUALIZER_GUI_BIN: &str = "nuillu-visualizer-gui";
+
 #[derive(Clone, Debug)]
 pub struct VisualizerEventSink {
     events: Sender<VisualizerServerMessage>,
@@ -119,71 +123,106 @@ pub fn spawn_visualizer_gui(host: &str) -> anyhow::Result<Child> {
 }
 
 fn visualizer_gui_command(host: &str) -> anyhow::Result<Command> {
-    if let Ok(path) = env::var("NUILLU_VISUALIZER_GUI_BIN")
-        && !path.trim().is_empty()
-    {
-        let mut command = Command::new(path);
-        command.arg("--host").arg(host);
-        return Ok(command);
-    }
-
-    build_visualizer_gui_binary()?;
-    if let Some(path) = existing_visualizer_binary() {
-        let mut command = Command::new(path);
-        command.arg("--host").arg(host);
-        return Ok(command);
-    }
-
-    anyhow::bail!(
-        "built nuillu-visualizer-gui but could not find sibling binary {}",
-        visualizer_binary_name()
-    )
+    let override_path = env::var(VISUALIZER_GUI_BIN_ENV).ok();
+    let path =
+        resolve_visualizer_gui_binary(override_path.as_deref(), build_visualizer_gui_binary)?;
+    let mut command = Command::new(path);
+    command.arg("--host").arg(host);
+    Ok(command)
 }
 
-fn build_visualizer_gui_binary() -> anyhow::Result<()> {
-    let status = Command::new("cargo")
+fn resolve_visualizer_gui_binary(
+    override_path: Option<&str>,
+    build: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = override_path
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+    build()
+}
+
+fn build_visualizer_gui_binary() -> anyhow::Result<PathBuf> {
+    let output = Command::new("cargo")
         .arg("build")
         .arg("--release")
         .arg("-p")
-        .arg("nuillu-visualizer-egui")
+        .arg(VISUALIZER_GUI_PACKAGE)
         .arg("--bin")
-        .arg("nuillu-visualizer-gui")
+        .arg(VISUALIZER_GUI_BIN)
+        .arg("--message-format=json-render-diagnostics")
         .current_dir(workspace_root())
-        .status()
+        .output()
         .context("build nuillu-visualizer-gui")?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("cargo build for nuillu-visualizer-gui failed with {status}")
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "cargo build for {VISUALIZER_GUI_BIN} failed with {}\n{}",
+            output.status,
+            stderr.trim_end()
+        );
     }
-}
-
-fn visualizer_binary_name() -> &'static str {
-    if cfg!(windows) {
-        "nuillu-visualizer-gui.exe"
-    } else {
-        "nuillu-visualizer-gui"
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
+    let stdout = std::str::from_utf8(&output.stdout).context("read cargo build stdout as utf-8")?;
+    let executable = required_visualizer_executable_from_cargo_messages(stdout)?;
+    if !executable.exists() {
+        anyhow::bail!(
+            "cargo build for {VISUALIZER_GUI_BIN} reported executable {}, but it does not exist",
+            executable.display()
+        );
+    }
+    Ok(executable)
 }
 
-fn existing_visualizer_binary() -> Option<PathBuf> {
-    [
-        current_exe_sibling(visualizer_binary_name()),
-        Some(
-            workspace_root()
-                .join("target")
-                .join("release")
-                .join(visualizer_binary_name()),
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|path| path.exists())
+fn required_visualizer_executable_from_cargo_messages(messages: &str) -> anyhow::Result<PathBuf> {
+    visualizer_executable_from_cargo_messages(messages)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cargo build for {VISUALIZER_GUI_BIN} succeeded but did not report an executable path"
+        )
+    })
 }
 
-fn current_exe_sibling(name: &str) -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
-    Some(exe.parent()?.join(name))
+fn visualizer_executable_from_cargo_messages(messages: &str) -> anyhow::Result<Option<PathBuf>> {
+    for (line_index, line) in messages.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: serde_json::Value = serde_json::from_str(line).with_context(|| {
+            format!(
+                "parse cargo JSON message line {} while building {VISUALIZER_GUI_BIN}",
+                line_index + 1
+            )
+        })?;
+        if !is_visualizer_compiler_artifact(&message) {
+            continue;
+        }
+        if let Some(executable) = message
+            .get("executable")
+            .and_then(serde_json::Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+    Ok(None)
+}
+
+fn is_visualizer_compiler_artifact(message: &serde_json::Value) -> bool {
+    message.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+        && message
+            .pointer("/target/name")
+            .and_then(serde_json::Value::as_str)
+            == Some(VISUALIZER_GUI_BIN)
+        && message
+            .pointer("/target/kind")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| kind.as_str().is_some_and(|kind| kind == "bin"))
+            })
 }
 
 fn workspace_root() -> &'static Path {
@@ -221,5 +260,65 @@ pub fn drain_child_stdio(child: &mut Child) {
         if !output.trim().is_empty() {
             eprintln!("visualizer stderr:\n{output}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_messages_extract_visualizer_gui_executable() {
+        let messages = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other-bin"},"executable":"/tmp/other-bin"}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-gui"},"executable":"/custom-target/release/nuillu-visualizer-gui"}"#;
+
+        assert_eq!(
+            visualizer_executable_from_cargo_messages(messages).unwrap(),
+            Some(PathBuf::from(
+                "/custom-target/release/nuillu-visualizer-gui"
+            ))
+        );
+    }
+
+    #[test]
+    fn cargo_messages_ignore_null_executable_and_other_bins() {
+        let messages = r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"nuillu-visualizer-gui"},"executable":null}
+{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"other-bin"},"executable":"/tmp/other-bin"}"#;
+
+        assert_eq!(
+            visualizer_executable_from_cargo_messages(messages).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn required_cargo_messages_error_when_visualizer_artifact_missing() {
+        let messages = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"nuillu_visualizer_egui"},"executable":null}"#;
+
+        let error = required_visualizer_executable_from_cargo_messages(messages).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not report an executable path")
+        );
+    }
+
+    #[test]
+    fn resolve_visualizer_gui_binary_prefers_non_empty_override() {
+        let path = resolve_visualizer_gui_binary(Some("/custom/visualizer"), || {
+            panic!("build should not be called when override is set")
+        })
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/custom/visualizer"));
+    }
+
+    #[test]
+    fn resolve_visualizer_gui_binary_builds_when_override_is_empty() {
+        let path =
+            resolve_visualizer_gui_binary(Some("  "), || Ok(PathBuf::from("/built/gui"))).unwrap();
+
+        assert_eq!(path, PathBuf::from("/built/gui"));
     }
 }
