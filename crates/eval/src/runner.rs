@@ -265,7 +265,8 @@ impl VisualizerHook {
                 | VisualizerCommand::FetchLinkedMemories { tab_id, .. }
                 | VisualizerCommand::DeleteMemory { tab_id, .. }
                 | VisualizerCommand::SetModuleDisabled { tab_id, .. }
-                | VisualizerCommand::SetModuleSettings { tab_id, .. } => {
+                | VisualizerCommand::SetModuleSettings { tab_id, .. }
+                | VisualizerCommand::ResetModuleSessionHistory { tab_id, .. } => {
                     self.send_event(VisualizerEvent::Log {
                         tab_id,
                         message: "eval case is no longer running".to_string(),
@@ -4128,6 +4129,14 @@ async fn handle_visualizer_commands(
                 if tab_id.as_str() == case_id =>
             {
                 apply_visualizer_module_settings(&tab_id, visualizer, blackboard, settings).await;
+            }
+            VisualizerCommand::ResetModuleSessionHistory { tab_id, .. }
+                if tab_id.as_str() == case_id =>
+            {
+                visualizer.send_event(VisualizerEvent::Log {
+                    tab_id,
+                    message: "module session reset is only supported by nuillu-server".to_string(),
+                });
             }
             VisualizerCommand::CreateAmbientSensoryRow { tab_id, .. }
             | VisualizerCommand::UpdateAmbientSensoryRow { tab_id, .. }

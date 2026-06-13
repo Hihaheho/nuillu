@@ -526,6 +526,10 @@ impl AgentRuntimeControl {
         )
     }
 
+    pub async fn delete_module_sessions(&self, owner: &ModuleInstanceId) -> Result<u64, PortError> {
+        self.session_store.delete_owner(owner).await
+    }
+
     pub fn record_module_activation_completed(
         &self,
         owner: ModuleInstanceId,
@@ -1557,6 +1561,14 @@ mod tests {
                 .borrow_mut()
                 .push((owner.clone(), key.clone(), snapshot.clone()));
             Ok(())
+        }
+
+        async fn delete_owner(&self, owner: &ModuleInstanceId) -> Result<u64, PortError> {
+            let before = self.saves.borrow().len();
+            self.saves
+                .borrow_mut()
+                .retain(|(saved_owner, _, _)| saved_owner != owner);
+            Ok((before - self.saves.borrow().len()) as u64)
         }
     }
 

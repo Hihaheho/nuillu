@@ -170,6 +170,10 @@ pub enum ModuleOverviewAction {
     SetModuleSettings { settings: ModuleSettingsView },
 }
 
+pub enum ModuleWindowAction {
+    ResetSessionHistory { owner: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveReplicaHighlight {
     AllocationDriven,
@@ -650,15 +654,27 @@ pub fn render_modules_overview(
     actions
 }
 
-pub fn render_module(ui: &mut egui::Ui, module: &ModuleState, memos: &[MemoView]) {
+pub fn render_module(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    memos: &[MemoView],
+) -> Vec<ModuleWindowAction> {
+    let mut actions = Vec::new();
     let module_memos = module_memos(module, memos);
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         ui.heading(module_title(module));
         if let Some(tier) = &module.last_tier {
             ui.label(format!("tier: {tier}"));
         }
         ui.label(format!("memos: {}", module_memos.len()));
         ui.label(format!("turns: {}", module.turns.len()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Reset").clicked() {
+                actions.push(ModuleWindowAction::ResetSessionHistory {
+                    owner: module.owner.clone(),
+                });
+            }
+        });
     });
     ui.separator();
 
@@ -698,6 +714,7 @@ pub fn render_module(ui: &mut egui::Ui, module: &ModuleState, memos: &[MemoView]
     if next_panel != selected_panel {
         persisted_panel.set_next(next_panel);
     }
+    actions
 }
 
 pub fn render_llm_turns(

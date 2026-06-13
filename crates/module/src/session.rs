@@ -665,6 +665,8 @@ pub trait SessionStore {
         key: &SessionKey,
         snapshot: &PersistedSessionSnapshot,
     ) -> Result<(), PortError>;
+
+    async fn delete_owner(&self, owner: &ModuleInstanceId) -> Result<u64, PortError>;
 }
 
 #[derive(Debug, Default)]
@@ -687,6 +689,10 @@ impl SessionStore for NoopSessionStore {
         _snapshot: &PersistedSessionSnapshot,
     ) -> Result<(), PortError> {
         Ok(())
+    }
+
+    async fn delete_owner(&self, _owner: &ModuleInstanceId) -> Result<u64, PortError> {
+        Ok(0)
     }
 }
 

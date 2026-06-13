@@ -6,7 +6,7 @@ use nuillu_blackboard::{
 };
 use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation};
 use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality};
-use nuillu_types::{MemoryIndex, ModuleId, ReplicaCapRange};
+use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
     ModuleSettingsView, VisualizerClientMessage, VisualizerCommand, VisualizerEvent,
     VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records, run_runtime_action_id,
@@ -252,6 +252,42 @@ async fn handle_server_visualizer_message(
             }
             false
         }
+        VisualizerCommand::ResetModuleSessionHistory {
+            tab_id: command_tab,
+            owner,
+        } if command_tab == *tab_id => {
+            match parse_module_owner(&owner) {
+                Ok(owner_id) => match run_controller
+                    .reset_module_session_history(owner_id.clone())
+                    .await
+                {
+                    Ok(reset) => {
+                        visualizer.send_event(VisualizerEvent::Log {
+                            tab_id: tab_id.clone(),
+                            message: format!(
+                                "reset module session history for {}; deleted {} persisted session(s)",
+                                reset.owner, reset.deleted_sessions
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        visualizer.send_event(VisualizerEvent::Log {
+                            tab_id: tab_id.clone(),
+                            message: format!(
+                                "failed to reset module session history for {owner_id}: {error}"
+                            ),
+                        });
+                    }
+                },
+                Err(message) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("invalid module owner {owner:?}: {message}"),
+                    });
+                }
+            }
+            false
+        }
         VisualizerCommand::QueryMemory {
             tab_id: command_tab,
             query,
@@ -344,6 +380,27 @@ fn parse_memory_relation(value: &str) -> Option<MemoryLinkRelation> {
         "derived_from" | "derived-from" => Some(MemoryLinkRelation::DerivedFrom),
         _ => None,
     }
+}
+
+fn parse_module_owner(value: &str) -> Result<ModuleInstanceId, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("owner must not be empty".to_string());
+    }
+    let (module, replica) = if let Some((module, replica)) = value.rsplit_once('[') {
+        let replica = replica
+            .strip_suffix(']')
+            .ok_or_else(|| "replica suffix must end with ']'".to_string())?;
+        let replica = replica
+            .parse::<u8>()
+            .map_err(|_| format!("replica must be a u8 integer: {replica}"))?;
+        (module, ReplicaIndex::new(replica))
+    } else {
+        (value, ReplicaIndex::ZERO)
+    };
+    let module =
+        ModuleId::new(module.to_string()).map_err(|_| format!("invalid module id: {module}"))?;
+    Ok(ModuleInstanceId::new(module, replica))
 }
 
 async fn set_module_disabled(
@@ -586,4 +643,33 @@ async fn build_module_policy_update(
     };
 
     Ok((module, policy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_module_owner_accepts_zero_replica_display_form() {
+        let owner = parse_module_owner("cognition-gate").expect("owner parses");
+
+        assert_eq!(owner.module.as_str(), "cognition-gate");
+        assert_eq!(owner.replica, ReplicaIndex::ZERO);
+    }
+
+    #[test]
+    fn parse_module_owner_accepts_indexed_display_form() {
+        let owner = parse_module_owner("predict[1]").expect("owner parses");
+
+        assert_eq!(owner.module.as_str(), "predict");
+        assert_eq!(owner.replica, ReplicaIndex::new(1));
+    }
+
+    #[test]
+    fn parse_module_owner_rejects_invalid_display_form() {
+        assert!(parse_module_owner("").is_err());
+        assert!(parse_module_owner("Predict").is_err());
+        assert!(parse_module_owner("predict[not-a-replica]").is_err());
+        assert!(parse_module_owner("predict[1").is_err());
+    }
 }

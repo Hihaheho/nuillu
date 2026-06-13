@@ -723,14 +723,29 @@ impl RuntimeTab {
                 let Some(module) = self.modules.get(&owner) else {
                     continue;
                 };
-                window::PersistedWindow::new(&module_id, &module_title)
+                let mut module_window_actions = Vec::new();
+                let window_open = window::PersistedWindow::new(&module_id, &module_title)
                     .open_override(requested)
                     .default_open(false)
                     .default_pos(x, y)
                     .default_size(420.0, 360.0)
                     .show(ui, |ui| {
-                        modules::render_module(ui, module, &self.blackboard.memos)
-                    })
+                        module_window_actions =
+                            modules::render_module(ui, module, &self.blackboard.memos);
+                    });
+                for action in module_window_actions {
+                    match action {
+                        modules::ModuleWindowAction::ResetSessionHistory { owner } => {
+                            let _ = commands.send(VisualizerClientMessage::Command {
+                                command: VisualizerCommand::ResetModuleSessionHistory {
+                                    tab_id: self.id.clone(),
+                                    owner,
+                                },
+                            });
+                        }
+                    }
+                }
+                window_open
             };
             self.record_window_open(module_id, open);
         }

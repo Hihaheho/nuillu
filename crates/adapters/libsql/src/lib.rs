@@ -494,6 +494,20 @@ impl SessionStore for LibsqlSessionStore {
             .map_err(map_libsql_error)?;
         Ok(())
     }
+
+    async fn delete_owner(&self, owner: &nuillu_types::ModuleInstanceId) -> Result<u64, PortError> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM llm_sessions
+                  WHERE owner_module = ?1
+                    AND owner_replica = ?2",
+                params![owner.module.as_str(), i64::from(owner.replica.get())],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        Ok(changed)
+    }
 }
 
 impl LibsqlLlmTranscriptStore {
@@ -3074,6 +3088,33 @@ mod tests {
             serde_json::to_value(store.load(&owner, &key).await.unwrap().unwrap()).unwrap(),
             serde_json::to_value(&second).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn llm_session_store_delete_owner_removes_all_keys_for_one_owner() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let store = agent.session_store();
+        let owner = ModuleInstanceId::new(ModuleId::new("memory").unwrap(), ReplicaIndex::ZERO);
+        let other_owner =
+            ModuleInstanceId::new(ModuleId::new("predict").unwrap(), ReplicaIndex::ZERO);
+        let main = SessionKey::new("main").unwrap();
+        let planning = SessionKey::new("planning").unwrap();
+        let snapshot = test_session_snapshot(1);
+
+        store.save(&owner, &main, &snapshot).await.unwrap();
+        store.save(&owner, &planning, &snapshot).await.unwrap();
+        store.save(&other_owner, &main, &snapshot).await.unwrap();
+
+        assert_eq!(store.delete_owner(&owner).await.unwrap(), 2);
+        assert!(store.load(&owner, &main).await.unwrap().is_none());
+        assert!(store.load(&owner, &planning).await.unwrap().is_none());
+        assert!(store.load(&other_owner, &main).await.unwrap().is_some());
     }
 
     #[tokio::test]

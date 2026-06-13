@@ -266,6 +266,10 @@ pub enum VisualizerCommand {
         tab_id: VisualizerTabId,
         settings: ModuleSettingsView,
     },
+    ResetModuleSessionHistory {
+        tab_id: VisualizerTabId,
+        owner: String,
+    },
     QueryMemory {
         tab_id: VisualizerTabId,
         query: String,
@@ -1156,6 +1160,21 @@ mod tests {
                     ..
                 },
             } if module == "predict"
+        ));
+
+        let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::ResetModuleSessionHistory {
+                tab_id: VisualizerTabId::new("live"),
+                owner: "predict[1]".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::ResetModuleSessionHistory { owner, .. },
+            } if owner == "predict[1]"
         ));
     }
 

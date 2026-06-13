@@ -10,7 +10,7 @@ use nuillu_blackboard::Blackboard;
 use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
 use nuillu_module::{
     CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-    CapabilityProviders, LutumTiers, RuntimeEventSink, RuntimePolicy,
+    CapabilityProviders, LutumTiers, RuntimeEventSink, RuntimePolicy, SessionStore,
 };
 
 /// Test clock whose `now()` is the wall clock but whose `sleep_until` returns
@@ -57,6 +57,20 @@ pub(crate) fn test_caps_with_event_sink(
         blackboard,
         CapabilityProviderRuntime {
             event_sink,
+            ..CapabilityProviderRuntime::default()
+        },
+        Rc::new(InstantSleepClock),
+    )
+}
+
+pub(crate) fn test_caps_with_session_store(
+    blackboard: Blackboard,
+    session_store: Rc<dyn SessionStore>,
+) -> CapabilityProviders {
+    test_caps_inner_with_runtime(
+        blackboard,
+        CapabilityProviderRuntime {
+            session_store,
             ..CapabilityProviderRuntime::default()
         },
         Rc::new(InstantSleepClock),

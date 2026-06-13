@@ -12,5 +12,6 @@ pub mod scheduler;
 mod testing;
 
 pub use scheduler::{
-    AgentEventLoopConfig, AgentRunControl, AgentRunController, SchedulerError, run, run_controlled,
+    AgentEventLoopConfig, AgentRunControl, AgentRunController, ModuleSessionReset,
+    ModuleSessionResetError, SchedulerError, run, run_controlled,
 };

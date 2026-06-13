@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -33,30 +33,53 @@ pub struct AgentEventLoopConfig {
     pub dependency_hard_timeout: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleSessionReset {
+    pub owner: ModuleInstanceId,
+    pub deleted_sessions: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum ModuleSessionResetError {
+    #[error("module {owner} is not registered in this runtime")]
+    UnknownOwner { owner: ModuleInstanceId },
+    #[error("agent runtime is not accepting reset requests")]
+    RuntimeUnavailable,
+    #[error("failed to reset module {owner} session history: {message}")]
+    Failed {
+        owner: ModuleInstanceId,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentRunMode {
     Running,
     Paused,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentRunController {
     mode: watch::Sender<AgentRunMode>,
     running: Arc<AtomicBool>,
+    requests: Arc<Mutex<VecDeque<AgentControlRequest>>>,
 }
 
 impl AgentRunController {
     pub fn new() -> (Self, AgentRunControl) {
         let (sender, receiver) = watch::channel(AgentRunMode::Running);
         let running = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(Mutex::new(VecDeque::new()));
         (
             Self {
                 mode: sender,
                 running: Arc::clone(&running),
+                requests: Arc::clone(&requests),
             },
             AgentRunControl {
                 mode: Some(receiver),
                 running: Some(running),
+                requests,
             },
         )
     }
@@ -74,12 +97,35 @@ impl AgentRunController {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+
+    pub async fn reset_module_session_history(
+        &self,
+        owner: ModuleInstanceId,
+    ) -> Result<ModuleSessionReset, ModuleSessionResetError> {
+        let (response, receiver) = oneshot::channel();
+        {
+            let Ok(mut requests) = self.requests.lock() else {
+                return Err(ModuleSessionResetError::RuntimeUnavailable);
+            };
+            requests.push_back(AgentControlRequest::ResetModuleSessionHistory { owner, response });
+        }
+        let mode = if self.is_running() {
+            AgentRunMode::Running
+        } else {
+            AgentRunMode::Paused
+        };
+        let _ = self.mode.send(mode);
+        receiver
+            .await
+            .unwrap_or(Err(ModuleSessionResetError::RuntimeUnavailable))
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentRunControl {
     mode: Option<watch::Receiver<AgentRunMode>>,
     running: Option<Arc<AtomicBool>>,
+    requests: Arc<Mutex<VecDeque<AgentControlRequest>>>,
 }
 
 impl AgentRunControl {
@@ -87,6 +133,7 @@ impl AgentRunControl {
         Self {
             mode: None,
             running: None,
+            requests: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -105,7 +152,24 @@ impl AgentRunControl {
             std::future::pending::<()>().await;
         }
     }
+
+    fn drain_requests(&self) -> Vec<AgentControlRequest> {
+        let Ok(mut requests) = self.requests.lock() else {
+            return Vec::new();
+        };
+        requests.drain(..).collect()
+    }
 }
+
+enum AgentControlRequest {
+    ResetModuleSessionHistory {
+        owner: ModuleInstanceId,
+        response: ModuleSessionResetResponder,
+    },
+}
+
+type ModuleSessionResetResponder =
+    oneshot::Sender<Result<ModuleSessionReset, ModuleSessionResetError>>;
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
@@ -178,6 +242,9 @@ pub async fn run_controlled(
             next_batch_throttle: None,
         })
         .collect::<Vec<_>>();
+    let mut pending_session_resets = std::iter::repeat_with(VecDeque::new)
+        .take(states.len())
+        .collect::<Vec<_>>();
     let mut consecutive_failures = vec![0_u32; states.len()];
     let mut active = vec![false; states.len()];
     let mut zero_windows = ZeroReplicaWindows::new(runtime.zero_replica_window_policies().await);
@@ -233,6 +300,7 @@ pub async fn run_controlled(
             biased;
             _ = shutdown.as_mut() => {
                 abort_tasks(&mut tasks).await;
+                fail_pending_session_resets(&mut pending_session_resets);
                 return Ok(());
             },
             joined = tasks.next(), if !tasks.is_empty() => {
@@ -257,8 +325,18 @@ pub async fn run_controlled(
                             &subscriber,
                         ).await {
                             abort_tasks(&mut tasks).await;
+                            fail_pending_session_resets(&mut pending_session_resets);
                             return Err(error);
                         }
+                        apply_pending_session_resets(
+                            &runtime,
+                            &owners,
+                            &mut states,
+                            &mut kick_inboxes,
+                            &mut consecutive_failures,
+                            &mut pending_session_resets,
+                        )
+                        .await;
                         if control.is_running() {
                             refresh_active_and_schedule(
                                 &runtime,
@@ -280,6 +358,7 @@ pub async fn run_controlled(
                         let message = e.to_string();
                         tracing::error!(error = ?e, "module task panicked");
                         abort_tasks(&mut tasks).await;
+                        fail_pending_session_resets(&mut pending_session_resets);
                         return Err(SchedulerError::ModuleTaskPanicked { message });
                     }
                     None => {}
@@ -299,6 +378,21 @@ pub async fn run_controlled(
                 idle_marker_sent = true;
             },
             _ = control.changed() => {
+                handle_control_requests(
+                    &control,
+                    &owners,
+                    &mut pending_session_resets,
+                    &mut zero_window_wakers,
+                );
+                apply_pending_session_resets(
+                    &runtime,
+                    &owners,
+                    &mut states,
+                    &mut kick_inboxes,
+                    &mut consecutive_failures,
+                    &mut pending_session_resets,
+                )
+                .await;
                 if control.is_running() {
                     refresh_active_and_schedule(
                         &runtime,
@@ -325,6 +419,143 @@ async fn abort_tasks(tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>) {
         handle.abort();
     }
     while tasks.next().await.is_some() {}
+}
+
+fn handle_control_requests(
+    control: &AgentRunControl,
+    owners: &[ModuleInstanceId],
+    pending_session_resets: &mut [VecDeque<ModuleSessionResetResponder>],
+    zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
+) {
+    for request in control.drain_requests() {
+        match request {
+            AgentControlRequest::ResetModuleSessionHistory { owner, response } => {
+                let Some(index) = owners.iter().position(|candidate| candidate == &owner) else {
+                    let _ = response.send(Err(ModuleSessionResetError::UnknownOwner { owner }));
+                    continue;
+                };
+                pending_session_resets[index].push_back(response);
+                if let Some(waker) = zero_window_wakers[index].take() {
+                    let _ = waker.send(());
+                }
+            }
+        }
+    }
+}
+
+async fn apply_pending_session_resets(
+    runtime: &AgentRuntimeControl,
+    owners: &[ModuleInstanceId],
+    states: &mut [ModuleState],
+    kick_inboxes: &mut [Option<KickInbox>],
+    consecutive_failures: &mut [u32],
+    pending_session_resets: &mut [VecDeque<ModuleSessionResetResponder>],
+) {
+    for index in 0..pending_session_resets.len() {
+        while let Some(response) = pending_session_resets[index].pop_front() {
+            let Some(result) = try_reset_module_session(
+                runtime,
+                owners,
+                states,
+                kick_inboxes,
+                consecutive_failures,
+                index,
+            )
+            .await
+            else {
+                pending_session_resets[index].push_front(response);
+                break;
+            };
+            let _ = response.send(result);
+        }
+    }
+}
+
+async fn try_reset_module_session(
+    runtime: &AgentRuntimeControl,
+    owners: &[ModuleInstanceId],
+    states: &mut [ModuleState],
+    kick_inboxes: &mut [Option<KickInbox>],
+    consecutive_failures: &mut [u32],
+    index: usize,
+) -> Option<Result<ModuleSessionReset, ModuleSessionResetError>> {
+    let owner = owners[index].clone();
+    let state = std::mem::replace(&mut states[index], ModuleState::Awaiting);
+    match state {
+        ModuleState::Stored { mut module, .. } => {
+            let result = reset_allocated_module(runtime, &owner, &mut module).await;
+            states[index] = ModuleState::Stored {
+                module,
+                next_batch_throttle: None,
+            };
+            consecutive_failures[index] = 0;
+            Some(result)
+        }
+        ModuleState::PendingBatch {
+            mut module,
+            pending_kicks,
+            ..
+        } => {
+            if let Some(kick_inbox) = &mut kick_inboxes[index] {
+                notify_pending_and_ready(pending_kicks, kick_inbox);
+            }
+            let result = reset_allocated_module(runtime, &owner, &mut module).await;
+            states[index] = ModuleState::Stored {
+                module,
+                next_batch_throttle: None,
+            };
+            consecutive_failures[index] = 0;
+            Some(result)
+        }
+        ModuleState::FailedUntilActivation { mut module, .. } => {
+            let result = reset_allocated_module(runtime, &owner, &mut module).await;
+            states[index] = ModuleState::Stored {
+                module,
+                next_batch_throttle: None,
+            };
+            consecutive_failures[index] = 0;
+            Some(result)
+        }
+        other => {
+            states[index] = other;
+            None
+        }
+    }
+}
+
+async fn reset_allocated_module(
+    runtime: &AgentRuntimeControl,
+    owner: &ModuleInstanceId,
+    module: &mut AllocatedModule,
+) -> Result<ModuleSessionReset, ModuleSessionResetError> {
+    let deleted_sessions = runtime
+        .delete_module_sessions(owner)
+        .await
+        .map_err(|error| ModuleSessionResetError::Failed {
+            owner: owner.clone(),
+            message: error.to_string(),
+        })?;
+    module
+        .restart()
+        .await
+        .map_err(|error| ModuleSessionResetError::Failed {
+            owner: owner.clone(),
+            message: error.to_string(),
+        })?;
+    Ok(ModuleSessionReset {
+        owner: owner.clone(),
+        deleted_sessions,
+    })
+}
+
+fn fail_pending_session_resets(
+    pending_session_resets: &mut [VecDeque<ModuleSessionResetResponder>],
+) {
+    for pending in pending_session_resets {
+        for response in pending.drain(..) {
+            let _ = response.send(Err(ModuleSessionResetError::RuntimeUnavailable));
+        }
+    }
 }
 
 enum ModuleState {
@@ -2072,7 +2303,8 @@ mod tests {
         AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
         CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, Memo,
         Module, ModuleCapabilityFactory, ModuleDependencies, ModuleRegistry, ModuleRegistryError,
-        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy,
+        PersistedSessionSnapshot, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
+        SessionCompactionPolicy, SessionKey, SessionStore,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
@@ -2083,6 +2315,7 @@ mod tests {
 
     use crate::testing::{
         test_caps, test_caps_with_event_sink, test_caps_with_policy, test_caps_with_real_clock,
+        test_caps_with_session_store,
     };
 
     #[derive(Clone, Default)]
@@ -2099,6 +2332,72 @@ mod tests {
     impl RuntimeEventSink for RecordingRuntimeEventSink {
         fn on_event(&self, event: RuntimeEvent) -> Result<(), nuillu_module::ports::PortError> {
             self.events.borrow_mut().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DeletingSessionStore {
+        deleted: Rc<RefCell<Vec<ModuleInstanceId>>>,
+    }
+
+    impl DeletingSessionStore {
+        fn deleted(&self) -> Vec<ModuleInstanceId> {
+            self.deleted.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SessionStore for DeletingSessionStore {
+        async fn load(
+            &self,
+            _owner: &ModuleInstanceId,
+            _key: &SessionKey,
+        ) -> Result<Option<PersistedSessionSnapshot>, nuillu_module::ports::PortError> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _owner: &ModuleInstanceId,
+            _key: &SessionKey,
+            _snapshot: &PersistedSessionSnapshot,
+        ) -> Result<(), nuillu_module::ports::PortError> {
+            Ok(())
+        }
+
+        async fn delete_owner(
+            &self,
+            owner: &ModuleInstanceId,
+        ) -> Result<u64, nuillu_module::ports::PortError> {
+            self.deleted.borrow_mut().push(owner.clone());
+            Ok(2)
+        }
+    }
+
+    struct RestartProbeModule;
+
+    #[async_trait(?Send)]
+    impl Module for RestartProbeModule {
+        type Batch = ();
+
+        fn id() -> &'static str {
+            "restart-probe"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            None
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            std::future::pending().await
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            _batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -3494,6 +3793,118 @@ mod tests {
             rate_limit_range,
             linear_ratio_fn,
         )
+    }
+
+    #[tokio::test]
+    async fn session_reset_restarts_stored_module_and_deletes_owner_sessions() {
+        let store = DeletingSessionStore::default();
+        let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
+        let builds = Rc::new(Cell::new(0_u32));
+        let observed_builds = Rc::clone(&builds);
+        let allocated = ModuleRegistry::new()
+            .register_sync::<RestartProbeModule, _>(test_policy(1..=1, fast_bpm()), move |_| {
+                observed_builds.set(observed_builds.get().saturating_add(1));
+                RestartProbeModule
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+        let (runtime, mut modules) = allocated.into_parts();
+        let owner = ModuleInstanceId::new(
+            ModuleId::new(RestartProbeModule::id()).unwrap(),
+            ReplicaIndex::ZERO,
+        );
+        let mut states = vec![super::ModuleState::Stored {
+            module: modules.remove(0),
+            next_batch_throttle: None,
+        }];
+        let mut kick_inboxes = vec![None];
+        let mut failures = vec![0_u32];
+        let (response, mut result) = oneshot::channel();
+        let mut pending = vec![VecDeque::from([response])];
+
+        super::apply_pending_session_resets(
+            &runtime,
+            std::slice::from_ref(&owner),
+            &mut states,
+            &mut kick_inboxes,
+            &mut failures,
+            &mut pending,
+        )
+        .await;
+
+        let reset = result.try_recv().expect("reset response sent").unwrap();
+        assert_eq!(reset.owner, owner);
+        assert_eq!(reset.deleted_sessions, 2);
+        assert_eq!(store.deleted(), vec![reset.owner]);
+        assert_eq!(builds.get(), 2);
+        assert!(pending[0].is_empty());
+        assert!(matches!(states[0], super::ModuleState::Stored { .. }));
+    }
+
+    #[tokio::test]
+    async fn session_reset_waits_until_activating_module_returns() {
+        let store = DeletingSessionStore::default();
+        let caps = test_caps_with_session_store(Blackboard::default(), Rc::new(store.clone()));
+        let builds = Rc::new(Cell::new(0_u32));
+        let observed_builds = Rc::clone(&builds);
+        let allocated = ModuleRegistry::new()
+            .register_sync::<RestartProbeModule, _>(test_policy(1..=1, fast_bpm()), move |_| {
+                observed_builds.set(observed_builds.get().saturating_add(1));
+                RestartProbeModule
+            })
+            .unwrap()
+            .build(&caps)
+            .await
+            .unwrap();
+        let (runtime, mut modules) = allocated.into_parts();
+        let owner = ModuleInstanceId::new(
+            ModuleId::new(RestartProbeModule::id()).unwrap(),
+            ReplicaIndex::ZERO,
+        );
+        let module = modules.remove(0);
+        let mut states = vec![super::ModuleState::Activating];
+        let mut kick_inboxes = vec![None];
+        let mut failures = vec![0_u32];
+        let (response, mut result) = oneshot::channel();
+        let mut pending = vec![VecDeque::from([response])];
+
+        super::apply_pending_session_resets(
+            &runtime,
+            std::slice::from_ref(&owner),
+            &mut states,
+            &mut kick_inboxes,
+            &mut failures,
+            &mut pending,
+        )
+        .await;
+
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(pending[0].len(), 1);
+        assert_eq!(store.deleted(), Vec::<ModuleInstanceId>::new());
+
+        states[0] = super::ModuleState::Stored {
+            module,
+            next_batch_throttle: None,
+        };
+        super::apply_pending_session_resets(
+            &runtime,
+            std::slice::from_ref(&owner),
+            &mut states,
+            &mut kick_inboxes,
+            &mut failures,
+            &mut pending,
+        )
+        .await;
+
+        let reset = result.try_recv().expect("reset response sent").unwrap();
+        assert_eq!(reset.owner, owner);
+        assert_eq!(store.deleted(), vec![reset.owner]);
+        assert_eq!(builds.get(), 2);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
