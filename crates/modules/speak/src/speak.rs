@@ -24,10 +24,10 @@ use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech after allocation has raised the speak module.
-Use only the cognition log and the available target schema. Do not casually re-decide whether speak should have been allocated.
+const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and the available target schema.
+Use exactly one available tool.
 Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
-Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible despite allocation, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
@@ -35,7 +35,7 @@ For self-directed cognition, transform only the listener-relevant implication in
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
-const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Speak has already been allocated. Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
+const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -129,9 +129,8 @@ impl JsonSchema for SpeechTarget {
 
 #[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// Call when allocation should proceed to an outward utterance. The input
-/// carries cognition-log information transformed for speech, not hidden
-/// analysis.
+/// Call when proceeding to an outward utterance. The input carries cognition-log
+/// information transformed for speech, not hidden analysis.
 struct PrepareSpeechArgs {
     /// The participant who should hear the utterance.
     target: SpeechTarget,
@@ -148,7 +147,7 @@ struct PrepareSpeechOutput {
 #[lutum::tool_input(name = "decline_speech_now", output = DeclineSpeechNowOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// Call only when a concrete blocker makes outward speech inappropriate or
-/// impossible despite allocation.
+/// impossible now.
 struct DeclineSpeechNowArgs {
     blocking_reason: String,
 }
@@ -2239,6 +2238,10 @@ mod tests {
         assert!(!prompt.contains("- cognition-gate:"));
         assert!(!prompt.contains("- query-memory:"));
         assert!(!SPEECH_PLANNING_PROMPT.contains("\"self\""));
+        assert!(!SPEECH_PLANNING_PROMPT.contains("greet"));
+        assert!(!SPEECH_PLANNING_PROMPT.contains("Hi"));
+        assert!(!SPEECH_PLANNING_PROMPT.contains("allocation"));
+        assert!(!SPEECH_PLANNING_PROMPT.contains("allocated"));
     }
 
     #[tokio::test(flavor = "current_thread")]

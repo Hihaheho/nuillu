@@ -15,13 +15,13 @@ const DEFAULT_OUTPUT_DIR: &str = ".tmp/speak-planning-probe";
 const TARGET_PEER: &str = "Peer";
 const COGNITION_CONTEXT: &str = r#"Peer greeted me with "Hi"; brief acknowledgement is warranted."#;
 const FINAL_INSTRUCTION: &str =
-    "Speak has already been allocated. For this current greeting, choose the outward speech path.";
-const DECISION_CONTRACT: &str = r#"Direct greetings, questions, and requests from a participant usually warrant a brief outward response to that participant. Use decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible despite allocation."#;
+    "Use exactly one available speech-planning tool for the current cognition log.";
+const DECISION_CONTRACT: &str = r#"Prepare speech when the current cognition log contains grounded listener-facing substance for an outward utterance. Use decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now."#;
 
-const PLAN_PROMPT: &str = r#"Plan outward speech after allocation has raised the speak module.
-Use only the cognition log and the available target schema. Do not casually re-decide whether speak should have been allocated.
+const PLAN_PROMPT: &str = r#"Plan outward speech from the current cognition log and the available target schema.
+Use exactly one available tool.
 Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
-Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible despite allocation, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
