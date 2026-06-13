@@ -49,7 +49,7 @@ Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or
 
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
-const SPEECH_GENERATION_MAX_OUTPUT_TOKENS: u32 = 8;
+const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 8;
 const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
 const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
     "Compacted speak generation session history:";
@@ -210,11 +210,16 @@ struct ActiveSpeech {
 #[derive(Default)]
 struct GenerationDeltaBuffer {
     deltas: Vec<String>,
+    non_empty_text_delta_count: usize,
 }
 
 impl GenerationDeltaBuffer {
-    fn push(&mut self, delta: String) {
+    fn push(&mut self, delta: String) -> bool {
+        if !delta.is_empty() {
+            self.non_empty_text_delta_count += 1;
+        }
         self.deltas.push(delta);
+        self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT
     }
 }
 
@@ -234,7 +239,9 @@ impl EventHandler<TextTurnEvent, TextTurnState> for GenerationDeltaCollector {
                 .buffered_deltas
                 .lock()
                 .expect("generation delta buffer mutex poisoned");
-            buffered.push(delta.clone());
+            if buffered.push(delta.clone()) {
+                return Ok(HandlerDirective::Stop);
+            }
         }
         Ok(HandlerDirective::Continue)
     }
@@ -735,7 +742,6 @@ impl SpeakModule {
         let lutum = self.llm.lutum().await;
         let result = turn_session
             .text_turn()
-            .max_output_tokens(SPEECH_GENERATION_MAX_OUTPUT_TOKENS)
             .on_event(GenerationDeltaCollector {
                 buffered_deltas: Arc::clone(&buffered_deltas),
             })
@@ -767,6 +773,12 @@ impl SpeakModule {
                 partial,
             }) => {
                 let usage = partial.usage.unwrap_or(limit.usage);
+                cx.compact_and_save(&mut self.generation_session, usage)
+                    .await?;
+                Ok(GenerationStreamOutcome::LengthLimited)
+            }
+            Err(CollectError::Stopped { partial }) => {
+                let usage = partial.usage.unwrap_or_else(Usage::zero);
                 cx.compact_and_save(&mut self.generation_session, usage)
                     .await?;
                 Ok(GenerationStreamOutcome::LengthLimited)
@@ -1134,9 +1146,36 @@ mod tests {
         MockTextScenario::events(events)
     }
 
-    fn generation_length_limited_scenario(deltas: &[&str]) -> MockTextScenario {
+    fn generation_text_sliced_scenario(deltas: &[&str]) -> MockTextScenario {
         assert!(deltas.iter().all(|delta| !delta.is_empty()));
-        generation_text_deltas_scenario_with_finish_reason(deltas, FinishReason::Length)
+        generation_text_deltas_scenario_with_finish_reason(deltas, FinishReason::Stop)
+    }
+
+    fn generation_reasoning_then_text_scenario(
+        reasoning_deltas: &[&str],
+        text_deltas: &[&str],
+        finish_reason: FinishReason,
+    ) -> MockTextScenario {
+        let mut events = vec![Ok(RawTextTurnEvent::Started {
+            request_id: Some("speak-text".into()),
+            model: "mock".into(),
+        })];
+        events.extend(reasoning_deltas.iter().map(|delta| {
+            Ok(RawTextTurnEvent::ReasoningDelta {
+                delta: (*delta).into(),
+            })
+        }));
+        events.extend(text_deltas.iter().map(|delta| {
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: (*delta).into(),
+            })
+        }));
+        events.push(Ok(RawTextTurnEvent::Completed {
+            request_id: Some("speak-text".into()),
+            finish_reason,
+            usage: Usage::zero(),
+        }));
+        MockTextScenario::events(events)
     }
 
     fn finish_without_planning_tool_scenario() -> MockTextScenario {
@@ -1802,7 +1841,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_sets_max_output_tokens_for_planning_and_generation() {
+    async fn speak_sets_max_output_tokens_for_planning_only() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
             .with_text_scenario(generation_text_scenario("Koro, stay close."));
@@ -1841,8 +1880,8 @@ mod tests {
             Some(MaxOutputTokens::new(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS))
         );
         assert_eq!(
-            turns[1].config.generation.max_output_tokens,
-            Some(MaxOutputTokens::new(SPEECH_GENERATION_MAX_OUTPUT_TOKENS))
+            turns[1].config.generation.max_output_tokens, None,
+            "speak generation is sliced by visible text deltas so reasoning tokens do not consume the slice budget"
         );
     }
 
@@ -1887,10 +1926,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn length_limited_generation_records_streaming_without_complete_emit() {
+    async fn generation_slice_limit_ignores_reasoning_deltas() {
+        let adapter =
+            MockLlmAdapter::new().with_text_scenario(generation_reasoning_then_text_scenario(
+                &[
+                    "think-0", "think-1", "think-2", "think-3", "think-4", "think-5", "think-6",
+                    "think-7", "think-8", "think-9",
+                ],
+                &["Koro", ", stay close."],
+                FinishReason::Stop,
+            ));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+
+        let outcome = module
+            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::Completed));
+        assert_eq!(draft.accumulated, "Koro, stay close.");
+        assert_eq!(
+            deltas.borrow().as_slice(),
+            &[
+                ("Koro".to_string(), 0, 0, "Koro".to_string()),
+                ("Koro".to_string(), 0, 1, ", stay close.".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_sliced_generation_records_streaming_without_complete_emit() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
-            .with_text_scenario(generation_length_limited_scenario(&[
+            .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]));
         let mut allocation = ResourceAllocation::default();
@@ -1947,10 +2029,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn length_limited_speech_continues_next_batch_without_new_cognition() {
+    async fn text_sliced_speech_continues_next_batch_without_new_cognition() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
-            .with_text_scenario(generation_length_limited_scenario(&[
+            .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
             .with_text_scenario(generation_text_scenario("ay close."));
@@ -2048,10 +2130,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn length_limited_speech_replans_with_late_cognition_and_prefills_generation() {
+    async fn text_sliced_speech_replans_with_late_cognition_and_prefills_generation() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to duck soon."))
-            .with_text_scenario(generation_length_limited_scenario(&[
+            .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "d", "u",
             ]))
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to duck now."))
@@ -2135,7 +2217,7 @@ mod tests {
     async fn active_speech_retarget_drops_partial_and_generates_new_target_once() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
-            .with_text_scenario(generation_length_limited_scenario(&[
+            .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
             .with_text_scenario(prepare_speech_scenario("Pibi", "Tell Pibi to duck now."))
@@ -2209,7 +2291,7 @@ mod tests {
     async fn active_speech_decline_stops_partial_without_completion() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
-            .with_text_scenario(generation_length_limited_scenario(&[
+            .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
             .with_text_scenario(decline_speech_now_scenario("speech is no longer needed"));
