@@ -14,7 +14,8 @@ use nuillu_blackboard::{
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies,
-    ModuleRunStatus, SessionCompactionRuntime, ports::Clock, with_activation_llm_request_metadata,
+    ModuleRunStatus, SessionCompactionRuntime, WakeClaim, ports::Clock,
+    with_activation_llm_request_metadata,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
 use thiserror::Error;
@@ -24,6 +25,8 @@ use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
 use crate::kicks::{Kick, KickHandle, KickInbox};
+
+const DEPENDENCY_SETTLE_MAX_WAVES: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentEventLoopConfig {
@@ -265,6 +268,8 @@ pub async fn run_controlled(
             &mut tasks,
             &mut kick_inboxes,
             &mut zero_window_wakers,
+            &kick_handles,
+            &dependency_targets,
             &mut zero_windows,
             config,
             &parent,
@@ -276,6 +281,7 @@ pub async fn run_controlled(
     let mut shutdown = pin!(shutdown);
     let mut idle_since: Option<Instant> = None;
     let mut idle_marker_sent = false;
+    let mut observed_wake_sequence = runtime.wake_change_sequence();
 
     loop {
         let running = control.is_running();
@@ -346,6 +352,8 @@ pub async fn run_controlled(
                                 &mut tasks,
                                 &mut kick_inboxes,
                                 &mut zero_window_wakers,
+                                &kick_handles,
+                                &dependency_targets,
                                 &mut zero_windows,
                                 config,
                                 &parent,
@@ -402,6 +410,8 @@ pub async fn run_controlled(
                         &mut tasks,
                         &mut kick_inboxes,
                         &mut zero_window_wakers,
+                        &kick_handles,
+                        &dependency_targets,
                         &mut zero_windows,
                         config,
                         &parent,
@@ -409,6 +419,25 @@ pub async fn run_controlled(
                     )
                     .await;
                 }
+            },
+            _ = runtime.wake_changed_since(observed_wake_sequence), if running => {
+                observed_wake_sequence = runtime.wake_change_sequence();
+                refresh_active_and_schedule(
+                    &runtime,
+                    &owners,
+                    &mut active,
+                    &mut states,
+                    &mut tasks,
+                    &mut kick_inboxes,
+                    &mut zero_window_wakers,
+                    &kick_handles,
+                    &dependency_targets,
+                    &mut zero_windows,
+                    config,
+                    &parent,
+                    &subscriber,
+                )
+                .await;
             },
         }
     }
@@ -572,7 +601,7 @@ enum ModuleState {
         gate_approved: bool,
         pending_kicks: Vec<Kick>,
     },
-    PendingDependencyFlush,
+    PendingDependencySettle,
     PendingActivationGate,
     Activating,
     FailedUntilActivation {
@@ -600,14 +629,16 @@ enum TaskMessage {
         index: usize,
         module: AllocatedModule,
         kick_inbox: KickInbox,
+        wake_claim: Option<WakeClaim>,
         result: Result<(ModuleBatch, Vec<Kick>), String>,
     },
-    DependencyFlush {
+    DependencySettled {
         index: usize,
         module: AllocatedModule,
         kick_inbox: KickInbox,
-        batch: ModuleBatch,
         pending_kicks: Vec<Kick>,
+        wake_claim: Option<WakeClaim>,
+        remaining_waves: u8,
     },
     Activate {
         index: usize,
@@ -796,6 +827,10 @@ impl DependencyTargets {
         }
         indexes
     }
+
+    fn has_dependencies(&self, dependent: &ModuleId) -> bool {
+        !self.dependencies.deps_of(dependent).is_empty()
+    }
 }
 
 struct DependencyWait {
@@ -893,7 +928,7 @@ async fn wait_for_inactive_dependency(
         }
         _ = &mut idle => {
             if runtime.is_active(&owner).await {
-                let completion = kick_handle.send(sender);
+                let completion = kick_handle.send(sender.clone());
                 let _ = completion.await;
             }
         }
@@ -909,6 +944,8 @@ async fn refresh_active_and_schedule(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     kick_inboxes: &mut [Option<KickInbox>],
     zero_window_wakers: &mut [Option<oneshot::Sender<()>>],
+    kick_handles: &[KickHandle],
+    dependency_targets: &DependencyTargets,
     zero_windows: &mut ZeroReplicaWindows,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
@@ -930,6 +967,11 @@ async fn refresh_active_and_schedule(
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
                     .await;
+                let pending_wake = runtime.has_pending_wake(&owners[index]);
+                let has_dependencies = dependency_targets.has_dependencies(&owners[index].module);
+                if has_dependencies && !pending_wake {
+                    continue;
+                }
                 let ModuleState::Stored {
                     module,
                     next_batch_throttle,
@@ -941,6 +983,9 @@ async fn refresh_active_and_schedule(
                     .take()
                     .expect("kick inbox available for stored module");
                 let now = runtime.clock().now();
+                let wake_claim = pending_wake
+                    .then(|| runtime.claim_wake(&owners[index]))
+                    .flatten();
                 if let Some(throttle) =
                     current_next_batch_throttle(runtime, &owners[index], next_batch_throttle, now)
                         .await
@@ -964,26 +1009,52 @@ async fn refresh_active_and_schedule(
                             subscriber,
                         );
                     } else {
-                        spawn_next_batch(
+                        let scheduled = schedule_dependency_settle_or_next_batch(
+                            runtime,
                             tasks,
                             index,
+                            owners[index].clone(),
                             module,
                             kick_inbox,
-                            config.dependency_idle_timeout,
+                            Vec::new(),
+                            wake_claim,
+                            DEPENDENCY_SETTLE_MAX_WAVES,
+                            states,
+                            kick_inboxes,
+                            kick_handles,
+                            dependency_targets,
+                            owners,
+                            zero_windows,
+                            config,
                             parent,
                             subscriber,
-                        );
+                        )
+                        .await;
+                        states[index] = scheduled.module_state();
                     }
                 } else {
-                    spawn_next_batch(
+                    let scheduled = schedule_dependency_settle_or_next_batch(
+                        runtime,
                         tasks,
                         index,
+                        owners[index].clone(),
                         module,
                         kick_inbox,
-                        config.dependency_idle_timeout,
+                        Vec::new(),
+                        wake_claim,
+                        DEPENDENCY_SETTLE_MAX_WAVES,
+                        states,
+                        kick_inboxes,
+                        kick_handles,
+                        dependency_targets,
+                        owners,
+                        zero_windows,
+                        config,
                         parent,
                         subscriber,
-                    );
+                    )
+                    .await;
+                    states[index] = scheduled.module_state();
                 }
             }
             ModuleState::Stored { .. } => {
@@ -1095,7 +1166,7 @@ async fn refresh_active_and_schedule(
                     .record_module_status(owners[index].clone(), ModuleRunStatus::PendingBatch)
                     .await;
             }
-            ModuleState::PendingDependencyFlush => {
+            ModuleState::PendingDependencySettle => {
                 let status = if active[index] {
                     ModuleRunStatus::PendingBatch
                 } else {
@@ -1251,14 +1322,18 @@ async fn handle_task_message(
             index,
             module,
             mut kick_inbox,
+            wake_claim,
             result,
         } => match result {
             Ok((batch, pending_kicks)) => {
+                if let Some(claim) = wake_claim {
+                    runtime.complete_wake_claim(claim);
+                }
                 if scheduling_enabled
                     && scheduling_active(runtime, zero_windows, &owners[index]).await
                 {
                     zero_windows.mark_batch_accepted(&owners[index]);
-                    let scheduled = spawn_dependency_flush_or_activate(
+                    let scheduled = spawn_activation_gate_or_activate(
                         runtime,
                         tasks,
                         index,
@@ -1267,11 +1342,6 @@ async fn handle_task_message(
                         kick_inbox,
                         pending_kicks,
                         batch,
-                        states,
-                        kick_handles,
-                        dependency_targets,
-                        &owners,
-                        zero_windows,
                         config,
                         parent,
                         subscriber,
@@ -1310,17 +1380,18 @@ async fn handle_task_message(
                 Ok(())
             }
         },
-        TaskMessage::DependencyFlush {
+        TaskMessage::DependencySettled {
             index,
             module,
             mut kick_inbox,
-            batch,
             mut pending_kicks,
+            wake_claim,
+            remaining_waves,
         } => {
             pending_kicks.extend(kick_inbox.drain_ready());
             if scheduling_enabled && scheduling_active(runtime, zero_windows, &owners[index]).await
             {
-                let scheduled = spawn_activation_gate_or_activate(
+                let scheduled = schedule_dependency_settle_or_next_batch(
                     runtime,
                     tasks,
                     index,
@@ -1328,7 +1399,14 @@ async fn handle_task_message(
                     module,
                     kick_inbox,
                     pending_kicks,
-                    batch,
+                    wake_claim,
+                    remaining_waves,
+                    states,
+                    kick_inboxes,
+                    kick_handles,
+                    dependency_targets,
+                    owners,
+                    zero_windows,
                     config,
                     parent,
                     subscriber,
@@ -1341,11 +1419,9 @@ async fn handle_task_message(
                     .await;
                 notify_pending_and_ready(pending_kicks, &mut kick_inbox);
                 kick_inboxes[index] = Some(kick_inbox);
-                states[index] = ModuleState::PendingBatch {
+                states[index] = ModuleState::Stored {
                     module,
-                    batch,
-                    gate_approved: false,
-                    pending_kicks: Vec::new(),
+                    next_batch_throttle: None,
                 };
             }
             Ok(())
@@ -1600,7 +1676,7 @@ fn wake_zero_window_modules(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn spawn_dependency_flush_or_activate(
+async fn schedule_dependency_settle_or_next_batch(
     runtime: &AgentRuntimeControl,
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
@@ -1608,8 +1684,10 @@ async fn spawn_dependency_flush_or_activate(
     module: AllocatedModule,
     kick_inbox: KickInbox,
     pending_kicks: Vec<Kick>,
-    batch: ModuleBatch,
+    wake_claim: Option<WakeClaim>,
+    remaining_waves: u8,
     states: &mut [ModuleState],
+    kick_inboxes: &mut [Option<KickInbox>],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
     owners: &[ModuleInstanceId],
@@ -1617,65 +1695,79 @@ async fn spawn_dependency_flush_or_activate(
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
-) -> ActivationScheduling {
-    let completions = collect_dependency_flush_completions(
-        runtime,
-        index,
-        &owner,
-        states,
-        kick_handles,
-        dependency_targets,
-        owners,
-        zero_windows,
-        config.dependency_idle_timeout,
-    )
-    .await;
-    if completions.is_empty() {
-        spawn_activation_gate_or_activate(
+) -> PreBatchScheduling {
+    let completions = if remaining_waves == 0 {
+        Vec::new()
+    } else {
+        collect_dependency_settle_completions(
             runtime,
             tasks,
             index,
-            owner,
-            module,
-            kick_inbox,
-            pending_kicks,
-            batch,
+            &owner,
+            states,
+            kick_inboxes,
+            kick_handles,
+            dependency_targets,
+            owners,
+            zero_windows,
             config,
             parent,
             subscriber,
         )
         .await
-    } else {
-        runtime
-            .record_module_status(owner.clone(), ModuleRunStatus::PendingBatch)
-            .await;
-        spawn_dependency_flush_wait(
+    };
+    if completions.is_empty() {
+        spawn_next_batch(
+            runtime.clone(),
             tasks,
             index,
             owner,
             module,
             kick_inbox,
             pending_kicks,
-            batch,
+            wake_claim,
+            config.dependency_idle_timeout,
+            parent,
+            subscriber,
+        );
+        PreBatchScheduling::Awaiting
+    } else {
+        runtime
+            .record_module_status(owner.clone(), ModuleRunStatus::PendingBatch)
+            .await;
+        spawn_dependency_settle_wait(
+            tasks,
+            index,
+            owner,
+            module,
+            kick_inbox,
+            pending_kicks,
+            wake_claim,
             completions,
+            remaining_waves.saturating_sub(1),
             config.dependency_hard_timeout,
             parent,
             subscriber,
         );
-        ActivationScheduling::PendingDependencyFlush
+        PreBatchScheduling::PendingDependencySettle
     }
 }
 
-async fn collect_dependency_flush_completions(
+#[allow(clippy::too_many_arguments)]
+async fn collect_dependency_settle_completions(
     runtime: &AgentRuntimeControl,
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     dependent_index: usize,
     sender: &ModuleInstanceId,
     states: &mut [ModuleState],
+    kick_inboxes: &mut [Option<KickInbox>],
     kick_handles: &[KickHandle],
     dependency_targets: &DependencyTargets,
     owners: &[ModuleInstanceId],
     zero_windows: &mut ZeroReplicaWindows,
-    idle_timeout: Duration,
+    config: AgentEventLoopConfig,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
 ) -> Vec<DependencyWait> {
     let mut completions = Vec::new();
     for target_index in dependency_targets.target_indexes(&sender.module) {
@@ -1683,24 +1775,51 @@ async fn collect_dependency_flush_completions(
             continue;
         }
         let target_owner = owners[target_index].clone();
+        let target_has_wake = runtime.has_pending_wake(&target_owner);
         if !scheduling_active(runtime, zero_windows, &target_owner).await {
-            let activation_waiter = runtime.activation_waiter(&target_owner).await;
-            completions.push(DependencyWait::inactive(
-                target_owner,
-                runtime.clone(),
-                kick_handles[target_index].clone(),
-                sender.clone(),
-                activation_waiter,
-                idle_timeout,
-            ));
+            if target_has_wake {
+                let activation_waiter = runtime.activation_waiter(&target_owner).await;
+                completions.push(DependencyWait::inactive(
+                    target_owner,
+                    runtime.clone(),
+                    kick_handles[target_index].clone(),
+                    sender.clone(),
+                    activation_waiter,
+                    config.dependency_idle_timeout,
+                ));
+            }
             continue;
         }
+
         match &mut states[target_index] {
+            ModuleState::Stored { .. } if target_has_wake => {
+                let completion = schedule_stored_dependency_for_wake(
+                    runtime,
+                    tasks,
+                    target_index,
+                    target_owner,
+                    sender.clone(),
+                    states,
+                    kick_inboxes,
+                    kick_handles,
+                    config,
+                    parent,
+                    subscriber,
+                )
+                .await;
+                completions.push(DependencyWait::kick(
+                    owners[target_index].clone(),
+                    completion,
+                ));
+            }
             ModuleState::Throttling
-            | ModuleState::Awaiting
-            | ModuleState::PendingDependencyFlush
+            | ModuleState::PendingDependencySettle
             | ModuleState::PendingActivationGate
             | ModuleState::Activating => completions.push(DependencyWait::kick(
+                target_owner,
+                kick_handles[target_index].send(sender.clone()),
+            )),
+            ModuleState::Awaiting if target_has_wake => completions.push(DependencyWait::kick(
                 target_owner,
                 kick_handles[target_index].send(sender.clone()),
             )),
@@ -1710,6 +1829,7 @@ async fn collect_dependency_flush_completions(
                 completions.push(DependencyWait::kick(target_owner, completion));
             }
             ModuleState::Stored { .. }
+            | ModuleState::Awaiting
             | ModuleState::WaitingForActivation
             | ModuleState::FailedUntilActivation { .. }
             | ModuleState::WaitingAfterFailure { .. } => {}
@@ -1719,15 +1839,84 @@ async fn collect_dependency_flush_completions(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_dependency_flush_wait(
+async fn schedule_stored_dependency_for_wake(
+    runtime: &AgentRuntimeControl,
+    tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
+    target_index: usize,
+    target_owner: ModuleInstanceId,
+    sender: ModuleInstanceId,
+    states: &mut [ModuleState],
+    kick_inboxes: &mut [Option<KickInbox>],
+    kick_handles: &[KickHandle],
+    config: AgentEventLoopConfig,
+    parent: &tracing::Span,
+    subscriber: &tracing::Dispatch,
+) -> oneshot::Receiver<()> {
+    let ModuleState::Stored {
+        module,
+        next_batch_throttle,
+    } = std::mem::replace(&mut states[target_index], ModuleState::Awaiting)
+    else {
+        unreachable!("dependency state changed while scheduling stored dependency");
+    };
+    let kick_inbox = kick_inboxes[target_index]
+        .take()
+        .expect("kick inbox available for stored dependency");
+    let now = runtime.clock().now();
+    if let Some(throttle) =
+        current_next_batch_throttle(runtime, &target_owner, next_batch_throttle, now).await
+    {
+        if let Some(activation_increase) = runtime
+            .activation_increase_waiter(&target_owner, throttle.activation_threshold)
+            .await
+        {
+            states[target_index] = ModuleState::Throttling;
+            let allocation_change = runtime.allocation_change_waiter().await;
+            spawn_batch_throttle(
+                tasks,
+                target_index,
+                module,
+                kick_inbox,
+                throttle,
+                runtime.clock(),
+                activation_increase,
+                allocation_change,
+                parent,
+                subscriber,
+            );
+            return kick_handles[target_index].send(sender);
+        }
+    }
+
+    let wake_claim = runtime.claim_wake(&target_owner);
+    let (kick, completion) = Kick::new(sender);
+    spawn_next_batch(
+        runtime.clone(),
+        tasks,
+        target_index,
+        target_owner,
+        module,
+        kick_inbox,
+        vec![kick],
+        wake_claim,
+        config.dependency_idle_timeout,
+        parent,
+        subscriber,
+    );
+    completion
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_dependency_settle_wait(
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
     owner: ModuleInstanceId,
     module: AllocatedModule,
     mut kick_inbox: KickInbox,
     mut pending_kicks: Vec<Kick>,
-    batch: ModuleBatch,
+    wake_claim: Option<WakeClaim>,
     completions: Vec<DependencyWait>,
+    remaining_waves: u8,
     hard_timeout: Duration,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -1755,8 +1944,8 @@ fn spawn_dependency_flush_wait(
                             remaining_dependencies = ?remaining,
                             elapsed_ms = started.elapsed().as_millis(),
                             timeout_ms = hard_timeout.as_millis(),
-                            reason = "dependency_flush_hard_timeout",
-                            "dependency flush hard timeout; starting dependent without remaining dependencies"
+                            reason = "dependency_settle_hard_timeout",
+                            "dependency settle hard timeout; starting dependent without remaining dependencies"
                         );
                         break;
                     }
@@ -1770,17 +1959,32 @@ fn spawn_dependency_flush_wait(
                 }
             }
             pending_kicks.extend(kick_inbox.drain_ready());
-            TaskMessage::DependencyFlush {
+            TaskMessage::DependencySettled {
                 index,
                 module,
                 kick_inbox,
-                batch,
                 pending_kicks,
+                wake_claim,
+                remaining_waves,
             }
         }
         .instrument(parent.clone())
         .with_subscriber(subscriber.clone()),
     ));
+}
+
+enum PreBatchScheduling {
+    Awaiting,
+    PendingDependencySettle,
+}
+
+impl PreBatchScheduling {
+    fn module_state(self) -> ModuleState {
+        match self {
+            Self::Awaiting => ModuleState::Awaiting,
+            Self::PendingDependencySettle => ModuleState::PendingDependencySettle,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1847,7 +2051,6 @@ async fn spawn_activation_gate_or_activate(
 
 enum ActivationScheduling {
     Activating,
-    PendingDependencyFlush,
     PendingActivationGate,
 }
 
@@ -1855,7 +2058,6 @@ impl ActivationScheduling {
     fn module_state(self) -> ModuleState {
         match self {
             Self::Activating => ModuleState::Activating,
-            Self::PendingDependencyFlush => ModuleState::PendingDependencyFlush,
             Self::PendingActivationGate => ModuleState::PendingActivationGate,
         }
     }
@@ -1971,26 +2173,38 @@ fn spawn_failure_wait(
 }
 
 fn spawn_next_batch(
+    runtime: AgentRuntimeControl,
     tasks: &mut FuturesUnordered<JoinHandle<TaskMessage>>,
     index: usize,
+    owner: ModuleInstanceId,
     mut module: AllocatedModule,
     mut kick_inbox: KickInbox,
+    initial_pending_kicks: Vec<Kick>,
+    wake_claim: Option<WakeClaim>,
     dependency_idle_timeout: Duration,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
 ) {
     tasks.push(spawn_local(
         async move {
-            let (batch_result, mut pending_kicks) = {
-                let mut pending_kicks = Vec::new();
+            let (batch_result, mut pending_kicks, wake_claim) = {
+                let mut pending_kicks = initial_pending_kicks;
+                let mut wake_claim = wake_claim;
+                let mut observed_wake_sequence = runtime.wake_change_sequence();
                 let mut kick_inbox_closed = false;
                 let mut next_batch = pin!(module.next_batch());
 
                 loop {
-                    let timeout_enabled = !pending_kicks.is_empty();
+                    let timeout_enabled = !pending_kicks.is_empty()
+                        && wake_claim.is_none()
+                        && !runtime.has_pending_wake(&owner);
                     tokio::select! {
                         biased;
-                        result = &mut next_batch => break (result, pending_kicks),
+                        _ = runtime.wake_changed_since(observed_wake_sequence), if wake_claim.is_none() => {
+                            observed_wake_sequence = runtime.wake_change_sequence();
+                            wake_claim = runtime.claim_wake(&owner);
+                        }
+                        result = &mut next_batch => break (result, pending_kicks, wake_claim),
                         maybe_kick = kick_inbox.next(), if !kick_inbox_closed => {
                             if let Some(kick) = maybe_kick {
                                 pending_kicks.push(kick);
@@ -2020,11 +2234,13 @@ fn spawn_next_batch(
                     Err(format!("{error:#}"))
                 }
             };
+            let wake_claim = if result.is_ok() { wake_claim } else { None };
 
             TaskMessage::NextBatch {
                 index,
                 module,
                 kick_inbox,
+                wake_claim,
                 result,
             }
         }
@@ -2275,7 +2491,7 @@ fn is_idle(active: &[bool], states: &[ModuleState]) -> bool {
             continue;
         }
         active_count += 1;
-        if !matches!(state, ModuleState::Awaiting) {
+        if !matches!(state, ModuleState::Awaiting | ModuleState::Stored { .. }) {
             return false;
         }
     }
@@ -2300,11 +2516,12 @@ mod tests {
     };
     use nuillu_module::{
         ActivationGate, ActivationGateEvent, ActivationGateVote, AttentionControlRequest,
-        AttentionControlRequestInbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
-        CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, Memo,
-        Module, ModuleCapabilityFactory, ModuleDependencies, ModuleRegistry, ModuleRegistryError,
-        PersistedSessionSnapshot, RuntimeEvent, RuntimeEventSink, RuntimePolicy,
-        SessionCompactionPolicy, SessionKey, SessionStore,
+        AttentionControlRequestInbox, CognitionLogReader, CognitionLogUpdated,
+        CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata,
+        LlmRequestSource, Memo, MemoUpdated, MemoUpdatedInbox, Module, ModuleCapabilityFactory,
+        ModuleDependencies, ModuleRegistry, ModuleRegistryError, PersistedSessionSnapshot,
+        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy, SessionKey,
+        SessionStore,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
@@ -3250,43 +3467,6 @@ mod tests {
     silent_dependency_stub!(SilentDependencyB, "silent-dependency-b");
     silent_dependency_stub!(SilentDependencyC, "silent-dependency-c");
 
-    #[allow(dead_code)]
-    struct DelayedBatchStub {
-        release: Option<oneshot::Receiver<()>>,
-        activated: Rc<Cell<bool>>,
-    }
-
-    #[async_trait(?Send)]
-    impl Module for DelayedBatchStub {
-        type Batch = ();
-
-        fn id() -> &'static str {
-            "status-pending"
-        }
-
-        fn peer_context() -> Option<&'static str> {
-            Some("test stub")
-        }
-
-        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            if let Some(release) = self.release.take() {
-                let _ = release.await;
-                Ok(())
-            } else {
-                std::future::pending().await
-            }
-        }
-
-        async fn activate(
-            &mut self,
-            _cx: &nuillu_module::ActivateCx<'_>,
-            _batch: &Self::Batch,
-        ) -> anyhow::Result<()> {
-            self.activated.set(true);
-            Ok(())
-        }
-    }
-
     struct BlockingActivateStub {
         entered: Option<oneshot::Sender<()>>,
         release: Option<oneshot::Receiver<()>>,
@@ -3501,44 +3681,6 @@ mod tests {
         }
     }
 
-    struct ReleasedDependentModule {
-        release: Option<oneshot::Receiver<()>>,
-        on_done: Option<oneshot::Sender<()>>,
-    }
-
-    #[async_trait(?Send)]
-    impl Module for ReleasedDependentModule {
-        type Batch = ();
-
-        fn id() -> &'static str {
-            "released-dependent"
-        }
-
-        fn peer_context() -> Option<&'static str> {
-            Some("test dependent")
-        }
-
-        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            if let Some(release) = self.release.take() {
-                let _ = release.await;
-                Ok(())
-            } else {
-                std::future::pending().await
-            }
-        }
-
-        async fn activate(
-            &mut self,
-            _cx: &nuillu_module::ActivateCx<'_>,
-            _batch: &Self::Batch,
-        ) -> anyhow::Result<()> {
-            if let Some(done) = self.on_done.take() {
-                let _ = done.send(());
-            }
-            Ok(())
-        }
-    }
-
     struct GatedKickTargetModule {
         batch_sent: bool,
         activated: Rc<Cell<bool>>,
@@ -3613,42 +3755,186 @@ mod tests {
         }
     }
 
-    struct GateKickDependentModule {
-        release: Option<oneshot::Receiver<()>>,
-        collected: Option<oneshot::Sender<()>>,
-        on_done: Option<oneshot::Sender<()>>,
+    struct AttentionCognitionGateStub {
+        input: AttentionControlRequestInbox,
+        writer: CognitionWriter,
     }
 
     #[async_trait(?Send)]
-    impl Module for GateKickDependentModule {
-        type Batch = ();
+    impl Module for AttentionCognitionGateStub {
+        type Batch = String;
 
         fn id() -> &'static str {
-            "gate-kick-dependent"
+            "cognition-gate"
         }
 
         fn peer_context() -> Option<&'static str> {
-            Some("test dependent")
+            Some("test cognition gate")
         }
 
         async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
-            if let Some(release) = self.release.take() {
-                let _ = release.await;
-                if let Some(collected) = self.collected.take() {
-                    let _ = collected.send(());
-                }
-                Ok(())
-            } else {
-                std::future::pending().await
-            }
+            Ok(self.input.next_item().await?.body.into_inner())
         }
 
         async fn activate(
             &mut self,
             _cx: &nuillu_module::ActivateCx<'_>,
-            _batch: &Self::Batch,
+            batch: &Self::Batch,
         ) -> anyhow::Result<()> {
+            self.writer.append(format!("cognition:{batch}")).await;
+            Ok(())
+        }
+    }
+
+    struct QueryMemoryMemoStub {
+        input: AttentionControlRequestInbox,
+        memo: Memo,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for QueryMemoryMemoStub {
+        type Batch = String;
+
+        fn id() -> &'static str {
+            "query-memory"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test query memory")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.input.next_item().await?.body.into_inner())
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.memo.write(format!("retrieved:{batch}")).await;
+            Ok(())
+        }
+    }
+
+    struct MemoCognitionGateStub {
+        updates: MemoUpdatedInbox,
+        writer: CognitionWriter,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for MemoCognitionGateStub {
+        type Batch = MemoUpdated;
+
+        fn id() -> &'static str {
+            "cognition-gate"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test memo cognition gate")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            Ok(self.updates.next_item().await?.body)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.writer
+                .append(format!("memo-cognition:{}", batch.owner.module))
+                .await;
+            Ok(())
+        }
+    }
+
+    struct SpeakCognitionSnapshotStub {
+        input: AttentionControlRequestInbox,
+        cognition: CognitionLogReader,
+        observed: Rc<RefCell<Vec<Vec<String>>>>,
+        on_done: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for SpeakCognitionSnapshotStub {
+        type Batch = Vec<String>;
+
+        fn id() -> &'static str {
+            "speak"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test speak")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            let _ = self.input.next_item().await?;
+            Ok(self
+                .cognition
+                .unread_events()
+                .await
+                .into_iter()
+                .map(|record| record.entry.text)
+                .collect())
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.observed.borrow_mut().push(batch.clone());
             if let Some(done) = self.on_done.take() {
+                let _ = done.send(());
+            }
+            Ok(())
+        }
+    }
+
+    struct BlockingWakeClaimModule {
+        input: AttentionControlRequestInbox,
+        first_drained: Option<oneshot::Sender<()>>,
+        first_release: Option<oneshot::Receiver<()>>,
+        batches: Rc<RefCell<Vec<String>>>,
+        on_two: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Module for BlockingWakeClaimModule {
+        type Batch = String;
+
+        fn id() -> &'static str {
+            "wake-claim-recorder"
+        }
+
+        fn peer_context() -> Option<&'static str> {
+            Some("test wake claim")
+        }
+
+        async fn next_batch(&mut self) -> anyhow::Result<Self::Batch> {
+            let body = self.input.next_item().await?.body.into_inner();
+            if body == "first" {
+                if let Some(drained) = self.first_drained.take() {
+                    let _ = drained.send(());
+                }
+                if let Some(release) = self.first_release.take() {
+                    let _ = release.await;
+                }
+            }
+            Ok(body)
+        }
+
+        async fn activate(
+            &mut self,
+            _cx: &nuillu_module::ActivateCx<'_>,
+            batch: &Self::Batch,
+        ) -> anyhow::Result<()> {
+            self.batches.borrow_mut().push(batch.clone());
+            if self.batches.borrow().len() >= 2
+                && let Some(done) = self.on_two.take()
+            {
                 let _ = done.send(());
             }
             Ok(())
@@ -5434,9 +5720,6 @@ mod tests {
             .await;
     }
 
-    // The DelayedBatchStub is retained for future inactive/pending transition
-    // coverage.
-
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn scheduler_records_activating_status() {
         let local = LocalSet::new();
@@ -5616,6 +5899,233 @@ mod tests {
                         (2, 3, "transient activation failure".to_string()),
                     ]
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn dependency_appends_cognition_before_dependent_builds_batch() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let cognition_id = ModuleId::new(AttentionCognitionGateStub::id()).unwrap();
+                let speak_id = ModuleId::new(SpeakCognitionSnapshotStub::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                for module in [cognition_id.clone(), speak_id.clone()] {
+                    alloc.set(module.clone(), ModuleConfig::default());
+                    alloc.set_activation(module, ActivationRatio::ONE);
+                }
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let observed = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let observed = Rc::clone(&observed);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| SpeakCognitionSnapshotStub {
+                                input: caps.attention_control_inbox(),
+                                cognition: caps.cognition_log_reader(),
+                                observed: Rc::clone(&observed),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |caps| AttentionCognitionGateStub {
+                            input: caps.attention_control_inbox(),
+                            writer: caps.cognition_writer(),
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(speak_id.clone(), cognition_id.clone())
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let delivered = mailbox
+                    .publish(AttentionControlRequest::new("bright-water"))
+                    .await
+                    .expect("attention request should wake both modules");
+                assert_eq!(delivered, 2);
+
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        dependency_idle_timeout: Duration::from_millis(10),
+                        ..test_config()
+                    },
+                    async move {
+                        tokio::time::timeout(Duration::from_millis(500), done_rx)
+                            .await
+                            .expect("speak should activate after dependency settles")
+                            .expect("done sender dropped");
+                    },
+                )
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    observed.borrow().as_slice(),
+                    &[vec!["cognition:bright-water".to_owned()]]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn dependency_chain_settles_two_waves_before_dependent_builds_batch() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let speak_id = ModuleId::new(SpeakCognitionSnapshotStub::id()).unwrap();
+                let query_id = ModuleId::new(QueryMemoryMemoStub::id()).unwrap();
+                let cognition_id = ModuleId::new(MemoCognitionGateStub::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                for module in [speak_id.clone(), query_id.clone(), cognition_id.clone()] {
+                    alloc.set(module.clone(), ModuleConfig::default());
+                    alloc.set_activation(module, ActivationRatio::ONE);
+                }
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let observed = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let observed = Rc::clone(&observed);
+                            let done_tx = Rc::clone(&done_tx);
+                            move |caps| SpeakCognitionSnapshotStub {
+                                input: caps.attention_control_inbox(),
+                                cognition: caps.cognition_log_reader(),
+                                observed: Rc::clone(&observed),
+                                on_done: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |caps| QueryMemoryMemoStub {
+                            input: caps.attention_control_inbox(),
+                            memo: caps.memo(),
+                        },
+                    )
+                    .unwrap()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        |caps| MemoCognitionGateStub {
+                            updates: caps.memo_updated_inbox(),
+                            writer: caps.cognition_writer(),
+                        },
+                    )
+                    .unwrap()
+                    .depends_on(speak_id.clone(), query_id)
+                    .depends_on(speak_id, cognition_id)
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let delivered = mailbox
+                    .publish(AttentionControlRequest::new("rule-request"))
+                    .await
+                    .expect("attention request should wake speak and query-memory");
+                assert_eq!(delivered, 2);
+
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        dependency_idle_timeout: Duration::from_millis(10),
+                        ..test_config()
+                    },
+                    async move {
+                        tokio::time::timeout(Duration::from_millis(500), done_rx)
+                            .await
+                            .expect("speak should activate after two settle waves")
+                            .expect("done sender dropped");
+                    },
+                )
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    observed.borrow().as_slice(),
+                    &[vec!["memo-cognition:query-memory".to_owned()]]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn wake_delivered_while_claim_is_in_flight_remains_pending() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(BlockingWakeClaimModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id, ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (first_drained_tx, first_drained_rx) = oneshot::channel();
+                let (first_release_tx, first_release_rx) = oneshot::channel();
+                let (done_tx, done_rx) = oneshot::channel();
+                let batches = Rc::new(RefCell::new(Vec::<String>::new()));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let batches = Rc::clone(&batches);
+                            let first_drained_tx = Rc::new(RefCell::new(Some(first_drained_tx)));
+                            let first_release_rx = Rc::new(RefCell::new(Some(first_release_rx)));
+                            let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                            move |caps| BlockingWakeClaimModule {
+                                input: caps.attention_control_inbox(),
+                                first_drained: first_drained_tx.borrow_mut().take(),
+                                first_release: first_release_rx.borrow_mut().take(),
+                                batches: Rc::clone(&batches),
+                                on_two: done_tx.borrow_mut().take(),
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                mailbox
+                    .publish(AttentionControlRequest::new("first"))
+                    .await
+                    .expect("first wake should enqueue");
+
+                super::run(modules, test_config(), async move {
+                    first_drained_rx
+                        .await
+                        .expect("first batch should drain first wake");
+                    mailbox
+                        .publish(AttentionControlRequest::new("second"))
+                        .await
+                        .expect("second wake should remain pending after first claim");
+                    let _ = first_release_tx.send(());
+                    tokio::time::timeout(Duration::from_millis(500), done_rx)
+                        .await
+                        .expect("module should run a second batch for the second wake")
+                        .expect("done sender dropped");
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(batches.borrow().as_slice(), &["first", "second"]);
             })
             .await;
     }
@@ -5873,7 +6383,7 @@ mod tests {
         local
             .run_until(async {
                 let dependency_id = ModuleId::new(StopAfterOneFailureDependency::id()).unwrap();
-                let dependent_id = ModuleId::new(ReleasedDependentModule::id()).unwrap();
+                let dependent_id = ModuleId::new(EchoModule::id()).unwrap();
                 let dependency_owner =
                     ModuleInstanceId::new(dependency_id.clone(), ReplicaIndex::ZERO);
                 let mut alloc = ResourceAllocation::default();
@@ -5884,8 +6394,6 @@ mod tests {
 
                 let blackboard = Blackboard::with_allocation(alloc);
                 let caps = test_caps_with_real_clock(blackboard.clone());
-                let (release_tx, release_rx) = oneshot::channel();
-                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
                 let (done_tx, done_rx) = oneshot::channel();
                 let done_tx = Rc::new(RefCell::new(Some(done_tx)));
                 let modules = ModuleRegistry::new()
@@ -5897,10 +6405,10 @@ mod tests {
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
-                            let release_rx = Rc::clone(&release_rx);
                             let done_tx = Rc::clone(&done_tx);
-                            move |_| ReleasedDependentModule {
-                                release: release_rx.borrow_mut().take(),
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
                                 on_done: done_tx.borrow_mut().take(),
                             }
                         },
@@ -5910,6 +6418,7 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 let shutdown_blackboard = blackboard.clone();
                 super::run(
@@ -5940,7 +6449,10 @@ mod tests {
                             tokio::task::yield_now().await;
                             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }
-                        let _ = release_tx.send(());
+                        mailbox
+                            .publish(AttentionControlRequest::new("wake-dependent"))
+                            .await
+                            .expect("attention request should wake dependent");
                         let _ = done_rx.await;
                     },
                 )
@@ -6087,12 +6599,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn kick_silent_timeout_noops_kick_without_canceling_dependency_next_batch() {
+    async fn dependent_wake_does_not_wait_for_dependency_next_batch_without_dependency_wake() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let dependency_id = ModuleId::new(PendingDependencyModule::id()).unwrap();
-                let dependent_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let dependent_id = ModuleId::new(EchoModule::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(dependency_id.clone(), ModuleConfig::default());
                 alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
@@ -6107,7 +6619,7 @@ mod tests {
                 let dependency_release_rx = Rc::new(RefCell::new(Some(dependency_release_rx)));
                 let (dependency_done_tx, dependency_done_rx) = oneshot::channel();
                 let dependency_done_tx = Rc::new(RefCell::new(Some(dependency_done_tx)));
-                let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
+                let (dependent_done_tx, mut dependent_done_rx) = oneshot::channel();
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
                 let modules = ModuleRegistry::new()
@@ -6129,8 +6641,9 @@ mod tests {
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
-                            move |_| ImmediateDependentModule {
-                                batch_sent: false,
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
                                 on_done: dependent_done_tx.borrow_mut().take(),
                             }
                         },
@@ -6140,14 +6653,40 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("dependent-only"))
+                        .await
+                        .expect("attention request should wake dependent");
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }
-                    tokio::time::advance(Duration::from_secs(1)).await;
-                    let _ = dependent_done_rx.await;
-                    assert_eq!(observed_dependency_activations.get(), 0);
+                    let mut dependent_finished = false;
+                    for _ in 0..20 {
+                        match dependent_done_rx.try_recv() {
+                            Ok(()) => {
+                                dependent_finished = true;
+                                break;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                panic!("dependent activation sender dropped");
+                            }
+                        }
+                    }
+                    assert!(
+                        dependent_finished,
+                        "dependent should activate without waiting for dependency next_batch"
+                    );
+                    assert_eq!(
+                        observed_dependency_activations.get(),
+                        0,
+                        "dependency should still be blocked in next_batch"
+                    );
                     let _ = dependency_release_tx.send(());
                     let _ = dependency_done_rx.await;
                 })
@@ -6160,24 +6699,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn active_awaiting_dependencies_apply_one_silent_window_backpressure() {
+    async fn dependent_wake_skips_active_awaiting_dependencies_without_wakes() {
         let local = LocalSet::new();
         local
             .run_until(async {
                 let dep_a_id = ModuleId::new(SilentDependencyA::id()).unwrap();
                 let dep_b_id = ModuleId::new(SilentDependencyB::id()).unwrap();
                 let dep_c_id = ModuleId::new(SilentDependencyC::id()).unwrap();
-                let dependent_id = ModuleId::new(ReleasedDependentModule::id()).unwrap();
+                let dependent_id = ModuleId::new(EchoModule::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 for id in [&dep_a_id, &dep_b_id, &dep_c_id, &dependent_id] {
                     alloc.set(id.clone(), ModuleConfig::default());
                     alloc.set_activation(id.clone(), ActivationRatio::ONE);
                 }
 
-                let caps = test_caps(Blackboard::with_allocation(alloc));
-                let (dependent_release_tx, dependent_release_rx) = oneshot::channel();
-                let dependent_release_rx = Rc::new(RefCell::new(Some(dependent_release_rx)));
-                let (dependent_done_tx, mut dependent_done_rx) = oneshot::channel();
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps(blackboard);
+                let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
                 let modules = ModuleRegistry::new()
                     .register_sync(
@@ -6198,10 +6736,10 @@ mod tests {
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
-                            let dependent_release_rx = Rc::clone(&dependent_release_rx);
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
-                            move |_| ReleasedDependentModule {
-                                release: dependent_release_rx.borrow_mut().take(),
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
                                 on_done: dependent_done_tx.borrow_mut().take(),
                             }
                         },
@@ -6213,42 +6751,17 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
-                    for _ in 0..4 {
-                        tokio::task::yield_now().await;
-                    }
-                    let _ = dependent_release_tx.send(());
-                    for _ in 0..8 {
-                        tokio::task::yield_now().await;
-                    }
-                    assert_oneshot_pending(
-                        &mut dependent_done_rx,
-                        "dependent should wait for active dependency kick completions",
-                    );
-
-                    tokio::time::advance(Duration::from_millis(1999)).await;
-                    for _ in 0..8 {
-                        tokio::task::yield_now().await;
-                    }
-                    assert_oneshot_pending(
-                        &mut dependent_done_rx,
-                        "dependency silent-window backpressure should not complete early",
-                    );
-
-                    tokio::time::advance(Duration::from_millis(1)).await;
-                    for _ in 0..50 {
-                        match dependent_done_rx.try_recv() {
-                            Ok(()) => return,
-                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                                tokio::task::yield_now().await;
-                            }
-                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                                panic!("dependent activation sender dropped");
-                            }
-                        }
-                    }
-                    panic!("dependent should activate after one shared silent window");
+                    mailbox
+                        .publish(AttentionControlRequest::new("wake-dependent"))
+                        .await
+                        .expect("attention request should wake dependent");
+                    tokio::time::timeout(Duration::from_millis(100), dependent_done_rx)
+                        .await
+                        .expect("dependent wake should not wait for idle dependencies")
+                        .expect("dependent activation sender dropped");
                 })
                 .await
                 .expect("scheduler returned err");
@@ -6258,8 +6771,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn stored_dependency_targets_are_skipped_by_state_based_filter() {
-        use futures::FutureExt as _;
-
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -6308,17 +6819,18 @@ mod tests {
 
                 let mut states = Vec::with_capacity(owners.len());
                 let mut kick_handles = Vec::with_capacity(owners.len());
-                let mut dependency_kick_inbox = None;
+                let mut kick_inboxes = Vec::with_capacity(owners.len());
                 for (index, module) in modules.into_iter().enumerate() {
                     let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
                     kick_handles.push(kick_handle);
                     if index == dependency_index {
-                        dependency_kick_inbox = Some(kick_inbox);
+                        kick_inboxes.push(Some(kick_inbox));
                         states.push(super::ModuleState::Stored {
                             module,
                             next_batch_throttle: None,
                         });
                     } else {
+                        kick_inboxes.push(Some(kick_inbox));
                         states.push(super::ModuleState::Awaiting);
                     }
                 }
@@ -6329,16 +6841,23 @@ mod tests {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
-                let completions = super::collect_dependency_flush_completions(
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                let completions = super::collect_dependency_settle_completions(
                     &runtime,
+                    &mut tasks,
                     dependent_index,
                     &owners[dependent_index],
                     &mut states,
+                    &mut kick_inboxes,
                     &kick_handles,
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
-                    Duration::from_secs(2),
+                    test_config(),
+                    &parent,
+                    &subscriber,
                 )
                 .await;
 
@@ -6346,23 +6865,12 @@ mod tests {
                     completions.is_empty(),
                     "stored dependency target should reproduce the zero-completion fast path"
                 );
-                assert!(
-                    dependency_kick_inbox
-                        .as_mut()
-                        .unwrap()
-                        .next()
-                        .now_or_never()
-                        .is_none(),
-                    "stored dependency target should not receive a kick"
-                );
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn inactive_dependency_targets_wait_for_idle_timeout_without_state_kick() {
-        use futures::FutureExt as _;
-
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -6415,13 +6923,11 @@ mod tests {
 
                 let mut states = Vec::with_capacity(owners.len());
                 let mut kick_handles = Vec::with_capacity(owners.len());
-                let mut dependency_kick_inbox = None;
-                for (index, _owner) in owners.iter().enumerate() {
+                let mut kick_inboxes = Vec::with_capacity(owners.len());
+                for _owner in &owners {
                     let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
                     kick_handles.push(kick_handle);
-                    if index == dependency_index {
-                        dependency_kick_inbox = Some(kick_inbox);
-                    }
+                    kick_inboxes.push(Some(kick_inbox));
                     states.push(super::ModuleState::Awaiting);
                 }
 
@@ -6431,53 +6937,50 @@ mod tests {
                     dependencies: Arc::new(dependencies),
                     target_indexes_by_role: Arc::new(target_indexes_by_role),
                 };
-                let completions = super::collect_dependency_flush_completions(
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                let completions = super::collect_dependency_settle_completions(
                     &runtime,
+                    &mut tasks,
                     dependent_index,
                     &owners[dependent_index],
                     &mut states,
+                    &mut kick_inboxes,
                     &kick_handles,
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
-                    Duration::from_secs(2),
+                    test_config(),
+                    &parent,
+                    &subscriber,
                 )
                 .await;
 
-                assert_eq!(completions.len(), 1);
                 assert!(
-                    dependency_kick_inbox
-                        .as_mut()
-                        .unwrap()
-                        .next()
-                        .now_or_never()
-                        .is_none(),
-                    "inactive dependency target should not receive a flush kick"
+                    completions.is_empty(),
+                    "inactive dependency with no pending wake should not delay dependent"
                 );
             })
             .await;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn dependency_kick_silent_timeout_prevents_deadlock_when_target_goes_inactive() {
+    async fn inactive_dependency_with_pending_wake_uses_idle_timeout_before_dependent_batch() {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let dependency_id = ModuleId::new(PendingDependencyModule::id()).unwrap();
-                let dependent_id = ModuleId::new(ReleasedDependentModule::id()).unwrap();
+                let dependency_id = ModuleId::new(ControllerTickModule::id()).unwrap();
+                let dependent_id = ModuleId::new(EchoModule::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(dependency_id.clone(), ModuleConfig::default());
-                alloc.set_activation(dependency_id.clone(), ActivationRatio::ONE);
+                alloc.set_activation(dependency_id.clone(), ActivationRatio::ZERO);
                 alloc.set(dependent_id.clone(), ModuleConfig::default());
                 alloc.set_activation(dependent_id.clone(), ActivationRatio::ONE);
 
                 let blackboard = Blackboard::with_allocation(alloc);
-                let caps = test_caps(blackboard.clone());
-                let dependency_activations = Rc::new(Cell::new(0_u8));
-                let (_dependency_release_tx, dependency_release_rx) = oneshot::channel();
-                let dependency_release_rx = Rc::new(RefCell::new(Some(dependency_release_rx)));
-                let (dependent_release_tx, dependent_release_rx) = oneshot::channel();
-                let dependent_release_rx = Rc::new(RefCell::new(Some(dependent_release_rx)));
+                let caps = test_caps(blackboard);
+                let dependency_activations = Rc::new(Cell::new(0_u32));
                 let (dependent_done_tx, mut dependent_done_rx) = oneshot::channel();
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
@@ -6486,11 +6989,9 @@ mod tests {
                         test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
                             let dependency_activations = Rc::clone(&dependency_activations);
-                            let dependency_release_rx = Rc::clone(&dependency_release_rx);
-                            move |_| PendingDependencyModule {
-                                release: dependency_release_rx.borrow_mut().take(),
+                            move |caps| ControllerTickModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
                                 activations: Rc::clone(&dependency_activations),
-                                on_done: None,
                             }
                         },
                     )
@@ -6498,10 +6999,10 @@ mod tests {
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
-                            let dependent_release_rx = Rc::clone(&dependent_release_rx);
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
-                            move |_| ReleasedDependentModule {
-                                release: dependent_release_rx.borrow_mut().take(),
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
                                 on_done: dependent_done_tx.borrow_mut().take(),
                             }
                         },
@@ -6511,37 +7012,53 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let delivered = mailbox
+                    .publish(AttentionControlRequest::new("wake-both"))
+                    .await
+                    .expect("attention request should wake inactive dependency fallback");
+                assert_eq!(delivered, 2);
 
-                super::run(modules, test_config(), async move {
-                    for _ in 0..4 {
-                        tokio::task::yield_now().await;
-                    }
-                    let mut lowered = ResourceAllocation::default();
-                    lowered.set(dependency_id, ModuleConfig::default());
-                    lowered.set_activation(
-                        ModuleId::new(PendingDependencyModule::id()).unwrap(),
-                        ActivationRatio::ZERO,
-                    );
-                    lowered.set(dependent_id, ModuleConfig::default());
-                    lowered.set_activation(
-                        ModuleId::new(ReleasedDependentModule::id()).unwrap(),
-                        ActivationRatio::ONE,
-                    );
-                    blackboard
-                        .apply(BlackboardCommand::SetAllocation(lowered))
-                        .await;
-                    let _ = dependent_release_tx.send(());
-                    for _ in 0..4 {
-                        tokio::task::yield_now().await;
-                    }
-                    tokio::time::advance(Duration::from_secs(2)).await;
-                    for _ in 0..4 {
-                        tokio::task::yield_now().await;
-                    }
-                    dependent_done_rx
-                        .try_recv()
-                        .expect("dependency kick silent timeout should release the dependent");
-                })
+                super::run(
+                    modules,
+                    AgentEventLoopConfig {
+                        dependency_idle_timeout: Duration::from_millis(10),
+                        ..test_config()
+                    },
+                    async move {
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_oneshot_pending(
+                            &mut dependent_done_rx,
+                            "dependent should wait briefly for inactive dependency with a wake",
+                        );
+
+                        tokio::time::advance(Duration::from_millis(9)).await;
+                        for _ in 0..4 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_oneshot_pending(
+                            &mut dependent_done_rx,
+                            "inactive dependency wait should use the configured idle timeout",
+                        );
+
+                        for _ in 0..100 {
+                            tokio::time::advance(Duration::from_millis(1)).await;
+                            tokio::task::yield_now().await;
+                            match dependent_done_rx.try_recv() {
+                                Ok(()) => return,
+                                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                    continue;
+                                }
+                                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                    panic!("dependent activation sender dropped");
+                                }
+                            }
+                        }
+                        panic!("dependent should activate after inactive dependency idle timeout");
+                    },
+                )
                 .await
                 .expect("scheduler returned err");
 
@@ -6549,7 +7066,6 @@ mod tests {
             })
             .await;
     }
-
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn gate_allow_after_target_inactive_noops_pending_dependency_kicks() {
         let local = LocalSet::new();
@@ -6557,7 +7073,7 @@ mod tests {
             .run_until(async {
                 let target_id = ModuleId::new(GatedKickTargetModule::id()).unwrap();
                 let gate_id = ModuleId::new(BlockingAllowGateModule::id()).unwrap();
-                let dependent_id = ModuleId::new(GateKickDependentModule::id()).unwrap();
+                let dependent_id = ModuleId::new(EchoModule::id()).unwrap();
                 let mut alloc = ResourceAllocation::default();
                 alloc.set(target_id.clone(), ModuleConfig::default());
                 alloc.set_activation(target_id.clone(), ActivationRatio::ONE);
@@ -6574,10 +7090,6 @@ mod tests {
                 let gate_seen_tx = Rc::new(RefCell::new(Some(gate_seen_tx)));
                 let (gate_allow_tx, gate_allow_rx) = oneshot::channel();
                 let gate_allow_rx = Rc::new(RefCell::new(Some(gate_allow_rx)));
-                let (dependent_release_tx, dependent_release_rx) = oneshot::channel();
-                let dependent_release_rx = Rc::new(RefCell::new(Some(dependent_release_rx)));
-                let (dependent_collected_tx, dependent_collected_rx) = oneshot::channel();
-                let dependent_collected_tx = Rc::new(RefCell::new(Some(dependent_collected_tx)));
                 let (dependent_done_tx, dependent_done_rx) = oneshot::channel();
                 let dependent_done_tx = Rc::new(RefCell::new(Some(dependent_done_tx)));
 
@@ -6609,12 +7121,10 @@ mod tests {
                     .register_sync(
                         test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
                         {
-                            let dependent_release_rx = Rc::clone(&dependent_release_rx);
-                            let dependent_collected_tx = Rc::clone(&dependent_collected_tx);
                             let dependent_done_tx = Rc::clone(&dependent_done_tx);
-                            move |_| GateKickDependentModule {
-                                release: dependent_release_rx.borrow_mut().take(),
-                                collected: dependent_collected_tx.borrow_mut().take(),
+                            move |caps| EchoModule {
+                                attention_control_inbox: caps.attention_control_inbox(),
+                                memo: caps.memo(),
                                 on_done: dependent_done_tx.borrow_mut().take(),
                             }
                         },
@@ -6624,11 +7134,14 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
 
                 super::run(modules, test_config(), async move {
                     let _ = gate_seen_rx.await;
-                    let _ = dependent_release_tx.send(());
-                    let _ = dependent_collected_rx.await;
+                    mailbox
+                        .publish(AttentionControlRequest::new("dependent-wake"))
+                        .await
+                        .expect("attention request should wake dependent");
                     for _ in 0..4 {
                         tokio::task::yield_now().await;
                     }
@@ -6646,7 +7159,7 @@ mod tests {
                     );
                     lowered.set(dependent_id, ModuleConfig::default());
                     lowered.set_activation(
-                        ModuleId::new(GateKickDependentModule::id()).unwrap(),
+                        ModuleId::new(EchoModule::id()).unwrap(),
                         ActivationRatio::ONE,
                     );
                     blackboard
@@ -6692,20 +7205,24 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let (_, mut modules, _) = modules.into_parts_with_dependencies();
+                let (runtime, mut modules, _) = modules.into_parts_with_dependencies();
                 let module = modules.pop().unwrap();
                 let sender = module.owner().clone();
                 let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
-                let completion = kick_handle.send(sender);
+                let completion = kick_handle.send(sender.clone());
                 let mut tasks = futures::stream::FuturesUnordered::new();
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let parent = tracing::Span::current();
 
                 super::spawn_next_batch(
+                    runtime,
                     &mut tasks,
                     0,
+                    sender.clone(),
                     module,
                     kick_inbox,
+                    Vec::new(),
+                    None,
                     Duration::from_secs(2),
                     &parent,
                     &subscriber,
@@ -6789,9 +7306,8 @@ mod tests {
                     .iter()
                     .position(|module| module.owner().module == dependency_id)
                     .unwrap();
-                let mut dependent = modules.remove(dependent_index);
+                let dependent = modules.remove(dependent_index);
                 let dependent_owner = dependent.owner().clone();
-                let batch = dependent.next_batch().await.unwrap();
                 let dependency_owner = nuillu_types::ModuleInstanceId::new(
                     dependency_id,
                     nuillu_types::ReplicaIndex::ZERO,
@@ -6800,13 +7316,18 @@ mod tests {
                 let mut dependent_kick_handle = None;
                 let mut dependency_kick_inbox = None;
                 let mut kick_handles = Vec::with_capacity(owners.len());
+                let mut kick_inboxes = Vec::with_capacity(owners.len());
                 for index in 0..owners.len() {
                     let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
                     if index == dependent_index {
                         dependent_kick_inbox = Some(kick_inbox);
                         dependent_kick_handle = Some(kick_handle.clone());
+                        kick_inboxes.push(None);
                     } else if index == dependency_index {
                         dependency_kick_inbox = Some(kick_inbox);
+                        kick_inboxes.push(None);
+                    } else {
+                        kick_inboxes.push(Some(kick_inbox));
                     }
                     kick_handles.push(kick_handle);
                 }
@@ -6820,32 +7341,38 @@ mod tests {
                 let mut states = (0..owners.len())
                     .map(|_| super::ModuleState::Awaiting)
                     .collect::<Vec<_>>();
-                let completions = super::collect_dependency_flush_completions(
+                states[dependency_index] = super::ModuleState::Activating;
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                let completions = super::collect_dependency_settle_completions(
                     &runtime,
+                    &mut tasks,
                     dependent_index,
                     &dependent_owner,
                     &mut states,
+                    &mut kick_inboxes,
                     &kick_handles,
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
-                    Duration::from_secs(2),
+                    test_config(),
+                    &parent,
+                    &subscriber,
                 )
                 .await;
                 assert_eq!(completions.len(), 1);
-                let mut tasks = futures::stream::FuturesUnordered::new();
-                let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                let parent = tracing::Span::current();
 
-                super::spawn_dependency_flush_wait(
+                super::spawn_dependency_settle_wait(
                     &mut tasks,
                     dependent_index,
                     dependent_owner.clone(),
                     dependent,
                     dependent_kick_inbox.unwrap(),
                     Vec::new(),
-                    batch,
+                    None,
                     completions,
+                    0,
                     Duration::from_secs(10),
                     &parent,
                     &subscriber,
@@ -6865,7 +7392,7 @@ mod tests {
                     .expect("dependency flush task should finish")
                     .expect("dependency flush task should not panic");
                 match message {
-                    super::TaskMessage::DependencyFlush { pending_kicks, .. } => {
+                    super::TaskMessage::DependencySettled { pending_kicks, .. } => {
                         assert_eq!(pending_kicks.len(), 1);
                         for kick in pending_kicks {
                             kick.notify_finish();
@@ -6907,9 +7434,8 @@ mod tests {
                     .await
                     .unwrap();
                 let (_, mut modules, _) = modules.into_parts_with_dependencies();
-                let mut module = modules.pop().unwrap();
+                let module = modules.pop().unwrap();
                 let owner = module.owner().clone();
-                let batch = module.next_batch().await.unwrap();
                 let (kick_inbox, _) = crate::kicks::KickInbox::new();
                 let (kick, completion) = crate::kicks::Kick::new(owner.clone());
                 drop(kick);
@@ -6917,15 +7443,16 @@ mod tests {
                 let mut tasks = futures::stream::FuturesUnordered::new();
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let parent = tracing::Span::current();
-                super::spawn_dependency_flush_wait(
+                super::spawn_dependency_settle_wait(
                     &mut tasks,
                     0,
                     owner.clone(),
                     module,
                     kick_inbox,
                     Vec::new(),
-                    batch,
+                    None,
                     vec![super::DependencyWait::kick(owner, completion)],
+                    0,
                     Duration::from_secs(10),
                     &parent,
                     &subscriber,
@@ -6937,7 +7464,7 @@ mod tests {
                     .expect("dependency flush task should finish")
                     .expect("dependency flush task should not panic");
                 match message {
-                    super::TaskMessage::DependencyFlush { pending_kicks, .. } => {
+                    super::TaskMessage::DependencySettled { pending_kicks, .. } => {
                         assert!(pending_kicks.is_empty());
                     }
                     _ => panic!("expected dependency flush task message"),
@@ -6995,19 +7522,23 @@ mod tests {
                     .iter()
                     .position(|owner| owner.module == dependent_id)
                     .unwrap();
-                let mut dependent = modules.remove(dependent_index);
+                let dependent = modules.remove(dependent_index);
                 let dependent_owner = dependent.owner().clone();
-                let batch = dependent.next_batch().await.unwrap();
 
                 let mut dependent_kick_inbox = None;
                 let mut _dependency_kick_inbox = None;
                 let mut kick_handles = Vec::with_capacity(owners.len());
+                let mut kick_inboxes = Vec::with_capacity(owners.len());
                 for index in 0..owners.len() {
                     let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
                     if index == dependent_index {
                         dependent_kick_inbox = Some(kick_inbox);
+                        kick_inboxes.push(None);
                     } else if index == dependency_index {
                         _dependency_kick_inbox = Some(kick_inbox);
+                        kick_inboxes.push(None);
+                    } else {
+                        kick_inboxes.push(Some(kick_inbox));
                     }
                     kick_handles.push(kick_handle);
                 }
@@ -7021,32 +7552,37 @@ mod tests {
                     .map(|_| super::ModuleState::Awaiting)
                     .collect::<Vec<_>>();
                 states[dependency_index] = super::ModuleState::Throttling;
-                let completions = super::collect_dependency_flush_completions(
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                let completions = super::collect_dependency_settle_completions(
                     &runtime,
+                    &mut tasks,
                     dependent_index,
                     &dependent_owner,
                     &mut states,
+                    &mut kick_inboxes,
                     &kick_handles,
                     &dependency_targets,
                     &owners,
                     &mut zero_windows,
-                    Duration::from_secs(2),
+                    test_config(),
+                    &parent,
+                    &subscriber,
                 )
                 .await;
                 assert_eq!(completions.len(), 1);
 
-                let mut tasks = futures::stream::FuturesUnordered::new();
-                let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                let parent = tracing::Span::current();
-                super::spawn_dependency_flush_wait(
+                super::spawn_dependency_settle_wait(
                     &mut tasks,
                     dependent_index,
                     dependent_owner,
                     dependent,
                     dependent_kick_inbox.unwrap(),
                     Vec::new(),
-                    batch,
+                    None,
                     completions,
+                    0,
                     Duration::from_secs(3),
                     &parent,
                     &subscriber,
@@ -7067,7 +7603,7 @@ mod tests {
                     .expect("dependency flush task should not panic");
                 assert!(matches!(
                     message,
-                    super::TaskMessage::DependencyFlush { .. }
+                    super::TaskMessage::DependencySettled { .. }
                 ));
             })
             .await;
@@ -7099,9 +7635,8 @@ mod tests {
                     .await
                     .unwrap();
                 let (_, mut modules, _) = modules.into_parts_with_dependencies();
-                let mut module = modules.pop().unwrap();
+                let module = modules.pop().unwrap();
                 let owner = module.owner().clone();
-                let batch = module.next_batch().await.unwrap();
                 let dependency_owner = ModuleInstanceId::new(
                     ModuleId::new("active-work").unwrap(),
                     ReplicaIndex::ZERO,
@@ -7112,15 +7647,16 @@ mod tests {
                 let mut tasks = futures::stream::FuturesUnordered::new();
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
                 let parent = tracing::Span::current();
-                super::spawn_dependency_flush_wait(
+                super::spawn_dependency_settle_wait(
                     &mut tasks,
                     0,
                     owner,
                     module,
                     kick_inbox,
                     Vec::new(),
-                    batch,
+                    None,
                     vec![super::DependencyWait::kick(dependency_owner, completion)],
+                    0,
                     Duration::from_secs(10),
                     &parent,
                     &subscriber,
@@ -7141,7 +7677,7 @@ mod tests {
                     .expect("dependency flush task should not panic");
                 assert!(matches!(
                     message,
-                    super::TaskMessage::DependencyFlush { .. }
+                    super::TaskMessage::DependencySettled { .. }
                 ));
             })
             .await;
@@ -7283,7 +7819,7 @@ mod tests {
                     .build(&caps)
                     .await
                     .unwrap();
-                let (_, mut modules, _) = modules.into_parts_with_dependencies();
+                let (runtime, mut modules, _) = modules.into_parts_with_dependencies();
                 let module = modules.pop().unwrap();
                 let owner = module.owner().clone();
                 let (kick_inbox, kick_handle) = crate::kicks::KickInbox::new();
@@ -7292,10 +7828,14 @@ mod tests {
                 let parent = tracing::Span::current();
 
                 super::spawn_next_batch(
+                    runtime,
                     &mut tasks,
                     0,
+                    owner.clone(),
                     module,
                     kick_inbox,
+                    Vec::new(),
+                    None,
                     Duration::from_secs(2),
                     &parent,
                     &subscriber,

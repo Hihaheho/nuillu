@@ -1,7 +1,8 @@
 //! Kick channels for dependency-aware module activation.
 //!
-//! Kicks are scheduler-internal. When a module has collected a batch, the scheduler kicks its
-//! active dependencies and waits for them to finish or noop before activating the dependent.
+//! Kicks are scheduler-internal. Before a dependent builds its next batch, the scheduler kicks the
+//! active dependencies that have a pending wake and waits for them to settle (finish or noop) so the
+//! dependent's batch reflects their fresh output rather than racing ahead of late evidence.
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;

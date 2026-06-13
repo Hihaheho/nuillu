@@ -14,7 +14,7 @@ use nuillu_blackboard::{
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 
 use crate::activation_gate::ActivationGateHub;
-use crate::channels::{Topic, TopicPolicy};
+use crate::channels::{Topic, TopicPolicy, WakeClaim, WakeRegistry};
 use crate::ports::{Clock, CognitionLogRepository, PortError};
 use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
@@ -50,6 +50,7 @@ pub struct CapabilityProviders {
 
 struct CapabilityProvidersInner {
     blackboard: Blackboard,
+    wakes: WakeRegistry,
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     cognition_log_evictions: Topic<nuillu_blackboard::CognitionLogEntryRecord>,
@@ -132,10 +133,13 @@ impl CapabilityProviders {
         } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
+        let wakes = WakeRegistry::default();
         Self {
             inner: Rc::new(CapabilityProvidersInner {
+                wakes: wakes.clone(),
                 attention_control_requests: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::RoleLoadBalanced,
                     TopicKind::AttentionControlRequest,
                     rate_limiter.clone(),
@@ -143,6 +147,7 @@ impl CapabilityProviders {
                 ),
                 cognition_log_updates: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::CognitionLogUpdated,
                     rate_limiter.clone(),
@@ -150,6 +155,7 @@ impl CapabilityProviders {
                 ),
                 cognition_log_evictions: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::CognitionLogEvicted,
                     rate_limiter.clone(),
@@ -157,6 +163,7 @@ impl CapabilityProviders {
                 ),
                 interoception_updates: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::InteroceptiveUpdated,
                     rate_limiter.clone(),
@@ -164,6 +171,7 @@ impl CapabilityProviders {
                 ),
                 memo_updates: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::MemoUpdated,
                     rate_limiter.clone(),
@@ -171,6 +179,7 @@ impl CapabilityProviders {
                 ),
                 memo_log_evictions: Topic::new(
                     blackboard.clone(),
+                    wakes.clone(),
                     TopicPolicy::Fanout,
                     TopicKind::MemoLogEvicted,
                     rate_limiter.clone(),
@@ -178,6 +187,7 @@ impl CapabilityProviders {
                 ),
                 sensory_input_topic: Topic::new(
                     blackboard.clone(),
+                    wakes,
                     TopicPolicy::RoleLoadBalanced,
                     TopicKind::SensoryInput,
                     rate_limiter.clone(),
@@ -268,6 +278,7 @@ impl CapabilityProviders {
         );
         AgentRuntimeControl {
             blackboard: self.inner.blackboard.clone(),
+            wakes: self.inner.wakes.clone(),
             cognition_log_updates: CognitionLogUpdatedMailbox::new(
                 owner,
                 self.inner.cognition_log_updates.clone(),
@@ -378,6 +389,7 @@ impl CapabilityProviders {
 #[derive(Clone)]
 pub struct AgentRuntimeControl {
     blackboard: Blackboard,
+    wakes: WakeRegistry,
     cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Rc<dyn Clock>,
     session_compaction: LlmTierHandle,
@@ -388,6 +400,26 @@ pub struct AgentRuntimeControl {
 }
 
 impl AgentRuntimeControl {
+    pub fn has_pending_wake(&self, owner: &ModuleInstanceId) -> bool {
+        self.wakes.has_pending_wake(owner)
+    }
+
+    pub fn claim_wake(&self, owner: &ModuleInstanceId) -> Option<WakeClaim> {
+        self.wakes.claim_wake(owner)
+    }
+
+    pub fn complete_wake_claim(&self, claim: WakeClaim) {
+        self.wakes.complete_wake_claim(claim);
+    }
+
+    pub fn wake_change_sequence(&self) -> u64 {
+        self.wakes.change_sequence()
+    }
+
+    pub async fn wake_changed_since(&self, observed: u64) {
+        self.wakes.changed_since(observed).await;
+    }
+
     pub async fn is_active(&self, owner: &ModuleInstanceId) -> bool {
         self.blackboard
             .read(|bb| bb.allocation().is_replica_active(owner))

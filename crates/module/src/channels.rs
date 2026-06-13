@@ -31,6 +31,114 @@ pub struct ReadyItems<T> {
     pub items: Vec<Envelope<T>>,
 }
 
+/// Opaque claim for one module's currently delivered wake notifications.
+///
+/// This is a delivery cursor, not a blackboard state epoch: it only tracks
+/// successful typed-topic deliveries to a module inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeClaim {
+    owner: ModuleInstanceId,
+    delivered_through: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct WakeRegistry {
+    inner: Arc<Mutex<WakeRegistryInner>>,
+}
+
+#[derive(Default)]
+struct WakeRegistryInner {
+    delivered_by_owner: HashMap<ModuleInstanceId, u64>,
+    completed_by_owner: HashMap<ModuleInstanceId, u64>,
+    change_sequence: u64,
+    waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl WakeRegistry {
+    pub(crate) fn record_wake(&self, owner: &ModuleInstanceId) {
+        let mut inner = self.inner.lock().expect("wake registry poisoned");
+        let next = inner
+            .delivered_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(1);
+        inner.delivered_by_owner.insert(owner.clone(), next);
+        inner.change_sequence = inner.change_sequence.saturating_add(1);
+        for waiter in inner.waiters.drain(..) {
+            let _ = waiter.send(());
+        }
+    }
+
+    pub(crate) fn claim_wake(&self, owner: &ModuleInstanceId) -> Option<WakeClaim> {
+        let inner = self.inner.lock().expect("wake registry poisoned");
+        let delivered = inner
+            .delivered_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = inner
+            .completed_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        (delivered > completed).then(|| WakeClaim {
+            owner: owner.clone(),
+            delivered_through: delivered,
+        })
+    }
+
+    pub(crate) fn complete_wake_claim(&self, claim: WakeClaim) {
+        let mut inner = self.inner.lock().expect("wake registry poisoned");
+        let delivered = inner
+            .delivered_by_owner
+            .get(&claim.owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = claim.delivered_through.min(delivered);
+        inner
+            .completed_by_owner
+            .entry(claim.owner)
+            .and_modify(|current| *current = (*current).max(completed))
+            .or_insert(completed);
+    }
+
+    pub(crate) fn has_pending_wake(&self, owner: &ModuleInstanceId) -> bool {
+        let inner = self.inner.lock().expect("wake registry poisoned");
+        let delivered = inner
+            .delivered_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = inner
+            .completed_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        delivered > completed
+    }
+
+    pub(crate) fn change_sequence(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("wake registry poisoned")
+            .change_sequence
+    }
+
+    pub(crate) async fn changed_since(&self, observed: u64) {
+        let receiver = {
+            let mut inner = self.inner.lock().expect("wake registry poisoned");
+            if inner.change_sequence > observed {
+                return;
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            inner.waiters.push(sender);
+            receiver
+        };
+        let _ = receiver.await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TopicPolicy {
     Fanout,
@@ -41,6 +149,7 @@ pub(crate) enum TopicPolicy {
 pub(crate) struct Topic<T: Clone> {
     inner: Arc<Mutex<TopicInner<T>>>,
     blackboard: Blackboard,
+    wakes: WakeRegistry,
     policy: TopicPolicy,
     kind: TopicKind,
     rate_limiter: RateLimiter,
@@ -50,6 +159,7 @@ pub(crate) struct Topic<T: Clone> {
 impl<T: Clone> Topic<T> {
     pub(crate) fn new(
         blackboard: Blackboard,
+        wakes: WakeRegistry,
         policy: TopicPolicy,
         kind: TopicKind,
         rate_limiter: RateLimiter,
@@ -58,6 +168,7 @@ impl<T: Clone> Topic<T> {
         Self {
             inner: Arc::new(Mutex::new(TopicInner::default())),
             blackboard,
+            wakes,
             policy,
             kind,
             rate_limiter,
@@ -143,6 +254,7 @@ impl<T: Clone> TopicMailbox<T> {
             .read(|bb| bb.allocation().clone())
             .await;
         let mut delivered = 0;
+        let mut delivered_owners = Vec::new();
         let mut inner = self.topic.inner.lock().expect("Topic inner poisoned");
 
         inner
@@ -172,6 +284,7 @@ impl<T: Clone> TopicMailbox<T> {
                     }
                     if subscriber.sender.unbounded_send(envelope.clone()).is_ok() {
                         delivered += 1;
+                        delivered_owners.push(subscriber.owner.clone());
                     }
                 }
             }
@@ -201,15 +314,22 @@ impl<T: Clone> TopicMailbox<T> {
                     let next = inner.next_by_role.entry(role).or_default();
                     let chosen = indexes[*next % indexes.len()];
                     *next = next.wrapping_add(1);
+                    let chosen_owner = inner.subscribers[chosen].owner.clone();
                     if inner.subscribers[chosen]
                         .sender
                         .unbounded_send(envelope.clone())
                         .is_ok()
                     {
                         delivered += 1;
+                        delivered_owners.push(chosen_owner);
                     }
                 }
             }
+        }
+        drop(inner);
+
+        for owner in &delivered_owners {
+            self.topic.wakes.record_wake(owner);
         }
 
         if delivered == 0 {

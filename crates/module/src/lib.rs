@@ -72,7 +72,7 @@ pub use channels::{
     InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
     MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox,
     ReadyItems, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox,
-    TopicMailbox, TopicRecvError,
+    TopicMailbox, TopicRecvError, WakeClaim,
 };
 pub use cognition::CognitionWriter;
 pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};
