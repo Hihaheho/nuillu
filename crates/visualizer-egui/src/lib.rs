@@ -271,8 +271,9 @@ impl VisualizerState {
             }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);
+                let now_secs = tab.resource_monitor_elapsed_secs();
                 tab.record_runtime_event_for_monitor(&event);
-                modules::apply_runtime_event(&mut tab.modules, &event);
+                modules::apply_runtime_event_at(&mut tab.modules, &event, now_secs);
                 tab.runtime_events.push_back(event);
                 if tab.runtime_events.len() > 256 {
                     tab.runtime_events.pop_front();
@@ -675,8 +676,12 @@ impl RuntimeTab {
             .default_pos(568.0, 1020.0)
             .default_size(640.0, 360.0)
             .show(ui, |ui| {
-                module_commands =
-                    modules::render_modules_overview(ui, &self.blackboard, &self.modules);
+                module_commands = modules::render_modules_overview(
+                    ui,
+                    &self.blackboard,
+                    &self.modules,
+                    resource_monitor_now_secs,
+                );
             });
         self.record_window_open(modules_id, open);
         for action in module_commands {

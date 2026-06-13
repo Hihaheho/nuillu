@@ -68,18 +68,24 @@ pub struct ModuleState {
     pub status: ModuleSessionStatus,
     pub runtime_status: Option<String>,
     pub last_tier: Option<String>,
-    pub last_throttle: Option<ThrottleSummary>,
+    pub bpm_wait: Option<BpmWaitStart>,
     pub latest_batch: Option<ModuleBatchDebugState>,
     pub activation_error_count: u32,
     pub activation_attempt_count: u32,
     pub last_execution_failed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BpmWaitStart {
+    pub completed_at_secs: f64,
+    pub activation_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThrottleSummary {
-    pub kind: String,
-    pub detail: String,
-    pub delayed_ms: u64,
+pub struct BpmWaitView {
+    pub label: String,
+    pub remaining_ms: u64,
+    pub total_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,7 +160,7 @@ pub struct ModuleOverviewRow {
     pub bpm: Option<f64>,
     pub period_ms: Option<u64>,
     pub policy: Option<ModulePolicyView>,
-    pub throttle: Option<String>,
+    pub bpm_wait: Option<BpmWaitView>,
     pub latest_llm_output: Option<String>,
     pub activation_error_count: u32,
     pub activation_attempt_count: u32,
@@ -207,6 +213,10 @@ pub fn apply_blackboard_snapshot(state: &mut ModulesState, snapshot: &Blackboard
 }
 
 pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
+    apply_runtime_event_at(state, event, 0.0);
+}
+
+pub fn apply_runtime_event_at(state: &mut ModulesState, event: &RuntimeEvent, now_secs: f64) {
     match event {
         RuntimeEvent::LlmAccessed { owner, tier, .. } => {
             let module = module_mut_for_owner(state, owner);
@@ -219,15 +229,9 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 module.status = ModuleSessionStatus::Completed;
             }
         }
-        RuntimeEvent::ModuleBatchThrottled {
-            owner, delayed_for, ..
-        } => {
+        RuntimeEvent::ModuleBatchThrottled { owner, .. } => {
             let module = module_mut_for_owner(state, owner);
-            module.last_throttle = Some(ThrottleSummary {
-                kind: "batch throttle".to_string(),
-                detail: "next_batch".to_string(),
-                delayed_ms: duration_millis(*delayed_for),
-            });
+            module.bpm_wait = None;
         }
         RuntimeEvent::MemoUpdated { owner, .. } => {
             let module = module_mut_for_owner(state, owner);
@@ -242,16 +246,24 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
             ..
         } => {
             let module = module_mut_for_owner(state, owner);
+            module.bpm_wait = None;
             module.latest_batch = Some(ModuleBatchDebugState {
                 batch_type: batch_type.clone(),
                 debug: batch_debug.clone(),
             });
         }
         RuntimeEvent::ModuleActivationCompleted {
-            owner, succeeded, ..
+            owner,
+            duration,
+            succeeded,
+            ..
         } => {
             let module = module_mut_for_owner(state, owner);
             if *succeeded {
+                module.bpm_wait = Some(BpmWaitStart {
+                    completed_at_secs: now_secs,
+                    activation_ms: duration_millis(*duration),
+                });
                 module.activation_attempt_count = module.activation_attempt_count.saturating_add(1);
                 module.last_execution_failed = false;
                 if module
@@ -261,6 +273,8 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 {
                     module.runtime_status = Some("Activated".to_string());
                 }
+            } else {
+                module.bpm_wait = None;
             }
         }
         RuntimeEvent::ModuleActivationAttemptFailed {
@@ -529,6 +543,7 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
 pub fn overview_rows(
     state: &ModulesState,
     snapshot: &BlackboardSnapshot,
+    now_secs: f64,
 ) -> Vec<ModuleOverviewRow> {
     let mut rows = BTreeMap::<String, ModuleOverviewRow>::new();
 
@@ -565,7 +580,6 @@ pub fn overview_rows(
         if row.tier.is_none() {
             row.tier = module.last_tier.clone();
         }
-        row.throttle = module.last_throttle.as_ref().map(throttle_label);
         row.latest_llm_output = latest_llm_output(module);
         row.activation_error_count = module.activation_error_count;
         row.activation_attempt_count = module.activation_attempt_count;
@@ -589,6 +603,12 @@ pub fn overview_rows(
         if let Some(allocation) = allocations.get(row.module.as_str()) {
             apply_allocation_to_row(row, allocation);
         }
+        if let Some(module) = state.get(&row.owner) {
+            row.bpm_wait = module.bpm_wait.and_then(|wait| {
+                row.period_ms
+                    .and_then(|period_ms| bpm_wait_view(wait, period_ms, now_secs))
+            });
+        }
         if let Some(policy) = policies.get(row.module.as_str()) {
             row.policy = Some((*policy).clone());
         }
@@ -606,8 +626,9 @@ pub fn render_modules_overview(
     ui: &mut egui::Ui,
     snapshot: &BlackboardSnapshot,
     state: &ModulesState,
+    now_secs: f64,
 ) -> Vec<ModuleOverviewAction> {
-    let rows = overview_rows(state, snapshot);
+    let rows = overview_rows(state, snapshot, now_secs);
     let mut actions = Vec::new();
     let open_config_id = ui.make_persistent_id("module-config-popup");
     let mut open_config = ui
@@ -1176,7 +1197,7 @@ const ALLOCATION_COLUMN_WIDTH: f32 = 36.0;
 const TIER_COLUMN_WIDTH: f32 = 60.0;
 const BPM_COLUMN_WIDTH: f32 = 30.0;
 const PERIOD_COLUMN_WIDTH: f32 = 40.0;
-const THROTTLE_COLUMN_WIDTH: f32 = 40.0;
+const BPM_WAIT_COLUMN_WIDTH: f32 = 72.0;
 const ACTIVATION_ERRORS_COLUMN_WIDTH: f32 = 64.0;
 const LLM_ERRORS_COLUMN_WIDTH: f32 = 64.0;
 const LATEST_OUTPUT_COLUMN_WIDTH: f32 = 300.0;
@@ -1193,7 +1214,7 @@ fn overview_header(ui: &mut egui::Ui) {
         overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
         overview_header_cell(ui, "BPM", BPM_COLUMN_WIDTH);
         overview_header_cell(ui, "Period", PERIOD_COLUMN_WIDTH);
-        overview_header_cell(ui, "Throttle", THROTTLE_COLUMN_WIDTH);
+        overview_header_cell(ui, "BPM Wait", BPM_WAIT_COLUMN_WIDTH);
         overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
         overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
         overview_header_cell(ui, "LLM", LLM_COLUMN_WIDTH);
@@ -1257,12 +1278,7 @@ fn overview_row(
                 None,
                 PERIOD_COLUMN_WIDTH,
             );
-            overview_label_cell(
-                ui,
-                row.throttle.as_deref().unwrap_or("-"),
-                None,
-                THROTTLE_COLUMN_WIDTH,
-            );
+            overview_bpm_wait_cell(ui, row);
             overview_label_cell(
                 ui,
                 row.tier.as_deref().unwrap_or("-"),
@@ -1617,6 +1633,29 @@ fn overview_label_cell(ui: &mut egui::Ui, text: &str, hover: Option<&str>, width
     }
 }
 
+fn overview_bpm_wait_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
+    let Some(wait) = &row.bpm_wait else {
+        overview_label_cell(ui, "-", None, BPM_WAIT_COLUMN_WIDTH);
+        return;
+    };
+    let fill = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(92, 74, 24)
+    } else {
+        egui::Color32::from_rgb(255, 238, 153)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            overview_label_cell(
+                ui,
+                &wait.label,
+                Some("BPM wait before the next batch"),
+                BPM_WAIT_COLUMN_WIDTH,
+            );
+        });
+}
+
 fn overview_llm_status_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
     let text = if row.llm_streaming {
         egui::RichText::new(&row.llm_status).strong()
@@ -1730,7 +1769,7 @@ fn upsert_overview_row<'a>(
             bpm: None,
             period_ms: None,
             policy: None,
-            throttle: None,
+            bpm_wait: None,
             latest_llm_output: None,
             activation_error_count: 0,
             activation_attempt_count: 0,
@@ -1766,7 +1805,7 @@ fn overview_row_visible(row: &ModuleOverviewRow) -> bool {
     }
     row.llm_status != status_label(ModuleSessionStatus::Idle)
         || row.latest_llm_output.is_some()
-        || row.throttle.is_some()
+        || row.bpm_wait.is_some()
         || row.activation_error_count > 0
         || row.llm_error_count > 0
         || row.last_execution_failed
@@ -1855,10 +1894,6 @@ fn replica_label(row: &ModuleOverviewRow) -> String {
         .unwrap_or_else(|| format!("{index}/-"))
 }
 
-fn throttle_label(summary: &ThrottleSummary) -> String {
-    format_millis(summary.delayed_ms)
-}
-
 fn format_bpm(bpm: f64) -> String {
     if bpm >= 100.0 {
         format!("{bpm:.0}")
@@ -1879,6 +1914,37 @@ fn format_millis(ms: u64) -> String {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn bpm_wait_view(wait: BpmWaitStart, period_ms: u64, now_secs: f64) -> Option<BpmWaitView> {
+    let total_ms = period_ms.checked_sub(wait.activation_ms)?;
+    if total_ms == 0 {
+        return None;
+    }
+    let elapsed_ms = elapsed_millis_since(wait.completed_at_secs, now_secs);
+    let remaining_ms = total_ms.checked_sub(elapsed_ms)?;
+    Some(BpmWaitView {
+        label: format_bpm_wait(remaining_ms, total_ms),
+        remaining_ms,
+        total_ms,
+    })
+}
+
+fn elapsed_millis_since(start_secs: f64, now_secs: f64) -> u64 {
+    if !start_secs.is_finite() || !now_secs.is_finite() || now_secs <= start_secs {
+        return 0;
+    }
+    Duration::from_secs_f64(now_secs - start_secs)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn format_bpm_wait(remaining_ms: u64, total_ms: u64) -> String {
+    format!(
+        "{:.1}/{:.1}s",
+        remaining_ms as f64 / 1000.0,
+        total_ms as f64 / 1000.0
+    )
 }
 
 fn owner_for_replica(module: &str, replica: u8) -> String {
@@ -2292,6 +2358,8 @@ mod tests {
     };
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
 
+    const TEST_NOW_SECS: f64 = 10.0;
+
     fn overview_row_for_highlight(
         active: bool,
         activation_ratio: Option<f64>,
@@ -2312,7 +2380,7 @@ mod tests {
             bpm: None,
             period_ms: None,
             policy: None,
-            throttle: None,
+            bpm_wait: None,
             latest_llm_output: None,
             activation_error_count: 0,
             activation_attempt_count: 0,
@@ -2828,7 +2896,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].llm_streaming);
 
@@ -2849,7 +2917,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].llm_streaming);
         assert_eq!(rows[0].owner, owner);
@@ -3237,7 +3305,7 @@ mod tests {
             ..BlackboardSnapshot::default()
         };
 
-        let rows = overview_rows(&state, &snapshot);
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].owner, "sensory");
@@ -3620,7 +3688,7 @@ mod tests {
             }],
             ..BlackboardSnapshot::default()
         };
-        let rows = overview_rows(&state, &snapshot);
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS);
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == "predict")
@@ -3666,7 +3734,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == "predict")
@@ -3700,7 +3768,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == owner.to_string())
@@ -3739,7 +3807,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == owner.to_string())
@@ -3763,7 +3831,7 @@ mod tests {
             },
         );
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(
             rows.iter()
                 .find(|row| row.owner == owner.to_string())
@@ -3829,7 +3897,7 @@ mod tests {
         assert_eq!(turn_rows[0].label, "predict.session 1");
         assert!(turn_rows[0].failed);
 
-        let overview = overview_rows(&state, &BlackboardSnapshot::default());
+        let overview = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(overview.len(), 1);
         assert_eq!(overview[0].llm_status, "idle");
         assert_eq!(overview[0].activation_error_count, 0);
@@ -3951,10 +4019,20 @@ mod tests {
     }
 
     #[test]
-    fn runtime_events_record_batch_throttle_summaries_without_changing_llm_status() {
+    fn module_batch_ready_and_throttled_clear_bpm_wait_without_changing_llm_status() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
+        apply_runtime_event_at(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 0,
+                owner: owner.clone(),
+                duration: Duration::from_millis(800),
+                succeeded: true,
+            },
+            TEST_NOW_SECS,
+        );
         apply_runtime_event(
             &mut state,
             &RuntimeEvent::ModuleBatchThrottled {
@@ -3969,14 +4047,115 @@ mod tests {
             .get(&owner.to_string())
             .expect("module exists");
         assert_eq!(module.status, ModuleSessionStatus::Idle);
+        assert_eq!(module.bpm_wait, None);
+
+        apply_runtime_event_at(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 2,
+                owner: owner.clone(),
+                duration: Duration::from_millis(800),
+                succeeded: true,
+            },
+            TEST_NOW_SECS,
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleBatchReady {
+                sequence: 3,
+                owner: owner.clone(),
+                batch_type: "input".to_string(),
+                batch_debug: "ready".to_string(),
+            },
+        );
+        let module = state
+            .modules
+            .get(&owner.to_string())
+            .expect("module exists");
+        assert_eq!(module.status, ModuleSessionStatus::Idle);
+        assert_eq!(module.bpm_wait, None);
+    }
+
+    #[test]
+    fn bpm_wait_countdown_uses_sleep_remaining_as_denominator() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        apply_runtime_event_at(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 1,
+                owner: owner.clone(),
+                duration: Duration::from_millis(800),
+                succeeded: true,
+            },
+            TEST_NOW_SECS,
+        );
+        let snapshot = BlackboardSnapshot {
+            allocation: vec![AllocationView {
+                module: "sensory".to_string(),
+                activation_ratio: 1.0,
+                active_replicas: 1,
+                bpm: Some(20.0),
+                period_ms: Some(3000),
+                tier: "Default".to_string(),
+                guidance: String::new(),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS);
         assert_eq!(
-            module.last_throttle,
-            Some(ThrottleSummary {
-                kind: "batch throttle".to_string(),
-                detail: "next_batch".to_string(),
-                delayed_ms: 25,
+            rows[0].bpm_wait,
+            Some(BpmWaitView {
+                label: "2.2/2.2s".to_string(),
+                remaining_ms: 2200,
+                total_ms: 2200,
             })
         );
+
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS + 1.0);
+        assert_eq!(
+            rows[0].bpm_wait,
+            Some(BpmWaitView {
+                label: "1.2/2.2s".to_string(),
+                remaining_ms: 1200,
+                total_ms: 2200,
+            })
+        );
+
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS + 2.3);
+        assert_eq!(rows[0].bpm_wait, None);
+    }
+
+    #[test]
+    fn bpm_wait_is_hidden_when_activation_duration_reaches_period() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        apply_runtime_event_at(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 1,
+                owner: owner.clone(),
+                duration: Duration::from_millis(3000),
+                succeeded: true,
+            },
+            TEST_NOW_SECS,
+        );
+        let snapshot = BlackboardSnapshot {
+            allocation: vec![AllocationView {
+                module: "sensory".to_string(),
+                activation_ratio: 1.0,
+                active_replicas: 1,
+                bpm: Some(20.0),
+                period_ms: Some(3000),
+                tier: "Default".to_string(),
+                guidance: String::new(),
+            }],
+            ..BlackboardSnapshot::default()
+        };
+
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS);
+        assert_eq!(rows[0].bpm_wait, None);
     }
 
     #[test]
@@ -4007,7 +4186,7 @@ mod tests {
         assert_eq!(module.activation_attempt_count, 0);
         assert!(module.last_execution_failed);
 
-        let rows = overview_rows(&state, &BlackboardSnapshot::default());
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].activation_error_count, 0);
         assert_eq!(rows[0].activation_attempt_count, 0);
@@ -4050,7 +4229,7 @@ mod tests {
     }
 
     #[test]
-    fn overview_rows_merge_allocation_status_throttle_and_latest_output() {
+    fn overview_rows_merge_allocation_status_bpm_wait_and_latest_output() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -4074,15 +4253,17 @@ mod tests {
                 delta: "filtered observation".to_string(),
             },
         );
-        state
-            .modules
-            .get_mut("sensory")
-            .expect("module exists")
-            .last_throttle = Some(ThrottleSummary {
-            kind: "batch throttle".to_string(),
-            detail: "next_batch".to_string(),
-            delayed_ms: 500,
-        });
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        apply_runtime_event_at(
+            &mut state,
+            &RuntimeEvent::ModuleActivationCompleted {
+                sequence: 0,
+                owner,
+                duration: Duration::from_millis(800),
+                succeeded: true,
+            },
+            TEST_NOW_SECS,
+        );
         let snapshot = BlackboardSnapshot {
             module_statuses: vec![ModuleStatusView {
                 owner: "sensory".to_string(),
@@ -4095,14 +4276,14 @@ mod tests {
                 activation_ratio: 0.75,
                 active_replicas: 1,
                 bpm: Some(12.5),
-                period_ms: Some(4800),
+                period_ms: Some(3000),
                 tier: "Premium".to_string(),
                 guidance: "inspect recent input".to_string(),
             }],
             ..BlackboardSnapshot::default()
         };
 
-        let rows = overview_rows(&state, &snapshot);
+        let rows = overview_rows(&state, &snapshot, TEST_NOW_SECS);
 
         assert_eq!(
             rows,
@@ -4120,12 +4301,16 @@ mod tests {
                 tier: Some("Premium".to_string()),
                 guidance: Some("inspect recent input".to_string()),
                 bpm: Some(12.5),
-                period_ms: Some(4800),
+                period_ms: Some(3000),
                 policy: None,
-                throttle: Some("500ms".to_string()),
+                bpm_wait: Some(BpmWaitView {
+                    label: "2.2/2.2s".to_string(),
+                    remaining_ms: 2200,
+                    total_ms: 2200,
+                }),
                 latest_llm_output: Some("text: filtered observation".to_string()),
                 activation_error_count: 0,
-                activation_attempt_count: 0,
+                activation_attempt_count: 1,
                 llm_error_count: 0,
                 llm_turn_count: 1,
                 last_execution_failed: false,
@@ -4151,7 +4336,7 @@ mod tests {
             bpm: None,
             period_ms: None,
             policy: None,
-            throttle: None,
+            bpm_wait: None,
             latest_llm_output: None,
             activation_error_count: 0,
             activation_attempt_count: 0,
