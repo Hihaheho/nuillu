@@ -14,7 +14,7 @@ use nuillu_blackboard::{
 use nuillu_module::{
     ActivateCx, ActivationGateVote, AgentRuntimeControl, AllocatedModule, AllocatedModules,
     LlmBatchDebug, LlmRequestMetadata, LlmRequestSource, ModuleBatch, ModuleDependencies,
-    ModuleRunStatus, SessionCompactionRuntime, WakeClaim, ports::Clock,
+    ModuleRunStatus, SelfWakePermitClaim, SessionCompactionRuntime, WakeClaim, ports::Clock,
     with_activation_llm_request_metadata,
 };
 use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaIndex, builtin};
@@ -599,6 +599,7 @@ enum ModuleState {
         module: AllocatedModule,
         batch: ModuleBatch,
         gate_approved: bool,
+        self_wake_activation_permit: bool,
         pending_kicks: Vec<Kick>,
     },
     PendingDependencySettle,
@@ -630,6 +631,7 @@ enum TaskMessage {
         module: AllocatedModule,
         kick_inbox: KickInbox,
         wake_claim: Option<WakeClaim>,
+        self_wake_permit_claim: Option<SelfWakePermitClaim>,
         result: Result<(ModuleBatch, Vec<Kick>), String>,
     },
     DependencySettled {
@@ -654,6 +656,7 @@ enum TaskMessage {
         kick_inbox: KickInbox,
         batch: ModuleBatch,
         pending_kicks: Vec<Kick>,
+        self_wake_activation_permit: bool,
         outcome: ActivationGateOutcome,
     },
     ActivationWaitReady {
@@ -958,18 +961,32 @@ async fn refresh_active_and_schedule(
     }
     zero_windows.reset_allocation_active(owners, &allocation_active);
     for (index, owner) in owners.iter().enumerate() {
-        active[index] = allocation_active[index] || zero_windows.allows(owner);
+        let self_wake_permit_active = runtime.has_pending_self_wake_permit(owner)
+            && !runtime.is_forced_disabled(&owner.module).await;
+        active[index] =
+            allocation_active[index] || zero_windows.allows(owner) || self_wake_permit_active;
     }
 
     for index in 0..states.len() {
+        let state_self_wake_activation_active =
+            matches!(
+                &states[index],
+                ModuleState::PendingBatch {
+                    self_wake_activation_permit: true,
+                    ..
+                }
+            ) && !runtime.is_forced_disabled(&owners[index].module).await;
+        let state_active = active[index] || state_self_wake_activation_active;
         match &states[index] {
-            ModuleState::Stored { .. } if active[index] => {
+            ModuleState::Stored { .. } if state_active => {
                 runtime
                     .record_module_status(owners[index].clone(), ModuleRunStatus::AwaitingBatch)
                     .await;
                 let pending_wake = runtime.has_pending_wake(&owners[index]);
+                let has_pending_self_wake_permit =
+                    runtime.has_pending_self_wake_permit(&owners[index]);
                 let has_dependencies = dependency_targets.has_dependencies(&owners[index].module);
-                if has_dependencies && !pending_wake {
+                if has_dependencies && !pending_wake && !has_pending_self_wake_permit {
                     continue;
                 }
                 let ModuleState::Stored {
@@ -1092,7 +1109,7 @@ async fn refresh_active_and_schedule(
                     .await;
             }
             ModuleState::Throttling | ModuleState::Awaiting => {
-                let status = if active[index] {
+                let status = if state_active {
                     ModuleRunStatus::AwaitingBatch
                 } else {
                     ModuleRunStatus::Inactive
@@ -1101,12 +1118,13 @@ async fn refresh_active_and_schedule(
                     .record_module_status(owners[index].clone(), status)
                     .await;
             }
-            ModuleState::PendingBatch { .. } if active[index] => {
+            ModuleState::PendingBatch { .. } if state_active => {
                 zero_windows.mark_batch_accepted(&owners[index]);
                 let ModuleState::PendingBatch {
                     module,
                     batch,
                     gate_approved,
+                    self_wake_activation_permit,
                     pending_kicks,
                 } = std::mem::replace(&mut states[index], ModuleState::Activating)
                 else {
@@ -1150,6 +1168,7 @@ async fn refresh_active_and_schedule(
                         kick_inbox,
                         pending_kicks,
                         batch,
+                        self_wake_activation_permit,
                         config,
                         parent,
                         subscriber,
@@ -1167,7 +1186,7 @@ async fn refresh_active_and_schedule(
                     .await;
             }
             ModuleState::PendingDependencySettle => {
-                let status = if active[index] {
+                let status = if state_active {
                     ModuleRunStatus::PendingBatch
                 } else {
                     ModuleRunStatus::Inactive
@@ -1177,7 +1196,7 @@ async fn refresh_active_and_schedule(
                     .await;
             }
             ModuleState::PendingActivationGate => {
-                let status = if active[index] {
+                let status = if state_active {
                     ModuleRunStatus::PendingActivationGate
                 } else {
                     ModuleRunStatus::Inactive
@@ -1323,14 +1342,25 @@ async fn handle_task_message(
             module,
             mut kick_inbox,
             wake_claim,
+            self_wake_permit_claim,
             result,
         } => match result {
             Ok((batch, pending_kicks)) => {
+                let has_self_wake_permit_claim = self_wake_permit_claim.is_some();
                 if let Some(claim) = wake_claim {
                     runtime.complete_wake_claim(claim);
                 }
+                if let Some(claim) = self_wake_permit_claim {
+                    runtime.complete_self_wake_permit_claim(claim);
+                }
                 if scheduling_enabled
-                    && scheduling_active(runtime, zero_windows, &owners[index]).await
+                    && scheduling_active(
+                        runtime,
+                        zero_windows,
+                        &owners[index],
+                        has_self_wake_permit_claim,
+                    )
+                    .await
                 {
                     zero_windows.mark_batch_accepted(&owners[index]);
                     let scheduled = spawn_activation_gate_or_activate(
@@ -1342,6 +1372,7 @@ async fn handle_task_message(
                         kick_inbox,
                         pending_kicks,
                         batch,
+                        has_self_wake_permit_claim,
                         config,
                         parent,
                         subscriber,
@@ -1358,12 +1389,19 @@ async fn handle_task_message(
                         module,
                         batch,
                         gate_approved: false,
+                        self_wake_activation_permit: false,
                         pending_kicks: Vec::new(),
                     };
                 }
                 Ok(())
             }
             Err(message) => {
+                if let Some(claim) = wake_claim {
+                    runtime.complete_wake_claim(claim);
+                }
+                if let Some(claim) = self_wake_permit_claim {
+                    runtime.complete_self_wake_permit_claim(claim);
+                }
                 notify_pending_and_ready(Vec::new(), &mut kick_inbox);
                 kick_inboxes[index] = Some(kick_inbox);
                 park_failed_module(
@@ -1389,7 +1427,8 @@ async fn handle_task_message(
             remaining_waves,
         } => {
             pending_kicks.extend(kick_inbox.drain_ready());
-            if scheduling_enabled && scheduling_active(runtime, zero_windows, &owners[index]).await
+            if scheduling_enabled
+                && scheduling_active(runtime, zero_windows, &owners[index], false).await
             {
                 let scheduled = schedule_dependency_settle_or_next_batch(
                     runtime,
@@ -1504,11 +1543,18 @@ async fn handle_task_message(
             mut kick_inbox,
             batch,
             pending_kicks,
+            self_wake_activation_permit,
             outcome,
         } => {
             if outcome.allowed() {
                 if scheduling_enabled
-                    && scheduling_active(runtime, zero_windows, &owners[index]).await
+                    && scheduling_active(
+                        runtime,
+                        zero_windows,
+                        &owners[index],
+                        self_wake_activation_permit,
+                    )
+                    .await
                 {
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
@@ -1545,6 +1591,7 @@ async fn handle_task_message(
                         module,
                         batch,
                         gate_approved: true,
+                        self_wake_activation_permit: false,
                         pending_kicks: Vec::new(),
                     };
                 }
@@ -1651,7 +1698,14 @@ async fn scheduling_active(
     runtime: &AgentRuntimeControl,
     zero_windows: &mut ZeroReplicaWindows,
     owner: &ModuleInstanceId,
+    has_self_wake_permit_claim: bool,
 ) -> bool {
+    if runtime.is_forced_disabled(&owner.module).await {
+        return false;
+    }
+    if has_self_wake_permit_claim || runtime.has_pending_self_wake_permit(owner) {
+        return true;
+    }
     if runtime.is_active(owner).await {
         zero_windows.reset_allocation_active(std::slice::from_ref(owner), &[true]);
         true
@@ -1776,7 +1830,7 @@ async fn collect_dependency_settle_completions(
         }
         let target_owner = owners[target_index].clone();
         let target_has_wake = runtime.has_pending_wake(&target_owner);
-        if !scheduling_active(runtime, zero_windows, &target_owner).await {
+        if !scheduling_active(runtime, zero_windows, &target_owner, false).await {
             if target_has_wake {
                 let activation_waiter = runtime.activation_waiter(&target_owner).await;
                 completions.push(DependencyWait::inactive(
@@ -1997,6 +2051,7 @@ async fn spawn_activation_gate_or_activate(
     kick_inbox: KickInbox,
     pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
+    self_wake_activation_permit: bool,
     config: AgentEventLoopConfig,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -2041,6 +2096,7 @@ async fn spawn_activation_gate_or_activate(
             kick_inbox,
             pending_kicks,
             batch,
+            self_wake_activation_permit,
             gate_requests,
             parent,
             subscriber,
@@ -2187,9 +2243,10 @@ fn spawn_next_batch(
 ) {
     tasks.push(spawn_local(
         async move {
-            let (batch_result, mut pending_kicks, wake_claim) = {
+            let (batch_result, mut pending_kicks, wake_claim, self_wake_permit_claim) = {
                 let mut pending_kicks = initial_pending_kicks;
                 let mut wake_claim = wake_claim;
+                let mut self_wake_permit_claim = runtime.claim_self_wake_permit(&owner);
                 let mut observed_wake_sequence = runtime.wake_change_sequence();
                 let mut kick_inbox_closed = false;
                 let mut next_batch = pin!(module.next_batch());
@@ -2200,11 +2257,21 @@ fn spawn_next_batch(
                         && !runtime.has_pending_wake(&owner);
                     tokio::select! {
                         biased;
-                        _ = runtime.wake_changed_since(observed_wake_sequence), if wake_claim.is_none() => {
+                        _ = runtime.wake_changed_since(observed_wake_sequence), if wake_claim.is_none() || self_wake_permit_claim.is_none() => {
                             observed_wake_sequence = runtime.wake_change_sequence();
-                            wake_claim = runtime.claim_wake(&owner);
+                            if wake_claim.is_none() {
+                                wake_claim = runtime.claim_wake(&owner);
+                            }
+                            if self_wake_permit_claim.is_none() {
+                                self_wake_permit_claim = runtime.claim_self_wake_permit(&owner);
+                            }
                         }
-                        result = &mut next_batch => break (result, pending_kicks, wake_claim),
+                        result = &mut next_batch => break (
+                            result,
+                            pending_kicks,
+                            wake_claim,
+                            self_wake_permit_claim,
+                        ),
                         maybe_kick = kick_inbox.next(), if !kick_inbox_closed => {
                             if let Some(kick) = maybe_kick {
                                 pending_kicks.push(kick);
@@ -2234,13 +2301,12 @@ fn spawn_next_batch(
                     Err(format!("{error:#}"))
                 }
             };
-            let wake_claim = if result.is_ok() { wake_claim } else { None };
-
             TaskMessage::NextBatch {
                 index,
                 module,
                 kick_inbox,
                 wake_claim,
+                self_wake_permit_claim,
                 result,
             }
         }
@@ -2297,6 +2363,7 @@ fn spawn_activation_gate_wait(
     kick_inbox: KickInbox,
     pending_kicks: Vec<Kick>,
     batch: ModuleBatch,
+    self_wake_activation_permit: bool,
     requests: Vec<tokio::sync::oneshot::Receiver<ActivationGateVote>>,
     parent: &tracing::Span,
     subscriber: &tracing::Dispatch,
@@ -2310,6 +2377,7 @@ fn spawn_activation_gate_wait(
                 kick_inbox,
                 batch,
                 pending_kicks,
+                self_wake_activation_permit,
                 outcome,
             }
         }
@@ -2520,8 +2588,8 @@ mod tests {
         CognitionLogUpdatedInbox, CognitionWriter, LlmAccess, LlmBatchDebug, LlmRequestMetadata,
         LlmRequestSource, Memo, MemoUpdated, MemoUpdatedInbox, Module, ModuleCapabilityFactory,
         ModuleDependencies, ModuleRegistry, ModuleRegistryError, PersistedSessionSnapshot,
-        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SessionCompactionPolicy, SessionKey,
-        SessionStore,
+        RuntimeEvent, RuntimeEventSink, RuntimePolicy, SelfWake, SessionCompactionPolicy,
+        SessionKey, SessionStore,
     };
     use nuillu_types::{
         MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
@@ -6598,6 +6666,122 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn self_wake_activates_inactive_owner_once() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id, ActivationRatio::ZERO);
+
+                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let (done_tx, done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let self_wake = Rc::new(RefCell::new(None::<SelfWake>));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            let self_wake = Rc::clone(&self_wake);
+                            move |caps| {
+                                *self_wake.borrow_mut() = Some(caps.self_wake());
+                                ImmediateDependentModule {
+                                    batch_sent: false,
+                                    on_done: done_tx.borrow_mut().take(),
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                let wake = self_wake
+                    .borrow()
+                    .as_ref()
+                    .expect("module constructor should expose self wake")
+                    .clone();
+                wake.wake();
+
+                super::run(modules, test_config(), async move {
+                    tokio::time::timeout(Duration::from_millis(500), done_rx)
+                        .await
+                        .expect("self-wake should activate the inactive owner")
+                        .expect("done sender dropped");
+                })
+                .await
+                .expect("scheduler returned err");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn self_wake_does_not_override_hard_disabled_owner() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(ImmediateDependentModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ZERO);
+                let blackboard = Blackboard::with_allocation(alloc);
+                blackboard
+                    .apply(BlackboardCommand::SetModuleForcedDisabled {
+                        module: module_id.clone(),
+                        disabled: true,
+                    })
+                    .await;
+
+                let caps = test_caps(blackboard);
+                let (done_tx, mut done_rx) = oneshot::channel();
+                let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+                let self_wake = Rc::new(RefCell::new(None::<SelfWake>));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(0..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let done_tx = Rc::clone(&done_tx);
+                            let self_wake = Rc::clone(&self_wake);
+                            move |caps| {
+                                *self_wake.borrow_mut() = Some(caps.self_wake());
+                                ImmediateDependentModule {
+                                    batch_sent: false,
+                                    on_done: done_tx.borrow_mut().take(),
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+
+                let wake = self_wake
+                    .borrow()
+                    .as_ref()
+                    .expect("module constructor should expose self wake")
+                    .clone();
+                wake.wake();
+
+                super::run(modules, test_config(), async move {
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert_oneshot_pending(
+                        &mut done_rx,
+                        "hard-disabled self-wake should not activate the owner",
+                    );
+                })
+                .await
+                .expect("scheduler returned err");
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dependent_wake_does_not_wait_for_dependency_next_batch_without_dependency_wake() {
         let local = LocalSet::new();
@@ -7248,6 +7432,117 @@ mod tests {
                 completion
                     .await
                     .expect("pending kick should be completed on next_batch error");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn next_batch_error_consumes_self_wake_permit() {
+        use futures::StreamExt as _;
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(FailingBatchModule::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id, ActivationRatio::ONE);
+
+                let (release_tx, release_rx) = oneshot::channel();
+                let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+                let self_wake = Rc::new(RefCell::new(None::<SelfWake>));
+                let caps = test_caps(Blackboard::with_allocation(alloc));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let release_rx = Rc::clone(&release_rx);
+                            let self_wake = Rc::clone(&self_wake);
+                            move |caps| {
+                                *self_wake.borrow_mut() = Some(caps.self_wake());
+                                FailingBatchModule {
+                                    release: release_rx.borrow_mut().take(),
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let (runtime, mut modules, _) = modules.into_parts_with_dependencies();
+                let module = modules.pop().unwrap();
+                let owner = module.owner().clone();
+                let wake = self_wake
+                    .borrow()
+                    .as_ref()
+                    .expect("module constructor should expose self wake")
+                    .clone();
+                wake.wake();
+                assert!(runtime.has_pending_self_wake_permit(&owner));
+
+                let (kick_inbox, _) = crate::kicks::KickInbox::new();
+                let mut tasks = futures::stream::FuturesUnordered::new();
+                let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                let parent = tracing::Span::current();
+                super::spawn_next_batch(
+                    runtime.clone(),
+                    &mut tasks,
+                    0,
+                    owner.clone(),
+                    module,
+                    kick_inbox,
+                    Vec::new(),
+                    None,
+                    Duration::from_secs(2),
+                    &parent,
+                    &subscriber,
+                );
+                tokio::task::yield_now().await;
+                let _ = release_tx.send(());
+                let message = tasks
+                    .next()
+                    .await
+                    .expect("next_batch task should finish")
+                    .expect("next_batch task should not panic");
+
+                let owners = vec![owner.clone()];
+                let mut states = vec![super::ModuleState::Awaiting];
+                let mut kick_inboxes = vec![None];
+                let mut zero_window_wakers = vec![None];
+                let dependency_targets = super::DependencyTargets {
+                    dependencies: Arc::new(ModuleDependencies::default()),
+                    target_indexes_by_role: Arc::new(HashMap::new()),
+                };
+                let mut zero_windows = super::ZeroReplicaWindows::new(HashMap::new());
+                let mut consecutive_failures = vec![0];
+                super::handle_task_message(
+                    message,
+                    &runtime,
+                    &owners,
+                    &mut states,
+                    &mut tasks,
+                    &mut kick_inboxes,
+                    &mut zero_window_wakers,
+                    &[],
+                    &dependency_targets,
+                    &HashMap::new(),
+                    &mut zero_windows,
+                    &mut consecutive_failures,
+                    true,
+                    test_config(),
+                    &parent,
+                    &subscriber,
+                )
+                .await
+                .expect("next_batch failure should be handled");
+
+                assert!(!runtime.has_pending_self_wake_permit(&owner));
+                assert!(matches!(
+                    &states[0],
+                    super::ModuleState::FailedUntilActivation { phase, message, .. }
+                        if phase == "next_batch" && message.contains("planned next_batch failure")
+                ));
             })
             .await;
     }

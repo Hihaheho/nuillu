@@ -357,6 +357,7 @@ fn register_server_module(
                             llm: caps.llm_access(),
                             scene: caps.scene_reader(),
                             clock: caps.clock(),
+                            self_wake: caps.self_wake(),
                             planning_session: caps
                                 .session("planning")
                                 .with_auto_compaction(

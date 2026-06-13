@@ -44,6 +44,7 @@ pub struct WakeClaim {
 #[derive(Clone, Default)]
 pub(crate) struct WakeRegistry {
     inner: Arc<Mutex<WakeRegistryInner>>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -51,23 +52,22 @@ struct WakeRegistryInner {
     delivered_by_owner: HashMap<ModuleInstanceId, u64>,
     completed_by_owner: HashMap<ModuleInstanceId, u64>,
     change_sequence: u64,
-    waiters: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl WakeRegistry {
     pub(crate) fn record_wake(&self, owner: &ModuleInstanceId) {
-        let mut inner = self.inner.lock().expect("wake registry poisoned");
-        let next = inner
-            .delivered_by_owner
-            .get(owner)
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(1);
-        inner.delivered_by_owner.insert(owner.clone(), next);
-        inner.change_sequence = inner.change_sequence.saturating_add(1);
-        for waiter in inner.waiters.drain(..) {
-            let _ = waiter.send(());
+        {
+            let mut inner = self.inner.lock().expect("wake registry poisoned");
+            let next = inner
+                .delivered_by_owner
+                .get(owner)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(1);
+            inner.delivered_by_owner.insert(owner.clone(), next);
+            inner.change_sequence = inner.change_sequence.saturating_add(1);
         }
+        self.notify.notify_waiters();
     }
 
     pub(crate) fn claim_wake(&self, owner: &ModuleInstanceId) -> Option<WakeClaim> {
@@ -90,15 +90,16 @@ impl WakeRegistry {
 
     pub(crate) fn complete_wake_claim(&self, claim: WakeClaim) {
         let mut inner = self.inner.lock().expect("wake registry poisoned");
+        let owner = claim.owner;
         let delivered = inner
             .delivered_by_owner
-            .get(&claim.owner)
+            .get(&owner)
             .copied()
             .unwrap_or_default();
         let completed = claim.delivered_through.min(delivered);
         inner
             .completed_by_owner
-            .entry(claim.owner)
+            .entry(owner)
             .and_modify(|current| *current = (*current).max(completed))
             .or_insert(completed);
     }
@@ -126,16 +127,13 @@ impl WakeRegistry {
     }
 
     pub(crate) async fn changed_since(&self, observed: u64) {
-        let receiver = {
-            let mut inner = self.inner.lock().expect("wake registry poisoned");
-            if inner.change_sequence > observed {
+        loop {
+            let notified = self.notify.notified();
+            if self.change_sequence() > observed {
                 return;
             }
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            inner.waiters.push(sender);
-            receiver
-        };
-        let _ = receiver.await;
+            notified.await;
+        }
     }
 }
 

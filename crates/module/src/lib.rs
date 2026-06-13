@@ -63,7 +63,7 @@ pub use capabilities::{
     AgentRuntimeControl, AllocatedModule, AllocatedModules, CapabilityProviderConfig,
     CapabilityProviderPorts, CapabilityProviderRuntime, CapabilityProviders, HostIo,
     InternalHarnessIo, ModuleCapabilityFactory, ModuleDependencies, ModuleRegisterer,
-    ModuleRegistry, ModuleRegistryError,
+    ModuleRegistry, ModuleRegistryError, SelfWake, SelfWakePermitClaim,
 };
 pub use channels::{
     AmbientSensoryEntry, AttentionControlRequest, AttentionControlRequestInbox,

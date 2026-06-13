@@ -560,8 +560,8 @@ fn default_server_modules() -> Vec<ServerModuleSpec> {
             M::Speak,
             0,
             1,
-            3.0,
             6.0,
+            18.0,
             0.0,
             T::Premium,
             [G::Voluntary, G::SleepSuppressed],
@@ -626,6 +626,13 @@ mod tests {
 
         assert_eq!(config.active_modules(), DEFAULT_MODULES.to_vec());
         assert_eq!(config.activation_table, default_activation_table_values());
+        let speak = config
+            .modules
+            .iter()
+            .find(|module| module.id == RuntimeModule::Speak)
+            .expect("default config includes speak");
+        assert_eq!(speak.bpm_min, 6.0);
+        assert_eq!(speak.bpm_max, 18.0);
     }
 
     #[test]

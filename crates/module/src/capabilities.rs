@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::{Future, IntoFuture};
@@ -51,6 +51,7 @@ pub struct CapabilityProviders {
 struct CapabilityProvidersInner {
     blackboard: Blackboard,
     wakes: WakeRegistry,
+    self_wake_permits: SelfWakePermitRegistry,
     attention_control_requests: Topic<AttentionControlRequest>,
     cognition_log_updates: Topic<CognitionLogUpdated>,
     cognition_log_evictions: Topic<nuillu_blackboard::CognitionLogEntryRecord>,
@@ -69,6 +70,138 @@ struct CapabilityProvidersInner {
     scene: SceneRegistry,
     session_store: Rc<dyn SessionStore>,
     allocation_store: Rc<dyn AllocationStore>,
+}
+
+/// Owner-stamped handle for requesting another scheduler pass for the holder.
+#[derive(Clone)]
+pub struct SelfWake {
+    owner: ModuleInstanceId,
+    permits: SelfWakePermitRegistry,
+}
+
+impl SelfWake {
+    fn new(owner: ModuleInstanceId, permits: SelfWakePermitRegistry) -> Self {
+        Self { owner, permits }
+    }
+
+    /// Mark this module owner as having pending work.
+    pub fn wake(&self) {
+        self.permits.issue(&self.owner);
+    }
+}
+
+/// Claim for one owner-stamped self-wake scheduling opportunity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfWakePermitClaim {
+    owner: ModuleInstanceId,
+    delivered_through: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeChangeSequence {
+    wake: u64,
+    self_wake_permit: u64,
+}
+
+#[derive(Clone)]
+struct SelfWakePermitRegistry {
+    inner: Rc<RefCell<SelfWakePermitRegistryInner>>,
+    notify: Rc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct SelfWakePermitRegistryInner {
+    delivered_by_owner: HashMap<ModuleInstanceId, u64>,
+    completed_by_owner: HashMap<ModuleInstanceId, u64>,
+    change_sequence: u64,
+}
+
+impl Default for SelfWakePermitRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(SelfWakePermitRegistryInner::default())),
+            notify: Rc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+impl SelfWakePermitRegistry {
+    fn issue(&self, owner: &ModuleInstanceId) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            let next = inner
+                .delivered_by_owner
+                .get(owner)
+                .copied()
+                .unwrap_or_default()
+                .saturating_add(1);
+            inner.delivered_by_owner.insert(owner.clone(), next);
+            inner.change_sequence = inner.change_sequence.saturating_add(1);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn claim(&self, owner: &ModuleInstanceId) -> Option<SelfWakePermitClaim> {
+        let inner = self.inner.borrow();
+        let delivered = inner
+            .delivered_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = inner
+            .completed_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        (delivered > completed).then(|| SelfWakePermitClaim {
+            owner: owner.clone(),
+            delivered_through: delivered,
+        })
+    }
+
+    fn complete(&self, claim: SelfWakePermitClaim) {
+        let mut inner = self.inner.borrow_mut();
+        let delivered = inner
+            .delivered_by_owner
+            .get(&claim.owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = claim.delivered_through.min(delivered);
+        inner
+            .completed_by_owner
+            .entry(claim.owner)
+            .and_modify(|current| *current = (*current).max(completed))
+            .or_insert(completed);
+    }
+
+    fn has_pending(&self, owner: &ModuleInstanceId) -> bool {
+        let inner = self.inner.borrow();
+        let delivered = inner
+            .delivered_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        let completed = inner
+            .completed_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or_default();
+        delivered > completed
+    }
+
+    fn change_sequence(&self) -> u64 {
+        self.inner.borrow().change_sequence
+    }
+
+    async fn changed_since(&self, observed: u64) {
+        loop {
+            let notified = self.notify.notified();
+            if self.change_sequence() > observed {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Required external services for the root capability provider set.
@@ -134,9 +267,11 @@ impl CapabilityProviders {
         let runtime_events = RuntimeEventEmitter::new(event_sink);
         let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         let wakes = WakeRegistry::default();
+        let self_wake_permits = SelfWakePermitRegistry::default();
         Self {
             inner: Rc::new(CapabilityProvidersInner {
                 wakes: wakes.clone(),
+                self_wake_permits: self_wake_permits.clone(),
                 attention_control_requests: Topic::new(
                     blackboard.clone(),
                     wakes.clone(),
@@ -279,6 +414,7 @@ impl CapabilityProviders {
         AgentRuntimeControl {
             blackboard: self.inner.blackboard.clone(),
             wakes: self.inner.wakes.clone(),
+            self_wake_permits: self.inner.self_wake_permits.clone(),
             cognition_log_updates: CognitionLogUpdatedMailbox::new(
                 owner,
                 self.inner.cognition_log_updates.clone(),
@@ -390,6 +526,7 @@ impl CapabilityProviders {
 pub struct AgentRuntimeControl {
     blackboard: Blackboard,
     wakes: WakeRegistry,
+    self_wake_permits: SelfWakePermitRegistry,
     cognition_log_updates: CognitionLogUpdatedMailbox,
     clock: Rc<dyn Clock>,
     session_compaction: LlmTierHandle,
@@ -404,6 +541,18 @@ impl AgentRuntimeControl {
         self.wakes.has_pending_wake(owner)
     }
 
+    pub fn has_pending_self_wake_permit(&self, owner: &ModuleInstanceId) -> bool {
+        self.self_wake_permits.has_pending(owner)
+    }
+
+    pub fn claim_self_wake_permit(&self, owner: &ModuleInstanceId) -> Option<SelfWakePermitClaim> {
+        self.self_wake_permits.claim(owner)
+    }
+
+    pub fn complete_self_wake_permit_claim(&self, claim: SelfWakePermitClaim) {
+        self.self_wake_permits.complete(claim);
+    }
+
     pub fn claim_wake(&self, owner: &ModuleInstanceId) -> Option<WakeClaim> {
         self.wakes.claim_wake(owner)
     }
@@ -412,17 +561,29 @@ impl AgentRuntimeControl {
         self.wakes.complete_wake_claim(claim);
     }
 
-    pub fn wake_change_sequence(&self) -> u64 {
-        self.wakes.change_sequence()
+    pub fn wake_change_sequence(&self) -> WakeChangeSequence {
+        WakeChangeSequence {
+            wake: self.wakes.change_sequence(),
+            self_wake_permit: self.self_wake_permits.change_sequence(),
+        }
     }
 
-    pub async fn wake_changed_since(&self, observed: u64) {
-        self.wakes.changed_since(observed).await;
+    pub async fn wake_changed_since(&self, observed: WakeChangeSequence) {
+        tokio::select! {
+            _ = self.wakes.changed_since(observed.wake) => {},
+            _ = self.self_wake_permits.changed_since(observed.self_wake_permit) => {},
+        }
     }
 
     pub async fn is_active(&self, owner: &ModuleInstanceId) -> bool {
         self.blackboard
             .read(|bb| bb.allocation().is_replica_active(owner))
+            .await
+    }
+
+    pub async fn is_forced_disabled(&self, module: &ModuleId) -> bool {
+        self.blackboard
+            .read(|bb| bb.forced_disabled_modules().contains(module))
             .await
     }
 
@@ -702,6 +863,13 @@ impl ModuleCapabilityFactory {
     /// returned by this factory are stamped with this id.
     pub fn owner(&self) -> &ModuleInstanceId {
         &self.owner
+    }
+
+    pub fn self_wake(&self) -> SelfWake {
+        SelfWake::new(
+            self.owner.clone(),
+            self.root.inner.self_wake_permits.clone(),
+        )
     }
 
     pub fn attention_control_mailbox(&self) -> AttentionControlRequestMailbox {
@@ -1961,6 +2129,36 @@ mod tests {
         let _w2 = cognition_gate.cognition_writer();
         let _a1 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
         let _a2 = controller.allocation_writer(vec![builtin::cognition_gate()], Vec::new());
+        let _wake1 = cognition_gate.self_wake();
+        let _wake2 = cognition_gate.self_wake();
+    }
+
+    #[tokio::test]
+    async fn self_wake_marks_only_its_owner_pending() {
+        let caps = test_caps(Blackboard::default());
+        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        let memory_owner = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
+        let wake = caps.scoped(speak_owner.clone()).self_wake();
+        let runtime = caps.runtime_control();
+
+        assert!(!runtime.has_pending_wake(&speak_owner));
+        assert!(!runtime.has_pending_self_wake_permit(&speak_owner));
+        assert!(!runtime.has_pending_wake(&memory_owner));
+        assert!(!runtime.has_pending_self_wake_permit(&memory_owner));
+
+        wake.wake();
+        wake.wake();
+
+        assert!(!runtime.has_pending_wake(&speak_owner));
+        assert!(runtime.has_pending_self_wake_permit(&speak_owner));
+        assert!(!runtime.has_pending_wake(&memory_owner));
+        assert!(!runtime.has_pending_self_wake_permit(&memory_owner));
+        let claim = runtime
+            .claim_self_wake_permit(&speak_owner)
+            .expect("self wake should create a permit claim");
+        runtime.complete_self_wake_permit_claim(claim);
+        assert!(!runtime.has_pending_wake(&speak_owner));
+        assert!(!runtime.has_pending_self_wake_permit(&speak_owner));
     }
 
     #[tokio::test]
