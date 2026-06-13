@@ -30,8 +30,9 @@ use serde::{Deserialize, Serialize};
 
 const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and the available target schema.
 Use exactly one available tool.
-Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
-Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current listener and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
@@ -39,7 +40,8 @@ For self-directed cognition, transform only the listener-relevant implication in
 Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
 For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
 
-const PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now. If speech is already in progress, treat already emitted text as immutable and prepare only speech substance that can continue coherently from it.";
+const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
+const ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: continue_speech for ordinary continuation of the current partial utterance, interrupt_and_redirect_speech only for urgent or safety-priority interruption, or abort_speech only when the partial should stop without completion.";
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
@@ -158,16 +160,80 @@ struct DeclineSpeechNowOutput {
     accepted: bool,
 }
 
+#[lutum::tool_input(name = "continue_speech", output = ContinueSpeechOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Call when an in-progress utterance should continue to the same target.
+struct ContinueSpeechArgs {
+    /// Speech-facing information to render as a continuation of the already
+    /// emitted partial utterance.
+    speech_content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct ContinueSpeechOutput {
+    accepted: bool,
+}
+
+#[lutum::tool_input(name = "interrupt_and_redirect_speech", output = InterruptAndRedirectSpeechOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Call only when urgent or safety-priority cognition must interrupt the current
+/// partial utterance and redirect outward speech to another allowed target.
+struct InterruptAndRedirectSpeechArgs {
+    /// The participant who should immediately hear the redirected utterance.
+    target: SpeechTarget,
+    /// Speech-facing information to render for `target`.
+    speech_content: String,
+    /// Why the in-progress utterance must be interrupted now.
+    interrupt_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct InterruptAndRedirectSpeechOutput {
+    accepted: bool,
+}
+
+#[lutum::tool_input(name = "abort_speech", output = AbortSpeechOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Call only when the partial utterance should stop without completion.
+struct AbortSpeechArgs {
+    /// Why the in-progress utterance should stop without completion.
+    interrupt_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct AbortSpeechOutput {
+    accepted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 enum SpeakTools {
     PrepareSpeech(PrepareSpeechArgs),
     DeclineSpeechNow(DeclineSpeechNowArgs),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+enum ActiveSpeakTools {
+    ContinueSpeech(ContinueSpeechArgs),
+    InterruptAndRedirectSpeech(InterruptAndRedirectSpeechArgs),
+    AbortSpeech(AbortSpeechArgs),
+}
+
 #[derive(Clone, Debug)]
 struct PlannedSpeech {
     args: PrepareSpeechArgs,
     target: String,
+}
+
+#[derive(Clone, Debug)]
+enum ActiveSpeechPlan {
+    Continue(PlannedSpeech),
+    Redirect {
+        plan: PlannedSpeech,
+        interrupt_reason: String,
+    },
+    Abort {
+        interrupt_reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -268,6 +334,19 @@ fn render_in_progress_utterance_memo(args: &PrepareSpeechArgs, draft: &Generatio
     )
 }
 
+fn render_aborted_utterance_memo(draft: &GenerationDraft, reason: &str) -> String {
+    format!(
+        "Aborted utterance to {}. Reason:\n{}\n\nAlready emitted:\n{}",
+        draft.target.trim(),
+        reason.trim(),
+        if draft.accumulated.trim().is_empty() {
+            "(none)"
+        } else {
+            draft.accumulated.trim()
+        },
+    )
+}
+
 fn render_completed_utterance_planning_record(draft: &GenerationDraft, text: &str) -> String {
     format!(
         "Completed outward utterance to {}:\n{}",
@@ -284,6 +363,19 @@ fn render_in_progress_utterance_planning_record(
         "Outward speech currently in progress to {}:\nPlanned substance:\n{}\n\nAlready emitted:\n{}",
         draft.target.trim(),
         args.speech_content.trim(),
+        if draft.accumulated.trim().is_empty() {
+            "(none)"
+        } else {
+            draft.accumulated.trim()
+        },
+    )
+}
+
+fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &str) -> String {
+    format!(
+        "Aborted outward speech to {}. Reason:\n{}\n\nAlready emitted:\n{}",
+        draft.target.trim(),
+        reason.trim(),
         if draft.accumulated.trim().is_empty() {
             "(none)"
         } else {
@@ -410,7 +502,12 @@ fn push_planning_context(
     active: Option<&ActiveSpeech>,
 ) {
     session.push_user(format_planning_input(cognition_context, active));
-    session.push_ephemeral_developer(PLANNING_TURN_DEVELOPER_INSTRUCTION);
+    let instruction = if active.is_some() {
+        ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION
+    } else {
+        FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION
+    };
+    session.push_ephemeral_developer(instruction);
 }
 
 #[derive(Debug)]
@@ -547,8 +644,8 @@ impl SpeakModule {
                 };
                 (cognition_context, plan, active.draft)
             } else {
-                let Some(plan) = self
-                    .plan_speech(cx, &cognition_context, Some(&active))
+                let Some(active_plan) = self
+                    .plan_active_speech(cx, &cognition_context, &active)
                     .await?
                 else {
                     self.reflect_generation_cognition_entries(
@@ -557,14 +654,33 @@ impl SpeakModule {
                         self.clock.now(),
                     )
                     .await?;
+                    self.active_speech = Some(active);
+                    self.self_wake.wake();
                     return Ok(());
                 };
-                if plan.target == active.draft.target {
-                    (cognition_context, plan, active.draft)
-                } else {
-                    let draft =
-                        GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
-                    (cognition_context, plan, draft)
+                match active_plan {
+                    ActiveSpeechPlan::Continue(plan) => (cognition_context, plan, active.draft),
+                    ActiveSpeechPlan::Redirect {
+                        plan,
+                        interrupt_reason,
+                    } => {
+                        self.record_aborted_generation(cx, &active.draft, &interrupt_reason)
+                            .await?;
+                        let draft =
+                            GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
+                        (cognition_context, plan, draft)
+                    }
+                    ActiveSpeechPlan::Abort { interrupt_reason } => {
+                        self.record_aborted_generation(cx, &active.draft, &interrupt_reason)
+                            .await?;
+                        self.reflect_generation_cognition_entries(
+                            cx,
+                            &batch.cognition_entries,
+                            self.clock.now(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
             }
         } else {
@@ -573,7 +689,7 @@ impl SpeakModule {
             else {
                 return Ok(());
             };
-            let Some(plan) = self.plan_speech(cx, &cognition_context, None).await? else {
+            let Some(plan) = self.plan_speech(cx, &cognition_context).await? else {
                 self.reflect_generation_cognition_entries(
                     cx,
                     &batch.cognition_entries,
@@ -630,10 +746,9 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
-        active: Option<&ActiveSpeech>,
     ) -> Result<Option<PlannedSpeech>> {
         self.ensure_planning_session_seeded(cx);
-        push_planning_context(&mut self.planning_session, cognition_context, active);
+        push_planning_context(&mut self.planning_session, cognition_context, None);
 
         let lutum = self.llm.lutum().await;
         let target_schema = self.scene.target_schema();
@@ -720,6 +835,137 @@ impl SpeakModule {
                 round
                     .commit(&mut self.planning_session, results)
                     .context("commit speak planning tool round")?;
+                cx.compact_and_save(&mut self.planning_session, usage)
+                    .await?;
+                Ok(selected)
+            }
+        }
+    }
+
+    async fn plan_active_speech(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        cognition_context: &str,
+        active: &ActiveSpeech,
+    ) -> Result<Option<ActiveSpeechPlan>> {
+        self.ensure_planning_session_seeded(cx);
+        push_planning_context(&mut self.planning_session, cognition_context, Some(active));
+
+        let lutum = self.llm.lutum().await;
+        let target_schema = self.scene.target_schema();
+        let validation_schema = target_schema.clone();
+        let outcome = SPEECH_TARGET_SCHEMA
+            .scope(target_schema, async {
+                self.planning_session
+                    .text_turn()
+                    .tools::<ActiveSpeakTools>()
+                    .available_tools([
+                        ActiveSpeakToolsSelector::ContinueSpeech,
+                        ActiveSpeakToolsSelector::InterruptAndRedirectSpeech,
+                        ActiveSpeakToolsSelector::AbortSpeech,
+                    ])
+                    .require_any_tool()
+                    .max_output_tokens(SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS)
+                    .collect_controlled_with(
+                        &lutum,
+                        nuillu_module::AbortOnAvailableToolNameInText::new(),
+                    )
+                    .await
+                    .context("active speak planning turn failed")
+            })
+            .await?;
+
+        match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                cx.compact_and_save(&mut self.planning_session, result.usage)
+                    .await?;
+                let detail = "model finished with assistant output but no tool call \
+                    (require_any_tool should have prevented this outcome)";
+                cx.warn(format!("active speak planning failed: {detail}"));
+                anyhow::bail!(
+                    "active speak planning finished without required tool call: {detail}"
+                );
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                cx.compact_and_save(&mut self.planning_session, result.usage)
+                    .await?;
+                let detail = "model finished with no output and no tool call \
+                    (require_any_tool should have prevented this outcome)";
+                cx.warn(format!("active speak planning failed: {detail}"));
+                anyhow::bail!(
+                    "active speak planning finished without required tool call: {detail}"
+                );
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let usage = round.usage;
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                if round.tool_calls.is_empty() {
+                    let detail = "model returned NeedsTools outcome with empty tool_calls; \
+                        expected continue_speech, interrupt_and_redirect_speech, or abort_speech";
+                    cx.warn(format!("active speak planning failed: {detail}"));
+                    anyhow::bail!(
+                        "active speak planning finished without required tool call: {detail}"
+                    );
+                }
+                let mut selected = None;
+                let mut results = Vec::new();
+                for call in round.tool_calls.iter().cloned() {
+                    match call {
+                        ActiveSpeakToolsCall::ContinueSpeech(call) => {
+                            let accepted = selected.is_none();
+                            if accepted {
+                                let target = active.draft.target.trim().to_owned();
+                                selected = Some(ActiveSpeechPlan::Continue(PlannedSpeech {
+                                    args: PrepareSpeechArgs {
+                                        target: SpeechTarget::from(target.clone()),
+                                        speech_content: call.input.speech_content.clone(),
+                                    },
+                                    target,
+                                }));
+                            }
+                            results.push(
+                                call.complete(ContinueSpeechOutput { accepted })
+                                    .context("complete continue_speech tool call")?,
+                            );
+                        }
+                        ActiveSpeakToolsCall::InterruptAndRedirectSpeech(call) => {
+                            let target = call.input.target.as_str().trim().to_owned();
+                            let accepted = selected.is_none()
+                                && is_target_allowed_by_schema(&validation_schema, &target);
+                            if accepted {
+                                selected = Some(ActiveSpeechPlan::Redirect {
+                                    plan: PlannedSpeech {
+                                        args: PrepareSpeechArgs {
+                                            target: call.input.target.clone(),
+                                            speech_content: call.input.speech_content.clone(),
+                                        },
+                                        target,
+                                    },
+                                    interrupt_reason: call.input.interrupt_reason.clone(),
+                                });
+                            }
+                            results.push(
+                                call.complete(InterruptAndRedirectSpeechOutput { accepted })
+                                    .context("complete interrupt_and_redirect_speech tool call")?,
+                            );
+                        }
+                        ActiveSpeakToolsCall::AbortSpeech(call) => {
+                            let accepted = selected.is_none();
+                            if accepted {
+                                selected = Some(ActiveSpeechPlan::Abort {
+                                    interrupt_reason: call.input.interrupt_reason.clone(),
+                                });
+                            }
+                            results.push(
+                                call.complete(AbortSpeechOutput { accepted })
+                                    .context("complete abort_speech tool call")?,
+                            );
+                        }
+                    }
+                }
+                round
+                    .commit(&mut self.planning_session, results)
+                    .context("commit active speak planning tool round")?;
                 cx.compact_and_save(&mut self.planning_session, usage)
                     .await?;
                 Ok(selected)
@@ -896,6 +1142,40 @@ impl SpeakModule {
         self.memo
             .write(render_in_progress_utterance_memo(args, draft))
             .await;
+        cx.compact_and_save(&mut self.planning_session, Usage::zero())
+            .await?;
+        Ok(())
+    }
+
+    async fn record_aborted_generation(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        draft: &GenerationDraft,
+        reason: &str,
+    ) -> Result<()> {
+        self.memo
+            .write(render_aborted_utterance_memo(draft, reason))
+            .await;
+        self.utterance
+            .record_progress(UtteranceProgress::aborted(
+                draft.generation_id,
+                draft.sequence,
+                draft.target.clone(),
+                draft.accumulated.clone(),
+            ))
+            .await;
+        self.utterance
+            .abort(
+                draft.target.clone(),
+                draft.generation_id,
+                draft.sequence,
+                draft.accumulated.clone(),
+                reason.to_owned(),
+            )
+            .await;
+        self.ensure_planning_session_seeded(cx);
+        self.planning_session
+            .push_system(render_aborted_utterance_planning_record(draft, reason));
         cx.compact_and_save(&mut self.planning_session, Usage::zero())
             .await?;
         Ok(())
@@ -1119,6 +1399,81 @@ mod tests {
             }),
             Ok(RawTextTurnEvent::Completed {
                 request_id: Some("decline-speech-now".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn continue_speech_scenario(speech_content: &str) -> MockTextScenario {
+        let arguments_json = serde_json::json!({
+            "speech_content": speech_content
+        })
+        .to_string();
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("continue-speech".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-continue-speech".into(),
+                name: "continue_speech".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("continue-speech".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn interrupt_and_redirect_speech_scenario(
+        target: &str,
+        speech_content: &str,
+        interrupt_reason: &str,
+    ) -> MockTextScenario {
+        let arguments_json = serde_json::json!({
+            "target": target,
+            "speech_content": speech_content,
+            "interrupt_reason": interrupt_reason
+        })
+        .to_string();
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("interrupt-and-redirect-speech".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-interrupt-and-redirect-speech".into(),
+                name: "interrupt_and_redirect_speech".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("interrupt-and-redirect-speech".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: Usage::zero(),
+            }),
+        ])
+    }
+
+    fn abort_speech_scenario(interrupt_reason: &str) -> MockTextScenario {
+        let arguments_json = serde_json::json!({
+            "interrupt_reason": interrupt_reason
+        })
+        .to_string();
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("abort-speech".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-abort-speech".into(),
+                name: "abort_speech".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("abort-speech".into()),
                 finish_reason: FinishReason::ToolCall,
                 usage: Usage::zero(),
             }),
@@ -2130,13 +2485,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn active_speech_continue_preserves_target_and_prefills_partial_japanese_greeting() {
+        let partial = "Aliceの挨拶には、親しみを";
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario(
+                "everyone",
+                "Aliceの挨拶に親しみを込めて短く応える。",
+            ))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                "Alice",
+                "の",
+                "挨",
+                "拶",
+                "に",
+                "は",
+                "、",
+                "親しみを",
+            ]))
+            .with_text_scenario(continue_speech_scenario(
+                "Aliceの挨拶に親しみを込めて短く応える。",
+            ))
+            .with_text_scenario(generation_text_scenario("込めて、こんにちは。"));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
+        caps.scene().set([Participant::new("Alice")]);
+        let now = SystemClock.now();
+        publish_cognition_update(&blackboard, &caps, now, "Alice greets Nuillu in Japanese.").await;
+        let first_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &first_batch)
+            .await
+            .unwrap();
+
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now + chrono::Duration::seconds(1),
+            "Alice is still present and waiting for the greeting reply.",
+        )
+        .await;
+        let second_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(1)).await;
+        SpeakModule::activate(&mut module, &cx, &second_batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[(
+                "everyone".to_string(),
+                "Aliceの挨拶には、親しみを込めて、こんにちは。".to_string(),
+            )]
+        );
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 4);
+        let generation_input = &inputs[3];
+        let items = generation_input.items();
+        assert!(items.len() >= 2);
+        let tail = &items[items.len() - 2..];
+        let ModelInputItem::Message { role, content } = &tail[0] else {
+            panic!("expected continuation generation user context");
+        };
+        assert_eq!(role, &InputMessageRole::User);
+        let user_text = content
+            .as_slice()
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_text.contains("Speak to: everyone"));
+        assert!(
+            user_text.contains("Substance to express:\nAliceの挨拶に親しみを込めて短く応える。")
+        );
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
+            panic!("expected assistant partial utterance prefill");
+        };
+        assert_eq!(text, partial);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn text_sliced_speech_replans_with_late_cognition_and_prefills_generation() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to duck soon."))
             .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "d", "u",
             ]))
-            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to duck now."))
+            .with_text_scenario(continue_speech_scenario("Tell Koro to duck now."))
             .with_text_scenario(generation_text_scenario("ck now."));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
@@ -2220,7 +2668,11 @@ mod tests {
             .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
-            .with_text_scenario(prepare_speech_scenario("Pibi", "Tell Pibi to duck now."))
+            .with_text_scenario(interrupt_and_redirect_speech_scenario(
+                "Pibi",
+                "Tell Pibi to duck now.",
+                "Pibi is in immediate danger.",
+            ))
             .with_text_scenario(generation_text_scenario("Pibi, duck now."));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
@@ -2284,7 +2736,15 @@ mod tests {
         assert_eq!(observed.text_turns().len(), 4);
         let planning_text = session_input_text(&module.planning_session);
         assert!(!planning_text.contains("Completed outward utterance to Koro:\nKoro, st"));
+        assert!(planning_text.contains("Aborted outward speech to Koro"));
+        assert!(planning_text.contains("Already emitted:\nKoro, st"));
         assert!(planning_text.contains("Pibi is in immediate danger"));
+        let memos = speak_memos(&blackboard).await;
+        assert!(
+            memos
+                .iter()
+                .any(|memo| memo.contains("Aborted utterance to Koro"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2294,7 +2754,7 @@ mod tests {
             .with_text_scenario(generation_text_sliced_scenario(&[
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
-            .with_text_scenario(decline_speech_now_scenario("speech is no longer needed"));
+            .with_text_scenario(abort_speech_scenario("speech is no longer needed"));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
@@ -2346,9 +2806,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             progress.state,
-            nuillu_blackboard::UtteranceProgressState::Streaming
+            nuillu_blackboard::UtteranceProgressState::Aborted
         );
         assert_eq!(progress.partial_utterance, "Koro, st");
+        let memos = speak_memos(&blackboard).await;
+        assert!(
+            memos
+                .iter()
+                .any(|memo| memo.contains("Aborted utterance to Koro"))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

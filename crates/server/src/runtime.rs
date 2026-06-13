@@ -1,4 +1,4 @@
-use std::{fs, net::TcpListener, time::Duration};
+use std::{cell::RefCell, fs, net::TcpListener, rc::Rc, time::Duration};
 
 use anyhow::Context as _;
 use nuillu_agent::{AgentEventLoopConfig, AgentRunController, run_controlled as run_agent};
@@ -11,7 +11,8 @@ use tokio::{runtime::Builder, task::LocalSet};
 
 use crate::SERVER_TAB_ID;
 use crate::commands::{
-    apply_persisted_module_settings, drive_server_until_shutdown, emit_scene_state,
+    apply_persisted_module_settings, drive_server_until_shutdown, emit_scene_activity_snapshot,
+    emit_scene_state,
 };
 use crate::config::ServerConfig;
 use crate::environment::build_server_environment;
@@ -22,7 +23,7 @@ use crate::gui::{
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
 use crate::snapshot::{emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page};
-use crate::state::{ModuleSettingsState, SceneState};
+use crate::state::{ModuleSettingsState, SceneActivityState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
 
@@ -103,6 +104,9 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         &legacy_ambient_path,
         &config.participants,
     )?;
+    let activity = Rc::new(RefCell::new(SceneActivityState::load(
+        config.state_dir.join("scene-activity.json"),
+    )?));
     scene.save()?;
     let mut module_settings =
         ModuleSettingsState::load(config.state_dir.join("module-settings.json"))?;
@@ -112,10 +116,12 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
         &config,
         full_agent_allocation(&config.boot_config),
         visualizer.event_sender(),
+        Rc::clone(&activity),
     )
     .await?;
     env.caps.scene().set(scene.participants());
     emit_scene_state(&scene, visualizer, &tab_id);
+    emit_scene_activity_snapshot(&activity, visualizer, &tab_id);
     for module in config
         .disabled_modules
         .iter()
@@ -175,6 +181,7 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
                 visualizer,
                 &tab_id,
                 &mut scene,
+                Rc::clone(&activity),
                 &mut module_settings,
                 &sensory,
                 &env,

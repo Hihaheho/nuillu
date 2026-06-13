@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use nuillu_module::{
 };
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
-use nuillu_speak::{Utterance, UtteranceDelta, UtteranceSink};
+use nuillu_speak::{Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink};
 use nuillu_visualizer_protocol::{
     UtteranceDeltaView, UtteranceView, VisualizerEvent, VisualizerTabId,
 };
@@ -39,6 +40,7 @@ use super::memory_seed::seed_memory_from_state_dir;
 use super::runtime_event_log::{
     RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
 };
+use super::state::SceneActivityState;
 
 pub(super) struct ServerEnvironment {
     pub(super) blackboard: Blackboard,
@@ -55,6 +57,7 @@ pub(super) async fn build_server_environment(
     config: &ServerConfig,
     allocation: nuillu_blackboard::ResourceAllocation,
     visualizer: VisualizerEventSink,
+    activity: Rc<RefCell<SceneActivityState>>,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
     let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
@@ -73,13 +76,15 @@ pub(super) async fn build_server_environment(
         "nuillu-server runtime-event-log path={}",
         runtime_event_log.path().display()
     );
+    let clock: Rc<dyn Clock> = Rc::new(SystemClock);
     let visualizer_for_events = visualizer.clone();
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
         visualizer,
+        activity,
+        clock.clone(),
     ));
-    let clock: Rc<dyn Clock> = Rc::new(SystemClock);
     let agent_store = connect_agent_store(config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
@@ -461,26 +466,64 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
     }
 }
 
-#[derive(Debug)]
 struct ServerUtteranceSink {
     tab_id: String,
     visualizer: VisualizerEventSink,
+    activity: Rc<RefCell<SceneActivityState>>,
+    clock: Rc<dyn Clock>,
 }
 
 impl ServerUtteranceSink {
-    fn new(tab_id: String, visualizer: VisualizerEventSink) -> Self {
-        Self { tab_id, visualizer }
+    fn new(
+        tab_id: String,
+        visualizer: VisualizerEventSink,
+        activity: Rc<RefCell<SceneActivityState>>,
+        clock: Rc<dyn Clock>,
+    ) -> Self {
+        Self {
+            tab_id,
+            visualizer,
+            activity,
+            clock,
+        }
+    }
+
+    fn emit_activity_upserts(
+        &self,
+        entries: Vec<nuillu_visualizer_protocol::SceneActivityEntryView>,
+    ) {
+        for entry in entries {
+            self.visualizer
+                .send(VisualizerEvent::SceneActivityEntryUpsert {
+                    tab_id: VisualizerTabId::new(self.tab_id.clone()),
+                    entry,
+                });
+        }
     }
 }
 
 #[async_trait(?Send)]
 impl UtteranceSink for ServerUtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
+        let sender = utterance.sender.to_string();
+        let target = utterance.target.clone();
+        let entries = self.activity.borrow_mut().record_speech_completed(
+            utterance.emitted_at,
+            sender.clone(),
+            target.clone(),
+            utterance.generation_id,
+            0,
+            utterance.text.clone(),
+        );
+        if let Err(error) = self.activity.borrow_mut().save_if_dirty() {
+            tracing::warn!(error = ?error, "scene activity save failed after utterance completion");
+        }
+        self.emit_activity_upserts(entries);
         self.visualizer.send(VisualizerEvent::UtteranceCompleted {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),
             utterance: UtteranceView {
-                sender: utterance.sender.to_string(),
-                target: utterance.target,
+                sender,
+                target,
                 generation_id: Some(utterance.generation_id),
                 text: utterance.text,
                 emitted_at: utterance.emitted_at,
@@ -490,16 +533,45 @@ impl UtteranceSink for ServerUtteranceSink {
     }
 
     async fn on_delta(&self, delta: UtteranceDelta) -> Result<(), PortError> {
+        let sender = delta.sender.to_string();
+        let target = delta.target.clone();
+        let entries = self.activity.borrow_mut().record_speech_delta(
+            self.clock.now(),
+            sender.clone(),
+            target.clone(),
+            delta.generation_id,
+            delta.sequence,
+            delta.delta.clone(),
+        );
+        self.emit_activity_upserts(entries);
         self.visualizer.send(VisualizerEvent::UtteranceDelta {
             tab_id: VisualizerTabId::new(self.tab_id.clone()),
             utterance: UtteranceDeltaView {
-                sender: delta.sender.to_string(),
-                target: delta.target,
+                sender,
+                target,
                 generation_id: delta.generation_id,
                 sequence: delta.sequence,
                 delta: delta.delta,
             },
         });
+        Ok(())
+    }
+
+    async fn on_abort(&self, abort: UtteranceAbort) -> Result<(), PortError> {
+        let sender = abort.sender.to_string();
+        let target = abort.target.clone();
+        let entries = self.activity.borrow_mut().record_speech_aborted(
+            abort.aborted_at,
+            sender,
+            target,
+            abort.generation_id,
+            abort.sequence,
+            abort.partial_utterance,
+        );
+        if let Err(error) = self.activity.borrow_mut().save_if_dirty() {
+            tracing::warn!(error = ?error, reason = %abort.reason, "scene activity save failed after utterance abort");
+        }
+        self.emit_activity_upserts(entries);
         Ok(())
     }
 }

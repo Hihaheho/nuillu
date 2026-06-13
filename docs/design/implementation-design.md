@@ -294,6 +294,16 @@ pub struct UtteranceDelta {
     pub sequence: u32,      // monotone within a generation
     pub delta: String,
 }
+
+pub struct UtteranceAbort {
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub partial_utterance: String,
+    pub reason: String,
+    pub aborted_at: DateTime<Utc>,
+}
 ```
 
 `UtteranceWriter` owner-stamps the emitting module instance, stamps `emitted_at` from `Clock`, and sends utterances to an `UtteranceSink`. The writer is a side-effect capability like `CognitionWriter`; it is not a request/response path.
@@ -302,9 +312,10 @@ pub struct UtteranceDelta {
 
 - `emit(target, text)` — stamps `emitted_at`, owner, target, and sends a complete `Utterance` to the sink. Used by any non-streaming utterance path.
 - `emit_delta(target, generation_id, sequence, delta)` — sends a targeted `UtteranceDelta` chunk. Used by the speak module during streaming. After the stream completes, speak also calls `emit()` with the full assembled text so that sinks which only consume complete utterances receive a well-formed record.
+- `abort(target, generation_id, sequence, partial_utterance, reason)` — sends a targeted `UtteranceAbort` for a partial utterance that should not continue or complete.
 - `record_progress(progress)` — owner-stamps the latest utterance progress on the blackboard so hosts and observers can inspect active or completed speech state.
 
-`UtteranceDelta` carries no durability semantics. When generation retries, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Cognition-log updates that arrive during streaming are checked by Speak's abort judge; if they do not require immediate interruption, generation continues and any buffered updates are judged in order. Sinks append resumed retry chunks to their in-progress buffer. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
+`UtteranceDelta` carries no durability semantics. When generation retries or ordinary active-speech continuation occurs, speak keeps the same `generation_id`, passes the already-emitted partial utterance back into the next generation request, and continues with the next `sequence`. Active-speech planning does not expose target selection for ordinary continuation; it can redirect only through an explicit urgent interruption tool, and redirects or aborts send `UtteranceAbort` before any replacement speech starts. Sinks append resumed retry chunks to their in-progress buffer and mark aborted partials as no longer streaming. Eval harnesses (Section 7) ignore deltas entirely and score output only from complete `Utterance` records.
 
 Speak stores LLM history in three separate persistent sessions: `planning` for target-selection tool
 turns, `generation` for completed assistant utterance turns, and `abort-judge` for interruption

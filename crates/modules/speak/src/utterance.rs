@@ -36,12 +36,27 @@ pub struct UtteranceDelta {
     pub delta: String,
 }
 
+/// A partial user-visible utterance that was intentionally stopped.
+pub struct UtteranceAbort {
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub partial_utterance: String,
+    pub reason: String,
+    pub aborted_at: DateTime<Utc>,
+}
+
 /// Append-only sink for utterances. Adapters provide concrete implementations.
 #[async_trait(?Send)]
 pub trait UtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError>;
 
     async fn on_delta(&self, _delta: UtteranceDelta) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn on_abort(&self, _abort: UtteranceAbort) -> Result<(), PortError> {
         Ok(())
     }
 }
@@ -139,6 +154,32 @@ impl UtteranceWriter {
         };
         if let Err(e) = self.sink.on_delta(delta).await {
             tracing::warn!(error = ?e, "utterance sink delta failed");
+        }
+    }
+
+    pub async fn abort(
+        &self,
+        target: impl Into<String>,
+        generation_id: u64,
+        sequence: u32,
+        partial_utterance: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let Some(target) = normalized_target(target) else {
+            tracing::warn!("utterance sink abort skipped empty target");
+            return;
+        };
+        let abort = UtteranceAbort {
+            sender: self.owner.clone(),
+            target,
+            generation_id,
+            sequence,
+            partial_utterance: partial_utterance.into(),
+            reason: reason.into(),
+            aborted_at: self.clock.now(),
+        };
+        if let Err(e) = self.sink.on_abort(abort).await {
+            tracing::warn!(error = ?e, "utterance sink abort failed");
         }
     }
 

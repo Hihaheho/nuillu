@@ -269,6 +269,12 @@ impl VisualizerState {
                     .scene
                     .push_utterance_completed(utterance);
             }
+            VisualizerEvent::SceneActivitySnapshot { tab_id, entries } => {
+                self.tab_mut(tab_id).scene.apply_activity_snapshot(entries);
+            }
+            VisualizerEvent::SceneActivityEntryUpsert { tab_id, entry } => {
+                self.tab_mut(tab_id).scene.upsert_activity_entry(entry);
+            }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);
                 let now_secs = tab.resource_monitor_elapsed_secs();

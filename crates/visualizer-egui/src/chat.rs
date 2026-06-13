@@ -4,9 +4,9 @@ use std::sync::mpsc::Sender;
 use nuillu_module::SensoryInput;
 
 use crate::{
-    DerivedAmbientSensoryRowView, SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView,
-    UtteranceView, VisualizerClientMessage, VisualizerCommand, VisualizerTabId,
-    text::wrapped_label,
+    DerivedAmbientSensoryRowView, SceneActivityEntryView, SceneRowKind, SceneRowView,
+    SceneStateView, SpeechSegmentStatusView, UtteranceDeltaView, UtteranceView,
+    VisualizerClientMessage, VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -43,6 +43,7 @@ impl ActivityRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActivityMessage {
+    id: Option<String>,
     role: ActivityRole,
     content: String,
     source: Option<String>,
@@ -52,6 +53,7 @@ struct ActivityMessage {
 impl ActivityMessage {
     fn new(role: ActivityRole, content: impl Into<String>) -> Self {
         Self {
+            id: None,
             role,
             content: content.into(),
             source: None,
@@ -71,6 +73,7 @@ struct UtteranceKey {
 pub struct SceneUiState {
     scene: SceneStateView,
     activity: Vec<ActivityMessage>,
+    activity_authoritative: bool,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
     completed_utterances: BTreeMap<UtteranceKey, usize>,
     person_message_drafts: BTreeMap<String, String>,
@@ -96,6 +99,9 @@ impl SceneUiState {
     }
 
     pub fn push_sensory_input(&mut self, input: SensoryInput) {
+        if self.activity_authoritative {
+            return;
+        }
         let SensoryInput::OneShot {
             modality,
             direction,
@@ -121,6 +127,9 @@ impl SceneUiState {
     }
 
     pub fn push_utterance_delta(&mut self, delta: UtteranceDeltaView) {
+        if self.activity_authoritative {
+            return;
+        }
         let key = UtteranceKey {
             sender: delta.sender.clone(),
             target: delta.target.clone(),
@@ -135,6 +144,7 @@ impl SceneUiState {
             let index = self.activity.len();
             self.streaming_utterances.insert(key, index);
             self.activity.push(ActivityMessage {
+                id: None,
                 role: ActivityRole::Assistant,
                 content: String::new(),
                 streaming: true,
@@ -149,6 +159,9 @@ impl SceneUiState {
     }
 
     pub fn push_utterance_completed(&mut self, utterance: UtteranceView) {
+        if self.activity_authoritative {
+            return;
+        }
         let matching_key = if let Some(generation_id) = utterance.generation_id {
             let key = UtteranceKey {
                 sender: utterance.sender.clone(),
@@ -198,6 +211,36 @@ impl SceneUiState {
         }
     }
 
+    pub fn apply_activity_snapshot(&mut self, entries: Vec<SceneActivityEntryView>) {
+        self.activity_authoritative = true;
+        self.streaming_utterances.clear();
+        self.completed_utterances.clear();
+        self.activity = entries
+            .into_iter()
+            .map(activity_message_from_entry)
+            .collect();
+    }
+
+    pub fn upsert_activity_entry(&mut self, entry: SceneActivityEntryView) {
+        if !self.activity_authoritative {
+            self.activity.clear();
+            self.streaming_utterances.clear();
+            self.completed_utterances.clear();
+            self.activity_authoritative = true;
+        }
+        let id = entry.id().to_string();
+        let message = activity_message_from_entry(entry);
+        if let Some(existing) = self
+            .activity
+            .iter_mut()
+            .find(|existing| existing.id.as_deref() == Some(id.as_str()))
+        {
+            *existing = message;
+        } else {
+            self.activity.push(message);
+        }
+    }
+
     fn send_person_message_commands(
         &mut self,
         tab_id: &VisualizerTabId,
@@ -238,6 +281,36 @@ impl SceneUiState {
                 },
             },
         ]
+    }
+}
+
+fn activity_message_from_entry(entry: SceneActivityEntryView) -> ActivityMessage {
+    match entry {
+        SceneActivityEntryView::UserMessage {
+            id,
+            content,
+            source,
+            ..
+        } => {
+            let mut message = ActivityMessage::new(ActivityRole::User, content);
+            message.id = Some(id);
+            message.source = Some(source);
+            message
+        }
+        SceneActivityEntryView::SpeechSegment {
+            id,
+            sender,
+            target,
+            content,
+            status,
+            ..
+        } => ActivityMessage {
+            id: Some(id),
+            role: ActivityRole::Assistant,
+            content,
+            source: Some(format!("{sender} -> {target}")),
+            streaming: status == SpeechSegmentStatusView::Streaming,
+        },
     }
 }
 
@@ -795,6 +868,106 @@ mod tests {
         assert!(!state.activity[0].streaming);
     }
 
+    #[test]
+    fn activity_snapshot_restores_split_streaming_speech() {
+        let mut state = SceneUiState::default();
+
+        state.apply_activity_snapshot(vec![
+            speech_segment(
+                "speech:0",
+                0,
+                0,
+                1,
+                "Koro, stay",
+                SpeechSegmentStatusView::Interrupted,
+            ),
+            user_message("user:1", "Koro says, \"wait\""),
+            speech_segment(
+                "speech:2",
+                1,
+                2,
+                2,
+                " close.",
+                SpeechSegmentStatusView::Streaming,
+            ),
+        ]);
+
+        assert_eq!(state.activity.len(), 3);
+        assert_eq!(state.activity[0].content, "Koro, stay");
+        assert!(!state.activity[0].streaming);
+        assert_eq!(state.activity[1].role, ActivityRole::User);
+        assert_eq!(state.activity[1].content, "Koro says, \"wait\"");
+        assert_eq!(state.activity[2].content, " close.");
+        assert!(state.activity[2].streaming);
+    }
+
+    #[test]
+    fn activity_upsert_completes_split_segments_without_collapsing_them() {
+        let mut state = SceneUiState::default();
+        state.apply_activity_snapshot(vec![
+            speech_segment(
+                "speech:0",
+                0,
+                0,
+                1,
+                "Koro, stay",
+                SpeechSegmentStatusView::Interrupted,
+            ),
+            user_message("user:1", "Koro says, \"wait\""),
+            speech_segment(
+                "speech:2",
+                1,
+                2,
+                2,
+                " close.",
+                SpeechSegmentStatusView::Streaming,
+            ),
+        ]);
+
+        state.upsert_activity_entry(speech_segment(
+            "speech:0",
+            0,
+            0,
+            1,
+            "Koro, stay",
+            SpeechSegmentStatusView::Completed,
+        ));
+        state.upsert_activity_entry(speech_segment(
+            "speech:2",
+            1,
+            2,
+            2,
+            " close.",
+            SpeechSegmentStatusView::Completed,
+        ));
+
+        assert_eq!(state.activity.len(), 3);
+        assert_eq!(state.activity[0].content, "Koro, stay");
+        assert_eq!(state.activity[1].content, "Koro says, \"wait\"");
+        assert_eq!(state.activity[2].content, " close.");
+        assert!(state.activity.iter().all(|message| !message.streaming));
+    }
+
+    #[test]
+    fn authoritative_activity_ignores_legacy_live_events() {
+        let mut state = SceneUiState::default();
+
+        state.apply_activity_snapshot(vec![speech_segment(
+            "speech:0",
+            0,
+            0,
+            0,
+            "Koro",
+            SpeechSegmentStatusView::Streaming,
+        )]);
+        state.push_utterance_delta(utterance_delta(7, 1, ", duplicate"));
+        state.push_utterance_completed(utterance_completed(Some(7), "Koro, duplicate"));
+
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(state.activity[0].content, "Koro");
+        assert!(state.activity[0].streaming);
+    }
+
     fn scene_with_two_people() -> SceneUiState {
         let mut state = SceneUiState::default();
         state.set_scene_state(SceneStateView {
@@ -836,6 +1009,37 @@ mod tests {
             generation_id,
             text: text.to_string(),
             emitted_at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 51).unwrap(),
+        }
+    }
+
+    fn user_message(id: &str, content: &str) -> SceneActivityEntryView {
+        SceneActivityEntryView::UserMessage {
+            id: id.to_string(),
+            at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 52).unwrap(),
+            content: content.to_string(),
+            source: "one-shot audition from Koro".to_string(),
+        }
+    }
+
+    fn speech_segment(
+        id: &str,
+        segment_index: u32,
+        start_sequence: u32,
+        end_sequence: u32,
+        content: &str,
+        status: SpeechSegmentStatusView,
+    ) -> SceneActivityEntryView {
+        SceneActivityEntryView::SpeechSegment {
+            id: id.to_string(),
+            at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 51).unwrap(),
+            sender: "speak".to_string(),
+            target: "Koro".to_string(),
+            generation_id: 7,
+            segment_index,
+            start_sequence,
+            end_sequence,
+            content: content.to_string(),
+            status,
         }
     }
 }

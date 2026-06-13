@@ -175,6 +175,14 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         utterance: UtteranceView,
     },
+    SceneActivitySnapshot {
+        tab_id: VisualizerTabId,
+        entries: Vec<SceneActivityEntryView>,
+    },
+    SceneActivityEntryUpsert {
+        tab_id: VisualizerTabId,
+        entry: SceneActivityEntryView,
+    },
     RuntimeEvent {
         tab_id: VisualizerTabId,
         event: RuntimeEvent,
@@ -545,6 +553,45 @@ pub struct UtteranceView {
     pub generation_id: Option<u64>,
     pub text: String,
     pub emitted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SceneActivityEntryView {
+    UserMessage {
+        id: String,
+        at: DateTime<Utc>,
+        content: String,
+        source: String,
+    },
+    SpeechSegment {
+        id: String,
+        at: DateTime<Utc>,
+        sender: String,
+        target: String,
+        generation_id: u64,
+        segment_index: u32,
+        start_sequence: u32,
+        end_sequence: u32,
+        content: String,
+        status: SpeechSegmentStatusView,
+    },
+}
+
+impl SceneActivityEntryView {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::UserMessage { id, .. } | Self::SpeechSegment { id, .. } => id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechSegmentStatusView {
+    Streaming,
+    Interrupted,
+    Completed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1177,6 +1224,66 @@ mod tests {
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::ResetModuleSessionHistory { owner, .. },
             } if owner == "predict[1]"
+        ));
+    }
+
+    #[test]
+    fn scene_activity_events_round_trip_through_json() {
+        let at = DateTime::<Utc>::from_timestamp(1_780_000_000, 0).unwrap();
+        let entry = SceneActivityEntryView::SpeechSegment {
+            id: "speech:speak:Koro:7:1".to_string(),
+            at,
+            sender: "speak".to_string(),
+            target: "Koro".to_string(),
+            generation_id: 7,
+            segment_index: 1,
+            start_sequence: 3,
+            end_sequence: 4,
+            content: " stay close".to_string(),
+            status: SpeechSegmentStatusView::Streaming,
+        };
+        let message = VisualizerServerMessage::event(VisualizerEvent::SceneActivityEntryUpsert {
+            tab_id: VisualizerTabId::new("live"),
+            entry: entry.clone(),
+        });
+
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert!(json.contains(r#""kind":"speech_segment""#));
+        assert!(json.contains(r#""status":"streaming""#));
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SceneActivityEntryUpsert {
+                    entry: actual_entry,
+                    ..
+                },
+            } if actual_entry == entry
+        ));
+
+        let entries = vec![SceneActivityEntryView::UserMessage {
+            id: "user:1".to_string(),
+            at,
+            content: "Koro says, \"wait\"".to_string(),
+            source: "one-shot audition from Koro".to_string(),
+        }];
+        let message = VisualizerServerMessage::event(VisualizerEvent::SceneActivitySnapshot {
+            tab_id: VisualizerTabId::new("live"),
+            entries: entries.clone(),
+        });
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert!(json.contains(r#""kind":"user_message""#));
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::SceneActivitySnapshot {
+                    entries: actual_entries,
+                    ..
+                },
+            } if actual_entries == entries
         ));
     }
 
