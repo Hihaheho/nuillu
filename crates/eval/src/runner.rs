@@ -6220,15 +6220,6 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
             owner,
             char_count,
         } => format!("seq={sequence} memo_updated owner={owner} chars={char_count}"),
-        RuntimeEvent::RateLimitDelayed {
-            sequence,
-            owner,
-            capability,
-            delayed_for,
-        } => format!(
-            "seq={sequence} rate_limit_delayed owner={owner} capability={capability:?} delayed_for_ms={}",
-            duration_millis_u64(*delayed_for)
-        ),
         RuntimeEvent::ModuleBatchThrottled {
             sequence,
             owner,
@@ -6759,8 +6750,7 @@ fn scheduled_wait_remaining_from_timed_events(
         .iter()
         .filter_map(|(offset_ms, event)| {
             let delayed_for = match event {
-                RuntimeEvent::RateLimitDelayed { delayed_for, .. }
-                | RuntimeEvent::ModuleBatchThrottled { delayed_for, .. } => *delayed_for,
+                RuntimeEvent::ModuleBatchThrottled { delayed_for, .. } => *delayed_for,
                 _ => return None,
             };
             let wait_until_ms = offset_ms.saturating_add(duration_millis_u64(delayed_for));
@@ -6780,8 +6770,7 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
         | RuntimeEvent::SessionCompactionFailed { .. }
         | RuntimeEvent::ModuleActivationAttemptFailed { .. }
         | RuntimeEvent::ModuleTaskFailed { .. } => true,
-        RuntimeEvent::RateLimitDelayed { .. }
-        | RuntimeEvent::ModuleBatchThrottled { .. }
+        RuntimeEvent::ModuleBatchThrottled { .. }
         | RuntimeEvent::ModuleBatchReady { .. }
         | RuntimeEvent::ModuleActivationCompleted { .. }
         | RuntimeEvent::ModuleWarning { .. } => false,
@@ -6796,7 +6785,6 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 .is_some_and(|max| call.saturating_add(1) >= max),
             RuntimeEvent::LlmCompleted { .. } => false,
             RuntimeEvent::MemoUpdated { .. } => false,
-            RuntimeEvent::RateLimitDelayed { .. } => false,
             RuntimeEvent::ModuleBatchThrottled { .. } => false,
             RuntimeEvent::ModuleBatchReady { .. } => false,
             RuntimeEvent::ModuleActivationCompleted { .. } => false,
@@ -6845,19 +6833,6 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 self.reporter.log_scope(&self.case_id),
                 owner,
                 char_count
-            ),
-            RuntimeEvent::RateLimitDelayed {
-                owner,
-                capability,
-                delayed_for,
-                ..
-            } => format!(
-                "{} rate-limit-delayed {} owner={} capability={:?} delayed_ms={}",
-                self.reporter.log_prefix(),
-                self.reporter.log_scope(&self.case_id),
-                owner,
-                capability,
-                delayed_for.as_millis()
             ),
             RuntimeEvent::ModuleBatchThrottled {
                 owner, delayed_for, ..
@@ -8876,19 +8851,11 @@ id = "module-query-memory-special-memory"
             batch_debug: "()".to_string(),
         })
         .unwrap();
-        sink.on_event(RuntimeEvent::RateLimitDelayed {
-            sequence: 2,
-            owner: owner.clone(),
-            capability: nuillu_module::CapabilityKind::LlmCall,
-            delayed_for: Duration::from_millis(250),
-        })
-        .unwrap();
-
-        assert_eq!(sink.event_count(), 3);
+        assert_eq!(sink.event_count(), 2);
         assert_eq!(sink.progress_event_count(), 0);
 
         sink.on_event(RuntimeEvent::ModuleActivationAttemptFailed {
-            sequence: 3,
+            sequence: 2,
             owner: owner.clone(),
             activation_attempt: 1,
             max_attempts: 3,
@@ -8896,22 +8863,22 @@ id = "module-query-memory-special-memory"
         })
         .unwrap();
 
-        assert_eq!(sink.event_count(), 4);
+        assert_eq!(sink.event_count(), 3);
         assert_eq!(sink.progress_event_count(), 1);
 
         sink.on_event(RuntimeEvent::MemoUpdated {
-            sequence: 4,
+            sequence: 3,
             owner,
             char_count: 42,
         })
         .unwrap();
 
-        assert_eq!(sink.event_count(), 5);
+        assert_eq!(sink.event_count(), 4);
         assert_eq!(sink.progress_event_count(), 2);
     }
 
     #[test]
-    fn scheduled_wait_remaining_tracks_throttle_and_rate_limit_deadlines() {
+    fn scheduled_wait_remaining_tracks_batch_throttle_deadlines() {
         let owner = ModuleInstanceId::new(builtin::homeostasis(), ReplicaIndex::ZERO);
         let timed_events = vec![
             (
@@ -8923,18 +8890,9 @@ id = "module-query-memory-special-memory"
                 },
             ),
             (
-                400,
-                RuntimeEvent::RateLimitDelayed {
-                    sequence: 1,
-                    owner,
-                    capability: nuillu_module::CapabilityKind::LlmCall,
-                    delayed_for: Duration::from_millis(200),
-                },
-            ),
-            (
                 450,
                 RuntimeEvent::MemoUpdated {
-                    sequence: 2,
+                    sequence: 1,
                     owner: ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO),
                     char_count: 12,
                 },

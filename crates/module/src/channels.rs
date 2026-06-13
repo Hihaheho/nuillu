@@ -10,9 +10,6 @@ use nuillu_types::{ModuleId, ModuleInstanceId};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::rate_limit::{CapabilityKind, RateLimiter, TopicKind};
-use crate::runtime_events::RuntimeEventEmitter;
-
 /// Owner-stamped message delivered over a typed topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Envelope<T> {
@@ -149,28 +146,15 @@ pub(crate) struct Topic<T: Clone> {
     blackboard: Blackboard,
     wakes: WakeRegistry,
     policy: TopicPolicy,
-    kind: TopicKind,
-    rate_limiter: RateLimiter,
-    events: RuntimeEventEmitter,
 }
 
 impl<T: Clone> Topic<T> {
-    pub(crate) fn new(
-        blackboard: Blackboard,
-        wakes: WakeRegistry,
-        policy: TopicPolicy,
-        kind: TopicKind,
-        rate_limiter: RateLimiter,
-        events: RuntimeEventEmitter,
-    ) -> Self {
+    pub(crate) fn new(blackboard: Blackboard, wakes: WakeRegistry, policy: TopicPolicy) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TopicInner::default())),
             blackboard,
             wakes,
             policy,
-            kind,
-            rate_limiter,
-            events,
         }
     }
 
@@ -226,22 +210,6 @@ impl<T: Clone> TopicMailbox<T> {
     }
 
     pub async fn publish(&self, body: T) -> Result<usize, Envelope<T>> {
-        let capability = CapabilityKind::ChannelPublish {
-            topic: self.topic.kind,
-        };
-        let outcome = self
-            .topic
-            .rate_limiter
-            .acquire(&self.owner, capability)
-            .await;
-        if outcome.was_delayed() {
-            self.topic.events.rate_limit_delayed(
-                self.owner.clone(),
-                capability,
-                outcome.delayed_for,
-            );
-        }
-
         let envelope = Envelope {
             sender: self.owner.clone(),
             body,
@@ -577,14 +545,10 @@ fn normalize_modality(value: &str) -> String {
 mod tests {
     use super::*;
 
-    use std::time::Duration;
-
     use nuillu_blackboard::{ActivationRatio, BlackboardCommand, ModuleConfig, ResourceAllocation};
     use nuillu_types::{ReplicaCapRange, builtin};
-    use tokio::time::Instant;
 
-    use crate::test_support::{scoped, test_caps, test_caps_with_policy};
-    use crate::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RuntimePolicy, TopicKind};
+    use crate::test_support::{scoped, test_caps};
 
     fn ticker_id() -> ModuleId {
         ModuleId::new("ticker").unwrap()
@@ -741,46 +705,5 @@ mod tests {
             AttentionControlRequest::new("active only")
         );
         assert!(controller_1.take_ready_items().unwrap().items.is_empty());
-    }
-
-    #[tokio::test]
-    async fn publish_waits_before_routing_when_rate_limited() {
-        let publisher_id = ticker_id();
-        let caps = test_caps_with_policy(
-            Blackboard::default(),
-            RuntimePolicy {
-                rate_limits: RateLimitPolicy::for_module(
-                    publisher_id.clone(),
-                    CapabilityKind::ChannelPublish {
-                        topic: TopicKind::AttentionControlRequest,
-                    },
-                    RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
-                )
-                .unwrap(),
-                ..RuntimePolicy::default()
-            },
-        );
-        let publisher = scoped(&caps, publisher_id, 0).attention_control_mailbox();
-        let mut controller = scoped(&caps, builtin::allocation(), 0).attention_control_inbox();
-
-        publisher
-            .publish(AttentionControlRequest::new("first"))
-            .await
-            .unwrap();
-        let started = Instant::now();
-        publisher
-            .publish(AttentionControlRequest::new("second"))
-            .await
-            .unwrap();
-
-        assert!(started.elapsed() >= Duration::from_millis(8));
-        assert_eq!(
-            controller.next_item().await.unwrap().body,
-            AttentionControlRequest::new("first")
-        );
-        assert_eq!(
-            controller.next_item().await.unwrap().body,
-            AttentionControlRequest::new("second")
-        );
     }
 }

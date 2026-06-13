@@ -37,9 +37,9 @@ mod mind_format;
 mod mind_session;
 pub mod ports;
 mod prompt;
-mod rate_limit;
 mod readers;
 mod runtime_events;
+mod runtime_policy;
 mod scene;
 mod session;
 mod session_compaction;
@@ -101,15 +101,12 @@ pub use ports::Embedder;
 pub use prompt::{
     format_faculty_system_prompt, format_identity_system_prompt, format_system_prompt,
 };
-pub use rate_limit::{
-    ActivitySnapshot, CapabilityKind, InteroceptionRuntimePolicy, RateLimitConfig,
-    RateLimitOutcome, RateLimitPolicy, RateLimitPolicyError, RateLimiter, RuntimePolicy, TopicKind,
-};
 pub use readers::{
     AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader,
     MemoryMetadataReader, ModuleStatusReader,
 };
 pub use runtime_events::{NoopRuntimeEventSink, RuntimeEvent, RuntimeEventSink};
+pub use runtime_policy::{InteroceptionRuntimePolicy, RuntimePolicy};
 pub use scene::{Participant, SceneReader, SceneRegistry, TARGET_EVERYONE, TARGET_SELF};
 pub use session::{
     ModuleSessionMetadata, NoopSessionStore, PersistedModelInputItem, PersistedSessionSnapshot,

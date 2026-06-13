@@ -73,7 +73,6 @@ impl ResourceMonitorState {
         match event {
             RuntimeEvent::LlmAccessed { .. } => counts.llm_accessed += 1,
             RuntimeEvent::LlmCompleted { .. } => counts.llm_completed += 1,
-            RuntimeEvent::RateLimitDelayed { .. } => counts.rate_limit_delays += 1,
             RuntimeEvent::ModuleBatchThrottled { .. } => counts.throttles += 1,
             RuntimeEvent::ModuleBatchReady { .. } => counts.batch_ready += 1,
             RuntimeEvent::ModuleActivationCompleted { succeeded, .. } => {
@@ -209,7 +208,6 @@ struct ModuleRuntimeCounts {
     activations_completed: u32,
     activations_failed: u32,
     throttles: u32,
-    rate_limit_delays: u32,
     llm_accessed: u32,
     llm_completed: u32,
     compactions_started: u32,
@@ -224,7 +222,6 @@ impl ModuleRuntimeCounts {
             activations_completed: self.activations_completed + other.activations_completed,
             activations_failed: self.activations_failed + other.activations_failed,
             throttles: self.throttles + other.throttles,
-            rate_limit_delays: self.rate_limit_delays + other.rate_limit_delays,
             llm_accessed: self.llm_accessed + other.llm_accessed,
             llm_completed: self.llm_completed + other.llm_completed,
             compactions_started: self.compactions_started + other.compactions_started,
@@ -442,7 +439,7 @@ fn render_throughput_plot(
                     "throttles",
                     Color32::from_rgb(224, 168, 64),
                     aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.throttles + counts.rate_limit_delays
+                        counts.throttles
                     }),
                 ),
                 (
@@ -654,7 +651,7 @@ fn throughput_y_max(
                 .max(counts.batch_ready)
                 .max(counts.activations_completed)
                 .max(counts.activations_failed)
-                .max(counts.throttles + counts.rate_limit_delays)
+                .max(counts.throttles)
                 .max(counts.llm_accessed + counts.llm_completed)
                 .max(counts.compactions())
         });
@@ -704,7 +701,6 @@ fn runtime_event_module(event: &RuntimeEvent) -> String {
         RuntimeEvent::LlmAccessed { owner, .. }
         | RuntimeEvent::LlmCompleted { owner, .. }
         | RuntimeEvent::MemoUpdated { owner, .. }
-        | RuntimeEvent::RateLimitDelayed { owner, .. }
         | RuntimeEvent::ModuleBatchThrottled { owner, .. }
         | RuntimeEvent::ModuleBatchReady { owner, .. }
         | RuntimeEvent::ModuleActivationCompleted { owner, .. }

@@ -12,7 +12,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::Id as TaskId;
 
 use crate::LutumTiers;
-use crate::rate_limit::{CapabilityKind, RateLimiter};
 use crate::runtime_events::RuntimeEventEmitter;
 use crate::r#trait::ModuleBatch;
 
@@ -293,7 +292,6 @@ pub struct LlmAccess {
     tiers: LutumTiers,
     blackboard: Blackboard,
     events: RuntimeEventEmitter,
-    rate_limiter: RateLimiter,
 }
 
 impl LlmAccess {
@@ -302,14 +300,12 @@ impl LlmAccess {
         tiers: LutumTiers,
         blackboard: Blackboard,
         events: RuntimeEventEmitter,
-        rate_limiter: RateLimiter,
     ) -> Self {
         Self {
             owner,
             tiers,
             blackboard,
             events,
-            rate_limiter,
         }
     }
 
@@ -327,18 +323,6 @@ impl LlmAccess {
         source: LlmRequestSource,
         session_key: Option<String>,
     ) -> LlmLease {
-        let outcome = self
-            .rate_limiter
-            .acquire(&self.owner, CapabilityKind::LlmCall)
-            .await;
-        if outcome.was_delayed() {
-            self.events.rate_limit_delayed(
-                self.owner.clone(),
-                CapabilityKind::LlmCall,
-                outcome.delayed_for,
-            );
-        }
-
         let tier = self
             .blackboard
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
@@ -394,7 +378,6 @@ mod tests {
     use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
 
     use crate::ports::PortError;
-    use crate::rate_limit::{CapabilityKind, RateLimitConfig, RateLimitPolicy, RateLimiter};
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
     use super::{LlmAccess, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
@@ -437,13 +420,7 @@ mod tests {
         let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink.clone());
-        let access = LlmAccess::new(
-            owner.clone(),
-            tiers,
-            blackboard,
-            events,
-            RateLimiter::disabled(),
-        );
+        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
 
         let _ = access.lutum().await;
         let _ = access.lutum().await;
@@ -514,13 +491,7 @@ mod tests {
         let tiers = crate::LutumTiers::from_shared_lutum(lutum);
         let sink = Rc::new(RecordingSink::default());
         let events = RuntimeEventEmitter::new(sink);
-        let access = LlmAccess::new(
-            owner.clone(),
-            tiers,
-            blackboard,
-            events,
-            RateLimiter::disabled(),
-        );
+        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
 
         let lutum = access.lutum().await;
         let _ = lutum
@@ -540,74 +511,6 @@ mod tests {
                 batch: None,
             })]
         );
-    }
-
-    #[tokio::test]
-    async fn lutum_waits_for_rate_limit_before_access_event() {
-        let blackboard = Blackboard::default();
-        let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-        let adapter = Arc::new(MockLlmAdapter::new());
-        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-        let lutum = Lutum::new(adapter, budget);
-        let tiers = crate::LutumTiers::from_shared_lutum(lutum);
-        let sink = Rc::new(RecordingSink::default());
-        let events = RuntimeEventEmitter::new(sink.clone());
-        let limiter = RateLimiter::new(
-            RateLimitPolicy::for_module(
-                owner.module.clone(),
-                CapabilityKind::LlmCall,
-                RateLimitConfig::new(Duration::from_millis(10), 100.0).unwrap(),
-            )
-            .unwrap(),
-        );
-        let access = LlmAccess::new(owner.clone(), tiers, blackboard, events, limiter);
-
-        let _ = access.lutum().await;
-        let _ = access.lutum().await;
-
-        let actual = sink.events.lock().expect("event lock poisoned").clone();
-        assert_eq!(actual.len(), 5);
-        assert!(matches!(
-            actual[0],
-            RuntimeEvent::LlmAccessed {
-                sequence: 0,
-                call: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            actual[1],
-            RuntimeEvent::LlmCompleted {
-                sequence: 1,
-                call: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &actual[2],
-            RuntimeEvent::RateLimitDelayed {
-                sequence: 2,
-                owner: delayed_owner,
-                capability: CapabilityKind::LlmCall,
-                delayed_for,
-            } if delayed_owner == &owner && *delayed_for > Duration::ZERO
-        ));
-        assert!(matches!(
-            actual[3],
-            RuntimeEvent::LlmAccessed {
-                sequence: 3,
-                call: 1,
-                ..
-            }
-        ));
-        assert!(matches!(
-            actual[4],
-            RuntimeEvent::LlmCompleted {
-                sequence: 4,
-                call: 1,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]

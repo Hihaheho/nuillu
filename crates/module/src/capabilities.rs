@@ -16,8 +16,8 @@ use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, Repli
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy, WakeClaim, WakeRegistry};
 use crate::ports::{Clock, CognitionLogRepository, PortError};
-use crate::rate_limit::{RateLimiter, RuntimePolicy, TopicKind};
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter, RuntimeEventSink};
+use crate::runtime_policy::RuntimePolicy;
 use crate::scene::{SceneReader, SceneRegistry};
 use crate::session::{
     NoopSessionStore, SessionAutoCompaction, SessionKey, SessionStore,
@@ -65,7 +65,6 @@ struct CapabilityProvidersInner {
     time_division: TimeDivision,
     tiers: LutumTiers,
     runtime_events: RuntimeEventEmitter,
-    rate_limiter: RateLimiter,
     runtime_policy: RuntimePolicy,
     scene: SceneRegistry,
     session_store: Rc<dyn SessionStore>,
@@ -265,7 +264,6 @@ impl CapabilityProviders {
             allocation_store,
         } = runtime;
         let runtime_events = RuntimeEventEmitter::new(event_sink);
-        let rate_limiter = RateLimiter::new(policy.rate_limits.clone());
         let wakes = WakeRegistry::default();
         let self_wake_permits = SelfWakePermitRegistry::default();
         Self {
@@ -276,57 +274,32 @@ impl CapabilityProviders {
                     blackboard.clone(),
                     wakes.clone(),
                     TopicPolicy::RoleLoadBalanced,
-                    TopicKind::AttentionControlRequest,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
                 cognition_log_updates: Topic::new(
                     blackboard.clone(),
                     wakes.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::CognitionLogUpdated,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
                 cognition_log_evictions: Topic::new(
                     blackboard.clone(),
                     wakes.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::CognitionLogEvicted,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
                 interoception_updates: Topic::new(
                     blackboard.clone(),
                     wakes.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::InteroceptiveUpdated,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
-                memo_updates: Topic::new(
-                    blackboard.clone(),
-                    wakes.clone(),
-                    TopicPolicy::Fanout,
-                    TopicKind::MemoUpdated,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
-                ),
+                memo_updates: Topic::new(blackboard.clone(), wakes.clone(), TopicPolicy::Fanout),
                 memo_log_evictions: Topic::new(
                     blackboard.clone(),
                     wakes.clone(),
                     TopicPolicy::Fanout,
-                    TopicKind::MemoLogEvicted,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
                 sensory_input_topic: Topic::new(
                     blackboard.clone(),
                     wakes,
                     TopicPolicy::RoleLoadBalanced,
-                    TopicKind::SensoryInput,
-                    rate_limiter.clone(),
-                    runtime_events.clone(),
                 ),
                 activation_gates: ActivationGateHub::new(blackboard.clone()),
                 blackboard,
@@ -335,7 +308,6 @@ impl CapabilityProviders {
                 time_division: TimeDivision::default(),
                 tiers,
                 runtime_events,
-                rate_limiter,
                 runtime_policy: policy,
                 scene: SceneRegistry::empty(),
                 session_store,
@@ -982,7 +954,6 @@ impl ModuleCapabilityFactory {
             self.root.inner.tiers.clone(),
             self.root.inner.blackboard.clone(),
             self.root.inner.runtime_events.clone(),
-            self.root.inner.rate_limiter.clone(),
         )
     }
 

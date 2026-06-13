@@ -76,15 +76,6 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
         RuntimeEvent::MemoUpdated {
             owner, char_count, ..
         } => format!("nuillu-server memo-updated tab={tab_id} owner={owner} chars={char_count}"),
-        RuntimeEvent::RateLimitDelayed {
-            owner,
-            capability,
-            delayed_for,
-            ..
-        } => format!(
-            "nuillu-server rate-limit-delayed tab={tab_id} owner={owner} capability={capability:?} delayed_ms={}",
-            delayed_for.as_millis()
-        ),
         RuntimeEvent::ModuleBatchThrottled {
             owner, delayed_for, ..
         } => format!(

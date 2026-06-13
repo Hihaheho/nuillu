@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::LlmBatchDebug;
 use crate::ports::PortError;
-use crate::rate_limit::CapabilityKind;
 use crate::r#trait::ModuleBatch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,12 +29,6 @@ pub enum RuntimeEvent {
         sequence: u64,
         owner: ModuleInstanceId,
         char_count: usize,
-    },
-    RateLimitDelayed {
-        sequence: u64,
-        owner: ModuleInstanceId,
-        capability: CapabilityKind,
-        delayed_for: Duration,
     },
     ModuleBatchThrottled {
         sequence: u64,
@@ -156,20 +149,6 @@ impl RuntimeEventEmitter {
             sequence,
             owner,
             char_count,
-        });
-    }
-
-    pub(crate) fn rate_limit_delayed(
-        &self,
-        owner: ModuleInstanceId,
-        capability: CapabilityKind,
-        delayed_for: Duration,
-    ) {
-        self.emit(|sequence| RuntimeEvent::RateLimitDelayed {
-            sequence,
-            owner,
-            capability,
-            delayed_for,
         });
     }
 

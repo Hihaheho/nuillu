@@ -219,19 +219,6 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
                 module.status = ModuleSessionStatus::Completed;
             }
         }
-        RuntimeEvent::RateLimitDelayed {
-            owner,
-            capability,
-            delayed_for,
-            ..
-        } => {
-            let module = module_mut_for_owner(state, owner);
-            module.last_throttle = Some(ThrottleSummary {
-                kind: "rate limit".to_string(),
-                detail: format!("{capability:?}"),
-                delayed_ms: duration_millis(*delayed_for),
-            });
-        }
         RuntimeEvent::ModuleBatchThrottled {
             owner, delayed_for, ..
         } => {
@@ -3964,16 +3951,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_events_record_throttle_summaries_without_changing_llm_status() {
+    fn runtime_events_record_batch_throttle_summaries_without_changing_llm_status() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
 
         apply_runtime_event(
             &mut state,
-            &RuntimeEvent::RateLimitDelayed {
+            &RuntimeEvent::ModuleBatchThrottled {
                 sequence: 1,
                 owner: owner.clone(),
-                capability: nuillu_module::CapabilityKind::LlmCall,
                 delayed_for: std::time::Duration::from_millis(25),
             },
         );
@@ -3986,8 +3972,8 @@ mod tests {
         assert_eq!(
             module.last_throttle,
             Some(ThrottleSummary {
-                kind: "rate limit".to_string(),
-                detail: "LlmCall".to_string(),
+                kind: "batch throttle".to_string(),
+                detail: "next_batch".to_string(),
                 delayed_ms: 25,
             })
         );
