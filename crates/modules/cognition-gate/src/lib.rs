@@ -84,6 +84,9 @@ const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate d
 events, rejected candidate events, cognition context, and relevant memory evidence needed for
 future cognition-gate decisions."#;
 const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
+const CANDIDATE_DECISION_INSTRUCTION: &str = "Review the new cognition candidates above and call \
+exactly one tool: promote_to_cognition if any candidate should enter conscious cognition now, or \
+leave_cognition_unchanged if none should. Do not write assistant text.";
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -120,7 +123,13 @@ fn retitle_candidate_batch(formatted: String, header: &str) -> Option<String> {
         out.push_str(content);
     }
 
-    (count > 0).then_some(out)
+    if count == 0 {
+        return None;
+    }
+
+    out.push_str("\n\n");
+    out.push_str(CANDIDATE_DECISION_INSTRUCTION);
+    Some(out)
 }
 
 #[lutum::tool_input(name = "promote_to_cognition", output = PromoteToCognitionOutput)]
@@ -987,6 +996,10 @@ mod tests {
             .expect("expected a candidate user message")
     }
 
+    fn assert_candidate_decision_instruction(text: &str) {
+        assert!(text.contains(CANDIDATE_DECISION_INSTRUCTION));
+    }
+
     #[test]
     fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
@@ -1130,6 +1143,7 @@ mod tests {
         assert_eq!(user_messages.len(), 1);
         let candidate_input = user_messages[0];
         assert!(candidate_input.contains(NEW_CANDIDATE_HEADER));
+        assert_candidate_decision_instruction(candidate_input);
         assert!(candidate_input.contains("- candidate 1"));
         assert!(candidate_input.contains("sensory detail A"));
         assert!(!candidate_input.contains("memo"));
@@ -1185,6 +1199,7 @@ mod tests {
                 content.as_slice(),
                 [MessageContent::Text(text)]
                     if text.contains(NEW_CANDIDATE_HEADER)
+                        && text.contains(CANDIDATE_DECISION_INSTRUCTION)
                         && text.contains("sensory detail A")
                         && !text.contains("memo")
                         && !text.contains("Held-in-mind notes")
@@ -1356,6 +1371,7 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         let retried_candidates = latest_candidate_user_message(inputs[1].items());
         assert!(retried_candidates.contains(NEW_CANDIDATE_HEADER));
+        assert_candidate_decision_instruction(retried_candidates);
         assert!(retried_candidates.contains("sensory detail A"));
         assert!(!retried_candidates.contains("memo"));
         assert!(!retried_candidates.contains("Held-in-mind notes"));
@@ -1408,6 +1424,7 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 3);
         let accumulated_candidates = latest_candidate_user_message(inputs[2].items());
+        assert_candidate_decision_instruction(accumulated_candidates);
         assert!(accumulated_candidates.contains("sensory detail A"));
         assert!(accumulated_candidates.contains("sensory detail B"));
 
@@ -1417,6 +1434,7 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 4);
         let latest_candidates = latest_candidate_user_message(inputs[3].items());
+        assert_candidate_decision_instruction(latest_candidates);
         assert!(latest_candidates.contains("sensory detail C"));
         assert!(!latest_candidates.contains("sensory detail A"));
         assert!(!latest_candidates.contains("sensory detail B"));
@@ -1470,6 +1488,7 @@ mod tests {
         let first_user_messages = message_texts_with_role(first_items, InputMessageRole::User);
         assert_eq!(first_user_messages.len(), 1);
         assert!(first_user_messages[0].contains(NEW_CANDIDATE_HEADER));
+        assert_candidate_decision_instruction(first_user_messages[0]);
         assert!(first_user_messages[0].contains("sensory detail A"));
         assert!(!first_user_messages[0].contains("memo"));
         assert!(!first_user_messages[0].contains(
@@ -1519,10 +1538,12 @@ mod tests {
         let second_user_messages = message_texts_with_role(second_items, InputMessageRole::User);
         assert_eq!(second_user_messages.len(), 3);
         assert!(second_user_messages[0].contains(NEW_CANDIDATE_HEADER));
+        assert_candidate_decision_instruction(second_user_messages[0]);
         assert!(second_user_messages[0].contains("sensory detail A"));
         assert!(second_user_messages[1].contains("Current cognition log at"));
         assert!(second_user_messages[1].contains("The agent noticed the north door is blocked."));
         assert!(second_user_messages[2].contains(NEW_CANDIDATE_HEADER));
+        assert_candidate_decision_instruction(second_user_messages[2]);
         assert!(second_user_messages[2].contains("sensory detail B"));
         assert!(!second_user_messages[2].contains("memo"));
         assert!(!second_user_messages[2].contains(
