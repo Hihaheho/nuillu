@@ -624,6 +624,7 @@ enum TaskMessage {
         module: AllocatedModule,
         kick_inbox: KickInbox,
         delayed_for: Duration,
+        record_event: bool,
         next_batch_throttle: Option<NextBatchThrottle>,
     },
     NextBatch {
@@ -999,14 +1000,17 @@ async fn refresh_active_and_schedule(
                 let kick_inbox = kick_inboxes[index]
                     .take()
                     .expect("kick inbox available for stored module");
-                let now = runtime.clock().now();
                 let wake_claim = pending_wake
                     .then(|| runtime.claim_wake(&owners[index]))
                     .flatten();
-                if let Some(throttle) =
+                let throttle = if has_pending_self_wake_permit {
+                    None
+                } else {
+                    let now = runtime.clock().now();
                     current_next_batch_throttle(runtime, &owners[index], next_batch_throttle, now)
                         .await
-                {
+                };
+                if let Some(throttle) = throttle {
                     if let Some(activation_increase) = runtime
                         .activation_increase_waiter(&owners[index], throttle.activation_threshold)
                         .await
@@ -1019,7 +1023,8 @@ async fn refresh_active_and_schedule(
                             module,
                             kick_inbox,
                             throttle,
-                            runtime.clock(),
+                            runtime.clone(),
+                            owners[index].clone(),
                             activation_increase,
                             allocation_change,
                             parent,
@@ -1327,9 +1332,12 @@ async fn handle_task_message(
             module,
             kick_inbox,
             delayed_for,
+            record_event,
             next_batch_throttle,
         } => {
-            runtime.record_module_batch_throttled(owners[index].clone(), delayed_for);
+            if record_event {
+                runtime.record_module_batch_throttled(owners[index].clone(), delayed_for);
+            }
             kick_inboxes[index] = Some(kick_inbox);
             states[index] = ModuleState::Stored {
                 module,
@@ -1916,10 +1924,14 @@ async fn schedule_stored_dependency_for_wake(
     let kick_inbox = kick_inboxes[target_index]
         .take()
         .expect("kick inbox available for stored dependency");
-    let now = runtime.clock().now();
-    if let Some(throttle) =
+    let has_pending_self_wake_permit = runtime.has_pending_self_wake_permit(&target_owner);
+    let throttle = if has_pending_self_wake_permit {
+        None
+    } else {
+        let now = runtime.clock().now();
         current_next_batch_throttle(runtime, &target_owner, next_batch_throttle, now).await
-    {
+    };
+    if let Some(throttle) = throttle {
         if let Some(activation_increase) = runtime
             .activation_increase_waiter(&target_owner, throttle.activation_threshold)
             .await
@@ -1932,7 +1944,8 @@ async fn schedule_stored_dependency_for_wake(
                 module,
                 kick_inbox,
                 throttle,
-                runtime.clock(),
+                runtime.clone(),
+                target_owner.clone(),
                 activation_increase,
                 allocation_change,
                 parent,
@@ -2322,7 +2335,8 @@ fn spawn_batch_throttle(
     module: AllocatedModule,
     kick_inbox: KickInbox,
     throttle: NextBatchThrottle,
-    clock: Rc<dyn Clock>,
+    runtime: AgentRuntimeControl,
+    owner: ModuleInstanceId,
     activation_increase: tokio::sync::oneshot::Receiver<()>,
     allocation_change: tokio::sync::oneshot::Receiver<()>,
     parent: &tracing::Span,
@@ -2330,16 +2344,37 @@ fn spawn_batch_throttle(
 ) {
     tasks.push(spawn_local(
         async move {
+            let clock = runtime.clock();
             let started = clock.now();
             let deadline = throttle.not_before;
             let mut next_batch_throttle = None;
-            tokio::select! {
-                biased;
-                _ = activation_increase => {},
-                _ = allocation_change => {
-                    next_batch_throttle = Some(throttle);
-                },
-                _ = clock.sleep_until(deadline) => {},
+            let mut record_event = true;
+            let mut activation_increase = pin!(activation_increase);
+            let mut allocation_change = pin!(allocation_change);
+            let deadline_sleep = clock.sleep_until(deadline);
+            let mut deadline_sleep = pin!(deadline_sleep);
+            let mut observed_wake_sequence = runtime.wake_change_sequence();
+            if runtime.has_pending_self_wake_permit(&owner) {
+                record_event = false;
+            } else {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut activation_increase => break,
+                        _ = &mut allocation_change => {
+                            next_batch_throttle = Some(throttle.clone());
+                            break;
+                        },
+                        _ = &mut deadline_sleep => break,
+                        _ = runtime.wake_changed_since(observed_wake_sequence) => {
+                            observed_wake_sequence = runtime.wake_change_sequence();
+                            if runtime.has_pending_self_wake_permit(&owner) {
+                                record_event = false;
+                                break;
+                            }
+                        },
+                    }
+                }
             }
             let delayed_for = (clock.now() - started).to_std().unwrap_or(Duration::ZERO);
             TaskMessage::BatchThrottleExpired {
@@ -2347,6 +2382,7 @@ fn spawn_batch_throttle(
                 module,
                 kick_inbox,
                 delayed_for,
+                record_event,
                 next_batch_throttle,
             }
         }
@@ -5519,6 +5555,90 @@ mod tests {
                         vec!["first".to_string()],
                         vec!["second".to_string(), "third".to_string()]
                     ]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn self_wake_bypasses_runtime_batch_throttle() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let module_id = ModuleId::new(QueryBatchRecorder::id()).unwrap();
+                let mut alloc = ResourceAllocation::default();
+                alloc.set(module_id.clone(), ModuleConfig::default());
+                alloc.set_activation(module_id.clone(), ActivationRatio::ONE);
+
+                let blackboard = Blackboard::with_allocation(alloc);
+                let caps = test_caps_with_real_clock(blackboard);
+                let batches = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+                let (first_tx, first_rx) = oneshot::channel();
+                let (second_tx, mut second_rx) = oneshot::channel();
+                let first_tx = Rc::new(RefCell::new(Some(first_tx)));
+                let second_tx = Rc::new(RefCell::new(Some(second_tx)));
+                let self_wake = Rc::new(RefCell::new(None::<SelfWake>));
+                let modules = ModuleRegistry::new()
+                    .register_sync(
+                        test_policy(1..=1, Bpm::from_f64(60.0)..=Bpm::from_f64(60.0)),
+                        {
+                            let batches = Rc::clone(&batches);
+                            let first_tx = Rc::clone(&first_tx);
+                            let second_tx = Rc::clone(&second_tx);
+                            let self_wake = Rc::clone(&self_wake);
+                            move |caps| {
+                                *self_wake.borrow_mut() = Some(caps.self_wake());
+                                QueryBatchRecorder {
+                                    attention_control_inbox: caps.attention_control_inbox(),
+                                    batches: Rc::clone(&batches),
+                                    first_done: first_tx.borrow_mut().take(),
+                                    second_done: second_tx.borrow_mut().take(),
+                                }
+                            }
+                        },
+                    )
+                    .unwrap()
+                    .build(&caps)
+                    .await
+                    .unwrap();
+                let mailbox = caps.internal_harness_io().attention_control_mailbox();
+                let wake = self_wake
+                    .borrow()
+                    .as_ref()
+                    .expect("module constructor should expose self wake")
+                    .clone();
+
+                super::run(modules, test_config(), async move {
+                    mailbox
+                        .publish(AttentionControlRequest::new("first"))
+                        .await
+                        .expect("first attention request should route");
+                    let _ = first_rx.await;
+
+                    mailbox
+                        .publish(AttentionControlRequest::new("second"))
+                        .await
+                        .expect("second attention request should route");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    assert_oneshot_pending(
+                        &mut second_rx,
+                        "second batch should be held by the normal batch throttle",
+                    );
+
+                    let started = tokio::time::Instant::now();
+                    wake.wake();
+                    tokio::time::timeout(Duration::from_millis(200), &mut second_rx)
+                        .await
+                        .expect("self-wake should bypass the remaining throttle")
+                        .expect("done sender dropped");
+                    assert!(started.elapsed() < Duration::from_millis(200));
+                })
+                .await
+                .expect("scheduler returned err");
+
+                assert_eq!(
+                    batches.borrow().as_slice(),
+                    &[vec!["first".to_string()], vec!["second".to_string()]]
                 );
             })
             .await;
