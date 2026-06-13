@@ -257,28 +257,35 @@ async fn handle_server_visualizer_message(
             owner,
         } if command_tab == *tab_id => {
             match parse_module_owner(&owner) {
-                Ok(owner_id) => match run_controller
-                    .reset_module_session_history(owner_id.clone())
-                    .await
-                {
-                    Ok(reset) => {
-                        visualizer.send_event(VisualizerEvent::Log {
-                            tab_id: tab_id.clone(),
-                            message: format!(
-                                "reset module session history for {}; deleted {} persisted session(s)",
-                                reset.owner, reset.deleted_sessions
-                            ),
-                        });
-                    }
-                    Err(error) => {
-                        visualizer.send_event(VisualizerEvent::Log {
-                            tab_id: tab_id.clone(),
-                            message: format!(
-                                "failed to reset module session history for {owner_id}: {error}"
-                            ),
-                        });
-                    }
-                },
+                Ok(owner_id) => {
+                    let controller = run_controller.clone();
+                    let events = visualizer.event_sender();
+                    let tab_id = tab_id.clone();
+                    tokio::task::spawn_local(async move {
+                        match controller
+                            .reset_module_session_history(owner_id.clone())
+                            .await
+                        {
+                            Ok(reset) => {
+                                events.send(VisualizerEvent::Log {
+                                    tab_id,
+                                    message: format!(
+                                        "reset module session history for {}; deleted {} persisted session(s)",
+                                        reset.owner, reset.deleted_sessions
+                                    ),
+                                });
+                            }
+                            Err(error) => {
+                                events.send(VisualizerEvent::Log {
+                                    tab_id,
+                                    message: format!(
+                                        "failed to reset module session history for {owner_id}: {error}"
+                                    ),
+                                });
+                            }
+                        }
+                    });
+                }
                 Err(message) => {
                     visualizer.send_event(VisualizerEvent::Log {
                         tab_id: tab_id.clone(),
