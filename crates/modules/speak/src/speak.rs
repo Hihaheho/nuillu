@@ -48,7 +48,7 @@ Use the cognition log only to keep wording grounded. Do not add facts, turn an a
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
 
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
+const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 1024;
 const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 8;
 const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
 const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
