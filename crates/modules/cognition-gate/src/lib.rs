@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use lutum::{Lutum, Session, TextStepOutcomeWithTools, ToolResult, Usage};
+use nuillu_blackboard::MemoLogRecord;
 use nuillu_module::{
     BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
@@ -180,6 +181,7 @@ pub struct CognitionGateModule {
     session: Session,
     system_prompt: std::sync::OnceLock<String>,
     last_seen_cognition_index: Option<u64>,
+    pending_unread_memos: Vec<MemoLogRecord>,
 }
 
 impl CognitionGateModule {
@@ -200,6 +202,7 @@ impl CognitionGateModule {
             session,
             system_prompt: std::sync::OnceLock::new(),
             last_seen_cognition_index: None,
+            pending_unread_memos: Vec::new(),
         }
     }
 
@@ -222,15 +225,14 @@ impl CognitionGateModule {
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
     async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
         self.ensure_session_seeded(cx);
+        let session_len_before_activation = self.session.input().items().len();
 
         let unread_cognition = self
             .blackboard
             .read(|bb| bb.unread_cognition_log_entries(self.last_seen_cognition_index))
             .await;
-        if let Some(index) = unread_cognition.last().map(|record| record.index) {
-            self.last_seen_cognition_index = Some(index);
-        }
         let unread_memos = self.blackboard.unread_memo_logs().await;
+        self.pending_unread_memos.extend(unread_memos);
         push_formatted_cognition_log_batch(
             &mut self.session,
             &unread_cognition,
@@ -238,7 +240,7 @@ impl CognitionGateModule {
             COGNITION_CONTEXT_WINDOW,
         );
         if let Some(candidate_notes) =
-            format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
+            format_bounded_memo_log_batch(&self.pending_unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
                 .and_then(|batch| retitle_candidate_batch(batch, NEW_CANDIDATE_HEADER))
         {
             self.session.push_user(candidate_notes);
@@ -246,9 +248,19 @@ impl CognitionGateModule {
 
         let lutum = self.llm.lutum().await;
         let result = self.run_decision_turn(&lutum, cx).await;
-        cx.compact_and_save(&mut self.session, Usage::zero())
-            .await?;
-        result?;
+        if let Err(error) = result {
+            self.session
+                .input_mut()
+                .items_mut()
+                .truncate(session_len_before_activation);
+            cx.compact_and_save(&mut self.session, Usage::zero())
+                .await?;
+            return Err(error);
+        }
+        if let Some(index) = unread_cognition.last().map(|record| record.index) {
+            self.last_seen_cognition_index = Some(index);
+        }
+        self.pending_unread_memos.clear();
         Ok(())
     }
 
@@ -280,7 +292,7 @@ impl CognitionGateModule {
         match outcome {
             // `require_any_tool()` should prevent a finish-without-tools outcome.
             TextStepOutcomeWithTools::Finished(result) => {
-                cx.compact_and_save(&mut self.session, result.usage).await?;
+                let usage = result.usage;
                 if let Some(cognition_text) =
                     salvage_cognition_from_plain_output(&result.assistant_text())
                 {
@@ -290,6 +302,7 @@ impl CognitionGateModule {
                         })
                         .await;
                     if promotion_decision == PromotionDecision::Promoted {
+                        cx.compact_and_save(&mut self.session, usage).await?;
                         return Ok(());
                     }
                     let detail = output
@@ -303,8 +316,7 @@ impl CognitionGateModule {
                 cx.warn(format!("cognition-gate activation failed: {detail}"));
                 anyhow::bail!("cognition-gate finished without required tool call: {detail}");
             }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                cx.compact_and_save(&mut self.session, result.usage).await?;
+            TextStepOutcomeWithTools::FinishedNoOutput(_result) => {
                 let detail = "model finished with no output and no tool call \
                                 (require_any_tool should have prevented this outcome)";
                 cx.warn(format!("cognition-gate activation failed: {detail}"));
@@ -368,8 +380,8 @@ impl CognitionGateModule {
                 round
                     .commit(&mut self.session, results)
                     .context("commit cognition-gate tool round")?;
-                cx.compact_and_save(&mut self.session, usage).await?;
                 if decision == DecisionStatus::Applied {
+                    cx.compact_and_save(&mut self.session, usage).await?;
                     return Ok(());
                 }
                 let detail = match decision {
@@ -961,6 +973,20 @@ mod tests {
             .collect()
     }
 
+    fn candidate_user_messages(items: &[ModelInputItem]) -> Vec<&str> {
+        message_texts_with_role(items, InputMessageRole::User)
+            .into_iter()
+            .filter(|text| text.contains(NEW_CANDIDATE_HEADER))
+            .collect()
+    }
+
+    fn latest_candidate_user_message(items: &[ModelInputItem]) -> &str {
+        candidate_user_messages(items)
+            .into_iter()
+            .last()
+            .expect("expected a candidate user message")
+    }
+
     #[test]
     fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
@@ -1276,13 +1302,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn activation_persists_new_candidates_after_failed_turn() {
-        let adapter = MockLlmAdapter::new().with_text_scenario(MockTextScenario::start_error(
-            MockError::Synthetic {
+    async fn activation_rolls_back_failed_candidate_turn_and_retries_pending_candidates() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
                 message: "synthetic failure".into(),
-            },
-        ));
-        let mut fixture = gate_fixture_with_adapter(adapter).await;
+            }))
+            .with_text_scenario(leave_cognition_unchanged_scenario(
+                "candidate A is not load-bearing",
+                1,
+            ));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
         fixture.source_memo.write("sensory detail A").await;
 
         let lutum = fixture.gate.llm.lutum().await;
@@ -1299,6 +1330,7 @@ mod tests {
 
         let err = fixture.gate.activate(&cx).await.unwrap_err();
         assert!(err.to_string().contains("decision turn failed"));
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 1);
 
         let items = fixture.gate.session.input().items().to_vec();
         assert!(!has_message_with_role_containing(
@@ -1311,11 +1343,83 @@ mod tests {
             InputMessageRole::System,
             "sensory detail A"
         ));
-        assert!(has_message_with_role_containing(
+        assert!(!has_message_with_role_containing(
             &items,
             InputMessageRole::User,
             "sensory detail A"
         ));
+
+        fixture.gate.activate(&cx).await.unwrap();
+        assert!(fixture.gate.pending_unread_memos.is_empty());
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let retried_candidates = latest_candidate_user_message(inputs[1].items());
+        assert!(retried_candidates.contains(NEW_CANDIDATE_HEADER));
+        assert!(retried_candidates.contains("sensory detail A"));
+        assert!(!retried_candidates.contains("memo"));
+        assert!(!retried_candidates.contains("Held-in-mind notes"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_activations_accumulate_pending_candidates_until_success() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
+                message: "synthetic failure A".into(),
+            }))
+            .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
+                message: "synthetic failure B".into(),
+            }))
+            .with_text_scenario(leave_cognition_unchanged_scenario(
+                "pending candidates are not load-bearing",
+                1,
+            ))
+            .with_text_scenario(leave_cognition_unchanged_scenario(
+                "candidate C is not load-bearing",
+                1,
+            ));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &peer_contexts,
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+
+        fixture.source_memo.write("sensory detail A").await;
+        fixture.gate.activate(&cx).await.unwrap_err();
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 1);
+
+        fixture.source_memo.write("sensory detail B").await;
+        fixture.gate.activate(&cx).await.unwrap_err();
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 2);
+
+        fixture.gate.activate(&cx).await.unwrap();
+        assert!(fixture.gate.pending_unread_memos.is_empty());
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 3);
+        let accumulated_candidates = latest_candidate_user_message(inputs[2].items());
+        assert!(accumulated_candidates.contains("sensory detail A"));
+        assert!(accumulated_candidates.contains("sensory detail B"));
+
+        fixture.source_memo.write("sensory detail C").await;
+        fixture.gate.activate(&cx).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 4);
+        let latest_candidates = latest_candidate_user_message(inputs[3].items());
+        assert!(latest_candidates.contains("sensory detail C"));
+        assert!(!latest_candidates.contains("sensory detail A"));
+        assert!(!latest_candidates.contains("sensory detail B"));
     }
 
     #[tokio::test(flavor = "current_thread")]
