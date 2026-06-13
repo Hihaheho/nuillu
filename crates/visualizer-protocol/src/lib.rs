@@ -541,6 +541,8 @@ pub struct UtteranceDeltaView {
 pub struct UtteranceView {
     pub sender: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<u64>,
     pub text: String,
     pub emitted_at: DateTime<Utc>,
 }

@@ -72,6 +72,7 @@ pub struct SceneUiState {
     scene: SceneStateView,
     activity: Vec<ActivityMessage>,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
+    completed_utterances: BTreeMap<UtteranceKey, usize>,
     person_message_drafts: BTreeMap<String, String>,
 }
 
@@ -125,6 +126,9 @@ impl SceneUiState {
             target: delta.target.clone(),
             generation_id: delta.generation_id,
         };
+        if self.completed_utterances.contains_key(&key) {
+            return;
+        }
         let index = if let Some(index) = self.streaming_utterances.get(&key).copied() {
             index
         } else {
@@ -145,27 +149,53 @@ impl SceneUiState {
     }
 
     pub fn push_utterance_completed(&mut self, utterance: UtteranceView) {
-        let matching_key = self
-            .streaming_utterances
-            .keys()
-            .find(|key| key.sender == utterance.sender && key.target == utterance.target)
-            .cloned();
-        if let Some(key) = matching_key
-            && let Some(index) = self.streaming_utterances.remove(&key)
-        {
-            if let Some(message) = self.activity.get_mut(index) {
-                message.content = utterance.text;
-                message.streaming = false;
+        let matching_key = if let Some(generation_id) = utterance.generation_id {
+            let key = UtteranceKey {
+                sender: utterance.sender.clone(),
+                target: utterance.target.clone(),
+                generation_id,
+            };
+            Some(key)
+        } else {
+            self.streaming_utterances
+                .iter()
+                .filter(|(key, _)| key.sender == utterance.sender && key.target == utterance.target)
+                .max_by_key(|(_, index)| **index)
+                .map(|(key, _)| key.clone())
+        };
+        if let Some(key) = matching_key {
+            if let Some(index) = self.streaming_utterances.remove(&key) {
+                if let Some(message) = self.activity.get_mut(index) {
+                    message.content = utterance.text.clone();
+                    message.streaming = false;
+                }
+                self.completed_utterances.insert(key, index);
+                return;
             }
-            return;
+            if let Some(index) = self.completed_utterances.get(&key).copied() {
+                if let Some(message) = self.activity.get_mut(index) {
+                    message.content = utterance.text.clone();
+                    message.streaming = false;
+                }
+                return;
+            }
         }
 
+        let completed_key = utterance.generation_id.map(|generation_id| UtteranceKey {
+            sender: utterance.sender.clone(),
+            target: utterance.target.clone(),
+            generation_id,
+        });
         let mut message = ActivityMessage::new(ActivityRole::Assistant, utterance.text);
         message.source = Some(format!(
             "{} -> {} at {}",
             utterance.sender, utterance.target, utterance.emitted_at
         ));
+        let index = self.activity.len();
         self.activity.push(message);
+        if let Some(key) = completed_key {
+            self.completed_utterances.insert(key, index);
+        }
     }
 
     fn send_person_message_commands(
@@ -643,6 +673,7 @@ fn text_field_with_id(
 mod tests {
     use super::*;
     use crate::ScenePersonRowView;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn person_message_send_flushes_target_row_before_message() {
@@ -725,6 +756,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completed_utterance_updates_matching_generation_not_old_stream() {
+        let mut state = SceneUiState::default();
+
+        state.push_utterance_delta(utterance_delta(1, 0, "old partial"));
+        state.push_utterance_delta(utterance_delta(2, 0, "latest"));
+        state.push_utterance_completed(utterance_completed(Some(2), "latest"));
+
+        assert_eq!(state.activity.len(), 2);
+        assert_eq!(state.activity[0].content, "old partial");
+        assert!(state.activity[0].streaming);
+        assert_eq!(state.activity[1].content, "latest");
+        assert!(!state.activity[1].streaming);
+    }
+
+    #[test]
+    fn late_delta_for_completed_utterance_is_ignored() {
+        let mut state = SceneUiState::default();
+
+        state.push_utterance_completed(utterance_completed(Some(7), "finished"));
+        state.push_utterance_delta(utterance_delta(7, 0, "finished"));
+
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(state.activity[0].content, "finished");
+        assert!(!state.activity[0].streaming);
+    }
+
+    #[test]
+    fn duplicate_completed_utterance_updates_existing_row() {
+        let mut state = SceneUiState::default();
+
+        state.push_utterance_completed(utterance_completed(Some(9), "first"));
+        state.push_utterance_completed(utterance_completed(Some(9), "final"));
+
+        assert_eq!(state.activity.len(), 1);
+        assert_eq!(state.activity[0].content, "final");
+        assert!(!state.activity[0].streaming);
+    }
+
     fn scene_with_two_people() -> SceneUiState {
         let mut state = SceneUiState::default();
         state.set_scene_state(SceneStateView {
@@ -747,5 +817,25 @@ mod tests {
             ..SceneStateView::default()
         });
         state
+    }
+
+    fn utterance_delta(generation_id: u64, sequence: u32, delta: &str) -> UtteranceDeltaView {
+        UtteranceDeltaView {
+            sender: "speak".to_string(),
+            target: "Alice".to_string(),
+            generation_id,
+            sequence,
+            delta: delta.to_string(),
+        }
+    }
+
+    fn utterance_completed(generation_id: Option<u64>, text: &str) -> UtteranceView {
+        UtteranceView {
+            sender: "speak".to_string(),
+            target: "Alice".to_string(),
+            generation_id,
+            text: text.to_string(),
+            emitted_at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 51).unwrap(),
+        }
     }
 }

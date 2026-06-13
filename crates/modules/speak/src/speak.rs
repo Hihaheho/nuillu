@@ -1180,7 +1180,7 @@ impl SpeakModule {
         }
 
         self.utterance
-            .emit(draft.target.clone(), text.to_owned())
+            .emit(draft.target.clone(), draft.generation_id, text.to_owned())
             .await;
         self.ensure_planning_session_seeded(cx);
         self.planning_session

@@ -481,6 +481,7 @@ impl UtteranceSink for ServerUtteranceSink {
             utterance: UtteranceView {
                 sender: utterance.sender.to_string(),
                 target: utterance.target,
+                generation_id: Some(utterance.generation_id),
                 text: utterance.text,
                 emitted_at: utterance.emitted_at,
             },

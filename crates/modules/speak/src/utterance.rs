@@ -18,6 +18,7 @@ use nuillu_types::ModuleInstanceId;
 pub struct Utterance {
     pub sender: ModuleInstanceId,
     pub target: String,
+    pub generation_id: u64,
     pub text: String,
     pub emitted_at: DateTime<Utc>,
 }
@@ -96,7 +97,12 @@ impl UtteranceWriter {
         id
     }
 
-    pub async fn emit(&self, target: impl Into<String>, text: impl Into<String>) {
+    pub async fn emit(
+        &self,
+        target: impl Into<String>,
+        generation_id: u64,
+        text: impl Into<String>,
+    ) {
         let Some(target) = normalized_target(target) else {
             tracing::warn!("utterance sink complete skipped empty target");
             return;
@@ -104,6 +110,7 @@ impl UtteranceWriter {
         let utterance = Utterance {
             sender: self.owner.clone(),
             target,
+            generation_id,
             text: text.into(),
             emitted_at: self.clock.now(),
         };

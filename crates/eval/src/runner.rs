@@ -6628,6 +6628,7 @@ impl UtteranceSink for RecordingUtteranceSink {
                 utterance: UtteranceView {
                     sender: recorded.sender,
                     target: recorded.target,
+                    generation_id: Some(utterance.generation_id),
                     text: recorded.text,
                     emitted_at: utterance.emitted_at,
                 },
@@ -8391,6 +8392,7 @@ id = "module-query-memory-special-memory"
         sink.on_complete(Utterance {
             sender: sender.clone(),
             target: "peer".to_string(),
+            generation_id: 0,
             text: "first".to_string(),
             emitted_at,
         })
@@ -8399,6 +8401,7 @@ id = "module-query-memory-special-memory"
         sink.on_complete(Utterance {
             sender,
             target: "peer".to_string(),
+            generation_id: 1,
             text: "second".to_string(),
             emitted_at,
         })
