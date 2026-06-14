@@ -29,10 +29,10 @@ use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and the available target schema.
+const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and current scene target hints.
 Use exactly one available tool.
-When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
-When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Scene target hints are preferred but not exhaustive; use another concrete non-empty addressee when the cognition log supports it. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no concrete addressee, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current listener and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 If the cognition log contains an explicit listener language request, such as asking for Japanese, include the requested language in the language field and transform speech_content for that language.
@@ -86,20 +86,21 @@ pub fn generation_session_auto_compaction() -> SessionAutoCompaction {
 }
 
 tokio::task_local! {
-    /// JSON Schema for `PrepareSpeechArgs.target` derived from the live
-    /// `SceneReader`. `.scope`d around each planning turn so the LLM sees the
-    /// current host-constrained target enum.
+    /// JSON Schema for `PrepareSpeechArgs.target`. `.scope`d around each
+    /// planning turn so the LLM sees the current non-empty target contract.
     static SPEECH_TARGET_SCHEMA: Schema;
 }
 
-fn fallback_speech_target_schema() -> Schema {
-    Schema::try_from(serde_json::json!({ "type": "string" }))
-        .expect("fallback speech target schema must be a JSON object")
+fn freeform_speech_target_schema() -> Schema {
+    Schema::try_from(serde_json::json!({
+        "type": "string",
+        "minLength": 1,
+    }))
+    .expect("speech target schema must be a JSON object")
 }
 
-/// Wire-format string with a JSON Schema dynamically constrained to the
-/// current scene's targets. Stored as `String` so existing serialization,
-/// downstream `Utterance.target` are unchanged.
+/// Wire-format string for a concrete speech addressee. Stored as `String` so
+/// existing serialization and downstream `Utterance.target` are unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 struct SpeechTarget(String);
@@ -132,7 +133,7 @@ impl JsonSchema for SpeechTarget {
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         SPEECH_TARGET_SCHEMA
             .try_with(Clone::clone)
-            .unwrap_or_else(|_| fallback_speech_target_schema())
+            .unwrap_or_else(|_| freeform_speech_target_schema())
     }
 }
 
@@ -141,7 +142,7 @@ impl JsonSchema for SpeechTarget {
 /// Call when proceeding to an outward utterance. The input carries cognition-log
 /// information transformed for speech, not hidden analysis.
 struct PrepareSpeechArgs {
-    /// The participant who should hear the utterance.
+    /// The concrete addressee who should hear the utterance.
     target: SpeechTarget,
     /// Requested output language when the cognition log contains an explicit
     /// listener language request.
@@ -506,8 +507,17 @@ fn format_generation_input(
     out
 }
 
-fn format_planning_input(cognition_context: &str, active: Option<&ActiveSpeech>) -> String {
+fn format_planning_input(
+    cognition_context: &str,
+    active: Option<&ActiveSpeech>,
+    target_hints: &[String],
+) -> String {
     let mut out = cognition_context.trim().to_owned();
+    if !target_hints.is_empty() {
+        out.push_str("\n\nPreferred visible speech targets (not exhaustive): ");
+        out.push_str(&target_hints.join(", "));
+        out.push_str("\nUse another concrete non-empty target when cognition supports it.");
+    }
     if let Some(active) = active {
         out.push_str("\n\nCurrent outward speech in progress:");
         out.push_str(&format!("\n- Target: {}", active.draft.target.trim()));
@@ -534,17 +544,27 @@ fn trimmed_optional(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
+fn target_hints_from_schema(schema: &Schema) -> Vec<String> {
+    let Ok(value) = serde_json::to_value(schema) else {
+        return Vec::new();
+    };
+    let Some(values) = value.get("enum").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn is_non_empty_target(target: &str) -> bool {
     if target.trim().is_empty() {
         return false;
     }
-    let Ok(value) = serde_json::to_value(schema) else {
-        return false;
-    };
-    let Some(values) = value.get("enum").and_then(serde_json::Value::as_array) else {
-        return false;
-    };
-    values.iter().any(|value| value.as_str() == Some(target))
+    true
 }
 
 fn push_generation_context(
@@ -622,8 +642,13 @@ fn push_planning_context(
     session: &mut Session,
     cognition_context: &str,
     active: Option<&ActiveSpeech>,
+    target_hints: &[String],
 ) {
-    session.push_user(format_planning_input(cognition_context, active));
+    session.push_user(format_planning_input(
+        cognition_context,
+        active,
+        target_hints,
+    ));
     let instruction = if active.is_some() {
         ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION
     } else {
@@ -860,11 +885,17 @@ impl SpeakModule {
         cognition_context: &str,
     ) -> Result<FreshSpeechPlan> {
         self.ensure_planning_session_seeded(cx);
-        push_planning_context(&mut self.planning_session, cognition_context, None);
+        let scene_target_schema = self.scene.target_schema();
+        let target_hints = target_hints_from_schema(&scene_target_schema);
+        push_planning_context(
+            &mut self.planning_session,
+            cognition_context,
+            None,
+            &target_hints,
+        );
 
         let lutum = self.llm.lutum().await;
-        let target_schema = self.scene.target_schema();
-        let validation_schema = target_schema.clone();
+        let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
                 self.planning_session
@@ -918,7 +949,7 @@ impl SpeakModule {
                         SpeakToolsCall::PrepareSpeech(call) => {
                             let target = call.input.target.as_str().trim().to_owned();
                             let accepted = matches!(plan, FreshSpeechPlan::None)
-                                && is_target_allowed_by_schema(&validation_schema, &target);
+                                && is_non_empty_target(&target);
                             if accepted {
                                 plan = FreshSpeechPlan::Prepare(PlannedSpeech {
                                     args: call.input.clone(),
@@ -961,11 +992,17 @@ impl SpeakModule {
         active: &ActiveSpeech,
     ) -> Result<Option<ActiveSpeechPlan>> {
         self.ensure_planning_session_seeded(cx);
-        push_planning_context(&mut self.planning_session, cognition_context, Some(active));
+        let scene_target_schema = self.scene.target_schema();
+        let target_hints = target_hints_from_schema(&scene_target_schema);
+        push_planning_context(
+            &mut self.planning_session,
+            cognition_context,
+            Some(active),
+            &target_hints,
+        );
 
         let lutum = self.llm.lutum().await;
-        let target_schema = self.scene.target_schema();
-        let validation_schema = target_schema.clone();
+        let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
                 self.planning_session
@@ -1047,8 +1084,7 @@ impl SpeakModule {
                         }
                         ActiveSpeakToolsCall::InterruptAndRedirectSpeech(call) => {
                             let target = call.input.target.as_str().trim().to_owned();
-                            let accepted = selected.is_none()
-                                && is_target_allowed_by_schema(&validation_schema, &target);
+                            let accepted = selected.is_none() && is_non_empty_target(&target);
                             if accepted {
                                 selected = Some(ActiveSpeechPlan::Redirect {
                                     plan: PlannedSpeech {
@@ -3149,11 +3185,13 @@ mod tests {
                 "K", "o", "r", "o", ",", " ", "s", "t",
             ]))
             .with_text_scenario(interrupt_and_redirect_speech_scenario(
-                "Pibi",
-                "Tell Pibi to duck now.",
-                "Pibi is in immediate danger.",
+                "OffstageVoice",
+                "Tell the offstage voice to stop causing trouble.",
+                "The offstage voice is causing immediate trouble.",
             ))
-            .with_text_scenario(generation_text_scenario("Pibi, duck now."));
+            .with_text_scenario(generation_text_scenario(
+                "Offstage voice, stop causing trouble.",
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut allocation = ResourceAllocation::default();
@@ -3167,8 +3205,7 @@ mod tests {
         });
         let (mut module, caps) =
             speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
-        caps.scene()
-            .set([Participant::new("Koro"), Participant::new("Pibi")]);
+        caps.scene().set([Participant::new("Koro")]);
         let now = SystemClock.now();
         publish_cognition_update(
             &blackboard,
@@ -3188,7 +3225,7 @@ mod tests {
             &blackboard,
             &caps,
             now + chrono::Duration::seconds(1),
-            "Pibi is in immediate danger and needs a warning.",
+            "An offstage voice is causing immediate trouble and needs a warning.",
         )
         .await;
         let second_batch = module.next_batch().await.unwrap();
@@ -3199,7 +3236,10 @@ mod tests {
 
         assert_eq!(
             completed.borrow().as_slice(),
-            &[("Pibi".to_string(), "Pibi, duck now.".to_string())]
+            &[(
+                "OffstageVoice".to_string(),
+                "Offstage voice, stop causing trouble.".to_string(),
+            )]
         );
         assert!(module.active_speech.is_none());
         let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
@@ -3211,14 +3251,17 @@ mod tests {
             progress.state,
             nuillu_blackboard::UtteranceProgressState::Completed
         );
-        assert_eq!(progress.target, "Pibi");
-        assert_eq!(progress.partial_utterance, "Pibi, duck now.");
+        assert_eq!(progress.target, "OffstageVoice");
+        assert_eq!(
+            progress.partial_utterance,
+            "Offstage voice, stop causing trouble."
+        );
         assert_eq!(observed.text_turns().len(), 4);
         let planning_text = session_input_text(&module.planning_session);
         assert!(!planning_text.contains("Completed outward utterance to Koro:\nKoro, st"));
         assert!(planning_text.contains("Aborted outward speech to Koro"));
         assert!(planning_text.contains("Already emitted:\nKoro, st"));
-        assert!(planning_text.contains("Pibi is in immediate danger"));
+        assert!(planning_text.contains("An offstage voice is causing immediate trouble"));
         let memos = speak_memos(&blackboard).await;
         assert!(
             memos
@@ -3341,7 +3384,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn speak_stays_silent_for_empty_planned_target() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(prepare_speech_scenario("", "Tell Koro to stay close."));
+            .with_text_scenario(prepare_speech_scenario("   ", "Tell Koro to stay close."));
 
         let (blackboard, completed) = activate_once_with_adapter(
             adapter,
@@ -3356,20 +3399,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn speak_stays_silent_for_planned_target_outside_scene_schema() {
+    async fn speak_generates_for_non_scene_planned_target() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Pibi to stay close."));
+            .with_text_scenario(prepare_speech_scenario(
+                "OffstageVoice",
+                "Tell the offstage voice to stop causing trouble.",
+            ))
+            .with_text_scenario(generation_text_scenario(
+                "Offstage voice, stop causing trouble.",
+            ));
 
         let (blackboard, completed) = activate_once_with_adapter(
             adapter,
             [Participant::new("Pibi")],
-            "Pibi asks whether Nui should say anything.",
+            "An offstage voice is causing trouble and should be addressed.",
         )
         .await;
 
-        assert!(completed.borrow().is_empty());
-        assert_eq!(speak_memo_count(&blackboard).await, 0);
-        assert!(!speak_progress_exists(&blackboard).await);
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[(
+                "OffstageVoice".to_string(),
+                "Offstage voice, stop causing trouble.".to_string(),
+            )]
+        );
+        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        let progress = blackboard
+            .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
+            .await
+            .unwrap();
+        assert_eq!(progress.target, "OffstageVoice");
+        assert_eq!(
+            progress.state,
+            nuillu_blackboard::UtteranceProgressState::Completed
+        );
     }
 
     #[test]
