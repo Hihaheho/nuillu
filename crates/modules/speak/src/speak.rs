@@ -473,22 +473,6 @@ fn render_completed_utterance_planning_record(draft: &GenerationDraft, text: &st
     )
 }
 
-fn render_in_progress_utterance_planning_record(
-    args: &PrepareSpeechArgs,
-    draft: &GenerationDraft,
-) -> String {
-    format!(
-        "Outward speech currently in progress to {}:\nPlanned substance:\n{}\n\nAlready emitted:\n{}",
-        draft.target.trim(),
-        args.speech_content.trim(),
-        if draft.accumulated.trim().is_empty() {
-            "(none)"
-        } else {
-            draft.accumulated.trim()
-        },
-    )
-}
-
 fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &str) -> String {
     format!(
         "Aborted outward speech to {}. Reason:\n{}\n\nAlready emitted:\n{}",
@@ -843,8 +827,7 @@ impl SpeakModule {
             }
             GenerationStreamOutcome::LengthLimited => {
                 self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
-                self.record_in_progress_generation(cx, &plan.args, &draft)
-                    .await?;
+                self.record_in_progress_generation(&plan.args, &draft).await;
                 self.active_speech = Some(ActiveSpeech {
                     args: plan.args.clone(),
                     draft,
@@ -1270,19 +1253,12 @@ impl SpeakModule {
 
     async fn record_in_progress_generation(
         &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
         args: &PrepareSpeechArgs,
         draft: &GenerationDraft,
-    ) -> Result<()> {
-        self.ensure_planning_session_seeded(cx);
-        self.planning_session
-            .push_system(render_in_progress_utterance_planning_record(args, draft));
+    ) {
         self.memo
             .write(render_in_progress_utterance_memo(args, draft))
             .await;
-        cx.compact_and_save(&mut self.planning_session, Usage::zero())
-            .await?;
-        Ok(())
     }
 
     async fn record_aborted_generation(
@@ -2804,8 +2780,9 @@ mod tests {
         assert_eq!(progress.partial_utterance, "Koro, st");
 
         let planning_text = session_input_text(&module.planning_session);
-        assert!(planning_text.contains("Outward speech currently in progress to Koro"));
-        assert!(planning_text.contains("Already emitted:\nKoro, st"));
+        assert_eq!(module.planning_session.list_turns().count(), 1);
+        assert!(!planning_text.contains("Outward speech currently in progress to Koro"));
+        assert!(!planning_text.contains("Already emitted:\nKoro, st"));
         assert!(!planning_text.contains("Completed outward utterance to Koro"));
     }
 
@@ -2912,6 +2889,79 @@ mod tests {
             1,
             "partial utterance should appear only as the continuation prefill"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_generation_only_slices_do_not_commit_in_progress_planning_records() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                "K", "o", "r", "o", ",", " ", "s", "t",
+            ]))
+            .with_text_scenario(generation_text_sliced_scenario(&[
+                "a", "y", " ", "c", "l", "o", "s", "e",
+            ]));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let first_batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &first_batch)
+            .await
+            .unwrap();
+        let second_batch = tokio::time::timeout(Duration::from_millis(100), module.next_batch())
+            .await
+            .expect("active speech continuation should not wait for a cognition update")
+            .unwrap();
+        assert!(second_batch.continue_active_speech);
+        assert!(second_batch.updates.is_empty());
+        assert!(second_batch.cognition_entries.is_empty());
+        let cx = test_activate_cx(&module, now + chrono::Duration::seconds(1)).await;
+        SpeakModule::activate(&mut module, &cx, &second_batch)
+            .await
+            .unwrap();
+
+        assert!(completed.borrow().is_empty());
+        let active = module
+            .active_speech
+            .as_ref()
+            .expect("generation should still be active after the second slice");
+        assert_eq!(active.draft.accumulated, "Koro, stay close");
+        assert_eq!(active.draft.sequence, 16);
+        let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        let progress = blackboard
+            .read(|bb| bb.utterance_progress_for_instance(&speak_owner).cloned())
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.state,
+            nuillu_blackboard::UtteranceProgressState::Streaming
+        );
+        assert_eq!(progress.partial_utterance, "Koro, stay close");
+
+        let planning_text = session_input_text(&module.planning_session);
+        assert_eq!(module.planning_session.list_turns().count(), 1);
+        assert!(!planning_text.contains("Outward speech currently in progress to Koro"));
+        assert!(!planning_text.contains("Already emitted:\nKoro, st"));
+        assert!(!planning_text.contains("Already emitted:\nKoro, stay close"));
     }
 
     #[tokio::test(flavor = "current_thread")]
