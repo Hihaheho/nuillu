@@ -21,3 +21,8 @@ next-minor = 1
   tag = "cognition-log"
   file = "dev/v0.1.cognition-log.sql"
 }
+
+@ tasks[] {
+  tag = "recent-activity-traces"
+  file = "dev/v0.1.recent-activity-traces.sql"
+}

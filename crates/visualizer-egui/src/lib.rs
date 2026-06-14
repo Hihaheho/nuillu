@@ -269,11 +269,31 @@ impl VisualizerState {
                     .scene
                     .push_utterance_completed(utterance);
             }
-            VisualizerEvent::SceneActivitySnapshot { tab_id, entries } => {
-                self.tab_mut(tab_id).scene.apply_activity_snapshot(entries);
+            VisualizerEvent::OneShotSensoryInputRows { tab_id, rows } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .apply_one_shot_sensory_input_rows(rows);
             }
-            VisualizerEvent::SceneActivityEntryUpsert { tab_id, entry } => {
-                self.tab_mut(tab_id).scene.upsert_activity_entry(entry);
+            VisualizerEvent::OneShotSensoryInputAppended { tab_id, row } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .append_one_shot_sensory_input_row(row);
+            }
+            VisualizerEvent::AmbientSensorySnapshotRows { tab_id, rows } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .apply_ambient_sensory_snapshot_rows(rows);
+            }
+            VisualizerEvent::AmbientSensorySnapshotAppended { tab_id, row } => {
+                self.tab_mut(tab_id)
+                    .scene
+                    .append_ambient_sensory_snapshot_row(row);
+            }
+            VisualizerEvent::UtteranceEventRows { tab_id, rows } => {
+                self.tab_mut(tab_id).scene.apply_utterance_event_rows(rows);
+            }
+            VisualizerEvent::UtteranceEventAppended { tab_id, row } => {
+                self.tab_mut(tab_id).scene.append_utterance_event_row(row);
             }
             VisualizerEvent::RuntimeEvent { tab_id, event } => {
                 let tab = self.tab_mut(tab_id);

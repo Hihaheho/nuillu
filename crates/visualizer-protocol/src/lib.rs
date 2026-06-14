@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use nuillu_module::{RuntimeEvent, SensoryInput};
+use nuillu_module::{AmbientSensoryEntry, RuntimeEvent, SensoryInput};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -175,14 +175,6 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         utterance: UtteranceView,
     },
-    SceneActivitySnapshot {
-        tab_id: VisualizerTabId,
-        entries: Vec<SceneActivityEntryView>,
-    },
-    SceneActivityEntryUpsert {
-        tab_id: VisualizerTabId,
-        entry: SceneActivityEntryView,
-    },
     RuntimeEvent {
         tab_id: VisualizerTabId,
         event: RuntimeEvent,
@@ -220,6 +212,30 @@ pub enum VisualizerEvent {
     AmbientSensoryRows {
         tab_id: VisualizerTabId,
         rows: Vec<AmbientSensoryRowView>,
+    },
+    OneShotSensoryInputRows {
+        tab_id: VisualizerTabId,
+        rows: Vec<OneShotSensoryInputRowView>,
+    },
+    OneShotSensoryInputAppended {
+        tab_id: VisualizerTabId,
+        row: OneShotSensoryInputRowView,
+    },
+    AmbientSensorySnapshotRows {
+        tab_id: VisualizerTabId,
+        rows: Vec<AmbientSensorySnapshotRowView>,
+    },
+    AmbientSensorySnapshotAppended {
+        tab_id: VisualizerTabId,
+        row: AmbientSensorySnapshotRowView,
+    },
+    UtteranceEventRows {
+        tab_id: VisualizerTabId,
+        rows: Vec<UtteranceEventRowView>,
+    },
+    UtteranceEventAppended {
+        tab_id: VisualizerTabId,
+        row: UtteranceEventRowView,
     },
     SceneState {
         tab_id: VisualizerTabId,
@@ -556,42 +572,48 @@ pub struct UtteranceView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SceneActivityEntryView {
-    UserMessage {
-        id: String,
-        at: DateTime<Utc>,
-        content: String,
-        source: String,
-    },
-    SpeechSegment {
-        id: String,
-        at: DateTime<Utc>,
-        sender: String,
-        target: String,
-        generation_id: u64,
-        segment_index: u32,
-        start_sequence: u32,
-        end_sequence: u32,
-        content: String,
-        status: SpeechSegmentStatusView,
-    },
+pub struct OneShotSensoryInputRowView {
+    pub id: i64,
+    pub server_session_id: String,
+    pub modality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    pub content: String,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
-impl SceneActivityEntryView {
-    pub fn id(&self) -> &str {
-        match self {
-            Self::UserMessage { id, .. } | Self::SpeechSegment { id, .. } => id,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbientSensorySnapshotRowView {
+    pub id: i64,
+    pub server_session_id: String,
+    pub entries: Vec<AmbientSensoryEntry>,
+    pub observed_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SpeechSegmentStatusView {
-    Streaming,
-    Interrupted,
+pub enum UtteranceEventKindView {
+    Delta,
     Completed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UtteranceEventRowView {
+    pub id: i64,
+    pub server_session_id: String,
+    pub event_kind: UtteranceEventKindView,
+    pub sender: String,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1228,63 +1250,73 @@ mod tests {
     }
 
     #[test]
-    fn scene_activity_events_round_trip_through_json() {
+    fn raw_recent_activity_rows_round_trip_through_json() {
         let at = DateTime::<Utc>::from_timestamp(1_780_000_000, 0).unwrap();
-        let entry = SceneActivityEntryView::SpeechSegment {
-            id: "speech:speak:Koro:7:1".to_string(),
-            at,
+        let one_shot = OneShotSensoryInputRowView {
+            id: 1,
+            server_session_id: "server-session".to_string(),
+            modality: "audition".to_string(),
+            direction: Some("Koro".to_string()),
+            content: "Koro says, \"wait\"".to_string(),
+            observed_at: at,
+            created_at: at,
+        };
+        let ambient = AmbientSensorySnapshotRowView {
+            id: 2,
+            server_session_id: "server-session".to_string(),
+            entries: vec![AmbientSensoryEntry {
+                id: "scene:person:koro".to_string(),
+                modality: nuillu_module::SensoryModality::parse("vision"),
+                content: "Koro waits nearby.".to_string(),
+            }],
+            observed_at: at,
+            created_at: at,
+        };
+        let utterance = UtteranceEventRowView {
+            id: 3,
+            server_session_id: "server-session".to_string(),
+            event_kind: UtteranceEventKindView::Delta,
             sender: "speak".to_string(),
             target: "Koro".to_string(),
             generation_id: 7,
-            segment_index: 1,
-            start_sequence: 3,
-            end_sequence: 4,
-            content: " stay close".to_string(),
-            status: SpeechSegmentStatusView::Streaming,
+            sequence: 1,
+            content: "stay".to_string(),
+            reason: None,
+            occurred_at: at,
+            created_at: at,
         };
-        let message = VisualizerServerMessage::event(VisualizerEvent::SceneActivityEntryUpsert {
-            tab_id: VisualizerTabId::new("live"),
-            entry: entry.clone(),
-        });
 
-        let json = serde_json::to_string(&message).unwrap();
-        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+        let messages = [
+            VisualizerServerMessage::event(VisualizerEvent::OneShotSensoryInputRows {
+                tab_id: VisualizerTabId::new("live"),
+                rows: vec![one_shot.clone()],
+            }),
+            VisualizerServerMessage::event(VisualizerEvent::AmbientSensorySnapshotAppended {
+                tab_id: VisualizerTabId::new("live"),
+                row: ambient.clone(),
+            }),
+            VisualizerServerMessage::event(VisualizerEvent::UtteranceEventAppended {
+                tab_id: VisualizerTabId::new("live"),
+                row: utterance.clone(),
+            }),
+        ];
 
-        assert!(json.contains(r#""kind":"speech_segment""#));
-        assert!(json.contains(r#""status":"streaming""#));
-        assert!(matches!(
-            actual,
-            VisualizerServerMessage::Event {
-                event: VisualizerEvent::SceneActivityEntryUpsert {
-                    entry: actual_entry,
-                    ..
-                },
-            } if actual_entry == entry
-        ));
-
-        let entries = vec![SceneActivityEntryView::UserMessage {
-            id: "user:1".to_string(),
-            at,
-            content: "Koro says, \"wait\"".to_string(),
-            source: "one-shot audition from Koro".to_string(),
-        }];
-        let message = VisualizerServerMessage::event(VisualizerEvent::SceneActivitySnapshot {
-            tab_id: VisualizerTabId::new("live"),
-            entries: entries.clone(),
-        });
-        let json = serde_json::to_string(&message).unwrap();
-        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
-
-        assert!(json.contains(r#""kind":"user_message""#));
-        assert!(matches!(
-            actual,
-            VisualizerServerMessage::Event {
-                event: VisualizerEvent::SceneActivitySnapshot {
-                    entries: actual_entries,
-                    ..
-                },
-            } if actual_entries == entries
-        ));
+        for message in messages {
+            let json = serde_json::to_string(&message).unwrap();
+            let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+            match actual {
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::OneShotSensoryInputRows { rows, .. },
+                } => assert_eq!(rows, vec![one_shot.clone()]),
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::AmbientSensorySnapshotAppended { row, .. },
+                } => assert_eq!(row, ambient.clone()),
+                VisualizerServerMessage::Event {
+                    event: VisualizerEvent::UtteranceEventAppended { row, .. },
+                } => assert_eq!(row, utterance.clone()),
+                other => panic!("unexpected raw activity row message: {other:?}"),
+            }
+        }
     }
 
     #[test]

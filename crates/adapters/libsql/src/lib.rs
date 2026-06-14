@@ -17,8 +17,8 @@ use nuillu_memory::{
 };
 pub use nuillu_module::ports::Embedder;
 use nuillu_module::{
-    AllocationStore, PersistedAllocationSnapshot, PersistedSessionSnapshot, SessionKey,
-    SessionStore,
+    AllocationStore, AmbientSensoryEntry, PersistedAllocationSnapshot, PersistedSessionSnapshot,
+    SessionKey, SessionStore,
     ports::{CognitionLogRepository, PersistedCognitionLogEntry, PortError},
 };
 use nuillu_reward::{
@@ -169,6 +169,21 @@ pub struct LibsqlLlmTranscriptStore {
     conn: Connection,
 }
 
+#[derive(Clone)]
+pub struct LibsqlOneShotSensoryInputStore {
+    conn: Connection,
+}
+
+#[derive(Clone)]
+pub struct LibsqlAmbientSensorySnapshotStore {
+    conn: Connection,
+}
+
+#[derive(Clone)]
+pub struct LibsqlUtteranceEventStore {
+    conn: Connection,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewLlmTranscriptTurn {
     pub server_session_id: String,
@@ -200,6 +215,87 @@ pub struct LlmTranscriptTurnRecord {
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
     pub trace_json: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewOneShotSensoryInput {
+    pub server_session_id: String,
+    pub modality: String,
+    pub direction: Option<String>,
+    pub content: String,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OneShotSensoryInputRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub modality: String,
+    pub direction: Option<String>,
+    pub content: String,
+    pub observed_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewAmbientSensorySnapshot {
+    pub server_session_id: String,
+    pub entries: Vec<AmbientSensoryEntry>,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AmbientSensorySnapshotRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub entries: Vec<AmbientSensoryEntry>,
+    pub observed_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtteranceEventKind {
+    Delta,
+    Completed,
+    Aborted,
+}
+
+impl UtteranceEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewUtteranceEvent {
+    pub server_session_id: String,
+    pub event_kind: UtteranceEventKind,
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub content: String,
+    pub reason: Option<String>,
+    pub occurred_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtteranceEventRecord {
+    pub id: i64,
+    pub server_session_id: String,
+    pub event_kind: UtteranceEventKind,
+    pub sender: ModuleInstanceId,
+    pub target: String,
+    pub generation_id: u64,
+    pub sequence: u32,
+    pub content: String,
+    pub reason: Option<String>,
+    pub occurred_at_ms: i64,
+    pub created_at_ms: i64,
 }
 
 impl LibsqlAgentStore {
@@ -263,6 +359,24 @@ impl LibsqlAgentStore {
 
     pub fn llm_transcript_store(&self) -> LibsqlLlmTranscriptStore {
         LibsqlLlmTranscriptStore {
+            conn: self.conn.clone(),
+        }
+    }
+
+    pub fn one_shot_sensory_input_store(&self) -> LibsqlOneShotSensoryInputStore {
+        LibsqlOneShotSensoryInputStore {
+            conn: self.conn.clone(),
+        }
+    }
+
+    pub fn ambient_sensory_snapshot_store(&self) -> LibsqlAmbientSensorySnapshotStore {
+        LibsqlAmbientSensorySnapshotStore {
+            conn: self.conn.clone(),
+        }
+    }
+
+    pub fn utterance_event_store(&self) -> LibsqlUtteranceEventStore {
+        LibsqlUtteranceEventStore {
             conn: self.conn.clone(),
         }
     }
@@ -630,6 +744,246 @@ impl LibsqlLlmTranscriptStore {
             .await
             .map_err(map_libsql_error)?;
         Ok(())
+    }
+}
+
+impl LibsqlOneShotSensoryInputStore {
+    pub async fn append(
+        &self,
+        input: NewOneShotSensoryInput,
+    ) -> Result<OneShotSensoryInputRecord, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO one_shot_sensory_inputs (
+                    server_session_id,
+                    modality,
+                    direction,
+                    content,
+                    observed_at_ms,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 RETURNING
+                    id,
+                    server_session_id,
+                    modality,
+                    direction,
+                    content,
+                    observed_at_ms,
+                    created_at_ms",
+                params![
+                    input.server_session_id,
+                    input.modality,
+                    input.direction,
+                    input.content,
+                    input.observed_at_ms,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(map_libsql_error)?
+            .ok_or_else(|| {
+                PortError::InvalidData("one-shot sensory insert returned no row".to_string())
+            })?;
+        one_shot_sensory_input_record_from_row(&row)
+    }
+
+    pub async fn recent(&self, limit: usize) -> Result<Vec<OneShotSensoryInputRecord>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    id,
+                    server_session_id,
+                    modality,
+                    direction,
+                    content,
+                    observed_at_ms,
+                    created_at_ms
+                   FROM one_shot_sensory_inputs
+                  ORDER BY id DESC
+                  LIMIT ?1",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            records.push(one_shot_sensory_input_record_from_row(&row)?);
+        }
+        records.reverse();
+        Ok(records)
+    }
+}
+
+impl LibsqlAmbientSensorySnapshotStore {
+    pub async fn append(
+        &self,
+        snapshot: NewAmbientSensorySnapshot,
+    ) -> Result<AmbientSensorySnapshotRecord, PortError> {
+        let entries_json = serde_json::to_string(&snapshot.entries)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO ambient_sensory_snapshots (
+                    server_session_id,
+                    entries_json,
+                    observed_at_ms,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 RETURNING
+                    id,
+                    server_session_id,
+                    entries_json,
+                    observed_at_ms,
+                    created_at_ms",
+                params![
+                    snapshot.server_session_id,
+                    entries_json,
+                    snapshot.observed_at_ms,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(map_libsql_error)?
+            .ok_or_else(|| {
+                PortError::InvalidData(
+                    "ambient sensory snapshot insert returned no row".to_string(),
+                )
+            })?;
+        ambient_sensory_snapshot_record_from_row(&row)
+    }
+
+    pub async fn recent(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AmbientSensorySnapshotRecord>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    id,
+                    server_session_id,
+                    entries_json,
+                    observed_at_ms,
+                    created_at_ms
+                   FROM ambient_sensory_snapshots
+                  ORDER BY id DESC
+                  LIMIT ?1",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            records.push(ambient_sensory_snapshot_record_from_row(&row)?);
+        }
+        records.reverse();
+        Ok(records)
+    }
+}
+
+impl LibsqlUtteranceEventStore {
+    pub async fn append(
+        &self,
+        event: NewUtteranceEvent,
+    ) -> Result<UtteranceEventRecord, PortError> {
+        let generation_id = u64_to_i64("generation_id", event.generation_id)?;
+        let sequence = i64::from(event.sequence);
+        let mut rows = self
+            .conn
+            .query(
+                "INSERT INTO utterance_events (
+                    server_session_id,
+                    event_kind,
+                    sender_module,
+                    sender_replica,
+                    target,
+                    generation_id,
+                    sequence,
+                    content,
+                    reason,
+                    occurred_at_ms,
+                    created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 RETURNING
+                    id,
+                    server_session_id,
+                    event_kind,
+                    sender_module,
+                    sender_replica,
+                    target,
+                    generation_id,
+                    sequence,
+                    content,
+                    reason,
+                    occurred_at_ms,
+                    created_at_ms",
+                params![
+                    event.server_session_id,
+                    event.event_kind.as_str(),
+                    event.sender.module.as_str(),
+                    i64::from(event.sender.replica.get()),
+                    event.target,
+                    generation_id,
+                    sequence,
+                    event.content,
+                    event.reason,
+                    event.occurred_at_ms,
+                    now_ms(),
+                ],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(map_libsql_error)?
+            .ok_or_else(|| {
+                PortError::InvalidData("utterance event insert returned no row".to_string())
+            })?;
+        utterance_event_record_from_row(&row)
+    }
+
+    pub async fn recent(&self, limit: usize) -> Result<Vec<UtteranceEventRecord>, PortError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    id,
+                    server_session_id,
+                    event_kind,
+                    sender_module,
+                    sender_replica,
+                    target,
+                    generation_id,
+                    sequence,
+                    content,
+                    reason,
+                    occurred_at_ms,
+                    created_at_ms
+                   FROM utterance_events
+                  ORDER BY id DESC
+                  LIMIT ?1",
+                params![limit_to_i64(limit)],
+            )
+            .await
+            .map_err(map_libsql_error)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            records.push(utterance_event_record_from_row(&row)?);
+        }
+        records.reverse();
+        Ok(records)
     }
 }
 
@@ -2660,6 +3014,81 @@ impl MemoryStore for LibsqlMemoryStore {
     }
 }
 
+fn one_shot_sensory_input_record_from_row(
+    row: &libsql::Row,
+) -> Result<OneShotSensoryInputRecord, PortError> {
+    Ok(OneShotSensoryInputRecord {
+        id: row.get(0).map_err(map_libsql_error)?,
+        server_session_id: row.get(1).map_err(map_libsql_error)?,
+        modality: row.get(2).map_err(map_libsql_error)?,
+        direction: row.get(3).map_err(map_libsql_error)?,
+        content: row.get(4).map_err(map_libsql_error)?,
+        observed_at_ms: row.get(5).map_err(map_libsql_error)?,
+        created_at_ms: row.get(6).map_err(map_libsql_error)?,
+    })
+}
+
+fn ambient_sensory_snapshot_record_from_row(
+    row: &libsql::Row,
+) -> Result<AmbientSensorySnapshotRecord, PortError> {
+    let entries_json: String = row.get(2).map_err(map_libsql_error)?;
+    Ok(AmbientSensorySnapshotRecord {
+        id: row.get(0).map_err(map_libsql_error)?,
+        server_session_id: row.get(1).map_err(map_libsql_error)?,
+        entries: serde_json::from_str(&entries_json)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?,
+        observed_at_ms: row.get(3).map_err(map_libsql_error)?,
+        created_at_ms: row.get(4).map_err(map_libsql_error)?,
+    })
+}
+
+fn utterance_event_record_from_row(row: &libsql::Row) -> Result<UtteranceEventRecord, PortError> {
+    let event_kind: String = row.get(2).map_err(map_libsql_error)?;
+    let sender_module: String = row.get(3).map_err(map_libsql_error)?;
+    let sender_replica: i64 = row.get(4).map_err(map_libsql_error)?;
+    let generation_id: i64 = row.get(6).map_err(map_libsql_error)?;
+    let sequence: i64 = row.get(7).map_err(map_libsql_error)?;
+    Ok(UtteranceEventRecord {
+        id: row.get(0).map_err(map_libsql_error)?,
+        server_session_id: row.get(1).map_err(map_libsql_error)?,
+        event_kind: utterance_event_kind_from_str(&event_kind)?,
+        sender: module_instance_from_row(sender_module, sender_replica)?,
+        target: row.get(5).map_err(map_libsql_error)?,
+        generation_id: u64_from_i64("utterance generation_id", generation_id)?,
+        sequence: u32_from_i64("utterance sequence", sequence)?,
+        content: row.get(8).map_err(map_libsql_error)?,
+        reason: row.get(9).map_err(map_libsql_error)?,
+        occurred_at_ms: row.get(10).map_err(map_libsql_error)?,
+        created_at_ms: row.get(11).map_err(map_libsql_error)?,
+    })
+}
+
+fn utterance_event_kind_from_str(value: &str) -> Result<UtteranceEventKind, PortError> {
+    match value {
+        "delta" => Ok(UtteranceEventKind::Delta),
+        "completed" => Ok(UtteranceEventKind::Completed),
+        "aborted" => Ok(UtteranceEventKind::Aborted),
+        _ => Err(PortError::InvalidData(format!(
+            "unknown utterance event kind: {value}"
+        ))),
+    }
+}
+
+fn u64_to_i64(label: &str, value: u64) -> Result<i64, PortError> {
+    i64::try_from(value)
+        .map_err(|_| PortError::InvalidInput(format!("{label} out of i64 range: {value}")))
+}
+
+fn u64_from_i64(label: &str, value: i64) -> Result<u64, PortError> {
+    u64::try_from(value)
+        .map_err(|_| PortError::InvalidData(format!("{label} is negative: {value}")))
+}
+
+fn u32_from_i64(label: &str, value: i64) -> Result<u32, PortError> {
+    u32::try_from(value)
+        .map_err(|_| PortError::InvalidData(format!("{label} out of u32 range: {value}")))
+}
+
 #[derive(Debug)]
 struct PendingEmbedding {
     memory_id: i64,
@@ -3030,6 +3459,9 @@ mod tests {
         assert!(table_exists(&store.conn, "llm_sessions").await);
         assert!(table_exists(&store.conn, "allocation_snapshots").await);
         assert!(table_exists(&store.conn, "llm_transcript_turns").await);
+        assert!(table_exists(&store.conn, "one_shot_sensory_inputs").await);
+        assert!(table_exists(&store.conn, "ambient_sensory_snapshots").await);
+        assert!(table_exists(&store.conn, "utterance_events").await);
         assert_eq!(
             version,
             SchemaVersion {
@@ -3231,6 +3663,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sensory_and_utterance_trace_stores_round_trip_independently() {
+        let agent = LibsqlAgentStore::connect(
+            LibsqlAgentStoreConfig::local(test_db_path(), 3, 3),
+            TestEmbedder::boxed(3),
+            TestEmbedder::boxed(3),
+        )
+        .await
+        .unwrap();
+        let one_shot = agent.one_shot_sensory_input_store();
+        let ambient = agent.ambient_sensory_snapshot_store();
+        let utterance = agent.utterance_event_store();
+        let sender = ModuleInstanceId::new(ModuleId::new("speak").unwrap(), ReplicaIndex::ZERO);
+
+        let one_shot_record = one_shot
+            .append(NewOneShotSensoryInput {
+                server_session_id: "server-session".to_string(),
+                modality: "audition".to_string(),
+                direction: Some("Koro".to_string()),
+                content: "Koro says, \"wait\"".to_string(),
+                observed_at_ms: 10,
+            })
+            .await
+            .unwrap();
+        let ambient_record = ambient
+            .append(NewAmbientSensorySnapshot {
+                server_session_id: "server-session".to_string(),
+                entries: vec![AmbientSensoryEntry {
+                    id: "scene:person:koro".to_string(),
+                    modality: nuillu_module::SensoryModality::parse("vision"),
+                    content: "Koro is nearby.".to_string(),
+                }],
+                observed_at_ms: 11,
+            })
+            .await
+            .unwrap();
+        let utterance_record = utterance
+            .append(NewUtteranceEvent {
+                server_session_id: "server-session".to_string(),
+                event_kind: UtteranceEventKind::Delta,
+                sender: sender.clone(),
+                target: "Koro".to_string(),
+                generation_id: 7,
+                sequence: 2,
+                content: " stay".to_string(),
+                reason: None,
+                occurred_at_ms: 12,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(one_shot.recent(10).await.unwrap(), vec![one_shot_record]);
+        assert_eq!(ambient.recent(10).await.unwrap(), vec![ambient_record]);
+        assert_eq!(utterance.recent(10).await.unwrap(), vec![utterance_record]);
+    }
+
+    #[tokio::test]
     async fn connect_rejects_dimension_mismatch() {
         let result = LibsqlAgentStore::connect(
             LibsqlAgentStoreConfig::local(test_db_path(), 2, 3),
@@ -3420,7 +3908,7 @@ mod tests {
         assert!(column_exists(&store, "cognition_log_entries", "owner_replica").await);
         assert!(column_exists(&store, "cognition_log_entries", "occurred_at_ms").await);
         assert!(column_exists(&store, "cognition_log_entries", "text").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 4);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 5);
     }
 
     #[tokio::test]

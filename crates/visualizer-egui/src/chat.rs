@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::Sender;
 
-use nuillu_module::SensoryInput;
+use nuillu_module::{AmbientSensoryEntry, SensoryInput};
 
 use crate::{
-    DerivedAmbientSensoryRowView, SceneActivityEntryView, SceneRowKind, SceneRowView,
-    SceneStateView, SpeechSegmentStatusView, UtteranceDeltaView, UtteranceView,
-    VisualizerClientMessage, VisualizerCommand, VisualizerTabId, text::wrapped_label,
+    AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, OneShotSensoryInputRowView,
+    SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
+    UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
+    VisualizerTabId, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -29,6 +30,7 @@ const ATMOSPHERE_ASPECTS: [&str; 6] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActivityRole {
     User,
+    Environment,
     Assistant,
 }
 
@@ -36,6 +38,7 @@ impl ActivityRole {
     fn label(&self) -> &'static str {
         match self {
             Self::User => "sensory",
+            Self::Environment => "ambient",
             Self::Assistant => "nui",
         }
     }
@@ -76,6 +79,9 @@ pub struct SceneUiState {
     activity_authoritative: bool,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
     completed_utterances: BTreeMap<UtteranceKey, usize>,
+    one_shot_sensory_rows: BTreeMap<i64, OneShotSensoryInputRowView>,
+    ambient_sensory_rows: BTreeMap<i64, AmbientSensorySnapshotRowView>,
+    utterance_event_rows: BTreeMap<i64, UtteranceEventRowView>,
     person_message_drafts: BTreeMap<String, String>,
 }
 
@@ -211,33 +217,103 @@ impl SceneUiState {
         }
     }
 
-    pub fn apply_activity_snapshot(&mut self, entries: Vec<SceneActivityEntryView>) {
-        self.activity_authoritative = true;
-        self.streaming_utterances.clear();
-        self.completed_utterances.clear();
-        self.activity = entries
-            .into_iter()
-            .map(activity_message_from_entry)
-            .collect();
+    pub fn apply_one_shot_sensory_input_rows(&mut self, rows: Vec<OneShotSensoryInputRowView>) {
+        self.one_shot_sensory_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.rebuild_activity_from_raw_rows();
     }
 
-    pub fn upsert_activity_entry(&mut self, entry: SceneActivityEntryView) {
-        if !self.activity_authoritative {
-            self.activity.clear();
-            self.streaming_utterances.clear();
-            self.completed_utterances.clear();
-            self.activity_authoritative = true;
-        }
-        let id = entry.id().to_string();
-        let message = activity_message_from_entry(entry);
-        if let Some(existing) = self
-            .activity
-            .iter_mut()
-            .find(|existing| existing.id.as_deref() == Some(id.as_str()))
-        {
-            *existing = message;
-        } else {
-            self.activity.push(message);
+    pub fn append_one_shot_sensory_input_row(&mut self, row: OneShotSensoryInputRowView) {
+        self.one_shot_sensory_rows.insert(row.id, row);
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn apply_ambient_sensory_snapshot_rows(
+        &mut self,
+        rows: Vec<AmbientSensorySnapshotRowView>,
+    ) {
+        self.ambient_sensory_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn append_ambient_sensory_snapshot_row(&mut self, row: AmbientSensorySnapshotRowView) {
+        self.ambient_sensory_rows.insert(row.id, row);
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn apply_utterance_event_rows(&mut self, rows: Vec<UtteranceEventRowView>) {
+        self.utterance_event_rows = rows.into_iter().map(|row| (row.id, row)).collect();
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    pub fn append_utterance_event_row(&mut self, row: UtteranceEventRowView) {
+        self.utterance_event_rows.insert(row.id, row);
+        self.rebuild_activity_from_raw_rows();
+    }
+
+    fn rebuild_activity_from_raw_rows(&mut self) {
+        self.activity_authoritative = true;
+        self.activity.clear();
+        self.streaming_utterances.clear();
+        self.completed_utterances.clear();
+
+        let mut utterance_messages = BTreeMap::<UtteranceKey, Vec<usize>>::new();
+        let mut ambient_baseline: Option<BTreeMap<String, AmbientSensoryEntry>> = None;
+        let mut rows = Vec::new();
+        rows.extend(
+            self.one_shot_sensory_rows
+                .values()
+                .map(ActivitySourceRow::OneShot),
+        );
+        rows.extend(
+            self.ambient_sensory_rows
+                .values()
+                .map(ActivitySourceRow::Ambient),
+        );
+        rows.extend(
+            self.utterance_event_rows
+                .values()
+                .map(ActivitySourceRow::Utterance),
+        );
+        rows.sort_by_key(ActivitySourceRow::sort_key);
+
+        for row in rows {
+            match row {
+                ActivitySourceRow::OneShot(row) => {
+                    interrupt_streaming_messages(
+                        &mut self.activity,
+                        &mut self.streaming_utterances,
+                    );
+                    let mut message = ActivityMessage::new(ActivityRole::User, row.content.clone());
+                    message.id = Some(format!("one-shot:{}", row.id));
+                    message.source = Some(one_shot_source(row));
+                    self.activity.push(message);
+                }
+                ActivitySourceRow::Ambient(row) => {
+                    let current = ambient_entry_map(&row.entries);
+                    if let Some(previous) = &ambient_baseline {
+                        if let Some(content) = ambient_diff_content(previous, &current) {
+                            interrupt_streaming_messages(
+                                &mut self.activity,
+                                &mut self.streaming_utterances,
+                            );
+                            let mut message =
+                                ActivityMessage::new(ActivityRole::Environment, content);
+                            message.id = Some(format!("ambient:{}", row.id));
+                            message.source =
+                                Some(format!("ambient snapshot at {}", row.observed_at));
+                            self.activity.push(message);
+                        }
+                    }
+                    ambient_baseline = Some(current);
+                }
+                ActivitySourceRow::Utterance(row) => apply_utterance_event_row(
+                    &mut self.activity,
+                    &mut self.streaming_utterances,
+                    &mut self.completed_utterances,
+                    &mut utterance_messages,
+                    row,
+                ),
+            }
         }
     }
 
@@ -284,34 +360,177 @@ impl SceneUiState {
     }
 }
 
-fn activity_message_from_entry(entry: SceneActivityEntryView) -> ActivityMessage {
-    match entry {
-        SceneActivityEntryView::UserMessage {
-            id,
-            content,
-            source,
-            ..
-        } => {
-            let mut message = ActivityMessage::new(ActivityRole::User, content);
-            message.id = Some(id);
-            message.source = Some(source);
-            message
+enum ActivitySourceRow<'a> {
+    OneShot(&'a OneShotSensoryInputRowView),
+    Ambient(&'a AmbientSensorySnapshotRowView),
+    Utterance(&'a UtteranceEventRowView),
+}
+
+impl ActivitySourceRow<'_> {
+    fn sort_key(
+        &self,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        u8,
+        i64,
+    ) {
+        match self {
+            Self::OneShot(row) => (row.observed_at, row.created_at, 0, row.id),
+            Self::Ambient(row) => (row.observed_at, row.created_at, 1, row.id),
+            Self::Utterance(row) => (row.occurred_at, row.created_at, 2, row.id),
         }
-        SceneActivityEntryView::SpeechSegment {
-            id,
-            sender,
-            target,
-            content,
-            status,
-            ..
-        } => ActivityMessage {
-            id: Some(id),
-            role: ActivityRole::Assistant,
-            content,
-            source: Some(format!("{sender} -> {target}")),
-            streaming: status == SpeechSegmentStatusView::Streaming,
-        },
     }
+}
+
+fn interrupt_streaming_messages(
+    activity: &mut [ActivityMessage],
+    streaming: &mut BTreeMap<UtteranceKey, usize>,
+) {
+    for (_, index) in std::mem::take(streaming) {
+        if let Some(message) = activity.get_mut(index) {
+            message.streaming = false;
+        }
+    }
+}
+
+fn apply_utterance_event_row(
+    activity: &mut Vec<ActivityMessage>,
+    streaming: &mut BTreeMap<UtteranceKey, usize>,
+    completed: &mut BTreeMap<UtteranceKey, usize>,
+    utterance_messages: &mut BTreeMap<UtteranceKey, Vec<usize>>,
+    row: &UtteranceEventRowView,
+) {
+    let key = UtteranceKey {
+        sender: row.sender.clone(),
+        target: row.target.clone(),
+        generation_id: row.generation_id,
+    };
+    match row.event_kind {
+        UtteranceEventKindView::Delta => {
+            if completed.contains_key(&key) {
+                return;
+            }
+            let index = if let Some(index) = streaming.get(&key).copied() {
+                index
+            } else {
+                let index = activity.len();
+                streaming.insert(key.clone(), index);
+                utterance_messages
+                    .entry(key.clone())
+                    .or_default()
+                    .push(index);
+                activity.push(ActivityMessage {
+                    id: Some(format!("utterance:{}:{}", row.generation_id, row.sequence)),
+                    role: ActivityRole::Assistant,
+                    content: String::new(),
+                    streaming: true,
+                    source: Some(format!("{} -> {}", row.sender, row.target)),
+                });
+                index
+            };
+            if let Some(message) = activity.get_mut(index) {
+                message.content.push_str(&row.content);
+                message.streaming = true;
+            }
+        }
+        UtteranceEventKindView::Completed => {
+            streaming.remove(&key);
+            if let Some(indexes) = utterance_messages.get(&key) {
+                if indexes.len() == 1
+                    && let Some(message) = activity.get_mut(indexes[0])
+                {
+                    message.content = row.content.clone();
+                }
+                for index in indexes {
+                    if let Some(message) = activity.get_mut(*index) {
+                        message.streaming = false;
+                    }
+                }
+                if let Some(index) = indexes.last().copied() {
+                    completed.insert(key, index);
+                }
+                return;
+            }
+            let mut message = ActivityMessage::new(ActivityRole::Assistant, row.content.clone());
+            message.id = Some(format!("utterance:{}", row.id));
+            message.source = Some(format!(
+                "{} -> {} at {}",
+                row.sender, row.target, row.occurred_at
+            ));
+            let index = activity.len();
+            activity.push(message);
+            completed.insert(key, index);
+        }
+        UtteranceEventKindView::Aborted => {
+            streaming.remove(&key);
+            if let Some(indexes) = utterance_messages.get(&key) {
+                for index in indexes {
+                    if let Some(message) = activity.get_mut(*index) {
+                        message.streaming = false;
+                    }
+                }
+                return;
+            }
+            if !row.content.trim().is_empty() {
+                let mut message =
+                    ActivityMessage::new(ActivityRole::Assistant, row.content.clone());
+                message.id = Some(format!("utterance:{}", row.id));
+                message.source = Some(format!("{} -> {} interrupted", row.sender, row.target));
+                activity.push(message);
+            }
+        }
+    }
+}
+
+fn one_shot_source(row: &OneShotSensoryInputRowView) -> String {
+    if let Some(direction) = &row.direction {
+        format!(
+            "one-shot {} from {} at {}",
+            row.modality, direction, row.observed_at
+        )
+    } else {
+        format!("one-shot {} at {}", row.modality, row.observed_at)
+    }
+}
+
+fn ambient_entry_map(entries: &[AmbientSensoryEntry]) -> BTreeMap<String, AmbientSensoryEntry> {
+    entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect()
+}
+
+fn ambient_diff_content(
+    previous: &BTreeMap<String, AmbientSensoryEntry>,
+    current: &BTreeMap<String, AmbientSensoryEntry>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for (id, entry) in current {
+        match previous.get(id) {
+            None => parts.push(format!("added {}", ambient_entry_summary(entry))),
+            Some(previous) if previous != entry => {
+                parts.push(format!("updated {}", ambient_entry_summary(entry)));
+            }
+            Some(_) => {}
+        }
+    }
+    for (id, entry) in previous {
+        if !current.contains_key(id) {
+            parts.push(format!("removed {}", ambient_entry_summary(entry)));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn ambient_entry_summary(entry: &AmbientSensoryEntry) -> String {
+    format!(
+        "{} {}: {}",
+        entry.modality.as_str(),
+        entry.id,
+        entry.content
+    )
 }
 
 pub fn ui(
@@ -663,6 +882,7 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
     egui::Frame::new()
         .fill(match message.role {
             ActivityRole::User => ui.visuals().selection.bg_fill.linear_multiply(0.65),
+            ActivityRole::Environment => ui.visuals().faint_bg_color,
             ActivityRole::Assistant => ui.visuals().extreme_bg_color,
         })
         .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -869,103 +1089,52 @@ mod tests {
     }
 
     #[test]
-    fn activity_snapshot_restores_split_streaming_speech() {
+    fn raw_rows_restore_one_shot_ambient_diff_and_split_streaming_speech() {
         let mut state = SceneUiState::default();
 
-        state.apply_activity_snapshot(vec![
-            speech_segment(
-                "speech:0",
-                0,
-                0,
-                1,
-                "Koro, stay",
-                SpeechSegmentStatusView::Interrupted,
-            ),
-            user_message("user:1", "Koro says, \"wait\""),
-            speech_segment(
-                "speech:2",
-                1,
-                2,
-                2,
-                " close.",
-                SpeechSegmentStatusView::Streaming,
-            ),
-        ]);
-
-        assert_eq!(state.activity.len(), 3);
-        assert_eq!(state.activity[0].content, "Koro, stay");
-        assert!(!state.activity[0].streaming);
-        assert_eq!(state.activity[1].role, ActivityRole::User);
-        assert_eq!(state.activity[1].content, "Koro says, \"wait\"");
-        assert_eq!(state.activity[2].content, " close.");
-        assert!(state.activity[2].streaming);
-    }
-
-    #[test]
-    fn activity_upsert_completes_split_segments_without_collapsing_them() {
-        let mut state = SceneUiState::default();
-        state.apply_activity_snapshot(vec![
-            speech_segment(
-                "speech:0",
-                0,
-                0,
-                1,
-                "Koro, stay",
-                SpeechSegmentStatusView::Interrupted,
-            ),
-            user_message("user:1", "Koro says, \"wait\""),
-            speech_segment(
-                "speech:2",
-                1,
-                2,
-                2,
-                " close.",
-                SpeechSegmentStatusView::Streaming,
-            ),
-        ]);
-
-        state.upsert_activity_entry(speech_segment(
-            "speech:0",
-            0,
-            0,
+        state.apply_ambient_sensory_snapshot_rows(vec![ambient_row(
             1,
-            "Koro, stay",
-            SpeechSegmentStatusView::Completed,
-        ));
-        state.upsert_activity_entry(speech_segment(
-            "speech:2",
-            1,
-            2,
-            2,
-            " close.",
-            SpeechSegmentStatusView::Completed,
-        ));
-
-        assert_eq!(state.activity.len(), 3);
-        assert_eq!(state.activity[0].content, "Koro, stay");
-        assert_eq!(state.activity[1].content, "Koro says, \"wait\"");
-        assert_eq!(state.activity[2].content, " close.");
-        assert!(state.activity.iter().all(|message| !message.streaming));
-    }
-
-    #[test]
-    fn authoritative_activity_ignores_legacy_live_events() {
-        let mut state = SceneUiState::default();
-
-        state.apply_activity_snapshot(vec![speech_segment(
-            "speech:0",
             0,
-            0,
-            0,
-            "Koro",
-            SpeechSegmentStatusView::Streaming,
+            vec![ambient_entry(
+                "scene:person:koro",
+                "vision",
+                "Koro waits nearby.",
+            )],
         )]);
-        state.push_utterance_delta(utterance_delta(7, 1, ", duplicate"));
-        state.push_utterance_completed(utterance_completed(Some(7), "Koro, duplicate"));
+        state.apply_utterance_event_rows(vec![
+            utterance_event(1, 1, UtteranceEventKindView::Delta, 0, "Koro, "),
+            utterance_event(2, 3, UtteranceEventKindView::Delta, 1, "stay"),
+            utterance_event(3, 5, UtteranceEventKindView::Delta, 2, " close."),
+            utterance_event(
+                4,
+                6,
+                UtteranceEventKindView::Completed,
+                3,
+                "Koro, stay close.",
+            ),
+        ]);
+        state.append_ambient_sensory_snapshot_row(ambient_row(
+            2,
+            2,
+            vec![ambient_entry(
+                "scene:person:koro",
+                "vision",
+                "Koro steps toward Nui.",
+            )],
+        ));
+        state.append_one_shot_sensory_input_row(one_shot_row(1, 4, "Koro says, \"wait\""));
 
-        assert_eq!(state.activity.len(), 1);
-        assert_eq!(state.activity[0].content, "Koro");
-        assert!(state.activity[0].streaming);
+        assert_eq!(state.activity.len(), 5);
+        assert_eq!(state.activity[0].content, "Koro, ");
+        assert!(!state.activity[0].streaming);
+        assert_eq!(state.activity[1].role, ActivityRole::Environment);
+        assert!(state.activity[1].content.contains("updated vision"));
+        assert_eq!(state.activity[2].content, "stay");
+        assert!(!state.activity[2].streaming);
+        assert_eq!(state.activity[3].role, ActivityRole::User);
+        assert_eq!(state.activity[3].content, "Koro says, \"wait\"");
+        assert_eq!(state.activity[4].content, " close.");
+        assert!(!state.activity[4].streaming);
     }
 
     fn scene_with_two_people() -> SceneUiState {
@@ -1012,34 +1181,63 @@ mod tests {
         }
     }
 
-    fn user_message(id: &str, content: &str) -> SceneActivityEntryView {
-        SceneActivityEntryView::UserMessage {
-            id: id.to_string(),
-            at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 52).unwrap(),
+    fn at(second: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, second).unwrap()
+    }
+
+    fn one_shot_row(id: i64, second: u32, content: &str) -> OneShotSensoryInputRowView {
+        OneShotSensoryInputRowView {
+            id,
+            server_session_id: "server-session".to_string(),
+            modality: "audition".to_string(),
+            direction: Some("Koro".to_string()),
             content: content.to_string(),
-            source: "one-shot audition from Koro".to_string(),
+            observed_at: at(second),
+            created_at: at(second),
         }
     }
 
-    fn speech_segment(
-        id: &str,
-        segment_index: u32,
-        start_sequence: u32,
-        end_sequence: u32,
-        content: &str,
-        status: SpeechSegmentStatusView,
-    ) -> SceneActivityEntryView {
-        SceneActivityEntryView::SpeechSegment {
+    fn ambient_row(
+        id: i64,
+        second: u32,
+        entries: Vec<AmbientSensoryEntry>,
+    ) -> AmbientSensorySnapshotRowView {
+        AmbientSensorySnapshotRowView {
+            id,
+            server_session_id: "server-session".to_string(),
+            entries,
+            observed_at: at(second),
+            created_at: at(second),
+        }
+    }
+
+    fn ambient_entry(id: &str, modality: &str, content: &str) -> AmbientSensoryEntry {
+        AmbientSensoryEntry {
             id: id.to_string(),
-            at: Utc.with_ymd_and_hms(2026, 6, 13, 6, 18, 51).unwrap(),
+            modality: nuillu_module::SensoryModality::parse(modality),
+            content: content.to_string(),
+        }
+    }
+
+    fn utterance_event(
+        id: i64,
+        second: u32,
+        event_kind: UtteranceEventKindView,
+        sequence: u32,
+        content: &str,
+    ) -> UtteranceEventRowView {
+        UtteranceEventRowView {
+            id,
+            server_session_id: "server-session".to_string(),
+            event_kind,
             sender: "speak".to_string(),
             target: "Koro".to_string(),
             generation_id: 7,
-            segment_index,
-            start_sequence,
-            end_sequence,
+            sequence,
             content: content.to_string(),
-            status,
+            reason: None,
+            occurred_at: at(second),
+            created_at: at(second),
         }
     }
 }

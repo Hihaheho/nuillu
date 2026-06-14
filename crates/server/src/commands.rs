@@ -1,5 +1,10 @@
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use lutum_libsql_adapter::{
+    AmbientSensorySnapshotRecord, NewAmbientSensorySnapshot, NewOneShotSensoryInput,
+    OneShotSensoryInputRecord, UtteranceEventKind, UtteranceEventRecord,
+};
 use nuillu_agent::AgentRunController;
 use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
@@ -8,7 +13,8 @@ use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation};
 use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality};
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
-    ModuleSettingsView, SceneActivityEntryView, VisualizerClientMessage, VisualizerCommand,
+    AmbientSensorySnapshotRowView, ModuleSettingsView, OneShotSensoryInputRowView,
+    UtteranceEventKindView, UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand,
     VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
     run_runtime_action_id, stop_runtime_action_id,
 };
@@ -21,21 +27,21 @@ use crate::snapshot::{
     emit_visualizer_blackboard_snapshot, linked_memory_record_view, list_all_memories,
     memory_record_view,
 };
-use crate::state::{ModuleSettingsState, SceneActivityState, SceneState};
+use crate::state::{ModuleSettingsState, SceneState};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+const RECENT_ACTIVITY_ROW_LIMIT: usize = 512;
 
 pub(super) async fn drive_server_until_shutdown(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     scene: &mut SceneState,
-    activity: Rc<RefCell<SceneActivityState>>,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
     run_controller: &AgentRunController,
 ) {
-    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
+    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env).await;
     loop {
         if visualizer.shutdown_requested() {
             break;
@@ -46,7 +52,6 @@ pub(super) async fn drive_server_until_shutdown(
                 visualizer,
                 tab_id,
                 scene,
-                Rc::clone(&activity),
                 module_settings,
                 sensory,
                 env,
@@ -60,11 +65,9 @@ pub(super) async fn drive_server_until_shutdown(
         if visualizer.shutdown_requested() {
             break;
         }
-        save_scene_activity_if_dirty(&activity, visualizer, tab_id);
         emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
         tokio::time::sleep(SNAPSHOT_INTERVAL).await;
     }
-    save_scene_activity_if_dirty(&activity, visualizer, tab_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,7 +76,6 @@ async fn handle_server_visualizer_message(
     visualizer: &mut VisualizerHook,
     tab_id: &VisualizerTabId,
     scene: &mut SceneState,
-    activity: Rc<RefCell<SceneActivityState>>,
     module_settings: &mut ModuleSettingsState,
     sensory: &SensoryInputMailbox,
     env: &ServerEnvironment,
@@ -110,11 +112,7 @@ async fn handle_server_visualizer_message(
                 observed_at: env.clock.now(),
             };
             let _ = sensory.publish(body.clone()).await;
-            visualizer.send_event(VisualizerEvent::SensoryInput {
-                tab_id: tab_id.clone(),
-                input: body.clone(),
-            });
-            record_one_shot_activity(&activity, visualizer, tab_id, &body);
+            record_sensory_input(visualizer, tab_id, env, &body).await;
             false
         }
         VisualizerCommand::CreateAmbientSensoryRow {
@@ -224,10 +222,8 @@ async fn handle_server_visualizer_message(
             if !run_controller.is_running() {
                 resume_runtime(visualizer, tab_id, scene, sensory, env, run_controller).await;
             }
-            send_scene_person_message(
-                scene, &row_id, message, &activity, visualizer, tab_id, sensory, env,
-            )
-            .await;
+            send_scene_person_message(scene, &row_id, message, visualizer, tab_id, sensory, env)
+                .await;
             false
         }
         VisualizerCommand::SetModuleDisabled {
@@ -460,7 +456,7 @@ async fn persist_and_emit_scene(
     env.caps.scene().set(scene.participants());
     emit_scene_state(scene, visualizer, tab_id);
     if publish_snapshot {
-        publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
+        publish_scene_snapshot(scene, sensory, visualizer, tab_id, env).await;
     }
 }
 
@@ -473,7 +469,7 @@ async fn resume_runtime(
     run_controller: &AgentRunController,
 ) {
     set_runtime_running(visualizer, tab_id, run_controller, true);
-    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env.clock.as_ref()).await;
+    publish_scene_snapshot(scene, sensory, visualizer, tab_id, env).await;
 }
 
 pub(super) fn emit_scene_state(
@@ -487,73 +483,166 @@ pub(super) fn emit_scene_state(
     });
 }
 
-pub(super) fn emit_scene_activity_snapshot(
-    activity: &Rc<RefCell<SceneActivityState>>,
+pub(super) async fn emit_recent_activity_rows(
+    env: &ServerEnvironment,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
 ) {
-    visualizer.send_event(VisualizerEvent::SceneActivitySnapshot {
-        tab_id: tab_id.clone(),
-        entries: activity.borrow().entries(),
-    });
-}
-
-fn emit_scene_activity_upserts(
-    entries: Vec<SceneActivityEntryView>,
-    visualizer: &VisualizerHook,
-    tab_id: &VisualizerTabId,
-) {
-    for entry in entries {
-        visualizer.send_event(VisualizerEvent::SceneActivityEntryUpsert {
+    match env
+        .one_shot_sensory_input_store
+        .recent(RECENT_ACTIVITY_ROW_LIMIT)
+        .await
+    {
+        Ok(rows) => visualizer.send_event(VisualizerEvent::OneShotSensoryInputRows {
             tab_id: tab_id.clone(),
-            entry,
-        });
+            rows: rows
+                .into_iter()
+                .map(one_shot_sensory_input_row_view)
+                .collect(),
+        }),
+        Err(error) => visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("failed to load one-shot sensory input rows: {error}"),
+        }),
+    }
+    match env
+        .ambient_sensory_snapshot_store
+        .recent(RECENT_ACTIVITY_ROW_LIMIT)
+        .await
+    {
+        Ok(rows) => visualizer.send_event(VisualizerEvent::AmbientSensorySnapshotRows {
+            tab_id: tab_id.clone(),
+            rows: rows
+                .into_iter()
+                .map(ambient_sensory_snapshot_row_view)
+                .collect(),
+        }),
+        Err(error) => visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("failed to load ambient sensory snapshot rows: {error}"),
+        }),
+    }
+    match env
+        .utterance_event_store
+        .recent(RECENT_ACTIVITY_ROW_LIMIT)
+        .await
+    {
+        Ok(rows) => visualizer.send_event(VisualizerEvent::UtteranceEventRows {
+            tab_id: tab_id.clone(),
+            rows: rows.into_iter().map(utterance_event_row_view).collect(),
+        }),
+        Err(error) => visualizer.send_event(VisualizerEvent::Log {
+            tab_id: tab_id.clone(),
+            message: format!("failed to load utterance event rows: {error}"),
+        }),
     }
 }
 
-fn save_scene_activity_if_dirty(
-    activity: &Rc<RefCell<SceneActivityState>>,
+async fn record_sensory_input(
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
-) {
-    if let Err(error) = activity.borrow_mut().save_if_dirty() {
-        visualizer.send_event(VisualizerEvent::Log {
-            tab_id: tab_id.clone(),
-            message: format!("failed to save scene activity: {error}"),
-        });
-    }
-}
-
-fn record_one_shot_activity(
-    activity: &Rc<RefCell<SceneActivityState>>,
-    visualizer: &VisualizerHook,
-    tab_id: &VisualizerTabId,
+    env: &ServerEnvironment,
     input: &SensoryInput,
 ) {
-    let SensoryInput::OneShot {
-        modality,
-        direction,
-        content,
-        observed_at,
-    } = input
-    else {
-        return;
-    };
-    let source = if let Some(direction) = direction {
-        format!(
-            "one-shot {} from {} at {}",
-            modality.as_str(),
+    match input {
+        SensoryInput::OneShot {
+            modality,
             direction,
-            observed_at
-        )
-    } else {
-        format!("one-shot {} at {}", modality.as_str(), observed_at)
-    };
-    let entries = activity
-        .borrow_mut()
-        .record_user_message(*observed_at, content.clone(), source);
-    save_scene_activity_if_dirty(activity, visualizer, tab_id);
-    emit_scene_activity_upserts(entries, visualizer, tab_id);
+            content,
+            observed_at,
+        } => match env
+            .one_shot_sensory_input_store
+            .append(NewOneShotSensoryInput {
+                server_session_id: env.server_session_id.clone(),
+                modality: modality.as_str().to_string(),
+                direction: direction.clone(),
+                content: content.clone(),
+                observed_at_ms: observed_at.timestamp_millis(),
+            })
+            .await
+        {
+            Ok(row) => visualizer.send_event(VisualizerEvent::OneShotSensoryInputAppended {
+                tab_id: tab_id.clone(),
+                row: one_shot_sensory_input_row_view(row),
+            }),
+            Err(error) => visualizer.send_event(VisualizerEvent::Log {
+                tab_id: tab_id.clone(),
+                message: format!("failed to persist one-shot sensory input: {error}"),
+            }),
+        },
+        SensoryInput::AmbientSnapshot {
+            entries,
+            observed_at,
+        } => match env
+            .ambient_sensory_snapshot_store
+            .append(NewAmbientSensorySnapshot {
+                server_session_id: env.server_session_id.clone(),
+                entries: entries.clone(),
+                observed_at_ms: observed_at.timestamp_millis(),
+            })
+            .await
+        {
+            Ok(row) => visualizer.send_event(VisualizerEvent::AmbientSensorySnapshotAppended {
+                tab_id: tab_id.clone(),
+                row: ambient_sensory_snapshot_row_view(row),
+            }),
+            Err(error) => visualizer.send_event(VisualizerEvent::Log {
+                tab_id: tab_id.clone(),
+                message: format!("failed to persist ambient sensory snapshot: {error}"),
+            }),
+        },
+    }
+}
+
+pub(super) fn one_shot_sensory_input_row_view(
+    row: OneShotSensoryInputRecord,
+) -> OneShotSensoryInputRowView {
+    OneShotSensoryInputRowView {
+        id: row.id,
+        server_session_id: row.server_session_id,
+        modality: row.modality,
+        direction: row.direction,
+        content: row.content,
+        observed_at: timestamp_from_ms(row.observed_at_ms),
+        created_at: timestamp_from_ms(row.created_at_ms),
+    }
+}
+
+pub(super) fn ambient_sensory_snapshot_row_view(
+    row: AmbientSensorySnapshotRecord,
+) -> AmbientSensorySnapshotRowView {
+    AmbientSensorySnapshotRowView {
+        id: row.id,
+        server_session_id: row.server_session_id,
+        entries: row.entries,
+        observed_at: timestamp_from_ms(row.observed_at_ms),
+        created_at: timestamp_from_ms(row.created_at_ms),
+    }
+}
+
+pub(super) fn utterance_event_row_view(row: UtteranceEventRecord) -> UtteranceEventRowView {
+    UtteranceEventRowView {
+        id: row.id,
+        server_session_id: row.server_session_id,
+        event_kind: match row.event_kind {
+            UtteranceEventKind::Delta => UtteranceEventKindView::Delta,
+            UtteranceEventKind::Completed => UtteranceEventKindView::Completed,
+            UtteranceEventKind::Aborted => UtteranceEventKindView::Aborted,
+        },
+        sender: row.sender.to_string(),
+        target: row.target,
+        generation_id: row.generation_id,
+        sequence: row.sequence,
+        content: row.content,
+        reason: row.reason,
+        occurred_at: timestamp_from_ms(row.occurred_at_ms),
+        created_at: timestamp_from_ms(row.created_at_ms),
+    }
+}
+
+fn timestamp_from_ms(value: i64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(value)
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch timestamp is valid"))
 }
 
 async fn publish_scene_snapshot(
@@ -561,7 +650,7 @@ async fn publish_scene_snapshot(
     sensory: &SensoryInputMailbox,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
-    clock: &dyn nuillu_module::ports::Clock,
+    env: &ServerEnvironment,
 ) {
     let entries = scene
         .derived_ambient()
@@ -574,20 +663,16 @@ async fn publish_scene_snapshot(
         .collect::<Vec<_>>();
     let body = SensoryInput::AmbientSnapshot {
         entries,
-        observed_at: clock.now(),
+        observed_at: env.clock.now(),
     };
     let _ = sensory.publish(body.clone()).await;
-    visualizer.send_event(VisualizerEvent::SensoryInput {
-        tab_id: tab_id.clone(),
-        input: body,
-    });
+    record_sensory_input(visualizer, tab_id, env, &body).await;
 }
 
 async fn send_scene_person_message(
     scene: &SceneState,
     row_id: &str,
     message: String,
-    activity: &Rc<RefCell<SceneActivityState>>,
     visualizer: &VisualizerHook,
     tab_id: &VisualizerTabId,
     sensory: &SensoryInputMailbox,
@@ -619,11 +704,7 @@ async fn send_scene_person_message(
         observed_at: env.clock.now(),
     };
     let _ = sensory.publish(body.clone()).await;
-    visualizer.send_event(VisualizerEvent::SensoryInput {
-        tab_id: tab_id.clone(),
-        input: body.clone(),
-    });
-    record_one_shot_activity(activity, visualizer, tab_id, &body);
+    record_sensory_input(visualizer, tab_id, env, &body).await;
 }
 
 pub(super) async fn apply_persisted_module_settings(

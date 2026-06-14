@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,7 +10,9 @@ use lutum::{
     Temperature, TopK, TopP,
 };
 use lutum_libsql_adapter::{
-    EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlLlmTranscriptStore,
+    EmbeddingProfile, LibsqlAgentStore, LibsqlAgentStoreConfig, LibsqlAmbientSensorySnapshotStore,
+    LibsqlLlmTranscriptStore, LibsqlOneShotSensoryInputStore, LibsqlUtteranceEventStore,
+    NewUtteranceEvent, UtteranceEventKind,
 };
 use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
@@ -27,9 +28,7 @@ use nuillu_module::{
 use nuillu_openai_embedding_adapter::{OpenAiEmbedder, OpenAiEmbedderConfig};
 use nuillu_reward::{PolicyCapabilities, PolicyStore};
 use nuillu_speak::{Utterance, UtteranceAbort, UtteranceDelta, UtteranceSink};
-use nuillu_visualizer_protocol::{
-    UtteranceDeltaView, UtteranceView, VisualizerEvent, VisualizerTabId,
-};
+use nuillu_visualizer_protocol::{VisualizerEvent, VisualizerTabId};
 
 use super::SERVER_TAB_ID;
 use super::config::{EmbeddingBackendConfig, LlmBackendConfig, LlmGenerationConfig, ServerConfig};
@@ -40,9 +39,9 @@ use super::memory_seed::seed_memory_from_state_dir;
 use super::runtime_event_log::{
     RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
 };
-use super::state::SceneActivityState;
 
 pub(super) struct ServerEnvironment {
+    pub(super) server_session_id: String,
     pub(super) blackboard: Blackboard,
     pub(super) caps: CapabilityProviders,
     pub(super) memory: Rc<dyn MemoryStore>,
@@ -51,13 +50,15 @@ pub(super) struct ServerEnvironment {
     pub(super) clock: Rc<dyn Clock>,
     pub(super) utterance_sink: Rc<dyn UtteranceSink>,
     pub(super) llm_transcript_store: LibsqlLlmTranscriptStore,
+    pub(super) one_shot_sensory_input_store: LibsqlOneShotSensoryInputStore,
+    pub(super) ambient_sensory_snapshot_store: LibsqlAmbientSensorySnapshotStore,
+    pub(super) utterance_event_store: LibsqlUtteranceEventStore,
 }
 
 pub(super) async fn build_server_environment(
     config: &ServerConfig,
     allocation: nuillu_blackboard::ResourceAllocation,
     visualizer: VisualizerEventSink,
-    activity: Rc<RefCell<SceneActivityState>>,
 ) -> anyhow::Result<ServerEnvironment> {
     let blackboard = Blackboard::with_allocation(allocation);
     let runtime_event_log_path = runtime_event_log_path(&config.state_dir, &config.session_id);
@@ -79,13 +80,17 @@ pub(super) async fn build_server_environment(
     let clock: Rc<dyn Clock> = Rc::new(SystemClock);
     let visualizer_for_events = visualizer.clone();
     let llm_observer = VisualizerLlmObserver::new(SERVER_TAB_ID.to_string(), visualizer.clone());
+    let agent_store = connect_agent_store(config).await?;
+    let one_shot_sensory_input_store = agent_store.one_shot_sensory_input_store();
+    let ambient_sensory_snapshot_store = agent_store.ambient_sensory_snapshot_store();
+    let utterance_event_store = agent_store.utterance_event_store();
     let utterance_sink = Rc::new(ServerUtteranceSink::new(
         SERVER_TAB_ID.to_string(),
+        config.session_id.clone(),
         visualizer,
-        activity,
+        utterance_event_store.clone(),
         clock.clone(),
     ));
-    let agent_store = connect_agent_store(config).await?;
     let memory: Rc<dyn MemoryStore> = Rc::new(agent_store.memory_store());
     let policy_store: Rc<dyn PolicyStore> = Rc::new(agent_store.policy_store());
     let session_store = Rc::new(agent_store.session_store());
@@ -150,6 +155,7 @@ pub(super) async fn build_server_environment(
         .map_err(|error| anyhow::anyhow!("failed to load core policies: {error}"))?;
 
     Ok(ServerEnvironment {
+        server_session_id: config.session_id.clone(),
         blackboard,
         caps,
         memory,
@@ -158,6 +164,9 @@ pub(super) async fn build_server_environment(
         clock,
         utterance_sink,
         llm_transcript_store,
+        one_shot_sensory_input_store,
+        ambient_sensory_snapshot_store,
+        utterance_event_store,
     })
 }
 
@@ -468,36 +477,44 @@ impl RuntimeEventSink for ServerRuntimeEventSink {
 
 struct ServerUtteranceSink {
     tab_id: String,
+    server_session_id: String,
     visualizer: VisualizerEventSink,
-    activity: Rc<RefCell<SceneActivityState>>,
+    store: LibsqlUtteranceEventStore,
     clock: Rc<dyn Clock>,
 }
 
 impl ServerUtteranceSink {
     fn new(
         tab_id: String,
+        server_session_id: String,
         visualizer: VisualizerEventSink,
-        activity: Rc<RefCell<SceneActivityState>>,
+        store: LibsqlUtteranceEventStore,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             tab_id,
+            server_session_id,
             visualizer,
-            activity,
+            store,
             clock,
         }
     }
 
-    fn emit_activity_upserts(
-        &self,
-        entries: Vec<nuillu_visualizer_protocol::SceneActivityEntryView>,
-    ) {
-        for entry in entries {
-            self.visualizer
-                .send(VisualizerEvent::SceneActivityEntryUpsert {
+    async fn append_event(&self, event: NewUtteranceEvent) {
+        match self.store.append(event).await {
+            Ok(record) => self
+                .visualizer
+                .send(VisualizerEvent::UtteranceEventAppended {
                     tab_id: VisualizerTabId::new(self.tab_id.clone()),
-                    entry,
+                    row: super::commands::utterance_event_row_view(record),
+                }),
+            Err(error) => {
+                tracing::warn!(error = ?error, "utterance event persistence failed");
+                self.visualizer.send(VisualizerEvent::Log {
+                    tab_id: VisualizerTabId::new(self.tab_id.clone()),
+                    message: format!("failed to persist utterance event: {error}"),
                 });
+            }
         }
     }
 }
@@ -505,73 +522,50 @@ impl ServerUtteranceSink {
 #[async_trait(?Send)]
 impl UtteranceSink for ServerUtteranceSink {
     async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
-        let sender = utterance.sender.to_string();
-        let target = utterance.target.clone();
-        let entries = self.activity.borrow_mut().record_speech_completed(
-            utterance.emitted_at,
-            sender.clone(),
-            target.clone(),
-            utterance.generation_id,
-            0,
-            utterance.text.clone(),
-        );
-        if let Err(error) = self.activity.borrow_mut().save_if_dirty() {
-            tracing::warn!(error = ?error, "scene activity save failed after utterance completion");
-        }
-        self.emit_activity_upserts(entries);
-        self.visualizer.send(VisualizerEvent::UtteranceCompleted {
-            tab_id: VisualizerTabId::new(self.tab_id.clone()),
-            utterance: UtteranceView {
-                sender,
-                target,
-                generation_id: Some(utterance.generation_id),
-                text: utterance.text,
-                emitted_at: utterance.emitted_at,
-            },
-        });
+        self.append_event(NewUtteranceEvent {
+            server_session_id: self.server_session_id.clone(),
+            event_kind: UtteranceEventKind::Completed,
+            sender: utterance.sender,
+            target: utterance.target,
+            generation_id: utterance.generation_id,
+            sequence: 0,
+            content: utterance.text,
+            reason: None,
+            occurred_at_ms: utterance.emitted_at.timestamp_millis(),
+        })
+        .await;
         Ok(())
     }
 
     async fn on_delta(&self, delta: UtteranceDelta) -> Result<(), PortError> {
-        let sender = delta.sender.to_string();
-        let target = delta.target.clone();
-        let entries = self.activity.borrow_mut().record_speech_delta(
-            self.clock.now(),
-            sender.clone(),
-            target.clone(),
-            delta.generation_id,
-            delta.sequence,
-            delta.delta.clone(),
-        );
-        self.emit_activity_upserts(entries);
-        self.visualizer.send(VisualizerEvent::UtteranceDelta {
-            tab_id: VisualizerTabId::new(self.tab_id.clone()),
-            utterance: UtteranceDeltaView {
-                sender,
-                target,
-                generation_id: delta.generation_id,
-                sequence: delta.sequence,
-                delta: delta.delta,
-            },
-        });
+        self.append_event(NewUtteranceEvent {
+            server_session_id: self.server_session_id.clone(),
+            event_kind: UtteranceEventKind::Delta,
+            sender: delta.sender,
+            target: delta.target,
+            generation_id: delta.generation_id,
+            sequence: delta.sequence,
+            content: delta.delta,
+            reason: None,
+            occurred_at_ms: self.clock.now().timestamp_millis(),
+        })
+        .await;
         Ok(())
     }
 
     async fn on_abort(&self, abort: UtteranceAbort) -> Result<(), PortError> {
-        let sender = abort.sender.to_string();
-        let target = abort.target.clone();
-        let entries = self.activity.borrow_mut().record_speech_aborted(
-            abort.aborted_at,
-            sender,
-            target,
-            abort.generation_id,
-            abort.sequence,
-            abort.partial_utterance,
-        );
-        if let Err(error) = self.activity.borrow_mut().save_if_dirty() {
-            tracing::warn!(error = ?error, reason = %abort.reason, "scene activity save failed after utterance abort");
-        }
-        self.emit_activity_upserts(entries);
+        self.append_event(NewUtteranceEvent {
+            server_session_id: self.server_session_id.clone(),
+            event_kind: UtteranceEventKind::Aborted,
+            sender: abort.sender,
+            target: abort.target,
+            generation_id: abort.generation_id,
+            sequence: abort.sequence,
+            content: abort.partial_utterance,
+            reason: Some(abort.reason),
+            occurred_at_ms: abort.aborted_at.timestamp_millis(),
+        })
+        .await;
         Ok(())
     }
 }
