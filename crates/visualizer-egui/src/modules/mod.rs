@@ -634,11 +634,6 @@ pub fn render_modules_overview(
     let mut open_config = ui
         .ctx()
         .data(|data| data.get_temp::<OpenModuleConfig>(open_config_id));
-    ui.horizontal_wrapped(|ui| {
-        ui.heading("Modules");
-        ui.label(format!("count: {}", rows.len()));
-    });
-    ui.separator();
 
     egui::ScrollArea::both()
         .id_salt("modules-overview")

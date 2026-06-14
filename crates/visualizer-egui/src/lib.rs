@@ -456,12 +456,6 @@ impl RuntimeTab {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(format!("{} {}", tab_status_icon(self.status), self.title));
-            ui.label(format!("runtime events: {}", self.runtime_events.len()));
-            ui.label(format!("modules: {}", self.modules.iter().count()));
-        });
-
         match self.view_mode {
             RuntimeTabViewMode::Simplified => self.simplified_ui(ui, commands),
             RuntimeTabViewMode::Windowed => self.windows_ui(ui, commands),
