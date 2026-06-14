@@ -1,33 +1,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lutum::{
-    FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
-    SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
-};
-use nuillu_blackboard::Blackboard;
-use nuillu_module::ports::{NoopCognitionLogRepository, PortError, SystemClock};
-use nuillu_module::{CapabilityProviderPorts, CapabilityProviders, LutumTiers, Module};
+use lutum::{FinishReason, MockTextScenario, RawTextTurnEvent, Usage};
+use nuillu_module::Module;
+use nuillu_module::ports::PortError;
 
 use crate::utterance::{Utterance, UtteranceSink};
-
-pub(crate) fn test_caps_with_adapter(
-    blackboard: Blackboard,
-    adapter: MockLlmAdapter,
-) -> CapabilityProviders {
-    let adapter = Arc::new(adapter);
-    let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
-    let lutum = Lutum::new(adapter, budget);
-    CapabilityProviders::new(CapabilityProviderPorts {
-        blackboard,
-        cognition_log_port: Rc::new(NoopCognitionLogRepository),
-        clock: Rc::new(SystemClock),
-        tiers: LutumTiers::from_shared_lutum(lutum),
-    })
-}
 
 pub(crate) struct CapturingUtteranceSink {
     pub(crate) completed: Rc<RefCell<Vec<(String, String)>>>,
