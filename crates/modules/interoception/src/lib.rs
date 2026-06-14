@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult, Usage};
 use nuillu_blackboard::{
     AllocationCommand, AllocationEffectLevel, CognitionLogEntryRecord, InteroceptiveMode,
     InteroceptivePatch, InteroceptiveState, MemoLogRecord,
@@ -54,7 +54,7 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArousalEffectLevel {
     Off,
@@ -78,12 +78,24 @@ impl From<ArousalEffectLevel> for AllocationEffectLevel {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[lutum::tool_input(name = "report_affect", output = ReportAffectOutput)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AffectAssessment {
     pub wake_arousal_increase: ArousalEffectLevel,
     pub affect_arousal_increase: ArousalEffectLevel,
     pub valence: f32,
     pub emotion: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReportAffectOutput {
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+#[allow(clippy::large_enum_variant)]
+pub enum InteroceptionTools {
+    ReportAffect(AffectAssessment),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -257,35 +269,142 @@ impl InteroceptionModule {
     ) -> Result<AffectAssessment> {
         self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
-        let semantic = {
-            self.session.push_ephemeral_user(format!(
-                "Current interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}",
-                serde_json::to_string(current).unwrap_or_default(),
-                format_bounded_memo_log_batch(unread_memos, cx.now(), MEMO_CONTEXT_WINDOW)
-                    .unwrap_or_else(|| "none".to_owned()),
-                format_bounded_cognition_log_batch(
-                    unread_cognition,
-                    cx.now(),
-                    COGNITION_CONTEXT_WINDOW,
-                )
-                .unwrap_or_else(|| "none".to_owned()),
-            ));
-            let result = self
-                .session
-                .structured_turn::<AffectAssessment>()
-                .max_output_tokens(512)
-                .collect(&lutum)
-                .await
-                .context("interoception structured turn failed")?;
-            let usage = result.usage;
-            let semantic = result.semantic;
-            cx.compact_and_save(&mut self.session, usage).await?;
-            semantic
+        let session_len_before_turn = self.session.input().items().len();
+        self.session.push_user(format_affect_assessment_input(
+            current,
+            unread_memos,
+            unread_cognition,
+            cx.now(),
+        ));
+
+        let outcome = match self
+            .session
+            .text_turn()
+            .tools::<InteroceptionTools>()
+            .available_tools([InteroceptionToolsSelector::ReportAffect])
+            .require_any_tool()
+            .max_output_tokens(256)
+            .collect_controlled_with(&lutum, nuillu_module::AbortOnAvailableToolNameInText::new())
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(error = %error, "interoception affect tool turn failed; using fallback");
+                truncate_session_to(&mut self.session, session_len_before_turn);
+                cx.compact_and_save(&mut self.session, Usage::zero())
+                    .await?;
+                return Ok(fallback_affect_assessment(current));
+            }
         };
-        let StructuredTurnOutcome::Structured(assessment) = semantic else {
-            anyhow::bail!("interoception structured turn refused");
+
+        let assessment = match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                tracing::warn!(
+                    input_tokens = result.usage.input_tokens,
+                    "interoception affect turn finished without report_affect; using fallback"
+                );
+                truncate_session_to(&mut self.session, session_len_before_turn);
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                return Ok(fallback_affect_assessment(current));
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                tracing::warn!(
+                    input_tokens = result.usage.input_tokens,
+                    "interoception affect turn finished without report_affect; using fallback"
+                );
+                truncate_session_to(&mut self.session, session_len_before_turn);
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                return Ok(fallback_affect_assessment(current));
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let usage = round.usage;
+                let mut selected = None;
+                let mut results: Vec<ToolResult> = Vec::new();
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                for call in round.tool_calls.iter().cloned() {
+                    match call {
+                        InteroceptionToolsCall::ReportAffect(call) => {
+                            let accepted = selected.is_none();
+                            if accepted {
+                                selected = Some(call.input.clone());
+                            }
+                            results.push(
+                                call.complete(ReportAffectOutput { accepted })
+                                    .context("complete report_affect tool call")?,
+                            );
+                        }
+                    }
+                }
+                let Some(assessment) = selected else {
+                    tracing::warn!(
+                        "interoception affect turn returned NeedsTools without report_affect; using fallback"
+                    );
+                    round.discard();
+                    truncate_session_to(&mut self.session, session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(fallback_affect_assessment(current));
+                };
+                if let Err(error) = round.commit(&mut self.session, results) {
+                    tracing::warn!(
+                        error = %error,
+                        "interoception affect tool round commit failed; using fallback"
+                    );
+                    truncate_session_to(&mut self.session, session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(fallback_affect_assessment(current));
+                }
+                cx.compact_and_save(&mut self.session, usage).await?;
+                assessment
+            }
         };
         Ok(normalize_affect_assessment(assessment))
+    }
+}
+
+fn format_affect_assessment_input(
+    current: &InteroceptiveState,
+    unread_memos: &[MemoLogRecord],
+    unread_cognition: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+) -> String {
+    format!(
+        "Interoception affect assessment request\n\nCurrent interoceptive state:\n{}\n\nUnread memo evidence:\n{}\n\nUnread cognition evidence:\n{}\n\nInstruction:\nCall report_affect once. Use structured arousal increase levels, not numeric arousal deltas. Use off/no-change levels and preserve current valence/emotion when evidence is weak.",
+        format_interoceptive_state(current),
+        format_bounded_memo_log_batch(unread_memos, now, MEMO_CONTEXT_WINDOW)
+            .unwrap_or_else(|| "none".to_owned()),
+        format_bounded_cognition_log_batch(unread_cognition, now, COGNITION_CONTEXT_WINDOW)
+            .unwrap_or_else(|| "none".to_owned()),
+    )
+}
+
+fn format_interoceptive_state(state: &InteroceptiveState) -> String {
+    format!(
+        "- mode: {:?}\n- wake_arousal: {:.2}\n- nrem_pressure: {:.2}\n- rem_pressure: {:.2}\n- affect_arousal: {:.2}\n- valence: {:.2}\n- emotion: {}\n- last_updated: {}",
+        state.mode,
+        state.wake_arousal,
+        state.nrem_pressure,
+        state.rem_pressure,
+        state.affect_arousal,
+        state.valence,
+        if state.emotion.trim().is_empty() {
+            "(none)"
+        } else {
+            state.emotion.trim()
+        },
+        state.last_updated.to_rfc3339(),
+    )
+}
+
+fn truncate_session_to(session: &mut Session, len: usize) {
+    session.input_mut().items_mut().truncate(len);
+}
+
+fn fallback_affect_assessment(current: &InteroceptiveState) -> AffectAssessment {
+    AffectAssessment {
+        wake_arousal_increase: ArousalEffectLevel::Off,
+        affect_arousal_increase: ArousalEffectLevel::Off,
+        valence: current.valence,
+        emotion: current.emotion.trim().to_owned(),
     }
 }
 
@@ -459,7 +578,63 @@ impl Module for InteroceptionModule {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    use lutum::{
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
+        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, Lutum,
+        MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+    };
+    use nuillu_blackboard::{Blackboard, Bpm, linear_ratio_fn};
+    use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
+    use nuillu_module::{
+        CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
+        ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
+    };
+    use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct CapturingTextAdapter {
+        inner: MockLlmAdapter,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
+    }
+
+    impl CapturingTextAdapter {
+        fn new(inner: MockLlmAdapter) -> Self {
+            Self {
+                inner,
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn text_inputs(&self) -> Vec<ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for CapturingTextAdapter {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
+            self.inner.text_turn(input, turn).await
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
+    }
 
     #[test]
     fn interoception_pressure_cycles_from_cognition_compaction_and_recombination() {
@@ -567,5 +742,363 @@ mod tests {
         assert_eq!(patch.mode, Some(InteroceptiveMode::Wake));
         assert_eq!(patch.valence, Some(0.4));
         assert_eq!(patch.emotion.as_deref(), Some("alert"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_affect_tool_updates_affect_fields() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(report_affect_scenario(
+            serde_json::json!({
+                "wake_arousal_increase": "high",
+                "affect_arousal_increase": "normal",
+                "valence": 0.4,
+                "emotion": "alert curiosity",
+                "ignored_extra": "ok"
+            })
+            .to_string(),
+        ));
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(adapter));
+        let mut module = build_interoception_module(&caps).await;
+
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        publish_interoception_wakeup(&caps, &blackboard, now).await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let state = blackboard.read(|bb| bb.interoception().clone()).await;
+        assert_eq!(state.valence, 0.4);
+        assert_eq!(state.emotion, "alert curiosity");
+        assert!(state.affect_arousal > 0.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_affect_tool_persists_readable_evidence_for_next_turn() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(report_affect_scenario(
+                serde_json::json!({
+                    "wake_arousal_increase": "low",
+                    "affect_arousal_increase": "low",
+                    "valence": 0.2,
+                    "emotion": "curious"
+                })
+                .to_string(),
+            ))
+            .with_text_scenario(report_affect_scenario(
+                serde_json::json!({
+                    "wake_arousal_increase": "minimal",
+                    "affect_arousal_increase": "minimal",
+                    "valence": 0.1,
+                    "emotion": "settled"
+                })
+                .to_string(),
+            ));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let mut module = build_interoception_module(&caps).await;
+
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        publish_interoception_wakeup_with_content(&caps, &blackboard, "first affect evidence", now)
+            .await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        publish_interoception_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "second affect evidence",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_text = all_input_text(&inputs[1]);
+        assert!(second_text.contains("Interoception affect assessment request"));
+        assert!(second_text.contains("Current interoceptive state:"));
+        assert!(second_text.contains("- wake_arousal:"));
+        assert!(second_text.contains("Unread memo evidence:"));
+        assert!(second_text.contains("Unread cognition evidence:"));
+        assert!(second_text.contains("Instruction:"));
+        assert!(second_text.contains("first affect evidence"));
+        assert!(!second_text.contains("{\""));
+        assert!(
+            inputs[1]
+                .items()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::ToolResult(_)))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affect_tool_failures_use_fallback_without_failing_activation() {
+        for scenario in [
+            no_affect_tool_scenario(),
+            report_affect_scenario(
+                serde_json::json!({
+                    "wake_arousal_increase": 0.2,
+                    "affect_arousal_increase": "normal",
+                    "valence": 0.4,
+                    "emotion": "alert curiosity"
+                })
+                .to_string(),
+            ),
+        ] {
+            let adapter = MockLlmAdapter::new().with_text_scenario(scenario);
+            let blackboard = Blackboard::default();
+            let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(adapter));
+            let mut module = build_interoception_module(&caps).await;
+
+            let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+            publish_interoception_wakeup(&caps, &blackboard, now).await;
+            let cx = activate_cx(&lutum, now);
+            let batch = module.next_batch().await.unwrap();
+            module.activate(&cx, &batch).await.unwrap();
+
+            let state = blackboard.read(|bb| bb.interoception().clone()).await;
+            assert_eq!(state.valence, 0.0);
+            assert_eq!(state.emotion, "");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_affect_tool_turn_does_not_persist_evidence_prompt() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(report_affect_scenario(
+                serde_json::json!({
+                    "wake_arousal_increase": 0.2,
+                    "affect_arousal_increase": "normal",
+                    "valence": 0.4,
+                    "emotion": "alert curiosity"
+                })
+                .to_string(),
+            ))
+            .with_text_scenario(report_affect_scenario(
+                serde_json::json!({
+                    "wake_arousal_increase": "minimal",
+                    "affect_arousal_increase": "minimal",
+                    "valence": 0.1,
+                    "emotion": "settled"
+                })
+                .to_string(),
+            ));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let mut module = build_interoception_module(&caps).await;
+
+        let now = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        publish_interoception_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "failed affect evidence",
+            now,
+        )
+        .await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        publish_interoception_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "successful affect evidence",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_text = all_input_text(&inputs[1]);
+        assert!(!second_text.contains("failed affect evidence"));
+        assert!(second_text.contains("successful affect evidence"));
+        assert!(
+            !inputs[1]
+                .items()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::ToolResult(_)))
+        );
+    }
+
+    fn test_caps_with_adapter<T>(
+        blackboard: Blackboard,
+        adapter: Arc<T>,
+    ) -> (CapabilityProviders, Lutum)
+    where
+        T: TurnAdapter + 'static,
+    {
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::new(adapter, budget);
+        let caps = CapabilityProviders::new(CapabilityProviderPorts {
+            blackboard,
+            cognition_log_port: Rc::new(NoopCognitionLogRepository),
+            clock: Rc::new(SystemClock),
+            tiers: LutumTiers::from_shared_lutum(lutum.clone()),
+        });
+        (caps, lutum)
+    }
+
+    async fn build_interoception_module(
+        caps: &CapabilityProviders,
+    ) -> nuillu_module::AllocatedModule {
+        let modules = ModuleRegistry::new()
+            .register(module_policy(), |caps| async move {
+                Ok(InteroceptionModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.allocation_writer(Vec::new(), Vec::new()),
+                    caps.interoception_policy(),
+                    caps.interoception_writer(),
+                    caps.llm_access(),
+                    caps.session("main")
+                        .with_auto_compaction(session_auto_compaction())
+                        .await?,
+                ))
+            })
+            .unwrap()
+            .build(caps)
+            .await
+            .unwrap();
+        let (_, mut modules) = modules.into_parts();
+        modules.remove(0)
+    }
+
+    fn module_policy() -> nuillu_blackboard::ModulePolicy {
+        nuillu_blackboard::ModulePolicy::new(
+            ReplicaCapRange::new(1, 1).unwrap(),
+            Bpm::from_f64(60_000.0)..=Bpm::from_f64(60_000.0),
+            linear_ratio_fn,
+        )
+    }
+
+    fn activate_cx(
+        lutum: &Lutum,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> nuillu_module::ActivateCx<'static> {
+        nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &[],
+            &[],
+            SessionCompactionRuntime::new(
+                lutum.clone(),
+                LlmConcurrencyLimiter::new(None),
+                ModelTier::Cheap,
+                SessionCompactionPolicy::default(),
+            ),
+            now,
+        )
+    }
+
+    async fn publish_interoception_wakeup(
+        caps: &CapabilityProviders,
+        blackboard: &Blackboard,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        publish_interoception_wakeup_with_content(caps, blackboard, "Alice asked for a story", now)
+            .await;
+    }
+
+    async fn publish_interoception_wakeup_with_content(
+        caps: &CapabilityProviders,
+        blackboard: &Blackboard,
+        content: impl Into<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let record = blackboard.update_memo(owner, content.into(), now).await;
+        caps.internal_harness_io()
+            .memo_updated_mailbox()
+            .publish(nuillu_module::MemoUpdated {
+                owner: record.owner,
+                index: record.index,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn all_input_text(input: &ModelInput) -> String {
+        let mut out = String::new();
+        for item in input.items() {
+            match item {
+                ModelInputItem::Message { content, .. } => {
+                    for content in content.as_slice() {
+                        if let MessageContent::Text(text) = content {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
+                ModelInputItem::Assistant(AssistantInputItem::Text(text)) => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                ModelInputItem::Turn(turn) => {
+                    for index in 0..turn.item_count() {
+                        let Some(item) = turn.item_at(index) else {
+                            continue;
+                        };
+                        if let Some(text) = item.as_text() {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn text_usage() -> Usage {
+        Usage {
+            input_tokens: 1,
+            ..Usage::zero()
+        }
+    }
+
+    fn report_affect_scenario(arguments_json: String) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("interoception-tool".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-affect".into(),
+                name: "report_affect".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("interoception-tool".into()),
+                finish_reason: FinishReason::ToolCall,
+                usage: text_usage(),
+            }),
+        ])
+    }
+
+    fn no_affect_tool_scenario() -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("interoception-no-tool".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: "no change".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("interoception-no-tool".into()),
+                finish_reason: FinishReason::Stop,
+                usage: text_usage(),
+            }),
+        ])
     }
 }

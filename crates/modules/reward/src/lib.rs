@@ -36,8 +36,8 @@ pub use compaction::{
     PolicyCompactionToolsSelector, PolicyContentView, SearchPoliciesArgs, SearchPoliciesOutput,
 };
 pub use policy::{
-    ExistingPolicyConsideration, PolicyConsideration, PolicyConsiderationDecision,
-    PolicyConsiderationPayload, PolicyConsiderationSource, PolicyConsiderationWriter, PolicyModule,
+    ExistingPolicyConsideration, PolicyConsideration, PolicyConsiderationPayload,
+    PolicyConsiderationSource, PolicyConsiderationWriter, PolicyModule,
     SyntheticPolicyConsideration, policy_session_auto_compaction,
 };
 pub use reward::{

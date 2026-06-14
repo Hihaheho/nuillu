@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, StructuredTurnOutcome};
+use lutum::{Session, TextStepOutcomeWithTools, ToolResult, Usage};
 use nuillu_blackboard::{CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_module::ports::Clock;
 use nuillu_module::{
@@ -86,29 +86,34 @@ pub struct SyntheticPolicyConsideration {
     pub behavior: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct PolicyConsiderationDecision {
-    pub existing: Vec<ExistingPolicyDecision>,
-    pub synthetic: Vec<SyntheticPolicyDecision>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct ExistingPolicyDecision {
-    pub policy_index: PolicyIndex,
-    pub predicted_expected_reward: f32,
-    pub confidence_hint: f32,
-    pub advice: String,
-    pub rationale: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SyntheticPolicyDecision {
+#[lutum::tool_input(name = "propose_policy_candidate", output = ProposePolicyCandidateOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProposePolicyCandidateArgs {
     pub trigger: String,
     pub behavior: String,
-    pub predicted_expected_reward: f32,
-    pub confidence_hint: f32,
     pub advice: String,
-    pub rationale: String,
+    pub expected_value: PolicyExpectedValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyExpectedValue {
+    StrongNegative,
+    Negative,
+    Neutral,
+    Positive,
+    StrongPositive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProposePolicyCandidateOutput {
+    pub accepted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
+#[allow(clippy::large_enum_variant)]
+pub enum PolicyTools {
+    ProposePolicyCandidate(ProposePolicyCandidateArgs),
 }
 
 #[derive(Clone)]
@@ -216,10 +221,7 @@ impl PolicyModule {
             .searcher
             .search(&context.query_text, POLICY_SEARCH_LIMIT)
             .await?;
-        let Some(decision) = self.assess(cx, &context, &hits).await? else {
-            return Ok(());
-        };
-        let considerations = normalize_decision(&hits, decision);
+        let considerations = self.considerations_for_context(cx, &context, &hits).await?;
         if considerations.is_empty() {
             return Ok(());
         }
@@ -284,161 +286,242 @@ impl PolicyModule {
             .await
     }
 
-    async fn assess(
+    async fn considerations_for_context(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         context: &PolicyActivationContext,
         hits: &[PolicySearchHit],
-    ) -> Result<Option<PolicyConsiderationDecision>> {
+    ) -> Result<Vec<PolicyConsideration>> {
+        let mut considerations = deterministic_existing_considerations(hits);
+        considerations.extend(self.propose_synthetic_candidates(cx, context, hits).await?);
+        Ok(considerations)
+    }
+
+    async fn propose_synthetic_candidates(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        context: &PolicyActivationContext,
+        hits: &[PolicySearchHit],
+    ) -> Result<Vec<PolicyConsideration>> {
         let interoception = self.interoception.snapshot().await;
 
+        self.ensure_session_seeded(cx);
         let lutum = self.llm.lutum().await;
-        let result = {
-            self.session.push_ephemeral_system(format!(
-                "Current interoception: affect_arousal={:.2}; valence={:.2}; emotion={}",
-                interoception.affect_arousal,
-                interoception.valence,
-                if interoception.emotion.trim().is_empty() {
-                    "unknown"
-                } else {
-                    interoception.emotion.trim()
+        let session_len_before_turn = self.session.input().items().len();
+        self.session.push_user(format_policy_candidate_request(
+            &self.owner,
+            context,
+            hits,
+            &interoception,
+            cx.now(),
+        ));
+
+        let outcome = match self
+            .session
+            .text_turn()
+            .tools::<PolicyTools>()
+            .available_tools([PolicyToolsSelector::ProposePolicyCandidate])
+            .max_output_tokens(512)
+            .collect_controlled_with(&lutum, nuillu_module::AbortOnAvailableToolNameInText::new())
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(error = %error, "policy candidate tool turn failed; continuing with deterministic considerations");
+                truncate_session_to(&mut self.session, session_len_before_turn);
+                cx.compact_and_save(&mut self.session, Usage::zero())
+                    .await?;
+                return Ok(Vec::new());
+            }
+        };
+
+        match outcome {
+            TextStepOutcomeWithTools::Finished(result) => {
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                Ok(Vec::new())
+            }
+            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
+                truncate_session_to(&mut self.session, session_len_before_turn);
+                cx.compact_and_save(&mut self.session, result.usage).await?;
+                Ok(Vec::new())
+            }
+            TextStepOutcomeWithTools::NeedsTools(round) => {
+                let usage = round.usage;
+                let mut selected = None;
+                let mut results: Vec<ToolResult> = Vec::new();
+                nuillu_module::emit_trace_tool_calls(&round.tool_calls);
+                for call in round.tool_calls.iter().cloned() {
+                    match call {
+                        PolicyToolsCall::ProposePolicyCandidate(call) => {
+                            let normalized = normalize_proposed_candidate(call.input.clone());
+                            let accepted = selected.is_none() && normalized.is_some();
+                            if accepted {
+                                selected = normalized;
+                            }
+                            results.push(
+                                call.complete(ProposePolicyCandidateOutput { accepted })
+                                    .context("complete propose_policy_candidate tool call")?,
+                            );
+                        }
+                    }
                 }
-            ));
-            self.session.push_ephemeral_user(format!(
-                "Policy consideration request for {}:\nQuery text:\n{}\n\nExisting policy hits:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}",
-                self.owner,
-                context.query_text,
-                serde_json::to_string(&render_hit_inputs(hits))
-                    .expect("policy hit input serialization should not fail"),
-                format_bounded_memo_log_batch(
-                    &context.memos,
-                    cx.now(),
-                    POLICY_MEMO_CONTEXT_WINDOW,
-                )
-                .unwrap_or_else(|| "none".to_owned()),
-                format_bounded_cognition_log_batch(
-                    &context.cognition,
-                    cx.now(),
-                    POLICY_COGNITION_CONTEXT_WINDOW,
-                )
-                .unwrap_or_else(|| "none".to_owned()),
-            ));
-            let result = self
-                .session
-                .structured_turn::<PolicyConsiderationDecision>()
-                .max_output_tokens(1024)
-                .collect(&lutum)
-                .await
-                .context("policy structured turn failed")?;
-            let semantic = result.semantic;
-            cx.compact_and_save(&mut self.session, result.usage).await?;
-            semantic
-        };
-        let StructuredTurnOutcome::Structured(decision) = result else {
-            tracing::debug!("policy structured turn refused; skipping activation");
-            return Ok(None);
-        };
-        Ok(Some(decision))
+                let Some(candidate) = selected else {
+                    if results.is_empty() {
+                        round.discard();
+                        truncate_session_to(&mut self.session, session_len_before_turn);
+                        cx.compact_and_save(&mut self.session, usage).await?;
+                        return Ok(Vec::new());
+                    }
+                    if let Err(error) = round.commit(&mut self.session, results) {
+                        tracing::warn!(
+                            error = %error,
+                            "policy candidate tool round commit failed; not persisting turn"
+                        );
+                        truncate_session_to(&mut self.session, session_len_before_turn);
+                    }
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(Vec::new());
+                };
+                if let Err(error) = round.commit(&mut self.session, results) {
+                    tracing::warn!(
+                        error = %error,
+                        "policy candidate tool round commit failed; not persisting turn"
+                    );
+                    truncate_session_to(&mut self.session, session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(Vec::new());
+                }
+                cx.compact_and_save(&mut self.session, usage).await?;
+                Ok(vec![candidate])
+            }
+        }
     }
 }
 
-#[derive(Serialize)]
-struct PolicyHitInput<'a> {
-    policy_index: &'a PolicyIndex,
-    similarity: f32,
-    rank: PolicyRank,
-    trigger: String,
-    behavior: String,
-    expected_reward: f32,
-    confidence: f32,
-    value: f32,
-    reward_tokens: u32,
+fn format_policy_candidate_request(
+    owner: &ModuleId,
+    context: &PolicyActivationContext,
+    hits: &[PolicySearchHit],
+    interoception: &nuillu_blackboard::InteroceptiveState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "Policy consideration request for {owner}\n\nQuery text:\n{}\n\nCurrent interoception:\n{}\n\nExisting policy hits already handled by runtime:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}\n\nInstruction:\nOnly call propose_policy_candidate if the existing hits are insufficient and a reusable new trigger/behavior policy is needed.",
+        context.query_text,
+        format_policy_interoception_state(interoception),
+        format_policy_hits(hits),
+        format_bounded_memo_log_batch(&context.memos, now, POLICY_MEMO_CONTEXT_WINDOW)
+            .unwrap_or_else(|| "none".to_owned()),
+        format_bounded_cognition_log_batch(
+            &context.cognition,
+            now,
+            POLICY_COGNITION_CONTEXT_WINDOW,
+        )
+        .unwrap_or_else(|| "none".to_owned()),
+    )
 }
 
-fn render_hit_inputs(hits: &[PolicySearchHit]) -> Vec<PolicyHitInput<'_>> {
+fn format_policy_interoception_state(state: &nuillu_blackboard::InteroceptiveState) -> String {
+    format!(
+        "- mode: {:?}\n- wake_arousal: {:.2}\n- nrem_pressure: {:.2}\n- rem_pressure: {:.2}\n- affect_arousal: {:.2}\n- valence: {:.2}\n- emotion: {}\n- last_updated: {}",
+        state.mode,
+        state.wake_arousal,
+        state.nrem_pressure,
+        state.rem_pressure,
+        state.affect_arousal,
+        state.valence,
+        if state.emotion.trim().is_empty() {
+            "(none)"
+        } else {
+            state.emotion.trim()
+        },
+        state.last_updated.to_rfc3339(),
+    )
+}
+
+fn format_policy_hits(hits: &[PolicySearchHit]) -> String {
+    if hits.is_empty() {
+        return "none".to_owned();
+    }
     hits.iter()
-        .map(|hit| PolicyHitInput {
-            policy_index: &hit.policy.index,
-            similarity: hit.similarity,
-            rank: hit.policy.rank,
-            trigger: compact_llm_context_text(&hit.policy.trigger, POLICY_HIT_TEXT_CHARS),
-            behavior: compact_llm_context_text(&hit.policy.behavior, POLICY_HIT_TEXT_CHARS),
-            expected_reward: hit.policy.expected_reward.get(),
-            confidence: hit.policy.confidence.get(),
-            value: hit.policy.value.get(),
-            reward_tokens: hit.policy.reward_tokens,
+        .map(|hit| {
+            format!(
+                "- policy_index: {}\n  similarity: {:.3}\n  rank: {:?}\n  trigger: {}\n  behavior: {}\n  stored_expected_reward: {:.3}\n  stored_confidence: {:.3}\n  stored_value: {:.3}\n  reward_tokens: {}",
+                hit.policy.index,
+                hit.similarity,
+                hit.policy.rank,
+                compact_llm_context_text(&hit.policy.trigger, POLICY_HIT_TEXT_CHARS),
+                compact_llm_context_text(&hit.policy.behavior, POLICY_HIT_TEXT_CHARS),
+                hit.policy.expected_reward.get(),
+                hit.policy.confidence.get(),
+                hit.policy.value.get(),
+                hit.policy.reward_tokens,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn truncate_session_to(session: &mut Session, len: usize) {
+    session.input_mut().items_mut().truncate(len);
+}
+
+fn deterministic_existing_considerations(hits: &[PolicySearchHit]) -> Vec<PolicyConsideration> {
+    hits.iter()
+        .map(|hit| {
+            let expected_reward = hit.policy.expected_reward.get();
+            PolicyConsideration {
+                candidate_id: format!("existing:{}", hit.policy.index),
+                source: PolicyConsiderationSource::Existing(ExistingPolicyConsideration {
+                    policy_index: hit.policy.index.clone(),
+                    similarity: hit.similarity,
+                    rank: hit.policy.rank,
+                    trigger: hit.policy.trigger.clone(),
+                    behavior: hit.policy.behavior.clone(),
+                    stored_expected_reward: expected_reward,
+                    stored_confidence: hit.policy.confidence.get(),
+                    stored_value: hit.policy.value.get(),
+                    reward_tokens: hit.policy.reward_tokens,
+                }),
+                predicted_expected_reward: expected_reward,
+                confidence_hint: hit.policy.confidence.get(),
+                advice: default_existing_advice(expected_reward),
+                rationale:
+                    "existing policy hit applied deterministically from stored policy statistics"
+                        .into(),
+            }
         })
         .collect()
 }
 
-fn normalize_decision(
-    hits: &[PolicySearchHit],
-    decision: PolicyConsiderationDecision,
-) -> Vec<PolicyConsideration> {
-    let mut existing = decision
-        .existing
-        .into_iter()
-        .map(|decision| (decision.policy_index.clone(), decision))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut out = Vec::new();
-
-    for hit in hits {
-        let decision = existing.remove(&hit.policy.index);
-        let (predicted_expected_reward, confidence_hint, advice, rationale) =
-            if let Some(decision) = decision {
-                (
-                    decision.predicted_expected_reward,
-                    decision.confidence_hint,
-                    decision.advice,
-                    decision.rationale,
-                )
-            } else {
-                (
-                    hit.policy.expected_reward.get(),
-                    hit.policy.confidence.get(),
-                    default_existing_advice(hit.policy.expected_reward.get()),
-                    "fallback: no policy prediction returned, used stored expected_reward".into(),
-                )
-            };
-        out.push(PolicyConsideration {
-            candidate_id: format!("existing:{}", hit.policy.index),
-            source: PolicyConsiderationSource::Existing(ExistingPolicyConsideration {
-                policy_index: hit.policy.index.clone(),
-                similarity: hit.similarity,
-                rank: hit.policy.rank,
-                trigger: hit.policy.trigger.clone(),
-                behavior: hit.policy.behavior.clone(),
-                stored_expected_reward: hit.policy.expected_reward.get(),
-                stored_confidence: hit.policy.confidence.get(),
-                stored_value: hit.policy.value.get(),
-                reward_tokens: hit.policy.reward_tokens,
-            }),
-            predicted_expected_reward: predicted_expected_reward.clamp(-1.0, 1.0),
-            confidence_hint: confidence_hint.clamp(0.0, 1.0),
-            advice,
-            rationale,
-        });
+fn normalize_proposed_candidate(args: ProposePolicyCandidateArgs) -> Option<PolicyConsideration> {
+    let trigger = args.trigger.trim();
+    let behavior = args.behavior.trim();
+    let advice = args.advice.trim();
+    if trigger.is_empty() || behavior.is_empty() || advice.is_empty() {
+        return None;
     }
+    Some(PolicyConsideration {
+        candidate_id: "synthetic:0".into(),
+        source: PolicyConsiderationSource::Synthetic(SyntheticPolicyConsideration {
+            trigger: trigger.to_owned(),
+            behavior: behavior.to_owned(),
+        }),
+        predicted_expected_reward: predicted_expected_reward_for(args.expected_value),
+        confidence_hint: 0.5,
+        advice: advice.to_owned(),
+        rationale: "synthetic policy candidate proposed through propose_policy_candidate".into(),
+    })
+}
 
-    for (index, candidate) in decision.synthetic.into_iter().enumerate() {
-        let trigger = candidate.trigger.trim();
-        let behavior = candidate.behavior.trim();
-        if trigger.is_empty() || behavior.is_empty() {
-            continue;
-        }
-        out.push(PolicyConsideration {
-            candidate_id: format!("synthetic:{index}"),
-            source: PolicyConsiderationSource::Synthetic(SyntheticPolicyConsideration {
-                trigger: trigger.to_owned(),
-                behavior: behavior.to_owned(),
-            }),
-            predicted_expected_reward: candidate.predicted_expected_reward.clamp(-1.0, 1.0),
-            confidence_hint: candidate.confidence_hint.clamp(0.0, 1.0),
-            advice: candidate.advice,
-            rationale: candidate.rationale,
-        });
+fn predicted_expected_reward_for(value: PolicyExpectedValue) -> f32 {
+    match value {
+        PolicyExpectedValue::StrongNegative => -0.75,
+        PolicyExpectedValue::Negative => -0.35,
+        PolicyExpectedValue::Neutral => 0.0,
+        PolicyExpectedValue::Positive => 0.35,
+        PolicyExpectedValue::StrongPositive => 0.75,
     }
-    out
 }
 
 fn default_existing_advice(expected_reward: f32) -> String {
@@ -534,9 +617,8 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
         ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        Lutum, MessageContent, MockLlmAdapter, MockStructuredScenario, ModelInput, ModelInputItem,
-        RawStructuredTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter,
-        Usage,
+        Lutum, MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::Blackboard;
     use nuillu_module::ports::SystemClock;
@@ -554,31 +636,32 @@ mod tests {
     };
 
     #[derive(Clone)]
-    struct CapturingStructuredAdapter {
+    struct CapturingTextAdapter {
         inner: MockLlmAdapter,
-        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
+        text_inputs: Arc<Mutex<Vec<ModelInput>>>,
     }
 
-    impl CapturingStructuredAdapter {
+    impl CapturingTextAdapter {
         fn new(inner: MockLlmAdapter) -> Self {
             Self {
                 inner,
-                structured_inputs: Arc::new(Mutex::new(Vec::new())),
+                text_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn structured_inputs(&self) -> Vec<ModelInput> {
-            self.structured_inputs.lock().unwrap().clone()
+        fn text_inputs(&self) -> Vec<ModelInput> {
+            self.text_inputs.lock().unwrap().clone()
         }
     }
 
     #[async_trait::async_trait]
-    impl TurnAdapter for CapturingStructuredAdapter {
+    impl TurnAdapter for CapturingTextAdapter {
         async fn text_turn(
             &self,
             input: ModelInput,
             turn: AdapterTextTurn,
         ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            self.text_inputs.lock().unwrap().push(input.clone());
             self.inner.text_turn(input, turn).await
         }
 
@@ -587,7 +670,6 @@ mod tests {
             input: ModelInput,
             turn: AdapterStructuredTurn,
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
-            self.structured_inputs.lock().unwrap().push(input.clone());
             self.inner.structured_turn(input, turn).await
         }
     }
@@ -616,30 +698,76 @@ mod tests {
         }
     }
 
-    fn policy_decision_scenario(input_tokens: u64) -> MockStructuredScenario {
-        let json = serde_json::json!({
-            "existing": [],
-            "synthetic": [
-                {
-                    "trigger": "fresh bounded trigger",
-                    "behavior": "fresh bounded behavior",
-                    "predicted_expected_reward": 0.25,
-                    "confidence_hint": 0.5,
-                    "advice": "continue cautiously",
-                    "rationale": "bounded current evidence is enough"
-                }
-            ]
-        })
-        .to_string();
-        MockStructuredScenario::events(vec![
-            Ok(RawStructuredTurnEvent::Started {
-                request_id: Some("policy-assess".into()),
+    fn proposed_candidate_scenario(input_tokens: u64) -> MockTextScenario {
+        policy_tool_scenario(
+            serde_json::json!({
+                "trigger": "fresh bounded trigger",
+                "behavior": "fresh bounded behavior",
+                "advice": "continue cautiously",
+                "expected_value": "positive"
+            })
+            .to_string(),
+            input_tokens,
+        )
+    }
+
+    fn invalid_candidate_scenario(input_tokens: u64) -> MockTextScenario {
+        policy_tool_scenario(
+            serde_json::json!({
+                "trigger": "",
+                "behavior": "fresh bounded behavior",
+                "advice": "continue cautiously",
+                "expected_value": "positive"
+            })
+            .to_string(),
+            input_tokens,
+        )
+    }
+
+    fn no_tool_scenario(input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("policy-no-tool".into()),
                 model: "mock".into(),
             }),
-            Ok(RawStructuredTurnEvent::StructuredOutputChunk { json_delta: json }),
-            Ok(RawStructuredTurnEvent::Completed {
-                request_id: Some("policy-assess".into()),
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: "no new reusable candidate".into(),
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("policy-no-tool".into()),
                 finish_reason: FinishReason::Stop,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn malformed_tool_scenario(input_tokens: u64) -> MockTextScenario {
+        policy_tool_scenario(
+            serde_json::json!({
+                "trigger": "fresh bounded trigger",
+                "behavior": "fresh bounded behavior",
+                "advice": "continue cautiously",
+                "expected_value": 0.7
+            })
+            .to_string(),
+            input_tokens,
+        )
+    }
+
+    fn policy_tool_scenario(arguments_json: String, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("policy-tool".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::ToolCallChunk {
+                id: "call-policy".into(),
+                name: "propose_policy_candidate".into(),
+                arguments_json_delta: arguments_json,
+            }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("policy-tool".into()),
+                finish_reason: FinishReason::ToolCall,
                 usage: text_usage(input_tokens),
             }),
         ])
@@ -736,6 +864,17 @@ mod tests {
                     out.push_str(text);
                     out.push('\n');
                 }
+                ModelInputItem::Turn(turn) => {
+                    for index in 0..turn.item_count() {
+                        let Some(item) = turn.item_at(index) else {
+                            continue;
+                        };
+                        if let Some(text) = item.as_text() {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -759,20 +898,16 @@ mod tests {
     }
 
     #[test]
-    fn normalize_decision_keeps_hits_and_synthetic_candidates() {
-        let considerations = normalize_decision(
-            &[hit("p1", -0.2)],
-            PolicyConsiderationDecision {
-                existing: Vec::new(),
-                synthetic: vec![SyntheticPolicyDecision {
-                    trigger: "new situation".into(),
-                    behavior: "new behavior".into(),
-                    predicted_expected_reward: 2.0,
-                    confidence_hint: 2.0,
-                    advice: "try carefully".into(),
-                    rationale: "novel pattern".into(),
-                }],
-            },
+    fn deterministic_existing_and_synthetic_candidate_normalization() {
+        let mut considerations = deterministic_existing_considerations(&[hit("p1", -0.2)]);
+        considerations.push(
+            normalize_proposed_candidate(ProposePolicyCandidateArgs {
+                trigger: "new situation".into(),
+                behavior: "new behavior".into(),
+                advice: "try carefully".into(),
+                expected_value: PolicyExpectedValue::StrongPositive,
+            })
+            .unwrap(),
         );
 
         assert_eq!(
@@ -784,16 +919,16 @@ mod tests {
                     candidate.confidence_hint
                 ))
                 .collect::<Vec<_>>(),
-            vec![("existing:p1", -0.2, 0.4), ("synthetic:0", 1.0, 1.0)]
+            vec![("existing:p1", -0.2, 0.4), ("synthetic:0", 0.75, 0.5)]
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_bounds_policy_input_and_seeds_stable_prompt_once() {
         let adapter = MockLlmAdapter::new()
-            .with_structured_scenario(policy_decision_scenario(1))
-            .with_structured_scenario(policy_decision_scenario(1));
-        let capture = CapturingStructuredAdapter::new(adapter);
+            .with_text_scenario(proposed_candidate_scenario(1))
+            .with_text_scenario(proposed_candidate_scenario(1));
+        let capture = CapturingTextAdapter::new(adapter);
         let observed = capture.clone();
         let blackboard = Blackboard::default();
         let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
@@ -866,13 +1001,19 @@ mod tests {
         let batch = module.next_batch().await.unwrap();
         module.activate(&cx, &batch).await.unwrap();
 
-        let first = observed.structured_inputs();
+        let first = observed.text_inputs();
         assert_eq!(first.len(), 1);
         let first_text = all_input_text(&first[0]);
         assert!(first_text.contains("answer the current bounded policy query"));
+        assert!(first_text.contains("Current interoception:"));
+        assert!(first_text.contains("- affect_arousal:"));
+        assert!(first_text.contains("Existing policy hits already handled by runtime:"));
+        assert!(first_text.contains("- policy_index: policy-0"));
         assert!(first_text.contains("policy-0"));
         assert!(first_text.contains("policy-4"));
         assert!(!first_text.contains("policy-5"));
+        assert!(!first_text.contains("\"policy_index\""));
+        assert!(!first_text.contains("{\""));
         assert!(!first_text.contains("not shown here"));
         assert!(!first_text.contains("omitted"));
         assert!(!first_text.contains("[truncated]"));
@@ -898,10 +1039,137 @@ mod tests {
         let batch = module.next_batch().await.unwrap();
         module.activate(&cx, &batch).await.unwrap();
 
-        let inputs = observed.structured_inputs();
+        let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         assert_eq!(system_prompt_count(&inputs[1]), 1);
         assert_eq!(store.search_limits.borrow().as_slice(), &[5, 5]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_writes_existing_hit_when_model_calls_no_tool() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(no_tool_scenario(1))
+            .with_text_scenario(proposed_candidate_scenario(1));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let store = Rc::new(RecordingPolicyStore::with_records(vec![record(
+            "p1",
+            "when Alice asks a gentle question",
+            "answer with calm curiosity",
+        )]));
+        let policy_caps = PolicyCapabilities::new(
+            blackboard.clone(),
+            Rc::new(SystemClock),
+            store.clone(),
+            Vec::new(),
+        );
+        let snapshots = policy_caps.clone();
+        let mut module = build_policy_module(&caps, policy_caps).await;
+
+        let now = chrono::Utc::now();
+        publish_policy_wakeup_with_content(&caps, &blackboard, "first policy evidence", now).await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let records = snapshots.consideration_snapshots();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload.considerations.len(), 1);
+        let consideration = &records[0].payload.considerations[0];
+        assert_eq!(consideration.candidate_id, "existing:p1");
+        assert!(matches!(
+            consideration.source,
+            PolicyConsiderationSource::Existing(_)
+        ));
+
+        publish_policy_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "second policy evidence",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_text = all_input_text(&inputs[1]);
+        assert!(second_text.contains("first policy evidence"));
+        assert!(second_text.contains("no new reusable candidate"));
+        assert!(second_text.contains("second policy evidence"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_drops_invalid_or_malformed_synthetic_candidate_without_failure() {
+        for scenario in [invalid_candidate_scenario(1), malformed_tool_scenario(1)] {
+            let adapter = MockLlmAdapter::new().with_text_scenario(scenario);
+            let blackboard = Blackboard::default();
+            let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(adapter));
+            let store = Rc::new(RecordingPolicyStore::default());
+            let policy_caps = PolicyCapabilities::new(
+                blackboard.clone(),
+                Rc::new(SystemClock),
+                store.clone(),
+                Vec::new(),
+            );
+            let snapshots = policy_caps.clone();
+            let mut module = build_policy_module(&caps, policy_caps).await;
+
+            let now = chrono::Utc::now();
+            publish_policy_wakeup(&caps, &blackboard, now).await;
+            let cx = activate_cx(&lutum, now);
+            let batch = module.next_batch().await.unwrap();
+            module.activate(&cx, &batch).await.unwrap();
+
+            assert!(snapshots.consideration_snapshots().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_drops_malformed_candidate_turn_from_session() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(malformed_tool_scenario(1))
+            .with_text_scenario(no_tool_scenario(1));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let store = Rc::new(RecordingPolicyStore::default());
+        let policy_caps =
+            PolicyCapabilities::new(blackboard.clone(), Rc::new(SystemClock), store, Vec::new());
+        let mut module = build_policy_module(&caps, policy_caps).await;
+
+        let now = chrono::Utc::now();
+        publish_policy_wakeup_with_content(&caps, &blackboard, "malformed policy evidence", now)
+            .await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        publish_policy_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "clean policy evidence",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_text = all_input_text(&inputs[1]);
+        assert!(!second_text.contains("malformed policy evidence"));
+        assert!(second_text.contains("clean policy evidence"));
+        assert!(
+            !inputs[1]
+                .items()
+                .iter()
+                .any(|item| matches!(item, ModelInputItem::ToolResult(_)))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -950,6 +1218,40 @@ mod tests {
                 rationale: "failure candidate remains useful".into(),
             }],
         }
+    }
+
+    async fn publish_policy_wakeup(
+        caps: &CapabilityProviders,
+        blackboard: &Blackboard,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        publish_policy_wakeup_with_content(
+            caps,
+            blackboard,
+            "policy-relevant current context",
+            now,
+        )
+        .await;
+    }
+
+    async fn publish_policy_wakeup_with_content(
+        caps: &CapabilityProviders,
+        blackboard: &Blackboard,
+        content: impl Into<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let memo_owner = ModuleInstanceId::new(builtin::self_model(), ReplicaIndex::ZERO);
+        let record = blackboard
+            .update_memo(memo_owner, content.into(), now)
+            .await;
+        caps.internal_harness_io()
+            .memo_updated_mailbox()
+            .publish(nuillu_module::MemoUpdated {
+                owner: record.owner,
+                index: record.index,
+            })
+            .await
+            .unwrap();
     }
 
     #[derive(Default)]
