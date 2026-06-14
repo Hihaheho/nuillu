@@ -2,6 +2,7 @@ pub mod blackboard;
 pub mod chat;
 pub mod cognition;
 pub mod errors;
+mod i18n;
 pub mod memories;
 pub mod memos;
 pub mod module_filter;
@@ -20,10 +21,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
+use egui_hooks::UseHookExt as _;
 use font_kit::family_name::FamilyName;
 use font_kit::handle::Handle;
 use font_kit::properties::Properties;
 use font_kit::source::SystemSource;
+use i18n::{EguiI18nExt as _, I18nArg, I18nCatalog, LOCALE_PERSISTENCE_KEY, Locale};
 use nuillu_module::RuntimeEvent;
 pub use nuillu_visualizer_protocol::*;
 
@@ -40,19 +43,33 @@ pub struct VisualizerApp {
     server_messages: Receiver<VisualizerServerMessage>,
     client_messages: Sender<VisualizerClientMessage>,
     remote: bool,
+    i18n_catalog: I18nCatalog,
+    current_locale: Locale,
     state: VisualizerState,
 }
 
 impl VisualizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
         install_visualizer_fonts(&cc.egui_ctx);
+        let i18n_catalog =
+            I18nCatalog::embedded().expect("embedded visualizer translations should be valid");
+        let current_locale = Locale::default();
+        cc.egui_ctx
+            .install_i18n(i18n_catalog.for_locale(current_locale));
 
         Self {
             server_messages: channels.server_messages,
             client_messages: channels.client_messages,
             remote: channels.remote,
+            i18n_catalog,
+            current_locale,
             state: VisualizerState::default(),
         }
+    }
+
+    fn install_locale(&mut self, ctx: &egui::Context, locale: Locale) {
+        self.current_locale = locale;
+        ctx.install_i18n(self.i18n_catalog.for_locale(locale));
     }
 
     fn drain_server_messages(&mut self) {
@@ -126,49 +143,88 @@ fn load_noto_sans_jp() -> Option<egui::FontData> {
     Some(font_data)
 }
 
+fn render_language_toggle(ui: &mut egui::Ui, locale: Locale) -> Option<Locale> {
+    let mut next_locale = None;
+    egui::Frame::new()
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::symmetric(2, 2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                for candidate in [Locale::JaJp, Locale::EnUs] {
+                    let selected = candidate == locale;
+                    if ui.selectable_label(selected, candidate.label()).clicked() && !selected {
+                        next_locale = Some(candidate);
+                    }
+                }
+            });
+        });
+    next_locale
+}
+
+fn tr_tab_title(ctx: &egui::Context, key: &str, title: &str) -> String {
+    ctx.tr_args(key, &[("title", I18nArg::from(title))])
+}
+
 impl eframe::App for VisualizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let persisted_locale = ui.use_persisted_state(Locale::default, LOCALE_PERSISTENCE_KEY);
+        let locale = *persisted_locale;
+        self.install_locale(ui.ctx(), locale);
         self.drain_server_messages();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
+        let mut next_locale = None;
         egui::Panel::top("nuillu-visualizer-tabs").show_inside(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for tab in self.state.tabs.values() {
-                    let selected = self.state.selected.as_ref() == Some(&tab.id);
-                    let label = format!("{} {}", tab_status_icon(tab.status), tab.title);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.state.selected = Some(tab.id.clone());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                next_locale = render_language_toggle(ui, locale);
+                ui.horizontal_wrapped(|ui| {
+                    for tab in self.state.tabs.values() {
+                        let selected = self.state.selected.as_ref() == Some(&tab.id);
+                        let label = format!("{} {}", tab_status_icon(tab.status), tab.title);
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.state.selected = Some(tab.id.clone());
+                        }
                     }
-                }
-                let view_tab_id = self
-                    .state
-                    .selected
-                    .clone()
-                    .or_else(|| self.state.tabs.keys().next().cloned());
-                if let Some(tab_id) = view_tab_id {
-                    if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
-                        tab.view_menu(ui);
+                    let view_tab_id = self
+                        .state
+                        .selected
+                        .clone()
+                        .or_else(|| self.state.tabs.keys().next().cloned());
+                    if let Some(tab_id) = view_tab_id {
+                        if let Some(tab) = self.state.tabs.get_mut(&tab_id) {
+                            tab.view_menu(ui);
+                        }
+                    } else {
+                        ui.menu_button(ui.ctx().tr("menu-view"), |ui| {
+                            ui.label(ui.ctx().tr("menu-no-runtime-windows"));
+                        });
                     }
-                } else {
-                    ui.menu_button("View", |ui| {
-                        ui.label("No runtime windows yet.");
-                    });
-                }
-                for action in self.state.visible_actions() {
-                    if ui.button(&action.label).clicked() {
-                        let _ = self
-                            .client_messages
-                            .send(VisualizerClientMessage::InvokeAction {
-                                action_id: action.id,
-                            });
+                    for action in self.state.visible_actions() {
+                        if ui.button(&action.label).clicked() {
+                            let _ =
+                                self.client_messages
+                                    .send(VisualizerClientMessage::InvokeAction {
+                                        action_id: action.id,
+                                    });
+                        }
                     }
-                }
-                if self.remote && self.state.disconnected {
-                    ui.colored_label(ui.visuals().error_fg_color, "Eval disconnected");
-                }
+                    if self.remote && self.state.disconnected {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            ui.ctx().tr("status-eval-disconnected"),
+                        );
+                    }
+                });
             });
         });
+        if let Some(locale) = next_locale {
+            persisted_locale.set_next(locale);
+            self.install_locale(ui.ctx(), locale);
+            ui.ctx().request_repaint();
+        }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let selected = self
@@ -186,9 +242,9 @@ impl eframe::App for VisualizerApp {
             } else {
                 ui.centered_and_justified(|ui| {
                     if self.remote && self.state.disconnected {
-                        ui.label("Eval process disconnected.");
+                        ui.label(ui.ctx().tr("status-eval-process-disconnected"));
                     } else {
-                        ui.label("No runtime tabs yet.");
+                        ui.label(ui.ctx().tr("status-no-runtime-tabs"));
                     }
                 });
             }
@@ -463,12 +519,12 @@ impl RuntimeTab {
     }
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button("View", |ui| {
+        ui.menu_button(ui.ctx().tr("menu-view"), |ui| {
             let simplified = self.view_mode == RuntimeTabViewMode::Simplified;
             let label = if simplified {
-                "☑️ Simplified View"
+                ui.ctx().tr("menu-simplified-view-enabled")
             } else {
-                "☐ Simplified View"
+                ui.ctx().tr("menu-simplified-view-disabled")
             };
             if ui.button(label).clicked() {
                 self.set_simplified_view(!simplified);
@@ -479,9 +535,12 @@ impl RuntimeTab {
             }
 
             ui.separator();
-            let specs = self.window_specs();
+            let specs = self.window_specs(ui.ctx());
             if specs.iter().any(|spec| spec.kind == ViewWindowKind::Module) {
-                if ui.button("Close all module windows").clicked() {
+                if ui
+                    .button(ui.ctx().tr("menu-close-all-module-windows"))
+                    .clicked()
+                {
                     self.close_all_module_windows();
                     ui.close();
                 }
@@ -521,66 +580,66 @@ impl RuntimeTab {
         }
     }
 
-    fn window_specs(&self) -> Vec<ViewWindowSpec> {
+    fn window_specs(&self, ctx: &egui::Context) -> Vec<ViewWindowSpec> {
         let base = self.id.as_str();
         let mut specs = vec![
             ViewWindowSpec {
                 id: format!("{base}:chat"),
-                title: format!("Scene - {}", self.title),
+                title: tr_tab_title(ctx, "window-scene-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:blackboard"),
-                title: format!("🧾 Blackboard - {}", self.title),
+                title: tr_tab_title(ctx, "window-blackboard-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:memories"),
-                title: format!("🧠 Memory - {}", self.title),
+                title: tr_tab_title(ctx, "window-memory-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:memos"),
-                title: format!("📝 Memo - {}", self.title),
+                title: tr_tab_title(ctx, "window-memo-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:llm-turns"),
-                title: format!("LLM Turns - {}", self.title),
+                title: tr_tab_title(ctx, "window-llm-turns-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:cognition"),
-                title: format!("🧩 Cognition Log - {}", self.title),
+                title: tr_tab_title(ctx, "window-cognition-log-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:errors"),
-                title: format!("Errors - {}", self.title),
+                title: tr_tab_title(ctx, "window-errors-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:logs"),
-                title: format!("📜 Logs - {}", self.title),
+                title: tr_tab_title(ctx, "window-logs-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:resource-monitor"),
-                title: format!("Resource Monitor - {}", self.title),
+                title: tr_tab_title(ctx, "window-resource-monitor-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
             ViewWindowSpec {
                 id: format!("{base}:modules"),
-                title: format!("Modules - {}", self.title),
+                title: tr_tab_title(ctx, "window-modules-title", &self.title),
                 default_open: true,
                 kind: ViewWindowKind::Normal,
             },
@@ -647,17 +706,19 @@ impl RuntimeTab {
                     let lower_height = ui.available_height().max(1.0);
                     let lower_width = ui.available_width();
                     let column_width = ((lower_width - SIMPLIFIED_PANE_GAP) / 2.0).max(1.0);
+                    let cognition_title = ui.ctx().tr("section-cognition-log");
+                    let memory_title = ui.ctx().tr("section-memory");
                     ui.horizontal(|ui| {
                         simplified_section(
                             ui,
-                            Some("Cognition Log"),
+                            Some(cognition_title.as_str()),
                             egui::vec2(column_width, lower_height),
                             |ui| self.render_cognition_contents(ui),
                         );
                         ui.add_space(SIMPLIFIED_PANE_GAP);
                         simplified_section(
                             ui,
-                            Some("Memory"),
+                            Some(memory_title.as_str()),
                             egui::vec2(ui.available_width().max(1.0), lower_height),
                             |ui| self.render_memory_contents(ui, commands),
                         );
@@ -670,9 +731,10 @@ impl RuntimeTab {
                 egui::vec2(right_width.min(ui.available_width()).max(1.0), available.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
+                    let scene_title = ui.ctx().tr("section-scene");
                     simplified_section(
                         ui,
-                        Some("Scene"),
+                        Some(scene_title.as_str()),
                         egui::vec2(ui.available_width(), available.y),
                         |ui| self.render_scene_contents(ui, commands),
                     );
@@ -781,18 +843,22 @@ impl RuntimeTab {
     }
 
     fn render_simplified_interoception_window(&self, ui: &mut egui::Ui, now_secs: f64) {
-        egui::Window::new(format!("Interoception - {}", self.title))
-            .id(egui::Id::new((
-                self.id.as_str(),
-                "simplified-interoception",
-            )))
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .default_pos(egui::pos2(24.0, 96.0))
-            .default_size(egui::vec2(520.0, 260.0))
-            .show(ui.ctx(), |ui| {
-                resource_monitor::render_interoception_plot(ui, &self.resource_monitor, now_secs);
-            });
+        egui::Window::new(tr_tab_title(
+            ui.ctx(),
+            "window-interoception-title",
+            &self.title,
+        ))
+        .id(egui::Id::new((
+            self.id.as_str(),
+            "simplified-interoception",
+        )))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .default_pos(egui::pos2(24.0, 96.0))
+        .default_size(egui::vec2(520.0, 260.0))
+        .show(ui.ctx(), |ui| {
+            resource_monitor::render_interoception_plot(ui, &self.resource_monitor, now_secs);
+        });
     }
 
     fn render_simplified_module_popup(
@@ -869,7 +935,7 @@ impl RuntimeTab {
         let mut window_requests = std::mem::take(&mut self.window_requests);
 
         let chat_id = format!("{base}:chat");
-        let chat_title = format!("Scene - {}", self.title);
+        let chat_title = tr_tab_title(ui.ctx(), "window-scene-title", &self.title);
         let open = window::PersistedWindow::new(&chat_id, &chat_title)
             .open_override(window_requests.remove(&chat_id))
             .default_pos(24.0, 88.0)
@@ -878,7 +944,7 @@ impl RuntimeTab {
         self.record_window_open(chat_id, open);
 
         let blackboard_id = format!("{base}:blackboard");
-        let blackboard_title = format!("🧾 Blackboard - {}", self.title);
+        let blackboard_title = tr_tab_title(ui.ctx(), "window-blackboard-title", &self.title);
         let open = window::PersistedWindow::new(&blackboard_id, &blackboard_title)
             .open_override(window_requests.remove(&blackboard_id))
             .default_pos(568.0, 88.0)
@@ -887,7 +953,7 @@ impl RuntimeTab {
         self.record_window_open(blackboard_id, open);
 
         let memories_id = format!("{base}:memories");
-        let memories_title = format!("🧠 Memory - {}", self.title);
+        let memories_title = tr_tab_title(ui.ctx(), "window-memory-title", &self.title);
         let open = window::PersistedWindow::new(&memories_id, &memories_title)
             .open_override(window_requests.remove(&memories_id))
             .default_pos(96.0, 636.0)
@@ -896,7 +962,7 @@ impl RuntimeTab {
         self.record_window_open(memories_id, open);
 
         let memos_id = format!("{base}:memos");
-        let memos_title = format!("📝 Memo - {}", self.title);
+        let memos_title = tr_tab_title(ui.ctx(), "window-memo-title", &self.title);
         let memo_filter_modules = self.memo_filter_modules();
         let open = window::PersistedWindow::new(&memos_id, &memos_title)
             .open_override(window_requests.remove(&memos_id))
@@ -913,7 +979,7 @@ impl RuntimeTab {
         self.record_window_open(memos_id, open);
 
         let llm_turns_id = format!("{base}:llm-turns");
-        let llm_turns_title = format!("LLM Turns - {}", self.title);
+        let llm_turns_title = tr_tab_title(ui.ctx(), "window-llm-turns-title", &self.title);
         let llm_turns_filter_modules = self.modules.module_names();
         let open = window::PersistedWindow::new(&llm_turns_id, &llm_turns_title)
             .open_override(window_requests.remove(&llm_turns_id))
@@ -930,7 +996,7 @@ impl RuntimeTab {
         self.record_window_open(llm_turns_id, open);
 
         let cognition_id = format!("{base}:cognition");
-        let cognition_title = format!("🧩 Cognition Log - {}", self.title);
+        let cognition_title = tr_tab_title(ui.ctx(), "window-cognition-log-title", &self.title);
         let open = window::PersistedWindow::new(&cognition_id, &cognition_title)
             .open_override(window_requests.remove(&cognition_id))
             .default_pos(1384.0, 636.0)
@@ -939,7 +1005,7 @@ impl RuntimeTab {
         self.record_window_open(cognition_id, open);
 
         let errors_id = self.errors_window_id();
-        let errors_title = format!("Errors - {}", self.title);
+        let errors_title = tr_tab_title(ui.ctx(), "window-errors-title", &self.title);
         let open = window::PersistedWindow::new(&errors_id, &errors_title)
             .open_override(window_requests.remove(&errors_id))
             .default_pos(24.0, 1020.0)
@@ -955,7 +1021,7 @@ impl RuntimeTab {
         self.record_window_open(errors_id, open);
 
         let logs_id = format!("{base}:logs");
-        let logs_title = format!("📜 Logs - {}", self.title);
+        let logs_title = tr_tab_title(ui.ctx(), "window-logs-title", &self.title);
         let open = window::PersistedWindow::new(&logs_id, &logs_title)
             .open_override(window_requests.remove(&logs_id))
             .default_pos(688.0, 1020.0)
@@ -964,7 +1030,8 @@ impl RuntimeTab {
         self.record_window_open(logs_id, open);
 
         let resource_monitor_id = format!("{base}:resource-monitor");
-        let resource_monitor_title = format!("Resource Monitor - {}", self.title);
+        let resource_monitor_title =
+            tr_tab_title(ui.ctx(), "window-resource-monitor-title", &self.title);
         let resource_monitor_modules = self.resource_monitor_modules();
         let resource_monitor_now_secs = self.resource_monitor_elapsed_secs();
         let open = window::PersistedWindow::new(&resource_monitor_id, &resource_monitor_title)
@@ -983,7 +1050,7 @@ impl RuntimeTab {
         self.record_window_open(resource_monitor_id, open);
 
         let modules_id = format!("{base}:modules");
-        let modules_title = format!("Modules - {}", self.title);
+        let modules_title = tr_tab_title(ui.ctx(), "window-modules-title", &self.title);
         let mut requested_module = None;
         let open = window::PersistedWindow::new(&modules_id, &modules_title)
             .open_override(window_requests.remove(&modules_id))
@@ -1163,6 +1230,13 @@ fn tab_status_icon(status: TabStatus) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_i18n_context(locale: Locale) -> egui::Context {
+        let ctx = egui::Context::default();
+        let catalog = I18nCatalog::embedded().expect("embedded translations load");
+        ctx.install_i18n(catalog.for_locale(locale));
+        ctx
+    }
+
     #[test]
     fn reducer_creates_and_updates_tabs() {
         let mut state = VisualizerState::default();
@@ -1340,11 +1414,12 @@ mod tests {
             .expect("tab exists")
             .set_simplified_view(false);
 
+        let ctx = test_i18n_context(Locale::EnUs);
         let specs = state
             .tabs()
             .get(&tab_id)
             .expect("tab exists")
-            .window_specs();
+            .window_specs(&ctx);
 
         assert!(
             specs

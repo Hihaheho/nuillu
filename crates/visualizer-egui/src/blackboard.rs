@@ -1,10 +1,14 @@
-use crate::{BlackboardSnapshot, text::wrapped_label};
+use crate::{
+    BlackboardSnapshot,
+    i18n::{EguiI18nExt as _, I18nArg},
+    text::wrapped_label,
+};
 
 pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
     egui::ScrollArea::vertical()
         .id_salt("blackboard-window")
         .show(ui, |ui| {
-            ui.heading("Allocation");
+            ui.heading(ui.ctx().tr("blackboard-allocation"));
             for item in &snapshot.allocation {
                 egui::Frame::new()
                     .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -13,8 +17,14 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.strong(&item.module);
-                            ui.label(format!("replicas {}", item.active_replicas));
-                            ui.label(format!("ratio {:.2}", item.activation_ratio));
+                            ui.label(ui.ctx().tr_args(
+                                "blackboard-replicas",
+                                &[("count", i64::from(item.active_replicas).into())],
+                            ));
+                            ui.label(ui.ctx().tr_args(
+                                "blackboard-ratio",
+                                &[("ratio", format!("{:.2}", item.activation_ratio).into())],
+                            ));
                             ui.label(&item.tier);
                         });
                         if !item.guidance.is_empty() {
@@ -26,7 +36,7 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
             }
 
             ui.separator();
-            ui.heading("Module Status");
+            ui.heading(ui.ctx().tr("blackboard-module-status"));
             for item in &snapshot.module_statuses {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong(&item.owner);
@@ -35,7 +45,7 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
             }
 
             ui.separator();
-            ui.heading("Utterance Progress");
+            ui.heading(ui.ctx().tr("blackboard-utterance-progress"));
             for progress in &snapshot.utterance_progresses {
                 egui::Frame::new()
                     .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -46,7 +56,10 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                             ui.strong(&progress.owner);
                             ui.label(&progress.state);
                             ui.label(format!("#{}:{}", progress.generation_id, progress.sequence));
-                            ui.label(format!("target: {}", progress.target));
+                            ui.label(ui.ctx().tr_args(
+                                "blackboard-target",
+                                &[("target", I18nArg::from(progress.target.as_str()))],
+                            ));
                         });
                         ui.add_space(4.0);
                         wrapped_label(ui, &progress.partial_utterance);
@@ -55,16 +68,16 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
             }
 
             ui.separator();
-            ui.heading("Memory Metadata");
+            ui.heading(ui.ctx().tr("blackboard-memory-metadata"));
             egui::Grid::new("memory-metadata-grid")
                 .striped(true)
                 .show(ui, |ui| {
-                    ui.strong("Index");
-                    ui.strong("Rank");
-                    ui.strong("Accesses");
-                    ui.strong("Uses");
-                    ui.strong("Reinforces");
-                    ui.strong("Occurred");
+                    ui.strong(ui.ctx().tr("blackboard-index"));
+                    ui.strong(ui.ctx().tr("blackboard-rank"));
+                    ui.strong(ui.ctx().tr("blackboard-accesses"));
+                    ui.strong(ui.ctx().tr("blackboard-uses"));
+                    ui.strong(ui.ctx().tr("blackboard-reinforces"));
+                    ui.strong(ui.ctx().tr("blackboard-occurred"));
                     ui.end_row();
                     for memory in &snapshot.memory_metadata {
                         ui.label(&memory.index);

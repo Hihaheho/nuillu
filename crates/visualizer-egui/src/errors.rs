@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use nuillu_visualizer_protocol::VisualizerErrorView;
 
-use crate::text::wrapped_label;
+use crate::{i18n::EguiI18nExt as _, text::wrapped_label};
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -11,20 +11,27 @@ pub fn ui(
     live_llm_turn_count: u32,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.heading("Errors");
-        ui.label(format!(
-            "session: {session_error_count}/{live_llm_turn_count}"
+        ui.heading(ui.ctx().tr("errors-heading"));
+        ui.label(ui.ctx().tr_args(
+            "errors-session-status",
+            &[
+                ("errors", session_error_count.into()),
+                ("turns", live_llm_turn_count.into()),
+            ],
         ))
-        .on_hover_text("session errors / live LLM turns in this visualizer session");
-        ui.label(format!("shown: {}", errors.len()));
-        if ui.button("Clear list").clicked() {
+        .on_hover_text(ui.ctx().tr("errors-session-status-hover"));
+        ui.label(
+            ui.ctx()
+                .tr_args("errors-shown-count", &[("count", errors.len().into())]),
+        );
+        if ui.button(ui.ctx().tr("errors-clear-list")).clicked() {
             errors.clear();
         }
     });
     ui.separator();
 
     if errors.is_empty() {
-        ui.label("No errors shown.");
+        ui.label(ui.ctx().tr("errors-empty"));
         return;
     }
 

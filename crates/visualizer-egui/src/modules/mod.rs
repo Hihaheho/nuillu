@@ -20,8 +20,9 @@ use nuillu_module::RuntimeEvent;
 use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
     LlmObservationSource, LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, MemoView,
-    ModulePolicyView, ModuleSettingsView, ModuleStatusView, ZeroReplicaWindowView, memos,
-    module_filter,
+    ModulePolicyView, ModuleSettingsView, ModuleStatusView, ZeroReplicaWindowView,
+    i18n::{EguiI18nExt as _, I18nArg},
+    memos, module_filter,
     module_filter::ModuleFilterState,
     text::{hard_wrap_long_segments, wrapped_label},
 };
@@ -672,7 +673,7 @@ pub fn render_module(
         ui.label(format!("memos: {}", module_memos.len()));
         ui.label(format!("turns: {}", module.turns.len()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Reset").clicked() {
+            if ui.small_button(ui.ctx().tr("module-reset")).clicked() {
                 actions.push(ModuleWindowAction::ResetSessionHistory {
                     owner: module.owner.clone(),
                 });
@@ -693,7 +694,7 @@ pub fn render_module(
     ui.horizontal(|ui| {
         ui.set_min_height(body_height);
         render_fixed_pane(ui, MODULE_SELECTOR_WIDTH, body_height, |ui| {
-            ui.strong("Views");
+            ui.strong(ui.ctx().tr("module-views"));
             ui.separator();
             render_module_selector(ui, module, &selected_panel, &mut next_panel);
         });
@@ -737,20 +738,20 @@ pub fn render_llm_turns(
     ui.horizontal(|ui| {
         ui.set_min_height(body_height);
         render_fixed_pane(ui, LLM_TURN_SELECTOR_WIDTH, body_height, |ui| {
-            ui.strong("Turns");
+            ui.strong(ui.ctx().tr("module-turns"));
             ui.separator();
             render_llm_turn_selector(ui, &rows, &mut selected_turn_id);
         });
         ui.separator();
         render_remaining_pane(ui, body_height, |ui| {
             if rows.is_empty() {
-                ui.label("No LLM turns yet.");
+                ui.label(ui.ctx().tr("module-no-llm-turns"));
             } else if let Some(turn_id) = selected_turn_id.as_deref()
                 && let Some((turn_index, module, turn)) = turn_by_id(state, turn_id)
             {
                 render_active_turn(ui, module, turn_index, turn);
             } else {
-                ui.label("Select a turn.");
+                ui.label(ui.ctx().tr("module-select-turn"));
             }
         });
     });
@@ -867,7 +868,7 @@ fn failed_turn_frame(ui: &egui::Ui, status: ModuleSessionStatus) -> egui::Frame 
 
 fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoView]) {
     ui.horizontal_wrapped(|ui| {
-        ui.strong("memos");
+        ui.strong(ui.ctx().tr("module-memos"));
         ui.label(format!("module: {}", module_name(module)));
         ui.label(format!("count: {}", memos.len()));
     });
@@ -876,7 +877,7 @@ fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoVi
         .id_salt(("module-memos", module.owner.as_str()))
         .show(ui, |ui| {
             if memos.is_empty() {
-                ui.label("No memos yet.");
+                ui.label(ui.ctx().tr("memo-empty"));
                 return;
             }
             for memo in memos {
@@ -1202,20 +1203,28 @@ const CONFIG_POPUP_GAP: f32 = 6.0;
 
 fn overview_header(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        overview_header_cell(ui, "Enabled", ACTIVE_COLUMN_WIDTH);
-        overview_header_cell(ui, "Configs", CONFIG_COLUMN_WIDTH);
-        overview_header_cell(ui, "Module", MODULE_COLUMN_WIDTH);
-        overview_header_cell(ui, "Replica", REPLICA_COLUMN_WIDTH);
-        overview_header_cell(ui, "Alloc", ALLOCATION_COLUMN_WIDTH);
-        overview_header_cell(ui, "BPM", BPM_COLUMN_WIDTH);
-        overview_header_cell(ui, "Period", PERIOD_COLUMN_WIDTH);
-        overview_header_cell(ui, "BPM Wait", BPM_WAIT_COLUMN_WIDTH);
-        overview_header_cell(ui, "Tier", TIER_COLUMN_WIDTH);
-        overview_header_cell(ui, "Runtime", STATUS_COLUMN_WIDTH);
-        overview_header_cell(ui, "LLM", LLM_COLUMN_WIDTH);
-        overview_header_cell(ui, "Act Err", ACTIVATION_ERRORS_COLUMN_WIDTH);
-        overview_header_cell(ui, "LLM Err", LLM_ERRORS_COLUMN_WIDTH);
-        overview_header_cell(ui, "Latest LLM out", LATEST_OUTPUT_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-enabled", ACTIVE_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-configs", CONFIG_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-module", MODULE_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-replica", REPLICA_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-alloc", ALLOCATION_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-bpm", BPM_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-period", PERIOD_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-bpm-wait", BPM_WAIT_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-tier", TIER_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-runtime", STATUS_COLUMN_WIDTH);
+        overview_header_cell_tr(ui, "module-overview-llm", LLM_COLUMN_WIDTH);
+        overview_header_cell_tr(
+            ui,
+            "module-overview-act-err",
+            ACTIVATION_ERRORS_COLUMN_WIDTH,
+        );
+        overview_header_cell_tr(ui, "module-overview-llm-err", LLM_ERRORS_COLUMN_WIDTH);
+        overview_header_cell_tr(
+            ui,
+            "module-overview-latest-llm-out",
+            LATEST_OUTPUT_COLUMN_WIDTH,
+        );
     });
 }
 
@@ -1319,6 +1328,11 @@ fn overview_header_cell(ui: &mut egui::Ui, text: &str, width: f32) {
     );
 }
 
+fn overview_header_cell_tr(ui: &mut egui::Ui, key: &str, width: f32) {
+    let text = ui.ctx().tr(key);
+    overview_header_cell(ui, &text, width);
+}
+
 fn overview_row_fill(
     row: &ModuleOverviewRow,
     index: usize,
@@ -1358,7 +1372,7 @@ fn overview_disable_cell(
             let mut enabled = !row.forced_disabled;
             if ui
                 .add(egui::Checkbox::without_text(&mut enabled))
-                .on_hover_text("Allow this module to use allocated replicas")
+                .on_hover_text(ui.ctx().tr("module-overview-enabled-hover"))
                 .changed()
             {
                 actions.push(ModuleOverviewAction::SetDisabled {
@@ -1385,11 +1399,14 @@ fn overview_config_cell(
             };
             let response = ui.add_sized(
                 [CONFIG_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
-                egui::Button::new("Edit"),
+                egui::Button::new(ui.ctx().tr("module-overview-edit")),
             );
             let anchor = response.rect.right_top();
             let clicked = response.clicked();
-            response.on_hover_text(format!("edit {}", policy.module));
+            response.on_hover_text(ui.ctx().tr_args(
+                "module-overview-edit-hover",
+                &[("module", I18nArg::from(policy.module.as_str()))],
+            ));
             if clicked {
                 if open_config
                     .as_ref()
@@ -1439,10 +1456,14 @@ fn render_open_config_popup(
             ui.set_min_width(CONFIG_POPUP_WIDTH);
             ui.set_max_width(CONFIG_POPUP_WIDTH);
             ui.horizontal(|ui| {
-                ui.strong("Configs");
+                ui.strong(ui.ctx().tr("module-overview-configs"));
                 ui.label(&policy.module);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("x").on_hover_text("close").clicked() {
+                    if ui
+                        .small_button("x")
+                        .on_hover_text(ui.ctx().tr("module-config-close-hover"))
+                        .clicked()
+                    {
                         close = true;
                     }
                 });
@@ -1485,7 +1506,7 @@ fn render_config_editor(
     let mut changed = false;
 
     ui.horizontal(|ui| {
-        ui.label("Replicas");
+        ui.label(ui.ctx().tr("module-config-replicas"));
         changed |= ui
             .add(
                 egui::DragValue::new(&mut settings.replica_min)
@@ -1493,7 +1514,7 @@ fn render_config_editor(
                     .speed(1.0),
             )
             .changed();
-        ui.label("to");
+        ui.label(ui.ctx().tr("module-config-to"));
         changed |= ui
             .add(
                 egui::DragValue::new(&mut settings.replica_max)
@@ -1501,11 +1522,14 @@ fn render_config_editor(
                     .speed(1.0),
             )
             .changed();
-        ui.label(format!("cap {}", policy.replica_capacity));
+        ui.label(ui.ctx().tr_args(
+            "module-config-cap",
+            &[("capacity", i64::from(policy.replica_capacity).into())],
+        ));
     });
 
     ui.horizontal(|ui| {
-        ui.label("BPM");
+        ui.label(ui.ctx().tr("module-overview-bpm"));
         changed |= ui
             .add(
                 egui::DragValue::new(&mut settings.bpm_min)
@@ -1513,7 +1537,7 @@ fn render_config_editor(
                     .speed(0.25),
             )
             .changed();
-        ui.label("to");
+        ui.label(ui.ctx().tr("module-config-to"));
         changed |= ui
             .add(
                 egui::DragValue::new(&mut settings.bpm_max)
@@ -1532,9 +1556,11 @@ fn render_config_editor(
         ZeroReplicaWindowView::EveryControllerActivations { period } => period.max(1),
     };
     ui.horizontal(|ui| {
-        changed |= ui.checkbox(&mut zero_enabled, "Zero window").changed();
+        changed |= ui
+            .checkbox(&mut zero_enabled, ui.ctx().tr("module-config-zero-window"))
+            .changed();
         ui.add_enabled_ui(zero_enabled, |ui| {
-            ui.label("period");
+            ui.label(ui.ctx().tr("module-config-period"));
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut zero_period)
@@ -2350,10 +2376,18 @@ mod tests {
     use crate::{
         LlmObservationSource, LlmOutputItemView, LlmTranscriptTurnStatus, LlmTranscriptTurnView,
         LlmUsageView,
+        i18n::{I18nCatalog, Locale},
     };
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
 
     const TEST_NOW_SECS: f64 = 10.0;
+
+    fn test_i18n_context(locale: Locale) -> egui::Context {
+        let ctx = egui::Context::default();
+        let catalog = I18nCatalog::embedded().expect("embedded translations load");
+        ctx.install_i18n(catalog.for_locale(locale));
+        ctx
+    }
 
     fn overview_row_for_highlight(
         active: bool,
@@ -3928,7 +3962,7 @@ mod tests {
             },
         );
 
-        let ctx = egui::Context::default();
+        let ctx = test_i18n_context(Locale::EnUs);
         let mut filter = ModuleFilterState::default();
         let modules = state.module_names();
         let mut widths = Vec::new();

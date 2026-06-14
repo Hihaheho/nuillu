@@ -1,4 +1,7 @@
-use crate::{MemoView, module_filter, module_filter::ModuleFilterState, text::wrapped_label};
+use crate::{
+    MemoView, i18n::EguiI18nExt as _, module_filter, module_filter::ModuleFilterState,
+    text::wrapped_label,
+};
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -13,7 +16,7 @@ pub fn ui(
         .id_salt("memo-window-list")
         .show(ui, |ui| {
             if memos.is_empty() {
-                ui.label("No memos yet.");
+                ui.label(ui.ctx().tr("memo-empty"));
                 return;
             }
             for memo in memos {
@@ -39,7 +42,10 @@ pub fn render_memo_card(ui: &mut egui::Ui, memo: &MemoView) {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&memo.owner);
                 ui.label(format!("{}#{}", memo.module, memo.replica));
-                ui.label(format!("memo {}", memo.index));
+                ui.label(
+                    ui.ctx()
+                        .tr_args("memo-index", &[("index", memo.index.to_string().into())]),
+                );
                 ui.label(memo.written_at.to_rfc3339());
             });
             ui.add_space(4.0);

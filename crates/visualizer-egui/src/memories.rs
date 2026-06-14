@@ -2,7 +2,9 @@ use std::sync::mpsc::Sender;
 
 use crate::{
     LinkedMemoryRecordView, MemoryPage, MemoryRecordView, VisualizerClientMessage,
-    VisualizerCommand, VisualizerTabId, text::wrapped_label,
+    VisualizerCommand, VisualizerTabId,
+    i18n::{EguiI18nExt as _, I18nArg},
+    text::wrapped_label,
 };
 
 #[derive(Debug)]
@@ -58,7 +60,7 @@ pub fn ui(
 
     ui.horizontal(|ui| {
         let response = ui.text_edit_singleline(&mut state.draft_query);
-        let query_requested = ui.button("Query").clicked()
+        let query_requested = ui.button(ui.ctx().tr("memory-query-button")).clicked()
             || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
         if query_requested {
             let query = state.draft_query.trim().to_owned();
@@ -72,7 +74,7 @@ pub fn ui(
                 });
             }
         }
-        if ui.button("Latest").clicked() {
+        if ui.button(ui.ctx().tr("memory-latest-button")).clicked() {
             state.query.clear();
             state.query_results.clear();
             let _ = commands.send(VisualizerClientMessage::Command {
@@ -86,7 +88,7 @@ pub fn ui(
     });
 
     ui.horizontal(|ui| {
-        if ui.button("Prev").clicked() {
+        if ui.button(ui.ctx().tr("memory-prev-button")).clicked() {
             state.page_index = state.page_index.saturating_sub(1);
             let _ = commands.send(VisualizerClientMessage::Command {
                 command: VisualizerCommand::ListMemories {
@@ -96,12 +98,14 @@ pub fn ui(
                 },
             });
         }
-        ui.label(format!(
-            "page {} / total {}",
-            state.page.page + 1,
-            state.page.total
+        ui.label(ui.ctx().tr_args(
+            "memory-page-status",
+            &[
+                ("page", (state.page.page + 1).into()),
+                ("total", state.page.total.into()),
+            ],
         ));
-        if ui.button("Next").clicked() {
+        if ui.button(ui.ctx().tr("memory-next-button")).clicked() {
             state.page_index = state.page_index.saturating_add(1);
             let _ = commands.send(VisualizerClientMessage::Command {
                 command: VisualizerCommand::ListMemories {
@@ -116,7 +120,10 @@ pub fn ui(
     let records = if state.query.is_empty() {
         &state.page.records
     } else {
-        ui.label(format!("Query: {}", state.query));
+        ui.label(ui.ctx().tr_args(
+            "memory-query-label",
+            &[("query", I18nArg::from(state.query.as_str()))],
+        ));
         &state.query_results
     };
     memory_list(
@@ -130,7 +137,10 @@ pub fn ui(
 
     if !state.linked_results.is_empty() {
         ui.separator();
-        ui.label(format!("Linked memories: {}", state.linked_memory_index));
+        ui.label(ui.ctx().tr_args(
+            "memory-linked-title",
+            &[("index", I18nArg::from(state.linked_memory_index.as_str()))],
+        ));
         egui::ScrollArea::vertical()
             .id_salt("linked-memory-list")
             .show(ui, |ui| {
@@ -177,13 +187,28 @@ fn memory_list(
                                     .map(|at| at.to_rfc3339())
                                     .unwrap_or_else(|| "-".to_string()),
                             );
-                            ui.label(format!("stored {}", record.stored_at.to_rfc3339()));
-                            ui.label(format!("arousal {:.2}", record.affect_arousal));
-                            ui.label(format!("valence {:.2}", record.valence));
+                            ui.label(ui.ctx().tr_args(
+                                "memory-stored-at",
+                                &[("stored_at", record.stored_at.to_rfc3339().into())],
+                            ));
+                            ui.label(ui.ctx().tr_args(
+                                "memory-arousal",
+                                &[("value", format!("{:.2}", record.affect_arousal).into())],
+                            ));
+                            ui.label(ui.ctx().tr_args(
+                                "memory-valence",
+                                &[("value", format!("{:.2}", record.valence).into())],
+                            ));
                             if !record.emotion.trim().is_empty() {
-                                ui.label(format!("emotion {}", record.emotion.trim()));
+                                ui.label(ui.ctx().tr_args(
+                                    "memory-emotion",
+                                    &[("emotion", I18nArg::from(record.emotion.trim()))],
+                                ));
                             }
-                            if ui.small_button("Links").clicked() {
+                            if ui
+                                .small_button(ui.ctx().tr("memory-links-button"))
+                                .clicked()
+                            {
                                 let _ = commands.send(VisualizerClientMessage::Command {
                                     command: VisualizerCommand::FetchLinkedMemories {
                                         tab_id: tab_id.clone(),
@@ -193,7 +218,10 @@ fn memory_list(
                                     },
                                 });
                             }
-                            if ui.small_button("Delete").clicked() {
+                            if ui
+                                .small_button(ui.ctx().tr("memory-delete-button"))
+                                .clicked()
+                            {
                                 let _ = commands.send(VisualizerClientMessage::Command {
                                     command: VisualizerCommand::DeleteMemory {
                                         tab_id: tab_id.clone(),

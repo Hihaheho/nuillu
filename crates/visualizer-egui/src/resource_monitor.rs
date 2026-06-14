@@ -5,7 +5,9 @@ use egui_plot::{Line, Plot, PlotPoint, PlotPoints};
 use nuillu_module::RuntimeEvent;
 
 use crate::{
-    AllocationView, BlackboardSnapshot, InteroceptionView, ModulePolicyView, module_filter,
+    AllocationView, BlackboardSnapshot, InteroceptionView, ModulePolicyView,
+    i18n::{EguiI18nExt as _, I18nArg},
+    module_filter,
     module_filter::ModuleFilterState,
 };
 
@@ -245,14 +247,17 @@ pub fn ui(
     state.prune(now_secs);
 
     ui.horizontal_wrapped(|ui| {
-        ui.heading("Resource Monitor");
-        ui.label(format!(
-            "samples: {}",
-            state.recent_snapshot_count(now_secs)
+        ui.heading(ui.ctx().tr("resource-monitor-heading"));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-samples",
+            &[("count", state.recent_snapshot_count(now_secs).into())],
         ));
-        ui.label(format!("modules: {}", modules.len()));
+        ui.label(
+            ui.ctx()
+                .tr_args("modules-count", &[("count", modules.len().into())]),
+        );
         ui.separator();
-        ui.label("Window");
+        ui.label(ui.ctx().tr("resource-monitor-window"));
         for window in WINDOWS {
             ui.selectable_value(&mut state.window, window, window.label());
         }
@@ -268,12 +273,12 @@ pub fn ui(
         .cloned()
         .collect::<Vec<_>>();
     if selected_modules.is_empty() {
-        ui.label("No modules selected.");
+        ui.label(ui.ctx().tr("resource-monitor-no-modules-selected"));
         return;
     }
 
     if state.snapshots.is_empty() && state.buckets.is_empty() {
-        ui.label("No resource history yet.");
+        ui.label(ui.ctx().tr("resource-monitor-empty"));
         return;
     }
 
@@ -296,8 +301,8 @@ fn render_module_activity_plot(
     selected_modules: &[String],
     now_secs: f64,
 ) {
-    ui.strong("Module allocation and activity");
-    ui.label("solid = allocation ratio; faint = normalized batch/activation load");
+    ui.strong(ui.ctx().tr("resource-monitor-allocation-activity"));
+    ui.label(ui.ctx().tr("resource-monitor-allocation-activity-help"));
     let activity_scale = module_activity_load_scale(state, selected_modules, now_secs);
     Plot::new("resource-monitor-module-activity")
         .height(MODULE_PLOT_HEIGHT)
@@ -337,8 +342,8 @@ fn render_module_activity_plot(
 }
 
 pub fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState, now_secs: f64) {
-    ui.strong("Interoception");
-    ui.label("valence is normalized from -1..1 into 0..1");
+    ui.strong(ui.ctx().tr("resource-monitor-interoception"));
+    ui.label(ui.ctx().tr("resource-monitor-interoception-help"));
     Plot::new("resource-monitor-interoception")
         .height(INTEROCEPTION_PLOT_HEIGHT)
         .allow_scroll(false)
@@ -397,8 +402,8 @@ fn render_throughput_plot(
     now_secs: f64,
 ) {
     let y_max = throughput_y_max(state, selected_modules, now_secs);
-    ui.strong("Runtime throughput");
-    ui.label("selected-module aggregate counts per second");
+    ui.strong(ui.ctx().tr("resource-monitor-throughput"));
+    ui.label(ui.ctx().tr("resource-monitor-throughput-help"));
     Plot::new("resource-monitor-throughput")
         .height(THROUGHPUT_PLOT_HEIGHT)
         .allow_scroll(false)
@@ -472,15 +477,42 @@ fn render_latest_snapshot(ui: &mut egui::Ui, state: &ResourceMonitorState) {
     let interoception = &sample.interoception;
     ui.separator();
     ui.horizontal_wrapped(|ui| {
-        ui.strong("Latest");
-        ui.label(format!("mode {}", interoception.mode));
-        ui.label(format!("wake {:.2}", interoception.wake_arousal));
-        ui.label(format!("nrem {:.2}", interoception.nrem_pressure));
-        ui.label(format!("rem {:.2}", interoception.rem_pressure));
-        ui.label(format!("affect {:.2}", interoception.affect_arousal));
-        ui.label(format!("valence {:.2}", interoception.valence));
+        ui.strong(ui.ctx().tr("resource-monitor-latest"));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-mode",
+            &[("mode", I18nArg::from(interoception.mode.as_str()))],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-wake",
+            &[("value", format!("{:.2}", interoception.wake_arousal).into())],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-nrem",
+            &[(
+                "value",
+                format!("{:.2}", interoception.nrem_pressure).into(),
+            )],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-rem",
+            &[("value", format!("{:.2}", interoception.rem_pressure).into())],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-affect",
+            &[(
+                "value",
+                format!("{:.2}", interoception.affect_arousal).into(),
+            )],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-valence",
+            &[("value", format!("{:.2}", interoception.valence).into())],
+        ));
         if !interoception.emotion.is_empty() {
-            ui.label(format!("emotion {}", interoception.emotion));
+            ui.label(ui.ctx().tr_args(
+                "resource-monitor-emotion",
+                &[("emotion", I18nArg::from(interoception.emotion.as_str()))],
+            ));
         }
     });
 
@@ -509,7 +541,10 @@ fn render_latest_snapshot(ui: &mut egui::Ui, state: &ResourceMonitorState) {
         })
         .collect::<Vec<_>>();
     if !active_modules.is_empty() {
-        ui.label(format!("active modules: {}", active_modules.join(", ")));
+        ui.label(ui.ctx().tr_args(
+            "resource-monitor-active-modules",
+            &[("modules", active_modules.join(", ").into())],
+        ));
     }
 }
 

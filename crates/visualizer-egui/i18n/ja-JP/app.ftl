@@ -1,0 +1,151 @@
+visualizer-locale-ja = 日本語
+visualizer-locale-en = English
+i18n-hello-name = こんにちは、{ $name }。
+
+menu-view = 表示
+menu-no-runtime-windows = まだランタイムウィンドウはありません。
+menu-simplified-view-enabled = [x] 簡易表示
+menu-simplified-view-disabled = [ ] 簡易表示
+menu-close-all-module-windows = すべてのモジュールウィンドウを閉じる
+
+status-eval-disconnected = Eval との接続が切れました
+status-eval-process-disconnected = Eval プロセスとの接続が切れました。
+status-no-runtime-tabs = まだランタイムタブはありません。
+
+runtime-events-count = runtime events: { $count }
+modules-count = modules: { $count }
+
+section-cognition-log = 認知ログ
+section-memory = メモリ
+section-scene = シーン
+
+window-scene-title = シーン - { $title }
+window-blackboard-title = Blackboard - { $title }
+window-memory-title = メモリ - { $title }
+window-memo-title = メモ - { $title }
+window-llm-turns-title = LLM Turns - { $title }
+window-cognition-log-title = 認知ログ - { $title }
+window-errors-title = エラー - { $title }
+window-logs-title = ログ - { $title }
+window-resource-monitor-title = リソースモニター - { $title }
+window-modules-title = Modules - { $title }
+window-interoception-title = Interoception - { $title }
+
+blackboard-allocation = Allocation
+blackboard-module-status = モジュール状態
+blackboard-utterance-progress = 発話進行
+blackboard-memory-metadata = メモリメタデータ
+blackboard-replicas = replicas { $count }
+blackboard-ratio = ratio { $ratio }
+blackboard-target = target: { $target }
+blackboard-index = Index
+blackboard-rank = Rank
+blackboard-accesses = Accesses
+blackboard-uses = Uses
+blackboard-reinforces = Reinforces
+blackboard-occurred = Occurred
+
+memory-query-button = 検索
+memory-latest-button = 最新
+memory-prev-button = 前へ
+memory-next-button = 次へ
+memory-page-status = page { $page } / total { $total }
+memory-query-label = 検索: { $query }
+memory-linked-title = リンク済みメモリ: { $index }
+memory-stored-at = stored { $stored_at }
+memory-arousal = arousal { $value }
+memory-valence = valence { $value }
+memory-emotion = emotion { $emotion }
+memory-links-button = Links
+memory-delete-button = Delete
+
+memo-empty = まだメモはありません。
+memo-index = memo { $index }
+
+module-filter-title = モジュールフィルター ({ $selected }/{ $total })
+module-filter-select-all = すべて選択
+module-filter-deselect-all = すべて解除
+module-filter-empty = まだモジュールはありません。
+
+errors-heading = エラー
+errors-session-status = session: { $errors }/{ $turns }
+errors-session-status-hover = この visualizer セッション内の session errors / live LLM turns
+errors-shown-count = 表示中: { $count }
+errors-clear-list = 一覧をクリア
+errors-empty = 表示中のエラーはありません。
+
+resource-monitor-heading = リソースモニター
+resource-monitor-samples = samples: { $count }
+resource-monitor-window = Window
+resource-monitor-no-modules-selected = モジュールが選択されていません。
+resource-monitor-empty = まだリソース履歴はありません。
+resource-monitor-allocation-activity = モジュール割り当てと活動
+resource-monitor-allocation-activity-help = solid = allocation ratio; faint = normalized batch/activation load
+resource-monitor-interoception = Interoception
+resource-monitor-interoception-help = valence is normalized from -1..1 into 0..1
+resource-monitor-throughput = Runtime throughput
+resource-monitor-throughput-help = selected-module aggregate counts per second
+resource-monitor-latest = 最新
+resource-monitor-mode = mode { $mode }
+resource-monitor-wake = wake { $value }
+resource-monitor-nrem = nrem { $value }
+resource-monitor-rem = rem { $value }
+resource-monitor-affect = affect { $value }
+resource-monitor-valence = valence { $value }
+resource-monitor-emotion = emotion { $emotion }
+resource-monitor-active-modules = active modules: { $modules }
+
+module-reset = Reset
+module-memos = memos
+module-views = 表示
+module-turns = Turns
+module-no-llm-turns = まだ LLM turn はありません。
+module-select-turn = turn を選択してください。
+module-overview-enabled = 有効
+module-overview-configs = 設定
+module-overview-module = Module
+module-overview-replica = Replica
+module-overview-alloc = Alloc
+module-overview-bpm = BPM
+module-overview-period = Period
+module-overview-bpm-wait = BPM Wait
+module-overview-tier = Tier
+module-overview-runtime = Runtime
+module-overview-llm = LLM
+module-overview-act-err = Act Err
+module-overview-llm-err = LLM Err
+module-overview-latest-llm-out = Latest LLM out
+module-overview-enabled-hover = この module が割り当て済み replica を使えるようにする
+module-overview-edit = 編集
+module-overview-edit-hover = edit { $module }
+module-config-close-hover = close
+module-config-replicas = Replicas
+module-config-to = to
+module-config-cap = cap { $capacity }
+module-config-zero-window = Zero window
+module-config-period = period
+
+scene-people = 人
+scene-objects = オブジェクト
+scene-sounds = 音
+scene-atmosphere = 雰囲気
+scene-remove = 削除
+scene-name = 名前
+scene-direction = 方向
+scene-distance = 距離
+scene-state = 状態
+scene-visual-description = 視覚説明
+scene-sound-description = 音の説明
+scene-description = 説明
+scene-aspect = 種別
+scene-derived-sensory-preview = 派生 sensory プレビュー
+scene-id = ID
+scene-modality = モダリティ
+scene-no-derived-sensory-input = 有効な派生 sensory input はありません。
+scene-recent-activity = 最近の活動
+scene-no-recent-speech = 最近の発話はありません。
+scene-message-hint = メッセージ
+scene-send = 送信
+scene-no-people = 人がいません
+scene-streaming = streaming
+scene-add = 追加

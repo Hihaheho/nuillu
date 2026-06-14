@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::i18n::EguiI18nExt as _;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleFilterState {
     default_selected: bool,
@@ -53,22 +55,31 @@ pub fn render_module_filter(
         .iter()
         .filter(|module| state.is_selected(module))
         .count();
-    let title = format!("Module filter ({selected_count}/{})", modules.len());
+    let title = ui.ctx().tr_args(
+        "module-filter-title",
+        &[
+            ("selected", selected_count.into()),
+            ("total", modules.len().into()),
+        ],
+    );
     egui::CollapsingHeader::new(title)
         .id_salt(id_salt)
         .default_open(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Select all").clicked() {
+                if ui.button(ui.ctx().tr("module-filter-select-all")).clicked() {
                     state.select_all();
                 }
-                if ui.button("Deselect all").clicked() {
+                if ui
+                    .button(ui.ctx().tr("module-filter-deselect-all"))
+                    .clicked()
+                {
                     state.deselect_all();
                 }
             });
             ui.add_space(4.0);
             if modules.is_empty() {
-                ui.label("No modules yet.");
+                ui.label(ui.ctx().tr("module-filter-empty"));
                 return;
             }
             for module in modules {

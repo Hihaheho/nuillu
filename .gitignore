@@ -13,6 +13,7 @@
 !Cargo.toml
 !Cargo.lock
 !crates/**/*.rs
+!crates/visualizer-egui/i18n/**/*.ftl
 
 !configs/**/*.toml
 !configs/**/*.csv

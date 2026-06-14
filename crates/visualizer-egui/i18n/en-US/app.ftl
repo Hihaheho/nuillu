@@ -1,0 +1,152 @@
+visualizer-locale-ja = Japanese
+visualizer-locale-en = English
+i18n-fallback-probe = English fallback
+i18n-hello-name = Hello, { $name }.
+
+menu-view = View
+menu-no-runtime-windows = No runtime windows yet.
+menu-simplified-view-enabled = [x] Simplified View
+menu-simplified-view-disabled = [ ] Simplified View
+menu-close-all-module-windows = Close all module windows
+
+status-eval-disconnected = Eval disconnected
+status-eval-process-disconnected = Eval process disconnected.
+status-no-runtime-tabs = No runtime tabs yet.
+
+runtime-events-count = runtime events: { $count }
+modules-count = modules: { $count }
+
+section-cognition-log = Cognition Log
+section-memory = Memory
+section-scene = Scene
+
+window-scene-title = Scene - { $title }
+window-blackboard-title = Blackboard - { $title }
+window-memory-title = Memory - { $title }
+window-memo-title = Memo - { $title }
+window-llm-turns-title = LLM Turns - { $title }
+window-cognition-log-title = Cognition Log - { $title }
+window-errors-title = Errors - { $title }
+window-logs-title = Logs - { $title }
+window-resource-monitor-title = Resource Monitor - { $title }
+window-modules-title = Modules - { $title }
+window-interoception-title = Interoception - { $title }
+
+blackboard-allocation = Allocation
+blackboard-module-status = Module Status
+blackboard-utterance-progress = Utterance Progress
+blackboard-memory-metadata = Memory Metadata
+blackboard-replicas = replicas { $count }
+blackboard-ratio = ratio { $ratio }
+blackboard-target = target: { $target }
+blackboard-index = Index
+blackboard-rank = Rank
+blackboard-accesses = Accesses
+blackboard-uses = Uses
+blackboard-reinforces = Reinforces
+blackboard-occurred = Occurred
+
+memory-query-button = Query
+memory-latest-button = Latest
+memory-prev-button = Prev
+memory-next-button = Next
+memory-page-status = page { $page } / total { $total }
+memory-query-label = Query: { $query }
+memory-linked-title = Linked memories: { $index }
+memory-stored-at = stored { $stored_at }
+memory-arousal = arousal { $value }
+memory-valence = valence { $value }
+memory-emotion = emotion { $emotion }
+memory-links-button = Links
+memory-delete-button = Delete
+
+memo-empty = No memos yet.
+memo-index = memo { $index }
+
+module-filter-title = Module filter ({ $selected }/{ $total })
+module-filter-select-all = Select all
+module-filter-deselect-all = Deselect all
+module-filter-empty = No modules yet.
+
+errors-heading = Errors
+errors-session-status = session: { $errors }/{ $turns }
+errors-session-status-hover = session errors / live LLM turns in this visualizer session
+errors-shown-count = shown: { $count }
+errors-clear-list = Clear list
+errors-empty = No errors shown.
+
+resource-monitor-heading = Resource Monitor
+resource-monitor-samples = samples: { $count }
+resource-monitor-window = Window
+resource-monitor-no-modules-selected = No modules selected.
+resource-monitor-empty = No resource history yet.
+resource-monitor-allocation-activity = Module allocation and activity
+resource-monitor-allocation-activity-help = solid = allocation ratio; faint = normalized batch/activation load
+resource-monitor-interoception = Interoception
+resource-monitor-interoception-help = valence is normalized from -1..1 into 0..1
+resource-monitor-throughput = Runtime throughput
+resource-monitor-throughput-help = selected-module aggregate counts per second
+resource-monitor-latest = Latest
+resource-monitor-mode = mode { $mode }
+resource-monitor-wake = wake { $value }
+resource-monitor-nrem = nrem { $value }
+resource-monitor-rem = rem { $value }
+resource-monitor-affect = affect { $value }
+resource-monitor-valence = valence { $value }
+resource-monitor-emotion = emotion { $emotion }
+resource-monitor-active-modules = active modules: { $modules }
+
+module-reset = Reset
+module-memos = memos
+module-views = Views
+module-turns = Turns
+module-no-llm-turns = No LLM turns yet.
+module-select-turn = Select a turn.
+module-overview-enabled = Enabled
+module-overview-configs = Configs
+module-overview-module = Module
+module-overview-replica = Replica
+module-overview-alloc = Alloc
+module-overview-bpm = BPM
+module-overview-period = Period
+module-overview-bpm-wait = BPM Wait
+module-overview-tier = Tier
+module-overview-runtime = Runtime
+module-overview-llm = LLM
+module-overview-act-err = Act Err
+module-overview-llm-err = LLM Err
+module-overview-latest-llm-out = Latest LLM out
+module-overview-enabled-hover = Allow this module to use allocated replicas
+module-overview-edit = Edit
+module-overview-edit-hover = edit { $module }
+module-config-close-hover = close
+module-config-replicas = Replicas
+module-config-to = to
+module-config-cap = cap { $capacity }
+module-config-zero-window = Zero window
+module-config-period = period
+
+scene-people = People
+scene-objects = Objects
+scene-sounds = Sounds
+scene-atmosphere = Atmosphere
+scene-remove = Remove
+scene-name = Name
+scene-direction = Direction
+scene-distance = Distance
+scene-state = State
+scene-visual-description = Visual Description
+scene-sound-description = Sound Description
+scene-description = Description
+scene-aspect = Aspect
+scene-derived-sensory-preview = Derived sensory preview
+scene-id = Id
+scene-modality = Modality
+scene-no-derived-sensory-input = No active derived sensory input.
+scene-recent-activity = Recent activity
+scene-no-recent-speech = No recent speech.
+scene-message-hint = Message
+scene-send = Send
+scene-no-people = No people
+scene-streaming = streaming
+scene-add = Add

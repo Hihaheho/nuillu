@@ -7,7 +7,7 @@ use crate::{
     AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, OneShotSensoryInputRowView,
     ScenePersonRowView, SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView,
     UtteranceEventKindView, UtteranceEventRowView, UtteranceView, VisualizerClientMessage,
-    VisualizerCommand, VisualizerTabId, text::wrapped_label,
+    VisualizerCommand, VisualizerTabId, i18n::EguiI18nExt as _, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -616,13 +616,15 @@ fn people_section_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    section_header(ui, "People", tab_id, commands, SceneRowKind::Person);
+    let section_title = ui.ctx().tr("scene-people");
+    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Person);
+    let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-people-grid", 5, |ui| {
-        ui.strong("Remove");
-        ui.strong("Name");
-        ui.strong("Direction");
-        ui.strong("Distance");
-        ui.strong("State");
+        ui.strong(ui.ctx().tr("scene-remove"));
+        ui.strong(ui.ctx().tr("scene-name"));
+        ui.strong(ui.ctx().tr("scene-direction"));
+        ui.strong(ui.ctx().tr("scene-distance"));
+        ui.strong(ui.ctx().tr("scene-state"));
         ui.end_row();
 
         let mut index = 0;
@@ -630,7 +632,10 @@ fn people_section_ui(
             let row_id = state.scene.people[index].id.clone();
             let mut send_update = false;
             let remove_clicked = ui
-                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .add_sized(
+                    [64.0, FIELD_HEIGHT],
+                    egui::Button::new(remove_label.as_str()),
+                )
                 .clicked();
             {
                 let row = &mut state.scene.people[index];
@@ -697,21 +702,26 @@ fn objects_section_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    section_header(ui, "Objects", tab_id, commands, SceneRowKind::Object);
+    let section_title = ui.ctx().tr("scene-objects");
+    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Object);
+    let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-objects-grid", 6, |ui| {
-        ui.strong("Remove");
-        ui.strong("Name");
-        ui.strong("Direction");
-        ui.strong("Distance");
-        ui.strong("Visual Description");
-        ui.strong("Sound Description");
+        ui.strong(ui.ctx().tr("scene-remove"));
+        ui.strong(ui.ctx().tr("scene-name"));
+        ui.strong(ui.ctx().tr("scene-direction"));
+        ui.strong(ui.ctx().tr("scene-distance"));
+        ui.strong(ui.ctx().tr("scene-visual-description"));
+        ui.strong(ui.ctx().tr("scene-sound-description"));
         ui.end_row();
 
         let mut index = 0;
         while index < state.scene.objects.len() {
             let row_id = state.scene.objects[index].id.clone();
             let remove_clicked = ui
-                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .add_sized(
+                    [64.0, FIELD_HEIGHT],
+                    egui::Button::new(remove_label.as_str()),
+                )
                 .clicked();
             let mut send_update = false;
             {
@@ -754,19 +764,24 @@ fn sounds_section_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    section_header(ui, "Sounds", tab_id, commands, SceneRowKind::Sound);
+    let section_title = ui.ctx().tr("scene-sounds");
+    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Sound);
+    let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-sounds-grid", 4, |ui| {
-        ui.strong("Remove");
-        ui.strong("Direction");
-        ui.strong("Distance");
-        ui.strong("Description");
+        ui.strong(ui.ctx().tr("scene-remove"));
+        ui.strong(ui.ctx().tr("scene-direction"));
+        ui.strong(ui.ctx().tr("scene-distance"));
+        ui.strong(ui.ctx().tr("scene-description"));
         ui.end_row();
 
         let mut index = 0;
         while index < state.scene.sounds.len() {
             let row_id = state.scene.sounds[index].id.clone();
             let remove_clicked = ui
-                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .add_sized(
+                    [64.0, FIELD_HEIGHT],
+                    egui::Button::new(remove_label.as_str()),
+                )
                 .clicked();
             let mut send_update = false;
             {
@@ -807,18 +822,29 @@ fn atmosphere_section_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    section_header(ui, "Atmosphere", tab_id, commands, SceneRowKind::Atmosphere);
+    let section_title = ui.ctx().tr("scene-atmosphere");
+    section_header(
+        ui,
+        &section_title,
+        tab_id,
+        commands,
+        SceneRowKind::Atmosphere,
+    );
+    let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-atmosphere-grid", 3, |ui| {
-        ui.strong("Remove");
-        ui.strong("Aspect");
-        ui.strong("Description");
+        ui.strong(ui.ctx().tr("scene-remove"));
+        ui.strong(ui.ctx().tr("scene-aspect"));
+        ui.strong(ui.ctx().tr("scene-description"));
         ui.end_row();
 
         let mut index = 0;
         while index < state.scene.atmosphere.len() {
             let row_id = state.scene.atmosphere[index].id.clone();
             let remove_clicked = ui
-                .add_sized([64.0, FIELD_HEIGHT], egui::Button::new("Remove"))
+                .add_sized(
+                    [64.0, FIELD_HEIGHT],
+                    egui::Button::new(remove_label.as_str()),
+                )
                 .clicked();
             let mut send_update = false;
             {
@@ -865,17 +891,17 @@ fn atmosphere_section_ui(
 }
 
 fn derived_ambient_ui(ui: &mut egui::Ui, rows: &[DerivedAmbientSensoryRowView]) {
-    ui.strong("Derived sensory preview");
+    ui.strong(ui.ctx().tr("scene-derived-sensory-preview"));
     horizontal_grid(ui, "scene-derived-ambient-grid", 3, |ui| {
-        ui.strong("Id");
-        ui.strong("Modality");
-        ui.strong("Description");
+        ui.strong(ui.ctx().tr("scene-id"));
+        ui.strong(ui.ctx().tr("scene-modality"));
+        ui.strong(ui.ctx().tr("scene-description"));
         ui.end_row();
 
         if rows.is_empty() {
             ui.label("-");
             ui.label("-");
-            ui.label("No active derived sensory input.");
+            ui.label(ui.ctx().tr("scene-no-derived-sensory-input"));
             ui.end_row();
             return;
         }
@@ -898,13 +924,13 @@ fn derived_ambient_ui(ui: &mut egui::Ui, rows: &[DerivedAmbientSensoryRowView]) 
 }
 
 fn activity_ui(ui: &mut egui::Ui, activity: &[ActivityMessage]) {
-    ui.strong("Recent activity");
+    ui.strong(ui.ctx().tr("scene-recent-activity"));
     egui::ScrollArea::vertical()
         .id_salt("scene-activity")
         .stick_to_bottom(true)
         .show(ui, |ui| {
             if activity.is_empty() {
-                ui.label("No recent speech.");
+                ui.label(ui.ctx().tr("scene-no-recent-speech"));
                 return;
             }
             for message in activity {
@@ -929,7 +955,7 @@ fn person_message_composer_ui(
             let mut next_selection = state.selected_person_message_row_id.clone();
             egui::ComboBox::from_id_salt(("scene-person-message-speaker", tab_id.as_str()))
                 .width(SCENE_COMPOSER_SPEAKER_WIDTH)
-                .selected_text(selected_person_message_label(state))
+                .selected_text(selected_person_message_label(ui, state))
                 .show_ui(ui, |ui| {
                     for person in &state.scene.people {
                         ui.selectable_value(
@@ -945,14 +971,15 @@ fn person_message_composer_ui(
             has_people,
             egui::TextEdit::singleline(&mut state.person_message_draft)
                 .desired_width(message_width)
-                .hint_text("Message")
+                .hint_text(ui.ctx().tr("scene-message-hint"))
                 .id_salt(("scene-person-message-draft", tab_id.as_str())),
         );
+        let send_label = ui.ctx().tr("scene-send");
         send_requested |= ui
             .add_enabled_ui(has_people, |ui| {
                 ui.add_sized(
                     [SCENE_COMPOSER_SEND_WIDTH, FIELD_HEIGHT],
-                    egui::Button::new("Send"),
+                    egui::Button::new(send_label.as_str()),
                 )
             })
             .inner
@@ -974,13 +1001,13 @@ fn composer_message_input_width(row_width: f32, item_spacing: f32) -> f32 {
         .max(SCENE_COMPOSER_MESSAGE_MIN_WIDTH)
 }
 
-fn selected_person_message_label(state: &SceneUiState) -> String {
+fn selected_person_message_label(ui: &egui::Ui, state: &SceneUiState) -> String {
     state
         .selected_person_message_row_id
         .as_deref()
         .and_then(|row_id| state.scene.people.iter().find(|row| row.id == row_id))
         .map(person_display_name)
-        .unwrap_or_else(|| "No people".to_string())
+        .unwrap_or_else(|| ui.ctx().tr("scene-no-people"))
 }
 
 fn person_display_name(person: &ScenePersonRowView) -> String {
@@ -1006,7 +1033,7 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(message.role.label());
                 if message.streaming {
-                    ui.label("streaming");
+                    ui.label(ui.ctx().tr("scene-streaming"));
                 }
                 if let Some(source) = &message.source {
                     wrapped_label(ui, source);
@@ -1026,7 +1053,7 @@ fn section_header(
 ) {
     ui.horizontal(|ui| {
         ui.strong(label);
-        if ui.button("Add").clicked() {
+        if ui.button(ui.ctx().tr("scene-add")).clicked() {
             let _ = commands.send(VisualizerClientMessage::Command {
                 command: VisualizerCommand::CreateSceneRow {
                     tab_id: tab_id.clone(),
