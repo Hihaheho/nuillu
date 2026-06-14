@@ -225,6 +225,13 @@ struct PlannedSpeech {
 }
 
 #[derive(Clone, Debug)]
+enum FreshSpeechPlan {
+    Prepare(PlannedSpeech),
+    Decline { blocking_reason: String },
+    None,
+}
+
+#[derive(Clone, Debug)]
 enum ActiveSpeechPlan {
     Continue(PlannedSpeech),
     Redirect {
@@ -345,6 +352,10 @@ fn render_aborted_utterance_memo(draft: &GenerationDraft, reason: &str) -> Strin
             draft.accumulated.trim()
         },
     )
+}
+
+fn render_declined_speech_memo(reason: &str) -> String {
+    format!("Declined outward speech. Reason:\n{}", reason.trim())
 }
 
 fn render_completed_utterance_planning_record(draft: &GenerationDraft, text: &str) -> String {
@@ -689,14 +700,27 @@ impl SpeakModule {
             else {
                 return Ok(());
             };
-            let Some(plan) = self.plan_speech(cx, &cognition_context).await? else {
-                self.reflect_generation_cognition_entries(
-                    cx,
-                    &batch.cognition_entries,
-                    self.clock.now(),
-                )
-                .await?;
-                return Ok(());
+            let plan = match self.plan_speech(cx, &cognition_context).await? {
+                FreshSpeechPlan::Prepare(plan) => plan,
+                FreshSpeechPlan::Decline { blocking_reason } => {
+                    self.record_declined_speech(&blocking_reason).await;
+                    self.reflect_generation_cognition_entries(
+                        cx,
+                        &batch.cognition_entries,
+                        self.clock.now(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                FreshSpeechPlan::None => {
+                    self.reflect_generation_cognition_entries(
+                        cx,
+                        &batch.cognition_entries,
+                        self.clock.now(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
             let draft = GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
             (cognition_context, plan, draft)
@@ -746,7 +770,7 @@ impl SpeakModule {
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
         cognition_context: &str,
-    ) -> Result<Option<PlannedSpeech>> {
+    ) -> Result<FreshSpeechPlan> {
         self.ensure_planning_session_seeded(cx);
         push_planning_context(&mut self.planning_session, cognition_context, None);
 
@@ -799,18 +823,16 @@ impl SpeakModule {
                     cx.warn(format!("speak planning failed: {detail}"));
                     anyhow::bail!("speak planning finished without required tool call: {detail}");
                 }
-                let mut selected = None;
-                let mut declined = false;
+                let mut plan = FreshSpeechPlan::None;
                 let mut results = Vec::new();
                 for call in round.tool_calls.iter().cloned() {
                     match call {
                         SpeakToolsCall::PrepareSpeech(call) => {
                             let target = call.input.target.as_str().trim().to_owned();
-                            let accepted = selected.is_none()
-                                && !declined
+                            let accepted = matches!(plan, FreshSpeechPlan::None)
                                 && is_target_allowed_by_schema(&validation_schema, &target);
                             if accepted {
-                                selected = Some(PlannedSpeech {
+                                plan = FreshSpeechPlan::Prepare(PlannedSpeech {
                                     args: call.input.clone(),
                                     target,
                                 });
@@ -821,9 +843,11 @@ impl SpeakModule {
                             );
                         }
                         SpeakToolsCall::DeclineSpeechNow(call) => {
-                            let accepted = selected.is_none() && !declined;
+                            let accepted = matches!(plan, FreshSpeechPlan::None);
                             if accepted {
-                                declined = true;
+                                plan = FreshSpeechPlan::Decline {
+                                    blocking_reason: call.input.blocking_reason.clone(),
+                                };
                             }
                             results.push(
                                 call.complete(DeclineSpeechNowOutput { accepted })
@@ -837,7 +861,7 @@ impl SpeakModule {
                     .context("commit speak planning tool round")?;
                 cx.compact_and_save(&mut self.planning_session, usage)
                     .await?;
-                Ok(selected)
+                Ok(plan)
             }
         }
     }
@@ -1179,6 +1203,10 @@ impl SpeakModule {
         cx.compact_and_save(&mut self.planning_session, Usage::zero())
             .await?;
         Ok(())
+    }
+
+    async fn record_declined_speech(&self, reason: &str) {
+        self.memo.write(render_declined_speech_memo(reason)).await;
     }
 
     async fn record_streaming_progress(&self, draft: &GenerationDraft) {
@@ -2831,7 +2859,10 @@ mod tests {
         .await;
 
         assert!(completed.borrow().is_empty());
-        assert_eq!(speak_memo_count(&blackboard).await, 0);
+        let memos = speak_memos(&blackboard).await;
+        assert_eq!(memos.len(), 1);
+        assert!(memos[0].contains("Declined outward speech. Reason:"));
+        assert!(memos[0].contains("no supported listener-facing content"));
         assert!(!speak_progress_exists(&blackboard).await);
     }
 
