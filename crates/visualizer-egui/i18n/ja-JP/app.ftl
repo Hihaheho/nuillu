@@ -39,6 +39,7 @@ module-name-speak = 発話
 module-name-speak-gate = 発話ゲート
 
 section-cognition-log = 認知ログ
+section-memo = メモ
 section-memory = 記憶
 section-scene = シーン
 

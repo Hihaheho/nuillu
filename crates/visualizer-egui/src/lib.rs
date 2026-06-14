@@ -639,6 +639,7 @@ pub struct RuntimeTab {
     title: String,
     status: TabStatus,
     view_mode: RuntimeTabViewMode,
+    simplified_cognition_pane_tab: SimplifiedCognitionPaneTab,
     active_simplified_module_owner: Option<String>,
     scene: chat::SceneUiState,
     blackboard: BlackboardSnapshot,
@@ -662,6 +663,13 @@ enum RuntimeTabViewMode {
     #[default]
     Simplified,
     Windowed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SimplifiedCognitionPaneTab {
+    #[default]
+    CognitionLog,
+    Memo,
 }
 
 const SIMPLIFIED_PANE_GAP: f32 = 8.0;
@@ -688,6 +696,7 @@ impl RuntimeTab {
             title,
             status: TabStatus::Running,
             view_mode: RuntimeTabViewMode::default(),
+            simplified_cognition_pane_tab: SimplifiedCognitionPaneTab::default(),
             active_simplified_module_owner: None,
             scene: chat::SceneUiState::default(),
             blackboard: BlackboardSnapshot::default(),
@@ -902,14 +911,13 @@ impl RuntimeTab {
                     let lower_height = ui.available_height().max(1.0);
                     let lower_width = ui.available_width();
                     let column_width = ((lower_width - SIMPLIFIED_PANE_GAP) / 2.0).max(1.0);
-                    let cognition_title = ui.ctx().tr("section-cognition-log");
                     let memory_title = ui.ctx().tr("section-memory");
                     ui.horizontal(|ui| {
                         simplified_section(
                             ui,
-                            Some(cognition_title.as_str()),
+                            None,
                             egui::vec2(column_width, lower_height),
-                            |ui| self.render_cognition_contents(ui),
+                            |ui| self.render_simplified_cognition_pane_contents(ui),
                         );
                         ui.add_space(SIMPLIFIED_PANE_GAP);
                         simplified_section(
@@ -960,6 +968,43 @@ impl RuntimeTab {
         commands: &Sender<VisualizerClientMessage>,
     ) {
         memories::ui(ui, &self.id, &mut self.memories, commands);
+    }
+
+    fn render_simplified_cognition_pane_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(
+                    self.simplified_cognition_pane_tab == SimplifiedCognitionPaneTab::CognitionLog,
+                    ui.ctx().tr("section-cognition-log"),
+                )
+                .clicked()
+            {
+                self.simplified_cognition_pane_tab = SimplifiedCognitionPaneTab::CognitionLog;
+            }
+            if ui
+                .selectable_label(
+                    self.simplified_cognition_pane_tab == SimplifiedCognitionPaneTab::Memo,
+                    ui.ctx().tr("section-memo"),
+                )
+                .clicked()
+            {
+                self.simplified_cognition_pane_tab = SimplifiedCognitionPaneTab::Memo;
+            }
+        });
+        ui.separator();
+
+        match self.simplified_cognition_pane_tab {
+            SimplifiedCognitionPaneTab::CognitionLog => self.render_cognition_contents(ui),
+            SimplifiedCognitionPaneTab::Memo => {
+                let memo_filter_modules = self.memo_filter_modules();
+                memos::ui(
+                    ui,
+                    &self.blackboard.memos,
+                    &mut self.memos_module_filter,
+                    &memo_filter_modules,
+                );
+            }
+        }
     }
 
     fn render_cognition_contents(&self, ui: &mut egui::Ui) {
@@ -1511,6 +1556,10 @@ mod tests {
         let tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
 
         assert_eq!(tab.view_mode, RuntimeTabViewMode::Simplified);
+        assert_eq!(
+            tab.simplified_cognition_pane_tab,
+            SimplifiedCognitionPaneTab::CognitionLog
+        );
         assert_eq!(tab.active_simplified_module_owner, None);
     }
 
@@ -1518,15 +1567,24 @@ mod tests {
     fn runtime_tab_view_mode_toggles_between_simplified_and_windowed() {
         let mut tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
         tab.open_simplified_module("sensory".to_string());
+        tab.simplified_cognition_pane_tab = SimplifiedCognitionPaneTab::Memo;
 
         tab.set_simplified_view(false);
 
         assert_eq!(tab.view_mode, RuntimeTabViewMode::Windowed);
+        assert_eq!(
+            tab.simplified_cognition_pane_tab,
+            SimplifiedCognitionPaneTab::Memo
+        );
         assert_eq!(tab.active_simplified_module_owner, None);
 
         tab.set_simplified_view(true);
 
         assert_eq!(tab.view_mode, RuntimeTabViewMode::Simplified);
+        assert_eq!(
+            tab.simplified_cognition_pane_tab,
+            SimplifiedCognitionPaneTab::Memo
+        );
     }
 
     #[test]
@@ -1534,6 +1592,44 @@ mod tests {
         let height = simplified_modules_max_height(600.0);
 
         assert_eq!(height, 412.0);
+    }
+
+    #[test]
+    fn memo_filter_modules_combines_registered_modules_and_memo_modules() {
+        let mut state = VisualizerState::default();
+        let tab_id = VisualizerTabId::new("case-1");
+        state.apply(VisualizerEvent::OpenTab {
+            tab_id: tab_id.clone(),
+            title: "Case 1".to_string(),
+        });
+        state.apply(VisualizerEvent::LlmObserved {
+            tab_id: tab_id.clone(),
+            event: LlmObservationEvent::ModelInput {
+                turn_id: "turn-1".to_string(),
+                owner: "sensory".to_string(),
+                module: "sensory".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                items: Vec::new(),
+            },
+        });
+        let tab = state.tabs.get_mut(&tab_id).expect("tab exists");
+        tab.blackboard.memos = vec![MemoView {
+            owner: "memory".to_string(),
+            module: "memory".to_string(),
+            replica: 0,
+            index: 0,
+            written_at: chrono::Utc::now(),
+            content: "memory memo".to_string(),
+        }];
+
+        assert_eq!(
+            tab.memo_filter_modules(),
+            vec!["memory".to_string(), "sensory".to_string()]
+        );
     }
 
     #[test]

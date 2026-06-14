@@ -40,6 +40,7 @@ module-name-speak = speak
 module-name-speak-gate = speak-gate
 
 section-cognition-log = Cognition Log
+section-memo = Memo
 section-memory = Memory
 section-scene = Scene
 
