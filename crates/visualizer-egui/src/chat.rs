@@ -1,20 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::mpsc::Sender;
 
 use nuillu_module::{AmbientSensoryEntry, SensoryInput};
 
 use crate::{
     AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, OneShotSensoryInputRowView,
-    SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
-    UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
-    VisualizerTabId, text::wrapped_label,
+    ScenePersonRowView, SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView,
+    UtteranceEventKindView, UtteranceEventRowView, UtteranceView, VisualizerClientMessage,
+    VisualizerCommand, VisualizerTabId, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
 const SHORT_FIELD_WIDTH: f32 = 96.0;
 const MEDIUM_FIELD_WIDTH: f32 = 150.0;
 const LONG_FIELD_WIDTH: f32 = 260.0;
-const MESSAGE_FIELD_WIDTH: f32 = 260.0;
 const PREVIEW_MODALITY_WIDTH: f32 = 96.0;
 const PREVIEW_CONTENT_WIDTH: f32 = 560.0;
 
@@ -82,7 +81,8 @@ pub struct SceneUiState {
     one_shot_sensory_rows: BTreeMap<i64, OneShotSensoryInputRowView>,
     ambient_sensory_rows: BTreeMap<i64, AmbientSensorySnapshotRowView>,
     utterance_event_rows: BTreeMap<i64, UtteranceEventRowView>,
-    person_message_drafts: BTreeMap<String, String>,
+    selected_person_message_row_id: Option<String>,
+    person_message_draft: String,
 }
 
 impl SceneUiState {
@@ -91,16 +91,11 @@ impl SceneUiState {
     }
 
     pub fn set_scene_state(&mut self, scene: SceneStateView) {
-        let valid_people = scene
-            .people
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<BTreeSet<_>>();
-        self.person_message_drafts
-            .retain(|row_id, _| valid_people.contains(row_id));
-        for row_id in valid_people {
-            self.person_message_drafts.entry(row_id).or_default();
-        }
+        let next_selection = selected_person_message_row_id(
+            self.selected_person_message_row_id.as_deref(),
+            &scene.people,
+        );
+        self.set_person_message_selection(next_selection);
         self.scene = scene;
     }
 
@@ -320,13 +315,11 @@ impl SceneUiState {
     fn send_person_message_commands(
         &mut self,
         tab_id: &VisualizerTabId,
-        row_id: &str,
     ) -> Vec<VisualizerClientMessage> {
-        let message = self
-            .person_message_drafts
-            .get(row_id)
-            .map(|draft| draft.trim().to_string())
-            .unwrap_or_default();
+        let Some(row_id) = self.selected_person_message_row_id.clone() else {
+            return Vec::new();
+        };
+        let message = self.person_message_draft.trim().to_string();
         if message.is_empty() {
             return Vec::new();
         }
@@ -339,9 +332,7 @@ impl SceneUiState {
         else {
             return Vec::new();
         };
-        if let Some(draft) = self.person_message_drafts.get_mut(row_id) {
-            draft.clear();
-        }
+        self.person_message_draft.clear();
         vec![
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::UpdateSceneRow {
@@ -352,12 +343,29 @@ impl SceneUiState {
             VisualizerClientMessage::Command {
                 command: VisualizerCommand::SendScenePersonMessage {
                     tab_id: tab_id.clone(),
-                    row_id: row_id.to_string(),
+                    row_id,
                     message,
                 },
             },
         ]
     }
+
+    fn set_person_message_selection(&mut self, next_selection: Option<String>) {
+        if self.selected_person_message_row_id != next_selection {
+            self.person_message_draft.clear();
+        }
+        self.selected_person_message_row_id = next_selection;
+    }
+}
+
+fn selected_person_message_row_id(
+    current: Option<&str>,
+    people: &[ScenePersonRowView],
+) -> Option<String> {
+    current
+        .filter(|row_id| people.iter().any(|row| row.id == *row_id))
+        .map(str::to_string)
+        .or_else(|| people.first().map(|row| row.id.clone()))
 }
 
 enum ActivitySourceRow<'a> {
@@ -539,21 +547,67 @@ pub fn ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    egui::ScrollArea::vertical()
-        .id_salt("scene-window-scroll")
-        .show(ui, |ui| {
-            people_section_ui(ui, tab_id, state, commands);
-            ui.separator();
-            objects_section_ui(ui, tab_id, state, commands);
-            ui.separator();
-            sounds_section_ui(ui, tab_id, state, commands);
-            ui.separator();
-            atmosphere_section_ui(ui, tab_id, state, commands);
-            ui.separator();
-            derived_ambient_ui(ui, &state.scene.derived_ambient);
-            ui.separator();
-            activity_ui(ui, &state.activity);
-        });
+    let available = ui.available_size();
+    let width = available.x.max(1.0);
+    let height = available.y.max(1.0);
+    let composer_height = SCENE_COMPOSER_HEIGHT;
+    let content_height = (height - composer_height - SCENE_ROW_GAP * 2.0).max(1.0);
+    let config_height = scene_config_height(height, content_height);
+    let activity_height = (content_height - config_height).max(1.0);
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, config_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("scene-config-scroll")
+                .show(ui, |ui| scene_config_ui(ui, tab_id, state, commands));
+        },
+    );
+    ui.add_space(SCENE_ROW_GAP);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, activity_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| activity_ui(ui, &state.activity),
+    );
+    ui.add_space(SCENE_ROW_GAP);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, composer_height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| person_message_composer_ui(ui, tab_id, state, commands),
+    );
+}
+
+const SCENE_CONFIG_MIN_HEIGHT: f32 = 120.0;
+const SCENE_CONFIG_MAX_HEIGHT: f32 = 320.0;
+const SCENE_COMPOSER_HEIGHT: f32 = 34.0;
+const SCENE_ROW_GAP: f32 = 6.0;
+const SCENE_COMPOSER_SPEAKER_WIDTH: f32 = 150.0;
+const SCENE_COMPOSER_SEND_WIDTH: f32 = 64.0;
+const SCENE_COMPOSER_MESSAGE_MIN_WIDTH: f32 = 96.0;
+
+fn scene_config_height(available_height: f32, content_height: f32) -> f32 {
+    let max_config = (content_height * 0.62).max(1.0);
+    (available_height * 0.38)
+        .clamp(SCENE_CONFIG_MIN_HEIGHT, SCENE_CONFIG_MAX_HEIGHT)
+        .min(max_config)
+}
+
+fn scene_config_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    people_section_ui(ui, tab_id, state, commands);
+    ui.separator();
+    objects_section_ui(ui, tab_id, state, commands);
+    ui.separator();
+    sounds_section_ui(ui, tab_id, state, commands);
+    ui.separator();
+    atmosphere_section_ui(ui, tab_id, state, commands);
+    ui.separator();
+    derived_ambient_ui(ui, &state.scene.derived_ambient);
 }
 
 fn people_section_ui(
@@ -563,14 +617,12 @@ fn people_section_ui(
     commands: &Sender<VisualizerClientMessage>,
 ) {
     section_header(ui, "People", tab_id, commands, SceneRowKind::Person);
-    horizontal_grid(ui, "scene-people-grid", 7, |ui| {
+    horizontal_grid(ui, "scene-people-grid", 5, |ui| {
         ui.strong("Remove");
         ui.strong("Name");
         ui.strong("Direction");
         ui.strong("Distance");
         ui.strong("State");
-        ui.strong("Message");
-        ui.strong("Send");
         ui.end_row();
 
         let mut index = 0;
@@ -607,21 +659,6 @@ fn people_section_ui(
                     ("person-state", tab_id.as_str(), row_id.as_str()),
                 );
             }
-            let draft = state
-                .person_message_drafts
-                .entry(row_id.clone())
-                .or_default();
-            let message_response = ui.add_sized(
-                [MESSAGE_FIELD_WIDTH, FIELD_HEIGHT],
-                egui::TextEdit::singleline(draft)
-                    .desired_width(MESSAGE_FIELD_WIDTH)
-                    .id_salt(("person-message", tab_id.as_str(), row_id.as_str())),
-            );
-            let send_clicked = ui
-                .add_sized([56.0, FIELD_HEIGHT], egui::Button::new("Send"))
-                .clicked()
-                || (message_response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
 
             if remove_clicked {
                 let _ = commands.send(VisualizerClientMessage::Command {
@@ -632,7 +669,11 @@ fn people_section_ui(
                     },
                 });
                 state.scene.people.remove(index);
-                state.person_message_drafts.remove(&row_id);
+                let next_selection = selected_person_message_row_id(
+                    state.selected_person_message_row_id.as_deref(),
+                    &state.scene.people,
+                );
+                state.set_person_message_selection(next_selection);
                 ui.end_row();
                 continue;
             }
@@ -643,11 +684,6 @@ fn people_section_ui(
                         row: SceneRowView::Person(state.scene.people[index].clone()),
                     },
                 });
-            }
-            if send_clicked {
-                for command in state.send_person_message_commands(tab_id, &row_id) {
-                    let _ = commands.send(command);
-                }
             }
             ui.end_row();
             index += 1;
@@ -878,6 +914,84 @@ fn activity_ui(ui: &mut egui::Ui, activity: &[ActivityMessage]) {
         });
 }
 
+fn person_message_composer_ui(
+    ui: &mut egui::Ui,
+    tab_id: &VisualizerTabId,
+    state: &mut SceneUiState,
+    commands: &Sender<VisualizerClientMessage>,
+) {
+    let has_people = !state.scene.people.is_empty();
+    let mut send_requested = false;
+    ui.horizontal(|ui| {
+        let message_width =
+            composer_message_input_width(ui.available_width(), ui.spacing().item_spacing.x);
+        ui.add_enabled_ui(has_people, |ui| {
+            let mut next_selection = state.selected_person_message_row_id.clone();
+            egui::ComboBox::from_id_salt(("scene-person-message-speaker", tab_id.as_str()))
+                .width(SCENE_COMPOSER_SPEAKER_WIDTH)
+                .selected_text(selected_person_message_label(state))
+                .show_ui(ui, |ui| {
+                    for person in &state.scene.people {
+                        ui.selectable_value(
+                            &mut next_selection,
+                            Some(person.id.clone()),
+                            person_display_name(person),
+                        );
+                    }
+                });
+            state.set_person_message_selection(next_selection);
+        });
+        let message_response = ui.add_enabled(
+            has_people,
+            egui::TextEdit::singleline(&mut state.person_message_draft)
+                .desired_width(message_width)
+                .hint_text("Message")
+                .id_salt(("scene-person-message-draft", tab_id.as_str())),
+        );
+        send_requested |= ui
+            .add_enabled_ui(has_people, |ui| {
+                ui.add_sized(
+                    [SCENE_COMPOSER_SEND_WIDTH, FIELD_HEIGHT],
+                    egui::Button::new("Send"),
+                )
+            })
+            .inner
+            .clicked();
+        send_requested |= has_people
+            && message_response.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    });
+
+    if send_requested {
+        for command in state.send_person_message_commands(tab_id) {
+            let _ = commands.send(command);
+        }
+    }
+}
+
+fn composer_message_input_width(row_width: f32, item_spacing: f32) -> f32 {
+    (row_width - SCENE_COMPOSER_SPEAKER_WIDTH - SCENE_COMPOSER_SEND_WIDTH - item_spacing * 2.0)
+        .max(SCENE_COMPOSER_MESSAGE_MIN_WIDTH)
+}
+
+fn selected_person_message_label(state: &SceneUiState) -> String {
+    state
+        .selected_person_message_row_id
+        .as_deref()
+        .and_then(|row_id| state.scene.people.iter().find(|row| row.id == row_id))
+        .map(person_display_name)
+        .unwrap_or_else(|| "No people".to_string())
+}
+
+fn person_display_name(person: &ScenePersonRowView) -> String {
+    let name = person.name.trim();
+    if name.is_empty() {
+        person.id.clone()
+    } else {
+        name.to_string()
+    }
+}
+
 fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
     egui::Frame::new()
         .fill(match message.role {
@@ -972,14 +1086,10 @@ mod tests {
     fn person_message_send_flushes_target_row_before_message() {
         let tab_id = VisualizerTabId::new("live");
         let mut state = scene_with_two_people();
-        state
-            .person_message_drafts
-            .insert("person-1".to_string(), "hello one".to_string());
-        state
-            .person_message_drafts
-            .insert("person-2".to_string(), " hello two ".to_string());
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.person_message_draft = " hello two ".to_string();
 
-        let commands = state.send_person_message_commands(&tab_id, "person-2");
+        let commands = state.send_person_message_commands(&tab_id);
 
         assert_eq!(commands.len(), 2);
         let update_row = match &commands[0] {
@@ -1014,39 +1124,96 @@ mod tests {
             other => panic!("expected target person message, got {other:?}"),
         }
         assert_eq!(
-            state
-                .person_message_drafts
-                .get("person-1")
-                .map(String::as_str),
-            Some("hello one")
+            state.selected_person_message_row_id.as_deref(),
+            Some("person-2")
         );
-        assert_eq!(
-            state
-                .person_message_drafts
-                .get("person-2")
-                .map(String::as_str),
-            Some("")
-        );
+        assert_eq!(state.person_message_draft, "");
     }
 
     #[test]
     fn empty_person_message_does_not_create_commands_or_clear_draft() {
         let tab_id = VisualizerTabId::new("live");
         let mut state = scene_with_two_people();
-        state
-            .person_message_drafts
-            .insert("person-2".to_string(), "   ".to_string());
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.person_message_draft = "   ".to_string();
 
-        let commands = state.send_person_message_commands(&tab_id, "person-2");
+        let commands = state.send_person_message_commands(&tab_id);
 
         assert!(commands.is_empty());
+        assert_eq!(state.person_message_draft, "   ");
+    }
+
+    #[test]
+    fn composer_message_input_width_uses_remaining_row_width() {
+        let spacing = 8.0;
+        let narrow = composer_message_input_width(240.0, spacing);
+        let wide = composer_message_input_width(620.0, spacing);
+
+        assert_eq!(narrow, SCENE_COMPOSER_MESSAGE_MIN_WIDTH);
+        assert!((wide - 390.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn person_message_selection_survives_scene_refresh_when_person_remains() {
+        let mut state = scene_with_two_people();
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.person_message_draft = "pending".to_string();
+
+        state.set_scene_state(SceneStateView {
+            people: vec![
+                ScenePersonRowView {
+                    id: "person-1".to_string(),
+                    name: "Pibi renamed".to_string(),
+                    direction: "front".to_string(),
+                    distance: "2m".to_string(),
+                    state: "watching Nui".to_string(),
+                },
+                ScenePersonRowView {
+                    id: "person-2".to_string(),
+                    name: "Koro renamed".to_string(),
+                    direction: "left".to_string(),
+                    distance: "1m".to_string(),
+                    state: "waiting".to_string(),
+                },
+            ],
+            ..SceneStateView::default()
+        });
+
         assert_eq!(
-            state
-                .person_message_drafts
-                .get("person-2")
-                .map(String::as_str),
-            Some("   ")
+            state.selected_person_message_row_id.as_deref(),
+            Some("person-2")
         );
+        assert_eq!(state.person_message_draft, "pending");
+    }
+
+    #[test]
+    fn person_message_selection_falls_back_and_clears_draft_when_person_disappears() {
+        let mut state = scene_with_two_people();
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.person_message_draft = "pending".to_string();
+
+        state.set_scene_state(SceneStateView {
+            people: vec![ScenePersonRowView {
+                id: "person-1".to_string(),
+                name: "Pibi".to_string(),
+                direction: "front".to_string(),
+                distance: "2m".to_string(),
+                state: "watching Nui".to_string(),
+            }],
+            ..SceneStateView::default()
+        });
+
+        assert_eq!(
+            state.selected_person_message_row_id.as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(state.person_message_draft, "");
+
+        state.person_message_draft = "new pending".to_string();
+        state.set_scene_state(SceneStateView::default());
+
+        assert_eq!(state.selected_person_message_row_id, None);
+        assert_eq!(state.person_message_draft, "");
     }
 
     #[test]

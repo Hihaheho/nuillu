@@ -413,6 +413,7 @@ enum RuntimeTabViewMode {
 }
 
 const SIMPLIFIED_PANE_GAP: f32 = 8.0;
+const SIMPLIFIED_LOWER_PANES_MIN_HEIGHT: f32 = 180.0;
 
 #[derive(Debug, Clone)]
 struct ViewWindowSpec {
@@ -634,13 +635,11 @@ impl RuntimeTab {
                 egui::vec2(center_width, available.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    let modules_height = (available.y * 0.42)
-                        .clamp(220.0, 380.0)
-                        .min(ui.available_height().max(1.0));
-                    simplified_section(
+                    let modules_max_height = simplified_modules_max_height(ui.available_height());
+                    simplified_auto_section(
                         ui,
                         None,
-                        egui::vec2(ui.available_width(), modules_height),
+                        egui::vec2(ui.available_width(), modules_max_height),
                         |ui| {
                             requested_module = self.render_modules_overview_contents(
                                 ui,
@@ -1120,6 +1119,31 @@ fn simplified_section(
     });
 }
 
+fn simplified_auto_section(
+    ui: &mut egui::Ui,
+    title: Option<&str>,
+    max_size: egui::Vec2,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let max_size = egui::vec2(max_size.x.max(1.0), max_size.y.max(1.0));
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_min_width(max_size.x);
+            ui.set_max_width(max_size.x);
+            ui.set_max_height(max_size.y);
+            if let Some(title) = title {
+                ui.strong(title);
+                ui.separator();
+            }
+            add_contents(ui);
+        });
+}
+
+fn simplified_modules_max_height(available_height: f32) -> f32 {
+    (available_height - SIMPLIFIED_PANE_GAP - SIMPLIFIED_LOWER_PANES_MIN_HEIGHT).max(1.0)
+}
+
 fn simplified_module_popup_interaction_closes(
     popup_rect: egui::Rect,
     opened_this_frame: bool,
@@ -1232,6 +1256,13 @@ mod tests {
         tab.set_simplified_view(true);
 
         assert_eq!(tab.view_mode, RuntimeTabViewMode::Simplified);
+    }
+
+    #[test]
+    fn simplified_modules_max_height_keeps_lower_panes_visible() {
+        let height = simplified_modules_max_height(600.0);
+
+        assert_eq!(height, 412.0);
     }
 
     #[test]
