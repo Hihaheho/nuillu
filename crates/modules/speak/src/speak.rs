@@ -63,9 +63,9 @@ const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
 const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target decisions,
 selected targets, rejected/no-speech decisions, completed outward utterances, in-progress
 speech continuations, and cognition-log context needed for future speak planning."#;
-const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances
-and their addressees. Do not preserve per-turn generation request context unless it is part of
-a completed utterance."#;
+const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve accumulated recent context,
+completed outward utterances, and their addressees. Do not preserve per-turn target/substance
+request context unless it is part of a completed utterance."#;
 
 pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -487,16 +487,8 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
     )
 }
 
-fn format_generation_input(
-    cognition_context: &str,
-    args: &PrepareSpeechArgs,
-    draft: &GenerationDraft,
-) -> String {
-    let mut out = format!(
-        "{}\n\nSpeak to: {}",
-        cognition_context.trim(),
-        draft.target.trim(),
-    );
+fn format_generation_input(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
+    let mut out = format!("Speak to: {}", draft.target.trim());
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
@@ -569,11 +561,10 @@ fn is_non_empty_target(target: &str) -> bool {
 
 fn push_generation_context(
     session: &mut Session,
-    cognition_context: &str,
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) {
-    session.push_ephemeral_user(format_generation_input(cognition_context, args, draft));
+    session.push_ephemeral_user(format_generation_input(args, draft));
     if !draft.accumulated.is_empty() {
         session.push_ephemeral_assistant_text(draft.accumulated.clone());
     }
@@ -600,14 +591,16 @@ fn speech_cognition_context_from_entries(
     format_new_cognition_log_entries(records, now, COGNITION_CONTEXT_WINDOW)
 }
 
-fn generation_cognition_context_from_entries(records: &[CognitionLogEntryRecord]) -> String {
+fn generation_cognition_context_from_entries(
+    records: &[CognitionLogEntryRecord],
+) -> Option<String> {
     let mut records = records
         .iter()
         .filter(|record| !record.entry.text.trim().is_empty())
         .collect::<Vec<_>>();
     records.sort_by_key(|record| record.entry.at);
     if records.is_empty() || COGNITION_CONTEXT_WINDOW.max_records == 0 {
-        return generation_cognition_context_fallback();
+        return None;
     }
 
     let omitted_for_record_limit = records
@@ -629,7 +622,7 @@ fn generation_cognition_context_from_entries(records: &[CognitionLogEntryRecord]
                 "- {}",
                 compact_llm_context_text(
                     &record.entry.text,
-                    COGNITION_CONTEXT_WINDOW.max_chars_per_record
+                    COGNITION_CONTEXT_WINDOW.max_chars_per_record,
                 )
             )
         })
@@ -637,7 +630,6 @@ fn generation_cognition_context_from_entries(records: &[CognitionLogEntryRecord]
         .collect::<Vec<_>>();
 
     bounded_generation_cognition_context(lines)
-        .unwrap_or_else(generation_cognition_context_fallback)
 }
 
 fn bounded_generation_cognition_context(lines: Vec<String>) -> Option<String> {
@@ -664,10 +656,6 @@ fn bounded_generation_cognition_context(lines: Vec<String>) -> Option<String> {
         drop_from_start += 1;
     }
     None
-}
-
-fn generation_cognition_context_fallback() -> String {
-    "Recent context:\n- none since the previous speech slice".to_owned()
 }
 
 fn active_speech_cognition_context_from_entries(
@@ -849,12 +837,11 @@ impl SpeakModule {
     ) -> Result<()> {
         let _update_count = batch.updates.len();
         let now = self.clock.now();
-        let (generation_context, plan, mut draft) = if let Some(active) = self.active_speech.take()
-        {
+        self.append_generation_cognition_context(cx, &batch.cognition_entries)
+            .await?;
+        let (plan, mut draft) = if let Some(active) = self.active_speech.take() {
             let planning_context =
                 active_speech_cognition_context_from_entries(&batch.cognition_entries, now);
-            let generation_context =
-                generation_cognition_context_from_entries(&batch.cognition_entries);
             let should_continue_without_planning = batch.continue_active_speech
                 && batch.updates.is_empty()
                 && batch.cognition_entries.is_empty();
@@ -863,7 +850,7 @@ impl SpeakModule {
                     args: active.args,
                     target: active.draft.target.clone(),
                 };
-                (generation_context, plan, active.draft)
+                (plan, active.draft)
             } else {
                 let Some(active_plan) = self
                     .plan_active_speech(cx, &planning_context, &active)
@@ -875,7 +862,7 @@ impl SpeakModule {
                     return Ok(());
                 };
                 match active_plan {
-                    ActiveSpeechPlan::Continue(plan) => (generation_context, plan, active.draft),
+                    ActiveSpeechPlan::Continue(plan) => (plan, active.draft),
                     ActiveSpeechPlan::Redirect {
                         plan,
                         interrupt_reason,
@@ -884,7 +871,7 @@ impl SpeakModule {
                             .await?;
                         let draft =
                             GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
-                        (generation_context, plan, draft)
+                        (plan, draft)
                     }
                     ActiveSpeechPlan::Abort { interrupt_reason } => {
                         self.record_aborted_generation(cx, &active.draft, &interrupt_reason)
@@ -900,8 +887,6 @@ impl SpeakModule {
             else {
                 return Ok(());
             };
-            let generation_context =
-                generation_cognition_context_from_entries(&batch.cognition_entries);
             let plan = match self.plan_speech(cx, &planning_context).await? {
                 FreshSpeechPlan::Prepare(plan) => plan,
                 FreshSpeechPlan::Decline { blocking_reason } => {
@@ -915,11 +900,11 @@ impl SpeakModule {
                 }
             };
             let draft = GenerationDraft::new(self.utterance.next_generation_id(), &plan.target);
-            (generation_context, plan, draft)
+            (plan, draft)
         };
 
         match self
-            .collect_generation_slice(cx, generation_context, &plan.args, &mut draft)
+            .collect_generation_slice(cx, &plan.args, &mut draft)
             .await?
         {
             GenerationStreamOutcome::Completed => {
@@ -1202,16 +1187,30 @@ impl SpeakModule {
         }
     }
 
+    async fn append_generation_cognition_context(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        entries: &[CognitionLogEntryRecord],
+    ) -> Result<()> {
+        let Some(context) = generation_cognition_context_from_entries(entries) else {
+            return Ok(());
+        };
+        self.ensure_generation_session_seeded(cx);
+        self.generation_session.push_user(context);
+        cx.compact_and_save(&mut self.generation_session, Usage::zero())
+            .await?;
+        Ok(())
+    }
+
     async fn collect_generation_slice(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        cognition_context: String,
         args: &PrepareSpeechArgs,
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         self.ensure_generation_session_seeded(cx);
         let mut turn_session = self.generation_session.clone();
-        push_generation_context(&mut turn_session, &cognition_context, args, draft);
+        push_generation_context(&mut turn_session, args, draft);
 
         let buffered_deltas = Arc::new(Mutex::new(GenerationDeltaBuffer::default()));
         let lutum = self.llm.lutum().await;
@@ -2202,12 +2201,15 @@ mod tests {
         let generation_contexts =
             session_message_texts(&module.generation_session, InputMessageRole::User)
                 .into_iter()
-                .filter(|text| text.starts_with("New cognition entries at "))
+                .filter(|text| text.starts_with("Recent context:"))
                 .collect::<Vec<_>>();
-        assert!(
-            generation_contexts.is_empty(),
-            "generation request context is per-turn ephemeral, not durable session history"
-        );
+        assert_eq!(generation_contexts.len(), 2);
+        assert!(generation_contexts[0].contains("first cognition"));
+        assert!(!generation_contexts[0].contains("second cognition"));
+        assert!(generation_contexts[1].contains("second cognition"));
+        assert!(!generation_contexts[1].contains("first cognition"));
+        assert!(!generation_contexts[0].contains("New cognition entries at"));
+        assert!(!generation_contexts[1].contains("New cognition entries at"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2303,12 +2305,7 @@ mod tests {
         let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
 
-        push_generation_context(
-            &mut session,
-            "Recent context:\n- Koro asks for help.",
-            &args,
-            &draft,
-        );
+        push_generation_context(&mut session, &args, &draft);
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 7);
@@ -2324,7 +2321,7 @@ mod tests {
         let [MessageContent::Text(text)] = content.as_slice() else {
             panic!("expected one text content item");
         };
-        assert!(text.contains("Recent context:\n- Koro asks for help."));
+        assert!(!text.contains("Recent context:"));
         assert!(!text.contains("Current cognition log at"));
         assert!(!text.contains("New cognition entries at"));
         assert!(text.contains("Speak to: Koro"));
@@ -2348,13 +2345,9 @@ mod tests {
             speech_content: "日本語で短く返事する。".into(),
         };
 
-        let text = format_generation_input(
-            "Recent context:\n- Ryo says, \"日本語でお願い\".",
-            &args,
-            &draft,
-        );
+        let text = format_generation_input(&args, &draft);
 
-        assert!(text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
+        assert!(!text.contains("Recent context:"));
         assert!(text.contains("Speak to: Ryo"));
         assert!(text.contains("Language: Japanese"));
         assert!(text.contains("Substance to express:\n日本語で短く返事する。"));
@@ -2370,10 +2363,9 @@ mod tests {
             speech_content: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
-        let text =
-            format_generation_input("Recent context:\n- Pibi asks about dinner.", &args, &draft);
+        let text = format_generation_input(&args, &draft);
 
-        assert!(text.contains("Recent context:\n- Pibi asks about dinner."));
+        assert!(!text.contains("Recent context:"));
         assert!(text.contains("I do not know whether dinner is ready"));
         assert!(text.contains("I see no food or person nearby."));
     }
@@ -2401,7 +2393,7 @@ mod tests {
             },
         ];
 
-        let context = generation_cognition_context_from_entries(&records);
+        let context = generation_cognition_context_from_entries(&records).unwrap();
 
         assert_eq!(
             context,
@@ -2510,7 +2502,9 @@ mod tests {
         assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
         let generation_text = session_input_text(&module.generation_session);
         assert!(!generation_text.contains("New cognition entries at "));
-        assert!(!generation_text.contains("Koro asks Nuillu to help them stay safe."));
+        assert!(
+            generation_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
+        );
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_input = model_input_text(&inputs[1]);
@@ -2597,7 +2591,7 @@ mod tests {
         let args = test_prepare_speech_args("Koro");
 
         let outcome = module
-            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .collect_generation_slice(&cx, &args, &mut draft)
             .await
             .unwrap();
 
@@ -2640,7 +2634,7 @@ mod tests {
         let args = test_prepare_speech_args("Koro");
 
         let outcome = module
-            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .collect_generation_slice(&cx, &args, &mut draft)
             .await
             .unwrap();
 
@@ -2686,7 +2680,7 @@ mod tests {
         let args = test_prepare_speech_args("Koro");
 
         let outcome = module
-            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .collect_generation_slice(&cx, &args, &mut draft)
             .await
             .unwrap();
 
@@ -2730,7 +2724,7 @@ mod tests {
         let args = test_prepare_speech_args("Koro");
 
         let outcome = module
-            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .collect_generation_slice(&cx, &args, &mut draft)
             .await
             .unwrap();
 
@@ -2986,6 +2980,12 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 3);
         let generation_input = &inputs[2];
+        let full_input_text = model_input_text(generation_input);
+        assert!(
+            full_input_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
+        );
+        assert!(!full_input_text.contains("none since the previous speech slice"));
+        assert!(!full_input_text.contains("New cognition entries at "));
         let items = generation_input.items();
         assert!(items.len() >= 2);
         let tail = &items[items.len() - 2..];
@@ -3002,8 +3002,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(user_text.contains("Recent context:\n- none since the previous speech slice"));
-        assert!(!user_text.contains("New cognition entries at "));
+        assert!(!user_text.contains("Recent context:"));
         assert!(user_text.contains("Substance to express:\nTell Koro to stay close."));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant partial utterance prefill");
@@ -3537,12 +3536,7 @@ mod tests {
 
         assert_eq!(draft.push_delta("hello "), 0);
         assert_eq!(draft.push_delta("world"), 1);
-        push_generation_context(
-            &mut session,
-            "Recent context:\n- Koro asks for help.",
-            &args,
-            &draft,
-        );
+        push_generation_context(&mut session, &args, &draft);
         let items = session.input().items();
 
         assert_eq!(draft.generation_id, 11);
