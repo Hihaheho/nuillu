@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult, Usage};
+use lutum::{
+    ModelInput, Session, StructuredTurnOutcome, TextStepOutcomeWithTools, ToolResult, Usage,
+};
 use nuillu_blackboard::{CognitionLogEntryRecord, MemoLogRecord};
 use nuillu_module::ports::Clock;
 use nuillu_module::{
@@ -21,8 +23,20 @@ Read recent memo and cognition context, retrieve applicable existing policies, a
 policy-grounded advice for the current situation. You may also synthesize reusable candidate
 policies when existing records do not cover the situation.
 
+Policy candidates must be policies: trigger-conditioned behavioral guidance. The trigger describes
+the situation where the rule applies. The behavior describes what action should or should not be
+taken. Advice must be derived from that behavior and must not invent factual, capability, identity,
+or state claims.
+
 For low or negative predicted value, give caution or avoidance advice rather than recommending the
 behavior. Do not mutate policy state. Do not claim a policy was persisted."#;
+
+const POLICY_CANDIDATE_EVALUATION_PROMPT: &str = r#"Evaluate a synthetic policy candidate before it is published.
+Accept only if the candidate is a policy: trigger-conditioned behavioral guidance.
+Reject candidates that introduce factual, capability, identity, or state claims as policy content,
+unless those claims are directly supported by the supplied evidence.
+Valid policy language includes should, must, and must not when it describes behavior.
+Return accepted=false with a concise reason when behavior or advice is not actually policy."#;
 
 const POLICY_SEARCH_LIMIT: usize = 5;
 const POLICY_QUERY_CONTEXT_CHARS: usize = 1_000;
@@ -108,6 +122,28 @@ pub enum PolicyExpectedValue {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProposePolicyCandidateOutput {
     pub accepted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct PolicyCandidateEvaluation {
+    accepted: bool,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct PolicyCandidateEvaluationInput<'a> {
+    query_text: &'a str,
+    current_memo_evidence: String,
+    current_cognition_evidence: String,
+    candidate: PolicyCandidateEvaluationCandidate<'a>,
+}
+
+#[derive(Serialize)]
+struct PolicyCandidateEvaluationCandidate<'a> {
+    trigger: &'a str,
+    behavior: &'a str,
+    advice: &'a str,
+    expected_value: PolicyExpectedValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -347,41 +383,34 @@ impl PolicyModule {
             }
             TextStepOutcomeWithTools::NeedsTools(round) => {
                 let usage = round.usage;
-                let mut selected = None;
-                let mut results: Vec<ToolResult> = Vec::new();
                 nuillu_module::emit_trace_tool_calls(&round.tool_calls);
-                for call in round.tool_calls.iter().cloned() {
-                    match call {
-                        PolicyToolsCall::ProposePolicyCandidate(call) => {
-                            let normalized = normalize_proposed_candidate(call.input.clone());
-                            let accepted = selected.is_none() && normalized.is_some();
-                            if accepted {
-                                selected = normalized;
-                            }
-                            results.push(
-                                call.complete(ProposePolicyCandidateOutput { accepted })
-                                    .context("complete propose_policy_candidate tool call")?,
-                            );
-                        }
-                    }
-                }
-                let Some(candidate) = selected else {
-                    if results.is_empty() {
-                        round.discard();
-                        truncate_session_to(&mut self.session, session_len_before_turn);
-                        cx.compact_and_save(&mut self.session, usage).await?;
-                        return Ok(Vec::new());
-                    }
-                    if let Err(error) = round.commit(&mut self.session, results) {
-                        tracing::warn!(
-                            error = %error,
-                            "policy candidate tool round commit failed; not persisting turn"
-                        );
-                        truncate_session_to(&mut self.session, session_len_before_turn);
-                    }
+                let [PolicyToolsCall::ProposePolicyCandidate(call)] = round.tool_calls.as_slice()
+                else {
+                    round.discard();
+                    truncate_session_to(&mut self.session, session_len_before_turn);
                     cx.compact_and_save(&mut self.session, usage).await?;
                     return Ok(Vec::new());
                 };
+                let Some(candidate) = normalize_proposed_candidate(call.input.clone()) else {
+                    round.discard();
+                    truncate_session_to(&mut self.session, session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(Vec::new());
+                };
+                if !self
+                    .evaluate_synthetic_candidate(cx, context, &call.input)
+                    .await
+                {
+                    round.discard();
+                    truncate_session_to(&mut self.session, session_len_before_turn);
+                    cx.compact_and_save(&mut self.session, usage).await?;
+                    return Ok(Vec::new());
+                }
+                let results: Vec<ToolResult> = vec![
+                    call.clone()
+                        .complete(ProposePolicyCandidateOutput { accepted: true })
+                        .context("complete propose_policy_candidate tool call")?,
+                ];
                 if let Err(error) = round.commit(&mut self.session, results) {
                     tracing::warn!(
                         error = %error,
@@ -396,6 +425,59 @@ impl PolicyModule {
             }
         }
     }
+
+    async fn evaluate_synthetic_candidate(
+        &self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        context: &PolicyActivationContext,
+        candidate: &ProposePolicyCandidateArgs,
+    ) -> bool {
+        let input = ModelInput::new()
+            .system(format_identity_system_prompt(
+                POLICY_CANDIDATE_EVALUATION_PROMPT,
+                cx.identity_memories(),
+                cx.core_policies(),
+                cx.now(),
+            ))
+            .user(format_policy_candidate_evaluation_request(
+                context,
+                candidate,
+                cx.now(),
+            ));
+        let lutum = self.llm.lutum().await;
+        let result = lutum
+            .structured_turn::<PolicyCandidateEvaluation>(input)
+            .max_output_tokens(256)
+            .collect()
+            .await;
+        match result {
+            Ok(result) => match result.semantic {
+                StructuredTurnOutcome::Structured(evaluation) => {
+                    if !evaluation.accepted {
+                        tracing::warn!(
+                            reason = %evaluation.reason,
+                            "synthetic policy candidate rejected by contract evaluation"
+                        );
+                    }
+                    evaluation.accepted
+                }
+                other => {
+                    tracing::warn!(
+                        outcome = ?other,
+                        "synthetic policy candidate evaluation produced no structured acceptance"
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "synthetic policy candidate evaluation failed"
+                );
+                false
+            }
+        }
+    }
 }
 
 fn format_policy_candidate_request(
@@ -406,7 +488,7 @@ fn format_policy_candidate_request(
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     format!(
-        "Policy consideration request for {owner}\n\nQuery text:\n{}\n\nCurrent interoception:\n{}\n\nExisting policy hits already handled by runtime:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}\n\nInstruction:\nOnly call propose_policy_candidate if the existing hits are insufficient and a reusable new trigger/behavior policy is needed.",
+        "Policy consideration request for {owner}\n\nQuery text:\n{}\n\nCurrent interoception:\n{}\n\nExisting policy hits already handled by runtime:\n{}\n\nCurrent memo evidence:\n{}\n\nCurrent cognition evidence:\n{}\n\nInstruction:\nOnly call propose_policy_candidate if the existing hits are insufficient and a reusable new trigger/behavior policy is needed.\nA policy candidate must be trigger-conditioned behavioral guidance. Put only the situation in trigger, only the action rule in behavior, and only behavior-derived guidance in advice. Do not introduce factual, capability, identity, or state claims as policy content.",
         context.query_text,
         format_policy_interoception_state(interoception),
         format_policy_hits(hits),
@@ -419,6 +501,35 @@ fn format_policy_candidate_request(
         )
         .unwrap_or_else(|| "none".to_owned()),
     )
+}
+
+fn format_policy_candidate_evaluation_request(
+    context: &PolicyActivationContext,
+    candidate: &ProposePolicyCandidateArgs,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    serde_json::to_string(&PolicyCandidateEvaluationInput {
+        query_text: &context.query_text,
+        current_memo_evidence: format_bounded_memo_log_batch(
+            &context.memos,
+            now,
+            POLICY_MEMO_CONTEXT_WINDOW,
+        )
+        .unwrap_or_else(|| "none".to_owned()),
+        current_cognition_evidence: format_bounded_cognition_log_batch(
+            &context.cognition,
+            now,
+            POLICY_COGNITION_CONTEXT_WINDOW,
+        )
+        .unwrap_or_else(|| "none".to_owned()),
+        candidate: PolicyCandidateEvaluationCandidate {
+            trigger: candidate.trigger.trim(),
+            behavior: candidate.behavior.trim(),
+            advice: candidate.advice.trim(),
+            expected_value: candidate.expected_value,
+        },
+    })
+    .expect("policy candidate evaluation input serialization should not fail")
 }
 
 fn format_policy_interoception_state(state: &nuillu_blackboard::InteroceptiveState) -> String {
@@ -617,16 +728,18 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
         ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        Lutum, MessageContent, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem,
-        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+        Lutum, MessageContent, MockLlmAdapter, MockStructuredScenario, MockTextScenario,
+        ModelInput, ModelInputItem, RawStructuredTurnEvent, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::Blackboard;
+    use nuillu_blackboard::IdentityMemoryRecord;
     use nuillu_module::ports::SystemClock;
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, LlmConcurrencyLimiter, LutumTiers,
         ModuleRegistry, SessionCompactionPolicy, SessionCompactionRuntime,
     };
-    use nuillu_types::{ModelTier, ReplicaCapRange};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModelTier, ReplicaCapRange};
     use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
     use nuillu_types::{SignedUnitF32, UnitF32};
 
@@ -639,6 +752,7 @@ mod tests {
     struct CapturingTextAdapter {
         inner: MockLlmAdapter,
         text_inputs: Arc<Mutex<Vec<ModelInput>>>,
+        structured_inputs: Arc<Mutex<Vec<ModelInput>>>,
     }
 
     impl CapturingTextAdapter {
@@ -646,11 +760,16 @@ mod tests {
             Self {
                 inner,
                 text_inputs: Arc::new(Mutex::new(Vec::new())),
+                structured_inputs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn text_inputs(&self) -> Vec<ModelInput> {
             self.text_inputs.lock().unwrap().clone()
+        }
+
+        fn structured_inputs(&self) -> Vec<ModelInput> {
+            self.structured_inputs.lock().unwrap().clone()
         }
     }
 
@@ -670,6 +789,7 @@ mod tests {
             input: ModelInput,
             turn: AdapterStructuredTurn,
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.structured_inputs.lock().unwrap().push(input.clone());
             self.inner.structured_turn(input, turn).await
         }
     }
@@ -705,6 +825,19 @@ mod tests {
                 "behavior": "fresh bounded behavior",
                 "advice": "continue cautiously",
                 "expected_value": "positive"
+            })
+            .to_string(),
+            input_tokens,
+        )
+    }
+
+    fn rejected_candidate_scenario(input_tokens: u64) -> MockTextScenario {
+        policy_tool_scenario(
+            serde_json::json!({
+                "trigger": "REJECTED_TRIGGER_MARKER",
+                "behavior": "REJECTED_BEHAVIOR_MARKER",
+                "advice": "REJECTED_ADVICE_MARKER",
+                "expected_value": "neutral"
             })
             .to_string(),
             input_tokens,
@@ -768,6 +901,47 @@ mod tests {
             Ok(RawTextTurnEvent::Completed {
                 request_id: Some("policy-tool".into()),
                 finish_reason: FinishReason::ToolCall,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn policy_candidate_evaluation_scenario(
+        accepted: bool,
+        reason: &str,
+        input_tokens: u64,
+    ) -> MockStructuredScenario {
+        let json = serde_json::json!({
+            "accepted": accepted,
+            "reason": reason,
+        })
+        .to_string();
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("policy-candidate-eval".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk { json_delta: json }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("policy-candidate-eval".into()),
+                finish_reason: FinishReason::Stop,
+                usage: text_usage(input_tokens),
+            }),
+        ])
+    }
+
+    fn policy_candidate_evaluation_refusal_scenario(input_tokens: u64) -> MockStructuredScenario {
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("policy-candidate-eval-refusal".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::RefusalDelta {
+                delta: "cannot evaluate".into(),
+            }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("policy-candidate-eval-refusal".into()),
+                finish_reason: FinishReason::Stop,
                 usage: text_usage(input_tokens),
             }),
         ])
@@ -846,6 +1020,21 @@ mod tests {
         now: chrono::DateTime<chrono::Utc>,
     ) -> nuillu_module::ActivateCx<'static> {
         nuillu_module::ActivateCx::new(&[], &[], &[], &[], compaction_runtime(lutum), now)
+    }
+
+    fn activate_cx_with_identity<'a>(
+        lutum: &Lutum,
+        now: chrono::DateTime<chrono::Utc>,
+        identity_memories: &'a [IdentityMemoryRecord],
+    ) -> nuillu_module::ActivateCx<'a> {
+        nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            identity_memories,
+            &[],
+            compaction_runtime(lutum),
+            now,
+        )
     }
 
     fn all_input_text(input: &ModelInput) -> String {
@@ -927,7 +1116,17 @@ mod tests {
     async fn activation_bounds_policy_input_and_seeds_stable_prompt_once() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(proposed_candidate_scenario(1))
-            .with_text_scenario(proposed_candidate_scenario(1));
+            .with_structured_scenario(policy_candidate_evaluation_scenario(
+                true,
+                "behavioral guidance",
+                1,
+            ))
+            .with_text_scenario(proposed_candidate_scenario(1))
+            .with_structured_scenario(policy_candidate_evaluation_scenario(
+                true,
+                "behavioral guidance",
+                1,
+            ));
         let capture = CapturingTextAdapter::new(adapter);
         let observed = capture.clone();
         let blackboard = Blackboard::default();
@@ -1049,7 +1248,12 @@ mod tests {
     async fn activation_writes_existing_hit_when_model_calls_no_tool() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(no_tool_scenario(1))
-            .with_text_scenario(proposed_candidate_scenario(1));
+            .with_text_scenario(proposed_candidate_scenario(1))
+            .with_structured_scenario(policy_candidate_evaluation_scenario(
+                true,
+                "behavioral guidance",
+                1,
+            ));
         let capture = CapturingTextAdapter::new(adapter);
         let observed = capture.clone();
         let blackboard = Blackboard::default();
@@ -1100,6 +1304,141 @@ mod tests {
         assert!(second_text.contains("first policy evidence"));
         assert!(second_text.contains("no new reusable candidate"));
         assert!(second_text.contains("second policy evidence"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_writes_synthetic_candidate_after_contract_acceptance() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(proposed_candidate_scenario(1))
+            .with_structured_scenario(policy_candidate_evaluation_scenario(
+                true,
+                "behavioral guidance",
+                1,
+            ));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let store = Rc::new(RecordingPolicyStore::default());
+        let policy_caps =
+            PolicyCapabilities::new(blackboard.clone(), Rc::new(SystemClock), store, Vec::new());
+        let snapshots = policy_caps.clone();
+        let mut module = build_policy_module(&caps, policy_caps).await;
+
+        let now = chrono::Utc::now();
+        publish_policy_wakeup_with_content(&caps, &blackboard, "fresh policy need", now).await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let records = snapshots.consideration_snapshots();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload.considerations.len(), 1);
+        let consideration = &records[0].payload.considerations[0];
+        assert_eq!(consideration.candidate_id, "synthetic:0");
+        assert_eq!(consideration.advice, "continue cautiously");
+        let structured_inputs = observed.structured_inputs();
+        assert_eq!(structured_inputs.len(), 1);
+        let eval_text = all_input_text(&structured_inputs[0]);
+        assert!(eval_text.contains("fresh bounded trigger"));
+        assert!(eval_text.contains("fresh bounded behavior"));
+        assert!(eval_text.contains("continue cautiously"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_rejects_synthetic_candidate_and_drops_turn_from_session() {
+        // The contract evaluator is a mock with a fixed `accepted: false` verdict, so the
+        // candidate/identity strings below are plumbing markers, not content the test judges.
+        // This exercises the rejection-handling path: the evidence reaches the evaluation
+        // request, the rejected candidate never lands in a memo, and the dropped turn does not
+        // leak into the next activation's session.
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(rejected_candidate_scenario(1))
+            .with_structured_scenario(policy_candidate_evaluation_scenario(
+                false,
+                "fixed mock rejection verdict",
+                1,
+            ))
+            .with_text_scenario(no_tool_scenario(1));
+        let capture = CapturingTextAdapter::new(adapter);
+        let observed = capture.clone();
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(capture));
+        let store = Rc::new(RecordingPolicyStore::default());
+        let policy_caps =
+            PolicyCapabilities::new(blackboard.clone(), Rc::new(SystemClock), store, Vec::new());
+        let snapshots = policy_caps.clone();
+        let mut module = build_policy_module(&caps, policy_caps).await;
+
+        let now = chrono::Utc::now();
+        publish_policy_wakeup_with_content(&caps, &blackboard, "REJECTED_QUERY_MARKER", now).await;
+        let identity_memories = vec![IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-evidence-marker"),
+            content: MemoryContent::new("IDENTITY_EVIDENCE_MARKER"),
+            occurred_at: None,
+        }];
+        let cx = activate_cx_with_identity(&lutum, now, &identity_memories);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        assert!(snapshots.consideration_snapshots().is_empty());
+        let structured_inputs = observed.structured_inputs();
+        assert_eq!(structured_inputs.len(), 1);
+        let eval_text = all_input_text(&structured_inputs[0]);
+        assert!(eval_text.contains("IDENTITY_EVIDENCE_MARKER"));
+        assert!(eval_text.contains("REJECTED_ADVICE_MARKER"));
+        assert!(
+            blackboard
+                .read(|bb| bb.recent_memo_logs())
+                .await
+                .iter()
+                .all(|record| !record.content.contains("REJECTED_ADVICE_MARKER"))
+        );
+
+        publish_policy_wakeup_with_content(
+            &caps,
+            &blackboard,
+            "clean policy evidence",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let second_text = all_input_text(&inputs[1]);
+        assert!(!second_text.contains("REJECTED_ADVICE_MARKER"));
+        assert!(second_text.contains("clean policy evidence"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_drops_synthetic_candidate_when_contract_evaluation_refuses() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(proposed_candidate_scenario(1))
+            .with_structured_scenario(policy_candidate_evaluation_refusal_scenario(1));
+        let blackboard = Blackboard::default();
+        let (caps, lutum) = test_caps_with_adapter(blackboard.clone(), Arc::new(adapter));
+        let store = Rc::new(RecordingPolicyStore::default());
+        let policy_caps =
+            PolicyCapabilities::new(blackboard.clone(), Rc::new(SystemClock), store, Vec::new());
+        let snapshots = policy_caps.clone();
+        let mut module = build_policy_module(&caps, policy_caps).await;
+
+        let now = chrono::Utc::now();
+        publish_policy_wakeup_with_content(&caps, &blackboard, "fresh policy need", now).await;
+        let cx = activate_cx(&lutum, now);
+        let batch = module.next_batch().await.unwrap();
+        module.activate(&cx, &batch).await.unwrap();
+
+        assert!(snapshots.consideration_snapshots().is_empty());
+        assert!(
+            blackboard
+                .read(|bb| bb.recent_memo_logs())
+                .await
+                .iter()
+                .all(|record| record.owner.module != builtin::policy())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
