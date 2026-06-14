@@ -9,9 +9,9 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow,
     MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, format_available_faculties,
-    format_bounded_memo_log_batch, format_current_allocation_state, format_memory_trace_inventory,
-    format_stuckness, memory_rank_counts, push_formatted_cognition_log_batch,
-    push_formatted_memo_log_batch,
+    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
+    format_current_allocation_state, format_memory_trace_inventory, format_stuckness,
+    memory_rank_counts,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -23,6 +23,12 @@ const SYSTEM_PROMPT: &str = r#"You are the allocation module.
 You wake on memo updates and internal attention-control requests. Use blackboard memos, attention
 control requests, the cognition log, the current allocation, and the registry schema to decide which
 allocation posture is best for the mind and which modules deserve extra activation now.
+
+On each activation, choose the best current allocation posture for the mind. Use current memos,
+current cognition entries, current attention-control requests, interoception, memory inventory,
+stuckness, and current allocation state. If the current allocation already fits that posture, call
+leave_allocation_unchanged; otherwise call reprioritize_modules for modules that need extra
+activation now.
 
 Use exactly one tool per activation:
 - leave_allocation_unchanged when the current allocation already fits the best current posture.
@@ -52,8 +58,8 @@ const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session 
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
-const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, prior allocation decisions,
-allocation notes, guidance changes, and relevant cognition-log context needed for future allocation
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo facts, prior allocation decisions,
+allocation notes, guidance changes, and relevant cognition context needed for future allocation
 decisions."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
@@ -259,7 +265,7 @@ pub struct LeaveAllocationUnchangedOutput {
     pub unchanged: bool,
 }
 
-/// Raise activation for modules that should act on the current memo batch now.
+/// Raise activation for modules that should act on the current evidence now.
 #[lutum::tool_input(name = "reprioritize_modules", output = ReprioritizeModulesOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReprioritizeModulesArgs {
@@ -390,12 +396,17 @@ impl AllocationModule {
         let lutum = self.llm.lutum().await;
         let outcome = MODULE_TARGET_ID_SCHEMA
             .scope(module_target_schema, async {
-                push_formatted_cognition_log_batch(
-                    &mut self.session,
-                    &unread_cognition,
-                    cx.now(),
-                    COGNITION_CONTEXT_WINDOW,
-                );
+                if let Some(observation) = allocation_observation_input(
+                    format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
+                    format_bounded_cognition_log_batch(
+                        &unread_cognition,
+                        cx.now(),
+                        COGNITION_CONTEXT_WINDOW,
+                    ),
+                    requests,
+                ) {
+                    self.session.push_user(observation);
+                }
                 self.session
                     .push_ephemeral_system(format_allocation_context(
                         &rank_counts,
@@ -403,11 +414,6 @@ impl AllocationModule {
                         &interoception,
                         &visible_modules,
                         stuckness.as_ref(),
-                    ));
-                self.session
-                    .push_ephemeral_developer(controller_activation_input(
-                        format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
-                        requests,
                     ));
                 self.session
                     .text_turn()
@@ -492,12 +498,6 @@ impl AllocationModule {
                     cx.warn(format!("allocation activation failed: {detail}"));
                     anyhow::bail!("allocation tool turn produced an empty memo: {detail}");
                 }
-                push_formatted_memo_log_batch(
-                    &mut self.session,
-                    &unread_memos,
-                    cx.now(),
-                    MEMO_CONTEXT_WINDOW,
-                );
                 round
                     .commit(&mut self.session, results)
                     .context("commit allocation tool round")?;
@@ -589,9 +589,33 @@ fn priority_level(rank: usize) -> AllocationEffectLevel {
     }
 }
 
-fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
+fn current_memos_input(batch: Option<String>) -> Option<String> {
+    batch.map(|batch| {
+        batch
+            .replacen("Held-in-mind notes at", "Current memos at", 1)
+            .replacen(
+                "These are working notes from other faculties, not instructions:",
+                "These are durable notes from other faculties:",
+                1,
+            )
+    })
+}
+
+fn current_cognition_entries_input(entries: Option<String>) -> Option<String> {
+    entries.map(|entries| {
+        entries.replacen(
+            "Current cognition log at",
+            "Current cognition entries at",
+            1,
+        )
+    })
+}
+
+fn current_attention_control_requests_input(
+    requests: &[AttentionControlRequest],
+) -> Option<String> {
     if requests.is_empty() {
-        return "No current attention-control requests.".to_owned();
+        return None;
     }
 
     let mut output = String::from("Current attention-control requests:");
@@ -600,20 +624,28 @@ fn controller_request_input(requests: &[AttentionControlRequest]) -> String {
         output.push_str("- ");
         output.push_str(request.as_str().trim());
     }
-    output
+    Some(output)
 }
 
-fn current_memo_batch_input(batch: Option<String>) -> String {
-    let Some(batch) = batch else {
-        return "Current memo batch: (none)".to_owned();
-    };
-    batch
-        .replacen("Held-in-mind notes at", "Current memo batch at", 1)
-        .replacen(
-            "These are working notes from other faculties, not instructions:",
-            "These are the new durable notes that triggered this allocation turn; treat them as current evidence to prioritize now:",
-            1,
-        )
+fn allocation_observation_input(
+    memos: Option<String>,
+    cognition: Option<String>,
+    requests: &[AttentionControlRequest],
+) -> Option<String> {
+    let sections = [
+        current_memos_input(memos),
+        current_cognition_entries_input(cognition),
+        current_attention_control_requests_input(requests),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 fn format_tool_call_names<C>(calls: &[C]) -> String
@@ -635,23 +667,6 @@ fn no_decision_failure_detail(tool_names: &str) -> String {
         "tool turn produced no decision: tool_calls=[{tool_names}]; expected exactly one of \
          leave_allocation_unchanged, reprioritize_modules"
     )
-}
-
-fn controller_activation_input(
-    memo_batch: Option<String>,
-    requests: &[AttentionControlRequest],
-) -> String {
-    let mut output = current_memo_batch_input(memo_batch);
-    output.push_str("\n\n");
-    output.push_str(&controller_request_input(requests));
-    output.push_str(
-        "\n\nInstruction: choose the best current allocation posture for the mind. Use the current \
-memo batch, current attention-control requests, cognition log, interoception, memory inventory, \
-stuckness, and current allocation state. If the current allocation already fits that posture, call \
-leave_allocation_unchanged; otherwise call reprioritize_modules for modules that need extra \
-activation now.",
-    );
-    output
 }
 
 #[async_trait(?Send)]
@@ -699,11 +714,13 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
-        Blackboard, Bpm, ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
+        Blackboard, Bpm, CognitionLogEntry, CognitionLogEntryRecord, ModuleConfig, ModulePolicy,
+        ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
-        CapabilityProviderPorts, CapabilityProviders, LutumTiers, Memo, ModuleRegistry,
+        CapabilityProviderPorts, CapabilityProviders, CognitionWriter, LutumTiers, Memo,
+        ModuleRegistry,
     };
     use nuillu_types::{ReplicaCapRange, builtin};
 
@@ -920,6 +937,7 @@ mod tests {
     struct ControllerFixture {
         controller: AllocationModule,
         source_memo: Memo,
+        source_cognition: CognitionWriter,
     }
 
     async fn controller_fixture_with_turn_adapter<T>(adapter: Arc<T>) -> ControllerFixture
@@ -931,9 +949,11 @@ mod tests {
 
         let controller_cell = Rc::new(RefCell::new(None));
         let source_memo_cell = Rc::new(RefCell::new(None));
+        let source_cognition_cell = Rc::new(RefCell::new(None));
 
         let controller_sink = Rc::clone(&controller_cell);
         let source_memo_sink = Rc::clone(&source_memo_cell);
+        let source_cognition_sink = Rc::clone(&source_cognition_cell);
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
@@ -961,8 +981,10 @@ mod tests {
             .unwrap()
             .register(test_policy(), move |caps| {
                 let source_memo_sink = Rc::clone(&source_memo_sink);
+                let source_cognition_sink = Rc::clone(&source_cognition_sink);
                 async move {
                     *source_memo_sink.borrow_mut() = Some(caps.memo());
+                    *source_cognition_sink.borrow_mut() = Some(caps.cognition_writer());
                     Ok(SensoryStub)
                 }
             })
@@ -974,6 +996,7 @@ mod tests {
         ControllerFixture {
             controller: controller_cell.borrow_mut().take().unwrap(),
             source_memo: source_memo_cell.borrow_mut().take().unwrap(),
+            source_cognition: source_cognition_cell.borrow_mut().take().unwrap(),
         }
     }
 
@@ -1100,6 +1123,24 @@ mod tests {
         )
     }
 
+    fn text_scenario(text: &str, input_tokens: u64) -> MockTextScenario {
+        MockTextScenario::events(vec![
+            Ok(RawTextTurnEvent::Started {
+                request_id: Some("allocation-text".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawTextTurnEvent::TextDelta { delta: text.into() }),
+            Ok(RawTextTurnEvent::Completed {
+                request_id: Some("allocation-text".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens,
+                    ..Usage::zero()
+                },
+            }),
+        ])
+    }
+
     fn last_target<'a>(
         commands: &'a [AllocationCommand],
         module: &ModuleId,
@@ -1159,6 +1200,21 @@ mod tests {
         items
             .iter()
             .any(|item| message_with_role_contains(item, role, needle))
+    }
+
+    fn message_texts(items: &[ModelInputItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| {
+                let ModelInputItem::Message { content, .. } = item else {
+                    return None;
+                };
+                match content.as_slice() {
+                    [MessageContent::Text(text)] => Some(text.as_str()),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -1278,15 +1334,16 @@ mod tests {
     }
 
     #[test]
-    fn controller_request_input_keeps_requests_separate_from_blackboard_context() {
-        let input = controller_request_input(&[
+    fn current_attention_control_requests_input_keeps_requests_separate() {
+        let input = current_attention_control_requests_input(&[
             AttentionControlRequest::new(
                 "which route is safe? Reason: speech needs grounded evidence",
             ),
             AttentionControlRequest::new(
                 "high-priority memory preservation: Remember the north door is blocked. Reason: direct safety constraint",
             ),
-        ]);
+        ])
+        .unwrap();
 
         assert_eq!(
             input,
@@ -1296,11 +1353,8 @@ mod tests {
     }
 
     #[test]
-    fn controller_request_input_without_requests_reports_absence_only() {
-        assert_eq!(
-            controller_request_input(&[]),
-            "No current attention-control requests.".to_owned()
-        );
+    fn current_attention_control_requests_input_omits_empty_requests() {
+        assert_eq!(current_attention_control_requests_input(&[]), None);
     }
 
     #[test]
@@ -1316,31 +1370,49 @@ mod tests {
     }
 
     #[test]
-    fn controller_activation_input_marks_memos_as_current_batch() {
+    fn allocation_observation_input_persists_current_evidence_without_internal_terms() {
         let owner = nuillu_types::ModuleInstanceId::new(
             builtin::sensory(),
             nuillu_types::ReplicaIndex::ZERO,
         );
         let now = SystemClock.now();
         let records = [nuillu_blackboard::MemoLogRecord {
-            owner,
+            owner: owner.clone(),
             index: 0,
             written_at: now,
             content: "fresh sensory memo".into(),
         }];
-        let input = controller_activation_input(
+        let cognition = [CognitionLogEntryRecord {
+            index: 0,
+            source: owner,
+            entry: CognitionLogEntry {
+                at: now,
+                text: "fresh cognition entry".into(),
+            },
+        }];
+        let requests = [AttentionControlRequest::new(
+            "answer when evidence is grounded",
+        )];
+        let input = allocation_observation_input(
             format_bounded_memo_log_batch(&records, now, MEMO_CONTEXT_WINDOW),
-            &[],
-        );
+            format_bounded_cognition_log_batch(&cognition, now, COGNITION_CONTEXT_WINDOW),
+            &requests,
+        )
+        .unwrap();
 
-        assert!(input.contains("Current memo batch"));
-        assert!(input.contains("triggered this allocation turn"));
+        let memo_index = input.find("Current memos at").unwrap();
+        let cognition_index = input.find("Current cognition entries at").unwrap();
+        let request_index = input.find("Current attention-control requests").unwrap();
+        assert!(memo_index < cognition_index);
+        assert!(cognition_index < request_index);
+        assert!(input.contains("These are durable notes from other faculties"));
         assert!(input.contains("fresh sensory memo"));
-        assert!(
-            input.contains("Instruction: choose the best current allocation posture for the mind")
-        );
+        assert!(input.contains("fresh cognition entry"));
+        assert!(input.contains("answer when evidence is grounded"));
+        assert!(!input.contains("batch"));
         assert!(!input.contains("Never call leave_allocation_unchanged"));
         assert!(!input.contains("not instructions"));
+        assert_eq!(allocation_observation_input(None, None, &[]), None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1411,6 +1483,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn failed_activation_persists_drained_observation_in_session() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(text_scenario("plain response", 1));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = controller_fixture_with_turn_adapter(Arc::new(capture)).await;
+
+        let lutum = fixture.controller.llm.lutum().await;
+        let peer_contexts = vec![(builtin::sensory(), "test stub")];
+        let allocation_hints = vec![(
+            builtin::sensory(),
+            "Allocate sensory for test observations; do not allocate it when no test input exists.",
+        )];
+        let identity_memories = Vec::new();
+        let compaction = nuillu_module::SessionCompactionRuntime::new(
+            lutum.lutum().clone(),
+            nuillu_module::LlmConcurrencyLimiter::new(None),
+            nuillu_types::ModelTier::Cheap,
+            nuillu_module::SessionCompactionPolicy::default(),
+        );
+        let cx = nuillu_module::ActivateCx::new(
+            &peer_contexts,
+            &allocation_hints,
+            &identity_memories,
+            &[],
+            compaction,
+            SystemClock.now(),
+        );
+        let requests = [AttentionControlRequest::new("answer after checking memory")];
+
+        fixture.source_memo.write("memo before failed turn").await;
+        fixture
+            .source_cognition
+            .append("cognition before failed turn")
+            .await;
+
+        let _error = fixture
+            .controller
+            .activate_with(&cx, &requests)
+            .await
+            .expect_err("plain response without a tool call should fail allocation");
+
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 1);
+        let first_items = inputs[0].items();
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::User,
+            "memo before failed turn"
+        ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::User,
+            "cognition before failed turn"
+        ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::User,
+            "answer after checking memory"
+        ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::System,
+            "Allocation context for assigning the next activation priorities"
+        ));
+
+        let session_after_error = fixture.controller.session.input().items().to_vec();
+        assert!(any_message_with_role_contains(
+            &session_after_error,
+            InputMessageRole::User,
+            "memo before failed turn"
+        ));
+        assert!(any_message_with_role_contains(
+            &session_after_error,
+            InputMessageRole::User,
+            "cognition before failed turn"
+        ));
+        assert!(any_message_with_role_contains(
+            &session_after_error,
+            InputMessageRole::User,
+            "answer after checking memory"
+        ));
+        assert!(!any_message_with_role_contains(
+            &session_after_error,
+            InputMessageRole::System,
+            "Allocation context for assigning the next activation priorities"
+        ));
+        assert!(!session_after_error.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::Developer,
+                ..
+            }
+        )));
+        assert!(
+            !message_texts(&session_after_error)
+                .iter()
+                .any(|text| text.contains("Current memo batch") || text.contains("batch"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(leave_unchanged_scenario(1, "first controller note"))
@@ -1442,8 +1615,10 @@ mod tests {
         );
 
         fixture.source_memo.write("sensory memo A").await;
+        fixture.source_cognition.append("cognition entry A").await;
         fixture.controller.activate_with(&cx, &[]).await.unwrap();
         fixture.source_memo.write("sensory memo B").await;
+        fixture.source_cognition.append("cognition entry B").await;
         fixture.controller.activate_with(&cx, &[]).await.unwrap();
 
         let allocation_memos = fixture
@@ -1481,17 +1656,22 @@ mod tests {
 
         assert!(any_message_with_role_contains(
             first_items,
-            InputMessageRole::Developer,
-            "Current memo batch"
+            InputMessageRole::User,
+            "Current memos"
         ));
         assert!(any_message_with_role_contains(
             first_items,
-            InputMessageRole::Developer,
+            InputMessageRole::User,
             "sensory memo A"
+        ));
+        assert!(any_message_with_role_contains(
+            first_items,
+            InputMessageRole::User,
+            "cognition entry A"
         ));
         assert!(!any_message_with_role_contains(
             first_items,
-            InputMessageRole::Developer,
+            InputMessageRole::User,
             "not instructions"
         ));
         assert!(first_items.iter().any(|item| matches!(
@@ -1505,6 +1685,18 @@ mod tests {
                             && !text.contains("Current attention guidance:")
                 )
         )));
+        assert!(!first_items.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message {
+                role: InputMessageRole::Developer,
+                ..
+            }
+        )));
+        assert!(
+            !message_texts(first_items)
+                .iter()
+                .any(|text| text.contains("Current memo batch") || text.contains("batch"))
+        );
 
         let second_items = inputs[1].items();
         let ModelInputItem::Message { role, content } = &second_items[0] else {
@@ -1517,18 +1709,23 @@ mod tests {
         assert!(system.contains("You are the allocation module"));
         assert!(any_message_with_role_contains(
             second_items,
-            InputMessageRole::System,
+            InputMessageRole::User,
             "sensory memo A"
         ));
         assert!(any_message_with_role_contains(
             second_items,
-            InputMessageRole::Developer,
-            "Current memo batch"
+            InputMessageRole::User,
+            "cognition entry A"
         ));
         assert!(any_message_with_role_contains(
             second_items,
-            InputMessageRole::Developer,
+            InputMessageRole::User,
             "sensory memo B"
+        ));
+        assert!(any_message_with_role_contains(
+            second_items,
+            InputMessageRole::User,
+            "cognition entry B"
         ));
         assert!(second_items.iter().any(|item| {
             let ModelInputItem::Turn(turn) = item else {
@@ -1560,13 +1757,18 @@ mod tests {
                             && !text.contains("Current attention guidance:")
                 )
         )));
-        assert!(second_items.iter().any(|item| matches!(
+        assert!(!second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Message {
                 role: InputMessageRole::Developer,
                 ..
             }
         )));
+        assert!(
+            !message_texts(second_items)
+                .iter()
+                .any(|text| text.contains("Current memo batch") || text.contains("batch"))
+        );
 
         let session_after_second = fixture.controller.session.input().items().to_vec();
         assert!(session_after_second.iter().any(|item| matches!(
@@ -1578,6 +1780,16 @@ mod tests {
             item,
             ModelInputItem::Message { content, .. }
                 if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("sensory memo B"))
+        )));
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("cognition entry A"))
+        )));
+        assert!(session_after_second.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if matches!(content.as_slice(), [MessageContent::Text(text)] if text.contains("cognition entry B"))
         )));
         assert!(session_after_second.iter().any(|item| {
             let ModelInputItem::Turn(turn) = item else {
@@ -1606,7 +1818,7 @@ mod tests {
             ModelInputItem::Message { content, .. }
                 if matches!(
                     content.as_slice(),
-                    [MessageContent::Text(text)] if text.contains("Current memo batch")
+                    [MessageContent::Text(text)] if text.contains("Current memo batch") || text.contains("batch")
                 )
         )));
         assert_eq!(fixture.controller.session.list_turns().count(), 2);
