@@ -304,6 +304,24 @@ fn render_module_activity_plot(
     ui.strong(ui.ctx().tr("resource-monitor-allocation-activity"));
     ui.label(ui.ctx().tr("resource-monitor-allocation-activity-help"));
     let activity_scale = module_activity_load_scale(state, selected_modules, now_secs);
+    let allocation_series_names = selected_modules
+        .iter()
+        .map(|module| {
+            ui.ctx().tr_args(
+                "resource-monitor-module-allocation-series",
+                &[("module", I18nArg::from(module.as_str()))],
+            )
+        })
+        .collect::<Vec<_>>();
+    let runtime_load_series_names = selected_modules
+        .iter()
+        .map(|module| {
+            ui.ctx().tr_args(
+                "resource-monitor-module-runtime-load-series",
+                &[("module", I18nArg::from(module.as_str()))],
+            )
+        })
+        .collect::<Vec<_>>();
     Plot::new("resource-monitor-module-activity")
         .height(MODULE_PLOT_HEIGHT)
         .allow_scroll(false)
@@ -323,7 +341,7 @@ fn render_module_activity_plot(
                 let activation = module_activation_points(state, module, now_secs);
                 if !activation.is_empty() {
                     plot_ui.line(
-                        Line::new(format!("{module} allocation"), activation)
+                        Line::new(allocation_series_names[index].clone(), activation)
                             .color(color)
                             .width(1.4),
                     );
@@ -332,7 +350,7 @@ fn render_module_activity_plot(
                 let activity = module_activity_load_points(state, module, now_secs, activity_scale);
                 if !activity.is_empty() {
                     plot_ui.line(
-                        Line::new(format!("{module} runtime load"), activity)
+                        Line::new(runtime_load_series_names[index].clone(), activity)
                             .color(translucent(color))
                             .width(0.9),
                     );
@@ -344,6 +362,35 @@ fn render_module_activity_plot(
 pub fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState, now_secs: f64) {
     ui.strong(ui.ctx().tr("resource-monitor-interoception"));
     ui.label(ui.ctx().tr("resource-monitor-interoception-help"));
+    let lines = [
+        (
+            ui.ctx().tr("resource-monitor-series-wake-arousal"),
+            Color32::from_rgb(64, 160, 224),
+            interoception_points(state, now_secs, |view| f64::from(view.wake_arousal)),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-nrem-pressure"),
+            Color32::from_rgb(160, 132, 220),
+            interoception_points(state, now_secs, |view| f64::from(view.nrem_pressure)),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-rem-pressure"),
+            Color32::from_rgb(224, 128, 96),
+            interoception_points(state, now_secs, |view| f64::from(view.rem_pressure)),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-affect-arousal"),
+            Color32::from_rgb(232, 184, 64),
+            interoception_points(state, now_secs, |view| f64::from(view.affect_arousal)),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-valence-norm"),
+            Color32::from_rgb(88, 184, 128),
+            interoception_points(state, now_secs, |view| {
+                (f64::from(view.valence) + 1.0) / 2.0
+            }),
+        ),
+    ];
     Plot::new("resource-monitor-interoception")
         .height(INTEROCEPTION_PLOT_HEIGHT)
         .allow_scroll(false)
@@ -358,35 +405,6 @@ pub fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState
         .show(ui, |plot_ui| {
             plot_ui.set_plot_bounds_x(-state.window.secs()..=0.0);
             plot_ui.set_plot_bounds_y(0.0..=1.0);
-            let lines = [
-                (
-                    "wake arousal",
-                    Color32::from_rgb(64, 160, 224),
-                    interoception_points(state, now_secs, |view| f64::from(view.wake_arousal)),
-                ),
-                (
-                    "nrem pressure",
-                    Color32::from_rgb(160, 132, 220),
-                    interoception_points(state, now_secs, |view| f64::from(view.nrem_pressure)),
-                ),
-                (
-                    "rem pressure",
-                    Color32::from_rgb(224, 128, 96),
-                    interoception_points(state, now_secs, |view| f64::from(view.rem_pressure)),
-                ),
-                (
-                    "affect arousal",
-                    Color32::from_rgb(232, 184, 64),
-                    interoception_points(state, now_secs, |view| f64::from(view.affect_arousal)),
-                ),
-                (
-                    "valence norm",
-                    Color32::from_rgb(88, 184, 128),
-                    interoception_points(state, now_secs, |view| {
-                        (f64::from(view.valence) + 1.0) / 2.0
-                    }),
-                ),
-            ];
             for (name, color, points) in lines {
                 if !points.is_empty() {
                     plot_ui.line(Line::new(name, points).color(color).width(1.5));
@@ -404,6 +422,48 @@ fn render_throughput_plot(
     let y_max = throughput_y_max(state, selected_modules, now_secs);
     ui.strong(ui.ctx().tr("resource-monitor-throughput"));
     ui.label(ui.ctx().tr("resource-monitor-throughput-help"));
+    let lines = [
+        (
+            ui.ctx().tr("resource-monitor-series-batches"),
+            Color32::from_rgb(72, 150, 220),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| {
+                counts.batch_ready
+            }),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-activations"),
+            Color32::from_rgb(92, 184, 124),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| {
+                counts.activations_completed
+            }),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-failed-activations"),
+            Color32::from_rgb(224, 80, 72),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| {
+                counts.activations_failed
+            }),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-throttles"),
+            Color32::from_rgb(224, 168, 64),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| counts.throttles),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-llm-access"),
+            Color32::from_rgb(156, 112, 220),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| {
+                counts.llm_accessed + counts.llm_completed
+            }),
+        ),
+        (
+            ui.ctx().tr("resource-monitor-series-compaction"),
+            Color32::from_rgb(120, 168, 176),
+            aggregate_event_points(state, selected_modules, now_secs, |counts| {
+                counts.compactions()
+            }),
+        ),
+    ];
     Plot::new("resource-monitor-throughput")
         .height(THROUGHPUT_PLOT_HEIGHT)
         .allow_scroll(false)
@@ -418,50 +478,6 @@ fn render_throughput_plot(
         .show(ui, |plot_ui| {
             plot_ui.set_plot_bounds_x(-state.window.secs()..=0.0);
             plot_ui.set_plot_bounds_y(0.0..=y_max);
-            let lines = [
-                (
-                    "batches",
-                    Color32::from_rgb(72, 150, 220),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.batch_ready
-                    }),
-                ),
-                (
-                    "activations",
-                    Color32::from_rgb(92, 184, 124),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.activations_completed
-                    }),
-                ),
-                (
-                    "failed activations",
-                    Color32::from_rgb(224, 80, 72),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.activations_failed
-                    }),
-                ),
-                (
-                    "throttles",
-                    Color32::from_rgb(224, 168, 64),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.throttles
-                    }),
-                ),
-                (
-                    "llm access",
-                    Color32::from_rgb(156, 112, 220),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.llm_accessed + counts.llm_completed
-                    }),
-                ),
-                (
-                    "compaction",
-                    Color32::from_rgb(120, 168, 176),
-                    aggregate_event_points(state, selected_modules, now_secs, |counts| {
-                        counts.compactions()
-                    }),
-                ),
-            ];
             for (name, color, points) in lines {
                 if !points.is_empty() {
                     plot_ui.line(Line::new(name, points).color(color).width(1.5));

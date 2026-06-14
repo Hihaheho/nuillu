@@ -26,6 +26,18 @@ const ATMOSPHERE_ASPECTS: [&str; 6] = [
     "other",
 ];
 
+fn atmosphere_aspect_label(ctx: &egui::Context, aspect: &str) -> String {
+    match aspect {
+        "light" => ctx.tr("scene-atmosphere-aspect-light"),
+        "smell" => ctx.tr("scene-atmosphere-aspect-smell"),
+        "temperature" => ctx.tr("scene-atmosphere-aspect-temperature"),
+        "air/weather" => ctx.tr("scene-atmosphere-aspect-air-weather"),
+        "surface/feel" => ctx.tr("scene-atmosphere-aspect-surface-feel"),
+        "other" => ctx.tr("scene-atmosphere-aspect-other"),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActivityRole {
     User,
@@ -34,11 +46,11 @@ enum ActivityRole {
 }
 
 impl ActivityRole {
-    fn label(&self) -> &'static str {
+    fn tr_key(&self) -> &'static str {
         match self {
-            Self::User => "sensory",
-            Self::Environment => "ambient",
-            Self::Assistant => "nui",
+            Self::User => "scene-activity-role-sensory",
+            Self::Environment => "scene-activity-role-ambient",
+            Self::Assistant => "scene-activity-role-nui",
         }
     }
 }
@@ -852,13 +864,17 @@ fn atmosphere_section_ui(
                 let before = row.aspect.clone();
                 egui::ComboBox::from_id_salt(format!("atmosphere-aspect-{row_id}"))
                     .selected_text(if row.aspect.is_empty() {
-                        "other"
+                        ui.ctx().tr("scene-atmosphere-aspect-other")
                     } else {
-                        row.aspect.as_str()
+                        atmosphere_aspect_label(ui.ctx(), row.aspect.as_str())
                     })
                     .show_ui(ui, |ui| {
                         for aspect in ATMOSPHERE_ASPECTS {
-                            ui.selectable_value(&mut row.aspect, aspect.to_string(), aspect);
+                            ui.selectable_value(
+                                &mut row.aspect,
+                                aspect.to_string(),
+                                atmosphere_aspect_label(ui.ctx(), aspect),
+                            );
                         }
                     });
                 send_update |= row.aspect != before;
@@ -1031,7 +1047,7 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong(message.role.label());
+                ui.strong(ui.ctx().tr(message.role.tr_key()));
                 if message.streaming {
                     ui.label(ui.ctx().tr("scene-streaming"));
                 }

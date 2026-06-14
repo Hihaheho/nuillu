@@ -235,10 +235,19 @@ fn memory_list(
                         if !record.concepts.is_empty() || !record.tags.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 for concept in &record.concepts {
-                                    ui.label(format!("concept:{}", concept.label));
+                                    ui.label(ui.ctx().tr_args(
+                                        "memory-concept-label",
+                                        &[("concept", I18nArg::from(concept.label.as_str()))],
+                                    ));
                                 }
                                 for tag in &record.tags {
-                                    ui.label(format!("tag:{}:{}", tag.namespace, tag.label));
+                                    ui.label(ui.ctx().tr_args(
+                                        "memory-tag-label",
+                                        &[
+                                            ("namespace", I18nArg::from(tag.namespace.as_str())),
+                                            ("tag", I18nArg::from(tag.label.as_str())),
+                                        ],
+                                    ));
                                 }
                             });
                         }

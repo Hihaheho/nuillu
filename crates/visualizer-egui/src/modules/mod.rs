@@ -668,10 +668,19 @@ pub fn render_module(
     ui.horizontal(|ui| {
         ui.heading(module_title(module));
         if let Some(tier) = &module.last_tier {
-            ui.label(format!("tier: {tier}"));
+            ui.label(ui.ctx().tr_args(
+                "module-tier-label",
+                &[("tier", I18nArg::from(tier.as_str()))],
+            ));
         }
-        ui.label(format!("memos: {}", module_memos.len()));
-        ui.label(format!("turns: {}", module.turns.len()));
+        ui.label(ui.ctx().tr_args(
+            "module-memos-count",
+            &[("count", module_memos.len().into())],
+        ));
+        ui.label(ui.ctx().tr_args(
+            "module-turns-count",
+            &[("count", module.turns.len().into())],
+        ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button(ui.ctx().tr("module-reset")).clicked() {
                 actions.push(ModuleWindowAction::ResetSessionHistory {
@@ -804,7 +813,10 @@ fn render_module_selector(
         .id_salt(format!("module-panel-list:{}", module.owner))
         .show(ui, |ui| {
             if ui
-                .selectable_label(selected_panel == MODULE_MEMOS_SELECTION, "memos")
+                .selectable_label(
+                    selected_panel == MODULE_MEMOS_SELECTION,
+                    ui.ctx().tr("module-memos"),
+                )
                 .clicked()
             {
                 *next_panel = MODULE_MEMOS_SELECTION.to_string();
@@ -846,7 +858,7 @@ fn render_llm_turn_selector(
                     failed_turn_frame(ui, status).show(ui, |ui| {
                         let response = ui
                             .selectable_label(selected, &row.label)
-                            .on_hover_text(llm_turn_row_hover(row));
+                            .on_hover_text(llm_turn_row_hover(ui.ctx(), row));
                         if response.clicked() {
                             *selected_turn_id = Some(row.turn_id.clone());
                         }
@@ -869,8 +881,14 @@ fn failed_turn_frame(ui: &egui::Ui, status: ModuleSessionStatus) -> egui::Frame 
 fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoView]) {
     ui.horizontal_wrapped(|ui| {
         ui.strong(ui.ctx().tr("module-memos"));
-        ui.label(format!("module: {}", module_name(module)));
-        ui.label(format!("count: {}", memos.len()));
+        ui.label(ui.ctx().tr_args(
+            "module-name-label",
+            &[("module", module_name(module).into())],
+        ));
+        ui.label(
+            ui.ctx()
+                .tr_args("module-count-label", &[("count", memos.len().into())]),
+        );
     });
     ui.separator();
     egui::ScrollArea::vertical()
@@ -922,15 +940,27 @@ fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmT
             ui.label(model);
         }
         if let Some(request_id) = &turn.request_id {
-            wrapped_label(ui, &format!("request: {request_id}"));
+            wrapped_label(
+                ui,
+                &ui.ctx().tr_args(
+                    "module-request-label",
+                    &[("request", I18nArg::from(request_id.as_str()))],
+                ),
+            );
         }
         if let Some(finish_reason) = &turn.finish_reason {
-            ui.label(format!("finish: {finish_reason}"));
+            ui.label(ui.ctx().tr_args(
+                "module-finish-label",
+                &[("finish", I18nArg::from(finish_reason.as_str()))],
+            ));
         }
         if let Some(usage) = &turn.usage {
-            ui.label(format!(
-                "tokens: {}/{}",
-                usage.input_tokens, usage.output_tokens
+            ui.label(ui.ctx().tr_args(
+                "module-token-counts",
+                &[
+                    ("input", I18nArg::from(usage.input_tokens as i64)),
+                    ("output", I18nArg::from(usage.output_tokens as i64)),
+                ],
             ));
         }
     });
@@ -969,7 +999,7 @@ fn render_batch_item(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("batch");
+                ui.strong(ui.ctx().tr("module-batch"));
                 wrapped_label(ui, &batch.batch_type);
             });
             ui.add_space(3.0);
@@ -997,7 +1027,7 @@ fn render_input_item(
                 ui.strong(&item.role);
                 ui.label(&item.kind);
                 if item.ephemeral {
-                    ui.label("ephemeral");
+                    ui.label(ui.ctx().tr("module-ephemeral"));
                 }
                 if let Some(source) = &item.source {
                     wrapped_label(ui, source);
@@ -1022,10 +1052,10 @@ fn render_output_item(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("assistant");
+                ui.strong(ui.ctx().tr("module-assistant"));
                 ui.label(&item.kind);
                 if item.streaming {
-                    ui.label("streaming");
+                    ui.label(ui.ctx().tr("module-streaming"));
                 }
                 if let Some(source) = &item.source {
                     wrapped_label(ui, source);
@@ -1055,7 +1085,7 @@ fn render_input_item_content(
                     item.kind.as_str(),
                     item.source.as_deref(),
                 ),
-                "tool input JSON",
+                ui.ctx().tr("module-tool-input-json").as_str(),
                 &item.content,
             ) {
                 wrapped_label(ui, &item.content);
@@ -1072,8 +1102,8 @@ fn render_input_item_content(
                         index,
                         item.source.as_deref(),
                     ),
-                    "tool input JSON",
-                    "arguments",
+                    ui.ctx().tr("module-tool-input-json").as_str(),
+                    ui.ctx().tr("module-arguments").as_str(),
                     arguments,
                 );
                 ui.add_space(4.0);
@@ -1086,8 +1116,8 @@ fn render_input_item_content(
                         index,
                         item.source.as_deref(),
                     ),
-                    "tool output JSON",
-                    "result",
+                    ui.ctx().tr("module-tool-output-json").as_str(),
+                    ui.ctx().tr("module-result").as_str(),
                     result,
                 );
             } else {
@@ -1106,8 +1136,8 @@ fn render_output_item_content(
     index: usize,
 ) {
     let json_label = match item.kind.as_str() {
-        "structured" | "structured_ready" => Some("structured JSON"),
-        "tool_call_ready" => Some("tool input JSON"),
+        "structured" | "structured_ready" => Some(ui.ctx().tr("module-structured-json")),
+        "tool_call_ready" => Some(ui.ctx().tr("module-tool-input-json")),
         _ => None,
     };
     if let Some(label) = json_label
@@ -1121,7 +1151,7 @@ fn render_output_item_content(
                 item.kind.as_str(),
                 item.source.as_deref(),
             ),
-            label,
+            &label,
             &item.content,
         )
     {
@@ -1236,7 +1266,9 @@ fn render_turn_error_banner(ui: &mut egui::Ui, message: &str) {
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.strong(egui::RichText::new("error").color(ui.visuals().error_fg_color));
+            ui.strong(
+                egui::RichText::new(ui.ctx().tr("module-error")).color(ui.visuals().error_fg_color),
+            );
             ui.add(
                 egui::Label::new(egui::RichText::new(display).monospace())
                     .wrap()
@@ -1602,7 +1634,10 @@ fn overview_module_cell(
         egui::Button::new(&row.module),
     );
     if row.owner != row.module {
-        response = response.on_hover_text(format!("open {}", row.owner));
+        response = response.on_hover_text(ui.ctx().tr_args(
+            "module-open-hover",
+            &[("module", I18nArg::from(row.owner.as_str()))],
+        ));
     }
     if response.clicked() {
         actions.push(ModuleOverviewAction::OpenModule {
@@ -2149,11 +2184,11 @@ fn llm_turn_row_label(
     }
 }
 
-fn llm_turn_row_hover(row: &LlmTurnListRow) -> String {
+fn llm_turn_row_hover(ctx: &egui::Context, row: &LlmTurnListRow) -> String {
     let status = if row.streaming {
-        "streaming"
+        ctx.tr("module-streaming")
     } else {
-        "not streaming"
+        ctx.tr("module-not-streaming")
     };
     format!("{} {} ({status})", row.owner, row.turn_id)
 }
