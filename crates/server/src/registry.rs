@@ -64,7 +64,6 @@ fn register_server_module(
         RuntimeModule::Sensory => registry.register_server(spec, |caps| async move {
             Ok(nuillu_sensory::SensoryModule::new(
                 caps.sensory_input_inbox(),
-                caps.allocation_reader(),
                 caps.memo(),
                 caps.scene_reader(),
                 caps.clock(),

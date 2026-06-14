@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{MessageContent, ModelInputItem, Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SceneReader, SensoryInput,
-    SensoryInputInbox, SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
+    AmbientSensoryEntry, LlmAccess, Memo, Module, SceneReader, SensoryInput, SensoryInputInbox,
+    SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, ports::Clock,
 };
 use schemars::JsonSchema;
@@ -29,12 +29,13 @@ or familiar. Kept events become durable sensory evidence that other cognitive mo
 the agent's behavior."#;
 
 const AMBIENT_SYSTEM_PROMPT: &str = r#"You are the ambient sensory diff filter.
-You receive changes derived from ambient sensory snapshots. Ambient rows are background conditions;
-the input describes what changed since the previous active ambient snapshot. Use tools for every
-decision: call broadcast_sensory for durable sensory memo-log output, or ignore_ambient_diff when
-the diff should not be written. Do not use final assistant text as an output channel. Memo text must
-contain observed scene facts only. Do not mention tools, prompts, scores, schemas, rubrics, or
-implementation details in memo text. Do not write to the cognition log, memory, or emit
+You receive changes derived from the host's current ambient sensory field. Ambient entries are
+host-provided context records; the input describes additions, updates, and removals since the
+previous active field. Use tools for every decision: call broadcast_sensory for durable sensory
+memo-log output, or ignore_ambient_diff when the change should not be written. Do not use final
+assistant text as an output channel. Memo text must contain observed scene facts only. Do not write
+about ambient entries, snapshots, diffs, row state, guidance, tools, prompts, scores, schemas,
+rubrics, or implementation details in memo text. Do not write to the cognition log, memory, or emit
 utterances."#;
 
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -127,7 +128,6 @@ struct PreparedAmbientObservation {
 pub struct SensoryModule {
     owner: nuillu_types::ModuleId,
     inbox: SensoryInputInbox,
-    allocation: AllocationReader,
     memo: Memo,
     scene: SceneReader,
     clock: Rc<dyn Clock>,
@@ -235,7 +235,6 @@ impl Default for SensoryBurstConfig {
 impl SensoryModule {
     pub fn new(
         inbox: SensoryInputInbox,
-        allocation: AllocationReader,
         memo: Memo,
         scene: SceneReader,
         clock: Rc<dyn Clock>,
@@ -248,7 +247,6 @@ impl SensoryModule {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("sensory id is valid"),
             inbox,
-            allocation,
             memo,
             scene,
             clock,
@@ -574,17 +572,15 @@ impl SensoryModule {
         now: DateTime<Utc>,
     ) -> Result<()> {
         self.ensure_ambient_session_seeded(cx);
-        let allocation = self.allocation.snapshot().await;
-        let guidance = allocation.for_module(&self.owner).guidance;
         let lutum = self.llm.lutum().await;
         let (outcome, session_len_before_turn) = {
             let session_len_before_turn = self.ambient_session.input().items().len();
             self.ambient_session
                 .push_user(format_ambient_diff(observations, now));
             self.ambient_session
-                .push_ephemeral_developer(format_ambient_decision_context(
-                    &guidance,
-                    &format_current_ambient_context(&self.ambient_entries, now),
+                .push_ephemeral_developer(format_current_ambient_context(
+                    &self.ambient_entries,
+                    now,
                 ));
             let turn = self
                 .ambient_session
@@ -815,7 +811,7 @@ impl SensoryModule {
 
     async fn broadcast_sensory(&self, args: BroadcastSensoryArgs) -> BroadcastSensoryOutput {
         let memo = args.memo.trim();
-        let written = !memo.is_empty();
+        let written = !memo.is_empty() && !contains_ambient_plumbing(memo);
         if written {
             self.memo.write(memo.to_owned()).await;
         }
@@ -1073,9 +1069,7 @@ fn format_current_ambient_context(
     if entries.is_empty() {
         out.push_str("\n- none");
     } else {
-        out.push_str(
-            "\nThese are currently enabled background rows. They are dynamic context, not durable conclusions.",
-        );
+        out.push_str("\nThese entries are dynamic context for filtering, not durable conclusions.");
         for (id, entry) in entries {
             out.push_str(&format!(
                 "\n- [{}] {}: {}",
@@ -1090,11 +1084,11 @@ fn format_current_ambient_context(
 
 fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTime<Utc>) -> String {
     let mut out = format!(
-        "Ambient sensory snapshot diff received at {}:",
+        "Ambient sensory field changes received at {}:",
         now.to_rfc3339()
     );
     out.push_str(
-        "\nAmbient entries are enabled background rows only; removal from the active ambient field is not proof that a condition disappeared.",
+        "\nAmbient entries are host-provided context records; removal from the active field is not proof that a condition disappeared.",
     );
     if observations.is_empty() {
         out.push_str("\n- none");
@@ -1114,17 +1108,38 @@ fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTim
     out
 }
 
-fn format_ambient_decision_context(guidance: &str, current_ambient_context: &str) -> String {
-    let mut out = String::from("Current sensory guidance: ");
-    let guidance = guidance.trim();
-    if guidance.is_empty() {
-        out.push_str("none");
-    } else {
-        out.push_str(guidance);
-    }
-    out.push_str("\n\n");
-    out.push_str(current_ambient_context);
-    out
+fn contains_ambient_plumbing(text: &str) -> bool {
+    let normalized = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        "sensory guidance",
+        "background row",
+        "background rows",
+        "ambient row",
+        "ambient rows",
+        "ambient entry",
+        "ambient entries",
+        "ambient added",
+        "ambient updated",
+        "ambient removed",
+        "data background",
+        "since the last snapshot",
+        "ambient snapshot",
+        "active ambient snapshot",
+        "snapshot diff",
+        "ambient diff",
+        "diff received",
+        "ambient sensory field changes",
+        "current ambient sensory field",
+        "host-provided context records",
+        "row id",
+        "row state",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 #[async_trait(?Send)]
@@ -1459,7 +1474,6 @@ mod tests {
                 async move {
                     let mut inner = SensoryModule::new(
                         caps.sensory_input_inbox(),
-                        caps.allocation_reader(),
                         caps.memo(),
                         caps.scene_reader(),
                         caps.clock(),
@@ -1668,7 +1682,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_snapshot_format_marks_background_context() {
+    fn ambient_snapshot_format_marks_host_context_records() {
         let observations = vec![PreparedAmbientObservation {
             kind: AmbientObservationKind::AmbientAdded,
             modality: SensoryModality::Smell,
@@ -1679,9 +1693,10 @@ mod tests {
         }];
         let text = format_ambient_diff(&observations, reference_now());
 
-        assert!(text.contains("Ambient entries are enabled background rows only"));
+        assert!(text.contains("Ambient entries are host-provided context records"));
         assert!(text.contains("ambient added smell [row-1]"));
         assert!(text.contains("wet stone smell"));
+        assert!(!text.contains("background rows"));
         assert!(!text.contains("salience_score"));
     }
 
@@ -1700,8 +1715,30 @@ mod tests {
         let text = format_current_ambient_context(&entries, reference_now());
 
         assert!(text.contains("Current ambient sensory field at 2026-05-07T12:00:00+00:00"));
+        assert!(text.contains("dynamic context for filtering"));
         assert!(text.contains("[ambient-1] vision: lamp is on"));
         assert!(text.contains("[ambient-2] audition: fan hum"));
+        assert!(!text.contains("background rows"));
+    }
+
+    #[test]
+    fn ambient_plumbing_guard_preserves_scene_uses_of_common_words() {
+        assert!(contains_ambient_plumbing(
+            "No ambient sensory guidance is currently active; no background rows have been added since the last snapshot."
+        ));
+        assert!(contains_ambient_plumbing(
+            "Ambient sensory field changes received at 2026-05-07T12:00:00Z."
+        ));
+
+        assert!(!contains_ambient_plumbing(
+            "A metal tool rests on the table beside a snapshot photo."
+        ));
+        assert!(!contains_ambient_plumbing(
+            "A schema diagram and implementation note are visible on the exhibit wall."
+        ));
+        assert!(!contains_ambient_plumbing(
+            "The light is different from earlier and the room remains quiet."
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1995,6 +2032,8 @@ mod tests {
                 assert!(first.contains("ambient added vision [ambient-1]"));
                 assert!(first.contains("lamp is on"));
                 assert!(!first.contains("Current ambient sensory field"));
+                assert!(!first.contains("Current sensory guidance"));
+                assert!(!first.contains("background rows"));
                 assert!(first.contains("ambient updated vision [ambient-1]"));
                 assert!(first.contains("was vision: lamp is on; now vision: lamp is off"));
                 assert!(first.contains("ambient removed vision [ambient-1]"));
@@ -2006,6 +2045,49 @@ mod tests {
                     ephemeral_indices.iter().all(|indices| indices.len() == 1),
                     "ambient sensory LLM turn should carry decision context as an ephemeral item"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambient_internal_plumbing_memo_is_rejected() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new().with_text_scenario(write_memo_scenario(
+                    "No ambient sensory guidance is currently active; no background rows have been added since the last snapshot.",
+                    0,
+                ));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(ambient(vec![ambient_entry(
+                            "ambient-1",
+                            SensoryModality::Vision,
+                            "Ryo is present at Front.",
+                        )]))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_ambient_session_count(&recorder, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert!(logs.is_empty());
             })
             .await;
     }

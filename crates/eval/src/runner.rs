@@ -4982,7 +4982,6 @@ fn register_eval_module(
                     |caps| async move {
                         Ok(nuillu_sensory::SensoryModule::new(
                             caps.sensory_input_inbox(),
-                            caps.allocation_reader(),
                             caps.memo(),
                             caps.scene_reader(),
                             caps.clock(),

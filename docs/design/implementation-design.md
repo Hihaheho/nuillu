@@ -383,7 +383,7 @@ Module conventions:
 - Memory-compaction, memory-association, memory-recombination, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update allocation before they read compaction/recombination guidance.
 - Reward wakes from policy-consideration custom evictions. These evictions are work-carrying payloads and are collected into a batch in `next_batch`; reward activation does not drain the custom queue.
 - Speak batches ready `CognitionLogUpdated` wake signals, then uses its optional `speak_to` tool to decide whether that activation emits. Cognition-log updates received during a generation stream remain queued for the next Speak batch.
-- Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring. Allocation guidance is read during input processing, but allocation updates alone do not wake sensory.
+- Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring. Allocation controls sensory activation and tier externally, but sensory does not read allocation guidance.
 
 ### Replica-owned blackboard views
 
@@ -539,13 +539,13 @@ Activation gating is event-loop owned. The role-specific capability lists below 
 
 ### Sensory
 
-Capabilities: `SensoryInputInbox`, `AllocationReader`, `Memo`, `Clock`, `LlmAccess`.
+Capabilities: `SensoryInputInbox`, `Memo`, `Clock`, `LlmAccess`.
 
 Receives external one-shot stimuli and ambient snapshots, computes deterministic salience features, then uses an LLM tool turn to decide whether to ignore the stimulus/diff or write a concise normalized observation to the sensory memo. Memo writes happen only through the sensory memo-writing tool. Memo text should use the observation datetime and detailed relative-age formatting, for example `Ryo said "..." 1 minute 20 seconds ago`. It does not read the blackboard, append cognition-log entries, write allocation, write memory, publish query/self-model requests, or emit utterances.
 
 The sensory module is deliberately a pre-attentive filter, not the conversation owner and not a work router. It maintains local stimulus state keyed by a normalized signature such as source/direction plus content or appearance. Habituation and decay are calculated, not delegated to the LLM: repeated low-change stimuli lose salience, old stimuli decay, and novel/user-directed/intense/changed stimuli gain salience.
 
-The LLM stage receives persisted assistant-side sensory ledger entries for one-shots and ambient add/update/remove diffs, plus ephemeral assistant context containing the full current ambient field. It also receives detailed relative age, normalized signature, repetition/change metrics, decay-adjusted salience, current allocation guidance, and any configured thresholds. Its durable shared output is constrained to tool calls: ignore the observation/diff or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observations and enough inspection detail to explain the computed salience and the LLM decision. Raw sensory events and full ambient snapshots are transient and should not be mirrored wholesale into durable shared state.
+The LLM stage receives persisted assistant-side sensory ledger entries for one-shots and ambient add/update/remove diffs, plus ephemeral assistant context containing the full current ambient field. It also receives detailed relative age and current observation details. Its durable shared output is constrained to tool calls: ignore the observation/diff or write a memo observation. The memo is the contract with the rest of the system. It should contain filtered observed scene facts, not ambient field mechanics, guidance, row state, or implementation detail. Raw sensory events and full ambient snapshots are transient and should not be mirrored wholesale into durable shared state.
 
 ### Cognition Gate
 
