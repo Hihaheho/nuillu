@@ -15,15 +15,19 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-const ONE_SHOT_SYSTEM_PROMPT: &str = r#"You are the one-shot sensory filter.
+const ONE_SHOT_SYSTEM_PROMPT: &str = r#"You are the one-shot sensory noise filter.
 You receive one-shot sensory events from the environment. A one-shot event is an individual event
 that occurred at its own observed_at time; it is not a snapshot, a diff, or a code-labeled repeated
-stimulus. Use the session history to understand temporal context, but evaluate the current event as
-its own occurrence. Call dispose_sensory only for current one-shot events that should not become
-durable sensory memo-log output. If no current event should be disposed, finish without function calls
-and without assistant text. Do not write memo text yourself; kept events are recorded by the
-runtime. Do not mention tools, prompts, scores, schemas, rubrics, or implementation details. Do not
-write to the cognition log, memory, or emit utterances."#;
+stimulus. Use the session history to understand temporal context, but evaluate each current event as
+its own occurrence. Select only current observations that are noise this agent should ignore. Call
+dispose_sensory only for current one-shot events that are noise and should not become durable
+sensory memo-log output. Call keep_all_sensory when every current event should remain durable. If no
+current event should be disposed, you may call keep_all_sensory or finish without function calls and
+without assistant text. Brief, common, or repeated participant-directed speech, greetings, questions,
+requests, hazards, and other load-bearing social signals are not noise merely because they are short
+or familiar. Do not write memo text yourself; kept events are recorded by the runtime. Do not mention
+tools, prompts, scores, schemas, rubrics, or implementation details. Do not write to the cognition
+log, memory, or emit utterances."#;
 
 const AMBIENT_SYSTEM_PROMPT: &str = r#"You are the ambient sensory diff filter.
 You receive changes derived from ambient sensory snapshots. Ambient rows are background conditions;
@@ -40,8 +44,8 @@ const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
 const COMPACTED_ONE_SHOT_SESSION_PREFIX: &str = "Compacted one-shot sensory session history:";
 const COMPACTED_AMBIENT_SESSION_PREFIX: &str = "Compacted ambient sensory session history:";
 const ONE_SHOT_SESSION_COMPACTION_FOCUS: &str = r#"Preserve one-shot event facts, source/direction
-details, observed_at times, dispose_sensory decisions, and uncertainty. Do not convert separate
-events into a single repeated stimulus label."#;
+details, observed_at times, dispose_sensory and keep_all_sensory decisions, and uncertainty. Do not
+convert separate events into a single repeated stimulus label."#;
 const AMBIENT_SESSION_COMPACTION_FOCUS: &str = r#"Preserve ambient diff facts, memo-log outputs
 written through tools, ignored background context, and uncertainty."#;
 
@@ -195,9 +199,20 @@ struct DisposeSensoryOutput {
     disposed: Vec<String>,
 }
 
+#[lutum::tool_input(name = "keep_all_sensory", output = KeepAllSensoryOutput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct KeepAllSensoryArgs {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+struct KeepAllSensoryOutput {
+    kept_all: bool,
+    kept: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
 enum OneShotSensoryTools {
     DisposeSensory(DisposeSensoryArgs),
+    KeepAllSensory(KeepAllSensoryArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,8 +394,6 @@ impl SensoryModule {
         now: DateTime<Utc>,
     ) -> Result<()> {
         self.ensure_one_shot_session_seeded(cx);
-        let allocation = self.allocation.snapshot().await;
-        let guidance = allocation.for_module(&self.owner).guidance;
         let lutum = self.llm.lutum().await;
         let current_ids = observations
             .iter()
@@ -390,13 +403,14 @@ impl SensoryModule {
             self.one_shot_session
                 .push_user(format_one_shot_turn_user_message(observations, now));
             let session_len_after_user = self.one_shot_session.input().items().len();
-            self.one_shot_session
-                .push_ephemeral_developer(format_one_shot_decision_context(&guidance));
             let turn = self
                 .one_shot_session
                 .text_turn()
                 .tools::<OneShotSensoryTools>()
-                .available_tools([OneShotSensoryToolsSelector::DisposeSensory])
+                .available_tools([
+                    OneShotSensoryToolsSelector::DisposeSensory,
+                    OneShotSensoryToolsSelector::KeepAllSensory,
+                ])
                 .max_output_tokens(TOOL_TURN_MAX_OUTPUT_TOKENS);
             let outcome = match tokio::time::timeout(
                 SENSORY_LLM_TURN_TIMEOUT,
@@ -430,18 +444,38 @@ impl SensoryModule {
                 } else {
                     let usage = round.usage;
                     let mut results: Vec<ToolResult> = Vec::new();
+                    let keep_all_requested = round
+                        .tool_calls
+                        .iter()
+                        .any(|call| matches!(call, OneShotSensoryToolsCall::KeepAllSensory(_)));
                     nuillu_module::emit_trace_tool_calls(&round.tool_calls);
                     for call in round.tool_calls.iter().cloned() {
                         match call {
                             OneShotSensoryToolsCall::DisposeSensory(call) => {
-                                let output = self.dispose_sensory(call.input.clone(), &current_ids);
+                                let output = if keep_all_requested {
+                                    DisposeSensoryOutput {
+                                        disposed: Vec::new(),
+                                    }
+                                } else {
+                                    self.dispose_sensory(call.input.clone(), &current_ids)
+                                };
                                 disposed.extend(output.disposed.iter().cloned());
                                 results.push(
                                     call.complete(output)
                                         .context("complete dispose_sensory tool call")?,
                                 );
                             }
+                            OneShotSensoryToolsCall::KeepAllSensory(call) => {
+                                let output = self.keep_all_sensory(&current_ids);
+                                results.push(
+                                    call.complete(output)
+                                        .context("complete keep_all_sensory tool call")?,
+                                );
+                            }
                         }
+                    }
+                    if keep_all_requested {
+                        disposed.clear();
                     }
                     round
                         .commit(&mut self.one_shot_session, results)
@@ -750,6 +784,13 @@ impl SensoryModule {
         DisposeSensoryOutput { disposed }
     }
 
+    fn keep_all_sensory(&self, current_ids: &BTreeSet<String>) -> KeepAllSensoryOutput {
+        KeepAllSensoryOutput {
+            kept_all: true,
+            kept: current_ids.iter().cloned().collect(),
+        }
+    }
+
     async fn next_batch(&mut self) -> Result<SensoryBatch> {
         let input = self.inbox.next_item().await?;
         let mut batch = SensoryBatch {
@@ -860,9 +901,14 @@ fn format_one_shot_turn_user_message(
     observations: &[PreparedOneShotObservation],
     now: DateTime<Utc>,
 ) -> String {
-    let mut out = format!("Current one-shot sensory batch at {}:", now.to_rfc3339());
+    let mut out = format!(
+        "From the latest one-shot sensory observations below, select only noise this agent should ignore. Current batch time: {}.",
+        now.to_rfc3339()
+    );
     out.push_str("\nThese are individual events with their own observed_at times, not a snapshot or a code-generated repetition/diff.");
-    out.push_str("\nOnly ids listed in this current batch are valid dispose_sensory observation_ids for this turn.");
+    out.push_str(
+        "\nCurrent batch ids are the only valid dispose_sensory observation_ids for this turn.",
+    );
     if observations.is_empty() {
         out.push_str("\n- none");
     } else {
@@ -969,20 +1015,6 @@ fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTim
             ));
         }
     }
-    out
-}
-
-fn format_one_shot_decision_context(guidance: &str) -> String {
-    let mut out = String::from("Current sensory guidance: ");
-    let guidance = guidance.trim();
-    if guidance.is_empty() {
-        out.push_str("none");
-    } else {
-        out.push_str(guidance);
-    }
-    out.push_str(
-        "\nCurrent batch ids are the only valid dispose_sensory observation_ids for this turn.",
-    );
     out
 }
 
@@ -1121,25 +1153,35 @@ mod tests {
     }
 
     fn tool_scenario(name: &str, arguments_json: String, input_tokens: u64) -> MockTextScenario {
+        tool_scenarios(vec![(name, arguments_json)], input_tokens)
+    }
+
+    fn tool_scenarios(
+        calls: Vec<(&str, String)>,
+        input_tokens: u64,
+    ) -> MockTextScenario {
         let mut usage = Usage::zero();
         usage.input_tokens = input_tokens;
         usage.total_tokens = input_tokens;
-        MockTextScenario::events(vec![
-            Ok(RawTextTurnEvent::Started {
-                request_id: Some("sensory-text".into()),
-                model: "mock".into(),
-            }),
-            Ok(RawTextTurnEvent::ToolCallChunk {
-                id: "call-sensory".into(),
-                name: name.into(),
-                arguments_json_delta: arguments_json,
-            }),
-            Ok(RawTextTurnEvent::Completed {
-                request_id: Some("sensory-text".into()),
-                finish_reason: FinishReason::ToolCall,
-                usage,
-            }),
-        ])
+        let mut events = vec![Ok(RawTextTurnEvent::Started {
+            request_id: Some("sensory-text".into()),
+            model: "mock".into(),
+        })];
+        events.extend(calls.into_iter().enumerate().map(
+            |(index, (name, arguments_json))| {
+                Ok(RawTextTurnEvent::ToolCallChunk {
+                    id: format!("call-sensory-{index}"),
+                    name: name.into(),
+                    arguments_json_delta: arguments_json,
+                })
+            },
+        ));
+        events.push(Ok(RawTextTurnEvent::Completed {
+            request_id: Some("sensory-text".into()),
+            finish_reason: FinishReason::ToolCall,
+            usage,
+        }));
+        MockTextScenario::events(events)
     }
 
     fn write_memo_scenario(memo: &str, input_tokens: u64) -> MockTextScenario {
@@ -1166,6 +1208,27 @@ mod tests {
                 "category": "nonsocial-background",
             })
             .to_string(),
+            input_tokens,
+        )
+    }
+
+    fn keep_all_scenario(input_tokens: u64) -> MockTextScenario {
+        tool_scenario("keep_all_sensory", serde_json::json!({}).to_string(), input_tokens)
+    }
+
+    fn keep_all_then_dispose_scenario(ids: Vec<&str>, input_tokens: u64) -> MockTextScenario {
+        tool_scenarios(
+            vec![
+                ("keep_all_sensory", serde_json::json!({}).to_string()),
+                (
+                    "dispose_sensory",
+                    serde_json::json!({
+                        "observation_ids": ids,
+                        "category": "nonsocial-background",
+                    })
+                    .to_string(),
+                ),
+            ],
             input_tokens,
         )
     }
@@ -1465,10 +1528,13 @@ mod tests {
         }];
         let text = format_one_shot_turn_user_message(&observations, reference_now());
 
-        assert!(text.contains("Current one-shot sensory batch at"));
-        assert!(text.contains("Only ids listed in this current batch"));
+        assert!(text.contains(
+            "From the latest one-shot sensory observations below, select only noise this agent should ignore."
+        ));
+        assert!(text.contains("Current batch ids are the only valid dispose_sensory"));
         assert!(text.contains("[one-shot-1] audition from Pibi"));
         assert!(text.contains("Pibi asks a question."));
+        assert!(!text.contains("Current sensory guidance"));
         assert!(!text.contains("signature="));
         assert!(!text.contains("repetition_count"));
         assert!(!text.contains("novelty_score"));
@@ -1479,7 +1545,7 @@ mod tests {
     fn one_shot_sequence_resumes_from_session_history() {
         let mut session = Session::new();
         session.push_user(
-            "Current one-shot sensory batch at 2026-05-07T12:00:00+00:00:\n\
+            "From the latest one-shot sensory observations below, select only noise this agent should ignore. Current batch time: 2026-05-07T12:00:00+00:00.\n\
              - [one-shot-41] audition from front observed 0 seconds ago \
              (2026-05-07T12:00:00+00:00): sound",
         );
@@ -1624,6 +1690,7 @@ mod tests {
                 let adapter = MockLlmAdapter::new()
                     .with_text_scenario(text_scenario("", 0))
                     .with_text_scenario(text_scenario("", 0));
+                let observed = adapter.clone();
                 let (blackboard, caps) = test_caps_with_adapter(adapter);
                 let recorder = SensoryTestRecorder::default();
                 let modules = build_recording_sensory(
@@ -1678,7 +1745,7 @@ mod tests {
                 let [MessageContent::Text(system)] = content.as_slice() else {
                     panic!("expected sensory system prompt text");
                 };
-                assert!(system.contains("You are the one-shot sensory filter"));
+                assert!(system.contains("You are the one-shot sensory noise filter"));
                 assert_eq!(
                     count_message_role(first_session, InputMessageRole::System),
                     1
@@ -1695,8 +1762,15 @@ mod tests {
                         .all(|text| !text.contains("Output instruction"))
                 );
                 assert!(
+                    first_user_texts
+                        .iter()
+                        .all(|text| !text.contains("Current sensory guidance"))
+                );
+                assert!(
                     first_user_texts.iter().any(|text| {
-                        text.contains("Current one-shot sensory batch")
+                        text.contains(
+                            "select only noise this agent should ignore"
+                        )
                             && text.contains("[one-shot-1] audition from front")
                             && text.contains("Koro is standing at the front.")
                             && !text.contains("repetition_count")
@@ -1745,6 +1819,10 @@ mod tests {
                     user_texts(second_session)
                         .iter()
                         .all(|text| !text.contains("Output instruction"))
+                );
+                assert!(
+                    observed.observed_ephemeral_indices().is_empty(),
+                    "one-shot sensory LLM turns should not carry ephemeral developer context"
                 );
             })
             .await;
