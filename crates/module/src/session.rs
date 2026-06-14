@@ -170,6 +170,53 @@ pub(crate) fn persistent_session_metadata_mut(
         .get_mut::<PersistentSessionMetadata>()
 }
 
+pub(crate) fn strip_reasoning_blocks_from_session(session: &mut Session) {
+    if !model_input_contains_reasoning(session.input()) {
+        return;
+    }
+    let metadata = persistent_session_metadata(session).cloned();
+    let items = session
+        .input()
+        .items()
+        .iter()
+        .filter_map(model_input_item_without_reasoning)
+        .collect();
+    *session = Session::from_input(ModelInput::from_items(items));
+    if let Some(metadata) = metadata {
+        restore_persistent_session_metadata(session, &metadata);
+    }
+}
+
+fn model_input_contains_reasoning(input: &ModelInput) -> bool {
+    input
+        .items()
+        .iter()
+        .any(model_input_item_contains_reasoning)
+}
+
+fn model_input_item_contains_reasoning(item: &ModelInputItem) -> bool {
+    match item {
+        ModelInputItem::Assistant(AssistantInputItem::Reasoning(_)) => true,
+        ModelInputItem::Turn(turn) => (0..turn.item_count()).any(|index| {
+            turn.item_at(index)
+                .and_then(|item| item.as_reasoning())
+                .is_some()
+        }),
+        _ => false,
+    }
+}
+
+fn model_input_item_without_reasoning(item: &ModelInputItem) -> Option<ModelInputItem> {
+    match item {
+        ModelInputItem::Assistant(AssistantInputItem::Reasoning(_)) => None,
+        ModelInputItem::Turn(turn) if model_input_item_contains_reasoning(item) => {
+            PersistedCommittedTurn::from_turn_without_reasoning(turn.as_ref())
+                .map(|turn| ModelInputItem::turn(Arc::new(turn)))
+        }
+        _ => Some(item.clone()),
+    }
+}
+
 pub fn ensure_persistent_session_seeded(
     session: &mut Session,
     system_prompt: impl Into<String>,
@@ -336,14 +383,16 @@ impl PersistedModelInputItem {
                 role: *role,
                 content: content.as_slice().to_vec(),
             }),
+            ModelInputItem::Assistant(AssistantInputItem::Reasoning(_)) => None,
             ModelInputItem::Assistant(item) => Some(Self::Assistant { item: item.clone() }),
             ModelInputItem::ToolResult(result) => Some(Self::ToolResult {
                 result: PersistedToolResult::from_tool_result(result),
             }),
             ModelInputItem::Turn(turn) if turn.ephemeral() => None,
-            ModelInputItem::Turn(turn) => Some(Self::Turn {
-                turn: PersistedCommittedTurn::from_turn(turn.as_ref()),
-            }),
+            ModelInputItem::Turn(turn) => {
+                PersistedCommittedTurn::from_turn_without_reasoning(turn.as_ref())
+                    .map(|turn| Self::Turn { turn })
+            }
         }
     }
 
@@ -400,18 +449,23 @@ pub struct PersistedCommittedTurn {
 }
 
 impl PersistedCommittedTurn {
-    fn from_turn(turn: &dyn TurnView) -> Self {
+    fn from_turn_without_reasoning(turn: &dyn TurnView) -> Option<Self> {
         let mut items = Vec::new();
         for index in 0..turn.item_count() {
             let Some(item) = turn.item_at(index) else {
                 continue;
             };
-            items.push(PersistedTurnItem::from_item(item));
+            if let Some(item) = PersistedTurnItem::from_item_without_reasoning(item) {
+                items.push(item);
+            }
         }
-        Self {
+        if items.is_empty() {
+            return None;
+        }
+        Some(Self {
             role: PersistedTurnRole::from_turn_role(turn.role()),
             items,
-        }
+        })
     }
 }
 
@@ -492,38 +546,36 @@ enum PersistedTurnItem {
 }
 
 impl PersistedTurnItem {
-    fn from_item(item: &dyn ItemView) -> Self {
-        if let Some(text) = item.as_text() {
-            return Self::Text {
-                text: text.to_string(),
-            };
+    fn from_item_without_reasoning(item: &dyn ItemView) -> Option<Self> {
+        if item.as_reasoning().is_some() {
+            return None;
         }
-        if let Some(text) = item.as_reasoning() {
-            return Self::Reasoning {
+        if let Some(text) = item.as_text() {
+            return Some(Self::Text {
                 text: text.to_string(),
-            };
+            });
         }
         if let Some(text) = item.as_refusal() {
-            return Self::Refusal {
+            return Some(Self::Refusal {
                 text: text.to_string(),
-            };
+            });
         }
         if let Some(tool) = item.as_tool_call() {
-            return Self::ToolCall {
+            return Some(Self::ToolCall {
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 arguments: PersistedRawJson::from_raw_json(tool.arguments),
-            };
+            });
         }
         if let Some(tool) = item.as_tool_result() {
-            return Self::ToolResult {
+            return Some(Self::ToolResult {
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 arguments: PersistedRawJson::from_raw_json(tool.arguments),
                 result: PersistedRawJson::from_raw_json(tool.result),
-            };
+            });
         }
-        Self::Unknown
+        Some(Self::Unknown)
     }
 }
 
@@ -745,6 +797,23 @@ mod tests {
     }
 
     #[test]
+    fn strip_reasoning_blocks_preserves_persistent_metadata() {
+        let mut session = Session::new();
+        session.push_user("history");
+        session.push_assistant_reasoning("thinking");
+        attach_test_metadata(&mut session, false, true);
+
+        strip_reasoning_blocks_from_session(&mut session);
+
+        assert!(!model_input_contains_reasoning(session.input()));
+        assert_eq!(session.input().items().len(), 1);
+        let metadata =
+            persistent_session_metadata(&session).expect("metadata should remain attached");
+        assert_eq!(metadata.key, SessionKey::new("main").unwrap());
+        assert!(metadata.reasoning);
+    }
+
+    #[test]
     fn reasoning_session_seeds_combined_system_message() {
         let mut session = Session::new();
         attach_test_metadata(&mut session, false, true);
@@ -813,6 +882,7 @@ mod tests {
         session.push_assistant_reasoning("thinking");
         session.input_mut().push(ModelInputItem::turn(Arc::new(
             AssistantTurnView::from_items(&[
+                AssistantTurnItem::Reasoning("turn thinking".into()),
                 AssistantTurnItem::Text("answer".into()),
                 AssistantTurnItem::ToolCall {
                     id: ToolCallId::new("call-1"),
@@ -820,6 +890,9 @@ mod tests {
                     arguments: tool_arguments.clone(),
                 },
             ]),
+        )));
+        session.input_mut().push(ModelInputItem::turn(Arc::new(
+            AssistantTurnView::from_items(&[AssistantTurnItem::Reasoning("only thinking".into())]),
         )));
         session
             .input_mut()
@@ -834,6 +907,21 @@ mod tests {
         let original = PersistedSessionSnapshot::from_session(&session);
         let round_trip = PersistedSessionSnapshot::from_session(&restored);
 
+        assert!(!model_input_contains_reasoning(restored.input()));
+        assert_eq!(restored.input().items().len(), 4);
+        let ModelInputItem::Turn(turn) = &restored.input().items()[2] else {
+            panic!("expected mixed assistant turn to remain");
+        };
+        assert_eq!(turn.item_count(), 2);
+        assert_eq!(
+            turn.item_at(0).and_then(|item| item.as_text()),
+            Some("answer")
+        );
+        assert!(
+            turn.item_at(1)
+                .and_then(|item| item.as_tool_call())
+                .is_some()
+        );
         assert_eq!(
             serde_json::to_value(round_trip).unwrap(),
             serde_json::to_value(&original).unwrap()

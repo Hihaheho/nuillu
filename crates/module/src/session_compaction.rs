@@ -3,6 +3,7 @@ use lutum::{AssistantInputItem, InputMessageRole, Lutum, ModelInput, ModelInputI
 use nuillu_types::{ModelTier, ModuleInstanceId};
 
 use crate::llm::{LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
+use crate::session::strip_reasoning_blocks_from_session;
 
 pub const DEFAULT_SESSION_COMPACTION_INPUT_TOKEN_THRESHOLD: u64 = 16_000;
 pub const DEFAULT_SESSION_COMPACTION_PREFIX_RATIO: f64 = 0.8;
@@ -210,6 +211,7 @@ pub async fn compact_session(
     compacted_prefix: &str,
     compaction_focus: &str,
 ) -> Result<()> {
+    strip_reasoning_blocks_from_session(session);
     let items = session.input().items();
     let protected_prefix_len = protected_prefix_len(items, protected_prefix);
     let compactable_len = items.len().saturating_sub(protected_prefix_len);
@@ -302,10 +304,10 @@ mod tests {
 
     use async_trait::async_trait;
     use lutum::{
-        AdapterStructuredTurn, AdapterTextTurn, AgentError, ErasedStructuredTurnEventStream,
-        ErasedTextTurnEventStream, FinishReason, MaxOutputTokens, MessageContent, MockLlmAdapter,
-        MockTextScenario, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
-        TurnAdapter, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantTurnItem, AssistantTurnView,
+        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, MaxOutputTokens,
+        MessageContent, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_types::ModelTier;
 
@@ -433,6 +435,26 @@ mod tests {
         text
     }
 
+    fn item_has_reasoning(item: &ModelInputItem) -> bool {
+        match item {
+            ModelInputItem::Assistant(AssistantInputItem::Reasoning(_)) => true,
+            ModelInputItem::Turn(turn) => (0..turn.item_count()).any(|index| {
+                turn.item_at(index)
+                    .and_then(|item| item.as_reasoning())
+                    .is_some()
+            }),
+            _ => false,
+        }
+    }
+
+    fn item_has_text(item: &ModelInputItem, expected: &str) -> bool {
+        match item {
+            ModelInputItem::Turn(turn) => (0..turn.item_count())
+                .any(|index| turn.item_at(index).and_then(|item| item.as_text()) == Some(expected)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn policy_resolves_threshold_by_module_tier() {
         let policy = SessionCompactionPolicy::new(11, 22, 33);
@@ -544,6 +566,46 @@ mod tests {
                 DEFAULT_SESSION_COMPACTION_MAX_OUTPUT_TOKENS
             ))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_strips_reasoning_before_summary_input() {
+        let adapter = CapturingAdapter::new(
+            MockLlmAdapter::new().with_text_scenario(summary_scenario("- old history")),
+        );
+        let (lutum, observed) = lutum_with_adapter(adapter);
+        let mut session = Session::new();
+        session.push_user("history-0");
+        session.push_assistant_reasoning("top-level thinking");
+        session.input_mut().push(ModelInputItem::turn(Arc::new(
+            AssistantTurnView::from_items(&[
+                AssistantTurnItem::Reasoning("turn thinking".into()),
+                AssistantTurnItem::Text("visible answer".into()),
+            ]),
+        )));
+        session.push_user("history-1");
+
+        compact_session(
+            &mut session,
+            &lutum,
+            SessionCompactionConfig::default(),
+            SessionCompactionProtectedPrefix::None,
+            "Compacted session:",
+            "Preserve test facts.",
+        )
+        .await
+        .unwrap();
+
+        let captured = observed.text_inputs();
+        assert_eq!(captured.len(), 1);
+        let summary_items = captured[0].items();
+        assert!(!summary_items.iter().any(item_has_reasoning));
+        assert!(
+            summary_items
+                .iter()
+                .any(|item| item_has_text(item, "visible answer"))
+        );
+        assert!(!session.input().items().iter().any(item_has_reasoning));
     }
 
     #[tokio::test(flavor = "current_thread")]

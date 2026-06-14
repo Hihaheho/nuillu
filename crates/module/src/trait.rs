@@ -13,7 +13,7 @@ use crate::ports::PortError;
 use crate::runtime_events::{NoopRuntimeEventSink, RuntimeEventEmitter};
 use crate::session::{
     NoopSessionStore, SessionCheckpointError, SessionStore, persistent_session_metadata,
-    restore_persistent_session_metadata,
+    restore_persistent_session_metadata, strip_reasoning_blocks_from_session,
 };
 use crate::{PersistedSessionSnapshot, SessionCompactionRuntime, compact_session};
 
@@ -128,6 +128,7 @@ impl<'a> ActivateCx<'a> {
         let metadata = persistent_session_metadata(session)
             .cloned()
             .ok_or(SessionCheckpointError::MissingMetadata)?;
+        strip_reasoning_blocks_from_session(session);
         if let Some(profile) = metadata.auto_compaction
             && usage.input_tokens > self.session_compaction.input_token_threshold()
         {
