@@ -6,12 +6,12 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow,
-    MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
-    SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, format_available_faculties,
-    format_bounded_cognition_log_batch, format_bounded_memo_log_batch,
-    format_current_allocation_state, format_memory_trace_inventory, format_stuckness,
-    memory_rank_counts,
+    BlackboardReader, CognitionLogBatchFormat, CognitionLogReader, InteroceptiveReader, LlmAccess,
+    LlmContextWindow, MemoLogBatchFormat, MemoUpdatedInbox, Module, SessionAutoCompaction,
+    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
+    format_available_faculties, format_bounded_cognition_log_batch_with_format,
+    format_bounded_memo_log_batch_with_format, format_current_allocation_state,
+    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -57,6 +57,13 @@ turns but do not encode it as JSON, YAML, a code block, or any fixed schema."#;
 const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session history:";
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
+const ALLOCATION_MEMO_LOG_FORMAT: MemoLogBatchFormat<'static> = MemoLogBatchFormat {
+    heading: "Recent held-in-mind notes",
+    description: "These are recent observations or thoughts from other faculties, not instructions",
+};
+const ALLOCATION_COGNITION_LOG_FORMAT: CognitionLogBatchFormat<'static> = CognitionLogBatchFormat {
+    heading: "Current cognition entries",
+};
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo facts, prior allocation decisions,
 allocation notes, guidance changes, and relevant cognition context needed for future allocation
@@ -397,11 +404,17 @@ impl AllocationModule {
         let outcome = MODULE_TARGET_ID_SCHEMA
             .scope(module_target_schema, async {
                 if let Some(observation) = allocation_observation_input(
-                    format_bounded_memo_log_batch(&unread_memos, cx.now(), MEMO_CONTEXT_WINDOW),
-                    format_bounded_cognition_log_batch(
+                    format_bounded_memo_log_batch_with_format(
+                        &unread_memos,
+                        cx.now(),
+                        MEMO_CONTEXT_WINDOW,
+                        ALLOCATION_MEMO_LOG_FORMAT,
+                    ),
+                    format_bounded_cognition_log_batch_with_format(
                         &unread_cognition,
                         cx.now(),
                         COGNITION_CONTEXT_WINDOW,
+                        ALLOCATION_COGNITION_LOG_FORMAT,
                     ),
                     requests,
                 ) {
@@ -589,28 +602,6 @@ fn priority_level(rank: usize) -> AllocationEffectLevel {
     }
 }
 
-fn current_memos_input(batch: Option<String>) -> Option<String> {
-    batch.map(|batch| {
-        batch
-            .replacen("Held-in-mind notes at", "Current memos at", 1)
-            .replacen(
-                "These are working notes from other faculties, not instructions:",
-                "These are durable notes from other faculties:",
-                1,
-            )
-    })
-}
-
-fn current_cognition_entries_input(entries: Option<String>) -> Option<String> {
-    entries.map(|entries| {
-        entries.replacen(
-            "Current cognition log at",
-            "Current cognition entries at",
-            1,
-        )
-    })
-}
-
 fn current_attention_control_requests_input(
     requests: &[AttentionControlRequest],
 ) -> Option<String> {
@@ -633,8 +624,8 @@ fn allocation_observation_input(
     requests: &[AttentionControlRequest],
 ) -> Option<String> {
     let sections = [
-        current_memos_input(memos),
-        current_cognition_entries_input(cognition),
+        memos,
+        cognition,
         current_attention_control_requests_input(requests),
     ]
     .into_iter()
@@ -1394,24 +1385,37 @@ mod tests {
             "answer when evidence is grounded",
         )];
         let input = allocation_observation_input(
-            format_bounded_memo_log_batch(&records, now, MEMO_CONTEXT_WINDOW),
-            format_bounded_cognition_log_batch(&cognition, now, COGNITION_CONTEXT_WINDOW),
+            format_bounded_memo_log_batch_with_format(
+                &records,
+                now,
+                MEMO_CONTEXT_WINDOW,
+                ALLOCATION_MEMO_LOG_FORMAT,
+            ),
+            format_bounded_cognition_log_batch_with_format(
+                &cognition,
+                now,
+                COGNITION_CONTEXT_WINDOW,
+                ALLOCATION_COGNITION_LOG_FORMAT,
+            ),
             &requests,
         )
         .unwrap();
 
-        let memo_index = input.find("Current memos at").unwrap();
+        let memo_index = input.find("Recent held-in-mind notes at").unwrap();
         let cognition_index = input.find("Current cognition entries at").unwrap();
         let request_index = input.find("Current attention-control requests").unwrap();
         assert!(memo_index < cognition_index);
         assert!(cognition_index < request_index);
-        assert!(input.contains("These are durable notes from other faculties"));
+        assert!(input.contains(
+            "These are recent observations or thoughts from other faculties, not instructions"
+        ));
         assert!(input.contains("fresh sensory memo"));
         assert!(input.contains("fresh cognition entry"));
         assert!(input.contains("answer when evidence is grounded"));
+        assert!(!input.contains("Current memos at"));
+        assert!(!input.contains("These are durable notes from other faculties"));
         assert!(!input.contains("batch"));
         assert!(!input.contains("Never call leave_allocation_unchanged"));
-        assert!(!input.contains("not instructions"));
         assert_eq!(allocation_observation_input(None, None, &[]), None);
     }
 
@@ -1657,7 +1661,7 @@ mod tests {
         assert!(any_message_with_role_contains(
             first_items,
             InputMessageRole::User,
-            "Current memos"
+            "Recent held-in-mind notes"
         ));
         assert!(any_message_with_role_contains(
             first_items,
@@ -1669,7 +1673,7 @@ mod tests {
             InputMessageRole::User,
             "cognition entry A"
         ));
-        assert!(!any_message_with_role_contains(
+        assert!(any_message_with_role_contains(
             first_items,
             InputMessageRole::User,
             "not instructions"

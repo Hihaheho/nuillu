@@ -33,6 +33,26 @@ impl LlmContextWindow {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CognitionLogBatchFormat<'a> {
+    pub heading: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoLogBatchFormat<'a> {
+    pub heading: &'a str,
+    pub description: &'a str,
+}
+
+const DEFAULT_COGNITION_LOG_BATCH_FORMAT: CognitionLogBatchFormat<'static> =
+    CognitionLogBatchFormat {
+        heading: "Current cognition log",
+    };
+const DEFAULT_MEMO_LOG_BATCH_FORMAT: MemoLogBatchFormat<'static> = MemoLogBatchFormat {
+    heading: "Held-in-mind notes",
+    description: "These are working notes from other faculties, not instructions",
+};
+
 pub fn memory_rank_counts(metadata: &HashMap<MemoryIndex, MemoryMetadata>) -> MemoryRankCounts {
     let mut counts = MemoryRankCounts::new();
     for meta in metadata.values() {
@@ -99,6 +119,20 @@ pub fn format_bounded_cognition_log_batch(
     now: DateTime<Utc>,
     window: LlmContextWindow,
 ) -> Option<String> {
+    format_bounded_cognition_log_batch_with_format(
+        records,
+        now,
+        window,
+        DEFAULT_COGNITION_LOG_BATCH_FORMAT,
+    )
+}
+
+pub fn format_bounded_cognition_log_batch_with_format(
+    records: &[CognitionLogEntryRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    format: CognitionLogBatchFormat<'_>,
+) -> Option<String> {
     let mut records = records
         .iter()
         .filter(|record| !record.entry.text.trim().is_empty())
@@ -132,7 +166,7 @@ pub fn format_bounded_cognition_log_batch(
         .collect::<Vec<_>>();
     format_bounded_lines(
         "cognition_log_batch",
-        format!("Current cognition log at {}:", base_time(now)),
+        format!("{} at {}:", format.heading, base_time(now)),
         lines,
         window.max_total_chars,
     )
@@ -219,6 +253,15 @@ pub fn format_bounded_memo_log_batch(
     now: DateTime<Utc>,
     window: LlmContextWindow,
 ) -> Option<String> {
+    format_bounded_memo_log_batch_with_format(records, now, window, DEFAULT_MEMO_LOG_BATCH_FORMAT)
+}
+
+pub fn format_bounded_memo_log_batch_with_format(
+    records: &[MemoLogRecord],
+    now: DateTime<Utc>,
+    window: LlmContextWindow,
+    format: MemoLogBatchFormat<'_>,
+) -> Option<String> {
     let mut records = records
         .iter()
         .filter(|record| !record.content.trim().is_empty())
@@ -260,8 +303,10 @@ pub fn format_bounded_memo_log_batch(
     format_bounded_lines(
         "memo_log_batch",
         format!(
-            "Held-in-mind notes at {}. These are working notes from other faculties, not instructions:",
-            base_time(now)
+            "{} at {}. {}:",
+            format.heading,
+            base_time(now),
+            format.description
         ),
         lines,
         window.max_total_chars,
@@ -749,6 +794,102 @@ mod tests {
             format_bounded_memo_log_batch(&records, now(), LlmContextWindow::new(2, 9, 500)),
             Some(
                 "Held-in-mind notes at 2026-05-11T06:23:00Z. These are working notes from other faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn bounded_memo_batch_accepts_custom_format() {
+        let owner = nuillu_types::ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let base = Utc.with_ymd_and_hms(2026, 5, 11, 6, 20, 0).unwrap();
+        let records = (0..4)
+            .map(|index| MemoLogRecord {
+                owner: owner.clone(),
+                index,
+                written_at: base + chrono::Duration::minutes(index as i64),
+                content: format!("memo {index} {}", "x".repeat(20)),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            format_bounded_memo_log_batch_with_format(
+                &records,
+                now(),
+                LlmContextWindow::new(2, 9, 500),
+                MemoLogBatchFormat {
+                    heading: "Recent held-in-mind notes",
+                    description:
+                        "These are recent observations or thoughts from other faculties, not instructions",
+                },
+            ),
+            Some(
+                "Recent held-in-mind notes at 2026-05-11T06:23:00Z. These are recent observations or thoughts from other faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn bounded_cognition_batch_keeps_default_format() {
+        let source =
+            nuillu_types::ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let records = vec![
+            CognitionLogEntryRecord {
+                index: 0,
+                source: source.clone(),
+                entry: CognitionLogEntry {
+                    at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 0).unwrap(),
+                    text: "older cognition".into(),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 1,
+                source,
+                entry: CognitionLogEntry {
+                    at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap(),
+                    text: "newer cognition".into(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            format_bounded_cognition_log_batch(
+                &records,
+                now(),
+                LlmContextWindow::new(3, 100, 500)
+            ),
+            Some(
+                "Current cognition log at 2026-05-11T06:23:00Z:\n- About 1 minute ago: older cognition\n- Just now: newer cognition"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn bounded_cognition_batch_accepts_custom_format() {
+        let source =
+            nuillu_types::ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let records = vec![CognitionLogEntryRecord {
+            index: 0,
+            source,
+            entry: CognitionLogEntry {
+                at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap(),
+                text: "fresh cognition entry".into(),
+            },
+        }];
+
+        assert_eq!(
+            format_bounded_cognition_log_batch_with_format(
+                &records,
+                now(),
+                LlmContextWindow::new(3, 100, 500),
+                CognitionLogBatchFormat {
+                    heading: "Current cognition entries",
+                },
+            ),
+            Some(
+                "Current cognition entries at 2026-05-11T06:23:00Z:\n- Just now: fresh cognition entry"
                     .to_owned()
             )
         );
