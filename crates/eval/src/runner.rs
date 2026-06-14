@@ -4984,6 +4984,7 @@ fn register_eval_module(
                             caps.sensory_input_inbox(),
                             caps.allocation_reader(),
                             caps.memo(),
+                            caps.scene_reader(),
                             caps.clock(),
                             caps.llm_access(),
                             caps.session("one-shot")

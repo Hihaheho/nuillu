@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{MessageContent, ModelInputItem, Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
+    AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SceneReader, SensoryInput,
     SensoryInputInbox, SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded, ports::Clock,
 };
@@ -25,9 +25,8 @@ sensory memo-log output. Call keep_all_sensory when every current event should r
 current event should be disposed, you may call keep_all_sensory or finish without function calls and
 without assistant text. Brief, common, or repeated participant-directed speech, greetings, questions,
 requests, hazards, and other load-bearing social signals are not noise merely because they are short
-or familiar. Do not write memo text yourself; kept events are recorded by the runtime. Do not mention
-tools, prompts, scores, schemas, rubrics, or implementation details. Do not write to the cognition
-log, memory, or emit utterances."#;
+or familiar. Kept events become durable sensory evidence that other cognitive modules use to guide
+the agent's behavior."#;
 
 const AMBIENT_SYSTEM_PROMPT: &str = r#"You are the ambient sensory diff filter.
 You receive changes derived from ambient sensory snapshots. Ambient rows are background conditions;
@@ -40,6 +39,7 @@ utterances."#;
 
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
+const RECENT_BYPASSED_ONE_SHOT_LIMIT: usize = 8;
 
 const COMPACTED_ONE_SHOT_SESSION_PREFIX: &str = "Compacted one-shot sensory session history:";
 const COMPACTED_AMBIENT_SESSION_PREFIX: &str = "Compacted ambient sensory session history:";
@@ -129,6 +129,7 @@ pub struct SensoryModule {
     inbox: SensoryInputInbox,
     allocation: AllocationReader,
     memo: Memo,
+    scene: SceneReader,
     clock: Rc<dyn Clock>,
     llm: LlmAccess,
     one_shot_session: Session,
@@ -138,6 +139,7 @@ pub struct SensoryModule {
     one_shot_system_prompt: std::sync::OnceLock<String>,
     ambient_system_prompt: std::sync::OnceLock<String>,
     ambient_entries: BTreeMap<String, AmbientSensoryEntry>,
+    recent_bypassed: Vec<PreparedOneShotObservation>,
 }
 
 #[lutum::tool_input(name = "broadcast_sensory", output = BroadcastSensoryOutput)]
@@ -235,6 +237,7 @@ impl SensoryModule {
         inbox: SensoryInputInbox,
         allocation: AllocationReader,
         memo: Memo,
+        scene: SceneReader,
         clock: Rc<dyn Clock>,
         llm: LlmAccess,
         one_shot_session: Session,
@@ -247,6 +250,7 @@ impl SensoryModule {
             inbox,
             allocation,
             memo,
+            scene,
             clock,
             llm,
             one_shot_session,
@@ -256,6 +260,7 @@ impl SensoryModule {
             one_shot_system_prompt: std::sync::OnceLock::new(),
             ambient_system_prompt: std::sync::OnceLock::new(),
             ambient_entries: BTreeMap::new(),
+            recent_bypassed: Vec::new(),
         }
     }
 
@@ -393,6 +398,12 @@ impl SensoryModule {
         observations: &[PreparedOneShotObservation],
         now: DateTime<Utc>,
     ) -> Result<()> {
+        if self.should_bypass_one_shot_filter(observations) {
+            self.memo.write(format_one_shot_memo(observations)).await;
+            self.record_recent_bypassed(observations);
+            return Ok(());
+        }
+
         self.ensure_one_shot_session_seeded(cx);
         let lutum = self.llm.lutum().await;
         let current_ids = observations
@@ -401,7 +412,11 @@ impl SensoryModule {
             .collect::<BTreeSet<_>>();
         let (outcome, session_len_after_user) = {
             self.one_shot_session
-                .push_user(format_one_shot_turn_user_message(observations, now));
+                .push_user(format_one_shot_turn_user_message(
+                    observations,
+                    now,
+                    &self.recent_bypassed,
+                ));
             let session_len_after_user = self.one_shot_session.input().items().len();
             let turn = self
                 .one_shot_session
@@ -501,6 +516,7 @@ impl SensoryModule {
                     .await?;
             }
         }
+        self.recent_bypassed.clear();
         let kept = observations
             .iter()
             .filter(|observation| !disposed.contains(&observation.id))
@@ -510,6 +526,45 @@ impl SensoryModule {
             self.memo.write(format_one_shot_memo(&kept)).await;
         }
         Ok(())
+    }
+
+    fn should_bypass_one_shot_filter(&self, observations: &[PreparedOneShotObservation]) -> bool {
+        if observations.is_empty() || observations.len() > 2 {
+            return false;
+        }
+        let participant_names = self
+            .scene
+            .snapshot()
+            .into_iter()
+            .filter_map(|participant| {
+                let name = participant.name.trim();
+                (!name.is_empty()).then(|| name.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        if participant_names.is_empty() {
+            return false;
+        }
+
+        observations.iter().all(|observation| {
+            matches!(observation.modality, SensoryModality::Audition)
+                && observation
+                    .direction
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|direction| !direction.is_empty())
+                    .is_some_and(|direction| participant_names.contains(direction))
+        })
+    }
+
+    fn record_recent_bypassed(&mut self, observations: &[PreparedOneShotObservation]) {
+        self.recent_bypassed.extend(observations.iter().cloned());
+        let extra = self
+            .recent_bypassed
+            .len()
+            .saturating_sub(RECENT_BYPASSED_ONE_SHOT_LIMIT);
+        if extra > 0 {
+            self.recent_bypassed.drain(..extra);
+        }
     }
 
     async fn handle_ambient_observations(
@@ -900,6 +955,7 @@ fn one_shot_sequences(text: &str) -> impl Iterator<Item = u64> + '_ {
 fn format_one_shot_turn_user_message(
     observations: &[PreparedOneShotObservation],
     now: DateTime<Utc>,
+    recent_bypassed: &[PreparedOneShotObservation],
 ) -> String {
     let mut out = format!(
         "From the latest one-shot sensory observations below, select only noise this agent should ignore. Current batch time: {}.",
@@ -913,23 +969,63 @@ fn format_one_shot_turn_user_message(
         out.push_str("\n- none");
     } else {
         for observation in observations {
-            out.push_str(&format!(
-                "\n- [{}] {}{} observed {} ({}): {}",
-                observation.id,
-                observation.modality.as_str(),
-                observation
-                    .direction
-                    .as_deref()
-                    .map(|direction| format!(" from {direction}"))
-                    .unwrap_or_default(),
-                observation.relative_age,
-                observation.observed_at.to_rfc3339(),
-                observation.content.trim()
+            out.push('\n');
+            out.push_str(&format_one_shot_observation_line(
+                observation,
+                &observation.relative_age,
+                true,
             ));
         }
     }
+    append_recent_bypassed_one_shot_context(&mut out, recent_bypassed, now);
 
     out
+}
+
+fn append_recent_bypassed_one_shot_context(
+    out: &mut String,
+    recent_bypassed: &[PreparedOneShotObservation],
+    now: DateTime<Utc>,
+) {
+    if recent_bypassed.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\n\nRecently kept small social one-shot observations (context only; only current batch ids are valid dispose_sensory observation_ids):",
+    );
+    for observation in recent_bypassed {
+        let relative_age = SensoryModule::format_age(now, observation.observed_at);
+        out.push('\n');
+        out.push_str(&format_one_shot_observation_line(
+            observation,
+            &relative_age,
+            false,
+        ));
+    }
+}
+
+fn format_one_shot_observation_line(
+    observation: &PreparedOneShotObservation,
+    relative_age: &str,
+    include_id: bool,
+) -> String {
+    let id = if include_id {
+        format!("[{}] ", observation.id)
+    } else {
+        String::new()
+    };
+    format!(
+        "- {id}{}{} observed {} ({}): {}",
+        observation.modality.as_str(),
+        observation
+            .direction
+            .as_deref()
+            .map(|direction| format!(" from {direction}"))
+            .unwrap_or_default(),
+        relative_age,
+        observation.observed_at.to_rfc3339(),
+        observation.content.trim()
+    )
 }
 
 fn format_one_shot_memo(observations: &[PreparedOneShotObservation]) -> String {
@@ -1084,7 +1180,8 @@ mod tests {
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderConfig, CapabilityProviderPorts, CapabilityProviderRuntime,
-        CapabilityProviders, LutumTiers, ModuleRegistry, RuntimePolicy, SessionCompactionPolicy,
+        CapabilityProviders, LutumTiers, ModuleRegistry, Participant, RuntimePolicy,
+        SessionCompactionPolicy,
     };
     use nuillu_types::builtin;
     use tokio::task::LocalSet;
@@ -1100,6 +1197,7 @@ mod tests {
         batches: Rc<RefCell<Vec<usize>>>,
         one_shot_session_inputs: Rc<RefCell<Vec<Vec<ModelInputItem>>>>,
         ambient_session_inputs: Rc<RefCell<Vec<Vec<ModelInputItem>>>>,
+        recent_bypassed_contents: Rc<RefCell<Vec<Vec<String>>>>,
     }
 
     struct RecordingSensoryModule {
@@ -1148,6 +1246,13 @@ mod tests {
                     .borrow_mut()
                     .push(ambient_items);
             }
+            self.recorder.recent_bypassed_contents.borrow_mut().push(
+                self.inner
+                    .recent_bypassed
+                    .iter()
+                    .map(|observation| observation.content.clone())
+                    .collect(),
+            );
             Ok(())
         }
     }
@@ -1156,10 +1261,7 @@ mod tests {
         tool_scenarios(vec![(name, arguments_json)], input_tokens)
     }
 
-    fn tool_scenarios(
-        calls: Vec<(&str, String)>,
-        input_tokens: u64,
-    ) -> MockTextScenario {
+    fn tool_scenarios(calls: Vec<(&str, String)>, input_tokens: u64) -> MockTextScenario {
         let mut usage = Usage::zero();
         usage.input_tokens = input_tokens;
         usage.total_tokens = input_tokens;
@@ -1167,15 +1269,18 @@ mod tests {
             request_id: Some("sensory-text".into()),
             model: "mock".into(),
         })];
-        events.extend(calls.into_iter().enumerate().map(
-            |(index, (name, arguments_json))| {
-                Ok(RawTextTurnEvent::ToolCallChunk {
-                    id: format!("call-sensory-{index}"),
-                    name: name.into(),
-                    arguments_json_delta: arguments_json,
-                })
-            },
-        ));
+        events.extend(
+            calls
+                .into_iter()
+                .enumerate()
+                .map(|(index, (name, arguments_json))| {
+                    Ok(RawTextTurnEvent::ToolCallChunk {
+                        id: format!("call-sensory-{index}").into(),
+                        name: name.into(),
+                        arguments_json_delta: arguments_json,
+                    })
+                }),
+        );
         events.push(Ok(RawTextTurnEvent::Completed {
             request_id: Some("sensory-text".into()),
             finish_reason: FinishReason::ToolCall,
@@ -1213,7 +1318,11 @@ mod tests {
     }
 
     fn keep_all_scenario(input_tokens: u64) -> MockTextScenario {
-        tool_scenario("keep_all_sensory", serde_json::json!({}).to_string(), input_tokens)
+        tool_scenario(
+            "keep_all_sensory",
+            serde_json::json!({}).to_string(),
+            input_tokens,
+        )
     }
 
     fn keep_all_then_dispose_scenario(ids: Vec<&str>, input_tokens: u64) -> MockTextScenario {
@@ -1352,6 +1461,7 @@ mod tests {
                         caps.sensory_input_inbox(),
                         caps.allocation_reader(),
                         caps.memo(),
+                        caps.scene_reader(),
                         caps.clock(),
                         caps.llm_access(),
                         caps.session("one-shot")
@@ -1421,9 +1531,13 @@ mod tests {
     }
 
     fn heard(content: &str) -> SensoryInput {
+        heard_from("front", content)
+    }
+
+    fn heard_from(direction: &str, content: &str) -> SensoryInput {
         SensoryInput::OneShot {
             modality: SensoryModality::Audition,
-            direction: Some("front".to_string()),
+            direction: Some(direction.to_string()),
             content: content.to_string(),
             observed_at: reference_now(),
         }
@@ -1526,7 +1640,7 @@ mod tests {
             observed_at: reference_now(),
             relative_age: "0 seconds ago".to_string(),
         }];
-        let text = format_one_shot_turn_user_message(&observations, reference_now());
+        let text = format_one_shot_turn_user_message(&observations, reference_now(), &[]);
 
         assert!(text.contains(
             "From the latest one-shot sensory observations below, select only noise this agent should ignore."
@@ -1768,9 +1882,7 @@ mod tests {
                 );
                 assert!(
                     first_user_texts.iter().any(|text| {
-                        text.contains(
-                            "select only noise this agent should ignore"
-                        )
+                        text.contains("select only noise this agent should ignore")
                             && text.contains("[one-shot-1] audition from front")
                             && text.contains("Koro is standing at the front.")
                             && !text.contains("repetition_count")
@@ -2014,6 +2126,354 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn small_social_audio_bypasses_one_shot_llm_filter() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(MockLlmAdapter::new());
+                let observed = capture.clone();
+                let (blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                caps.scene().set([Participant::new("Alice")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard_from("Alice", "Alice says hello"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("Alice says hello"));
+                assert!(observed.text_turns().is_empty());
+                assert!(recorder.one_shot_session_inputs.borrow().is_empty());
+                assert_eq!(
+                    recorder
+                        .recent_bypassed_contents
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .unwrap_or_default(),
+                    vec!["Alice says hello".to_string()]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_participant_social_audio_bypasses_one_shot_llm_filter() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(MockLlmAdapter::new());
+                let observed = capture.clone();
+                let (blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                caps.scene()
+                    .set([Participant::new("Alice"), Participant::new("Ryo")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(30),
+                        budget: Duration::from_millis(100),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard_from("Alice", "Alice says hello"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    sensory
+                        .publish(heard_from("Ryo", "Ryo says hello"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("Alice says hello"));
+                assert!(logs[0].content.contains("Ryo says hello"));
+                assert!(observed.text_turns().is_empty());
+                assert_eq!(
+                    recorder
+                        .recent_bypassed_contents
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .unwrap_or_default(),
+                    vec!["Alice says hello".to_string(), "Ryo says hello".to_string()]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recent_bypassed_social_audio_is_capped_to_newest_eight_observations() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new();
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                caps.scene().set([Participant::new("Alice")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    for index in 0..10 {
+                        sensory
+                            .publish(heard_from("Alice", &format!("greeting-{index}")))
+                            .await
+                            .expect("sensory subscriber exists");
+                        wait_for_memo_log_count(&blackboard, index + 1).await;
+                    }
+                })
+                .await;
+
+                let latest = recorder
+                    .recent_bypassed_contents
+                    .borrow()
+                    .last()
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(latest.len(), RECENT_BYPASSED_ONE_SHOT_LIMIT);
+                assert_eq!(latest.first().map(String::as_str), Some("greeting-2"));
+                assert_eq!(latest.last().map(String::as_str), Some("greeting-9"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_one_shot_llm_request_includes_and_clears_recent_bypassed_context() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(
+                    MockLlmAdapter::new().with_text_scenario(text_scenario("", 0)),
+                );
+                let observed = capture.clone();
+                let (blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                caps.scene().set([Participant::new("Alice")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard_from("Alice", "Alice says hello"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                    sensory
+                        .publish(heard("fan hum continues"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_one_shot_session_count(&recorder, 1).await;
+                })
+                .await;
+
+                assert_eq!(observed.text_turns().len(), 1);
+                let sessions = recorder.one_shot_session_inputs.borrow();
+                let session = sessions.first().expect("one-shot session recorded");
+                let user_text = user_texts(session).join("\n");
+                assert!(user_text.contains("Recently kept small social one-shot observations"));
+                assert!(user_text.contains("Alice says hello"));
+                assert!(user_text.contains("fan hum continues"));
+                assert!(!user_text.contains("[one-shot-1] audition from Alice"));
+                assert_eq!(
+                    recorder
+                        .recent_bypassed_contents
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| vec!["missing".to_string()]),
+                    Vec::<String>::new()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spatial_direction_does_not_bypass_one_shot_llm_filter() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(
+                    MockLlmAdapter::new().with_text_scenario(text_scenario("", 0)),
+                );
+                let observed = capture.clone();
+                let (blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                caps.scene().set([Participant::new("Alice")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("fan hum continues"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_one_shot_session_count(&recorder, 1).await;
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                assert_eq!(observed.text_turns().len(), 1);
+                assert_eq!(
+                    recorder
+                        .recent_bypassed_contents
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .unwrap_or_default(),
+                    Vec::<String>::new()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_tool_call_keeps_all_current_one_shot_observations() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new().with_text_scenario(text_scenario("", 0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(30),
+                        budget: Duration::from_millis(100),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("first participant greeting"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    sensory
+                        .publish(heard("second participant greeting"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("first participant greeting"));
+                assert!(logs[0].content.contains("second participant greeting"));
+                assert_eq!(recorder.batches.borrow().as_slice(), &[2]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keep_all_tool_writes_one_shot_memo() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new().with_text_scenario(keep_all_scenario(0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("Pibi says hello"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("Pibi says hello"));
+                let sessions = recorder.one_shot_session_inputs.borrow();
+                let first_session = sessions.first().expect("sensory activation recorded");
+                assert!(has_tool_call(first_session, "keep_all_sensory"));
+                assert!(has_tool_result(first_session, "keep_all_sensory"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dispose_tool_does_not_write_one_shot_memo() {
         let local = LocalSet::new();
         local
@@ -2056,6 +2516,50 @@ mod tests {
                 let sessions = recorder.one_shot_session_inputs.borrow();
                 let first_session = sessions.first().expect("sensory activation recorded");
                 assert!(has_tool_call(first_session, "dispose_sensory"));
+                assert!(has_tool_result(first_session, "dispose_sensory"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keep_all_tool_dominates_same_round_dispose_calls() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(keep_all_then_dispose_scenario(vec!["one-shot-1"], 0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard("load-bearing current sound"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("load-bearing current sound"));
+                let sessions = recorder.one_shot_session_inputs.borrow();
+                let first_session = sessions.first().expect("sensory activation recorded");
+                assert!(has_tool_call(first_session, "keep_all_sensory"));
+                assert!(has_tool_call(first_session, "dispose_sensory"));
+                assert!(has_tool_result(first_session, "keep_all_sensory"));
                 assert!(has_tool_result(first_session, "dispose_sensory"));
             })
             .await;
@@ -2223,7 +2727,7 @@ mod tests {
                 let [MessageContent::Text(system)] = content.as_slice() else {
                     panic!("expected system prompt text");
                 };
-                assert!(system.contains("You are the one-shot sensory filter"));
+                assert!(system.contains("You are the one-shot sensory noise filter"));
                 let ModelInputItem::Assistant(lutum::AssistantInputItem::Text(summary)) =
                     &compacted[1]
                 else {
