@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -10,6 +10,7 @@ use nuillu_server::{
 
 const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
+const STATE_MODEL_SET_FILE: &str = "model-set.eure";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,8 +35,10 @@ struct Args {
     llm_log_root: PathBuf,
 
     /// Model set Eure file with per-role backend config.
+    ///
+    /// Defaults to <state>/model-set.eure.
     #[arg(long)]
-    model_set: PathBuf,
+    model_set: Option<PathBuf>,
 
     /// Local minishlab/potion-base-8M model directory.
     #[arg(long, default_value = DEFAULT_MODEL_DIR)]
@@ -53,7 +56,8 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     install_lutum_trace_subscriber()?;
     let args = Args::parse();
-    let model_set = parse_model_set_file(&args.model_set)?;
+    let model_set_path = resolve_model_set_path(&args.state, args.model_set);
+    let model_set = parse_model_set_file(&model_set_path)?;
     let backends = resolve_llm_backends(&model_set)?;
     let cheap_backend = backends.cheap;
     let default_backend = backends.default;
@@ -82,6 +86,10 @@ fn resolve_session_id(session_id: Option<String>, run_id_alias: Option<String>) 
     session_id
         .or(run_id_alias)
         .unwrap_or_else(default_server_session_id)
+}
+
+fn resolve_model_set_path(state_dir: &Path, model_set: Option<PathBuf>) -> PathBuf {
+    model_set.unwrap_or_else(|| state_dir.join(STATE_MODEL_SET_FILE))
 }
 
 fn resolve_embedding(
@@ -144,5 +152,23 @@ mod tests {
 
         assert!(session_id.starts_with("server-"));
         assert!(session_id.len() > "server-20260517T000000Z-".len());
+    }
+
+    #[test]
+    fn resolve_model_set_path_prefers_explicit_path() {
+        let explicit = PathBuf::from("configs/modelsets/server.eure");
+
+        assert_eq!(
+            resolve_model_set_path(Path::new(".tmp/server"), Some(explicit.clone())),
+            explicit
+        );
+    }
+
+    #[test]
+    fn resolve_model_set_path_defaults_under_state_dir() {
+        assert_eq!(
+            resolve_model_set_path(Path::new(".tmp/custom-server"), None),
+            PathBuf::from(".tmp/custom-server/model-set.eure")
+        );
     }
 }
