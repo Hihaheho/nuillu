@@ -19,6 +19,7 @@ const MAX_JSON_ARRAY_ITEMS: usize = 16;
 const MAX_JSON_OBJECT_ENTRIES: usize = 32;
 const MAX_JSON_STRING_CHARS: usize = 1000;
 const MAX_RENDERED_SECTION_CHARS: usize = 6000;
+const MAX_COMPACT_JUDGE_CHARS: usize = 2400;
 const MAX_TRACE_SPANS: usize = 32;
 const MAX_TRACE_EVENTS: usize = 32;
 const MAX_TRACE_TEXT_CHARS: usize = 800;
@@ -131,28 +132,65 @@ impl RubricJudge for LlmRubricJudge {
             generation.temperature = Some(temperature);
         }
 
-        let input = render_judge_model_input(trace, &request);
         let output_schema = rubric_judge_output_schema(&request)?;
         let _permit = self.concurrency.acquire().await;
-        let result = self
-            .llm
-            .structured_turn::<Value>(input)
-            .output_schema("rubric_judge_verdict", output_schema)
-            .generation_config(generation)
-            .budget(RequestBudget::unlimited())
-            .collect()
-            .await
-            .map_err(|error| RubricJudgeError::Turn(error.to_string()))?;
-        let raw_verdict = match result.semantic {
-            StructuredTurnOutcome::Structured(value) => value,
-            StructuredTurnOutcome::Refusal(reason) => {
-                return Err(RubricJudgeError::Refusal { reason });
+
+        let first = collect_judge_verdict(
+            &self.llm,
+            render_judge_model_input(trace, &request),
+            output_schema.clone(),
+            generation.clone(),
+            &request.criteria,
+        )
+        .await;
+        match first {
+            Ok(verdict) => Ok(verdict),
+            Err(RubricJudgeError::Turn(first_error)) => {
+                let retry = collect_judge_verdict(
+                    &self.llm,
+                    render_compact_judge_model_input(trace, &request),
+                    output_schema,
+                    generation,
+                    &request.criteria,
+                )
+                .await;
+                match retry {
+                    Ok(verdict) => Ok(verdict),
+                    Err(RubricJudgeError::Turn(retry_error)) => Err(RubricJudgeError::Turn(
+                        format!("{first_error}; compact retry failed: {retry_error}"),
+                    )),
+                    Err(error) => Err(error),
+                }
             }
-        };
-        let mut verdict = parse_dynamic_verdict(raw_verdict, &request.criteria)?;
-        normalize_verdict(&mut verdict);
-        Ok(verdict)
+            Err(error) => Err(error),
+        }
     }
+}
+
+async fn collect_judge_verdict(
+    llm: &Lutum,
+    input: ModelInput,
+    output_schema: Value,
+    generation: GenerationParams,
+    criteria: &[RubricCriterion],
+) -> Result<RubricJudgeVerdict, RubricJudgeError> {
+    let result = llm
+        .structured_turn::<Value>(input)
+        .output_schema("rubric_judge_verdict", output_schema)
+        .generation_config(generation)
+        .budget(RequestBudget::unlimited())
+        .collect()
+        .await
+        .map_err(|error| RubricJudgeError::Turn(error.to_string()))?;
+    let raw_verdict = match result.semantic {
+        StructuredTurnOutcome::Structured(value) => value,
+        StructuredTurnOutcome::Refusal(reason) => {
+            return Err(RubricJudgeError::Refusal { reason });
+        }
+    };
+    let mut verdict = parse_dynamic_verdict(raw_verdict, criteria)?;
+    normalize_verdict(&mut verdict);
+    Ok(verdict)
 }
 
 fn rubric_judge_output_schema(request: &RubricJudgeRequest) -> Result<Value, RubricJudgeError> {
@@ -210,27 +248,17 @@ fn parse_dynamic_verdict(
     criteria: &[RubricCriterion],
 ) -> Result<RubricJudgeVerdict, RubricJudgeError> {
     let object = expect_object(&value, "verdict")?;
-    let criteria_value = required_value(object, "criteria", "verdict.criteria")?;
-    let criteria_object = expect_object(criteria_value, "verdict.criteria")?;
-    for actual_name in criteria_object.keys() {
-        if !criteria
-            .iter()
-            .any(|expected| expected.name.as_str() == actual_name)
-        {
-            return Err(invalid_verdict(format!(
-                "unexpected criterion '{actual_name}'"
-            )));
-        }
-    }
+    let criteria_values = verdict_criteria_values(object, criteria)?;
 
     let mut verdict = RubricJudgeVerdict {
-        summary: required_string(object, "summary", "verdict.summary")?,
+        summary: optional_string(object, "summary", "verdict.summary")?
+            .unwrap_or_else(|| "No summary provided.".to_string()),
         criteria: Vec::with_capacity(criteria.len()),
     };
 
     for expected in criteria {
         let path = format!("verdict.criteria.{}", expected.name);
-        let criterion_value = criteria_object.get(&expected.name).ok_or_else(|| {
+        let criterion_value = criteria_values.get(&expected.name).ok_or_else(|| {
             invalid_verdict(format!("missing required criterion '{}'", expected.name))
         })?;
         let criterion_object = expect_object(criterion_value, &path)?;
@@ -243,6 +271,102 @@ fn parse_dynamic_verdict(
     }
 
     Ok(verdict)
+}
+
+fn verdict_criteria_values<'a>(
+    object: &'a Map<String, Value>,
+    criteria: &[RubricCriterion],
+) -> Result<std::collections::BTreeMap<String, &'a Value>, RubricJudgeError> {
+    let mut values = match object.get("criteria") {
+        Some(Value::Object(criteria_object)) => {
+            criteria_values_from_object(criteria_object, criteria, "verdict.criteria")?
+        }
+        Some(Value::Array(criteria_array)) => {
+            criteria_values_from_array(criteria_array, criteria, "verdict.criteria")?
+        }
+        Some(_) => {
+            return Err(invalid_verdict(
+                "verdict.criteria must be an object or array",
+            ));
+        }
+        None => criteria_values_from_top_level(object, criteria),
+    };
+
+    for expected in criteria {
+        if !values.contains_key(&expected.name) {
+            return Err(invalid_verdict(format!(
+                "missing required criterion '{}'",
+                expected.name
+            )));
+        }
+    }
+
+    if criteria.is_empty() {
+        values.clear();
+    }
+    Ok(values)
+}
+
+fn criteria_values_from_object<'a>(
+    object: &'a Map<String, Value>,
+    criteria: &[RubricCriterion],
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, &'a Value>, RubricJudgeError> {
+    let mut values = std::collections::BTreeMap::new();
+    for (name, value) in object {
+        if !is_expected_criterion(name, criteria) {
+            return Err(invalid_verdict(format!("unexpected criterion '{name}'")));
+        }
+        if values.insert(name.clone(), value).is_some() {
+            return Err(invalid_verdict(format!("duplicate criterion '{name}'")));
+        }
+    }
+    if values.is_empty() && !criteria.is_empty() {
+        return Err(invalid_verdict(format!("{path} is empty")));
+    }
+    Ok(values)
+}
+
+fn criteria_values_from_array<'a>(
+    items: &'a [Value],
+    criteria: &[RubricCriterion],
+    path: &str,
+) -> Result<std::collections::BTreeMap<String, &'a Value>, RubricJudgeError> {
+    let mut values = std::collections::BTreeMap::new();
+    for (index, value) in items.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let item = expect_object(value, &item_path)?;
+        let name = required_string(item, "name", &format!("{item_path}.name"))?;
+        if !is_expected_criterion(&name, criteria) {
+            return Err(invalid_verdict(format!("unexpected criterion '{name}'")));
+        }
+        if values.insert(name.clone(), value).is_some() {
+            return Err(invalid_verdict(format!("duplicate criterion '{name}'")));
+        }
+    }
+    if values.is_empty() && !criteria.is_empty() {
+        return Err(invalid_verdict(format!("{path} is empty")));
+    }
+    Ok(values)
+}
+
+fn criteria_values_from_top_level<'a>(
+    object: &'a Map<String, Value>,
+    criteria: &[RubricCriterion],
+) -> std::collections::BTreeMap<String, &'a Value> {
+    let mut values = std::collections::BTreeMap::new();
+    for expected in criteria {
+        if let Some(value) = object.get(&expected.name) {
+            values.insert(expected.name.clone(), value);
+        }
+    }
+    values
+}
+
+fn is_expected_criterion(name: &str, criteria: &[RubricCriterion]) -> bool {
+    criteria
+        .iter()
+        .any(|expected| expected.name.as_str() == name)
 }
 
 fn expect_object<'a>(
@@ -312,12 +436,22 @@ fn invalid_verdict(message: impl Into<String>) -> RubricJudgeError {
 fn render_judge_model_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -> ModelInput {
     ModelInput::new()
         .system(
-            "You are an eval judge for a capability-based agent runtime. \
-Apply the rubric strictly to the selected evidence sections. Grade only observable behavior. \
-Return structured output only. Criterion scores are floats from 0.0 to 1.0. \
-Return criteria as an object keyed exactly by the provided criterion names.",
+            "Grade only observable behavior against the rubric. Return structured output only: \
+summary plus criteria keyed by the provided names. Scores are 0.0 to 1.0. Keep reasons short.",
         )
         .user(render_judge_input(trace, request))
+}
+
+fn render_compact_judge_model_input(
+    trace: &TraceSnapshot,
+    request: &RubricJudgeRequest,
+) -> ModelInput {
+    ModelInput::new()
+        .system(
+            "Return exactly one JSON object. No markdown, prose, or code fences. Grade only the \
+observable evidence. Scores are 0.0 to 1.0.",
+        )
+        .user(render_compact_judge_input(trace, request))
 }
 
 pub fn render_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -> String {
@@ -343,9 +477,62 @@ pub fn render_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -
     let evidence = render_selected_judge_inputs(trace, request);
 
     format!(
-        "Prompt:\n{}\n\nAdditional context:\n{}\n\nRubric:\n{}\n\nCriteria:\n{}\n\nSelected judge inputs:\n{}\n",
+        "Prompt:\n{}\n\nContext:\n{}\n\nRubric:\n{}\n\nCriteria:\n{}\n\nEvidence:\n{}\n",
         request.prompt, context, request.rubric, criteria, evidence
     )
+}
+
+fn render_compact_judge_input(trace: &TraceSnapshot, request: &RubricJudgeRequest) -> String {
+    let context = request.context.as_deref().unwrap_or("(none)");
+    let criteria = render_compact_criteria(&request.criteria);
+    let evidence = truncate_text(
+        &render_selected_judge_inputs(trace, request),
+        MAX_COMPACT_JUDGE_CHARS,
+    );
+    format!(
+        "Task:\n{}\n\nContext:\n{}\n\nRubric:\n{}\n\nCriteria:\n{}\n\nEvidence:\n{}\n\nJSON shape:\n{}\n",
+        truncate_text(&request.prompt, MAX_COMPACT_JUDGE_CHARS),
+        truncate_text(context, MAX_COMPACT_JUDGE_CHARS),
+        truncate_text(&request.rubric, MAX_COMPACT_JUDGE_CHARS),
+        criteria,
+        evidence,
+        render_judge_json_shape(&request.criteria)
+    )
+}
+
+fn render_compact_criteria(criteria: &[RubricCriterion]) -> String {
+    if criteria.is_empty() {
+        return "(none)".to_string();
+    }
+    criteria
+        .iter()
+        .map(|criterion| {
+            format!(
+                "- {}: {}",
+                criterion.name,
+                truncate_text(
+                    &normalize_text_block(&criterion.description.content),
+                    MAX_TRACE_TEXT_CHARS,
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_judge_json_shape(criteria: &[RubricCriterion]) -> String {
+    let criteria_shape = criteria
+        .iter()
+        .map(|criterion| {
+            format!(
+                "{}:{{\"score\":0.0,\"reason\":\"\",\"evidence\":null}}",
+                serde_json::to_string(&criterion.name)
+                    .expect("criterion names are valid JSON strings")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"summary\":\"\",\"criteria\":{{{criteria_shape}}}}}")
 }
 
 fn render_selected_judge_inputs(trace: &TraceSnapshot, request: &RubricJudgeRequest) -> String {
@@ -952,7 +1139,13 @@ fn normalize_verdict(verdict: &mut RubricJudgeVerdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use eure::value::{Language, Text};
+    use lutum::{
+        FinishReason, Lutum, MockLlmAdapter, MockStructuredScenario, RawStructuredTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
+    };
 
     fn criterion(name: &str) -> RubricCriterion {
         RubricCriterion {
@@ -1049,6 +1242,123 @@ mod tests {
         assert_eq!(verdict.criteria[1].evidence, None);
     }
 
+    #[test]
+    fn dynamic_verdict_accepts_criteria_array() {
+        let criteria = vec![
+            criterion("grounded-in-attention"),
+            criterion("simplified-first-person-model"),
+        ];
+        let raw = serde_json::json!({
+            "summary": "passes",
+            "criteria": [
+                {
+                    "name": "grounded-in-attention",
+                    "score": 1.0,
+                    "reason": "grounded",
+                    "evidence": "Koro growling"
+                },
+                {
+                    "name": "simplified-first-person-model",
+                    "score": 0.9,
+                    "reason": "first person",
+                    "evidence": null
+                }
+            ]
+        });
+
+        let verdict = parse_dynamic_verdict(raw, &criteria).unwrap();
+
+        assert_eq!(verdict.criteria.len(), 2);
+        assert_eq!(verdict.criteria[0].name, "grounded-in-attention");
+        assert_eq!(verdict.criteria[0].score, 1.0);
+        assert_eq!(verdict.criteria[1].name, "simplified-first-person-model");
+    }
+
+    #[test]
+    fn dynamic_verdict_accepts_top_level_criteria_objects() {
+        let criteria = vec![
+            criterion("grounded-in-attention"),
+            criterion("simplified-first-person-model"),
+        ];
+        let raw = serde_json::json!({
+            "summary": "passes",
+            "grounded-in-attention": {
+                "score": 1.0,
+                "reason": "grounded",
+                "evidence": "Koro growling"
+            },
+            "simplified-first-person-model": {
+                "score": 0.9,
+                "reason": "first person",
+                "evidence": null
+            }
+        });
+
+        let verdict = parse_dynamic_verdict(raw, &criteria).unwrap();
+
+        assert_eq!(verdict.criteria.len(), 2);
+        assert_eq!(verdict.criteria[0].name, "grounded-in-attention");
+        assert_eq!(verdict.criteria[1].name, "simplified-first-person-model");
+    }
+
+    #[test]
+    fn dynamic_verdict_rejects_missing_required_criterion() {
+        let criteria = vec![
+            criterion("grounded-in-attention"),
+            criterion("simplified-first-person-model"),
+        ];
+        let raw = serde_json::json!({
+            "summary": "incomplete",
+            "criteria": {
+                "grounded-in-attention": {
+                    "score": 1.0,
+                    "reason": "grounded",
+                    "evidence": null
+                }
+            }
+        });
+
+        let error = parse_dynamic_verdict(raw, &criteria).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing required criterion 'simplified-first-person-model'")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn llm_judge_retries_with_compact_input_after_invalid_json() {
+        let criteria = vec![criterion("records-event")];
+        let adapter = MockLlmAdapter::new()
+            .with_structured_scenario(structured_json_scenario("not json"))
+            .with_structured_scenario(structured_json_scenario(
+                serde_json::json!({
+                    "summary": "kept",
+                    "criteria": {
+                        "records-event": {
+                            "score": 1.0,
+                            "reason": "memo contains the event",
+                            "evidence": "memo text"
+                        }
+                    }
+                })
+                .to_string(),
+            ));
+        let judge = LlmRubricJudge::new(test_lutum(adapter));
+        let request = RubricJudgeRequest {
+            criteria,
+            artifact: CaseArtifact::new("memo text"),
+            ..empty_request(vec![RubricJudgeInput::Output])
+        };
+
+        let verdict = judge.judge(&empty_trace(), request).await.unwrap();
+
+        assert_eq!(verdict.summary, "kept");
+        assert_eq!(verdict.criteria[0].name, "records-event");
+        assert_eq!(verdict.criteria[0].score, 1.0);
+    }
+
     fn event(message: &str, fields: Vec<(String, FieldValue)>) -> lutum_eval::EventRecord {
         lutum_eval::EventRecord {
             target: "lutum".to_string(),
@@ -1056,6 +1366,30 @@ mod tests {
             message: Some(message.to_string()),
             fields,
         }
+    }
+
+    fn test_lutum(adapter: MockLlmAdapter) -> Lutum {
+        Lutum::new(
+            Arc::new(adapter),
+            SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default()),
+        )
+    }
+
+    fn structured_json_scenario(json_delta: impl Into<String>) -> MockStructuredScenario {
+        MockStructuredScenario::events(vec![
+            Ok(RawStructuredTurnEvent::Started {
+                request_id: Some("judge".into()),
+                model: "mock".into(),
+            }),
+            Ok(RawStructuredTurnEvent::StructuredOutputChunk {
+                json_delta: json_delta.into(),
+            }),
+            Ok(RawStructuredTurnEvent::Completed {
+                request_id: Some("judge".into()),
+                finish_reason: FinishReason::Stop,
+                usage: Usage::zero(),
+            }),
+        ])
     }
 
     fn span(events: Vec<lutum_eval::EventRecord>) -> lutum_eval::SpanNode {
