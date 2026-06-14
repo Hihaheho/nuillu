@@ -55,7 +55,9 @@ pub use query::{
 };
 pub use recombination::{
     AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
-    RecombinationTools, RecombinationToolsCall, RecombinationToolsSelector,
+    RecombinationMemoryHit, RecombinationTools, RecombinationToolsCall, RecombinationToolsSelector,
+    SearchMemoryArgs as RecombinationSearchMemoryArgs,
+    SearchMemoryOutput as RecombinationSearchMemoryOutput,
 };
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,
