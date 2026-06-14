@@ -78,8 +78,8 @@ pub use cognition::CognitionWriter;
 pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};
 pub use interoception::InteroceptiveWriter;
 pub use llm::{
-    LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmLease, LlmRequestMetadata,
-    LlmRequestSource, current_activation_llm_request_metadata,
+    FixedTierLlmAccess, LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmLease,
+    LlmRequestMetadata, LlmRequestSource, current_activation_llm_request_metadata,
     with_activation_llm_request_metadata,
 };
 pub use memo::{Memo, TypedMemo};

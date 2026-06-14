@@ -194,6 +194,7 @@ fn register_server_module(
                         caps.blackboard_reader(),
                         memory_caps.compactor(),
                         caps.llm_access(),
+                        caps.default_tier_llm_access(),
                     ))
                 }
             })

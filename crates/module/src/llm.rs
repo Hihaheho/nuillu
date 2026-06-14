@@ -294,6 +294,14 @@ pub struct LlmAccess {
     events: RuntimeEventEmitter,
 }
 
+#[derive(Clone)]
+pub struct FixedTierLlmAccess {
+    owner: ModuleInstanceId,
+    tier: ModelTier,
+    tiers: LutumTiers,
+    events: RuntimeEventEmitter,
+}
+
 impl LlmAccess {
     pub(crate) fn new(
         owner: ModuleInstanceId,
@@ -352,6 +360,47 @@ impl LlmAccess {
     }
 }
 
+impl FixedTierLlmAccess {
+    pub(crate) fn new(
+        owner: ModuleInstanceId,
+        tier: ModelTier,
+        tiers: LutumTiers,
+        events: RuntimeEventEmitter,
+    ) -> Self {
+        Self {
+            owner,
+            tier,
+            tiers,
+            events,
+        }
+    }
+
+    pub async fn lutum(&self) -> LlmLease {
+        let handle = self.tiers.pick_handle(self.tier);
+        let permit = handle.concurrency.acquire().await;
+        let call = self.events.llm_accessed(self.owner.clone(), self.tier);
+        let (activation_attempt, batch) = current_activation_llm_request_metadata();
+        let lutum = handle.lutum.clone().with_extension(LlmRequestMetadata {
+            owner: self.owner.clone(),
+            tier: self.tier,
+            source: LlmRequestSource::ModuleTurn,
+            session_key: None,
+            activation_attempt,
+            batch,
+        });
+        LlmLease::new(
+            lutum,
+            permit,
+            LlmLeaseCompletion {
+                events: self.events.clone(),
+                owner: self.owner.clone(),
+                tier: self.tier,
+                call,
+            },
+        )
+    }
+}
+
 fn truncated_batch_debug(debug: &str) -> String {
     let mut out = String::with_capacity(debug.len().min(MAX_LLM_BATCH_DEBUG_CHARS));
     for (index, ch) in debug.chars().enumerate() {
@@ -380,7 +429,9 @@ mod tests {
     use crate::ports::PortError;
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
-    use super::{LlmAccess, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
+    use super::{
+        FixedTierLlmAccess, LlmAccess, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource,
+    };
 
     #[derive(Debug, Default)]
     struct RecordingSink {
@@ -505,6 +556,80 @@ mod tests {
             &[Some(LlmRequestMetadata {
                 owner,
                 tier: ModelTier::Premium,
+                source: LlmRequestSource::ModuleTurn,
+                session_key: None,
+                activation_attempt: None,
+                batch: None,
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_tier_lutum_uses_configured_tier_independent_of_allocation() {
+        let mut allocation = ResourceAllocation::default();
+        allocation.set_model_override(builtin::memory_compaction(), ModelTier::Premium);
+        let _blackboard = Blackboard::with_allocation(allocation);
+        let owner = ModuleInstanceId::new(builtin::memory_compaction(), ReplicaIndex::ZERO);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(
+            MockLlmAdapter::new().with_text_scenario(MockTextScenario::events(vec![
+                Ok(RawTextTurnEvent::Started {
+                    request_id: Some("req-fixed-tier".into()),
+                    model: "mock".into(),
+                }),
+                Ok(RawTextTurnEvent::TextDelta { delta: "ok".into() }),
+                Ok(RawTextTurnEvent::Completed {
+                    request_id: Some("req-fixed-tier".into()),
+                    finish_reason: FinishReason::Stop,
+                    usage: Usage {
+                        total_tokens: 1,
+                        ..Usage::zero()
+                    },
+                }),
+            ])),
+        );
+        let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+        let lutum = Lutum::with_hooks(
+            adapter,
+            budget,
+            LutumHooksSet::new()
+                .with_on_model_input(RecordingModelInputHook { seen: seen.clone() }),
+        );
+        let tiers = crate::LutumTiers::from_shared_lutum(lutum);
+        let sink = Rc::new(RecordingSink::default());
+        let events = RuntimeEventEmitter::new(sink.clone());
+        let access = FixedTierLlmAccess::new(owner.clone(), ModelTier::Default, tiers, events);
+
+        let lutum = access.lutum().await;
+        let _ = lutum
+            .text_turn(ModelInput::new().user("hello"))
+            .collect()
+            .await
+            .expect("mock text turn should complete");
+        drop(lutum);
+
+        assert_eq!(
+            sink.events.lock().expect("event lock poisoned").as_slice(),
+            &[
+                RuntimeEvent::LlmAccessed {
+                    sequence: 0,
+                    call: 0,
+                    owner: owner.clone(),
+                    tier: ModelTier::Default,
+                },
+                RuntimeEvent::LlmCompleted {
+                    sequence: 1,
+                    call: 0,
+                    owner: owner.clone(),
+                    tier: ModelTier::Default,
+                },
+            ]
+        );
+        assert_eq!(
+            seen.lock().expect("metadata lock poisoned").as_slice(),
+            &[Some(LlmRequestMetadata {
+                owner,
+                tier: ModelTier::Default,
                 source: LlmRequestSource::ModuleTurn,
                 session_key: None,
                 activation_attempt: None,

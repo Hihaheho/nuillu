@@ -5185,6 +5185,7 @@ fn register_eval_module(
                                 caps.blackboard_reader(),
                                 memory_caps.compactor(),
                                 caps.llm_access(),
+                                caps.default_tier_llm_access(),
                             ))
                         }
                     }

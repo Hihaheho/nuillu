@@ -37,8 +37,8 @@ pub use association::{
 };
 pub use common::{GetMemoriesOutput, MemoryContentView};
 pub use compaction::{
-    CompactionTools, CompactionToolsCall, CompactionToolsSelector, GetMemoriesArgs,
-    MemoryCompactionModule, MergeMemoriesArgs, MergeMemoriesOutput,
+    CompactionAuditOutput, CompactionTools, CompactionToolsCall, CompactionToolsSelector,
+    GetMemoriesArgs, MemoryCompactionModule, MergeMemoriesArgs, MergeMemoriesOutput,
 };
 pub use memory::{
     InsertMemoryArgs, InsertMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,

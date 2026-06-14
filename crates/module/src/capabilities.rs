@@ -957,6 +957,15 @@ impl ModuleCapabilityFactory {
         )
     }
 
+    pub fn default_tier_llm_access(&self) -> crate::FixedTierLlmAccess {
+        crate::FixedTierLlmAccess::new(
+            self.owner.clone(),
+            ModelTier::Default,
+            self.root.inner.tiers.clone(),
+            self.root.inner.runtime_events.clone(),
+        )
+    }
+
     pub fn session(&self, key: impl Into<String>) -> SessionCapabilityRequest {
         SessionCapabilityRequest {
             owner: self.owner.clone(),
