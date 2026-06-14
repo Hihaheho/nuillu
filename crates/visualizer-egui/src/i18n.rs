@@ -12,6 +12,29 @@ pub(crate) const LOCALE_PERSISTENCE_KEY: &str = "visualizer-locale";
 const EN_US_FTL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/i18n/en-US/app.ftl"));
 const JA_JP_FTL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/i18n/ja-JP/app.ftl"));
 
+const MODULE_NAME_KEYS: &[(&str, &str)] = &[
+    ("sensory", "module-name-sensory"),
+    ("cognition-gate", "module-name-cognition-gate"),
+    ("allocation", "module-name-allocation"),
+    ("attention-schema", "module-name-attention-schema"),
+    ("interpreter", "module-name-interpreter"),
+    ("self-model", "module-name-self-model"),
+    ("query-memory", "module-name-query-memory"),
+    ("memory", "module-name-memory"),
+    ("memory-compaction", "module-name-memory-compaction"),
+    ("memory-association", "module-name-memory-association"),
+    ("memory-recombination", "module-name-memory-recombination"),
+    ("interoception", "module-name-interoception"),
+    ("homeostasis", "module-name-homeostasis"),
+    ("policy", "module-name-policy"),
+    ("policy-compaction", "module-name-policy-compaction"),
+    ("reward", "module-name-reward"),
+    ("predict", "module-name-predict"),
+    ("surprise", "module-name-surprise"),
+    ("speak", "module-name-speak"),
+    ("speak-gate", "module-name-speak-gate"),
+];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Locale {
     #[default]
@@ -112,6 +135,27 @@ impl I18n {
 
         format!("[[{id}]]")
     }
+
+    fn localized_module_name(&self, module_id: &str) -> String {
+        module_name_key(module_id)
+            .map(|key| self.tr(key))
+            .unwrap_or_else(|| module_id.to_string())
+    }
+
+    fn localized_module_name_with_id(&self, module_id: &str) -> String {
+        let name = self.localized_module_name(module_id);
+        if name == module_id {
+            name
+        } else {
+            format!("{name} ({module_id})")
+        }
+    }
+}
+
+fn module_name_key(module_id: &str) -> Option<&'static str> {
+    MODULE_NAME_KEYS
+        .iter()
+        .find_map(|(known_id, key)| (*known_id == module_id).then_some(*key))
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +215,19 @@ pub(crate) trait EguiI18nExt {
     fn tr_args(&self, id: &str, args: &[(&str, I18nArg<'_>)]) -> String;
 }
 
+fn installed_i18n(ctx: &egui::Context) -> Arc<I18n> {
+    ctx.data(|data| data.get_temp::<Arc<I18n>>(egui::Id::new(I18N_CTX_KEY)))
+        .expect("I18n is not installed in egui::Context")
+}
+
+pub(crate) fn localized_module_name(ctx: &egui::Context, module_id: &str) -> String {
+    installed_i18n(ctx).localized_module_name(module_id)
+}
+
+pub(crate) fn localized_module_name_with_id(ctx: &egui::Context, module_id: &str) -> String {
+    installed_i18n(ctx).localized_module_name_with_id(module_id)
+}
+
 impl EguiI18nExt for egui::Context {
     fn install_i18n(&self, i18n: Arc<I18n>) {
         self.data_mut(|data| {
@@ -179,17 +236,11 @@ impl EguiI18nExt for egui::Context {
     }
 
     fn tr(&self, id: &str) -> String {
-        let i18n = self
-            .data(|data| data.get_temp::<Arc<I18n>>(egui::Id::new(I18N_CTX_KEY)))
-            .expect("I18n is not installed in egui::Context");
-        i18n.tr(id)
+        installed_i18n(self).tr(id)
     }
 
     fn tr_args(&self, id: &str, args: &[(&str, I18nArg<'_>)]) -> String {
-        let i18n = self
-            .data(|data| data.get_temp::<Arc<I18n>>(egui::Id::new(I18N_CTX_KEY)))
-            .expect("I18n is not installed in egui::Context");
-        i18n.tr_args(id, args)
+        installed_i18n(self).tr_args(id, args)
     }
 }
 
@@ -211,6 +262,18 @@ mod tests {
         );
         assert_eq!(catalog.for_locale(Locale::EnUs).tr("menu-zoom"), "Zoom");
         assert_eq!(catalog.for_locale(Locale::JaJp).tr("menu-zoom"), "倍率");
+        assert_eq!(
+            catalog
+                .for_locale(Locale::JaJp)
+                .tr("module-name-attention-schema"),
+            "注意スキーマ"
+        );
+        assert_eq!(
+            catalog
+                .for_locale(Locale::EnUs)
+                .tr("module-name-attention-schema"),
+            "attention-schema"
+        );
     }
 
     #[test]
@@ -242,6 +305,26 @@ mod tests {
         assert_eq!(
             catalog.for_locale(Locale::EnUs).tr("missing-key"),
             "[[missing-key]]"
+        );
+    }
+
+    #[test]
+    fn localized_module_names_translate_known_ids_and_fallback_for_unknown_ids() {
+        let catalog = I18nCatalog::embedded().expect("embedded translations load");
+        let ja = catalog.for_locale(Locale::JaJp);
+        let en = catalog.for_locale(Locale::EnUs);
+
+        assert_eq!(ja.localized_module_name("sensory"), "感覚");
+        assert_eq!(
+            ja.localized_module_name_with_id("sensory"),
+            "感覚 (sensory)"
+        );
+        assert_eq!(en.localized_module_name("sensory"), "sensory");
+        assert_eq!(en.localized_module_name_with_id("sensory"), "sensory");
+        assert_eq!(ja.localized_module_name("custom-module"), "custom-module");
+        assert_eq!(
+            ja.localized_module_name_with_id("custom-module"),
+            "custom-module"
         );
     }
 }

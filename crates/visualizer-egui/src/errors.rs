@@ -2,7 +2,10 @@ use std::collections::VecDeque;
 
 use nuillu_visualizer_protocol::VisualizerErrorView;
 
-use crate::{i18n::EguiI18nExt as _, text::wrapped_label};
+use crate::{
+    i18n::{EguiI18nExt as _, localized_module_name_with_id},
+    text::wrapped_label,
+};
 
 pub fn ui(
     ui: &mut egui::Ui,
@@ -56,10 +59,10 @@ fn error_row(ui: &mut egui::Ui, error: &VisualizerErrorView) {
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, &error.phase);
-                ui.label(&error.source);
+                ui.label(localized_module_name_with_id(ui.ctx(), &error.source));
                 ui.label(error.at.format("%H:%M:%S%.3f").to_string());
                 if let Some(owner) = &error.owner {
-                    wrapped_label(ui, owner);
+                    wrapped_label(ui, &localized_module_name_with_id(ui.ctx(), owner));
                 }
             });
             ui.add_space(4.0);

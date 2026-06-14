@@ -1,4 +1,6 @@
-use crate::{CognitionEntryView, CognitionLogView, text::wrapped_label};
+use crate::{
+    CognitionEntryView, CognitionLogView, i18n::localized_module_name_with_id, text::wrapped_label,
+};
 
 pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
     let entries = cognition_entries_newest_first(logs);
@@ -12,7 +14,7 @@ pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.strong(entry.source);
+                            ui.strong(localized_module_name_with_id(ui.ctx(), entry.source));
                             ui.label(entry.entry.at.to_rfc3339());
                         });
                         ui.add_space(4.0);

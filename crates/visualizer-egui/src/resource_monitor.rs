@@ -6,7 +6,7 @@ use nuillu_module::RuntimeEvent;
 
 use crate::{
     AllocationView, BlackboardSnapshot, InteroceptionView, ModulePolicyView,
-    i18n::{EguiI18nExt as _, I18nArg},
+    i18n::{EguiI18nExt as _, I18nArg, localized_module_name, localized_module_name_with_id},
     module_filter,
     module_filter::ModuleFilterState,
 };
@@ -309,7 +309,7 @@ fn render_module_activity_plot(
         .map(|module| {
             ui.ctx().tr_args(
                 "resource-monitor-module-allocation-series",
-                &[("module", I18nArg::from(module.as_str()))],
+                &[("module", localized_module_name(ui.ctx(), module).into())],
             )
         })
         .collect::<Vec<_>>();
@@ -318,7 +318,7 @@ fn render_module_activity_plot(
         .map(|module| {
             ui.ctx().tr_args(
                 "resource-monitor-module-runtime-load-series",
-                &[("module", I18nArg::from(module.as_str()))],
+                &[("module", localized_module_name(ui.ctx(), module).into())],
             )
         })
         .collect::<Vec<_>>();
@@ -547,7 +547,7 @@ fn render_latest_snapshot(ui: &mut egui::Ui, state: &ResourceMonitorState) {
                 .unwrap_or_else(|| "- ms".to_string());
             format!(
                 "{} {:.2} {}/{} {} {}",
-                module,
+                localized_module_name_with_id(ui.ctx(), module),
                 allocation.activation_ratio,
                 allocation.active_replicas,
                 allocation.replica_capacity,

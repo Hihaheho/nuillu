@@ -18,6 +18,27 @@ status-no-runtime-tabs = No runtime tabs yet.
 runtime-events-count = runtime events: { $count }
 modules-count = modules: { $count }
 
+module-name-sensory = sensory
+module-name-cognition-gate = cognition-gate
+module-name-allocation = allocation
+module-name-attention-schema = attention-schema
+module-name-interpreter = interpreter
+module-name-self-model = self-model
+module-name-query-memory = query-memory
+module-name-memory = memory
+module-name-memory-compaction = memory-compaction
+module-name-memory-association = memory-association
+module-name-memory-recombination = memory-recombination
+module-name-interoception = interoception
+module-name-homeostasis = homeostasis
+module-name-policy = policy
+module-name-policy-compaction = policy-compaction
+module-name-reward = reward
+module-name-predict = predict
+module-name-surprise = surprise
+module-name-speak = speak
+module-name-speak-gate = speak-gate
+
 section-cognition-log = Cognition Log
 section-memory = Memory
 section-scene = Scene

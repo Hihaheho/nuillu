@@ -21,7 +21,7 @@ use crate::{
     AllocationView, BlackboardSnapshot, LlmInputItemView, LlmObservationEvent,
     LlmObservationSource, LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, MemoView,
     ModulePolicyView, ModuleSettingsView, ModuleStatusView, ZeroReplicaWindowView,
-    i18n::{EguiI18nExt as _, I18nArg},
+    i18n::{EguiI18nExt as _, I18nArg, localized_module_name, localized_module_name_with_id},
     memos, module_filter,
     module_filter::ModuleFilterState,
     text::{hard_wrap_long_segments, wrapped_label},
@@ -666,7 +666,7 @@ pub fn render_module(
     let mut actions = Vec::new();
     let module_memos = module_memos(module, memos);
     ui.horizontal(|ui| {
-        ui.heading(module_title(module));
+        ui.heading(module_title(ui.ctx(), module));
         if let Some(tier) = &module.last_tier {
             ui.label(ui.ctx().tr_args(
                 "module-tier-label",
@@ -770,8 +770,8 @@ pub fn render_llm_turns(
     }
 }
 
-pub fn window_title(module: &ModuleState) -> String {
-    format!("Module - {}", module.owner)
+pub fn window_title(ctx: &egui::Context, module: &ModuleState) -> String {
+    format!("Module - {}", localized_owner_name(ctx, &module.owner))
 }
 
 const MODULE_BODY_MIN_HEIGHT: f32 = 160.0;
@@ -857,7 +857,7 @@ fn render_llm_turn_selector(
                     };
                     failed_turn_frame(ui, status).show(ui, |ui| {
                         let response = ui
-                            .selectable_label(selected, &row.label)
+                            .selectable_label(selected, localized_llm_turn_row_label(ui.ctx(), row))
                             .on_hover_text(llm_turn_row_hover(ui.ctx(), row));
                         if response.clicked() {
                             *selected_turn_id = Some(row.turn_id.clone());
@@ -883,7 +883,10 @@ fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoVi
         ui.strong(ui.ctx().tr("module-memos"));
         ui.label(ui.ctx().tr_args(
             "module-name-label",
-            &[("module", module_name(module).into())],
+            &[(
+                "module",
+                localized_module_name_with_id(ui.ctx(), &module_name(module)).into(),
+            )],
         ));
         ui.label(
             ui.ctx()
@@ -1437,7 +1440,10 @@ fn overview_config_cell(
             let clicked = response.clicked();
             response.on_hover_text(ui.ctx().tr_args(
                 "module-overview-edit-hover",
-                &[("module", I18nArg::from(policy.module.as_str()))],
+                &[(
+                    "module",
+                    localized_module_name_with_id(ui.ctx(), &policy.module).into(),
+                )],
             ));
             if clicked {
                 if open_config
@@ -1489,7 +1495,7 @@ fn render_open_config_popup(
             ui.set_max_width(CONFIG_POPUP_WIDTH);
             ui.horizontal(|ui| {
                 ui.strong(ui.ctx().tr("module-overview-configs"));
-                ui.label(&policy.module);
+                ui.label(localized_module_name_with_id(ui.ctx(), &policy.module));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("x")
@@ -1629,16 +1635,20 @@ fn overview_module_cell(
     row: &ModuleOverviewRow,
     actions: &mut Vec<ModuleOverviewAction>,
 ) {
+    let label = localized_module_name(ui.ctx(), &row.module);
+    let hover_module = if row.owner != row.module {
+        localized_owner_name_with_id(ui.ctx(), &row.owner)
+    } else {
+        localized_module_name_with_id(ui.ctx(), &row.module)
+    };
     let mut response = ui.add_sized(
         [MODULE_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
-        egui::Button::new(&row.module),
+        egui::Button::new(label),
     );
-    if row.owner != row.module {
-        response = response.on_hover_text(ui.ctx().tr_args(
-            "module-open-hover",
-            &[("module", I18nArg::from(row.owner.as_str()))],
-        ));
-    }
+    response = response.on_hover_text(
+        ui.ctx()
+            .tr_args("module-open-hover", &[("module", hover_module.into())]),
+    );
     if response.clicked() {
         actions.push(ModuleOverviewAction::OpenModule {
             owner: row.owner.clone(),
@@ -2184,13 +2194,26 @@ fn llm_turn_row_label(
     }
 }
 
+fn localized_llm_turn_row_label(ctx: &egui::Context, row: &LlmTurnListRow) -> String {
+    llm_turn_row_label(
+        localized_module_name(ctx, &row.module),
+        row.session_key.as_deref().unwrap_or("turn"),
+        row.turn_number,
+        row.streaming,
+    )
+}
+
 fn llm_turn_row_hover(ctx: &egui::Context, row: &LlmTurnListRow) -> String {
     let status = if row.streaming {
         ctx.tr("module-streaming")
     } else {
         ctx.tr("module-not-streaming")
     };
-    format!("{} {} ({status})", row.owner, row.turn_id)
+    format!(
+        "{} {} ({status})",
+        localized_owner_name_with_id(ctx, &row.owner),
+        row.turn_id
+    )
 }
 
 fn turn_is_streaming(turn: &LlmTurnState) -> bool {
@@ -2391,8 +2414,26 @@ fn infer_owner_parts(owner: &str) -> (String, u8) {
     (owner.to_string(), 0)
 }
 
-fn module_title(module: &ModuleState) -> String {
-    format!("{} {}", status_label(module.status), module.owner)
+fn localized_owner_name(ctx: &egui::Context, owner: &str) -> String {
+    let (module, replica) = infer_owner_parts(owner);
+    owner_for_replica(&localized_module_name(ctx, &module), replica)
+}
+
+fn localized_owner_name_with_id(ctx: &egui::Context, owner: &str) -> String {
+    let label = localized_owner_name(ctx, owner);
+    if label == owner {
+        label
+    } else {
+        format!("{label} ({owner})")
+    }
+}
+
+fn module_title(ctx: &egui::Context, module: &ModuleState) -> String {
+    format!(
+        "{} {}",
+        status_label(module.status),
+        localized_owner_name_with_id(ctx, &module.owner)
+    )
 }
 
 fn status_label(status: ModuleSessionStatus) -> &'static str {
@@ -4414,17 +4455,18 @@ mod tests {
 
     #[test]
     fn module_window_title_is_stable_across_status_changes() {
+        let ctx = test_i18n_context(Locale::JaJp);
         let mut module = ModuleState {
             owner: "sensory".to_string(),
             module: "sensory".to_string(),
             status: ModuleSessionStatus::Idle,
             ..ModuleState::default()
         };
-        let idle_title = window_title(&module);
+        let idle_title = window_title(&ctx, &module);
         module.status = ModuleSessionStatus::Running;
 
-        assert_eq!(idle_title, "Module - sensory");
-        assert_eq!(window_title(&module), idle_title);
+        assert_eq!(idle_title, "Module - 感覚");
+        assert_eq!(window_title(&ctx, &module), idle_title);
     }
 
     fn memo_view(owner: &str, module: &str, replica: u8, index: u64, content: &str) -> MemoView {

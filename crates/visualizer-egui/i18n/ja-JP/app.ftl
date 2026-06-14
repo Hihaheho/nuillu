@@ -17,6 +17,27 @@ status-no-runtime-tabs = まだランタイムタブはありません。
 runtime-events-count = ランタイムイベント: { $count }
 modules-count = モジュール: { $count }
 
+module-name-sensory = 感覚
+module-name-cognition-gate = 認知ゲート
+module-name-allocation = 資源配分
+module-name-attention-schema = 注意スキーマ
+module-name-interpreter = 解釈
+module-name-self-model = 自己モデル
+module-name-query-memory = 記憶検索
+module-name-memory = 記憶
+module-name-memory-compaction = 記憶圧縮
+module-name-memory-association = 記憶関連づけ
+module-name-memory-recombination = 記憶再結合
+module-name-interoception = 内受容
+module-name-homeostasis = 恒常性制御
+module-name-policy = ポリシー
+module-name-policy-compaction = ポリシー圧縮
+module-name-reward = 報酬
+module-name-predict = 予測
+module-name-surprise = 驚き
+module-name-speak = 発話
+module-name-speak-gate = 発話ゲート
+
 section-cognition-log = 認知ログ
 section-memory = 記憶
 section-scene = シーン

@@ -1,6 +1,6 @@
 use crate::{
     BlackboardSnapshot,
-    i18n::{EguiI18nExt as _, I18nArg},
+    i18n::{EguiI18nExt as _, I18nArg, localized_module_name_with_id},
     text::wrapped_label,
 };
 
@@ -16,7 +16,7 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.strong(&item.module);
+                            ui.strong(localized_module_name_with_id(ui.ctx(), &item.module));
                             ui.label(ui.ctx().tr_args(
                                 "blackboard-replicas",
                                 &[("count", i64::from(item.active_replicas).into())],
@@ -39,7 +39,10 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
             ui.heading(ui.ctx().tr("blackboard-module-status"));
             for item in &snapshot.module_statuses {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(&item.owner);
+                    ui.strong(localized_module_name_with_id(ui.ctx(), &item.module));
+                    if item.owner != item.module {
+                        ui.label(&item.owner);
+                    }
                     ui.label(&item.status);
                 });
             }
@@ -53,7 +56,7 @@ pub fn ui(ui: &mut egui::Ui, snapshot: &BlackboardSnapshot) {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.strong(&progress.owner);
+                            ui.strong(localized_module_name_with_id(ui.ctx(), &progress.owner));
                             ui.label(&progress.state);
                             ui.label(format!("#{}:{}", progress.generation_id, progress.sequence));
                             ui.label(ui.ctx().tr_args(

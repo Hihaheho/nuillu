@@ -1,5 +1,8 @@
 use crate::{
-    MemoView, i18n::EguiI18nExt as _, module_filter, module_filter::ModuleFilterState,
+    MemoView,
+    i18n::{EguiI18nExt as _, localized_module_name_with_id},
+    module_filter,
+    module_filter::ModuleFilterState,
     text::wrapped_label,
 };
 
@@ -41,7 +44,11 @@ pub fn render_memo_card(ui: &mut egui::Ui, memo: &MemoView) {
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&memo.owner);
-                ui.label(format!("{}#{}", memo.module, memo.replica));
+                ui.label(format!(
+                    "{}#{}",
+                    localized_module_name_with_id(ui.ctx(), &memo.module),
+                    memo.replica
+                ));
                 ui.label(
                     ui.ctx()
                         .tr_args("memo-index", &[("index", memo.index.to_string().into())]),

@@ -843,7 +843,7 @@ impl RuntimeTab {
         for module in self.modules.iter() {
             specs.push(ViewWindowSpec {
                 id: format!("{base}:module:{}", module.owner),
-                title: modules::window_title(module),
+                title: modules::window_title(ctx, module),
                 default_open: false,
                 kind: ViewWindowKind::Module,
             });
@@ -1070,7 +1070,7 @@ impl RuntimeTab {
             self.active_simplified_module_owner = None;
             return;
         };
-        let title = modules::window_title(module);
+        let title = modules::window_title(ui.ctx(), module);
         let mut open = true;
         let response = egui::Window::new(title)
             .id(egui::Id::new((
@@ -1258,11 +1258,18 @@ impl RuntimeTab {
             });
         self.record_window_open(modules_id, open);
 
+        let ctx = ui.ctx().clone();
         let module_windows = self
             .modules
             .iter()
             .enumerate()
-            .map(|(index, module)| (index, module.owner.clone(), modules::window_title(module)))
+            .map(|(index, module)| {
+                (
+                    index,
+                    module.owner.clone(),
+                    modules::window_title(&ctx, module),
+                )
+            })
             .collect::<Vec<_>>();
         for (index, owner, module_title) in module_windows {
             let module_id = format!("{base}:module:{owner}");

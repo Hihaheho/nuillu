@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::i18n::EguiI18nExt as _;
+use crate::i18n::{EguiI18nExt as _, localized_module_name, localized_module_name_with_id};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleFilterState {
@@ -84,7 +84,13 @@ pub fn render_module_filter(
             }
             for module in modules {
                 let mut selected = state.is_selected(&module);
-                if ui.checkbox(&mut selected, &module).changed() {
+                let label = localized_module_name(ui.ctx(), &module);
+                let hover = localized_module_name_with_id(ui.ctx(), &module);
+                if ui
+                    .checkbox(&mut selected, label)
+                    .on_hover_text(hover)
+                    .changed()
+                {
                     state.set_selected(module, selected);
                 }
             }
