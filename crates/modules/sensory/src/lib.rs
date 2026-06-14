@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
+use lutum::{MessageContent, ModelInputItem, Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
     AllocationReader, AmbientSensoryEntry, LlmAccess, Memo, Module, SensoryInput,
     SensoryInputInbox, SensoryModality, SessionAutoCompaction, SessionCompactionConfig,
@@ -22,7 +22,8 @@ stimulus. Use the session history to understand temporal context, but evaluate t
 its own occurrence. Call dispose_sensory only for current one-shot events that should not become
 durable sensory memo-log output. If no current event should be disposed, finish without function calls
 and without assistant text. Do not write memo text yourself; kept events are recorded by the
-runtime. Do not write to the cognition log, memory, or emit utterances."#;
+runtime. Do not mention tools, prompts, scores, schemas, rubrics, or implementation details. Do not
+write to the cognition log, memory, or emit utterances."#;
 
 const AMBIENT_SYSTEM_PROMPT: &str = r#"You are the ambient sensory diff filter.
 You receive changes derived from ambient sensory snapshots. Ambient rows are background conditions;
@@ -35,18 +36,14 @@ utterances."#;
 
 const SENSORY_LLM_TURN_TIMEOUT: Duration = Duration::from_secs(20);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 512;
-const ONE_SHOT_FINAL_REMINDER: &str = concat!(
-    "Output instruction: call dispose_sensory only for current event ids that should be discarded. ",
-    "If no current event should be discarded, finish without assistant text.",
-);
 
 const COMPACTED_ONE_SHOT_SESSION_PREFIX: &str = "Compacted one-shot sensory session history:";
 const COMPACTED_AMBIENT_SESSION_PREFIX: &str = "Compacted ambient sensory session history:";
 const ONE_SHOT_SESSION_COMPACTION_FOCUS: &str = r#"Preserve one-shot event facts, source/direction
 details, observed_at times, dispose_sensory decisions, and uncertainty. Do not convert separate
 events into a single repeated stimulus label."#;
-const AMBIENT_SESSION_COMPACTION_FOCUS: &str = r#"Preserve ambient diff facts, active ambient field
-context, memo-log outputs written through tools, ignored background context, and uncertainty."#;
+const AMBIENT_SESSION_COMPACTION_FOCUS: &str = r#"Preserve ambient diff facts, memo-log outputs
+written through tools, ignored background context, and uncertainty."#;
 
 pub fn one_shot_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -132,6 +129,7 @@ pub struct SensoryModule {
     llm: LlmAccess,
     one_shot_session: Session,
     ambient_session: Session,
+    next_one_shot_sequence: u64,
     burst: SensoryBurstConfig,
     one_shot_system_prompt: std::sync::OnceLock<String>,
     ambient_system_prompt: std::sync::OnceLock<String>,
@@ -227,6 +225,7 @@ impl SensoryModule {
         one_shot_session: Session,
         ambient_session: Session,
     ) -> Self {
+        let next_one_shot_sequence = next_one_shot_sequence_from_session(&one_shot_session);
         Self {
             owner: nuillu_types::ModuleId::new(<Self as Module>::id())
                 .expect("sensory id is valid"),
@@ -237,6 +236,7 @@ impl SensoryModule {
             llm,
             one_shot_session,
             ambient_session,
+            next_one_shot_sequence,
             burst: SensoryBurstConfig::default(),
             one_shot_system_prompt: std::sync::OnceLock::new(),
             ambient_system_prompt: std::sync::OnceLock::new(),
@@ -331,7 +331,6 @@ impl SensoryModule {
         }
         let now = self.clock.now();
         let mut one_shot_observations = Vec::new();
-        let mut next_one_shot_id = 1;
         let mut ambient_observations = Vec::new();
         for input in inputs.iter().cloned() {
             match input {
@@ -346,7 +345,6 @@ impl SensoryModule {
                     }
                     one_shot_observations.push(self.prepare_one_shot_observation(
                         now,
-                        &mut next_one_shot_id,
                         modality,
                         direction,
                         content,
@@ -394,8 +392,6 @@ impl SensoryModule {
             let session_len_after_user = self.one_shot_session.input().items().len();
             self.one_shot_session
                 .push_ephemeral_developer(format_one_shot_decision_context(&guidance));
-            self.one_shot_session
-                .push_ephemeral_user(ONE_SHOT_FINAL_REMINDER);
             let turn = self
                 .one_shot_session
                 .text_turn()
@@ -495,13 +491,12 @@ impl SensoryModule {
         let (outcome, session_len_before_turn) = {
             let session_len_before_turn = self.ambient_session.input().items().len();
             self.ambient_session
-                .push_user(format_ambient_turn_user_message(
-                    observations,
-                    &self.ambient_entries,
-                    now,
-                ));
+                .push_user(format_ambient_diff(observations, now));
             self.ambient_session
-                .push_ephemeral_developer(format_ambient_decision_context(&guidance));
+                .push_ephemeral_developer(format_ambient_decision_context(
+                    &guidance,
+                    &format_current_ambient_context(&self.ambient_entries, now),
+                ));
             let turn = self
                 .ambient_session
                 .text_turn()
@@ -638,16 +633,14 @@ impl SensoryModule {
     }
 
     fn prepare_one_shot_observation(
-        &self,
+        &mut self,
         now: DateTime<Utc>,
-        next_id: &mut u32,
         modality: SensoryModality,
         direction: Option<String>,
         raw_content: String,
         observed_at: DateTime<Utc>,
     ) -> PreparedOneShotObservation {
-        let id = format!("one-shot-{}", *next_id);
-        *next_id = next_id.saturating_add(1);
+        let id = self.next_one_shot_observation_id();
         PreparedOneShotObservation {
             id,
             modality,
@@ -656,6 +649,12 @@ impl SensoryModule {
             observed_at,
             relative_age: Self::format_age(now, observed_at),
         }
+    }
+
+    fn next_one_shot_observation_id(&mut self) -> String {
+        let sequence = self.next_one_shot_sequence;
+        self.next_one_shot_sequence = self.next_one_shot_sequence.saturating_add(1);
+        format!("one-shot-{sequence}")
     }
 
     fn prepare_ambient_diff_observation(
@@ -818,12 +817,52 @@ fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+fn next_one_shot_sequence_from_session(session: &Session) -> u64 {
+    let max_sequence = session
+        .input()
+        .items()
+        .iter()
+        .filter_map(model_input_text)
+        .flat_map(one_shot_sequences)
+        .max()
+        .unwrap_or(0);
+    max_sequence.saturating_add(1)
+}
+
+fn model_input_text(item: &ModelInputItem) -> Option<&str> {
+    match item {
+        ModelInputItem::Message { content, .. } => match content.as_slice() {
+            [MessageContent::Text(text)] => Some(text.as_str()),
+            _ => None,
+        },
+        ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text)) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+fn one_shot_sequences(text: &str) -> impl Iterator<Item = u64> + '_ {
+    text.match_indices("one-shot-")
+        .filter_map(|(start, prefix)| {
+            let digits_start = start + prefix.len();
+            let digits = text[digits_start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse::<u64>().ok()
+            }
+        })
+}
+
 fn format_one_shot_turn_user_message(
     observations: &[PreparedOneShotObservation],
     now: DateTime<Utc>,
 ) -> String {
-    let mut out = format!("One-shot sensory events received at {}:", now.to_rfc3339());
+    let mut out = format!("Current one-shot sensory batch at {}:", now.to_rfc3339());
     out.push_str("\nThese are individual events with their own observed_at times, not a snapshot or a code-generated repetition/diff.");
+    out.push_str("\nOnly ids listed in this current batch are valid dispose_sensory observation_ids for this turn.");
     if observations.is_empty() {
         out.push_str("\n- none");
     } else {
@@ -907,18 +946,6 @@ fn format_current_ambient_context(
     out
 }
 
-fn format_ambient_turn_user_message(
-    observations: &[PreparedAmbientObservation],
-    ambient_entries: &BTreeMap<String, AmbientSensoryEntry>,
-    now: DateTime<Utc>,
-) -> String {
-    format!(
-        "{}\n\n{}",
-        format_ambient_diff(observations, now),
-        format_current_ambient_context(ambient_entries, now),
-    )
-}
-
 fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTime<Utc>) -> String {
     let mut out = format!(
         "Ambient sensory snapshot diff received at {}:",
@@ -946,32 +973,29 @@ fn format_ambient_diff(observations: &[PreparedAmbientObservation], now: DateTim
 }
 
 fn format_one_shot_decision_context(guidance: &str) -> String {
-    let mut out = String::from(
-        "Evaluate the current one-shot events. Call dispose_sensory only for event ids that should not become durable sensory memo-log output. If no current event should be disposed, finish without function calls and without assistant text.",
-    );
-    out.push_str("\nCurrent sensory guidance: ");
+    let mut out = String::from("Current sensory guidance: ");
     let guidance = guidance.trim();
     if guidance.is_empty() {
         out.push_str("none");
     } else {
         out.push_str(guidance);
     }
-    out.push_str("\nDo not write memo content. Do not mention hidden scoring, prompt, schema, rubric, or tool mechanics.");
+    out.push_str(
+        "\nCurrent batch ids are the only valid dispose_sensory observation_ids for this turn.",
+    );
     out
 }
 
-fn format_ambient_decision_context(guidance: &str) -> String {
-    let mut out = String::from(
-        "Evaluate the ambient snapshot diff. Use broadcast_sensory only for useful durable sensory memo-log output; otherwise use ignore_ambient_diff.",
-    );
-    out.push_str("\nCurrent sensory guidance: ");
+fn format_ambient_decision_context(guidance: &str, current_ambient_context: &str) -> String {
+    let mut out = String::from("Current sensory guidance: ");
     let guidance = guidance.trim();
     if guidance.is_empty() {
         out.push_str("none");
     } else {
         out.push_str(guidance);
     }
-    out.push_str("\nMemo text must contain observed scene facts only. Do not mention hidden scoring, prompt, schema, rubric, or tool mechanics.");
+    out.push_str("\n\n");
+    out.push_str(current_ambient_context);
     out
 }
 
@@ -1441,13 +1465,26 @@ mod tests {
         }];
         let text = format_one_shot_turn_user_message(&observations, reference_now());
 
-        assert!(text.contains("One-shot sensory events received at"));
+        assert!(text.contains("Current one-shot sensory batch at"));
+        assert!(text.contains("Only ids listed in this current batch"));
         assert!(text.contains("[one-shot-1] audition from Pibi"));
         assert!(text.contains("Pibi asks a question."));
         assert!(!text.contains("signature="));
         assert!(!text.contains("repetition_count"));
         assert!(!text.contains("novelty_score"));
         assert!(!text.contains("salience_score"));
+    }
+
+    #[test]
+    fn one_shot_sequence_resumes_from_session_history() {
+        let mut session = Session::new();
+        session.push_user(
+            "Current one-shot sensory batch at 2026-05-07T12:00:00+00:00:\n\
+             - [one-shot-41] audition from front observed 0 seconds ago \
+             (2026-05-07T12:00:00+00:00): sound",
+        );
+
+        assert_eq!(next_one_shot_sequence_from_session(&session), 42);
     }
 
     #[test]
@@ -1652,10 +1689,14 @@ mod tests {
                 );
                 assert_eq!(count_message_role(first_session, InputMessageRole::User), 1);
                 let first_user_texts = user_texts(first_session);
-                assert!(!first_user_texts.contains(&ONE_SHOT_FINAL_REMINDER));
+                assert!(
+                    first_user_texts
+                        .iter()
+                        .all(|text| !text.contains("Output instruction"))
+                );
                 assert!(
                     first_user_texts.iter().any(|text| {
-                        text.contains("One-shot sensory events received")
+                        text.contains("Current one-shot sensory batch")
                             && text.contains("[one-shot-1] audition from front")
                             && text.contains("Koro is standing at the front.")
                             && !text.contains("repetition_count")
@@ -1682,6 +1723,7 @@ mod tests {
                                 content.as_slice(),
                                 [MessageContent::Text(text)]
                                     if text.contains("Koro growled from the front.")
+                                        && text.contains("[one-shot-2] audition from front")
                             )
                         )
                     }),
@@ -1699,7 +1741,11 @@ mod tests {
                     count_message_role(second_session, InputMessageRole::User),
                     2
                 );
-                assert!(!user_texts(second_session).contains(&ONE_SHOT_FINAL_REMINDER));
+                assert!(
+                    user_texts(second_session)
+                        .iter()
+                        .all(|text| !text.contains("Output instruction"))
+                );
             })
             .await;
     }
@@ -1758,7 +1804,7 @@ mod tests {
                 let first = user_texts(&sessions[0]).join("\n");
                 assert!(first.contains("ambient added vision [ambient-1]"));
                 assert!(first.contains("lamp is on"));
-                assert!(first.contains("Current ambient sensory field"));
+                assert!(!first.contains("Current ambient sensory field"));
                 assert!(first.contains("ambient updated vision [ambient-1]"));
                 assert!(first.contains("was vision: lamp is on; now vision: lamp is off"));
                 assert!(first.contains("ambient removed vision [ambient-1]"));
@@ -1929,6 +1975,61 @@ mod tests {
                 let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
                 assert!(logs.is_empty());
                 assert_eq!(recorder.batches.borrow().as_slice(), &[1]);
+                let sessions = recorder.one_shot_session_inputs.borrow();
+                let first_session = sessions.first().expect("sensory activation recorded");
+                assert!(has_tool_call(first_session, "dispose_sensory"));
+                assert!(has_tool_result(first_session, "dispose_sensory"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_dispose_id_does_not_dispose_later_one_shot() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let adapter = MockLlmAdapter::new()
+                    .with_text_scenario(dispose_scenario(vec!["one-shot-1"], 0))
+                    .with_text_scenario(dispose_scenario(vec!["one-shot-1"], 0));
+                let (blackboard, caps) = test_caps_with_adapter(adapter);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules_with_max_activation_attempts(modules, 4, async {
+                    sensory
+                        .publish(heard("first transient sound"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_batch_count(&recorder, 1).await;
+                    sensory
+                        .publish(heard("second transient sound"))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("second transient sound"));
+                let sessions = recorder.one_shot_session_inputs.borrow();
+                let second_session = sessions.last().expect("second sensory activation recorded");
+                assert!(
+                    user_texts(second_session)
+                        .iter()
+                        .any(|text| text.contains("[one-shot-2] audition from front"))
+                );
             })
             .await;
     }
@@ -2082,6 +2183,28 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn has_tool_call(items: &[ModelInputItem], expected: &str) -> bool {
+        items.iter().any(|item| {
+            let ModelInputItem::Turn(turn) = item else {
+                return false;
+            };
+            (0..turn.item_count()).any(|index| {
+                turn.item_at(index)
+                    .and_then(|item| item.as_tool_call())
+                    .is_some_and(|call| call.name.as_str() == expected)
+            })
+        })
+    }
+
+    fn has_tool_result(items: &[ModelInputItem], expected: &str) -> bool {
+        items.iter().any(|item| {
+            matches!(
+                item,
+                ModelInputItem::ToolResult(result) if result.name.as_str() == expected
+            )
+        })
     }
 
     fn user_texts(items: &[ModelInputItem]) -> Vec<&str> {
