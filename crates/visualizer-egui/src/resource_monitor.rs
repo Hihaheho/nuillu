@@ -336,7 +336,7 @@ fn render_module_activity_plot(
         });
 }
 
-fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState, now_secs: f64) {
+pub fn render_interoception_plot(ui: &mut egui::Ui, state: &ResourceMonitorState, now_secs: f64) {
     ui.strong("Interoception");
     ui.label("valence is normalized from -1..1 into 0..1");
     Plot::new("resource-monitor-interoception")

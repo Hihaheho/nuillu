@@ -386,6 +386,8 @@ pub struct RuntimeTab {
     id: VisualizerTabId,
     title: String,
     status: TabStatus,
+    view_mode: RuntimeTabViewMode,
+    active_simplified_module_owner: Option<String>,
     scene: chat::SceneUiState,
     blackboard: BlackboardSnapshot,
     memories: memories::MemoriesState,
@@ -402,6 +404,15 @@ pub struct RuntimeTab {
     resource_monitor_module_filter: module_filter::ModuleFilterState,
     resource_monitor_started_at: Instant,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RuntimeTabViewMode {
+    #[default]
+    Simplified,
+    Windowed,
+}
+
+const SIMPLIFIED_PANE_GAP: f32 = 8.0;
 
 #[derive(Debug, Clone)]
 struct ViewWindowSpec {
@@ -423,6 +434,8 @@ impl RuntimeTab {
             id,
             title,
             status: TabStatus::Running,
+            view_mode: RuntimeTabViewMode::default(),
+            active_simplified_module_owner: None,
             scene: chat::SceneUiState::default(),
             blackboard: BlackboardSnapshot::default(),
             memories: memories::MemoriesState::default(),
@@ -448,12 +461,30 @@ impl RuntimeTab {
             ui.label(format!("modules: {}", self.modules.iter().count()));
         });
 
-        self.windows_ui(ui, commands);
+        match self.view_mode {
+            RuntimeTabViewMode::Simplified => self.simplified_ui(ui, commands),
+            RuntimeTabViewMode::Windowed => self.windows_ui(ui, commands),
+        }
     }
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
-        let specs = self.window_specs();
         ui.menu_button("View", |ui| {
+            let simplified = self.view_mode == RuntimeTabViewMode::Simplified;
+            let label = if simplified {
+                "☑️ Simplified View"
+            } else {
+                "☐ Simplified View"
+            };
+            if ui.button(label).clicked() {
+                self.set_simplified_view(!simplified);
+                ui.close();
+            }
+            if self.view_mode == RuntimeTabViewMode::Simplified {
+                return;
+            }
+
+            ui.separator();
+            let specs = self.window_specs();
             if specs.iter().any(|spec| spec.kind == ViewWindowKind::Module) {
                 if ui.button("Close all module windows").clicked() {
                     self.close_all_module_windows();
@@ -482,6 +513,17 @@ impl RuntimeTab {
                 });
             }
         });
+    }
+
+    fn set_simplified_view(&mut self, simplified: bool) {
+        self.view_mode = if simplified {
+            RuntimeTabViewMode::Simplified
+        } else {
+            RuntimeTabViewMode::Windowed
+        };
+        if self.view_mode == RuntimeTabViewMode::Windowed {
+            self.active_simplified_module_owner = None;
+        }
     }
 
     fn window_specs(&self) -> Vec<ViewWindowSpec> {
@@ -573,6 +615,262 @@ impl RuntimeTab {
         }
     }
 
+    fn simplified_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
+        let available = ui.available_size();
+        if available.x <= 1.0 || available.y <= 1.0 {
+            return;
+        }
+
+        let resource_monitor_now_secs = self.resource_monitor_elapsed_secs();
+        let right_width = (available.x * 0.32)
+            .clamp(360.0, 560.0)
+            .min((available.x - 320.0).max(260.0));
+        let center_width = (available.x - right_width - SIMPLIFIED_PANE_GAP).max(260.0);
+        let mut requested_module = None;
+
+        ui.horizontal(|ui| {
+            ui.set_min_height(available.y);
+            ui.allocate_ui_with_layout(
+                egui::vec2(center_width, available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let modules_height = (available.y * 0.42)
+                        .clamp(220.0, 380.0)
+                        .min(ui.available_height().max(1.0));
+                    simplified_section(
+                        ui,
+                        None,
+                        egui::vec2(ui.available_width(), modules_height),
+                        |ui| {
+                            requested_module = self.render_modules_overview_contents(
+                                ui,
+                                commands,
+                                resource_monitor_now_secs,
+                            );
+                        },
+                    );
+                    ui.add_space(SIMPLIFIED_PANE_GAP);
+
+                    let lower_height = ui.available_height().max(1.0);
+                    let lower_width = ui.available_width();
+                    let column_width = ((lower_width - SIMPLIFIED_PANE_GAP) / 2.0).max(1.0);
+                    ui.horizontal(|ui| {
+                        simplified_section(
+                            ui,
+                            Some("Cognition Log"),
+                            egui::vec2(column_width, lower_height),
+                            |ui| self.render_cognition_contents(ui),
+                        );
+                        ui.add_space(SIMPLIFIED_PANE_GAP);
+                        simplified_section(
+                            ui,
+                            Some("Memory"),
+                            egui::vec2(ui.available_width().max(1.0), lower_height),
+                            |ui| self.render_memory_contents(ui, commands),
+                        );
+                    });
+                },
+            );
+
+            ui.add_space(SIMPLIFIED_PANE_GAP);
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_width.min(ui.available_width()).max(1.0), available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    simplified_section(
+                        ui,
+                        Some("Scene"),
+                        egui::vec2(ui.available_width(), available.y),
+                        |ui| self.render_scene_contents(ui, commands),
+                    );
+                },
+            );
+        });
+
+        let module_opened_this_frame = requested_module.is_some();
+        if let Some(owner) = requested_module {
+            self.open_simplified_module(owner);
+        }
+        self.render_simplified_interoception_window(ui, resource_monitor_now_secs);
+        self.render_simplified_module_popup(ui, commands, module_opened_this_frame);
+    }
+
+    fn render_scene_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        chat::ui(ui, &self.id, &mut self.scene, commands);
+    }
+
+    fn render_memory_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        memories::ui(ui, &self.id, &mut self.memories, commands);
+    }
+
+    fn render_cognition_contents(&self, ui: &mut egui::Ui) {
+        cognition::ui(ui, &self.blackboard.cognition_logs);
+    }
+
+    fn render_modules_overview_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &Sender<VisualizerClientMessage>,
+        now_secs: f64,
+    ) -> Option<String> {
+        let actions =
+            modules::render_modules_overview(ui, &self.blackboard, &self.modules, now_secs);
+        self.handle_module_overview_actions(actions, commands)
+    }
+
+    fn handle_module_overview_actions(
+        &mut self,
+        actions: Vec<modules::ModuleOverviewAction>,
+        commands: &Sender<VisualizerClientMessage>,
+    ) -> Option<String> {
+        let mut requested_module = None;
+        for action in actions {
+            match action {
+                modules::ModuleOverviewAction::OpenModule { owner } => {
+                    requested_module = Some(owner);
+                }
+                modules::ModuleOverviewAction::SetDisabled { module, disabled } => {
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::SetModuleDisabled {
+                            tab_id: self.id.clone(),
+                            module,
+                            disabled,
+                        },
+                    });
+                }
+                modules::ModuleOverviewAction::SetModuleSettings { settings } => {
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::SetModuleSettings {
+                            tab_id: self.id.clone(),
+                            settings,
+                        },
+                    });
+                }
+            }
+        }
+        requested_module
+    }
+
+    fn render_module_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        owner: &str,
+        commands: &Sender<VisualizerClientMessage>,
+    ) {
+        let Some(module) = self.modules.get(owner) else {
+            return;
+        };
+        let module_window_actions = modules::render_module(ui, module, &self.blackboard.memos);
+        for action in module_window_actions {
+            match action {
+                modules::ModuleWindowAction::ResetSessionHistory { owner } => {
+                    let _ = commands.send(VisualizerClientMessage::Command {
+                        command: VisualizerCommand::ResetModuleSessionHistory {
+                            tab_id: self.id.clone(),
+                            owner,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    fn open_simplified_module(&mut self, owner: String) {
+        self.active_simplified_module_owner = Some(owner);
+    }
+
+    fn render_simplified_interoception_window(&self, ui: &mut egui::Ui, now_secs: f64) {
+        egui::Window::new(format!("Interoception - {}", self.title))
+            .id(egui::Id::new((
+                self.id.as_str(),
+                "simplified-interoception",
+            )))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .default_pos(egui::pos2(24.0, 96.0))
+            .default_size(egui::vec2(520.0, 260.0))
+            .show(ui.ctx(), |ui| {
+                resource_monitor::render_interoception_plot(ui, &self.resource_monitor, now_secs);
+            });
+    }
+
+    fn render_simplified_module_popup(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &Sender<VisualizerClientMessage>,
+        opened_this_frame: bool,
+    ) {
+        let Some(owner) = self.active_simplified_module_owner.clone() else {
+            return;
+        };
+        let Some(module) = self.modules.get(&owner) else {
+            self.active_simplified_module_owner = None;
+            return;
+        };
+        let title = modules::window_title(module);
+        let mut open = true;
+        let response = egui::Window::new(title)
+            .id(egui::Id::new((
+                self.id.as_str(),
+                "simplified-module-popup",
+                owner.as_str(),
+            )))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .open(&mut open)
+            .default_pos(egui::pos2(720.0, 128.0))
+            .default_size(egui::vec2(520.0, 420.0))
+            .show(ui.ctx(), |ui| {
+                self.render_module_contents(ui, &owner, commands);
+            });
+
+        let Some(response) = response else {
+            self.active_simplified_module_owner = None;
+            return;
+        };
+        if !open {
+            self.active_simplified_module_owner = None;
+            return;
+        }
+        let (primary_clicked, interact_pos) = ui.ctx().input(|input| {
+            (
+                input.pointer.primary_clicked(),
+                input.pointer.interact_pos(),
+            )
+        });
+        self.close_simplified_module_popup_for_interaction(
+            response.response.rect,
+            opened_this_frame,
+            primary_clicked,
+            interact_pos,
+        );
+    }
+
+    fn close_simplified_module_popup_for_interaction(
+        &mut self,
+        popup_rect: egui::Rect,
+        opened_this_frame: bool,
+        primary_clicked: bool,
+        interact_pos: Option<egui::Pos2>,
+    ) {
+        if simplified_module_popup_interaction_closes(
+            popup_rect,
+            opened_this_frame,
+            primary_clicked,
+            interact_pos,
+        ) {
+            self.active_simplified_module_owner = None;
+        }
+    }
+
     fn windows_ui(&mut self, ui: &mut egui::Ui, commands: &Sender<VisualizerClientMessage>) {
         let base = self.id.as_str().to_string();
         let mut window_requests = std::mem::take(&mut self.window_requests);
@@ -583,7 +881,7 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&chat_id))
             .default_pos(24.0, 88.0)
             .default_size(760.0, 620.0)
-            .show(ui, |ui| chat::ui(ui, &self.id, &mut self.scene, commands));
+            .show(ui, |ui| self.render_scene_contents(ui, commands));
         self.record_window_open(chat_id, open);
 
         let blackboard_id = format!("{base}:blackboard");
@@ -601,9 +899,7 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&memories_id))
             .default_pos(96.0, 636.0)
             .default_size(720.0, 360.0)
-            .show(ui, |ui| {
-                memories::ui(ui, &self.id, &mut self.memories, commands)
-            });
+            .show(ui, |ui| self.render_memory_contents(ui, commands));
         self.record_window_open(memories_id, open);
 
         let memos_id = format!("{base}:memos");
@@ -646,7 +942,7 @@ impl RuntimeTab {
             .open_override(window_requests.remove(&cognition_id))
             .default_pos(1384.0, 636.0)
             .default_size(560.0, 360.0)
-            .show(ui, |ui| cognition::ui(ui, &self.blackboard.cognition_logs));
+            .show(ui, |ui| self.render_cognition_contents(ui));
         self.record_window_open(cognition_id, open);
 
         let errors_id = self.errors_window_id();
@@ -696,44 +992,15 @@ impl RuntimeTab {
         let modules_id = format!("{base}:modules");
         let modules_title = format!("Modules - {}", self.title);
         let mut requested_module = None;
-        let mut module_commands = Vec::new();
         let open = window::PersistedWindow::new(&modules_id, &modules_title)
             .open_override(window_requests.remove(&modules_id))
             .default_pos(568.0, 1020.0)
             .default_size(640.0, 360.0)
             .show(ui, |ui| {
-                module_commands = modules::render_modules_overview(
-                    ui,
-                    &self.blackboard,
-                    &self.modules,
-                    resource_monitor_now_secs,
-                );
+                requested_module =
+                    self.render_modules_overview_contents(ui, commands, resource_monitor_now_secs);
             });
         self.record_window_open(modules_id, open);
-        for action in module_commands {
-            match action {
-                modules::ModuleOverviewAction::OpenModule { owner } => {
-                    requested_module = Some(owner);
-                }
-                modules::ModuleOverviewAction::SetDisabled { module, disabled } => {
-                    let _ = commands.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::SetModuleDisabled {
-                            tab_id: self.id.clone(),
-                            module,
-                            disabled,
-                        },
-                    });
-                }
-                modules::ModuleOverviewAction::SetModuleSettings { settings } => {
-                    let _ = commands.send(VisualizerClientMessage::Command {
-                        command: VisualizerCommand::SetModuleSettings {
-                            tab_id: self.id.clone(),
-                            settings,
-                        },
-                    });
-                }
-            }
-        }
 
         let module_windows = self
             .modules
@@ -751,31 +1018,14 @@ impl RuntimeTab {
                 window_requests.remove(&module_id)
             };
             let open = {
-                let Some(module) = self.modules.get(&owner) else {
-                    continue;
-                };
-                let mut module_window_actions = Vec::new();
                 let window_open = window::PersistedWindow::new(&module_id, &module_title)
                     .open_override(requested)
                     .default_open(false)
                     .default_pos(x, y)
                     .default_size(420.0, 360.0)
                     .show(ui, |ui| {
-                        module_window_actions =
-                            modules::render_module(ui, module, &self.blackboard.memos);
+                        self.render_module_contents(ui, &owner, commands);
                     });
-                for action in module_window_actions {
-                    match action {
-                        modules::ModuleWindowAction::ResetSessionHistory { owner } => {
-                            let _ = commands.send(VisualizerClientMessage::Command {
-                                command: VisualizerCommand::ResetModuleSessionHistory {
-                                    tab_id: self.id.clone(),
-                                    owner,
-                                },
-                            });
-                        }
-                    }
-                }
                 window_open
             };
             self.record_window_open(module_id, open);
@@ -846,6 +1096,39 @@ impl RuntimeTab {
             }
         });
     }
+}
+
+fn simplified_section(
+    ui: &mut egui::Ui,
+    title: Option<&str>,
+    size: egui::Vec2,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let size = egui::vec2(size.x.max(1.0), size.y.max(1.0));
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_min_size(size);
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                if let Some(title) = title {
+                    ui.strong(title);
+                    ui.separator();
+                }
+                add_contents(ui);
+            });
+    });
+}
+
+fn simplified_module_popup_interaction_closes(
+    popup_rect: egui::Rect,
+    opened_this_frame: bool,
+    primary_clicked: bool,
+    interact_pos: Option<egui::Pos2>,
+) -> bool {
+    !opened_this_frame
+        && primary_clicked
+        && interact_pos.is_some_and(|pos| !popup_rect.contains(pos))
 }
 
 fn tab_status_icon(status: TabStatus) -> &'static str {
@@ -929,6 +1212,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tab_defaults_to_simplified_view() {
+        let tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
+
+        assert_eq!(tab.view_mode, RuntimeTabViewMode::Simplified);
+        assert_eq!(tab.active_simplified_module_owner, None);
+    }
+
+    #[test]
+    fn runtime_tab_view_mode_toggles_between_simplified_and_windowed() {
+        let mut tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
+        tab.open_simplified_module("sensory".to_string());
+
+        tab.set_simplified_view(false);
+
+        assert_eq!(tab.view_mode, RuntimeTabViewMode::Windowed);
+        assert_eq!(tab.active_simplified_module_owner, None);
+
+        tab.set_simplified_view(true);
+
+        assert_eq!(tab.view_mode, RuntimeTabViewMode::Simplified);
+    }
+
+    #[test]
     fn reducer_tracks_offered_actions_by_scope() {
         let mut state = VisualizerState::default();
         let tab_id = VisualizerTabId::new("case-1");
@@ -1003,6 +1309,11 @@ mod tests {
                 items: Vec::new(),
             },
         });
+        state
+            .tabs
+            .get_mut(&tab_id)
+            .expect("tab exists")
+            .set_simplified_view(false);
 
         let specs = state
             .tabs()
@@ -1032,6 +1343,66 @@ mod tests {
         assert_eq!(module_spec.title, "Module - sensory");
         assert!(!module_spec.default_open);
         assert_eq!(module_spec.kind, ViewWindowKind::Module);
+        assert!(
+            !specs
+                .iter()
+                .any(|spec| spec.id.contains("simplified-interoception"))
+        );
+        assert!(
+            !specs
+                .iter()
+                .any(|spec| spec.id.contains("simplified-module-popup"))
+        );
+    }
+
+    #[test]
+    fn simplified_module_popup_replaces_active_owner() {
+        let mut tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
+
+        tab.open_simplified_module("sensory".to_string());
+        tab.open_simplified_module("memory".to_string());
+
+        assert_eq!(
+            tab.active_simplified_module_owner.as_deref(),
+            Some("memory")
+        );
+    }
+
+    #[test]
+    fn simplified_module_popup_outside_interaction_closes_active_owner() {
+        let mut tab = RuntimeTab::new(VisualizerTabId::new("case-1"), "Case 1".to_string());
+        let popup_rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0));
+
+        tab.open_simplified_module("sensory".to_string());
+        tab.close_simplified_module_popup_for_interaction(
+            popup_rect,
+            false,
+            true,
+            Some(egui::pos2(50.0, 50.0)),
+        );
+        assert_eq!(
+            tab.active_simplified_module_owner.as_deref(),
+            Some("sensory")
+        );
+
+        tab.close_simplified_module_popup_for_interaction(
+            popup_rect,
+            true,
+            true,
+            Some(egui::pos2(200.0, 200.0)),
+        );
+        assert_eq!(
+            tab.active_simplified_module_owner.as_deref(),
+            Some("sensory")
+        );
+
+        tab.close_simplified_module_popup_for_interaction(
+            popup_rect,
+            false,
+            true,
+            Some(egui::pos2(200.0, 200.0)),
+        );
+        assert_eq!(tab.active_simplified_module_owner, None);
     }
 
     #[test]
