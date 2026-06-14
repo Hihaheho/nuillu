@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use lutum::{
-    CollectError, EventHandler, FinishReason, HandlerContext, HandlerDirective, HandlerResult,
-    Session, TextStepOutcomeWithTools, TextTurnEvent, TextTurnReductionError, TextTurnState, Usage,
+    AgentError, AssistantTurnItem, AssistantTurnView, CollectError, EventHandler, FinishReason,
+    HandlerContext, HandlerDirective, HandlerResult, ModelInputItem, Session,
+    TextStepOutcomeWithTools, TextTurnEvent, TextTurnReductionError, TextTurnState, Usage,
 };
 use nuillu_blackboard::CognitionLogEntryRecord;
 #[cfg(test)]
@@ -34,6 +35,7 @@ When no speech is in progress, call prepare_speech exactly once when a grounded 
 When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current listener and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
+If the cognition log contains an explicit listener language request, such as asking for Japanese, include the requested language in the language field and transform speech_content for that language.
 speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
 For self-directed cognition, transform only the listener-relevant implication into outward substance. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the listener.
@@ -45,6 +47,7 @@ const ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: 
 
 const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
 The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
+If a language is supplied, render the utterance in that language.
 Preserve its answer polarity, addressee-facing perspective, direct warnings, advice, uncertainty, and visible-absence evidence.
 Use the cognition log only to keep wording grounded. Do not add facts, turn an answer back into a question, turn listener-facing substance into a self-directed note, weaken direct content into vague caution, or merely restate the situation.
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
@@ -52,14 +55,17 @@ Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 1024;
 const SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT: usize = 8;
+const THINK_OPEN_TAG: &str = "<think>";
+const THINK_CLOSE_TAG: &str = "</think>";
 const COMPACTED_SPEAK_PLANNING_SESSION_PREFIX: &str = "Compacted speak planning session history:";
 const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
     "Compacted speak generation session history:";
 const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target decisions,
 selected targets, rejected/no-speech decisions, completed outward utterances, in-progress
 speech continuations, and cognition-log context needed for future speak planning."#;
-const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances,
-their addressees, speech substance, and cognition-log context needed for future utterance rendering."#;
+const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances
+and their addressees. Do not preserve per-turn generation request context unless it is part of
+a completed utterance."#;
 
 pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -137,6 +143,10 @@ impl JsonSchema for SpeechTarget {
 struct PrepareSpeechArgs {
     /// The participant who should hear the utterance.
     target: SpeechTarget,
+    /// Requested output language when the cognition log contains an explicit
+    /// listener language request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
     /// Speech-facing information to render for `target`, with perspective and
     /// addressee adjusted from the cognition log.
     speech_content: String,
@@ -167,6 +177,10 @@ struct ContinueSpeechArgs {
     /// Speech-facing information to render as a continuation of the already
     /// emitted partial utterance.
     speech_content: String,
+    /// Requested output language when the continuation should preserve or apply
+    /// an explicit listener language request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -181,6 +195,10 @@ struct ContinueSpeechOutput {
 struct InterruptAndRedirectSpeechArgs {
     /// The participant who should immediately hear the redirected utterance.
     target: SpeechTarget,
+    /// Requested output language when the redirected speech should preserve or
+    /// apply an explicit listener language request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
     /// Speech-facing information to render for `target`.
     speech_content: String,
     /// Why the in-progress utterance must be interrupted now.
@@ -284,16 +302,105 @@ struct ActiveSpeech {
 struct GenerationDeltaBuffer {
     deltas: Vec<String>,
     non_empty_text_delta_count: usize,
+    think_filter: ThinkTagFilter,
 }
 
 impl GenerationDeltaBuffer {
     fn push(&mut self, delta: String) -> bool {
+        let Some(delta) = self.think_filter.push(&delta) else {
+            return self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT;
+        };
+        self.push_visible(delta)
+    }
+
+    fn finish(&mut self) {
+        if let Some(delta) = self.think_filter.finish() {
+            self.push_visible(delta);
+        }
+    }
+
+    fn push_visible(&mut self, delta: String) -> bool {
         if !delta.is_empty() {
             self.non_empty_text_delta_count += 1;
         }
         self.deltas.push(delta);
         self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT
     }
+}
+
+#[derive(Default)]
+struct ThinkTagFilter {
+    pending: String,
+    inside_think: bool,
+}
+
+impl ThinkTagFilter {
+    fn push(&mut self, delta: &str) -> Option<String> {
+        self.pending.push_str(delta);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> Option<String> {
+        let mut out = String::new();
+        loop {
+            if self.inside_think {
+                let Some(end) = self.pending.find(THINK_CLOSE_TAG) else {
+                    self.keep_possible_tag_suffix(THINK_CLOSE_TAG, flush);
+                    break;
+                };
+                self.pending.drain(..end + THINK_CLOSE_TAG.len());
+                self.inside_think = false;
+                continue;
+            }
+
+            let Some(start) = self.pending.find(THINK_OPEN_TAG) else {
+                let keep = if flush {
+                    0
+                } else {
+                    possible_tag_suffix_len(&self.pending, THINK_OPEN_TAG)
+                };
+                let emit_len = self.pending.len() - keep;
+                out.push_str(&self.pending[..emit_len]);
+                self.pending.drain(..emit_len);
+                break;
+            };
+
+            out.push_str(&self.pending[..start]);
+            self.pending.drain(..start + THINK_OPEN_TAG.len());
+            self.inside_think = true;
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn keep_possible_tag_suffix(&mut self, tag: &str, flush: bool) {
+        if flush {
+            self.pending.clear();
+            return;
+        }
+        let keep = possible_tag_suffix_len(&self.pending, tag);
+        if keep == 0 {
+            self.pending.clear();
+            return;
+        }
+        let suffix = self.pending[self.pending.len() - keep..].to_owned();
+        self.pending = suffix;
+    }
+}
+
+fn possible_tag_suffix_len(text: &str, tag: &str) -> usize {
+    let max = tag.len().min(text.len());
+    for len in (1..=max).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) && tag.starts_with(&text[start..]) {
+            return len;
+        }
+    }
+    0
 }
 
 struct GenerationDeltaCollector {
@@ -400,12 +507,19 @@ fn format_generation_input(
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) -> String {
-    format!(
-        "{}\n\nSpeak to: {}\n\nSubstance to express:\n{}",
+    let mut out = format!(
+        "{}\n\nSpeak to: {}",
         cognition_context.trim(),
         draft.target.trim(),
+    );
+    if let Some(language) = trimmed_optional(args.language.as_deref()) {
+        out.push_str(&format!("\nLanguage: {language}"));
+    }
+    out.push_str(&format!(
+        "\n\nSubstance to express:\n{}",
         args.speech_content.trim()
-    )
+    ));
+    out
 }
 
 fn format_planning_input(cognition_context: &str, active: Option<&ActiveSpeech>) -> String {
@@ -413,6 +527,9 @@ fn format_planning_input(cognition_context: &str, active: Option<&ActiveSpeech>)
     if let Some(active) = active {
         out.push_str("\n\nCurrent outward speech in progress:");
         out.push_str(&format!("\n- Target: {}", active.draft.target.trim()));
+        if let Some(language) = trimmed_optional(active.args.language.as_deref()) {
+            out.push_str(&format!("\n- Language: {language}"));
+        }
         out.push_str(&format!(
             "\n- Planned substance: {}",
             active.args.speech_content.trim()
@@ -427,6 +544,10 @@ fn format_planning_input(cognition_context: &str, active: Option<&ActiveSpeech>)
         ));
     }
     out
+}
+
+fn trimmed_optional(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn is_target_allowed_by_schema(schema: &Schema, target: &str) -> bool {
@@ -448,10 +569,16 @@ fn push_generation_context(
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) {
-    session.push_user(format_generation_input(cognition_context, args, draft));
+    session.push_ephemeral_user(format_generation_input(cognition_context, args, draft));
     if !draft.accumulated.is_empty() {
         session.push_ephemeral_assistant_text(draft.accumulated.clone());
     }
+}
+
+fn push_completed_generation_turn(session: &mut Session, text: &str) {
+    session.input_mut().push(ModelInputItem::turn(Arc::new(
+        AssistantTurnView::from_items(&[AssistantTurnItem::Text(text.to_owned())]),
+    )));
 }
 
 #[cfg(test)]
@@ -525,6 +652,7 @@ fn push_planning_context(
 enum GenerationStreamOutcome {
     Completed,
     LengthLimited,
+    NoVisibleOutput,
 }
 
 pub struct SpeakModule {
@@ -659,12 +787,7 @@ impl SpeakModule {
                     .plan_active_speech(cx, &cognition_context, &active)
                     .await?
                 else {
-                    self.reflect_generation_cognition_entries(
-                        cx,
-                        &batch.cognition_entries,
-                        self.clock.now(),
-                    )
-                    .await?;
+                    self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                     self.active_speech = Some(active);
                     self.self_wake.wake();
                     return Ok(());
@@ -684,12 +807,7 @@ impl SpeakModule {
                     ActiveSpeechPlan::Abort { interrupt_reason } => {
                         self.record_aborted_generation(cx, &active.draft, &interrupt_reason)
                             .await?;
-                        self.reflect_generation_cognition_entries(
-                            cx,
-                            &batch.cognition_entries,
-                            self.clock.now(),
-                        )
-                        .await?;
+                        self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                         return Ok(());
                     }
                 }
@@ -704,21 +822,11 @@ impl SpeakModule {
                 FreshSpeechPlan::Prepare(plan) => plan,
                 FreshSpeechPlan::Decline { blocking_reason } => {
                     self.record_declined_speech(&blocking_reason).await;
-                    self.reflect_generation_cognition_entries(
-                        cx,
-                        &batch.cognition_entries,
-                        self.clock.now(),
-                    )
-                    .await?;
+                    self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                     return Ok(());
                 }
                 FreshSpeechPlan::None => {
-                    self.reflect_generation_cognition_entries(
-                        cx,
-                        &batch.cognition_entries,
-                        self.clock.now(),
-                    )
-                    .await?;
+                    self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                     return Ok(());
                 }
             };
@@ -726,7 +834,6 @@ impl SpeakModule {
             (cognition_context, plan, draft)
         };
 
-        self.record_streaming_progress(&draft).await;
         match self
             .collect_generation_slice(cx, cognition_context.clone(), &plan.args, &mut draft)
             .await?
@@ -735,12 +842,7 @@ impl SpeakModule {
                 self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
             }
             GenerationStreamOutcome::LengthLimited => {
-                self.reflect_generation_cognition_entries(
-                    cx,
-                    &batch.cognition_entries,
-                    self.clock.now(),
-                )
-                .await?;
+                self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                 self.record_in_progress_generation(cx, &plan.args, &draft)
                     .await?;
                 self.active_speech = Some(ActiveSpeech {
@@ -748,6 +850,9 @@ impl SpeakModule {
                     draft,
                 });
                 self.self_wake.wake();
+            }
+            GenerationStreamOutcome::NoVisibleOutput => {
+                self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
             }
         }
         Ok(())
@@ -942,6 +1047,11 @@ impl SpeakModule {
                                 selected = Some(ActiveSpeechPlan::Continue(PlannedSpeech {
                                     args: PrepareSpeechArgs {
                                         target: SpeechTarget::from(target.clone()),
+                                        language: call
+                                            .input
+                                            .language
+                                            .clone()
+                                            .or_else(|| active.args.language.clone()),
                                         speech_content: call.input.speech_content.clone(),
                                     },
                                     target,
@@ -961,6 +1071,7 @@ impl SpeakModule {
                                     plan: PlannedSpeech {
                                         args: PrepareSpeechArgs {
                                             target: call.input.target.clone(),
+                                            language: call.input.language.clone(),
                                             speech_content: call.input.speech_content.clone(),
                                         },
                                         target,
@@ -1005,7 +1116,7 @@ impl SpeakModule {
         draft: &mut GenerationDraft,
     ) -> Result<GenerationStreamOutcome> {
         self.ensure_generation_session_seeded(cx);
-        let mut turn_session = Session::from_input(self.generation_session.input().clone());
+        let mut turn_session = self.generation_session.clone();
         push_generation_context(&mut turn_session, &cognition_context, args, draft);
 
         let buffered_deltas = Arc::new(Mutex::new(GenerationDeltaBuffer::default()));
@@ -1026,17 +1137,18 @@ impl SpeakModule {
                 let usage = staged.usage;
                 let finish_reason = staged.finish_reason.clone();
                 if finish_reason == FinishReason::Length {
+                    staged.turn.discard();
                     cx.compact_and_save(&mut self.generation_session, usage)
                         .await?;
-                    return Ok(GenerationStreamOutcome::LengthLimited);
+                    return Ok(if draft.accumulated.trim().is_empty() {
+                        GenerationStreamOutcome::NoVisibleOutput
+                    } else {
+                        GenerationStreamOutcome::LengthLimited
+                    });
                 }
-                staged.turn.commit_into(turn_session.input_mut());
-                *self.generation_session.input_mut() = turn_session.into_input();
-                cx.compact_and_save(&mut self.generation_session, usage)
-                    .await?;
-                let text = draft.accumulated.trim().to_owned();
-                self.record_completed_generation(cx, draft, &text).await?;
-                Ok(GenerationStreamOutcome::Completed)
+                staged.turn.discard();
+                self.finish_completed_generation_slice(cx, turn_session, usage, draft)
+                    .await
             }
             Err(CollectError::Reduction {
                 source: TextTurnReductionError::OutputLimitExceeded(limit),
@@ -1045,41 +1157,76 @@ impl SpeakModule {
                 let usage = partial.usage.unwrap_or(limit.usage);
                 cx.compact_and_save(&mut self.generation_session, usage)
                     .await?;
-                Ok(GenerationStreamOutcome::LengthLimited)
+                Ok(if draft.accumulated.trim().is_empty() {
+                    GenerationStreamOutcome::NoVisibleOutput
+                } else {
+                    GenerationStreamOutcome::LengthLimited
+                })
             }
             Err(CollectError::Stopped { partial }) => {
                 let usage = partial.usage.unwrap_or_else(Usage::zero);
                 cx.compact_and_save(&mut self.generation_session, usage)
                     .await?;
-                Ok(GenerationStreamOutcome::LengthLimited)
+                Ok(if draft.accumulated.trim().is_empty() {
+                    GenerationStreamOutcome::NoVisibleOutput
+                } else {
+                    GenerationStreamOutcome::LengthLimited
+                })
             }
             Err(CollectError::UnexpectedEof { partial }) => {
                 let usage = partial.usage.unwrap_or_else(Usage::zero);
-                cx.compact_and_save(&mut self.generation_session, usage)
-                    .await?;
-                self.reflect_generation_cognition_context(cx, &cognition_context)
-                    .await?;
-                let text = draft.accumulated.trim().to_owned();
-                self.record_completed_generation(cx, draft, &text).await?;
-                Ok(GenerationStreamOutcome::Completed)
+                self.finish_completed_generation_slice(cx, turn_session, usage, draft)
+                    .await
+            }
+            Err(CollectError::Execution { source, partial })
+            | Err(CollectError::Handler { source, partial }) => {
+                let usage = partial.usage.unwrap_or_else(Usage::zero);
+                self.handle_generation_stream_error(cx, draft, usage, source)
+                    .await
             }
             Err(error) => Err(error).context("speak generation turn failed"),
         }
     }
 
-    fn unreflected_generation_cognition_entries(
-        &self,
-        entries: &[CognitionLogEntryRecord],
-    ) -> Vec<CognitionLogEntryRecord> {
-        entries
-            .iter()
-            .filter(|record| {
-                !self
-                    .generation_reflected_cognition_indices
-                    .contains(&record.index)
-            })
-            .cloned()
-            .collect()
+    async fn finish_completed_generation_slice(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        turn_session: Session,
+        usage: Usage,
+        draft: &GenerationDraft,
+    ) -> Result<GenerationStreamOutcome> {
+        let text = draft.accumulated.trim().to_owned();
+        if text.is_empty() {
+            cx.compact_and_save(&mut self.generation_session, usage)
+                .await?;
+            return Ok(GenerationStreamOutcome::NoVisibleOutput);
+        }
+
+        self.generation_session = turn_session;
+        push_completed_generation_turn(&mut self.generation_session, &text);
+        cx.compact_and_save(&mut self.generation_session, usage)
+            .await?;
+        self.record_completed_generation(cx, draft, &text).await?;
+        Ok(GenerationStreamOutcome::Completed)
+    }
+
+    async fn handle_generation_stream_error(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        draft: &GenerationDraft,
+        usage: Usage,
+        source: AgentError,
+    ) -> Result<GenerationStreamOutcome> {
+        if draft.accumulated.trim().is_empty() {
+            return Err(source).context("speak generation turn failed");
+        }
+
+        cx.warn(format!(
+            "speak generation interrupted after partial output; keeping active speech: {source}"
+        ));
+        cx.compact_and_save(&mut self.generation_session, usage)
+            .await?;
+        Ok(GenerationStreamOutcome::LengthLimited)
     }
 
     fn mark_generation_cognition_entries_reflected(&mut self, entries: &[CognitionLogEntryRecord]) {
@@ -1087,39 +1234,6 @@ impl SpeakModule {
             self.generation_reflected_cognition_indices
                 .insert(record.index);
         }
-    }
-
-    async fn reflect_generation_cognition_entries(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        entries: &[CognitionLogEntryRecord],
-        now: DateTime<Utc>,
-    ) -> Result<Option<String>> {
-        let entries = self.unreflected_generation_cognition_entries(entries);
-        let Some(context) = speech_cognition_context_from_entries(&entries, now) else {
-            return Ok(None);
-        };
-        self.reflect_generation_cognition_context(cx, &context)
-            .await?;
-        self.mark_generation_cognition_entries_reflected(&entries);
-        Ok(Some(context.trim().to_owned()))
-    }
-
-    async fn reflect_generation_cognition_context(
-        &mut self,
-        cx: &nuillu_module::ActivateCx<'_>,
-        cognition_context: &str,
-    ) -> Result<()> {
-        let cognition_context = cognition_context.trim();
-        if cognition_context.is_empty() {
-            return Ok(());
-        }
-        self.ensure_generation_session_seeded(cx);
-        self.generation_session
-            .push_user(cognition_context.to_owned());
-        cx.compact_and_save(&mut self.generation_session, Usage::zero())
-            .await?;
-        Ok(())
     }
 
     async fn record_completed_generation(
@@ -1229,6 +1343,7 @@ impl SpeakModule {
             let mut buffered = buffered_deltas
                 .lock()
                 .expect("generation delta buffer mutex poisoned");
+            buffered.finish();
             std::mem::take(&mut buffered.deltas)
         };
         for delta in deltas {
@@ -1318,7 +1433,7 @@ mod tests {
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
         ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        MaxOutputTokens, MessageContent, MockLlmAdapter, MockTextScenario, ModelInput,
+        MaxOutputTokens, MessageContent, MockError, MockLlmAdapter, MockTextScenario, ModelInput,
         ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
         TurnAdapter, Usage,
     };
@@ -1387,8 +1502,17 @@ mod tests {
     }
 
     fn prepare_speech_scenario(target: &str, speech_content: &str) -> MockTextScenario {
+        prepare_speech_scenario_with_language(target, None, speech_content)
+    }
+
+    fn prepare_speech_scenario_with_language(
+        target: &str,
+        language: Option<&str>,
+        speech_content: &str,
+    ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
+            "language": language,
             "speech_content": speech_content
         })
         .to_string();
@@ -1561,6 +1685,22 @@ mod tests {
         MockTextScenario::events(events)
     }
 
+    fn generation_text_then_error_scenario(deltas: &[&str]) -> MockTextScenario {
+        let mut events = vec![Ok(RawTextTurnEvent::Started {
+            request_id: Some("speak-text".into()),
+            model: "mock".into(),
+        })];
+        events.extend(deltas.iter().map(|delta| {
+            Ok(RawTextTurnEvent::TextDelta {
+                delta: (*delta).into(),
+            })
+        }));
+        events.push(Err(MockError::Synthetic {
+            message: "stream closed before terminal event".into(),
+        }));
+        MockTextScenario::events(events)
+    }
+
     fn finish_without_planning_tool_scenario() -> MockTextScenario {
         MockTextScenario::events(vec![
             Ok(RawTextTurnEvent::Started {
@@ -1578,6 +1718,7 @@ mod tests {
     fn test_prepare_speech_args(target: &str) -> PrepareSpeechArgs {
         PrepareSpeechArgs {
             target: SpeechTarget::from(target),
+            language: None,
             speech_content: "Tell Koro to stay close because Koro asks for help.".into(),
         }
     }
@@ -1976,13 +2117,10 @@ mod tests {
                 .into_iter()
                 .filter(|text| text.starts_with("New cognition entries at "))
                 .collect::<Vec<_>>();
-        assert_eq!(generation_contexts.len(), 2);
-        assert!(generation_contexts[0].contains("first cognition"));
-        assert!(!generation_contexts[0].contains("second cognition"));
-        assert!(generation_contexts[1].contains("second cognition"));
-        assert!(!generation_contexts[1].contains("first cognition"));
-        assert!(!generation_contexts[0].contains("Current cognition log at"));
-        assert!(!generation_contexts[1].contains("Current cognition log at"));
+        assert!(
+            generation_contexts.is_empty(),
+            "generation request context is per-turn ephemeral, not durable session history"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2026,6 +2164,50 @@ mod tests {
         assert!(!speak_progress_exists(&blackboard).await);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn language_request_flows_from_planning_to_generation_input() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario_with_language(
+                "Ryo",
+                Some("Japanese"),
+                "日本語で短く返事する。",
+            ))
+            .with_text_scenario(generation_text_scenario("もちろん、日本語で話すよ。"));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
+        caps.scene().set([Participant::new("Ryo")]);
+        let now = SystemClock.now();
+        publish_cognition_update(&blackboard, &caps, now, "Ryo says, \"日本語でお願い\".").await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[("Ryo".to_string(), "もちろん、日本語で話すよ。".to_string())]
+        );
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let generation_text = model_input_text(&inputs[1]);
+        assert!(generation_text.contains("Speak to: Ryo"));
+        assert!(generation_text.contains("Language: Japanese"));
+        assert!(generation_text.contains("Substance to express:\n日本語で短く返事する。"));
+    }
+
     #[test]
     fn fresh_generation_omits_assistant_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
@@ -2067,10 +2249,27 @@ mod tests {
     }
 
     #[test]
+    fn generation_input_includes_planned_language() {
+        let draft = GenerationDraft::new(8, "Ryo");
+        let args = PrepareSpeechArgs {
+            target: SpeechTarget::from("Ryo"),
+            language: Some("Japanese".into()),
+            speech_content: "日本語で短く返事する。".into(),
+        };
+
+        let text = format_generation_input("- Ryo says, \"日本語でお願い\".", &args, &draft);
+
+        assert!(text.contains("Speak to: Ryo"));
+        assert!(text.contains("Language: Japanese"));
+        assert!(text.contains("Substance to express:\n日本語で短く返事する。"));
+    }
+
+    #[test]
     fn unknown_evidence_plan_renders_uncertainty_and_visible_absence() {
         let draft = GenerationDraft::new(8, "Pibi");
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Pibi"),
+            language: None,
             speech_content: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
@@ -2215,8 +2414,8 @@ mod tests {
         assert!(planning_text.contains("Koro asks Nuillu to help them stay safe."));
         assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
         let generation_text = session_input_text(&module.generation_session);
-        assert!(generation_text.contains("New cognition entries at "));
-        assert!(generation_text.contains("Koro asks Nuillu to help them stay safe."));
+        assert!(!generation_text.contains("New cognition entries at "));
+        assert!(!generation_text.contains("Koro asks Nuillu to help them stay safe."));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -2352,6 +2551,205 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn generation_think_tag_text_is_not_emitted_or_persisted() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(
+            generation_text_deltas_scenario_with_finish_reason(
+                &[
+                    "<thi",
+                    "nk>hidden reasoning",
+                    "</thi",
+                    "nk>Koro",
+                    ", stay close.",
+                ],
+                FinishReason::Stop,
+            ),
+        );
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+
+        let outcome = module
+            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::Completed));
+        assert_eq!(draft.accumulated, "Koro, stay close.");
+        assert_eq!(
+            deltas.borrow().as_slice(),
+            &[
+                ("Koro".to_string(), 0, 0, "Koro".to_string()),
+                ("Koro".to_string(), 0, 1, ", stay close.".to_string()),
+            ]
+        );
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            vec!["Koro, stay close.".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_reasoning_only_completion_does_not_persist_empty_turn() {
+        let adapter =
+            MockLlmAdapter::new().with_text_scenario(generation_reasoning_then_text_scenario(
+                &["thinking about the utterance"],
+                &[],
+                FinishReason::Stop,
+            ));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+
+        let outcome = module
+            .collect_generation_slice(&cx, "- initial awareness".into(), &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::NoVisibleOutput));
+        assert_eq!(draft.accumulated, "");
+        assert!(completed.borrow().is_empty());
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            Vec::<String>::new()
+        );
+        assert!(speak_memos(&blackboard).await.is_empty());
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reasoning_only_generation_activation_does_not_leave_active_or_empty_progress() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(generation_reasoning_then_text_scenario(
+                &["thinking about the utterance"],
+                &[],
+                FinishReason::Stop,
+            ));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert!(completed.borrow().is_empty());
+        assert!(module.active_speech.is_none());
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            Vec::<String>::new()
+        );
+        assert!(speak_memos(&blackboard).await.is_empty());
+        assert!(!speak_progress_exists(&blackboard).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_error_after_partial_keeps_active_speech_in_progress() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
+            .with_text_scenario(generation_text_then_error_scenario(&["Koro", ", st"]));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks Nuillu to help them stay safe.",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert!(completed.borrow().is_empty());
+        let active = module
+            .active_speech
+            .as_ref()
+            .expect("partial output should remain active for continuation");
+        assert_eq!(active.draft.accumulated, "Koro, st");
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            Vec::<String>::new()
+        );
+        let progress = blackboard
+            .read(|bb| {
+                bb.utterance_progress_for_instance(&ModuleInstanceId::new(
+                    builtin::speak(),
+                    ReplicaIndex::ZERO,
+                ))
+                .cloned()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.state,
+            nuillu_blackboard::UtteranceProgressState::Streaming
+        );
+        assert_eq!(progress.partial_utterance, "Koro, st");
+        let memos = speak_memos(&blackboard).await;
+        assert_eq!(memos.len(), 1);
+        assert!(memos[0].contains("Utterance in progress to Koro"));
+        assert!(memos[0].contains("Already emitted:\nKoro, st"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn text_sliced_generation_records_streaming_without_complete_emit() {
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(prepare_speech_scenario("Koro", "Tell Koro to stay close."))
@@ -2474,6 +2872,10 @@ mod tests {
             nuillu_blackboard::UtteranceProgressState::Completed
         );
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
+        assert_eq!(
+            session_turn_texts(&module.generation_session),
+            vec!["Koro, stay close.".to_string()]
+        );
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 3);
