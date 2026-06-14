@@ -7,6 +7,8 @@ menu-no-runtime-windows = まだランタイムウィンドウはありません
 menu-simplified-view-enabled = [x] 簡易表示
 menu-simplified-view-disabled = [ ] 簡易表示
 menu-close-all-module-windows = すべてのモジュールウィンドウを閉じる
+menu-zoom = 倍率
+menu-zoom-hover = { $min }から{ $max }のパーセントを入力して Enter、+/- で{ $step }%ずつ変更、+/- のダブルクリックで{ $jump }%変更します。
 
 status-eval-disconnected = Eval との接続が切れました
 status-eval-process-disconnected = Eval プロセスとの接続が切れました。

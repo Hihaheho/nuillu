@@ -32,6 +32,13 @@ pub use nuillu_visualizer_protocol::*;
 
 const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
 const NOTO_SANS_JP_FAMILY_NAME: &str = "Noto Sans JP";
+const ZOOM_FACTOR_PERSISTENCE_KEY: &str = "visualizer-zoom-factor";
+const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
+const MIN_ZOOM_FACTOR: f32 = 0.5;
+const MAX_ZOOM_FACTOR: f32 = 2.0;
+const ZOOM_BUTTON_STEP_PERCENT: f32 = 1.0;
+const ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT: f32 = 10.0;
+const ZOOM_SYNC_EPSILON: f32 = 0.000_1;
 
 pub struct VisualizerChannels {
     pub server_messages: Receiver<VisualizerServerMessage>,
@@ -45,6 +52,10 @@ pub struct VisualizerApp {
     remote: bool,
     i18n_catalog: I18nCatalog,
     current_locale: Locale,
+    zoom_persistence_applied: bool,
+    zoom_percent_input: String,
+    zoom_percent_input_dirty: bool,
+    zoom_percent_input_focused: bool,
     state: VisualizerState,
 }
 
@@ -63,6 +74,10 @@ impl VisualizerApp {
             remote: channels.remote,
             i18n_catalog,
             current_locale,
+            zoom_persistence_applied: false,
+            zoom_percent_input: format_zoom_percent(DEFAULT_ZOOM_FACTOR),
+            zoom_percent_input_dirty: false,
+            zoom_percent_input_focused: false,
             state: VisualizerState::default(),
         }
     }
@@ -163,6 +178,148 @@ fn render_language_toggle(ui: &mut egui::Ui, locale: Locale) -> Option<Locale> {
     next_locale
 }
 
+struct ZoomControlOutcome {
+    next_zoom_factor: Option<f32>,
+    input_focused: bool,
+}
+
+fn render_zoom_control(
+    ui: &mut egui::Ui,
+    zoom_factor: f32,
+    zoom_percent_input: &mut String,
+    zoom_percent_input_dirty: &mut bool,
+) -> ZoomControlOutcome {
+    let mut next_zoom_factor = None;
+    let zoom_hover = zoom_hover_text(ui.ctx());
+    ui.label(ui.ctx().tr("menu-zoom"));
+
+    let decrement = ui.small_button("-").on_hover_text(zoom_hover.clone());
+    if let Some(percent_delta) = zoom_button_percent_delta(&decrement) {
+        let zoom_factor = step_zoom_factor(zoom_factor, -percent_delta);
+        *zoom_percent_input = format_zoom_percent(zoom_factor);
+        *zoom_percent_input_dirty = false;
+        next_zoom_factor = Some(zoom_factor);
+    }
+
+    let text_response = ui.add_sized(
+        egui::vec2(48.0, ui.spacing().interact_size.y),
+        egui::TextEdit::singleline(zoom_percent_input).desired_width(48.0),
+    );
+    if text_response.changed() {
+        *zoom_percent_input_dirty = true;
+    }
+    let input_focused = text_response.has_focus();
+    let commit_text_input = *zoom_percent_input_dirty
+        && (text_response.lost_focus()
+            || (input_focused && ui.input(|input| input.key_pressed(egui::Key::Enter))));
+    text_response.on_hover_text(zoom_hover.clone());
+    if commit_text_input {
+        if let Some(zoom_factor) = parse_zoom_percent_input(zoom_percent_input) {
+            *zoom_percent_input = format_zoom_percent(zoom_factor);
+            next_zoom_factor = Some(zoom_factor);
+        } else {
+            *zoom_percent_input = format_zoom_percent(next_zoom_factor.unwrap_or(zoom_factor));
+        }
+        *zoom_percent_input_dirty = false;
+    }
+
+    ui.label("%").on_hover_text(zoom_hover.clone());
+
+    let step_base = next_zoom_factor.unwrap_or(zoom_factor);
+    let increment = ui.small_button("+").on_hover_text(zoom_hover);
+    if let Some(percent_delta) = zoom_button_percent_delta(&increment) {
+        let zoom_factor = step_zoom_factor(step_base, percent_delta);
+        *zoom_percent_input = format_zoom_percent(zoom_factor);
+        *zoom_percent_input_dirty = false;
+        next_zoom_factor = Some(zoom_factor);
+    }
+
+    ZoomControlOutcome {
+        next_zoom_factor,
+        input_focused,
+    }
+}
+
+fn zoom_button_percent_delta(response: &egui::Response) -> Option<f32> {
+    if response.double_clicked() {
+        Some(ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT - ZOOM_BUTTON_STEP_PERCENT)
+    } else if response.clicked() {
+        Some(ZOOM_BUTTON_STEP_PERCENT)
+    } else {
+        None
+    }
+}
+
+fn zoom_hover_text(ctx: &egui::Context) -> String {
+    ctx.tr_args(
+        "menu-zoom-hover",
+        &[
+            ("min", zoom_percent_label(MIN_ZOOM_FACTOR).into()),
+            ("max", zoom_percent_label(MAX_ZOOM_FACTOR).into()),
+            (
+                "step",
+                zoom_button_percent_label(ZOOM_BUTTON_STEP_PERCENT).into(),
+            ),
+            (
+                "jump",
+                zoom_button_percent_label(ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT).into(),
+            ),
+        ],
+    )
+}
+
+fn zoom_percent_label(zoom_factor: f32) -> i64 {
+    zoom_factor_to_percent(zoom_factor).round() as i64
+}
+
+fn zoom_button_percent_label(percent: f32) -> i64 {
+    percent.round() as i64
+}
+
+fn default_zoom_factor() -> f32 {
+    DEFAULT_ZOOM_FACTOR
+}
+
+fn normalize_zoom_factor(zoom_factor: f32) -> f32 {
+    if zoom_factor.is_finite() {
+        zoom_factor.clamp(MIN_ZOOM_FACTOR, MAX_ZOOM_FACTOR)
+    } else {
+        DEFAULT_ZOOM_FACTOR
+    }
+}
+
+fn zoom_factor_to_percent(zoom_factor: f32) -> f32 {
+    normalize_zoom_factor(zoom_factor) * 100.0
+}
+
+fn format_zoom_percent(zoom_factor: f32) -> String {
+    format!("{:.0}", zoom_factor_to_percent(zoom_factor).round())
+}
+
+fn parse_zoom_percent_input(input: &str) -> Option<f32> {
+    let percent = input.trim().trim_end_matches('%').trim();
+    if percent.is_empty() {
+        return None;
+    }
+    percent.parse::<f32>().ok().map(zoom_percent_to_factor)
+}
+
+fn zoom_percent_to_factor(percent: f32) -> f32 {
+    if percent.is_finite() {
+        normalize_zoom_factor(percent / 100.0)
+    } else {
+        DEFAULT_ZOOM_FACTOR
+    }
+}
+
+fn step_zoom_factor(zoom_factor: f32, percent_delta: f32) -> f32 {
+    zoom_percent_to_factor(zoom_factor_to_percent(zoom_factor).round() + percent_delta)
+}
+
+fn zoom_factors_differ(left: f32, right: f32) -> bool {
+    (left - right).abs() > ZOOM_SYNC_EPSILON
+}
+
 fn tr_tab_title(ctx: &egui::Context, key: &str, title: &str) -> String {
     ctx.tr_args(key, &[("title", I18nArg::from(title))])
 }
@@ -172,14 +329,48 @@ impl eframe::App for VisualizerApp {
         let persisted_locale = ui.use_persisted_state(Locale::default, LOCALE_PERSISTENCE_KEY);
         let locale = *persisted_locale;
         self.install_locale(ui.ctx(), locale);
+        let persisted_zoom =
+            ui.use_persisted_state(default_zoom_factor, ZOOM_FACTOR_PERSISTENCE_KEY);
+        let mut zoom_factor = normalize_zoom_factor(*persisted_zoom);
+        if zoom_factors_differ(zoom_factor, *persisted_zoom) {
+            persisted_zoom.set_next(zoom_factor);
+        }
+        if self.zoom_persistence_applied {
+            let context_zoom = normalize_zoom_factor(ui.ctx().zoom_factor());
+            if zoom_factors_differ(context_zoom, zoom_factor) {
+                zoom_factor = context_zoom;
+                persisted_zoom.set_next(zoom_factor);
+            }
+        } else {
+            ui.ctx().set_zoom_factor(zoom_factor);
+            self.zoom_persistence_applied = true;
+        }
+        if !self.zoom_percent_input_focused && !self.zoom_percent_input_dirty {
+            self.zoom_percent_input = format_zoom_percent(zoom_factor);
+        }
         self.drain_server_messages();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(100));
 
         let mut next_locale = None;
+        let mut next_zoom_factor = None;
         egui::Panel::top("nuillu-visualizer-tabs").show_inside(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 next_locale = render_language_toggle(ui, locale);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(176.0, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let outcome = render_zoom_control(
+                            ui,
+                            zoom_factor,
+                            &mut self.zoom_percent_input,
+                            &mut self.zoom_percent_input_dirty,
+                        );
+                        next_zoom_factor = outcome.next_zoom_factor;
+                        self.zoom_percent_input_focused = outcome.input_focused;
+                    },
+                );
                 ui.horizontal_wrapped(|ui| {
                     for tab in self.state.tabs.values() {
                         let selected = self.state.selected.as_ref() == Some(&tab.id);
@@ -223,6 +414,11 @@ impl eframe::App for VisualizerApp {
         if let Some(locale) = next_locale {
             persisted_locale.set_next(locale);
             self.install_locale(ui.ctx(), locale);
+            ui.ctx().request_repaint();
+        }
+        if let Some(zoom_factor) = next_zoom_factor {
+            persisted_zoom.set_next(zoom_factor);
+            ui.ctx().set_zoom_factor(zoom_factor);
             ui.ctx().request_repaint();
         }
 
@@ -1331,6 +1527,42 @@ mod tests {
         let height = simplified_modules_max_height(600.0);
 
         assert_eq!(height, 412.0);
+    }
+
+    #[test]
+    fn zoom_percent_converts_to_factor() {
+        assert_eq!(zoom_percent_to_factor(100.0), 1.0);
+        assert_eq!(zoom_percent_to_factor(125.0), 1.25);
+        assert_eq!(parse_zoom_percent_input("125"), Some(1.25));
+        assert_eq!(parse_zoom_percent_input("125%"), Some(1.25));
+        assert_eq!(parse_zoom_percent_input(""), None);
+        assert_eq!(parse_zoom_percent_input("not a number"), None);
+    }
+
+    #[test]
+    fn zoom_factor_normalization_clamps_and_defaults() {
+        assert_eq!(normalize_zoom_factor(0.01), MIN_ZOOM_FACTOR);
+        assert_eq!(normalize_zoom_factor(100.0), MAX_ZOOM_FACTOR);
+        assert_eq!(normalize_zoom_factor(f32::NAN), DEFAULT_ZOOM_FACTOR);
+        assert_eq!(normalize_zoom_factor(f32::INFINITY), DEFAULT_ZOOM_FACTOR);
+        assert_eq!(zoom_percent_to_factor(49.0), MIN_ZOOM_FACTOR);
+        assert_eq!(zoom_percent_to_factor(201.0), MAX_ZOOM_FACTOR);
+        assert_eq!(zoom_percent_to_factor(f32::NAN), DEFAULT_ZOOM_FACTOR);
+    }
+
+    #[test]
+    fn zoom_step_changes_by_one_percent() {
+        assert!((step_zoom_factor(1.0, 1.0) - 1.01).abs() < ZOOM_SYNC_EPSILON);
+        assert!((step_zoom_factor(1.0, -1.0) - 0.99).abs() < ZOOM_SYNC_EPSILON);
+        assert_eq!(step_zoom_factor(MIN_ZOOM_FACTOR, -1.0), MIN_ZOOM_FACTOR);
+        assert_eq!(step_zoom_factor(MAX_ZOOM_FACTOR, 1.0), MAX_ZOOM_FACTOR);
+    }
+
+    #[test]
+    fn zoom_second_double_click_step_completes_ten_percent_gesture() {
+        let double_click_delta = ZOOM_BUTTON_DOUBLE_CLICK_TOTAL_PERCENT - ZOOM_BUTTON_STEP_PERCENT;
+        assert!((step_zoom_factor(1.01, double_click_delta) - 1.10).abs() < ZOOM_SYNC_EPSILON);
+        assert!((step_zoom_factor(0.99, -double_click_delta) - 0.90).abs() < ZOOM_SYNC_EPSILON);
     }
 
     #[test]

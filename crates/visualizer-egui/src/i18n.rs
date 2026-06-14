@@ -209,6 +209,8 @@ mod tests {
             catalog.for_locale(Locale::JaJp).tr("visualizer-locale-ja"),
             "日本語"
         );
+        assert_eq!(catalog.for_locale(Locale::EnUs).tr("menu-zoom"), "Zoom");
+        assert_eq!(catalog.for_locale(Locale::JaJp).tr("menu-zoom"), "倍率");
     }
 
     #[test]
