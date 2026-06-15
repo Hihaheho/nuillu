@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
-use nuillu_types::{ModelTier, ModuleInstanceId};
+use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::Id as TaskId;
@@ -51,14 +51,14 @@ pub struct LlmRequestMetadata {
     pub source: LlmRequestSource,
     #[serde(default)]
     pub session_key: Option<String>,
-    #[serde(default)]
-    pub activation_attempt: Option<u32>,
-    #[serde(default)]
-    pub batch: Option<LlmBatchDebug>,
+    pub activation_id: ModuleActivationId,
+    pub activation_attempt: u32,
+    pub batch: LlmBatchDebug,
 }
 
 #[derive(Clone, Debug)]
 struct ActivationLlmRequestMetadata {
+    activation_id: ModuleActivationId,
     activation_attempt: u32,
     batch: LlmBatchDebug,
 }
@@ -68,6 +68,7 @@ tokio::task_local! {
 }
 
 pub async fn with_activation_llm_request_metadata<F, T>(
+    activation_id: ModuleActivationId,
     activation_attempt: u32,
     batch: &ModuleBatch,
     future: F,
@@ -78,6 +79,7 @@ where
     ACTIVATION_LLM_REQUEST_METADATA
         .scope(
             ActivationLlmRequestMetadata {
+                activation_id,
                 activation_attempt,
                 batch: LlmBatchDebug::from_batch(batch),
             },
@@ -86,15 +88,17 @@ where
         .await
 }
 
-pub fn current_activation_llm_request_metadata() -> (Option<u32>, Option<LlmBatchDebug>) {
+pub fn current_activation_llm_request_metadata() -> Option<(ModuleActivationId, u32, LlmBatchDebug)>
+{
     ACTIVATION_LLM_REQUEST_METADATA
         .try_with(|metadata| {
             (
-                Some(metadata.activation_attempt),
-                Some(metadata.batch.clone()),
+                metadata.activation_id,
+                metadata.activation_attempt,
+                metadata.batch.clone(),
             )
         })
-        .unwrap_or((None, None))
+        .ok()
 }
 
 type HeldConcurrencyKey = (TaskId, usize);
@@ -338,15 +342,21 @@ impl LlmAccess {
         let handle = self.tiers.pick_handle(tier);
         let permit = handle.concurrency.acquire().await;
         let call = self.events.llm_accessed(self.owner.clone(), tier);
-        let (activation_attempt, batch) = current_activation_llm_request_metadata();
-        let lutum = handle.lutum.clone().with_extension(LlmRequestMetadata {
-            owner: self.owner.clone(),
-            tier,
-            source,
-            session_key,
-            activation_attempt,
-            batch,
-        });
+        let lutum = if let Some((activation_id, activation_attempt, batch)) =
+            current_activation_llm_request_metadata()
+        {
+            handle.lutum.clone().with_extension(LlmRequestMetadata {
+                owner: self.owner.clone(),
+                tier,
+                source,
+                session_key,
+                activation_id,
+                activation_attempt,
+                batch,
+            })
+        } else {
+            handle.lutum.clone()
+        };
         LlmLease::new(
             lutum,
             permit,
@@ -379,15 +389,21 @@ impl FixedTierLlmAccess {
         let handle = self.tiers.pick_handle(self.tier);
         let permit = handle.concurrency.acquire().await;
         let call = self.events.llm_accessed(self.owner.clone(), self.tier);
-        let (activation_attempt, batch) = current_activation_llm_request_metadata();
-        let lutum = handle.lutum.clone().with_extension(LlmRequestMetadata {
-            owner: self.owner.clone(),
-            tier: self.tier,
-            source: LlmRequestSource::ModuleTurn,
-            session_key: None,
-            activation_attempt,
-            batch,
-        });
+        let lutum = if let Some((activation_id, activation_attempt, batch)) =
+            current_activation_llm_request_metadata()
+        {
+            handle.lutum.clone().with_extension(LlmRequestMetadata {
+                owner: self.owner.clone(),
+                tier: self.tier,
+                source: LlmRequestSource::ModuleTurn,
+                session_key: None,
+                activation_id,
+                activation_attempt,
+                batch,
+            })
+        } else {
+            handle.lutum.clone()
+        };
         LlmLease::new(
             lutum,
             permit,
@@ -424,13 +440,14 @@ mod tests {
         SharedPoolBudgetOptions, Usage,
     };
     use nuillu_blackboard::{Blackboard, ResourceAllocation};
-    use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId, ReplicaIndex, builtin};
 
     use crate::ports::PortError;
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
 
     use super::{
-        FixedTierLlmAccess, LlmAccess, LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource,
+        FixedTierLlmAccess, LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmRequestMetadata,
+        LlmRequestSource, with_activation_llm_request_metadata,
     };
 
     #[derive(Debug, Default)]
@@ -544,7 +561,15 @@ mod tests {
         let events = RuntimeEventEmitter::new(sink);
         let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
 
-        let lutum = access.lutum().await;
+        let batch = crate::ModuleBatch::new("metadata-batch");
+        let expected_batch = LlmBatchDebug::from_batch(&batch);
+        let lutum = with_activation_llm_request_metadata(
+            ModuleActivationId::new(7),
+            1,
+            &batch,
+            access.lutum(),
+        )
+        .await;
         let _ = lutum
             .text_turn(ModelInput::new().user("hello"))
             .collect()
@@ -558,8 +583,9 @@ mod tests {
                 tier: ModelTier::Premium,
                 source: LlmRequestSource::ModuleTurn,
                 session_key: None,
-                activation_attempt: None,
-                batch: None,
+                activation_id: ModuleActivationId::new(7),
+                activation_attempt: 1,
+                batch: expected_batch,
             })]
         );
     }
@@ -600,7 +626,15 @@ mod tests {
         let events = RuntimeEventEmitter::new(sink.clone());
         let access = FixedTierLlmAccess::new(owner.clone(), ModelTier::Default, tiers, events);
 
-        let lutum = access.lutum().await;
+        let batch = crate::ModuleBatch::new("fixed-tier-batch");
+        let expected_batch = LlmBatchDebug::from_batch(&batch);
+        let lutum = with_activation_llm_request_metadata(
+            ModuleActivationId::new(8),
+            1,
+            &batch,
+            access.lutum(),
+        )
+        .await;
         let _ = lutum
             .text_turn(ModelInput::new().user("hello"))
             .collect()
@@ -632,8 +666,9 @@ mod tests {
                 tier: ModelTier::Default,
                 source: LlmRequestSource::ModuleTurn,
                 session_key: None,
-                activation_attempt: None,
-                batch: None,
+                activation_id: ModuleActivationId::new(8),
+                activation_attempt: 1,
+                batch: expected_batch,
             })]
         );
     }

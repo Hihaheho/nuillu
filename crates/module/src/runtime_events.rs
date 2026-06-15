@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nuillu_types::{ModelTier, ModuleInstanceId};
+use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::LlmBatchDebug;
@@ -37,18 +37,22 @@ pub enum RuntimeEvent {
     },
     ModuleBatchReady {
         sequence: u64,
+        activation_id: ModuleActivationId,
+        activation_attempt: u32,
         owner: ModuleInstanceId,
         batch_type: String,
         batch_debug: String,
     },
     ModuleActivationCompleted {
         sequence: u64,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         duration: Duration,
         succeeded: bool,
     },
     ModuleActivationAttemptFailed {
         sequence: u64,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         activation_attempt: u32,
         max_attempts: u32,
@@ -112,6 +116,7 @@ pub(crate) struct RuntimeEventEmitter {
     sink: Rc<dyn RuntimeEventSink>,
     next_sequence: Arc<AtomicU64>,
     next_llm_call: Arc<AtomicU64>,
+    next_activation: Arc<AtomicU64>,
 }
 
 impl RuntimeEventEmitter {
@@ -120,7 +125,12 @@ impl RuntimeEventEmitter {
             sink,
             next_sequence: Arc::new(AtomicU64::new(0)),
             next_llm_call: Arc::new(AtomicU64::new(0)),
+            next_activation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn next_module_activation_id(&self) -> ModuleActivationId {
+        ModuleActivationId::new(self.next_activation.fetch_add(1, Ordering::Relaxed))
     }
 
     pub(crate) fn llm_accessed(&self, owner: ModuleInstanceId, tier: ModelTier) -> u64 {
@@ -160,13 +170,21 @@ impl RuntimeEventEmitter {
         });
     }
 
-    pub(crate) fn module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
+    pub(crate) fn module_batch_ready(
+        &self,
+        activation_id: ModuleActivationId,
+        activation_attempt: u32,
+        owner: ModuleInstanceId,
+        batch: &ModuleBatch,
+    ) {
         let LlmBatchDebug {
             batch_type,
             batch_debug,
         } = LlmBatchDebug::from_batch(batch);
         self.emit(|sequence| RuntimeEvent::ModuleBatchReady {
             sequence,
+            activation_id,
+            activation_attempt,
             owner,
             batch_type,
             batch_debug,
@@ -175,12 +193,14 @@ impl RuntimeEventEmitter {
 
     pub(crate) fn module_activation_completed(
         &self,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         duration: Duration,
         succeeded: bool,
     ) {
         self.emit(|sequence| RuntimeEvent::ModuleActivationCompleted {
             sequence,
+            activation_id,
             owner,
             duration,
             succeeded,
@@ -189,6 +209,7 @@ impl RuntimeEventEmitter {
 
     pub(crate) fn module_activation_attempt_failed(
         &self,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         activation_attempt: u32,
         max_attempts: u32,
@@ -196,6 +217,7 @@ impl RuntimeEventEmitter {
     ) {
         self.emit(|sequence| RuntimeEvent::ModuleActivationAttemptFailed {
             sequence,
+            activation_id,
             owner,
             activation_attempt,
             max_attempts,

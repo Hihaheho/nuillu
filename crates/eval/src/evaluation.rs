@@ -1371,7 +1371,7 @@ mod tests {
     use std::time::Duration;
 
     use eure::value::{Language, Text};
-    use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
+    use nuillu_types::{ModuleActivationId, ModuleId, ModuleInstanceId, ReplicaIndex};
 
     use super::{
         CaseTiming, CaseTrialSummary, ModuleActivationRecord, aggregate_trial_timing,
@@ -1452,6 +1452,8 @@ mod tests {
                 100,
                 nuillu_module::RuntimeEvent::ModuleBatchReady {
                     sequence: 1,
+                    activation_id: ModuleActivationId::new(1),
+                    activation_attempt: 1,
                     owner: speak.clone(),
                     batch_type: "cognition".to_string(),
                     batch_debug: String::new(),
@@ -1461,6 +1463,7 @@ mod tests {
                 250,
                 nuillu_module::RuntimeEvent::ModuleActivationCompleted {
                     sequence: 2,
+                    activation_id: ModuleActivationId::new(1),
                     owner: speak.clone(),
                     duration: Duration::from_millis(150),
                     succeeded: true,

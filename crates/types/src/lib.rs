@@ -13,8 +13,8 @@ mod policy;
 mod scalars;
 
 pub use ids::{
-    ModuleId, ModuleIdParseError, ModuleInstanceId, ReplicaCapRange, ReplicaCapRangeError,
-    ReplicaIndex, builtin,
+    ModuleActivationId, ModuleId, ModuleIdParseError, ModuleInstanceId, ReplicaCapRange,
+    ReplicaCapRangeError, ReplicaIndex, builtin,
 };
 pub use memory::{MemoryContent, MemoryIndex, MemoryRank};
 pub use model::{ModelTier, TokenBudget};

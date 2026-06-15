@@ -1142,7 +1142,6 @@ async fn refresh_active_and_schedule(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
-                    runtime.record_module_batch_ready(owners[index].clone(), &batch);
                     let peer_contexts = runtime.peer_contexts();
                     let allocation_hints = runtime.allocation_hints();
                     let identity_memories = runtime.identity_memories().await;
@@ -1480,71 +1479,64 @@ async fn handle_task_message(
             pending_kicks,
             activation_elapsed,
             result,
-        } => {
-            runtime.record_module_activation_completed(
-                owners[index].clone(),
-                activation_elapsed,
-                result.is_ok(),
-            );
-            match result {
-                Ok(()) => {
-                    consecutive_failures[index] = 0;
-                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
-                    kick_inboxes[index] = Some(kick_inbox);
-                    let now = runtime.clock().now();
-                    let next_batch_throttle = runtime
-                        .module_batch_throttle_baseline(&owners[index])
-                        .await
-                        .and_then(|(bpm, activation_threshold)| {
-                            let remaining = bpm.sleep_after_turn(activation_elapsed);
-                            if remaining.is_zero() {
-                                None
-                            } else {
-                                chrono::Duration::from_std(remaining).ok().map(|d| {
-                                    NextBatchThrottle {
-                                        baseline: now
-                                            - ChronoDuration::from_std(activation_elapsed)
-                                                .unwrap_or_default(),
-                                        not_before: now + d,
-                                        activation_threshold,
-                                    }
+        } => match result {
+            Ok(()) => {
+                consecutive_failures[index] = 0;
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
+                let now = runtime.clock().now();
+                let next_batch_throttle = runtime
+                    .module_batch_throttle_baseline(&owners[index])
+                    .await
+                    .and_then(|(bpm, activation_threshold)| {
+                        let remaining = bpm.sleep_after_turn(activation_elapsed);
+                        if remaining.is_zero() {
+                            None
+                        } else {
+                            chrono::Duration::from_std(remaining)
+                                .ok()
+                                .map(|d| NextBatchThrottle {
+                                    baseline: now
+                                        - ChronoDuration::from_std(activation_elapsed)
+                                            .unwrap_or_default(),
+                                    not_before: now + d,
+                                    activation_threshold,
                                 })
-                            }
-                        });
-                    states[index] = ModuleState::Stored {
-                        module,
-                        next_batch_throttle,
-                    };
-                    zero_windows.finish(&owners[index]);
-                    if scheduling_enabled && owners[index].module == builtin::allocation() {
-                        let opened = zero_windows.record_controller_activation(runtime).await;
-                        wake_zero_window_modules(
-                            opened,
-                            replica_zero_index_by_role,
-                            zero_window_wakers,
-                        );
-                    }
-                    Ok(())
+                        }
+                    });
+                states[index] = ModuleState::Stored {
+                    module,
+                    next_batch_throttle,
+                };
+                zero_windows.finish(&owners[index]);
+                if scheduling_enabled && owners[index].module == builtin::allocation() {
+                    let opened = zero_windows.record_controller_activation(runtime).await;
+                    wake_zero_window_modules(
+                        opened,
+                        replica_zero_index_by_role,
+                        zero_window_wakers,
+                    );
                 }
-                Err(message) => {
-                    notify_pending_and_ready(pending_kicks, &mut kick_inbox);
-                    kick_inboxes[index] = Some(kick_inbox);
-                    zero_windows.finish(&owners[index]);
-                    park_failed_module(
-                        runtime,
-                        &owners[index],
-                        states,
-                        consecutive_failures,
-                        index,
-                        module,
-                        "activate",
-                        message,
-                    )
-                    .await;
-                    Ok(())
-                }
+                Ok(())
             }
-        }
+            Err(message) => {
+                notify_pending_and_ready(pending_kicks, &mut kick_inbox);
+                kick_inboxes[index] = Some(kick_inbox);
+                zero_windows.finish(&owners[index]);
+                park_failed_module(
+                    runtime,
+                    &owners[index],
+                    states,
+                    consecutive_failures,
+                    index,
+                    module,
+                    "activate",
+                    message,
+                )
+                .await;
+                Ok(())
+            }
+        },
         TaskMessage::ActivationGate {
             index,
             module,
@@ -1567,7 +1559,6 @@ async fn handle_task_message(
                     runtime
                         .record_module_status(owners[index].clone(), ModuleRunStatus::Activating)
                         .await;
-                    runtime.record_module_batch_ready(owners[index].clone(), &batch);
                     states[index] = ModuleState::Activating;
                     let peer_contexts = runtime.peer_contexts();
                     let allocation_hints = runtime.allocation_hints();
@@ -2076,7 +2067,6 @@ async fn spawn_activation_gate_or_activate(
         runtime
             .record_module_status(owner.clone(), ModuleRunStatus::Activating)
             .await;
-        runtime.record_module_batch_ready(owner.clone(), &batch);
         let peer_contexts = runtime.peer_contexts();
         let allocation_hints = runtime.allocation_hints();
         let identity_memories = runtime.identity_memories().await;
@@ -2513,7 +2503,9 @@ async fn activate_with_retries(
     let max_attempts = u32::from(max_activation_attempts.max(1));
     let mut activation_attempt = 1_u32;
     loop {
+        let activation_id = runtime.next_module_activation_id();
         let owner = module.owner().clone();
+        runtime.record_module_batch_ready(activation_id, activation_attempt, owner.clone(), batch);
         let cx = runtime.with_session_checkpoint_runtime(
             ActivateCx::new(
                 peer_contexts,
@@ -2530,8 +2522,9 @@ async fn activate_with_retries(
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
-                            activation_attempt: Some(activation_attempt),
-                            batch: Some(LlmBatchDebug::from_batch(batch)),
+                            activation_id,
+                            activation_attempt,
+                            batch: LlmBatchDebug::from_batch(batch),
                         }),
                     runtime.session_compaction_handle().concurrency.clone(),
                     module_tier,
@@ -2550,23 +2543,41 @@ async fn activate_with_retries(
             replica = owner.replica.get(),
             activation_attempt,
         );
+        let attempt_started = Instant::now();
         let activation_result = with_activation_llm_request_metadata(
+            activation_id,
             activation_attempt,
             batch,
             module.activate(&cx, batch).instrument(activation_span),
         )
         .await;
+        let attempt_elapsed = attempt_started.elapsed();
         match activation_result {
-            Ok(()) => return (module, Ok(())),
+            Ok(()) => {
+                runtime.record_module_activation_completed(
+                    activation_id,
+                    module.owner().clone(),
+                    attempt_elapsed,
+                    true,
+                );
+                return (module, Ok(()));
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 runtime.record_module_activation_attempt_failed(
+                    activation_id,
                     module.owner().clone(),
                     activation_attempt,
                     max_attempts,
                     message.clone(),
                 );
                 if activation_attempt >= max_attempts {
+                    runtime.record_module_activation_completed(
+                        activation_id,
+                        module.owner().clone(),
+                        attempt_elapsed,
+                        false,
+                    );
                     return (module, Err(message));
                 }
                 tracing::warn!(
@@ -2628,8 +2639,8 @@ mod tests {
         SessionKey, SessionStore,
     };
     use nuillu_types::{
-        MemoryContent, MemoryIndex, ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange,
-        ReplicaIndex, builtin,
+        MemoryContent, MemoryIndex, ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId,
+        ReplicaCapRange, ReplicaIndex, builtin,
     };
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
@@ -4622,12 +4633,13 @@ mod tests {
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
-                            activation_attempt: Some(1),
-                            batch: Some(nuillu_module::LlmBatchDebug {
+                            activation_id: ModuleActivationId::new(0),
+                            activation_attempt: 1,
+                            batch: nuillu_module::LlmBatchDebug {
                                 batch_type: std::any::type_name::<AttentionControlRequest>()
                                     .to_string(),
                                 batch_debug: "\"ping\"".to_string(),
-                            }),
+                            },
                         })
                     );
                     assert_eq!(observation.module_tier, ModelTier::Premium);
@@ -4708,6 +4720,7 @@ mod tests {
                 assert_eq!(observations.len(), 2);
                 for (index, observation) in observations.iter().enumerate() {
                     let attempt = u32::try_from(index + 1).unwrap();
+                    let activation_id = ModuleActivationId::new(u64::try_from(index).unwrap());
                     assert_eq!(
                         observation.module_turn,
                         Some(LlmRequestMetadata {
@@ -4715,8 +4728,9 @@ mod tests {
                             tier: ModelTier::Premium,
                             source: LlmRequestSource::ModuleTurn,
                             session_key: None,
-                            activation_attempt: Some(attempt),
-                            batch: Some(expected_batch.clone()),
+                            activation_id,
+                            activation_attempt: attempt,
+                            batch: expected_batch.clone(),
                         })
                     );
                     assert_eq!(
@@ -4726,8 +4740,9 @@ mod tests {
                             tier: ModelTier::Cheap,
                             source: LlmRequestSource::SessionCompaction,
                             session_key: None,
-                            activation_attempt: Some(attempt),
-                            batch: Some(expected_batch.clone()),
+                            activation_id,
+                            activation_attempt: attempt,
+                            batch: expected_batch.clone(),
                         })
                     );
                 }

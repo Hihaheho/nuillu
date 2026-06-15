@@ -929,11 +929,12 @@ mod tests {
             tier: ModelTier::Premium,
             source: LlmRequestSource::ModuleTurn,
             session_key: None,
-            activation_attempt: Some(1),
-            batch: Some(LlmBatchDebug {
+            activation_id: nuillu_types::ModuleActivationId::new(7),
+            activation_attempt: 1,
+            batch: LlmBatchDebug {
                 batch_type: "test::Batch".to_string(),
                 batch_debug: "Batch(\"debug\")".to_string(),
-            }),
+            },
         }
     }
 

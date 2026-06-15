@@ -109,6 +109,28 @@ impl fmt::Display for ModuleInstanceId {
     }
 }
 
+/// Monotonic runtime-local identifier for one module activation attempt.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct ModuleActivationId(u64);
+
+impl ModuleActivationId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ModuleActivationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Boot-time policy limiting the replicas a module role may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReplicaCapRange {

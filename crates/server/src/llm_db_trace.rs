@@ -14,8 +14,8 @@ use lutum_libsql_adapter::{LibsqlLlmTranscriptStore, NewLlmTranscriptTurn};
 use nuillu_module::{LlmRequestMetadata, ModuleSessionMetadata};
 use nuillu_types::ModuleInstanceId;
 use nuillu_visualizer_protocol::{
-    LlmInputItemView, LlmObservationSource, LlmOutputItemView, LlmTranscriptTurnStatus,
-    LlmTranscriptTurnView, LlmUsageView, VisualizerEvent, VisualizerTabId,
+    LlmBatchDebugView, LlmInputItemView, LlmObservationSource, LlmOutputItemView,
+    LlmTranscriptTurnStatus, LlmTranscriptTurnView, LlmUsageView, VisualizerEvent, VisualizerTabId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,9 @@ pub struct CompletedTurnTrace {
     #[serde(default)]
     session_key: Option<String>,
     operation: String,
+    activation_id: u64,
+    activation_attempt: u32,
+    batch: LlmBatchDebugView,
     started_at_ms: i64,
     completed_at_ms: Option<i64>,
     input: Vec<LlmInputItemView>,
@@ -187,6 +190,9 @@ impl DbLlmTraceSink {
             source: observation_source(metadata.source),
             session_key: observation_session_key(extensions, metadata),
             operation: operation_kind_label(operation).to_string(),
+            activation_id: metadata.activation_id.get(),
+            activation_attempt: metadata.activation_attempt,
+            batch: batch_debug_view(&metadata.batch),
             started_at_ms: now,
             completed_at_ms: None,
             input: Vec::new(),
@@ -202,16 +208,14 @@ impl DbLlmTraceSink {
     }
 
     fn record_activation_attempt_turn(&self, metadata: &LlmRequestMetadata, turn_id: &str) {
-        if let Some(activation_attempt) = metadata.activation_attempt {
-            self.inner
-                .activation_attempt_turns
-                .lock()
-                .expect("DB LLM trace activation turn map lock poisoned")
-                .insert(
-                    (metadata.owner.to_string(), activation_attempt),
-                    turn_id.to_string(),
-                );
-        }
+        self.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("DB LLM trace activation turn map lock poisoned")
+            .insert(
+                (metadata.owner.to_string(), metadata.activation_attempt),
+                turn_id.to_string(),
+            );
     }
 
     fn remove_activation_mappings_for_turn(&self, turn_id: &str) {
@@ -395,6 +399,9 @@ impl CompletedTurnTrace {
             source: self.source,
             session_key: self.session_key.clone(),
             operation: self.operation.clone(),
+            activation_id: self.activation_id,
+            activation_attempt: self.activation_attempt,
+            batch: self.batch.clone(),
             input: self.input.clone(),
             output: transcript_output_items(self),
             request_id: self.request_id.clone(),
@@ -409,6 +416,13 @@ impl CompletedTurnTrace {
             },
             error_message: self.error_message.clone(),
         }
+    }
+}
+
+fn batch_debug_view(batch: &nuillu_module::LlmBatchDebug) -> LlmBatchDebugView {
+    LlmBatchDebugView {
+        batch_type: batch.batch_type.clone(),
+        debug: batch.batch_debug.clone(),
     }
 }
 
@@ -811,6 +825,15 @@ mod tests {
 
         let direct_turn = restored.to_transcript_turn_view("restored".to_string());
         assert_eq!(direct_turn.turn_id, "restored");
+        assert_eq!(direct_turn.activation_id, 7);
+        assert_eq!(direct_turn.activation_attempt, 1);
+        assert_eq!(
+            (
+                direct_turn.batch.batch_type.as_str(),
+                direct_turn.batch.debug.as_str()
+            ),
+            ("test::Batch", "Batch(\"debug\")")
+        );
         assert_eq!(direct_turn.status, LlmTranscriptTurnStatus::Failed);
         assert_eq!(
             direct_turn.error_message.as_deref(),
@@ -832,6 +855,15 @@ mod tests {
         };
         assert_eq!(tab_id.as_str(), "server");
         assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].activation_id, 7);
+        assert_eq!(turns[0].activation_attempt, 1);
+        assert_eq!(
+            (
+                turns[0].batch.batch_type.as_str(),
+                turns[0].batch.debug.as_str()
+            ),
+            ("test::Batch", "Batch(\"debug\")")
+        );
         assert_eq!(turns[0].status, LlmTranscriptTurnStatus::Failed);
         assert_eq!(
             turns[0].error_message.as_deref(),
@@ -902,6 +934,10 @@ mod tests {
 
         assert_eq!(recent[1].turn_id, second_turn_id);
         assert_eq!(recent[1].trace_json["status"], "completed");
+        assert_eq!(recent[1].trace_json["activation_id"], 7);
+        assert_eq!(recent[1].trace_json["activation_attempt"], 2);
+        assert_eq!(recent[1].trace_json["batch"]["batch_type"], "test::Batch");
+        assert_eq!(recent[1].trace_json["batch"]["debug"], "Batch(\"debug\")");
         assert_eq!(recent[1].trace_json["input"][0]["content"], "second");
         assert_eq!(recent[1].trace_json["request_id"], "req-2");
         assert_eq!(recent[1].trace_json["usage"]["total_tokens"], 18);
@@ -924,8 +960,12 @@ mod tests {
             tier: ModelTier::Default,
             source: LlmRequestSource::ModuleTurn,
             session_key: None,
-            activation_attempt: Some(activation_attempt),
-            batch: None,
+            activation_id: nuillu_types::ModuleActivationId::new(7),
+            activation_attempt,
+            batch: nuillu_module::LlmBatchDebug {
+                batch_type: "test::Batch".to_string(),
+                batch_debug: "Batch(\"debug\")".to_string(),
+            },
         }
     }
 
@@ -956,6 +996,12 @@ mod tests {
             source: LlmObservationSource::ModuleTurn,
             session_key: Some("session".to_string()),
             operation: "text_turn".to_string(),
+            activation_id: 7,
+            activation_attempt: 1,
+            batch: LlmBatchDebugView {
+                batch_type: "test::Batch".to_string(),
+                debug: "Batch(\"debug\")".to_string(),
+            },
             started_at_ms: 10,
             completed_at_ms: (status != TranscriptTurnStatus::InProgress).then_some(20),
             input: vec![LlmInputItemView {

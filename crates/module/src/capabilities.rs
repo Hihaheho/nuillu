@@ -11,7 +11,9 @@ use nuillu_blackboard::{
     ActivationRatio, AgenticDeadlockMarker, Blackboard, BlackboardCommand, Bpm, ModulePolicy,
     ModuleRunStatus, ZeroReplicaWindowPolicy,
 };
-use nuillu_types::{ModelTier, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
+use nuillu_types::{
+    ModelTier, ModuleActivationId, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex,
+};
 
 use crate::activation_gate::ActivationGateHub;
 use crate::channels::{Topic, TopicPolicy, WakeClaim, WakeRegistry};
@@ -675,8 +677,19 @@ impl AgentRuntimeControl {
             .module_batch_throttled(owner, delayed_for);
     }
 
-    pub fn record_module_batch_ready(&self, owner: ModuleInstanceId, batch: &ModuleBatch) {
-        self.runtime_events.module_batch_ready(owner, batch);
+    pub fn next_module_activation_id(&self) -> ModuleActivationId {
+        self.runtime_events.next_module_activation_id()
+    }
+
+    pub fn record_module_batch_ready(
+        &self,
+        activation_id: ModuleActivationId,
+        activation_attempt: u32,
+        owner: ModuleInstanceId,
+        batch: &ModuleBatch,
+    ) {
+        self.runtime_events
+            .module_batch_ready(activation_id, activation_attempt, owner, batch);
     }
 
     pub fn with_session_checkpoint_runtime<'a>(
@@ -697,22 +710,25 @@ impl AgentRuntimeControl {
 
     pub fn record_module_activation_completed(
         &self,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         duration: Duration,
         succeeded: bool,
     ) {
         self.runtime_events
-            .module_activation_completed(owner, duration, succeeded);
+            .module_activation_completed(activation_id, owner, duration, succeeded);
     }
 
     pub fn record_module_activation_attempt_failed(
         &self,
+        activation_id: ModuleActivationId,
         owner: ModuleInstanceId,
         activation_attempt: u32,
         max_attempts: u32,
         message: impl Into<String>,
     ) {
         self.runtime_events.module_activation_attempt_failed(
+            activation_id,
             owner,
             activation_attempt,
             max_attempts,

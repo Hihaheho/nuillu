@@ -6328,27 +6328,37 @@ fn runtime_event_summary(event: &RuntimeEvent) -> String {
         ),
         RuntimeEvent::ModuleBatchReady {
             sequence,
+            activation_id,
             owner,
             batch_type,
             ..
-        } => format!("seq={sequence} module_batch_ready owner={owner} batch={batch_type}"),
+        } => format!(
+            "seq={sequence} module_batch_ready activation={} owner={owner} batch={batch_type}",
+            activation_id
+        ),
         RuntimeEvent::ModuleActivationCompleted {
             sequence,
+            activation_id,
             owner,
             duration,
             succeeded,
+            ..
         } => format!(
-            "seq={sequence} module_activation_completed owner={owner} duration_ms={} succeeded={succeeded}",
+            "seq={sequence} module_activation_completed activation={} owner={owner} duration_ms={} succeeded={succeeded}",
+            activation_id,
             duration_millis_u64(*duration)
         ),
         RuntimeEvent::ModuleActivationAttemptFailed {
             sequence,
+            activation_id,
             owner,
             activation_attempt,
             max_attempts,
             message,
+            ..
         } => format!(
-            "seq={sequence} module_activation_attempt_failed owner={owner} attempt={activation_attempt}/{max_attempts} message={message}"
+            "seq={sequence} module_activation_attempt_failed activation={} owner={owner} attempt={activation_attempt}/{max_attempts} message={message}",
+            activation_id
         ),
         RuntimeEvent::ModuleTaskFailed {
             sequence,
@@ -6942,41 +6952,47 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
                 delayed_for.as_millis()
             ),
             RuntimeEvent::ModuleBatchReady {
+                activation_id,
                 owner,
                 batch_type,
                 batch_debug,
                 ..
             } => format!(
-                "{} module-batch-ready {} owner={} type={} chars={}",
+                "{} module-batch-ready {} activation={} owner={} type={} chars={}",
                 self.reporter.log_prefix(),
                 self.reporter.log_scope(&self.case_id),
+                activation_id,
                 owner,
                 batch_type,
                 batch_debug.chars().count()
             ),
             RuntimeEvent::ModuleActivationCompleted {
+                activation_id,
                 owner,
                 duration,
                 succeeded,
                 ..
             } => format!(
-                "{} module-activation-completed {} owner={} duration_ms={} succeeded={}",
+                "{} module-activation-completed {} activation={} owner={} duration_ms={} succeeded={}",
                 self.reporter.log_prefix(),
                 self.reporter.log_scope(&self.case_id),
+                activation_id,
                 owner,
                 duration.as_millis(),
                 succeeded
             ),
             RuntimeEvent::ModuleActivationAttemptFailed {
+                activation_id,
                 owner,
                 activation_attempt,
                 max_attempts,
                 message,
                 ..
             } => format!(
-                "{} module-activation-attempt-failed {} owner={} attempt={}/{} error={}",
+                "{} module-activation-attempt-failed {} activation={} owner={} attempt={}/{} error={}",
                 self.reporter.log_prefix(),
                 self.reporter.log_scope(&self.case_id),
+                activation_id,
                 owner,
                 activation_attempt,
                 max_attempts,
@@ -7221,7 +7237,7 @@ mod tests {
     use nuillu_memory::NoopMemoryStore;
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{LlmConcurrencyPool, LutumTiers, MemoUpdated};
-    use nuillu_types::{MemoryIndex, ModuleInstanceId, ReplicaIndex};
+    use nuillu_types::{MemoryIndex, ModuleActivationId, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
 
@@ -8909,6 +8925,8 @@ id = "module-query-memory-special-memory"
 
         sink.on_event(RuntimeEvent::ModuleBatchReady {
             sequence: 0,
+            activation_id: ModuleActivationId::new(0),
+            activation_attempt: 1,
             owner: owner.clone(),
             batch_type: "cognition".to_string(),
             batch_debug: String::new(),
@@ -8916,6 +8934,7 @@ id = "module-query-memory-special-memory"
         .unwrap();
         sink.on_event(RuntimeEvent::ModuleActivationCompleted {
             sequence: 1,
+            activation_id: ModuleActivationId::new(0),
             owner,
             duration: Duration::from_millis(42),
             succeeded: true,
@@ -8944,6 +8963,8 @@ id = "module-query-memory-special-memory"
         .unwrap();
         sink.on_event(RuntimeEvent::ModuleBatchReady {
             sequence: 1,
+            activation_id: ModuleActivationId::new(1),
+            activation_attempt: 1,
             owner: owner.clone(),
             batch_type: "()".to_string(),
             batch_debug: "()".to_string(),
@@ -8954,6 +8975,7 @@ id = "module-query-memory-special-memory"
 
         sink.on_event(RuntimeEvent::ModuleActivationAttemptFailed {
             sequence: 2,
+            activation_id: ModuleActivationId::new(1),
             owner: owner.clone(),
             activation_attempt: 1,
             max_attempts: 3,

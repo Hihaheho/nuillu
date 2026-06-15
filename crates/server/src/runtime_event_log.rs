@@ -83,31 +83,37 @@ pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> Strin
             delayed_for.as_millis()
         ),
         RuntimeEvent::ModuleBatchReady {
+            activation_id,
             owner,
             batch_type,
             batch_debug,
             ..
         } => format!(
-            "nuillu-server module-batch-ready tab={tab_id} owner={owner} type={batch_type} chars={}",
+            "nuillu-server module-batch-ready tab={tab_id} activation={} owner={owner} type={batch_type} chars={}",
+            activation_id,
             batch_debug.chars().count()
         ),
         RuntimeEvent::ModuleActivationCompleted {
+            activation_id,
             owner,
             duration,
             succeeded,
             ..
         } => format!(
-            "nuillu-server module-activation-completed tab={tab_id} owner={owner} duration_ms={} succeeded={succeeded}",
+            "nuillu-server module-activation-completed tab={tab_id} activation={} owner={owner} duration_ms={} succeeded={succeeded}",
+            activation_id,
             duration.as_millis()
         ),
         RuntimeEvent::ModuleActivationAttemptFailed {
+            activation_id,
             owner,
             activation_attempt,
             max_attempts,
             message,
             ..
         } => format!(
-            "nuillu-server module-activation-attempt-failed tab={tab_id} owner={owner} attempt={activation_attempt}/{max_attempts} error={message}"
+            "nuillu-server module-activation-attempt-failed tab={tab_id} activation={} owner={owner} attempt={activation_attempt}/{max_attempts} error={message}",
+            activation_id
         ),
         RuntimeEvent::ModuleTaskFailed {
             owner,
@@ -189,7 +195,7 @@ mod tests {
 
     use chrono::{TimeZone as _, Utc};
     use nuillu_module::RuntimeEvent;
-    use nuillu_types::{ModelTier, ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId, ReplicaIndex, builtin};
 
     use super::{RuntimeEventLogWriter, runtime_event_log_record_at, runtime_event_message};
 
@@ -200,6 +206,7 @@ mod tests {
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         let event = RuntimeEvent::ModuleActivationCompleted {
             sequence: 17,
+            activation_id: ModuleActivationId::new(3),
             owner,
             duration: Duration::from_millis(42),
             succeeded: true,
@@ -207,7 +214,7 @@ mod tests {
 
         assert_eq!(
             runtime_event_message("server", &event),
-            "nuillu-server module-activation-completed tab=server owner=sensory duration_ms=42 succeeded=true"
+            "nuillu-server module-activation-completed tab=server activation=3 owner=sensory duration_ms=42 succeeded=true"
         );
     }
 

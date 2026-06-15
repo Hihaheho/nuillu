@@ -1330,7 +1330,7 @@ impl RuntimeTab {
                     .open_override(requested)
                     .default_open(false)
                     .default_pos(x, y)
-                    .default_size(420.0, 360.0)
+                    .default_size(520.0, 360.0)
                     .show(ui, |ui| {
                         self.render_module_contents(ui, &owner, commands);
                     });
@@ -1478,6 +1478,13 @@ fn tab_status_icon(status: TabStatus) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_batch_view() -> LlmBatchDebugView {
+        LlmBatchDebugView {
+            batch_type: "test::Batch".to_string(),
+            debug: "batch".to_string(),
+        }
+    }
+
     fn test_i18n_context(locale: Locale) -> egui::Context {
         let ctx = egui::Context::default();
         let catalog = I18nCatalog::embedded().expect("embedded translations load");
@@ -1613,6 +1620,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         });
@@ -1741,6 +1751,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         });
@@ -1860,6 +1873,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         });

@@ -332,6 +332,9 @@ pub enum LlmObservationEvent {
         #[serde(default)]
         session_key: Option<String>,
         operation: String,
+        activation_id: u64,
+        activation_attempt: u32,
+        batch: LlmBatchDebugView,
         items: Vec<LlmInputItemView>,
     },
     StreamStarted {
@@ -344,6 +347,9 @@ pub enum LlmObservationEvent {
         #[serde(default)]
         session_key: Option<String>,
         operation: String,
+        activation_id: u64,
+        activation_attempt: u32,
+        batch: LlmBatchDebugView,
         request_id: Option<String>,
         model: String,
     },
@@ -391,6 +397,9 @@ pub struct LlmTranscriptTurnView {
     #[serde(default)]
     pub session_key: Option<String>,
     pub operation: String,
+    pub activation_id: u64,
+    pub activation_attempt: u32,
+    pub batch: LlmBatchDebugView,
     pub input: Vec<LlmInputItemView>,
     pub output: Vec<LlmOutputItemView>,
     pub request_id: Option<String>,
@@ -399,6 +408,12 @@ pub struct LlmTranscriptTurnView {
     pub usage: Option<LlmUsageView>,
     pub status: LlmTranscriptTurnStatus,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmBatchDebugView {
+    pub batch_type: String,
+    pub debug: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

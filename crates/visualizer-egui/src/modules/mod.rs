@@ -27,11 +27,23 @@ use crate::{
     text::{hard_wrap_long_segments, wrapped_label},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModulesState {
     modules: BTreeMap<String, ModuleState>,
+    activation_to_owner: BTreeMap<u64, String>,
+    activation_order: Vec<u64>,
     turn_to_owner: BTreeMap<String, String>,
-    turn_order: Vec<String>,
+}
+
+impl Default for ModulesState {
+    fn default() -> Self {
+        Self {
+            modules: BTreeMap::new(),
+            activation_to_owner: BTreeMap::new(),
+            activation_order: Vec::new(),
+            turn_to_owner: BTreeMap::new(),
+        }
+    }
 }
 
 impl ModulesState {
@@ -65,12 +77,12 @@ pub struct ModuleState {
     pub owner: String,
     pub module: String,
     pub replica: u8,
+    pub activations: Vec<ActivationState>,
     pub turns: Vec<LlmTurnState>,
     pub status: ModuleSessionStatus,
     pub runtime_status: Option<String>,
     pub last_tier: Option<String>,
     pub bpm_wait: Option<BpmWaitStart>,
-    pub latest_batch: Option<ModuleBatchDebugState>,
     pub activation_error_count: u32,
     pub activation_attempt_count: u32,
     pub last_execution_failed: bool,
@@ -96,6 +108,18 @@ pub struct ModuleBatchDebugState {
 }
 
 #[derive(Debug, Clone)]
+pub struct ActivationState {
+    pub activation_id: u64,
+    pub activation_attempt: Option<u32>,
+    pub batch: Option<ModuleBatchDebugState>,
+    pub error_message: Option<String>,
+    pub status: ModuleSessionStatus,
+    pub duration_ms: Option<u64>,
+    pub succeeded: Option<bool>,
+    pub turn_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LlmTurnState {
     pub turn_id: String,
     pub operation: String,
@@ -107,7 +131,6 @@ pub struct LlmTurnState {
     pub finish_reason: Option<String>,
     pub usage: Option<LlmUsageView>,
     pub error_message: Option<String>,
-    pub batch: Option<ModuleBatchDebugState>,
     pub input: Vec<LlmInputItemView>,
     pub output: Vec<LlmOutputItemState>,
     pub status: ModuleSessionStatus,
@@ -129,9 +152,28 @@ pub struct LlmTurnListRow {
     pub turn_id: String,
     pub session_key: Option<String>,
     pub turn_number: usize,
+    pub token_count: Option<u64>,
     pub label: String,
     pub streaming: bool,
     pub failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationListRow {
+    pub owner: String,
+    pub module: String,
+    pub activation_id: u64,
+    pub batch_number: usize,
+    pub attempt_number: Option<u32>,
+    pub label: String,
+    pub failed: bool,
+    pub turn_rows: Vec<LlmTurnListRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivationBatchDisplay {
+    batch_number: usize,
+    attempt_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -241,25 +283,49 @@ pub fn apply_runtime_event_at(state: &mut ModulesState, event: &RuntimeEvent, no
             }
         }
         RuntimeEvent::ModuleBatchReady {
+            activation_id,
+            activation_attempt,
             owner,
             batch_type,
             batch_debug,
             ..
         } => {
+            let owner_string = owner.to_string();
+            let activation_id = activation_id.get();
+            record_activation_owner(state, activation_id, &owner_string);
             let module = module_mut_for_owner(state, owner);
             module.bpm_wait = None;
-            module.latest_batch = Some(ModuleBatchDebugState {
+            let batch = ModuleBatchDebugState {
                 batch_type: batch_type.clone(),
                 debug: batch_debug.clone(),
-            });
+            };
+            let activation = ensure_activation(
+                module,
+                activation_id,
+                Some(*activation_attempt),
+                Some(batch),
+            );
+            activation.status = ModuleSessionStatus::Running;
         }
         RuntimeEvent::ModuleActivationCompleted {
             owner,
+            activation_id,
             duration,
             succeeded,
             ..
         } => {
+            let owner_string = owner.to_string();
+            let activation_id = activation_id.get();
+            record_activation_owner(state, activation_id, &owner_string);
             let module = module_mut_for_owner(state, owner);
+            let activation = ensure_activation(module, activation_id, None, None);
+            activation.duration_ms = Some(duration_millis(*duration));
+            activation.succeeded = Some(*succeeded);
+            activation.status = if *succeeded {
+                ModuleSessionStatus::Completed
+            } else {
+                ModuleSessionStatus::Failed
+            };
             if *succeeded {
                 module.bpm_wait = Some(BpmWaitStart {
                     completed_at_secs: now_secs,
@@ -280,12 +346,20 @@ pub fn apply_runtime_event_at(state: &mut ModulesState, event: &RuntimeEvent, no
         }
         RuntimeEvent::ModuleActivationAttemptFailed {
             owner,
+            activation_id,
             activation_attempt,
             max_attempts,
             message,
             ..
         } => {
+            let owner_string = owner.to_string();
+            let activation_id = activation_id.get();
+            record_activation_owner(state, activation_id, &owner_string);
             let module = module_mut_for_owner(state, owner);
+            let activation =
+                ensure_activation(module, activation_id, Some(*activation_attempt), None);
+            activation.error_message = Some(message.clone());
+            activation.status = ModuleSessionStatus::Failed;
             module.runtime_status = Some(format!(
                 "Retrying activation {activation_attempt}/{max_attempts}: {message}"
             ));
@@ -343,23 +417,26 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             source,
             session_key,
             operation,
+            activation_id,
+            activation_attempt,
+            batch,
             items,
             ..
         } => {
             record_turn_owner(state, &turn_id, &owner);
+            record_activation_owner(state, activation_id, &owner);
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
-            let batch = module_state.latest_batch.clone();
-            let turn = ensure_turn(
+            let activation = ensure_activation(
                 module_state,
-                turn_id,
-                operation,
-                source,
-                session_key,
-                tier,
-                batch,
+                activation_id,
+                Some(activation_attempt),
+                Some(module_batch_debug_state(batch)),
             );
+            activation.status = ModuleSessionStatus::Running;
+            push_activation_turn(activation, &turn_id);
+            let turn = ensure_turn(module_state, turn_id, operation, source, session_key, tier);
             turn.input = items;
             turn.status = ModuleSessionStatus::Running;
             turn.counted_in_session = true;
@@ -373,24 +450,27 @@ pub fn apply_llm_observation(state: &mut ModulesState, event: LlmObservationEven
             source,
             session_key,
             operation,
+            activation_id,
+            activation_attempt,
+            batch,
             request_id,
             model,
             ..
         } => {
             record_turn_owner(state, &turn_id, &owner);
+            record_activation_owner(state, activation_id, &owner);
             let module_state = module_mut_with_metadata(state, owner, module, replica);
             module_state.status = ModuleSessionStatus::Running;
             module_state.last_tier = Some(tier.clone());
-            let batch = module_state.latest_batch.clone();
-            let turn = ensure_turn(
+            let activation = ensure_activation(
                 module_state,
-                turn_id,
-                operation,
-                source,
-                session_key,
-                tier,
-                batch,
+                activation_id,
+                Some(activation_attempt),
+                Some(module_batch_debug_state(batch)),
             );
+            activation.status = ModuleSessionStatus::Running;
+            push_activation_turn(activation, &turn_id);
+            let turn = ensure_turn(module_state, turn_id, operation, source, session_key, tier);
             turn.model = Some(model);
             turn.request_id = request_id;
             turn.status = ModuleSessionStatus::Running;
@@ -499,6 +579,9 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
         source,
         session_key,
         operation,
+        activation_id,
+        activation_attempt,
+        batch,
         input,
         output,
         request_id,
@@ -510,16 +593,16 @@ fn apply_llm_transcript_turn(state: &mut ModulesState, turn: LlmTranscriptTurnVi
     } = turn;
 
     record_turn_owner(state, &turn_id, &owner);
+    record_activation_owner(state, activation_id, &owner);
     let module_state = module_mut_with_metadata(state, owner, module, replica);
-    let turn_state = ensure_turn(
+    let activation = ensure_activation(
         module_state,
-        turn_id,
-        operation,
-        source,
-        session_key,
-        tier,
-        None,
+        activation_id,
+        Some(activation_attempt),
+        Some(module_batch_debug_state(batch)),
     );
+    push_activation_turn(activation, &turn_id);
+    let turn_state = ensure_turn(module_state, turn_id, operation, source, session_key, tier);
     turn_state.input = input;
     turn_state.output = output
         .into_iter()
@@ -711,6 +794,16 @@ pub fn render_module(
         render_remaining_pane(ui, body_height, |ui| {
             if next_panel == MODULE_MEMOS_SELECTION {
                 render_module_memos(ui, module, &module_memos);
+            } else if let Some(activation_id) =
+                next_panel.strip_prefix(MODULE_ACTIVATION_SELECTION_PREFIX)
+                && let Ok(activation_id) = activation_id.parse::<u64>()
+                && let Some((activation_index, activation)) = module
+                    .activations
+                    .iter()
+                    .enumerate()
+                    .find(|(_, activation)| activation.activation_id == activation_id)
+            {
+                render_active_activation(ui, module, activation_index, activation);
             } else if let Some(turn_id) = next_panel.strip_prefix(MODULE_TURN_SELECTION_PREFIX)
                 && let Some((turn_index, turn)) = module
                     .turns
@@ -739,9 +832,9 @@ pub fn render_llm_turns(
     module_filter::render_module_filter(ui, "llm-turns-module-filter", filter, modules);
     ui.separator();
 
-    let rows = llm_turn_rows(state, |module| filter.is_selected(module));
+    let rows = activation_history_rows(state, |module| filter.is_selected(module));
     let persisted_selection = ui.use_persisted_state(String::new, "llm-turns-selection");
-    let mut selected_turn_id = selected_llm_turn_id(persisted_selection.as_str(), &rows);
+    let mut selected_panel = selected_history_panel(persisted_selection.as_str(), &rows);
 
     let body_height = ui.available_height().max(MODULE_BODY_MIN_HEIGHT);
     ui.horizontal(|ui| {
@@ -749,13 +842,21 @@ pub fn render_llm_turns(
         render_fixed_pane(ui, LLM_TURN_SELECTOR_WIDTH, body_height, |ui| {
             ui.strong(ui.ctx().tr("module-turns"));
             ui.separator();
-            render_llm_turn_selector(ui, &rows, &mut selected_turn_id);
+            render_llm_turn_selector(ui, &rows, &mut selected_panel);
         });
         ui.separator();
         render_remaining_pane(ui, body_height, |ui| {
             if rows.is_empty() {
                 ui.label(ui.ctx().tr("module-no-llm-turns"));
-            } else if let Some(turn_id) = selected_turn_id.as_deref()
+            } else if let Some(panel) = selected_panel.as_deref()
+                && let Some(activation_id) = panel.strip_prefix(MODULE_ACTIVATION_SELECTION_PREFIX)
+                && let Ok(activation_id) = activation_id.parse::<u64>()
+                && let Some((activation_index, module, activation)) =
+                    activation_by_id(state, activation_id)
+            {
+                render_active_activation(ui, module, activation_index, activation);
+            } else if let Some(panel) = selected_panel.as_deref()
+                && let Some(turn_id) = panel.strip_prefix(MODULE_TURN_SELECTION_PREFIX)
                 && let Some((turn_index, module, turn)) = turn_by_id(state, turn_id)
             {
                 render_active_turn(ui, module, turn_index, turn);
@@ -765,8 +866,8 @@ pub fn render_llm_turns(
         });
     });
 
-    if selected_turn_id.as_deref().unwrap_or_default() != persisted_selection.as_str() {
-        persisted_selection.set_next(selected_turn_id.unwrap_or_default());
+    if selected_panel.as_deref().unwrap_or_default() != persisted_selection.as_str() {
+        persisted_selection.set_next(selected_panel.unwrap_or_default());
     }
 }
 
@@ -775,9 +876,10 @@ pub fn window_title(ctx: &egui::Context, module: &ModuleState) -> String {
 }
 
 const MODULE_BODY_MIN_HEIGHT: f32 = 160.0;
-const MODULE_SELECTOR_WIDTH: f32 = 190.0;
-const LLM_TURN_SELECTOR_WIDTH: f32 = 220.0;
+const MODULE_SELECTOR_WIDTH: f32 = 220.0;
+const LLM_TURN_SELECTOR_WIDTH: f32 = 300.0;
 const MODULE_MEMOS_SELECTION: &str = "memos";
+const MODULE_ACTIVATION_SELECTION_PREFIX: &str = "activation:";
 const MODULE_TURN_SELECTION_PREFIX: &str = "turn:";
 
 fn render_fixed_pane(
@@ -790,7 +892,11 @@ fn render_fixed_pane(
     ui.allocate_ui_with_layout(
         egui::vec2(width, body_height),
         egui::Layout::top_down(egui::Align::Min),
-        content,
+        |ui| {
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            content(ui);
+        },
     );
 }
 
@@ -821,51 +927,210 @@ fn render_module_selector(
             {
                 *next_panel = MODULE_MEMOS_SELECTION.to_string();
             }
-            for (index, turn) in module.turns.iter().enumerate() {
-                let panel_id = turn_selection_id(&turn.turn_id);
-                let selected = panel_id == selected_panel;
-                let turn_number = session_turn_number(module, index);
-                ui.push_id(("turn-row", index, turn.turn_id.as_str()), |ui| {
-                    failed_turn_frame(ui, turn.status).show(ui, |ui| {
-                        let response = ui
-                            .selectable_label(selected, turn_selector_label(turn_number, turn))
-                            .on_hover_text(turn_selector_hover(turn));
-                        if response.clicked() {
-                            *next_panel = panel_id;
-                        }
-                    });
-                });
+            for (activation_index, activation) in module.activations.iter().enumerate() {
+                render_module_activation_selector_row(
+                    ui,
+                    module,
+                    activation_index,
+                    activation,
+                    selected_panel,
+                    next_panel,
+                );
             }
         });
 }
 
+fn render_module_activation_selector_row(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    activation_index: usize,
+    activation: &ActivationState,
+    selected_panel: &str,
+    next_panel: &mut String,
+) {
+    let activation_panel_id = activation_selection_id(activation.activation_id);
+    let activation_selected = activation_panel_id == selected_panel;
+    let turn_refs = activation_turn_refs(module, activation);
+    let batch_display = activation_batch_display(module, activation_index);
+    ui.push_id(("activation-row", activation.activation_id), |ui| {
+        if turn_refs.len() == 1 {
+            let (turn_index, turn) = turn_refs[0];
+            let activation_label = activation_selector_label(batch_display);
+            ui.horizontal(|ui| {
+                selector_frame(ui, activation.status, |ui| {
+                    let response = ui
+                        .add(selector_button(activation_selected, activation_label))
+                        .on_hover_text(activation_selector_hover(activation));
+                    if response.clicked() {
+                        *next_panel = activation_panel_id.clone();
+                    }
+                });
+                render_selector_separator(ui);
+                render_module_turn_selector_button(
+                    ui,
+                    module,
+                    turn_index,
+                    turn,
+                    selected_panel,
+                    next_panel,
+                );
+            });
+        } else {
+            selector_frame(ui, activation.status, |ui| {
+                let response = ui
+                    .add(selector_button(
+                        activation_selected,
+                        activation_selector_label(batch_display),
+                    ))
+                    .on_hover_text(activation_selector_hover(activation));
+                if response.clicked() {
+                    *next_panel = activation_panel_id.clone();
+                }
+            });
+            ui.indent(("activation-turns", activation.activation_id), |ui| {
+                for (turn_index, turn) in turn_refs {
+                    render_module_turn_selector_button(
+                        ui,
+                        module,
+                        turn_index,
+                        turn,
+                        selected_panel,
+                        next_panel,
+                    );
+                }
+            });
+        }
+    });
+}
+
+fn render_module_turn_selector_button(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    turn_index: usize,
+    turn: &LlmTurnState,
+    selected_panel: &str,
+    next_panel: &mut String,
+) {
+    let panel_id = turn_selection_id(&turn.turn_id);
+    let selected = panel_id == selected_panel;
+    let turn_number = session_turn_number(module, turn_index);
+    ui.push_id(("turn-row", turn_index, turn.turn_id.as_str()), |ui| {
+        selector_frame(ui, turn.status, |ui| {
+            let response = ui
+                .add(selector_button(
+                    selected,
+                    turn_selector_label(turn_number, turn),
+                ))
+                .on_hover_text(turn_selector_hover(turn));
+            if response.clicked() {
+                *next_panel = panel_id;
+            }
+        });
+    });
+}
+
 fn render_llm_turn_selector(
     ui: &mut egui::Ui,
-    rows: &[LlmTurnListRow],
-    selected_turn_id: &mut Option<String>,
+    rows: &[ActivationListRow],
+    selected_panel: &mut Option<String>,
 ) {
     egui::ScrollArea::vertical()
         .id_salt("llm-turn-panel-list")
         .show(ui, |ui| {
             for (index, row) in rows.iter().enumerate() {
-                let selected = selected_turn_id.as_deref() == Some(row.turn_id.as_str());
-                ui.push_id(("llm-turn-row", index, row.turn_id.as_str()), |ui| {
-                    let status = if row.failed {
-                        ModuleSessionStatus::Failed
-                    } else {
-                        ModuleSessionStatus::Idle
-                    };
-                    failed_turn_frame(ui, status).show(ui, |ui| {
-                        let response = ui
-                            .selectable_label(selected, localized_llm_turn_row_label(ui.ctx(), row))
-                            .on_hover_text(llm_turn_row_hover(ui.ctx(), row));
-                        if response.clicked() {
-                            *selected_turn_id = Some(row.turn_id.clone());
-                        }
-                    });
-                });
+                render_llm_activation_selector_row(ui, index, row, selected_panel);
             }
         });
+}
+
+fn render_llm_activation_selector_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    row: &ActivationListRow,
+    selected_panel: &mut Option<String>,
+) {
+    let activation_panel = activation_selection_id(row.activation_id);
+    let activation_selected = selected_panel.as_deref() == Some(activation_panel.as_str());
+    let status = if row.failed {
+        ModuleSessionStatus::Failed
+    } else {
+        ModuleSessionStatus::Idle
+    };
+    ui.push_id(("llm-activation-row", index, row.activation_id), |ui| {
+        if row.turn_rows.len() == 1 {
+            let activation_label = localized_activation_row_label(ui.ctx(), row);
+            ui.horizontal(|ui| {
+                selector_frame(ui, status, |ui| {
+                    let response = ui
+                        .add(selector_button(activation_selected, activation_label))
+                        .on_hover_text(activation_row_hover(ui.ctx(), row));
+                    if response.clicked() {
+                        *selected_panel = Some(activation_panel.clone());
+                    }
+                });
+                render_selector_separator(ui);
+                render_llm_turn_selector_button(ui, &row.turn_rows[0], selected_panel);
+            });
+        } else {
+            selector_frame(ui, status, |ui| {
+                let response = ui
+                    .add(selector_button(
+                        activation_selected,
+                        localized_activation_row_label(ui.ctx(), row),
+                    ))
+                    .on_hover_text(activation_row_hover(ui.ctx(), row));
+                if response.clicked() {
+                    *selected_panel = Some(activation_panel.clone());
+                }
+            });
+            ui.indent(("llm-activation-turns", row.activation_id), |ui| {
+                for turn_row in &row.turn_rows {
+                    render_llm_turn_selector_button(ui, turn_row, selected_panel);
+                }
+            });
+        }
+    });
+}
+
+fn render_llm_turn_selector_button(
+    ui: &mut egui::Ui,
+    row: &LlmTurnListRow,
+    selected_panel: &mut Option<String>,
+) {
+    let panel = turn_selection_id(&row.turn_id);
+    let selected = selected_panel.as_deref() == Some(panel.as_str());
+    let status = if row.failed {
+        ModuleSessionStatus::Failed
+    } else {
+        ModuleSessionStatus::Idle
+    };
+    selector_frame(ui, status, |ui| {
+        let response = ui
+            .add(selector_button(
+                selected,
+                localized_llm_turn_row_label(ui.ctx(), row),
+            ))
+            .on_hover_text(llm_turn_row_hover(ui.ctx(), row));
+        if response.clicked() {
+            *selected_panel = Some(panel);
+        }
+    });
+}
+
+fn render_selector_separator(ui: &mut egui::Ui) {
+    ui.label("|");
+}
+
+fn selector_frame(
+    ui: &mut egui::Ui,
+    status: ModuleSessionStatus,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    failed_turn_frame(ui, status).show(ui, content);
+}
+
+fn selector_button(selected: bool, label: String) -> egui::Button<'static> {
+    egui::Button::selectable(selected, label).truncate()
 }
 
 fn failed_turn_frame(ui: &egui::Ui, status: ModuleSessionStatus) -> egui::Frame {
@@ -908,6 +1173,122 @@ fn render_module_memos(ui: &mut egui::Ui, module: &ModuleState, memos: &[&MemoVi
         });
 }
 
+fn render_active_activation(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    activation_index: usize,
+    activation: &ActivationState,
+) {
+    ui.push_id(
+        (
+            "active-activation",
+            module.owner.as_str(),
+            activation.activation_id,
+        ),
+        |ui| render_active_activation_contents(ui, module, activation_index, activation),
+    );
+}
+
+fn render_active_activation_contents(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    activation_index: usize,
+    activation: &ActivationState,
+) {
+    let batch_display = activation_batch_display(module, activation_index);
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!(
+            "{} {}",
+            status_label(activation.status),
+            activation_selector_label(batch_display)
+        ));
+        ui.label(format!("#{}", activation.activation_id));
+        if let Some(attempt) = activation.activation_attempt {
+            ui.label(format!("attempt {attempt}"));
+        }
+        if let Some(duration_ms) = activation.duration_ms {
+            ui.label(format_millis(duration_ms));
+        }
+    });
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt(("activation-scroll-area", activation.activation_id))
+        .show(ui, |ui| {
+            if let Some(batch) = &activation.batch {
+                render_batch_item(ui, batch, "activation", activation_index);
+                ui.add_space(6.0);
+            }
+            if let Some(message) = &activation.error_message {
+                render_error_banner(ui, ui.ctx().tr("module-activation-error"), message);
+                ui.add_space(6.0);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(ui.ctx().tr("module-llm-turn-summaries"));
+                ui.label(ui.ctx().tr_args(
+                    "module-count-label",
+                    &[("count", activation.turn_ids.len().into())],
+                ));
+            });
+            ui.add_space(4.0);
+            if activation.turn_ids.is_empty() {
+                ui.label(ui.ctx().tr("module-no-llm-turns"));
+            }
+            for (index, turn_id) in activation.turn_ids.iter().enumerate() {
+                if let Some((turn_index, turn)) = turn_ref_by_id(module, turn_id) {
+                    render_llm_turn_summary(ui, module, turn_index, turn, index);
+                    ui.add_space(6.0);
+                }
+            }
+        });
+}
+
+fn render_llm_turn_summary(
+    ui: &mut egui::Ui,
+    module: &ModuleState,
+    turn_index: usize,
+    turn: &LlmTurnState,
+    summary_index: usize,
+) {
+    let fill = if turn.status == ModuleSessionStatus::Failed {
+        ui.visuals().error_fg_color.linear_multiply(0.12)
+    } else {
+        ui.visuals().extreme_bg_color
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("turn {}", session_turn_number(module, turn_index)));
+                ui.label(status_label(turn.status));
+                ui.label(turn.source.label());
+                if let Some(usage) = &turn.usage {
+                    ui.label(turn_usage_tokens(usage).to_string());
+                }
+            });
+            ui.add_space(3.0);
+            wrapped_metadata_label(
+                ui,
+                &format!(
+                    "{} {}",
+                    turn_session_label(turn),
+                    hard_wrap_long_segments(&turn.operation, 48)
+                ),
+            );
+            if let Some(message) = &turn.error_message {
+                ui.add_space(3.0);
+                render_error_banner(ui, ui.ctx().tr("module-llm-error"), message);
+            } else if let Some(output) = turn_latest_output(turn) {
+                ui.add_space(3.0);
+                ui.push_id(("turn-summary-output", summary_index), |ui| {
+                    wrapped_label(ui, &output);
+                });
+            }
+        });
+}
+
 fn render_active_turn(
     ui: &mut egui::Ui,
     module: &ModuleState,
@@ -927,30 +1308,17 @@ fn render_active_turn(
 
 fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmTurnState) {
     if let Some(message) = &turn.error_message {
-        render_turn_error_banner(ui, message);
+        render_error_banner(ui, ui.ctx().tr("module-llm-error"), message);
         ui.add_space(6.0);
     }
     ui.horizontal_wrapped(|ui| {
         ui.strong(format!(
             "{} turn {}",
             status_label(turn.status),
-            turn.turn_id
+            turn_index + 1
         ));
-        ui.label(&turn.operation);
         ui.label(turn.source.label());
         ui.label(&turn.tier);
-        if let Some(model) = &turn.model {
-            ui.label(model);
-        }
-        if let Some(request_id) = &turn.request_id {
-            wrapped_label(
-                ui,
-                &ui.ctx().tr_args(
-                    "module-request-label",
-                    &[("request", I18nArg::from(request_id.as_str()))],
-                ),
-            );
-        }
         if let Some(finish_reason) = &turn.finish_reason {
             ui.label(ui.ctx().tr_args(
                 "module-finish-label",
@@ -967,16 +1335,27 @@ fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmT
             ));
         }
     });
+    ui.add_space(3.0);
+    wrapped_metadata_label(ui, &format!("id: {}", turn.turn_id));
+    wrapped_metadata_label(ui, &format!("operation: {}", turn.operation));
+    if let Some(model) = &turn.model {
+        wrapped_metadata_label(ui, &format!("model: {model}"));
+    }
+    if let Some(request_id) = &turn.request_id {
+        wrapped_metadata_label(
+            ui,
+            &ui.ctx().tr_args(
+                "module-request-label",
+                &[("request", I18nArg::from(request_id.as_str()))],
+            ),
+        );
+    }
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("scroll-area")
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.push_id("scroll-content", |ui| {
-                if let Some(batch) = &turn.batch {
-                    render_batch_item(ui, batch, &turn.turn_id, turn_index);
-                    ui.add_space(6.0);
-                }
                 for (index, item) in turn.input.iter().enumerate() {
                     render_input_item(ui, item, &turn.turn_id, turn_index, index);
                     ui.add_space(6.0);
@@ -987,6 +1366,15 @@ fn render_active_turn_contents(ui: &mut egui::Ui, turn_index: usize, turn: &LlmT
                 }
             });
         });
+}
+
+fn wrapped_metadata_label(ui: &mut egui::Ui, text: &str) {
+    let width = ui.available_width().max(1.0);
+    let display = hard_wrap_long_segments(text, 48);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        ui.add(egui::Label::new(display).wrap());
+    });
 }
 
 fn render_batch_item(
@@ -1261,7 +1649,7 @@ fn overview_header(ui: &mut egui::Ui) {
     });
 }
 
-fn render_turn_error_banner(ui: &mut egui::Ui, message: &str) {
+fn render_error_banner(ui: &mut egui::Ui, label: String, message: &str) {
     let display = hard_wrap_long_segments(message, 96);
     egui::Frame::new()
         .fill(ui.visuals().error_fg_color.linear_multiply(0.16))
@@ -1269,9 +1657,7 @@ fn render_turn_error_banner(ui: &mut egui::Ui, message: &str) {
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            ui.strong(
-                egui::RichText::new(ui.ctx().tr("module-error")).color(ui.visuals().error_fg_color),
-            );
+            ui.strong(egui::RichText::new(label).color(ui.visuals().error_fg_color));
             ui.add(
                 egui::Label::new(egui::RichText::new(display).monospace())
                     .wrap()
@@ -2037,54 +2423,104 @@ fn module_memos<'a>(module: &ModuleState, memos: &'a [MemoView]) -> Vec<&'a Memo
         .collect()
 }
 
-pub fn llm_turn_rows(
+pub fn activation_history_rows(
     state: &ModulesState,
     module_selected: impl Fn(&str) -> bool,
-) -> Vec<LlmTurnListRow> {
+) -> Vec<ActivationListRow> {
     state
-        .turn_order
+        .activation_order
         .iter()
-        .filter_map(|turn_id| {
-            let owner = state.turn_to_owner.get(turn_id)?;
+        .filter_map(|activation_id| {
+            let owner = state.activation_to_owner.get(activation_id)?;
             let module = state.modules.get(owner)?;
-            let turn_index = module
-                .turns
+            let activation_index = module
+                .activations
                 .iter()
-                .position(|turn| turn.turn_id == *turn_id)?;
-            let turn = &module.turns[turn_index];
+                .position(|activation| activation.activation_id == *activation_id)?;
+            let activation = &module.activations[activation_index];
             let module_name = module_name(module);
             module_selected(&module_name).then(|| {
-                let streaming = turn_is_streaming(turn);
-                let turn_number = session_turn_number(module, turn_index);
-                LlmTurnListRow {
+                let batch_display = activation_batch_display(module, activation_index);
+                let turn_rows = activation
+                    .turn_ids
+                    .iter()
+                    .filter_map(|turn_id| llm_turn_row_for_id(module, &module_name, turn_id))
+                    .collect::<Vec<_>>();
+                ActivationListRow {
                     owner: module.owner.clone(),
-                    module: module_name,
-                    turn_id: turn.turn_id.clone(),
-                    session_key: turn.session_key.clone(),
-                    turn_number,
-                    label: llm_turn_row_label(
+                    module: module_name.clone(),
+                    activation_id: *activation_id,
+                    batch_number: batch_display.batch_number,
+                    attempt_number: batch_display.attempt_number,
+                    label: activation_row_label(
                         module_turn_label_module(module),
-                        turn_session_label(turn),
-                        turn_number,
-                        streaming,
+                        batch_display,
+                        activation_llm_in_flight(module, activation),
                     ),
-                    streaming,
-                    failed: turn.status == ModuleSessionStatus::Failed,
+                    failed: activation.status == ModuleSessionStatus::Failed,
+                    turn_rows,
                 }
             })
         })
         .collect()
 }
 
-pub fn selected_llm_turn_id(selected: &str, rows: &[LlmTurnListRow]) -> Option<String> {
-    if rows.iter().any(|row| row.turn_id == selected) {
+fn llm_turn_row_for_id(
+    module: &ModuleState,
+    module_name: &str,
+    turn_id: &str,
+) -> Option<LlmTurnListRow> {
+    let turn_index = module
+        .turns
+        .iter()
+        .position(|turn| turn.turn_id == turn_id)?;
+    let turn = &module.turns[turn_index];
+    let streaming = turn_is_streaming(turn);
+    let turn_number = session_turn_number(module, turn_index);
+    Some(LlmTurnListRow {
+        owner: module.owner.clone(),
+        module: module_name.to_string(),
+        turn_id: turn.turn_id.clone(),
+        session_key: turn.session_key.clone(),
+        turn_number,
+        token_count: turn_label_token_count(turn.usage.as_ref()),
+        label: llm_turn_row_label(
+            module_turn_label_module(module),
+            turn_session_label(turn),
+            turn_number,
+            turn_label_token_count(turn.usage.as_ref()),
+            streaming,
+        ),
+        streaming,
+        failed: turn.status == ModuleSessionStatus::Failed,
+    })
+}
+
+pub fn selected_history_panel(selected: &str, rows: &[ActivationListRow]) -> Option<String> {
+    if rows
+        .iter()
+        .any(|row| activation_selection_id(row.activation_id) == selected)
+        || rows
+            .iter()
+            .flat_map(|row| row.turn_rows.iter())
+            .any(|row| turn_selection_id(&row.turn_id) == selected)
+    {
         return Some(selected.to_string());
     }
     rows.iter()
         .rev()
+        .flat_map(|row| row.turn_rows.iter().rev())
         .find(|row| row.streaming)
-        .or_else(|| rows.last())
-        .map(|row| row.turn_id.clone())
+        .map(|row| turn_selection_id(&row.turn_id))
+        .or_else(|| {
+            rows.last().map(|row| {
+                if row.turn_rows.len() == 1 {
+                    turn_selection_id(&row.turn_rows[0].turn_id)
+                } else {
+                    activation_selection_id(row.activation_id)
+                }
+            })
+        })
 }
 
 fn turn_by_id<'a>(
@@ -2100,9 +2536,43 @@ fn turn_by_id<'a>(
     Some((turn_index, module, &module.turns[turn_index]))
 }
 
+fn activation_by_id<'a>(
+    state: &'a ModulesState,
+    activation_id: u64,
+) -> Option<(usize, &'a ModuleState, &'a ActivationState)> {
+    let owner = state.activation_to_owner.get(&activation_id)?;
+    let module = state.modules.get(owner)?;
+    let activation_index = module
+        .activations
+        .iter()
+        .position(|activation| activation.activation_id == activation_id)?;
+    Some((
+        activation_index,
+        module,
+        &module.activations[activation_index],
+    ))
+}
+
+fn turn_ref_by_id<'a>(module: &'a ModuleState, turn_id: &str) -> Option<(usize, &'a LlmTurnState)> {
+    let turn_index = module
+        .turns
+        .iter()
+        .position(|turn| turn.turn_id == turn_id)?;
+    Some((turn_index, &module.turns[turn_index]))
+}
+
 fn selected_module_panel(module: &ModuleState, persisted: &str) -> String {
     if persisted == MODULE_MEMOS_SELECTION {
         return MODULE_MEMOS_SELECTION.to_string();
+    }
+    if let Some(activation_id) = persisted.strip_prefix(MODULE_ACTIVATION_SELECTION_PREFIX)
+        && let Ok(activation_id) = activation_id.parse::<u64>()
+        && module
+            .activations
+            .iter()
+            .any(|activation| activation.activation_id == activation_id)
+    {
+        return persisted.to_string();
     }
     let Some(turn_id) = persisted.strip_prefix(MODULE_TURN_SELECTION_PREFIX) else {
         return MODULE_MEMOS_SELECTION.to_string();
@@ -2116,6 +2586,33 @@ fn selected_module_panel(module: &ModuleState, persisted: &str) -> String {
 
 fn turn_selection_id(turn_id: &str) -> String {
     format!("{MODULE_TURN_SELECTION_PREFIX}{turn_id}")
+}
+
+fn activation_selection_id(activation_id: u64) -> String {
+    format!("{MODULE_ACTIVATION_SELECTION_PREFIX}{activation_id}")
+}
+
+fn activation_selector_label(display: ActivationBatchDisplay) -> String {
+    let mut label = format!("Batch {}", display.batch_number);
+    if let Some(attempt_number) = display.attempt_number {
+        label.push_str(&format!(" ({attempt_number})"));
+    }
+    label
+}
+
+fn activation_selector_hover(activation: &ActivationState) -> String {
+    let mut hover = format!(
+        "{} activation {}",
+        status_label(activation.status),
+        activation.activation_id
+    );
+    if let Some(attempt) = activation.activation_attempt {
+        hover.push_str(&format!(" attempt {attempt}"));
+    }
+    if let Some(duration_ms) = activation.duration_ms {
+        hover.push_str(&format!(" duration {}", format_millis(duration_ms)));
+    }
+    hover
 }
 
 fn turn_selector_label(turn_number: usize, turn: &LlmTurnState) -> String {
@@ -2145,15 +2642,77 @@ fn turn_usage_tokens(usage: &LlmUsageView) -> u64 {
     usage.input_tokens.saturating_add(usage.output_tokens)
 }
 
+fn turn_label_token_count(usage: Option<&LlmUsageView>) -> Option<u64> {
+    usage
+        .map(turn_usage_tokens)
+        .filter(|token_count| *token_count > 0)
+}
+
 fn tool_call_source(name: &str, id: &str) -> String {
     format!("{name}({id})")
 }
 
+fn module_batch_debug_state(batch: crate::LlmBatchDebugView) -> ModuleBatchDebugState {
+    ModuleBatchDebugState {
+        batch_type: batch.batch_type,
+        debug: batch.debug,
+    }
+}
+
+fn record_activation_owner(state: &mut ModulesState, activation_id: u64, owner: &str) {
+    if !state.activation_to_owner.contains_key(&activation_id) {
+        state.activation_order.push(activation_id);
+    }
+    state
+        .activation_to_owner
+        .insert(activation_id, owner.to_string());
+}
+
+fn ensure_activation(
+    module: &mut ModuleState,
+    activation_id: u64,
+    activation_attempt: Option<u32>,
+    batch: Option<ModuleBatchDebugState>,
+) -> &mut ActivationState {
+    if let Some(index) = module
+        .activations
+        .iter()
+        .position(|activation| activation.activation_id == activation_id)
+    {
+        let activation = &mut module.activations[index];
+        if activation_attempt.is_some() {
+            activation.activation_attempt = activation_attempt;
+        }
+        if batch.is_some() && activation.batch.is_none() {
+            activation.batch = batch;
+        }
+        return activation;
+    }
+    module.activations.push(ActivationState {
+        activation_id,
+        activation_attempt,
+        batch,
+        error_message: None,
+        status: ModuleSessionStatus::Running,
+        duration_ms: None,
+        succeeded: None,
+        turn_ids: Vec::new(),
+    });
+    module.activations.last_mut().expect("activation inserted")
+}
+
+fn push_activation_turn(activation: &mut ActivationState, turn_id: &str) {
+    if !activation
+        .turn_ids
+        .iter()
+        .any(|existing| existing == turn_id)
+    {
+        activation.turn_ids.push(turn_id.to_string());
+    }
+}
+
 fn record_turn_owner(state: &mut ModulesState, turn_id: &str, owner: &str) -> bool {
     let new_turn = !state.turn_to_owner.contains_key(turn_id);
-    if new_turn {
-        state.turn_order.push(turn_id.to_string());
-    }
     state
         .turn_to_owner
         .insert(turn_id.to_string(), owner.to_string());
@@ -2166,6 +2725,28 @@ fn module_turn_label_module(module: &ModuleState) -> String {
     } else {
         module.owner.clone()
     }
+}
+
+fn activation_batch_display(
+    module: &ModuleState,
+    activation_index: usize,
+) -> ActivationBatchDisplay {
+    let mut batch_number = 0;
+    for activation in module.activations.iter().take(activation_index + 1) {
+        let attempt = activation_attempt_number(activation);
+        if attempt <= 1 || batch_number == 0 {
+            batch_number += 1;
+        }
+    }
+    let attempt = activation_attempt_number(&module.activations[activation_index]);
+    ActivationBatchDisplay {
+        batch_number,
+        attempt_number: (attempt > 1).then_some(attempt),
+    }
+}
+
+fn activation_attempt_number(activation: &ActivationState) -> u32 {
+    activation.activation_attempt.unwrap_or(1).max(1)
 }
 
 fn turn_session_label(turn: &LlmTurnState) -> &str {
@@ -2184,9 +2765,13 @@ fn llm_turn_row_label(
     module: String,
     session_label: &str,
     turn_number: usize,
+    token_count: Option<u64>,
     streaming: bool,
 ) -> String {
-    let label = format!("{module}.{session_label} {turn_number}");
+    let mut label = format!("{module} {session_label} {turn_number}");
+    if let Some(token_count) = token_count {
+        label.push_str(&format!(" ({token_count})"));
+    }
     if streaming {
         format!("* {label}")
     } else {
@@ -2194,11 +2779,48 @@ fn llm_turn_row_label(
     }
 }
 
+fn activation_row_label(
+    module: String,
+    display: ActivationBatchDisplay,
+    streaming: bool,
+) -> String {
+    let mut label = format!("{module} Batch {}", display.batch_number);
+    if let Some(attempt_number) = display.attempt_number {
+        label.push_str(&format!(" ({attempt_number})"));
+    }
+    if streaming {
+        format!("* {label}")
+    } else {
+        label
+    }
+}
+
+fn localized_activation_row_label(ctx: &egui::Context, row: &ActivationListRow) -> String {
+    activation_row_label(
+        localized_module_name(ctx, &row.module),
+        ActivationBatchDisplay {
+            batch_number: row.batch_number,
+            attempt_number: row.attempt_number,
+        },
+        row.turn_rows.iter().any(|turn| turn.streaming),
+    )
+}
+
+fn activation_row_hover(ctx: &egui::Context, row: &ActivationListRow) -> String {
+    format!(
+        "{} activation {} ({})",
+        localized_owner_name_with_id(ctx, &row.owner),
+        row.activation_id,
+        row.turn_rows.len()
+    )
+}
+
 fn localized_llm_turn_row_label(ctx: &egui::Context, row: &LlmTurnListRow) -> String {
     llm_turn_row_label(
         localized_module_name(ctx, &row.module),
         row.session_key.as_deref().unwrap_or("turn"),
         row.turn_number,
+        row.token_count,
         row.streaming,
     )
 }
@@ -2218,6 +2840,33 @@ fn llm_turn_row_hover(ctx: &egui::Context, row: &LlmTurnListRow) -> String {
 
 fn turn_is_streaming(turn: &LlmTurnState) -> bool {
     turn.status == ModuleSessionStatus::Running || turn.output.iter().any(|item| item.streaming)
+}
+
+fn activation_llm_in_flight(module: &ModuleState, activation: &ActivationState) -> bool {
+    activation.turn_ids.iter().any(|turn_id| {
+        turn_ref_by_id(module, turn_id)
+            .map(|(_, turn)| turn_is_streaming(turn))
+            .unwrap_or(false)
+    })
+}
+
+fn activation_turn_refs<'a>(
+    module: &'a ModuleState,
+    activation: &'a ActivationState,
+) -> Vec<(usize, &'a LlmTurnState)> {
+    activation
+        .turn_ids
+        .iter()
+        .filter_map(|turn_id| turn_ref_by_id(module, turn_id))
+        .collect()
+}
+
+fn turn_latest_output(turn: &LlmTurnState) -> Option<String> {
+    turn.output
+        .iter()
+        .rev()
+        .find(|item| !item.content.trim().is_empty())
+        .map(output_text)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2247,7 +2896,6 @@ fn ensure_turn(
     source: LlmObservationSource,
     session_key: Option<String>,
     tier: String,
-    batch: Option<ModuleBatchDebugState>,
 ) -> &mut LlmTurnState {
     if let Some(index) = module.turns.iter().position(|turn| turn.turn_id == turn_id) {
         let turn = &mut module.turns[index];
@@ -2257,9 +2905,6 @@ fn ensure_turn(
             turn.session_key = session_key;
         }
         turn.tier = tier;
-        if turn.batch.is_none() {
-            turn.batch = batch;
-        }
         return turn;
     }
     module.turns.push(LlmTurnState {
@@ -2273,7 +2918,6 @@ fn ensure_turn(
         finish_reason: None,
         usage: None,
         error_message: None,
-        batch,
         input: Vec::new(),
         output: Vec::new(),
         status: ModuleSessionStatus::Running,
@@ -2454,9 +3098,16 @@ mod tests {
         LlmUsageView,
         i18n::{I18nCatalog, Locale},
     };
-    use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::{ModuleActivationId, ModuleInstanceId, ReplicaIndex, builtin};
 
     const TEST_NOW_SECS: f64 = 10.0;
+
+    fn test_batch_view() -> crate::LlmBatchDebugView {
+        crate::LlmBatchDebugView {
+            batch_type: "test::Batch".to_string(),
+            debug: "batch".to_string(),
+        }
+    }
 
     fn test_i18n_context(locale: Locale) -> egui::Context {
         let ctx = egui::Context::default();
@@ -2562,6 +3213,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 42,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: vec![LlmInputItemView {
                     role: "user".to_string(),
                     kind: "text".to_string(),
@@ -2607,6 +3261,9 @@ mod tests {
                 source: LlmObservationSource::SessionCompaction,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 42,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2637,7 +3294,7 @@ mod tests {
     }
 
     #[test]
-    fn module_batch_ready_is_copied_to_new_turns() {
+    fn module_batch_ready_is_stored_on_activation() {
         let mut state = ModulesState::default();
         let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
 
@@ -2645,6 +3302,8 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleBatchReady {
                 sequence: 0,
+                activation_id: ModuleActivationId::new(42),
+                activation_attempt: 1,
                 owner: owner.clone(),
                 batch_type: "nuillu_sensory::SensoryBatch".to_string(),
                 batch_debug: "SensoryBatch { inputs: [] }".to_string(),
@@ -2661,6 +3320,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 42,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2670,12 +3332,191 @@ mod tests {
             .get(&owner.to_string())
             .expect("module exists");
         assert_eq!(
-            module.turns[0].batch,
+            module.activations[0].batch,
             Some(ModuleBatchDebugState {
                 batch_type: "nuillu_sensory::SensoryBatch".to_string(),
                 debug: "SensoryBatch { inputs: [] }".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn activation_history_rows_group_turns_by_activation() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+
+        for (activation_id, turn_ids) in [(10, vec!["plan"]), (11, vec!["think", "say"])] {
+            apply_runtime_event(
+                &mut state,
+                &RuntimeEvent::ModuleBatchReady {
+                    sequence: activation_id,
+                    activation_id: ModuleActivationId::new(activation_id),
+                    activation_attempt: 1,
+                    owner: owner.clone(),
+                    batch_type: "test::Batch".to_string(),
+                    batch_debug: format!("batch {activation_id}"),
+                },
+            );
+            for turn_id in turn_ids {
+                apply_llm_observation(
+                    &mut state,
+                    LlmObservationEvent::ModelInput {
+                        turn_id: turn_id.to_string(),
+                        owner: owner.to_string(),
+                        module: "speak".to_string(),
+                        replica: 0,
+                        tier: "Default".to_string(),
+                        source: LlmObservationSource::ModuleTurn,
+                        session_key: Some("main".to_string()),
+                        operation: "text_turn".to_string(),
+                        activation_id,
+                        activation_attempt: 1,
+                        batch: test_batch_view(),
+                        items: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        let rows = activation_history_rows(&state, |_| true);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.activation_id, row.turn_rows.len()))
+                .collect::<Vec<_>>(),
+            vec![(10, 1), (11, 2)]
+        );
+        assert_eq!(
+            selected_history_panel("", &rows),
+            Some(turn_selection_id("say"))
+        );
+    }
+
+    #[test]
+    fn activation_history_labels_use_batch_number_and_attempt_number() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+
+        for (sequence, activation_id, activation_attempt) in [(0, 10, 1), (1, 11, 2), (2, 12, 1)] {
+            apply_runtime_event(
+                &mut state,
+                &RuntimeEvent::ModuleBatchReady {
+                    sequence,
+                    activation_id: ModuleActivationId::new(activation_id),
+                    activation_attempt,
+                    owner: owner.clone(),
+                    batch_type: "test::Batch".to_string(),
+                    batch_debug: format!("batch {activation_id}"),
+                },
+            );
+        }
+
+        let rows = activation_history_rows(&state, |_| true);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["speak Batch 1", "speak Batch 1 (2)", "speak Batch 2"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.batch_number, row.attempt_number))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (1, Some(2)), (2, None)]
+        );
+    }
+
+    #[test]
+    fn zero_turn_activation_is_listed_without_llm_turns() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::allocation(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleBatchReady {
+                sequence: 0,
+                activation_id: ModuleActivationId::new(42),
+                activation_attempt: 1,
+                owner,
+                batch_type: "test::Batch".to_string(),
+                batch_debug: "batch".to_string(),
+            },
+        );
+
+        let rows = activation_history_rows(&state, |_| true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].activation_id, 42);
+        assert!(rows[0].turn_rows.is_empty());
+        assert_eq!(
+            selected_history_panel("", &rows),
+            Some(activation_selection_id(42))
+        );
+    }
+
+    #[test]
+    fn activation_and_llm_errors_remain_separate() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleBatchReady {
+                sequence: 0,
+                activation_id: ModuleActivationId::new(7),
+                activation_attempt: 1,
+                owner: owner.clone(),
+                batch_type: "test::Batch".to_string(),
+                batch_debug: "batch".to_string(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::ModelInput {
+                turn_id: "predict-turn".to_string(),
+                owner: owner.to_string(),
+                module: "predict".to_string(),
+                replica: 0,
+                tier: "Default".to_string(),
+                source: LlmObservationSource::ModuleTurn,
+                session_key: None,
+                operation: "text_turn".to_string(),
+                activation_id: 7,
+                activation_attempt: 1,
+                batch: test_batch_view(),
+                items: Vec::new(),
+            },
+        );
+        apply_llm_observation(
+            &mut state,
+            LlmObservationEvent::Failed {
+                turn_id: "predict-turn".to_string(),
+                message: "LLM failed".to_string(),
+            },
+        );
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::ModuleActivationAttemptFailed {
+                sequence: 1,
+                activation_id: ModuleActivationId::new(7),
+                owner,
+                activation_attempt: 1,
+                max_attempts: 1,
+                message: "activation failed".to_string(),
+            },
+        );
+
+        let rows = activation_history_rows(&state, |_| true);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].failed);
+        assert_eq!(rows[0].turn_rows.len(), 1);
+        assert!(rows[0].turn_rows[0].failed);
+
+        let (_, module, activation) = activation_by_id(&state, 7).expect("activation exists");
+        assert_eq!(
+            activation.error_message.as_deref(),
+            Some("activation failed")
+        );
+        let (_, turn) = turn_ref_by_id(module, "predict-turn").expect("turn exists");
+        assert_eq!(turn.error_message.as_deref(), Some("LLM failed"));
     }
 
     #[test]
@@ -2693,6 +3534,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "structured_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2739,6 +3583,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "structured_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2808,6 +3655,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2857,6 +3707,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2923,6 +3776,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2971,6 +3827,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -2997,6 +3856,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3042,6 +3904,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3091,6 +3956,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3113,6 +3981,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3137,63 +4008,6 @@ mod tests {
         assert_eq!(
             latest_llm_output(module),
             Some("text: stale output".to_string())
-        );
-    }
-
-    #[test]
-    fn selected_llm_turn_id_prefers_latest_streaming_then_latest() {
-        let rows = vec![
-            LlmTurnListRow {
-                owner: "sensory".to_string(),
-                module: "sensory".to_string(),
-                turn_id: "turn-1".to_string(),
-                session_key: None,
-                turn_number: 1,
-                label: "sensory.turn 1".to_string(),
-                streaming: false,
-                failed: false,
-            },
-            LlmTurnListRow {
-                owner: "memory".to_string(),
-                module: "memory".to_string(),
-                turn_id: "turn-2".to_string(),
-                session_key: None,
-                turn_number: 1,
-                label: "* memory.turn 1".to_string(),
-                streaming: true,
-                failed: false,
-            },
-            LlmTurnListRow {
-                owner: "allocation".to_string(),
-                module: "allocation".to_string(),
-                turn_id: "turn-3".to_string(),
-                session_key: None,
-                turn_number: 1,
-                label: "* allocation.turn 1".to_string(),
-                streaming: true,
-                failed: false,
-            },
-        ];
-
-        assert_eq!(
-            selected_llm_turn_id("turn-1", &rows),
-            Some("turn-1".to_string())
-        );
-        assert_eq!(
-            selected_llm_turn_id("missing", &rows),
-            Some("turn-3".to_string())
-        );
-
-        let completed_rows = rows
-            .into_iter()
-            .map(|mut row| {
-                row.streaming = false;
-                row
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected_llm_turn_id("missing", &completed_rows),
-            Some("turn-3".to_string())
         );
     }
 
@@ -3240,6 +4054,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3273,6 +4090,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3453,7 +4273,6 @@ mod tests {
                 request_id: None,
                 finish_reason: None,
                 usage: None,
-                batch: None,
                 input: Vec::new(),
                 output: Vec::new(),
                 status: ModuleSessionStatus::Running,
@@ -3482,7 +4301,6 @@ mod tests {
             request_id: None,
             finish_reason: None,
             usage: None,
-            batch: None,
             input: Vec::new(),
             output: Vec::new(),
             status: ModuleSessionStatus::Running,
@@ -3507,7 +4325,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_turn_rows_follow_first_seen_order_and_mark_streaming() {
+    fn activation_history_turn_rows_follow_first_seen_order_and_mark_streaming() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -3520,6 +4338,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3550,22 +4371,30 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 2,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
 
-        let rows = llm_turn_rows(&state, |_| true);
+        let rows = activation_history_rows(&state, |_| true);
+        let turn_rows = rows
+            .iter()
+            .flat_map(|row| row.turn_rows.iter())
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            rows.iter()
+            turn_rows
+                .iter()
                 .map(|row| row.turn_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["sensory-turn", "memory-turn"]
         );
-        assert_eq!(rows[0].label, "sensory.turn 1");
-        assert!(!rows[0].streaming);
-        assert_eq!(rows[1].label, "* memory.turn 1");
-        assert!(rows[1].streaming);
+        assert_eq!(turn_rows[0].label, "sensory turn 1");
+        assert!(!turn_rows[0].streaming);
+        assert_eq!(turn_rows[1].label, "* memory turn 1");
+        assert!(turn_rows[1].streaming);
     }
 
     #[test]
@@ -3588,6 +4417,9 @@ mod tests {
                     source: LlmObservationSource::ModuleTurn,
                     session_key: Some(session_key.to_string()),
                     operation: "text_turn".to_string(),
+                    activation_id: 1,
+                    activation_attempt: 1,
+                    batch: test_batch_view(),
                     items: Vec::new(),
                 },
             );
@@ -3605,20 +4437,28 @@ mod tests {
             vec!["planning 1", "generation 1", "planning 2", "generation 2"]
         );
 
-        let rows = llm_turn_rows(&state, |_| true);
+        let rows = activation_history_rows(&state, |_| true);
+        let turn_rows = rows
+            .iter()
+            .flat_map(|row| row.turn_rows.iter())
+            .collect::<Vec<_>>();
         assert_eq!(
-            rows.iter()
+            turn_rows
+                .iter()
                 .map(|row| row.label.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "* speak.planning 1",
-                "* speak.generation 1",
-                "* speak.planning 2",
-                "* speak.generation 2"
+                "* speak planning 1",
+                "* speak generation 1",
+                "* speak planning 2",
+                "* speak generation 2"
             ]
         );
         assert_eq!(
-            rows.iter().map(|row| row.turn_number).collect::<Vec<_>>(),
+            turn_rows
+                .iter()
+                .map(|row| row.turn_number)
+                .collect::<Vec<_>>(),
             vec![1, 1, 2, 2]
         );
     }
@@ -3637,6 +4477,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3663,11 +4506,12 @@ mod tests {
         assert_eq!(turn.output.len(), 1);
         assert_eq!(module.status, ModuleSessionStatus::Failed);
 
-        let rows = llm_turn_rows(&state, |_| true);
+        let rows = activation_history_rows(&state, |_| true);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].turn_id, "predict-turn");
-        assert!(rows[0].failed);
-        assert!(!rows[0].streaming);
+        assert_eq!(rows[0].turn_rows.len(), 1);
+        assert_eq!(rows[0].turn_rows[0].turn_id, "predict-turn");
+        assert!(rows[0].turn_rows[0].failed);
+        assert!(!rows[0].turn_rows[0].streaming);
         assert_eq!(
             module
                 .turns
@@ -3692,6 +4536,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3706,6 +4553,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3720,6 +4570,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 request_id: Some("req-1".to_string()),
                 model: "model-a".to_string(),
             },
@@ -3735,6 +4588,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3749,6 +4605,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3763,6 +4622,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 request_id: Some("req-2".to_string()),
                 model: "model-a".to_string(),
             },
@@ -3828,6 +4690,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -3857,6 +4722,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationAttemptFailed {
                 sequence: 0,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 activation_attempt: 1,
                 max_attempts: 3,
@@ -3867,6 +4733,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 duration: Duration::from_millis(42),
                 succeeded: true,
@@ -3886,6 +4753,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationAttemptFailed {
                 sequence: 0,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 activation_attempt: 1,
                 max_attempts: 2,
@@ -3896,6 +4764,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationAttemptFailed {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(2),
                 owner: owner.clone(),
                 activation_attempt: 2,
                 max_attempts: 2,
@@ -3906,6 +4775,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 2,
+                activation_id: ModuleActivationId::new(2),
                 owner: owner.clone(),
                 duration: Duration::from_millis(42),
                 succeeded: false,
@@ -3960,6 +4830,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: Some("session".to_string()),
                 operation: "text_turn".to_string(),
+                activation_id: 42,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 input: Vec::new(),
                 output: vec![LlmOutputItemView {
                     kind: "text".to_string(),
@@ -3997,10 +4870,11 @@ mod tests {
         assert_eq!(turn.error_message.as_deref(), Some("request timed out"));
         assert_eq!(turn.output.len(), 1);
 
-        let turn_rows = llm_turn_rows(&state, |_| true);
-        assert_eq!(turn_rows.len(), 1);
-        assert_eq!(turn_rows[0].label, "predict.session 1");
-        assert!(turn_rows[0].failed);
+        let rows = activation_history_rows(&state, |_| true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_rows.len(), 1);
+        assert_eq!(rows[0].turn_rows[0].label, "predict session 1 (8)");
+        assert!(rows[0].turn_rows[0].failed);
 
         let overview = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
         assert_eq!(overview.len(), 1);
@@ -4027,6 +4901,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -4055,7 +4932,7 @@ mod tests {
             let _ = ctx.run_ui(input, |ui| {
                 let response = egui::Window::new("LLM Turns")
                     .id(egui::Id::new("failed-turn-growth-test"))
-                    .default_size(egui::vec2(520.0, 360.0))
+                    .default_size(egui::vec2(760.0, 520.0))
                     .show(ui.ctx(), |ui| {
                         render_llm_turns(ui, &state, &mut filter, &modules);
                     })
@@ -4077,7 +4954,86 @@ mod tests {
     }
 
     #[test]
-    fn llm_turn_rows_filter_by_module_and_selection_falls_back() {
+    fn single_turn_selector_rows_fit_compact_turn_history_window() {
+        fn state_with_single_turn(
+            turn_id: String,
+            session_key: String,
+            operation: String,
+        ) -> ModulesState {
+            let mut state = ModulesState::default();
+            let owner = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+            apply_runtime_event(
+                &mut state,
+                &RuntimeEvent::ModuleBatchReady {
+                    sequence: 0,
+                    activation_id: ModuleActivationId::new(91),
+                    activation_attempt: 1,
+                    owner: owner.clone(),
+                    batch_type: "test::Batch".to_string(),
+                    batch_debug: "batch".to_string(),
+                },
+            );
+            apply_llm_observation(
+                &mut state,
+                LlmObservationEvent::ModelInput {
+                    turn_id,
+                    owner: owner.to_string(),
+                    module: "predict".to_string(),
+                    replica: 0,
+                    tier: "Default".to_string(),
+                    source: LlmObservationSource::SessionCompaction,
+                    session_key: Some(session_key),
+                    operation,
+                    activation_id: 91,
+                    activation_attempt: 1,
+                    batch: test_batch_view(),
+                    items: Vec::new(),
+                },
+            );
+            state
+        }
+
+        fn rendered_llm_turns_width(state: &ModulesState, id: &'static str) -> f32 {
+            let ctx = test_i18n_context(Locale::EnUs);
+            let mut filter = ModuleFilterState::default();
+            let modules = state.module_names();
+            let mut width = 0.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                time: Some(0.0),
+                ..egui::RawInput::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let response = egui::Window::new("LLM Turns")
+                    .id(egui::Id::new(id))
+                    .default_size(egui::vec2(760.0, 520.0))
+                    .show(ui.ctx(), |ui| {
+                        render_llm_turns(ui, state, &mut filter, &modules);
+                    })
+                    .expect("window is open");
+                width = response.response.rect.width();
+            });
+            width
+        }
+
+        let long_state = state_with_single_turn(
+            format!("turn-{}", "long-id-".repeat(24)),
+            format!("session-{}", "long-key-".repeat(12)),
+            format!("operation-{}", "long-name-".repeat(12)),
+        );
+        let long_width = rendered_llm_turns_width(&long_state, "single-turn-selector-long");
+
+        assert!(
+            long_width <= 772.0,
+            "single-turn selector row should fit the compact turn-history window: {long_width}"
+        );
+    }
+
+    #[test]
+    fn activation_history_rows_filter_by_module_and_selection_falls_back() {
         let mut state = ModulesState::default();
         apply_llm_observation(
             &mut state,
@@ -4090,6 +5046,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -4104,23 +5063,30 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 2,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
 
-        let rows = llm_turn_rows(&state, |module| module == "memory");
+        let rows = activation_history_rows(&state, |module| module == "memory");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].turn_id, "memory-turn");
+        assert_eq!(rows[0].turn_rows.len(), 1);
+        assert_eq!(rows[0].turn_rows[0].turn_id, "memory-turn");
         assert_eq!(
-            selected_llm_turn_id("sensory-turn", &rows),
-            Some("memory-turn".to_string())
+            selected_history_panel(&turn_selection_id("sensory-turn"), &rows),
+            Some(turn_selection_id("memory-turn"))
         );
         assert_eq!(
-            selected_llm_turn_id("memory-turn", &rows),
-            Some("memory-turn".to_string())
+            selected_history_panel(&turn_selection_id("memory-turn"), &rows),
+            Some(turn_selection_id("memory-turn"))
         );
-        assert_eq!(selected_llm_turn_id("memory-turn", &[]), None);
+        assert_eq!(
+            selected_history_panel(&turn_selection_id("memory-turn"), &[]),
+            None
+        );
     }
 
     #[test]
@@ -4132,6 +5098,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 0,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 duration: Duration::from_millis(800),
                 succeeded: true,
@@ -4158,6 +5125,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 2,
+                activation_id: ModuleActivationId::new(2),
                 owner: owner.clone(),
                 duration: Duration::from_millis(800),
                 succeeded: true,
@@ -4168,6 +5136,8 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleBatchReady {
                 sequence: 3,
+                activation_id: ModuleActivationId::new(3),
+                activation_attempt: 1,
                 owner: owner.clone(),
                 batch_type: "input".to_string(),
                 batch_debug: "ready".to_string(),
@@ -4189,6 +5159,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 duration: Duration::from_millis(800),
                 succeeded: true,
@@ -4240,6 +5211,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 duration: Duration::from_millis(3000),
                 succeeded: true,
@@ -4318,6 +5290,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 3,
+                activation_id: ModuleActivationId::new(3),
                 owner: owner.clone(),
                 duration: Duration::from_millis(42),
                 succeeded: true,
@@ -4347,6 +5320,9 @@ mod tests {
                 source: LlmObservationSource::ModuleTurn,
                 session_key: None,
                 operation: "text_turn".to_string(),
+                activation_id: 1,
+                activation_attempt: 1,
+                batch: test_batch_view(),
                 items: Vec::new(),
             },
         );
@@ -4363,6 +5339,7 @@ mod tests {
             &mut state,
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 0,
+                activation_id: ModuleActivationId::new(1),
                 owner,
                 duration: Duration::from_millis(800),
                 succeeded: true,

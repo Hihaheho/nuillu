@@ -15,8 +15,8 @@ use lutum::{
 };
 use nuillu_module::{LlmRequestMetadata, LlmRequestSource, ModuleSessionMetadata};
 use nuillu_visualizer_protocol::{
-    LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView, VisualizerEvent,
-    VisualizerTabId,
+    LlmBatchDebugView, LlmInputItemView, LlmObservationEvent, LlmObservationSource, LlmUsageView,
+    VisualizerEvent, VisualizerTabId,
 };
 
 use crate::gui::VisualizerEventSink;
@@ -100,16 +100,14 @@ impl VisualizerLlmObserver {
                 })
                 .clone()
         };
-        if let Some(activation_attempt) = metadata.activation_attempt {
-            self.inner
-                .activation_attempt_turns
-                .lock()
-                .expect("server visualizer LLM activation turn map lock poisoned")
-                .insert(
-                    (metadata.owner.to_string(), activation_attempt),
-                    turn_id.clone(),
-                );
-        }
+        self.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("server visualizer LLM activation turn map lock poisoned")
+            .insert(
+                (metadata.owner.to_string(), metadata.activation_attempt),
+                turn_id.clone(),
+            );
         turn_id
     }
 
@@ -130,16 +128,14 @@ impl VisualizerLlmObserver {
         if let Some(superseded) = &superseded {
             self.remove_activation_mappings_for_turn(superseded);
         }
-        if let Some(activation_attempt) = metadata.activation_attempt {
-            self.inner
-                .activation_attempt_turns
-                .lock()
-                .expect("server visualizer LLM activation turn map lock poisoned")
-                .insert(
-                    (metadata.owner.to_string(), activation_attempt),
-                    turn_id.clone(),
-                );
-        }
+        self.inner
+            .activation_attempt_turns
+            .lock()
+            .expect("server visualizer LLM activation turn map lock poisoned")
+            .insert(
+                (metadata.owner.to_string(), metadata.activation_attempt),
+                turn_id.clone(),
+            );
         (superseded, turn_id)
     }
 
@@ -189,6 +185,9 @@ impl OnModelInput for VisualizerLlmObserver {
             source: observation_source(metadata.source),
             session_key: observation_session_key(cx.extensions(), metadata),
             operation: operation_kind_label(cx.kind()).to_string(),
+            activation_id: metadata.activation_id.get(),
+            activation_attempt: metadata.activation_attempt,
+            batch: batch_debug_view(&metadata.batch),
             items: model_input_views(cx.input().items()),
         });
     }
@@ -254,9 +253,19 @@ fn emit_started(
         source: observation_source(metadata.source),
         session_key: observation_session_key(extensions, metadata),
         operation: operation_kind_label(operation).to_string(),
+        activation_id: metadata.activation_id.get(),
+        activation_attempt: metadata.activation_attempt,
+        batch: batch_debug_view(&metadata.batch),
         request_id,
         model,
     });
+}
+
+fn batch_debug_view(batch: &nuillu_module::LlmBatchDebug) -> LlmBatchDebugView {
+    LlmBatchDebugView {
+        batch_type: batch.batch_type.clone(),
+        debug: batch.batch_debug.clone(),
+    }
 }
 
 fn emit_delta(observer: &VisualizerLlmObserver, turn_id: String, kind: &str, delta: String) {
@@ -730,6 +739,8 @@ mod tests {
         let events = observed_events(&rx);
         assert_eq!(events.len(), 3);
 
+        assert_model_input_metadata(&events[0], 7, 1);
+        assert_model_input_metadata(&events[2], 7, 2);
         let first_turn_id = model_input_turn_id(&events[0]);
         let failed_turn_id = failed_turn_id(&events[1]);
         let second_turn_id = model_input_turn_id(&events[2]);
@@ -760,9 +771,35 @@ mod tests {
             tier: ModelTier::Default,
             source: LlmRequestSource::ModuleTurn,
             session_key: None,
-            activation_attempt: Some(activation_attempt),
-            batch: None,
+            activation_id: nuillu_types::ModuleActivationId::new(7),
+            activation_attempt,
+            batch: nuillu_module::LlmBatchDebug {
+                batch_type: "test::Batch".to_string(),
+                batch_debug: "Batch(\"debug\")".to_string(),
+            },
         }
+    }
+
+    fn assert_model_input_metadata(
+        event: &LlmObservationEvent,
+        expected_activation_id: u64,
+        expected_activation_attempt: u32,
+    ) {
+        let LlmObservationEvent::ModelInput {
+            activation_id,
+            activation_attempt,
+            batch,
+            ..
+        } = event
+        else {
+            panic!("expected model input event: {event:?}");
+        };
+        assert_eq!(*activation_id, expected_activation_id);
+        assert_eq!(*activation_attempt, expected_activation_attempt);
+        assert_eq!(
+            (batch.batch_type.as_str(), batch.debug.as_str()),
+            ("test::Batch", "Batch(\"debug\")")
+        );
     }
 
     fn observed_events(rx: &mpsc::Receiver<VisualizerServerMessage>) -> Vec<LlmObservationEvent> {

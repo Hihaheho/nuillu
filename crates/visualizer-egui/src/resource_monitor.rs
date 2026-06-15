@@ -785,7 +785,7 @@ fn module_color(index: usize) -> Color32 {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
-    use nuillu_types::{ModuleId, ModuleInstanceId, ReplicaIndex};
+    use nuillu_types::{ModuleActivationId, ModuleId, ModuleInstanceId, ReplicaIndex};
 
     use super::*;
 
@@ -818,6 +818,8 @@ mod tests {
         state.record_runtime_event_at(
             &RuntimeEvent::ModuleBatchReady {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(1),
+                activation_attempt: 1,
                 owner: owner.clone(),
                 batch_type: "Batch".to_string(),
                 batch_debug: "Batch".to_string(),
@@ -827,6 +829,7 @@ mod tests {
         state.record_runtime_event_at(
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 2,
+                activation_id: ModuleActivationId::new(1),
                 owner: owner.clone(),
                 duration: std::time::Duration::from_millis(10),
                 succeeded: true,
@@ -836,6 +839,7 @@ mod tests {
         state.record_runtime_event_at(
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 3,
+                activation_id: ModuleActivationId::new(2),
                 owner,
                 duration: std::time::Duration::from_millis(10),
                 succeeded: false,
@@ -859,6 +863,8 @@ mod tests {
             state.record_runtime_event_at(
                 &RuntimeEvent::ModuleBatchReady {
                     sequence,
+                    activation_id: ModuleActivationId::new(sequence),
+                    activation_attempt: 1,
                     owner: sensory.clone(),
                     batch_type: "Batch".to_string(),
                     batch_debug: "Batch".to_string(),
@@ -870,6 +876,8 @@ mod tests {
             state.record_runtime_event_at(
                 &RuntimeEvent::ModuleBatchReady {
                     sequence,
+                    activation_id: ModuleActivationId::new(sequence),
+                    activation_attempt: 1,
                     owner: reward.clone(),
                     batch_type: "Batch".to_string(),
                     batch_debug: "Batch".to_string(),
@@ -893,6 +901,8 @@ mod tests {
         state.record_runtime_event_at(
             &RuntimeEvent::ModuleBatchReady {
                 sequence: 1,
+                activation_id: ModuleActivationId::new(1),
+                activation_attempt: 1,
                 owner: sensory.clone(),
                 batch_type: "Batch".to_string(),
                 batch_debug: "Batch".to_string(),
@@ -902,6 +912,7 @@ mod tests {
         state.record_runtime_event_at(
             &RuntimeEvent::ModuleActivationCompleted {
                 sequence: 2,
+                activation_id: ModuleActivationId::new(1),
                 owner: sensory,
                 duration: std::time::Duration::from_millis(10),
                 succeeded: true,
@@ -912,6 +923,8 @@ mod tests {
             state.record_runtime_event_at(
                 &RuntimeEvent::ModuleBatchReady {
                     sequence,
+                    activation_id: ModuleActivationId::new(sequence),
+                    activation_attempt: 1,
                     owner: reward.clone(),
                     batch_type: "Batch".to_string(),
                     batch_debug: "Batch".to_string(),

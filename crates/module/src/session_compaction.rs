@@ -132,16 +132,19 @@ impl SessionCompactionRuntime {
             .default_extensions()
             .get::<LlmRequestMetadata>()
             .cloned();
-        self.lutum.clone().with_extension(LlmRequestMetadata {
-            owner,
-            tier: self.module_tier,
-            source: LlmRequestSource::SessionCompaction,
-            session_key: Some(session_key),
-            activation_attempt: base
-                .as_ref()
-                .and_then(|metadata| metadata.activation_attempt),
-            batch: base.and_then(|metadata| metadata.batch),
-        })
+        if let Some(base) = base {
+            self.lutum.clone().with_extension(LlmRequestMetadata {
+                owner,
+                tier: self.module_tier,
+                source: LlmRequestSource::SessionCompaction,
+                session_key: Some(session_key),
+                activation_id: base.activation_id,
+                activation_attempt: base.activation_attempt,
+                batch: base.batch,
+            })
+        } else {
+            self.lutum.clone()
+        }
     }
 }
 
