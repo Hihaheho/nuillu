@@ -74,6 +74,8 @@ pub struct MemoLogRecord {
     pub index: u64,
     pub written_at: DateTime<Utc>,
     pub content: String,
+    #[serde(default)]
+    pub cognitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +96,7 @@ pub struct TypedMemoLogRecord<T> {
     pub index: u64,
     pub written_at: DateTime<Utc>,
     pub content: String,
+    pub cognitive: bool,
     payload: Arc<dyn Any>,
     _marker: PhantomData<fn() -> T>,
 }
@@ -134,6 +137,7 @@ impl MemoLogEntry {
             index: self.record.index,
             written_at: self.record.written_at,
             content: self.record.content.clone(),
+            cognitive: self.record.cognitive,
             payload: Arc::clone(&self.payload),
             _marker: PhantomData,
         }
@@ -360,6 +364,27 @@ impl Blackboard {
             .await
     }
 
+    pub async fn update_cognitive_memo(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        written_at: DateTime<Utc>,
+    ) -> MemoLogRecord {
+        self.update_cognitive_memo_with_evictions(owner, memo, written_at)
+            .await
+            .record
+    }
+
+    pub async fn update_cognitive_memo_with_evictions(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        written_at: DateTime<Utc>,
+    ) -> MemoAppendResult {
+        self.update_typed_cognitive_memo_with_evictions(owner, memo, (), written_at)
+            .await
+    }
+
     pub async fn update_typed_memo<T: 'static>(
         &self,
         owner: ModuleInstanceId,
@@ -379,8 +404,43 @@ impl Blackboard {
         payload: T,
         written_at: DateTime<Utc>,
     ) -> MemoAppendResult {
+        self.update_typed_memo_with_evictions_and_cognitive(owner, memo, payload, written_at, false)
+            .await
+    }
+
+    pub async fn update_typed_cognitive_memo<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        payload: T,
+        written_at: DateTime<Utc>,
+    ) -> MemoLogRecord {
+        self.update_typed_cognitive_memo_with_evictions(owner, memo, payload, written_at)
+            .await
+            .record
+    }
+
+    pub async fn update_typed_cognitive_memo_with_evictions<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        payload: T,
+        written_at: DateTime<Utc>,
+    ) -> MemoAppendResult {
+        self.update_typed_memo_with_evictions_and_cognitive(owner, memo, payload, written_at, true)
+            .await
+    }
+
+    async fn update_typed_memo_with_evictions_and_cognitive<T: 'static>(
+        &self,
+        owner: ModuleInstanceId,
+        memo: String,
+        payload: T,
+        written_at: DateTime<Utc>,
+        cognitive: bool,
+    ) -> MemoAppendResult {
         let mut guard = self.inner.write().await;
-        guard.append_memo(owner, memo, Arc::new(payload), written_at)
+        guard.append_memo(owner, memo, Arc::new(payload), written_at, cognitive)
     }
 
     pub async fn append_cognition_log(
@@ -657,6 +717,7 @@ impl BlackboardInner {
                     "index": record.index,
                     "written_at": record.written_at,
                     "content": record.content,
+                    "cognitive": record.cognitive,
                 }));
         }
         serde_json::json!(grouped)
@@ -791,7 +852,7 @@ impl BlackboardInner {
                 memo,
                 written_at,
             } => {
-                self.append_memo(owner, memo, Arc::new(()), written_at);
+                self.append_memo(owner, memo, Arc::new(()), written_at, false);
             }
             BlackboardCommand::SetModuleRunStatus { owner, status } => {
                 self.module_statuses.insert(owner, status);
@@ -924,6 +985,7 @@ impl BlackboardInner {
         content: String,
         payload: Arc<dyn Any>,
         written_at: DateTime<Utc>,
+        cognitive: bool,
     ) -> MemoAppendResult {
         let index = self.memo_next_indices.entry(owner.clone()).or_default();
         let record = MemoLogRecord {
@@ -931,6 +993,7 @@ impl BlackboardInner {
             index: *index,
             written_at,
             content,
+            cognitive,
         };
         *index = (*index).saturating_add(1);
 
@@ -1170,6 +1233,7 @@ mod tests {
                 index: 0,
                 written_at: memo_time(0),
                 content: "noted".into(),
+                cognitive: false,
             }]
         );
     }
@@ -1201,6 +1265,7 @@ mod tests {
                 index: 0,
                 written_at: memo_time(0),
                 content: "plain memo".into(),
+                cognitive: false,
             }]
         );
 
@@ -1223,8 +1288,68 @@ mod tests {
                     "index": 0,
                     "written_at": memo_time(0),
                     "content": "plain memo",
+                    "cognitive": false,
                 }]
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn cognitive_memo_round_trip_marks_plaintext_view() {
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+
+        let record = bb
+            .update_cognitive_memo(owner.clone(), "cognitive note".into(), memo_time(0))
+            .await;
+
+        assert!(record.cognitive);
+        let logs = bb.read(|bb| bb.recent_memo_logs()).await;
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].cognitive);
+        let json = bb.read(|bb| bb.memo_logs()).await;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "sensory": [{
+                    "replica": 0,
+                    "index": 0,
+                    "written_at": memo_time(0),
+                    "content": "cognitive note",
+                    "cognitive": true,
+                }]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_cognitive_memo_keeps_payload_and_cognitive_flag() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct TestPayload {
+            value: String,
+        }
+
+        let bb = Blackboard::new();
+        let owner = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        bb.update_typed_cognitive_memo(
+            owner.clone(),
+            "retrieved evidence".into(),
+            TestPayload {
+                value: "structured".into(),
+            },
+            memo_time(0),
+        )
+        .await;
+
+        let typed_logs = bb.typed_memo_logs::<TestPayload>(&owner).await;
+        assert_eq!(typed_logs.len(), 1);
+        assert_eq!(typed_logs[0].content, "retrieved evidence");
+        assert!(typed_logs[0].cognitive);
+        assert_eq!(
+            typed_logs[0].data(),
+            &TestPayload {
+                value: "structured".into()
+            }
         );
     }
 
@@ -1309,6 +1434,7 @@ mod tests {
                 index: 0,
                 written_at: memo_time(1),
                 content: "first".into(),
+                cognitive: false,
             }]
         );
     }

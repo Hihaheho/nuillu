@@ -10,14 +10,8 @@ limits {
 
 @ memos[] {
   module: sensory
+  cognitive = true
   content: Audition from Peer: Peer says, "Hi." Peer is facing Nui from the front at conversational distance.
-}
-
-@ checks[] {
-  $variant: trace-tool-call
-  name: uses-promote-to-cognition-tool
-  must-pass = true
-  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -43,7 +37,7 @@ limits {
   judge-inputs = ["output", "memo-contents", "cognition-entries", "tool-calls"]
   rubric = ```
   Pass if cognition-gate promotes one conscious entry that preserves the current direct greeting from Peer and the fact that it matters now for a social response.
-  Fail if it leaves cognition unchanged, treats the greeting as mere noise, drops the participant or greeting content, turns the entry into a plan to inspect internal state, emits plain assistant text without promote_to_cognition, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
+  Fail if it leaves cognition unchanged, treats the greeting as mere noise, drops the participant or greeting content, turns the entry into a plan to inspect internal state, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {

@@ -717,6 +717,8 @@ pub struct MemoView {
     pub index: u64,
     pub written_at: DateTime<Utc>,
     pub content: String,
+    #[serde(default)]
+    pub cognitive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

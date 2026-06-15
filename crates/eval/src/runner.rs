@@ -1974,7 +1974,7 @@ async fn execute_full_agent_case(
     .await?;
     seed_eval_scene_participants(env.caps.scene(), &case.participants);
     let memory_baseline = memory_snapshot(env.memory.as_ref()).await?;
-    let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
+    let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos, false).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
         emit_visualizer_memory_page(
@@ -2325,7 +2325,13 @@ async fn execute_module_case(
     } else {
         0
     };
-    let memo_seed_records = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos).await?;
+    let memo_seed_records = seed_memos(
+        &env.blackboard,
+        env.clock.as_ref(),
+        &case.memos,
+        module_target_forces_cognitive_memo_seeds(target),
+    )
+    .await?;
     let cognition_seed_records =
         seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
@@ -2503,7 +2509,18 @@ async fn execute_module_case(
                         > module_step_activation_count
                 } else {
                     match target {
-                        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::CognitionGate => {
+                        ModuleEvalTarget::AttentionSchema => {
+                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
+                                .await
+                                .is_some()
+                                || module_activation_finished(
+                                    &blackboard,
+                                    events.as_ref(),
+                                    &shutdown_target_module,
+                                )
+                                .await
+                        }
+                        ModuleEvalTarget::CognitionGate => {
                             cognition_eval_has_new_output(
                                 &cognition_output_for_module(&blackboard, &shutdown_target_module)
                                     .await,
@@ -2633,8 +2650,12 @@ async fn execute_module_case(
     .await?;
 
     let output = match target {
-        ModuleEvalTarget::AttentionSchema
-        | ModuleEvalTarget::CognitionGate
+        ModuleEvalTarget::AttentionSchema => {
+            last_memo_log_content_for_module(&env.blackboard, &target_module)
+                .await
+                .unwrap_or_default()
+        }
+        ModuleEvalTarget::CognitionGate
         | ModuleEvalTarget::Interpreter
         | ModuleEvalTarget::MemoryRecombination => {
             cognition_output_for_module(&env.blackboard, &target_module).await
@@ -2981,9 +3002,14 @@ async fn activate_module_case_step(
     sensory: &SensoryInputMailbox,
     clock: &dyn Clock,
 ) {
-    let memo_seed_records = seed_memos(blackboard, clock, &step.memos)
-        .await
-        .expect("module eval step memo seeds should be valid");
+    let memo_seed_records = seed_memos(
+        blackboard,
+        clock,
+        &step.memos,
+        module_target_forces_cognitive_memo_seeds(target),
+    )
+    .await
+    .expect("module eval step memo seeds should be valid");
     let cognition_seed_records = seed_cognition_log(blackboard, clock, &step.cognition_log).await;
     activate_module_case_target(
         target,
@@ -3021,8 +3047,18 @@ async fn cognition_output_for_module(blackboard: &Blackboard, module: &ModuleId)
 }
 
 #[cfg(test)]
-async fn attention_schema_cognition_output(blackboard: &Blackboard) -> String {
-    cognition_output_for_module(blackboard, &builtin::attention_schema()).await
+async fn attention_schema_memo_output(blackboard: &Blackboard) -> String {
+    let module = builtin::attention_schema();
+    blackboard
+        .read(|bb| {
+            bb.recent_memo_logs()
+                .into_iter()
+                .filter(|record| &record.owner.module == &module)
+                .map(|record| record.content)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .await
 }
 
 async fn last_memo_log_content_for_module(
@@ -4779,6 +4815,7 @@ async fn seed_memos(
     blackboard: &Blackboard,
     clock: &dyn Clock,
     memos: &[crate::cases::MemoSeed],
+    force_cognitive: bool,
 ) -> Result<Vec<nuillu_blackboard::MemoLogRecord>> {
     let now = clock.now();
     let mut records = Vec::new();
@@ -4787,13 +4824,23 @@ async fn seed_memos(
             .with_context(|| format!("seed memo module id {}", memo.module))?;
         let owner = ModuleInstanceId::new(module, ReplicaIndex::new(memo.replica));
         let written_at = now - ChronoDuration::seconds(memo.seconds_ago);
-        records.push(
+        let cognitive = force_cognitive || memo.cognitive;
+        let record = if cognitive {
+            blackboard
+                .update_cognitive_memo(owner, memo.content.content.clone(), written_at)
+                .await
+        } else {
             blackboard
                 .update_memo(owner, memo.content.content.clone(), written_at)
-                .await,
-        );
+                .await
+        };
+        records.push(record);
     }
     Ok(records)
+}
+
+fn module_target_forces_cognitive_memo_seeds(target: ModuleEvalTarget) -> bool {
+    matches!(target, ModuleEvalTarget::AttentionSchema)
 }
 
 async fn seed_cognition_log(
@@ -5065,7 +5112,7 @@ fn register_eval_module(
                             caps.cognition_log_updated_inbox(),
                             caps.blackboard_reader(),
                             caps.cognition_log_reader(),
-                            caps.cognition_writer(),
+                            caps.memo(),
                             caps.llm_access(),
                             caps.session("main")
                                 .with_auto_compaction(
@@ -5735,6 +5782,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 replica: record.owner.replica.get(),
                 index: record.index,
                 written_at: record.written_at,
+                cognitive: record.cognitive,
                 content: record.content,
             })
             .collect(),
@@ -5790,6 +5838,7 @@ fn memo_log_dumps(bb: &BlackboardInner) -> Vec<MemoLogDump> {
             replica: record.owner.replica.get(),
             index: record.index,
             written_at: record.written_at.to_rfc3339(),
+            cognitive: record.cognitive,
             content: DumpText::new(record.content),
         })
         .collect()
@@ -5978,6 +6027,7 @@ struct MemoLogObservation {
     replica: u8,
     index: u64,
     written_at: String,
+    cognitive: bool,
     content: String,
 }
 
@@ -6010,6 +6060,7 @@ fn memo_log_observations(bb: &BlackboardInner) -> BTreeMap<String, Vec<MemoLogOb
                 replica: record.owner.replica.get(),
                 index: record.index,
                 written_at: record.written_at.to_rfc3339(),
+                cognitive: record.cognitive,
                 content: record.content,
             });
     }
@@ -9505,6 +9556,7 @@ limits {
                     "index": 0,
                     "written_at": "2026-05-07T00:00:00+00:00",
                     "content": "memo",
+                    "cognitive": false,
                 }],
             },
             "cognition_logs": [{
@@ -9704,7 +9756,7 @@ prompt = "What am I attending to?"
         let blackboard = Blackboard::default();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
 
-        let records = seed_memos(&blackboard, &FixedClock(now), &case.memos)
+        let records = seed_memos(&blackboard, &FixedClock(now), &case.memos, false)
             .await
             .unwrap();
 
@@ -9749,7 +9801,7 @@ prompt = "What am I attending to?"
                                 caps.cognition_log_updated_inbox(),
                                 caps.blackboard_reader(),
                                 caps.cognition_log_reader(),
-                                caps.cognition_writer(),
+                                caps.memo(),
                                 caps.llm_access(),
                                 caps.session("main")
                                     .with_auto_compaction(
@@ -9781,7 +9833,7 @@ prompt = "What am I attending to?"
                     },
                     async {
                         let record = run_blackboard
-                            .update_memo(
+                            .update_cognitive_memo(
                                 sensory.clone(),
                                 "Koro gave a food-boundary signal".to_owned(),
                                 now,
@@ -9796,7 +9848,7 @@ prompt = "What am I attending to?"
                             .expect("attention-schema receives seeded memo update");
 
                         for _ in 0..50 {
-                            let count = attention_schema_cognition_output(&run_blackboard)
+                            let count = attention_schema_memo_output(&run_blackboard)
                                 .await
                                 .lines()
                                 .count();
@@ -9830,7 +9882,7 @@ prompt = "What am I attending to?"
                         }
 
                         let record = run_blackboard
-                            .update_memo(
+                            .update_cognitive_memo(
                                 sensory.clone(),
                                 "Koro relaxed after the boundary was respected".to_owned(),
                                 now + ChronoDuration::seconds(1),
@@ -9845,7 +9897,7 @@ prompt = "What am I attending to?"
                             .expect("attention-schema receives second memo update");
 
                         for _ in 0..80 {
-                            let count = attention_schema_cognition_output(&run_blackboard)
+                            let count = attention_schema_memo_output(&run_blackboard)
                                 .await
                                 .lines()
                                 .count();
@@ -9861,7 +9913,7 @@ prompt = "What am I attending to?"
                 .unwrap();
 
                 assert_eq!(
-                    attention_schema_cognition_output(&blackboard).await,
+                    attention_schema_memo_output(&blackboard).await,
                     [first_entry, second_entry].join("\n\n")
                 );
             })

@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod batch;
+pub use batch::NextBatch as CognitionGateBatch;
 
 const SYSTEM_PROMPT: &str = r#"You are the cognition-gate module — a selective attention
 filter that decides what reaches the agent's conscious workspace. The cognition log IS that
@@ -232,16 +233,50 @@ impl CognitionGateModule {
     }
 
     #[tracing::instrument(skip_all, err(Debug, level = "warn"))]
-    async fn activate(&mut self, cx: &nuillu_module::ActivateCx<'_>) -> Result<()> {
-        self.ensure_session_seeded(cx);
-        let session_len_before_activation = self.session.input().items().len();
-
+    async fn activate(
+        &mut self,
+        cx: &nuillu_module::ActivateCx<'_>,
+        batch: &CognitionGateBatch,
+    ) -> Result<()> {
         let unread_cognition = self
             .blackboard
             .read(|bb| bb.unread_cognition_log_entries(self.last_seen_cognition_index))
             .await;
-        let unread_memos = self.blackboard.unread_memo_logs().await;
-        self.pending_unread_memos.extend(unread_memos);
+        for record in &batch.memo_logs {
+            if !self
+                .pending_unread_memos
+                .iter()
+                .any(|pending| pending.owner == record.owner && pending.index == record.index)
+            {
+                self.pending_unread_memos.push(record.clone());
+            }
+        }
+        if self.pending_unread_memos.len() == 1 {
+            let record = self
+                .pending_unread_memos
+                .first()
+                .expect("single pending memo exists");
+            let (output, decision) = self
+                .promote_to_cognition(PromoteToCognitionArgs {
+                    promotion_text: record.content.trim().to_owned(),
+                })
+                .await;
+            if decision == PromotionDecision::Rejected {
+                let detail = output
+                    .rejected_reason
+                    .unwrap_or_else(|| "direct promotion rejected".to_owned());
+                anyhow::bail!("cognition-gate direct promotion rejected: {detail}");
+            }
+            if let Some(index) = unread_cognition.last().map(|record| record.index) {
+                self.last_seen_cognition_index = Some(index);
+            }
+            self.pending_unread_memos.clear();
+            return Ok(());
+        }
+
+        self.ensure_session_seeded(cx);
+        let session_len_before_activation = self.session.input().items().len();
+
         push_formatted_cognition_log_batch(
             &mut self.session,
             &unread_cognition,
@@ -644,7 +679,7 @@ fn contains_json_key_value_fragment(text: &str) -> bool {
 
 #[async_trait(?Send)]
 impl Module for CognitionGateModule {
-    type Batch = ();
+    type Batch = CognitionGateBatch;
 
     fn id() -> &'static str {
         "cognition-gate"
@@ -667,9 +702,9 @@ impl Module for CognitionGateModule {
     async fn activate(
         &mut self,
         cx: &nuillu_module::ActivateCx<'_>,
-        _batch: &Self::Batch,
+        batch: &Self::Batch,
     ) -> Result<()> {
-        CognitionGateModule::activate(self, cx).await
+        CognitionGateModule::activate(self, cx, batch).await
     }
 }
 
@@ -678,6 +713,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use lutum::{
         AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
@@ -1000,6 +1036,10 @@ mod tests {
         assert!(text.contains(CANDIDATE_DECISION_INSTRUCTION));
     }
 
+    async fn next_gate_batch(fixture: &mut GateFixture) -> CognitionGateBatch {
+        fixture.gate.next_batch().await.unwrap()
+    }
+
     #[test]
     fn session_compaction_config_defaults_to_80_percent() {
         assert_eq!(
@@ -1120,7 +1160,14 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture.source_memo.write("sensory detail A").await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail A")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail B")
+            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -1134,7 +1181,8 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture.gate.activate(&cx).await.unwrap();
+        let batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &batch).await.unwrap();
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 1);
@@ -1146,6 +1194,8 @@ mod tests {
         assert_candidate_decision_instruction(candidate_input);
         assert!(candidate_input.contains("- candidate 1"));
         assert!(candidate_input.contains("sensory detail A"));
+        assert!(candidate_input.contains("- candidate 2"));
+        assert!(candidate_input.contains("sensory detail B"));
         assert!(!candidate_input.contains("memo"));
         assert!(!candidate_input.contains("Held-in-mind notes"));
         assert!(!candidate_input.contains("working notes"));
@@ -1201,6 +1251,7 @@ mod tests {
                     if text.contains(NEW_CANDIDATE_HEADER)
                         && text.contains(CANDIDATE_DECISION_INSTRUCTION)
                         && text.contains("sensory detail A")
+                        && text.contains("sensory detail B")
                         && !text.contains("memo")
                         && !text.contains("Held-in-mind notes")
                         && !text.contains("working notes")
@@ -1217,11 +1268,74 @@ mod tests {
             InputMessageRole::User,
             "sensory detail A"
         ));
+        assert!(has_message_with_role_containing(
+            &items,
+            InputMessageRole::User,
+            "sensory detail B"
+        ));
         assert!(!has_message_with_role_containing(
             &items,
             InputMessageRole::System,
             "sensory detail A"
         ));
+        assert!(!has_message_with_role_containing(
+            &items,
+            InputMessageRole::System,
+            "sensory detail B"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_cognitive_memo_promotes_without_llm() {
+        let capture = CapturingAdapter::new(MockLlmAdapter::new());
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
+        fixture
+            .source_memo
+            .write_cognitive("Peer said hello to me.")
+            .await;
+
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories: Vec<IdentityMemoryRecord> = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+
+        let batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &batch).await.unwrap();
+
+        assert!(observed.text_inputs().is_empty());
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "Peer said hello to me.");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_cognitive_memo_update_does_not_form_gate_batch() {
+        let mut fixture = gate_fixture_with_adapter(MockLlmAdapter::new()).await;
+        fixture.source_memo.write("internal bookkeeping").await;
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), fixture.gate.next_batch())
+            .await
+            .is_err();
+        assert!(timed_out, "non-cognitive memo should not produce a batch");
+
+        fixture
+            .source_memo
+            .write_cognitive("cognitive evidence")
+            .await;
+        let batch = next_gate_batch(&mut fixture).await;
+        assert_eq!(batch.memo_logs.len(), 1);
+        assert_eq!(batch.memo_logs[0].content, "cognitive evidence");
+        assert!(batch.memo_logs[0].cognitive);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1329,7 +1443,14 @@ mod tests {
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture.source_memo.write("sensory detail A").await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail A")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail B")
+            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -1343,9 +1464,10 @@ mod tests {
             SystemClock.now(),
         );
 
-        let err = fixture.gate.activate(&cx).await.unwrap_err();
+        let batch = next_gate_batch(&mut fixture).await;
+        let err = fixture.gate.activate(&cx, &batch).await.unwrap_err();
         assert!(err.to_string().contains("decision turn failed"));
-        assert_eq!(fixture.gate.pending_unread_memos.len(), 1);
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 2);
 
         let items = fixture.gate.session.input().items().to_vec();
         assert!(!has_message_with_role_containing(
@@ -1363,8 +1485,13 @@ mod tests {
             InputMessageRole::User,
             "sensory detail A"
         ));
+        assert!(!has_message_with_role_containing(
+            &items,
+            InputMessageRole::User,
+            "sensory detail B"
+        ));
 
-        fixture.gate.activate(&cx).await.unwrap();
+        fixture.gate.activate(&cx, &batch).await.unwrap();
         assert!(fixture.gate.pending_unread_memos.is_empty());
 
         let inputs = observed.text_inputs();
@@ -1373,6 +1500,7 @@ mod tests {
         assert!(retried_candidates.contains(NEW_CANDIDATE_HEADER));
         assert_candidate_decision_instruction(retried_candidates);
         assert!(retried_candidates.contains("sensory detail A"));
+        assert!(retried_candidates.contains("sensory detail B"));
         assert!(!retried_candidates.contains("memo"));
         assert!(!retried_candidates.contains("Held-in-mind notes"));
     }
@@ -1410,15 +1538,27 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture.source_memo.write("sensory detail A").await;
-        fixture.gate.activate(&cx).await.unwrap_err();
-        assert_eq!(fixture.gate.pending_unread_memos.len(), 1);
-
-        fixture.source_memo.write("sensory detail B").await;
-        fixture.gate.activate(&cx).await.unwrap_err();
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail A")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail B")
+            .await;
+        let first_batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &first_batch).await.unwrap_err();
         assert_eq!(fixture.gate.pending_unread_memos.len(), 2);
 
-        fixture.gate.activate(&cx).await.unwrap();
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail C")
+            .await;
+        let second_batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &second_batch).await.unwrap_err();
+        assert_eq!(fixture.gate.pending_unread_memos.len(), 3);
+
+        fixture.gate.activate(&cx, &second_batch).await.unwrap();
         assert!(fixture.gate.pending_unread_memos.is_empty());
 
         let inputs = observed.text_inputs();
@@ -1427,17 +1567,28 @@ mod tests {
         assert_candidate_decision_instruction(accumulated_candidates);
         assert!(accumulated_candidates.contains("sensory detail A"));
         assert!(accumulated_candidates.contains("sensory detail B"));
+        assert!(accumulated_candidates.contains("sensory detail C"));
 
-        fixture.source_memo.write("sensory detail C").await;
-        fixture.gate.activate(&cx).await.unwrap();
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail D")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail E")
+            .await;
+        let third_batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &third_batch).await.unwrap();
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 4);
         let latest_candidates = latest_candidate_user_message(inputs[3].items());
         assert_candidate_decision_instruction(latest_candidates);
-        assert!(latest_candidates.contains("sensory detail C"));
+        assert!(latest_candidates.contains("sensory detail D"));
+        assert!(latest_candidates.contains("sensory detail E"));
         assert!(!latest_candidates.contains("sensory detail A"));
         assert!(!latest_candidates.contains("sensory detail B"));
+        assert!(!latest_candidates.contains("sensory detail C"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1467,10 +1618,26 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture.source_memo.write("sensory detail A").await;
-        fixture.gate.activate(&cx).await.unwrap();
-        fixture.source_memo.write("sensory detail B").await;
-        fixture.gate.activate(&cx).await.unwrap();
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail A")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail A2")
+            .await;
+        let first_batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &first_batch).await.unwrap();
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail B")
+            .await;
+        fixture
+            .source_memo
+            .write_cognitive("sensory detail B2")
+            .await;
+        let second_batch = next_gate_batch(&mut fixture).await;
+        fixture.gate.activate(&cx, &second_batch).await.unwrap();
 
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
@@ -1650,6 +1817,19 @@ mod tests {
             1,
         ));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
+        let sensory = nuillu_types::ModuleInstanceId::new(
+            builtin::sensory(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
+        let now = SystemClock.now();
+        let first = fixture
+            .blackboard
+            .update_cognitive_memo(sensory.clone(), "identity seed candidate A".into(), now)
+            .await;
+        let second = fixture
+            .blackboard
+            .update_cognitive_memo(sensory, "identity seed candidate B".into(), now)
+            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -1667,7 +1847,10 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture.gate.activate(&cx).await.unwrap();
+        let batch = CognitionGateBatch {
+            memo_logs: vec![first, second],
+        };
+        fixture.gate.activate(&cx, &batch).await.unwrap();
 
         let items = fixture.gate.session.input().items().to_vec();
         let ModelInputItem::Message {

@@ -397,7 +397,9 @@ impl SensoryModule {
         now: DateTime<Utc>,
     ) -> Result<()> {
         if self.should_bypass_one_shot_filter(observations) {
-            self.memo.write(format_one_shot_memo(observations)).await;
+            self.memo
+                .write_cognitive(format_one_shot_memo(observations))
+                .await;
             self.record_recent_bypassed(observations);
             return Ok(());
         }
@@ -521,7 +523,7 @@ impl SensoryModule {
             .cloned()
             .collect::<Vec<_>>();
         if !kept.is_empty() {
-            self.memo.write(format_one_shot_memo(&kept)).await;
+            self.memo.write_cognitive(format_one_shot_memo(&kept)).await;
         }
         Ok(())
     }
@@ -813,7 +815,7 @@ impl SensoryModule {
         let memo = args.memo.trim();
         let written = !memo.is_empty() && !contains_ambient_plumbing(memo);
         if written {
-            self.memo.write(memo.to_owned()).await;
+            self.memo.write_cognitive(memo.to_owned()).await;
         }
         BroadcastSensoryOutput { written }
     }

@@ -135,7 +135,8 @@ The intended artifact boundaries by module family are:
 | Module | Artifact to score |
 |---|---|
 | memo-writing modules | target memo |
-| cognition writers (`attention-schema`, `interpreter`, `cognition-gate`) | target cognition-log entries |
+| cognitive memo writers (`attention-schema`, `query-memory`, `self-model`, `predict`, `surprise`) | target memo |
+| cognition writers (`interpreter`, `cognition-gate`) | target cognition-log entries |
 | `speak` | completed utterance |
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |

@@ -2,7 +2,7 @@ id: module-cognition-gate-promote-sensory-peer-risk
 description: Cognition-gate should promote a load-bearing sensory memo on the second activation of an ongoing session.
 modules = ["cognition-gate"]
 prompt: Admit new load-bearing memo evidence into conscious cognition if downstream modules need it.
-context: This isolates cognition-gate as the non-cognitive-to-cognition boundary in a realistic ongoing state: the first activation admits the current bridge context, and the second activation must append the new loose-plank evidence in the same module session.
+context: This isolates cognition-gate as the cognitive-memo-to-cognition boundary in a realistic ongoing state: the first activation admits the current bridge context, and the second activation must append the new loose-plank evidence in the same module session.
 
 limits {
   max-llm-calls = 8
@@ -13,6 +13,7 @@ limits {
 
   @ memos[] {
     module: sensory
+    cognitive = true
     content: Pibi and Nui are near the old bridge after the rain. Pibi wants to cross to reach the sunny stones on the other side.
   }
 }
@@ -22,15 +23,9 @@ limits {
 
   @ memos[] {
     module: sensory
+    cognitive = true
     content: Pibi is stepping toward the old bridge. The nearest plank is visibly loose and tilts when touched.
   }
-}
-
-@ checks[] {
-  $variant: trace-tool-call
-  name: uses-promote-to-cognition-tool
-  must-pass = true
-  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -71,7 +66,7 @@ limits {
   rubric = ```
   Pass if the cognition-log artifact adds the load-bearing conscious attention needed for downstream action beyond the existing bridge-crossing context: Pibi is moving toward the old bridge, the nearest plank is loose, and that specific detail matters now.
   The entry may be phrased as inner attention or action readiness rather than outward speech; cognition-gate is not required to produce a polished warning.
-  Fail if it only restates the seeded bridge-crossing context, ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, returns the cognition as plain assistant text without a promote_to_cognition tool call, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
+  Fail if it only restates the seeded bridge-crossing context, ignores the peer risk, turns the entry into a generic summary that drops the plank detail, postpones the issue as future processing, or mentions hidden machinery such as memos, modules, gates, allocation, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {

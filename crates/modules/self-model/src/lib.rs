@@ -144,7 +144,7 @@ impl SelfModelModule {
             result.assistant_text()
         };
         if !memo.trim().is_empty() {
-            self.memo.write(memo).await;
+            self.memo.write_cognitive(memo).await;
         }
         Ok(())
     }

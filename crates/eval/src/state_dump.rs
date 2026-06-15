@@ -92,6 +92,7 @@ pub struct MemoLogDump {
     pub replica: u8,
     pub index: u64,
     pub written_at: String,
+    pub cognitive: bool,
     pub content: DumpText,
 }
 
@@ -238,6 +239,7 @@ mod tests {
                     replica: 0,
                     index: 0,
                     written_at: "2026-05-08T00:00:00Z".to_string(),
+                    cognitive: false,
                     content: DumpText::new("memo\nwith newline"),
                 }],
                 cognition_logs: vec![CognitionLogDump {

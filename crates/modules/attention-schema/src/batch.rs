@@ -19,7 +19,7 @@ impl AttentionSchemaModule {
         self.await_first_batch().await?;
         self.collect_ready_events_into_batch()?;
         Ok(NextBatch {
-            memo_logs: self.blackboard.unread_memo_logs().await,
+            memo_logs: self.blackboard.unread_cognitive_memo_logs().await,
             cognition_log: self.cognition_log.unread_events().await,
         })
     }

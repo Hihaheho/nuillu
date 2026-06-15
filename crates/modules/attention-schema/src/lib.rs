@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_module::{
-    BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, CognitionWriter, LlmAccess,
-    LlmContextWindow, MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
+    BlackboardReader, CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
+    Memo, MemoUpdatedInbox, Module, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
     format_new_cognition_log_entries, format_source_blind_memo_log_batch,
 };
@@ -30,13 +30,13 @@ Use exactly one tool per activation:
 
 Do not use final assistant text as an output channel.
 
-The plaintext field is the exact cognition-log entry to append. Write it as subjective experience:
-use "I" as the subject whenever possible, use an experiential verb, and describe the attention as an
-active first-person experience. Preserve named attention targets and control-boundary participants;
-do not replace another entity's state with the agent's own state. Do not add extra explanation that
-would become decision noise. Do not mention mechanical internals such as modules, memos,
-allocation, tools, prompts, schemas, blackboards, logs, or implementation details in the appended
-text."#;
+The plaintext field is the exact cognitive attention-experience memo to write. Write it as
+subjective experience: use "I" as the subject whenever possible, use an experiential verb, and
+describe the attention as an active first-person experience. Preserve named attention targets and
+control-boundary participants; do not replace another entity's state with the agent's own state. Do
+not add extra explanation that would become decision noise. Do not mention mechanical internals such
+as modules, memos, allocation, tools, prompts, schemas, blackboards, logs, or implementation details
+in the written text."#;
 
 const COMPACTED_ATTENTION_SCHEMA_SESSION_PREFIX: &str =
     "Compacted attention-schema session history:";
@@ -44,7 +44,7 @@ const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo-log facts, attention-state interpretations,
-prior appended first-person attention experiences, rejected candidates, and cognition-log context
+prior written first-person attention experiences, rejected candidates, and cognition-log context
 needed for future attention updates."#;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
@@ -120,7 +120,7 @@ pub struct AttentionSchemaModule {
     cognition_updates: CognitionLogUpdatedInbox,
     blackboard: BlackboardReader,
     cognition_log: CognitionLogReader,
-    cognition: CognitionWriter,
+    memo: Memo,
     llm: LlmAccess,
     session: Session,
     model_prompt: std::sync::OnceLock<String>,
@@ -133,7 +133,7 @@ impl AttentionSchemaModule {
         cognition_updates: CognitionLogUpdatedInbox,
         blackboard: BlackboardReader,
         cognition_log: CognitionLogReader,
-        cognition: CognitionWriter,
+        memo: Memo,
         llm: LlmAccess,
         session: Session,
     ) -> Self {
@@ -142,7 +142,7 @@ impl AttentionSchemaModule {
             cognition_updates,
             blackboard,
             cognition_log,
-            cognition,
+            memo,
             llm,
             session,
             model_prompt: std::sync::OnceLock::new(),
@@ -253,7 +253,7 @@ impl AttentionSchemaModule {
         if plaintext.is_empty() {
             return Ok(AppendAttentionExperienceOutput { appended: false });
         }
-        self.cognition.append(plaintext.to_owned()).await;
+        self.memo.write_cognitive(plaintext.to_owned()).await;
         Ok(AppendAttentionExperienceOutput { appended: true })
     }
 
@@ -450,7 +450,7 @@ mod tests {
                     caps.cognition_log_updated_inbox(),
                     caps.blackboard_reader(),
                     caps.cognition_log_reader(),
-                    caps.cognition_writer(),
+                    caps.memo(),
                     caps.llm_access(),
                     caps.session("main")
                         .with_auto_compaction(session_auto_compaction())
@@ -481,7 +481,7 @@ mod tests {
         let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
 
         let first_record = blackboard
-            .update_memo(
+            .update_cognitive_memo(
                 sensory.clone(),
                 "first fresh note about Koro".to_owned(),
                 now,
@@ -502,7 +502,7 @@ mod tests {
             .unwrap();
 
         let second_record = blackboard
-            .update_memo(
+            .update_cognitive_memo(
                 sensory.clone(),
                 "second fresh note about the doorway".to_owned(),
                 now,

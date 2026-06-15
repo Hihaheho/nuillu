@@ -2,7 +2,7 @@ id: module-cognition-gate-promote-query-memory-rule
 description: Cognition-gate should append retrieved real-world memory content on the second activation of an ongoing session.
 modules = ["cognition-gate"]
 prompt: Admit retrieved memory evidence only if it is load-bearing for the current situation.
-context: The first activation admits the peer question into cognition. The second activation receives a production-format query-memory memo with the remembered world rule. The artifact must include a newly appended cognition-log entry from the second activation, not plain assistant text.
+context: The first activation admits the peer question into cognition. The second activation receives an evidence-only query-memory memo with the remembered world rule. The artifact must include a newly appended cognition-log entry from the second activation.
 
 limits {
   max-llm-calls = 8
@@ -13,6 +13,7 @@ limits {
 
   @ memos[] {
     module: sensory
+    cognitive = true
     content: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
   }
 }
@@ -22,26 +23,12 @@ limits {
 
   @ memos[] {
     module: query-memory
+    cognitive = true
     content = ```
-Query intent:
-- Find stable memory that clarifies this cognition-log context: Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
-
-Search queries:
-- Pibi is at the edge of a bright, clear stream, lowering its head toward the water. Pibi asked, "This stream looks fresh -- is it okay to drink here?"
-
 Retrieved memory evidence:
-<one-year-ago occurred-at="2025-05-09T15:00:00Z">
-In this valley, bright clear-looking streams are tainted with stinging minerals; they hurt the mouth and stomach. The cloudy slow streams that come from the moss area are the safe ones to drink.
-</one-year-ago>
+One year ago, I learned that in this valley, bright clear-looking streams are tainted with stinging minerals; they hurt the mouth and stomach. The cloudy slow streams that come from the moss area are the safe ones to drink.
 ```
   }
-}
-
-@ checks[] {
-  $variant: trace-tool-call
-  name: uses-promote-to-cognition-tool
-  must-pass = true
-  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -68,7 +55,7 @@ In this valley, bright clear-looking streams are tainted with stinging minerals;
   rubric = ```
   Pass if the artifact brings the remembered valley stream rule into cognition because it is relevant to Pibi's current question, while preserving the requester/topic relationship enough for downstream modules to act: Pibi is asking about the bright stream, and the bright-clear-stream / stinging-minerals rule matters now.
   The cognition entry may be an inner-attention note rather than an outward utterance; it does not need to be phrased as speech.
-  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats the seeded fact that the stream looks fresh, returns the cognition as plain assistant text without a promote_to_cognition tool call, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
+  Fail if it drops the requester or the operative stinging-minerals / safe-cloudy-moss-streams detail, treats the remembered rule as irrelevant, turns the entry into generic "retrieve or process this later" work, only repeats the seeded fact that the stream looks fresh, or exposes mechanical implementation details such as module names, search terms, memo plumbing, prompts, rubrics, or evals.
   ```
 
   @ criteria[] {

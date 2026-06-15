@@ -380,7 +380,7 @@ impl QueryMemoryModule {
                 })
                 .collect(),
         };
-        self.memo.write(payload, content).await;
+        self.memo.write_cognitive(payload, content).await;
         let use_targets = usage_targets(&hits, &linked_hits);
         self.memory.record_uses(&use_targets).await;
         let mut seen_used = HashSet::new();
@@ -973,8 +973,8 @@ fn format_memory_with_affect(
 }
 
 fn render_memo(
-    requests: &[String],
-    searches: &[QueryMemoryMemoSearch],
+    _requests: &[String],
+    _searches: &[QueryMemoryMemoSearch],
     hits: &[QueryMemoryHit],
     linked_hits: &[QueryMemoryLinkedHit],
 ) -> String {
@@ -990,14 +990,6 @@ fn render_memo(
     }
     if !linked.is_empty() {
         sections.push(format!("Linked memory evidence:\n{linked}"));
-    }
-    let request_lines = bullet_lines(requests.iter().map(String::as_str));
-    if !request_lines.is_empty() {
-        sections.push(format!("Query intent:\n{request_lines}"));
-    }
-    let search_lines = bullet_lines(searches.iter().map(|search| search.query.as_str()));
-    if !search_lines.is_empty() {
-        sections.push(format!("Search queries:\n{search_lines}"));
     }
     sections.join("\n\n")
 }
@@ -1018,15 +1010,6 @@ fn render_linked_hit(linked: LinkedMemoryRecord, now: DateTime<Utc>) -> QueryMem
         emotion: record.emotion,
         link: linked.link,
     }
-}
-
-fn bullet_lines<'a>(items: impl Iterator<Item = &'a str>) -> String {
-    items
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| format!("- {item}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn format_memory_questions(questions: &[String]) -> String {
@@ -1092,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_puts_evidence_before_query_bookkeeping() {
+    fn broadcast_plaintext_contains_only_retrieved_evidence() {
         let memo = render_memo(
             &["Find the useful rule.".to_owned()],
             &[QueryMemoryMemoSearch {
@@ -1118,7 +1101,7 @@ mod tests {
         );
 
         assert!(memo.starts_with("Retrieved memory evidence:\nA concrete remembered rule."));
-        assert!(memo.contains("\n\nQuery intent:\n- Find the useful rule."));
-        assert!(memo.contains("\n\nSearch queries:\n- useful rule"));
+        assert!(!memo.contains("Query intent:"));
+        assert!(!memo.contains("Search queries:"));
     }
 }

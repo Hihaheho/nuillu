@@ -47,6 +47,18 @@ impl BlackboardReader {
     }
 
     pub async fn unread_memo_logs(&self) -> Vec<MemoLogRecord> {
+        self.unread_memo_logs_matching(|_| true).await
+    }
+
+    pub async fn unread_cognitive_memo_logs(&self) -> Vec<MemoLogRecord> {
+        self.unread_memo_logs_matching(|record| record.cognitive)
+            .await
+    }
+
+    async fn unread_memo_logs_matching(
+        &self,
+        include: impl Fn(&MemoLogRecord) -> bool,
+    ) -> Vec<MemoLogRecord> {
         let last_seen = self
             .last_seen_memo_indices
             .lock()
@@ -68,7 +80,7 @@ impl BlackboardReader {
                     .or_insert(record.index);
             }
         }
-        records
+        records.into_iter().filter(include).collect()
     }
 }
 
@@ -306,6 +318,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "second")]
         );
+    }
+
+    #[tokio::test]
+    async fn unread_cognitive_memo_logs_filters_and_advances_reader_cursor() {
+        let blackboard = Blackboard::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let reader = BlackboardReader::new(blackboard.clone());
+
+        blackboard
+            .update_memo(
+                owner.clone(),
+                "non-cognitive".into(),
+                Utc.timestamp_opt(0, 0).unwrap(),
+            )
+            .await;
+        blackboard
+            .update_cognitive_memo(
+                owner.clone(),
+                "cognitive".into(),
+                Utc.timestamp_opt(1, 0).unwrap(),
+            )
+            .await;
+
+        let cognitive = reader.unread_cognitive_memo_logs().await;
+        assert_eq!(
+            cognitive
+                .iter()
+                .map(|record| (record.index, record.content.as_str(), record.cognitive))
+                .collect::<Vec<_>>(),
+            vec![(1, "cognitive", true)]
+        );
+        assert!(reader.unread_memo_logs().await.is_empty());
     }
 
     #[tokio::test]

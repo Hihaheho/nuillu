@@ -1372,6 +1372,7 @@ mod tests {
             index: 0,
             written_at: now,
             content: "fresh sensory memo".into(),
+            cognitive: false,
         }];
         let cognition = [CognitionLogEntryRecord {
             index: 0,

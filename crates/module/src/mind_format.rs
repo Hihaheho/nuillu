@@ -746,12 +746,14 @@ mod tests {
                 index: 0,
                 written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 0).unwrap(),
                 content: "newer memory note".into(),
+                cognitive: false,
             },
             MemoLogRecord {
                 owner: sensory,
                 index: 0,
                 written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 19, 0).unwrap(),
                 content: "older sensory note".into(),
+                cognitive: false,
             },
         ];
 
@@ -787,6 +789,7 @@ mod tests {
                 index,
                 written_at: base + chrono::Duration::minutes(index as i64),
                 content: format!("memo {index} {}", "x".repeat(20)),
+                cognitive: false,
             })
             .collect::<Vec<_>>();
 
@@ -809,6 +812,7 @@ mod tests {
                 index,
                 written_at: base + chrono::Duration::minutes(index as i64),
                 content: format!("memo {index} {}", "x".repeat(20)),
+                cognitive: false,
             })
             .collect::<Vec<_>>();
 
@@ -930,6 +934,7 @@ mod tests {
             index: 0,
             written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 50).unwrap(),
             content: "Koro is guarding the food bowl.".into(),
+            cognitive: false,
         };
 
         let formatted = format_source_blind_memo_log_batch(

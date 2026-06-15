@@ -74,6 +74,7 @@ mod tests {
                 replica: 0,
                 index: 0,
                 written_at: now,
+                cognitive: false,
                 content: "sensory memo".to_string(),
             },
             MemoView {
@@ -82,6 +83,7 @@ mod tests {
                 replica: 0,
                 index: 1,
                 written_at: now,
+                cognitive: false,
                 content: "memory memo".to_string(),
             },
         ];

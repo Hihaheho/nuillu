@@ -183,6 +183,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                 replica: record.owner.replica.get(),
                 index: record.index,
                 written_at: record.written_at,
+                cognitive: record.cognitive,
                 content: record.content,
             })
             .collect(),

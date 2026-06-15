@@ -115,6 +115,7 @@ mod tests {
                 index: 0,
                 written_at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 0).unwrap(),
                 content: "A memo fact.".into(),
+                cognitive: false,
             }],
             now(),
             LlmContextWindow::new(8, 420, 3_000),

@@ -82,6 +82,8 @@ replica = `integer`
 replica.$optional = true
 seconds-ago = `integer`
 seconds-ago.$optional = true
+cognitive = `boolean`
+cognitive.$optional = true
 content {
   $variant: text
   min-length = 1

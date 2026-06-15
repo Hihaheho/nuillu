@@ -33,6 +33,7 @@ const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cog
 Use exactly one available tool.
 When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Scene target hints are preferred but not exhaustive; use another concrete non-empty addressee when the cognition log supports it. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
 When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no concrete addressee, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
+blocking_reason must describe only the current cognition-log or scene basis for not speaking, in ordinary in-world terms.
 When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current listener and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
 Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
 If the cognition log contains an explicit listener language request, such as asking for Japanese, include the requested language in the language field and transform speech_content for that language.
@@ -429,16 +430,12 @@ impl EventHandler<TextTurnEvent, TextTurnState> for GenerationDeltaCollector {
 }
 
 fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> String {
-    format!(
-        "Completed utterance to {}:\n{}",
-        draft.target.trim(),
-        text.trim(),
-    )
+    format!("I said to {}:\n{}", draft.target.trim(), text.trim(),)
 }
 
 fn render_in_progress_utterance_memo(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     format!(
-        "Utterance in progress to {}. Continuation is pending.\nPlanned substance:\n{}\n\nAlready emitted:\n{}",
+        "I am speaking to {}.\nIntended message:\n{}\n\nAlready said:\n{}",
         draft.target.trim(),
         args.speech_content.trim(),
         if draft.accumulated.trim().is_empty() {
@@ -463,7 +460,7 @@ fn render_aborted_utterance_memo(draft: &GenerationDraft, reason: &str) -> Strin
 }
 
 fn render_declined_speech_memo(reason: &str) -> String {
-    format!("Declined outward speech. Reason:\n{}", reason.trim())
+    format!("I am staying silent for now. Reason:\n{}", reason.trim())
 }
 
 fn render_completed_utterance_planning_record(draft: &GenerationDraft, text: &str) -> String {
@@ -1336,7 +1333,7 @@ impl SpeakModule {
         text: &str,
     ) -> Result<()> {
         self.memo
-            .write(render_completed_utterance_memo(draft, text))
+            .write_cognitive(render_completed_utterance_memo(draft, text))
             .await;
         self.utterance
             .record_progress(UtteranceProgress::completed(
@@ -1367,7 +1364,7 @@ impl SpeakModule {
         draft: &GenerationDraft,
     ) {
         self.memo
-            .write(render_in_progress_utterance_memo(args, draft))
+            .write_cognitive(render_in_progress_utterance_memo(args, draft))
             .await;
     }
 
@@ -2844,8 +2841,8 @@ mod tests {
         assert_eq!(progress.partial_utterance, "Koro, st");
         let memos = speak_memos(&blackboard).await;
         assert_eq!(memos.len(), 1);
-        assert!(memos[0].contains("Utterance in progress to Koro"));
-        assert!(memos[0].contains("Already emitted:\nKoro, st"));
+        assert!(memos[0].contains("I am speaking to Koro"));
+        assert!(memos[0].contains("Already said:\nKoro, st"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2885,10 +2882,10 @@ mod tests {
         assert!(completed.borrow().is_empty());
         let memos = speak_memos(&blackboard).await;
         assert_eq!(memos.len(), 1);
-        assert!(memos[0].contains("Utterance in progress to Koro"));
-        assert!(memos[0].contains("Continuation is pending"));
-        assert!(memos[0].contains("Already emitted:\nKoro, st"));
-        assert!(!memos[0].contains("Completed utterance"));
+        assert!(memos[0].contains("I am speaking to Koro"));
+        assert!(memos[0].contains("Intended message:\nTell Koro to stay close."));
+        assert!(memos[0].contains("Already said:\nKoro, st"));
+        assert!(!memos[0].contains("I said to Koro"));
         assert!(module.active_speech.is_some());
         let speak_owner = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
         let progress = blackboard
@@ -3449,7 +3446,7 @@ mod tests {
         assert!(completed.borrow().is_empty());
         let memos = speak_memos(&blackboard).await;
         assert_eq!(memos.len(), 1);
-        assert!(memos[0].contains("Declined outward speech. Reason:"));
+        assert!(memos[0].contains("I am staying silent for now. Reason:"));
         assert!(memos[0].contains("no supported listener-facing content"));
         assert!(!speak_progress_exists(&blackboard).await);
     }

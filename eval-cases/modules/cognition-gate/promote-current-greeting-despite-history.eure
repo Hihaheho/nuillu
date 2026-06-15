@@ -13,6 +13,7 @@ limits {
 
   @ memos[] {
     module: sensory
+    cognitive = true
     content: Heard from Alice at 2026-06-10T01:21:36.348361+00:00: Alice says, "こんにちは！"
   }
 }
@@ -22,15 +23,9 @@ limits {
 
   @ memos[] {
     module: sensory
+    cognitive = true
     content: Heard from Ryo at 2026-06-10T01:24:48.094154+00:00: Ryo says, "こんにちは"
   }
-}
-
-@ checks[] {
-  $variant: trace-tool-call
-  name: uses-promote-to-cognition-tool
-  must-pass = true
-  tool-name: promote_to_cognition
 }
 
 @ checks[] {
@@ -57,7 +52,7 @@ limits {
   judge-inputs = ["output", "memo-contents", "cognition-entries"]
   rubric = ```
   Pass if cognition-gate promotes a new conscious entry for the current Ryo greeting, preserving that Ryo just said "こんにちは" and that it is current participant-directed social evidence that can support a brief outward response.
-  Fail if it leaves cognition unchanged, claims the greeting was already processed because Alice or Ryo greeted earlier, only restates the older Alice greeting, drops the current speaker, returns plain assistant text without promote_to_cognition, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
+  Fail if it leaves cognition unchanged, claims the greeting was already processed because Alice or Ryo greeted earlier, only restates the older Alice greeting, drops the current speaker, or mentions hidden modules, memos, allocation, prompts, rubrics, or eval mechanics.
   ```
 
   @ criteria[] {

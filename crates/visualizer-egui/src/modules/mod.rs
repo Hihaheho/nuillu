@@ -4478,6 +4478,7 @@ mod tests {
             written_at: chrono::DateTime::parse_from_rfc3339("2026-05-13T00:00:00Z")
                 .expect("valid timestamp")
                 .with_timezone(&chrono::Utc),
+            cognitive: false,
             content: content.to_string(),
         }
     }

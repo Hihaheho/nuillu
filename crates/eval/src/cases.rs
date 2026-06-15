@@ -696,6 +696,8 @@ pub struct MemoSeed {
     pub module: String,
     #[eure(default = "default_memo_replica")]
     pub replica: u8,
+    #[eure(default)]
+    pub cognitive: bool,
     pub content: Text,
     #[eure(default = "default_seed_seconds_ago")]
     pub seconds_ago: i64,

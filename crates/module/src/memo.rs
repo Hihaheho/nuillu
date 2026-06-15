@@ -57,7 +57,13 @@ impl Memo {
     /// Append a new plaintext owner memo item. Allocates the queue on first
     /// call.
     pub async fn write(&self, memo: impl Into<String>) -> MemoLogRecord {
-        self.core.write_plain(memo.into()).await
+        self.core.write_plain(memo.into(), false).await
+    }
+
+    /// Append a plaintext owner memo item that is eligible for cognition-gate
+    /// promotion.
+    pub async fn write_cognitive(&self, memo: impl Into<String>) -> MemoLogRecord {
+        self.core.write_plain(memo.into(), true).await
     }
 }
 
@@ -78,7 +84,13 @@ impl<T: 'static> TypedMemo<T> {
 
     /// Append a new typed owner memo item plus its plaintext representation.
     pub async fn write(&self, payload: T, memo: impl Into<String>) -> MemoLogRecord {
-        self.core.write_typed(payload, memo.into()).await
+        self.core.write_typed(payload, memo.into(), false).await
+    }
+
+    /// Append a typed owner memo item whose plaintext representation is
+    /// eligible for cognition-gate promotion.
+    pub async fn write_cognitive(&self, payload: T, memo: impl Into<String>) -> MemoLogRecord {
+        self.core.write_typed(payload, memo.into(), true).await
     }
 
     /// Return retained typed memo entries for this owner.
@@ -106,23 +118,48 @@ impl MemoCore {
         }
     }
 
-    async fn write_plain(&self, memo: String) -> MemoLogRecord {
+    async fn write_plain(&self, memo: String, cognitive: bool) -> MemoLogRecord {
         let char_count = memo.chars().count();
-        let result = self
-            .blackboard
-            .update_memo_with_evictions(self.owner.clone(), memo, self.clock.now())
-            .await;
+        let result = if cognitive {
+            self.blackboard
+                .update_cognitive_memo_with_evictions(self.owner.clone(), memo, self.clock.now())
+                .await
+        } else {
+            self.blackboard
+                .update_memo_with_evictions(self.owner.clone(), memo, self.clock.now())
+                .await
+        };
         self.publish_update(result.record.index, char_count).await;
         self.publish_evictions(result.evicted).await;
         result.record
     }
 
-    async fn write_typed<T: 'static>(&self, payload: T, memo: String) -> MemoLogRecord {
+    async fn write_typed<T: 'static>(
+        &self,
+        payload: T,
+        memo: String,
+        cognitive: bool,
+    ) -> MemoLogRecord {
         let char_count = memo.chars().count();
-        let result = self
-            .blackboard
-            .update_typed_memo_with_evictions(self.owner.clone(), memo, payload, self.clock.now())
-            .await;
+        let result = if cognitive {
+            self.blackboard
+                .update_typed_cognitive_memo_with_evictions(
+                    self.owner.clone(),
+                    memo,
+                    payload,
+                    self.clock.now(),
+                )
+                .await
+        } else {
+            self.blackboard
+                .update_typed_memo_with_evictions(
+                    self.owner.clone(),
+                    memo,
+                    payload,
+                    self.clock.now(),
+                )
+                .await
+        };
         self.publish_update(result.record.index, char_count).await;
         self.publish_evictions(result.evicted).await;
         result.record

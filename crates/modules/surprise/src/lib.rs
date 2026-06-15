@@ -214,6 +214,7 @@ impl SurpriseModule {
         };
         let usage = round.usage;
         let mut memo: Option<String> = None;
+        let mut memo_cognitive = false;
         let mut results: Vec<ToolResult> = Vec::new();
         nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         // The LLM may return multiple tool calls; adopt the first valid decision only.
@@ -224,6 +225,7 @@ impl SurpriseModule {
                     if first_decision {
                         if let Some(args) = normalize_preserve_args(call.input.clone()) {
                             memo = Some(render_surprise_memo(&args));
+                            memo_cognitive = true;
                         }
                     }
                     let output = if first_decision {
@@ -258,7 +260,11 @@ impl SurpriseModule {
         let Some(memo) = memo else {
             anyhow::bail!("surprise finished without a valid tool decision");
         };
-        self.memo.write(memo).await;
+        if memo_cognitive {
+            self.memo.write_cognitive(memo).await;
+        } else {
+            self.memo.write(memo).await;
+        }
         Ok(())
     }
 

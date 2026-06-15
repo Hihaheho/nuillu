@@ -114,7 +114,7 @@ fn register_server_module(
                 caps.cognition_log_updated_inbox(),
                 caps.blackboard_reader(),
                 caps.cognition_log_reader(),
-                caps.cognition_writer(),
+                caps.memo(),
                 caps.llm_access(),
                 caps.session("main")
                     .with_auto_compaction(nuillu_attention_schema::session_auto_compaction())

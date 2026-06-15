@@ -1623,6 +1623,7 @@ mod tests {
             replica: 0,
             index: 0,
             written_at: chrono::Utc::now(),
+            cognitive: false,
             content: "memory memo".to_string(),
         }];
 
