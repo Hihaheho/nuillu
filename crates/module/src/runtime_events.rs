@@ -13,6 +13,11 @@ use crate::r#trait::ModuleBatch;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    LlmSemaphoreWaitStarted {
+        sequence: u64,
+        owner: ModuleInstanceId,
+        tier: ModelTier,
+    },
     LlmAccessed {
         sequence: u64,
         call: u64,
@@ -143,6 +148,14 @@ impl RuntimeEventEmitter {
             tier,
         });
         call
+    }
+
+    pub(crate) fn llm_semaphore_wait_started(&self, owner: ModuleInstanceId, tier: ModelTier) {
+        self.emit(|sequence| RuntimeEvent::LlmSemaphoreWaitStarted {
+            sequence,
+            owner,
+            tier,
+        });
     }
 
     pub(crate) fn llm_completed(&self, owner: ModuleInstanceId, tier: ModelTier, call: u64) {

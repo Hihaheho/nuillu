@@ -8,7 +8,7 @@ use lutum::Lutum;
 use nuillu_blackboard::Blackboard;
 use nuillu_types::{ModelTier, ModuleActivationId, ModuleInstanceId};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::Id as TaskId;
 
 use crate::LutumTiers;
@@ -187,6 +187,13 @@ impl LlmConcurrencyLimiter {
     }
 
     pub async fn acquire(&self) -> Option<LlmConcurrencyPermit> {
+        self.acquire_with_wait_observer(|| {}).await
+    }
+
+    async fn acquire_with_wait_observer(
+        &self,
+        on_wait: impl FnOnce(),
+    ) -> Option<LlmConcurrencyPermit> {
         let semaphore = self.semaphore.as_ref()?;
         let task_key =
             tokio::task::try_id().map(|task_id| (task_id, Arc::as_ptr(semaphore) as usize));
@@ -200,11 +207,20 @@ impl LlmConcurrencyLimiter {
             }
         }
 
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("LLM concurrency semaphore is never closed");
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                on_wait();
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("LLM concurrency semaphore is never closed")
+            }
+            Err(TryAcquireError::Closed) => {
+                panic!("LLM concurrency semaphore is never closed");
+            }
+        };
         let Some(key) = task_key else {
             return Some(LlmConcurrencyPermit::unscoped(permit));
         };
@@ -340,7 +356,14 @@ impl LlmAccess {
             .read(|bb| bb.allocation().tier_for(&self.owner.module))
             .await;
         let handle = self.tiers.pick_handle(tier);
-        let permit = handle.concurrency.acquire().await;
+        let events = self.events.clone();
+        let owner = self.owner.clone();
+        let permit = handle
+            .concurrency
+            .acquire_with_wait_observer(|| {
+                events.llm_semaphore_wait_started(owner, tier);
+            })
+            .await;
         let call = self.events.llm_accessed(self.owner.clone(), tier);
         let lutum = if let Some((activation_id, activation_attempt, batch)) =
             current_activation_llm_request_metadata()
@@ -387,7 +410,15 @@ impl FixedTierLlmAccess {
 
     pub async fn lutum(&self) -> LlmLease {
         let handle = self.tiers.pick_handle(self.tier);
-        let permit = handle.concurrency.acquire().await;
+        let events = self.events.clone();
+        let owner = self.owner.clone();
+        let tier = self.tier;
+        let permit = handle
+            .concurrency
+            .acquire_with_wait_observer(|| {
+                events.llm_semaphore_wait_started(owner, tier);
+            })
+            .await;
         let call = self.events.llm_accessed(self.owner.clone(), self.tier);
         let lutum = if let Some((activation_id, activation_attempt, batch)) =
             current_activation_llm_request_metadata()
@@ -430,6 +461,7 @@ fn truncated_batch_debug(debug: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -444,6 +476,7 @@ mod tests {
 
     use crate::ports::PortError;
     use crate::runtime_events::{RuntimeEvent, RuntimeEventEmitter, RuntimeEventSink};
+    use crate::{LlmTierHandle, LutumTiers};
 
     use super::{
         FixedTierLlmAccess, LlmAccess, LlmBatchDebug, LlmConcurrencyLimiter, LlmRequestMetadata,
@@ -523,6 +556,103 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lutum_emits_semaphore_wait_event_only_when_acquisition_blocks() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let blackboard = Blackboard::default();
+                let owner = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+                let adapter = Arc::new(MockLlmAdapter::new());
+                let budget = SharedPoolBudgetManager::new(SharedPoolBudgetOptions::default());
+                let lutum = Lutum::new(adapter, budget);
+                let limiter = LlmConcurrencyLimiter::new(NonZeroUsize::new(1));
+                let handle = LlmTierHandle::new(lutum, limiter, "test", false);
+                let tiers = LutumTiers {
+                    cheap: handle.clone(),
+                    default: handle.clone(),
+                    premium: handle,
+                };
+                let sink = Rc::new(RecordingSink::default());
+                let events = RuntimeEventEmitter::new(sink.clone());
+                let access = LlmAccess::new(owner.clone(), tiers, blackboard, events);
+
+                let first = access.lutum().await;
+                assert_eq!(
+                    sink.events.lock().expect("event lock poisoned").as_slice(),
+                    &[RuntimeEvent::LlmAccessed {
+                        sequence: 0,
+                        call: 0,
+                        owner: owner.clone(),
+                        tier: ModelTier::Default,
+                    }]
+                );
+
+                let second = tokio::task::spawn_local({
+                    let access = access.clone();
+                    async move { access.lutum().await }
+                });
+                tokio::task::yield_now().await;
+
+                assert_eq!(
+                    sink.events.lock().expect("event lock poisoned").as_slice(),
+                    &[
+                        RuntimeEvent::LlmAccessed {
+                            sequence: 0,
+                            call: 0,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                        RuntimeEvent::LlmSemaphoreWaitStarted {
+                            sequence: 1,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                    ]
+                );
+
+                drop(first);
+                let second = second.await.expect("second local task should complete");
+                drop(second);
+
+                assert_eq!(
+                    sink.events.lock().expect("event lock poisoned").as_slice(),
+                    &[
+                        RuntimeEvent::LlmAccessed {
+                            sequence: 0,
+                            call: 0,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                        RuntimeEvent::LlmSemaphoreWaitStarted {
+                            sequence: 1,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                        RuntimeEvent::LlmCompleted {
+                            sequence: 2,
+                            call: 0,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                        RuntimeEvent::LlmAccessed {
+                            sequence: 3,
+                            call: 1,
+                            owner: owner.clone(),
+                            tier: ModelTier::Default,
+                        },
+                        RuntimeEvent::LlmCompleted {
+                            sequence: 4,
+                            call: 1,
+                            owner,
+                            tier: ModelTier::Default,
+                        },
+                    ]
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

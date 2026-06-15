@@ -63,6 +63,9 @@ pub(crate) fn runtime_event_log_path(state_dir: &Path, session_id: &str) -> Path
 
 pub(crate) fn runtime_event_message(tab_id: &str, event: &RuntimeEvent) -> String {
     match event {
+        RuntimeEvent::LlmSemaphoreWaitStarted { owner, tier, .. } => format!(
+            "nuillu-server llm-semaphore-wait-started tab={tab_id} owner={owner} tier={tier:?}"
+        ),
         RuntimeEvent::LlmAccessed {
             call, owner, tier, ..
         } => format!(

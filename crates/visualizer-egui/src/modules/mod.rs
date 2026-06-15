@@ -180,6 +180,7 @@ struct ActivationBatchDisplay {
 pub enum ModuleSessionStatus {
     #[default]
     Idle,
+    SemaphoreWait,
     Running,
     Retrying,
     Completed,
@@ -195,6 +196,7 @@ pub struct ModuleOverviewRow {
     pub forced_disabled: bool,
     pub runtime_status: String,
     pub llm_status: String,
+    pub llm_waiting: bool,
     pub llm_streaming: bool,
     pub activation_ratio: Option<f64>,
     pub active_replicas: Option<u8>,
@@ -261,6 +263,11 @@ pub fn apply_runtime_event(state: &mut ModulesState, event: &RuntimeEvent) {
 
 pub fn apply_runtime_event_at(state: &mut ModulesState, event: &RuntimeEvent, now_secs: f64) {
     match event {
+        RuntimeEvent::LlmSemaphoreWaitStarted { owner, tier, .. } => {
+            let module = module_mut_for_owner(state, owner);
+            module.status = ModuleSessionStatus::SemaphoreWait;
+            module.last_tier = Some(format!("{tier:?}"));
+        }
         RuntimeEvent::LlmAccessed { owner, tier, .. } => {
             let module = module_mut_for_owner(state, owner);
             module.status = ModuleSessionStatus::Running;
@@ -660,6 +667,7 @@ pub fn overview_rows(
             row.runtime_status = runtime_status.clone();
         }
         row.llm_status = status_label(module.status).to_string();
+        row.llm_waiting = module.status == ModuleSessionStatus::SemaphoreWait;
         row.llm_streaming = module_llm_in_flight(module);
         if row.tier.is_none() {
             row.tier = module.last_tier.clone();
@@ -2109,19 +2117,45 @@ fn overview_bpm_wait_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
 }
 
 fn overview_llm_status_cell(ui: &mut egui::Ui, row: &ModuleOverviewRow) {
+    let response = if row.llm_waiting {
+        egui::Frame::new()
+            .fill(llm_wait_fill(ui))
+            .inner_margin(egui::Margin::same(0))
+            .show(ui, |ui| overview_llm_status_label(ui, row))
+            .inner
+    } else {
+        overview_llm_status_label(ui, row)
+    };
+    if row.llm_streaming {
+        response.on_hover_text("LLM request in flight");
+    } else if row.llm_waiting {
+        response.on_hover_text("Waiting for LLM concurrency semaphore");
+    }
+}
+
+fn overview_llm_status_label(ui: &mut egui::Ui, row: &ModuleOverviewRow) -> egui::Response {
     let text = if row.llm_streaming {
         egui::RichText::new(&row.llm_status).strong()
     } else {
         egui::RichText::new(&row.llm_status)
     };
-    let response = ui.add_sized(
+    ui.add_sized(
         [LLM_COLUMN_WIDTH, OVERVIEW_ROW_HEIGHT],
         egui::Label::new(text)
             .truncate()
             .show_tooltip_when_elided(true),
-    );
-    if row.llm_streaming {
-        response.on_hover_text("LLM request in flight");
+    )
+}
+
+fn llm_wait_fill(ui: &egui::Ui) -> egui::Color32 {
+    llm_wait_fill_color(ui.visuals().dark_mode)
+}
+
+fn llm_wait_fill_color(dark_mode: bool) -> egui::Color32 {
+    if dark_mode {
+        egui::Color32::from_rgb(92, 74, 24)
+    } else {
+        egui::Color32::from_rgb(255, 238, 153)
     }
 }
 
@@ -2213,6 +2247,7 @@ fn upsert_overview_row<'a>(
             forced_disabled: false,
             runtime_status: "not reported".to_string(),
             llm_status: status_label(ModuleSessionStatus::Idle).to_string(),
+            llm_waiting: false,
             llm_streaming: false,
             activation_ratio: None,
             active_replicas: None,
@@ -3083,6 +3118,7 @@ fn module_title(ctx: &egui::Context, module: &ModuleState) -> String {
 fn status_label(status: ModuleSessionStatus) -> &'static str {
     match status {
         ModuleSessionStatus::Idle => "idle",
+        ModuleSessionStatus::SemaphoreWait => "semaphore wait",
         ModuleSessionStatus::Running => "running",
         ModuleSessionStatus::Retrying => "retrying",
         ModuleSessionStatus::Completed => "done",
@@ -3128,6 +3164,7 @@ mod tests {
             forced_disabled: false,
             runtime_status: "Activating".to_string(),
             llm_status: "idle".to_string(),
+            llm_waiting: false,
             llm_streaming: false,
             activation_ratio,
             active_replicas: active.then_some(1),
@@ -3187,6 +3224,60 @@ mod tests {
             overview_row_fill_kind(&row, 1),
             Some(OverviewRowFill::Failed)
         );
+    }
+
+    #[test]
+    fn semaphore_wait_uses_llm_cell_highlight_without_row_fill() {
+        let mut row = overview_row_for_highlight(true, Some(0.75));
+        row.llm_waiting = true;
+        row.llm_status = "semaphore wait".to_string();
+
+        assert_eq!(overview_row_fill_kind(&row, 0), None);
+        assert_eq!(
+            llm_wait_fill_color(false),
+            egui::Color32::from_rgb(255, 238, 153)
+        );
+        assert_eq!(
+            llm_wait_fill_color(true),
+            egui::Color32::from_rgb(92, 74, 24)
+        );
+    }
+
+    #[test]
+    fn runtime_event_marks_llm_semaphore_wait_until_accessed() {
+        let mut state = ModulesState::default();
+        let owner = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::LlmSemaphoreWaitStarted {
+                sequence: 0,
+                owner: owner.clone(),
+                tier: nuillu_types::ModelTier::Default,
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].llm_status, "semaphore wait");
+        assert!(rows[0].llm_waiting);
+        assert!(!rows[0].llm_streaming);
+
+        apply_runtime_event(
+            &mut state,
+            &RuntimeEvent::LlmAccessed {
+                sequence: 1,
+                owner,
+                call: 0,
+                tier: nuillu_types::ModelTier::Default,
+            },
+        );
+
+        let rows = overview_rows(&state, &BlackboardSnapshot::default(), TEST_NOW_SECS);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].llm_status, "running");
+        assert!(!rows[0].llm_waiting);
+        assert!(rows[0].llm_streaming);
     }
 
     #[test]
@@ -5377,6 +5468,7 @@ mod tests {
                 forced_disabled: false,
                 runtime_status: "Activating".to_string(),
                 llm_status: "running".to_string(),
+                llm_waiting: false,
                 llm_streaming: true,
                 activation_ratio: Some(0.75),
                 active_replicas: Some(1),
@@ -5410,6 +5502,7 @@ mod tests {
             forced_disabled: false,
             runtime_status: "Activating".to_string(),
             llm_status: "running".to_string(),
+            llm_waiting: false,
             llm_streaming: false,
             activation_ratio: Some(1.0),
             active_replicas: Some(2),

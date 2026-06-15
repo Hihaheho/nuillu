@@ -6285,6 +6285,13 @@ fn idle_timeout_message(
         .iter()
         .rev()
         .find_map(|event| match event {
+            RuntimeEvent::LlmSemaphoreWaitStarted {
+                sequence,
+                owner,
+                tier,
+            } => Some(format!(
+                "seq={sequence} semaphore_wait owner={owner} tier={tier:?}"
+            )),
             RuntimeEvent::LlmAccessed {
                 sequence,
                 call,
@@ -6304,6 +6311,11 @@ fn idle_timeout_message(
 
 fn runtime_event_summary(event: &RuntimeEvent) -> String {
     match event {
+        RuntimeEvent::LlmSemaphoreWaitStarted {
+            sequence,
+            owner,
+            tier,
+        } => format!("seq={sequence} llm_semaphore_wait owner={owner} tier={tier:?}"),
         RuntimeEvent::LlmAccessed {
             sequence,
             call,
@@ -6873,7 +6885,8 @@ fn scheduled_wait_remaining_from_timed_events(
 
 fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
     match event {
-        RuntimeEvent::LlmAccessed { .. }
+        RuntimeEvent::LlmSemaphoreWaitStarted { .. }
+        | RuntimeEvent::LlmAccessed { .. }
         | RuntimeEvent::LlmCompleted { .. }
         | RuntimeEvent::MemoUpdated { .. }
         | RuntimeEvent::SessionCompactionStarted { .. }
@@ -6891,6 +6904,7 @@ fn runtime_event_counts_as_eval_progress(event: &RuntimeEvent) -> bool {
 impl RuntimeEventSink for RecordingRuntimeEventSink {
     fn on_event(&self, event: RuntimeEvent) -> Result<(), PortError> {
         let should_stop = match &event {
+            RuntimeEvent::LlmSemaphoreWaitStarted { .. } => false,
             RuntimeEvent::LlmAccessed { call, .. } => self
                 .max_llm_calls
                 .is_some_and(|max| call.saturating_add(1) >= max),
@@ -6916,6 +6930,13 @@ impl RuntimeEventSink for RecordingRuntimeEventSink {
             _ => {}
         }
         let live_message = match &event {
+            RuntimeEvent::LlmSemaphoreWaitStarted { owner, tier, .. } => format!(
+                "{} llm-semaphore-wait-started {} owner={} tier={:?}",
+                self.reporter.log_prefix(),
+                self.reporter.log_scope(&self.case_id),
+                owner,
+                tier
+            ),
             RuntimeEvent::LlmAccessed {
                 call, owner, tier, ..
             } => format!(

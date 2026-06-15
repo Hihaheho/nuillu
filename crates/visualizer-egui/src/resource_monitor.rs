@@ -73,6 +73,7 @@ impl ResourceMonitorState {
             .expect("runtime event bucket exists after push");
         let counts = bucket.modules.entry(module).or_default();
         match event {
+            RuntimeEvent::LlmSemaphoreWaitStarted { .. } => {}
             RuntimeEvent::LlmAccessed { .. } => counts.llm_accessed += 1,
             RuntimeEvent::LlmCompleted { .. } => counts.llm_completed += 1,
             RuntimeEvent::ModuleBatchThrottled { .. } => counts.throttles += 1,
@@ -749,7 +750,8 @@ fn module_capacities(policies: &[ModulePolicyView]) -> BTreeMap<&str, u8> {
 
 fn runtime_event_module(event: &RuntimeEvent) -> String {
     match event {
-        RuntimeEvent::LlmAccessed { owner, .. }
+        RuntimeEvent::LlmSemaphoreWaitStarted { owner, .. }
+        | RuntimeEvent::LlmAccessed { owner, .. }
         | RuntimeEvent::LlmCompleted { owner, .. }
         | RuntimeEvent::MemoUpdated { owner, .. }
         | RuntimeEvent::ModuleBatchThrottled { owner, .. }
