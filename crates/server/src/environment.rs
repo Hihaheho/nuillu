@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,7 +13,6 @@ use lutum_libsql_adapter::{
     LibsqlLlmTranscriptStore, LibsqlOneShotSensoryInputStore, LibsqlUtteranceEventStore,
     NewUtteranceEvent, UtteranceEventKind,
 };
-use lutum_model2vec_adapter::PotionBase8MEmbedder;
 use lutum_openai::{FeatureFlags, OpenAiAdapter, OpenAiReasoningEffort};
 use nuillu_blackboard::{AllocationLimits, Blackboard};
 use nuillu_llm_trace_file::{FileLlmTraceSink, LlmLogContext};
@@ -194,9 +192,9 @@ fn session_compaction_policy(config: &ServerConfig) -> SessionCompactionPolicy {
 
 async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgentStore> {
     let (memory_embedder, memory_profile, memory_dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+        build_embedder(&config.embedding_backend)?;
     let (policy_embedder, policy_profile, policy_dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+        build_embedder(&config.embedding_backend)?;
     LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
             config.state_dir.join("agent.db"),
@@ -213,30 +211,17 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
 }
 
 pub fn build_embedder(
-    embedding_backend: Option<&EmbeddingBackendConfig>,
-    model_dir: &Path,
+    embedding: &EmbeddingBackendConfig,
 ) -> anyhow::Result<(Box<dyn Embedder>, EmbeddingProfile, usize)> {
-    if let Some(embedding) = embedding_backend {
-        let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
-            base_url: embedding.endpoint.clone(),
-            api_key: embedding.token.clone(),
-            model: embedding.model.clone(),
-            target_dimensions: embedding.dimensions,
-            request_timeout: None,
-        })?;
-        let profile =
-            EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
-        Ok((Box::new(embedder), profile, embedding.dimensions))
-    } else {
-        let embedder = PotionBase8MEmbedder::from_local_dir(model_dir)
-            .with_context(|| format!("load model2vec model from {}", model_dir.display()))?;
-        let dimensions = embedder.dimensions();
-        Ok((
-            Box::new(embedder),
-            EmbeddingProfile::new("potion-base-8M", "local", dimensions),
-            dimensions,
-        ))
-    }
+    let embedder = OpenAiEmbedder::new(OpenAiEmbedderConfig {
+        base_url: embedding.endpoint.clone(),
+        api_key: embedding.token.clone(),
+        model: embedding.model.clone(),
+        target_dimensions: embedding.dimensions,
+        request_timeout: None,
+    })?;
+    let profile = EmbeddingProfile::new(embedding.model.clone(), "openai", embedding.dimensions);
+    Ok((Box::new(embedder), profile, embedding.dimensions))
 }
 
 pub fn build_tiers(
@@ -582,6 +567,15 @@ mod tests {
     use crate::config::{DEFAULT_MODULES, ServerBootConfig};
     use crate::registry::full_agent_allocation;
 
+    fn test_embedding_backend() -> EmbeddingBackendConfig {
+        EmbeddingBackendConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            token: "local".to_string(),
+            model: "embed".to_string(),
+            dimensions: 8,
+        }
+    }
+
     fn test_backend_config() -> LlmBackendConfig {
         LlmBackendConfig {
             model_key: "model".to_string(),
@@ -606,8 +600,7 @@ mod tests {
             cheap_backend: test_backend_config(),
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
-            model_dir: PathBuf::from("models/potion-base-8M"),
-            embedding_backend: None,
+            embedding_backend: test_embedding_backend(),
             boot_config: ServerBootConfig::default(),
             disabled_modules: Vec::new(),
             participants: Vec::new(),

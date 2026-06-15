@@ -8,7 +8,6 @@ use nuillu_server::{
     resolve_llm_backends, resolve_token_fields, run_server_with_visualizer,
 };
 
-const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
 const STATE_MODEL_SET_FILE: &str = "model-set.eure";
 
@@ -40,10 +39,6 @@ struct Args {
     #[arg(long)]
     model_set: Option<PathBuf>,
 
-    /// Local minishlab/potion-base-8M model directory.
-    #[arg(long, default_value = DEFAULT_MODEL_DIR)]
-    model_dir: PathBuf,
-
     /// Modules to force-disable at startup.
     #[arg(long = "disable-module", value_enum, value_name = "MODULE")]
     disable_module: Vec<RuntimeModule>,
@@ -62,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     let cheap_backend = backends.cheap;
     let default_backend = backends.default;
     let premium_backend = backends.premium;
-    let embedding_backend = resolve_embedding(model_set.embedding.as_ref())?;
+    let embedding_backend = resolve_embedding(&model_set.embedding)?;
     let session_id = resolve_session_id(args.session_id, args.run_id);
     let boot_config = load_server_boot_config(&args.state)?;
 
@@ -73,7 +68,6 @@ fn main() -> anyhow::Result<()> {
         cheap_backend,
         default_backend,
         premium_backend,
-        model_dir: args.model_dir,
         embedding_backend,
         boot_config,
         disabled_modules: args.disable_module,
@@ -92,12 +86,7 @@ fn resolve_model_set_path(state_dir: &Path, model_set: Option<PathBuf>) -> PathB
     model_set.unwrap_or_else(|| state_dir.join(STATE_MODEL_SET_FILE))
 }
 
-fn resolve_embedding(
-    role: Option<&EmbeddingRole>,
-) -> anyhow::Result<Option<EmbeddingBackendConfig>> {
-    let Some(role) = role else {
-        return Ok(None);
-    };
+fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBackendConfig> {
     let endpoint = role
         .endpoint()
         .unwrap_or(DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
@@ -108,22 +97,12 @@ fn resolve_embedding(
         role.token.as_deref(),
         None,
     )?;
-    let model = role
-        .model
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("missing embedding.model in --model-set"))?;
-    let dimensions = role
-        .dimensions
-        .ok_or_else(|| anyhow::anyhow!("missing embedding.dimensions in --model-set"))?;
-    if dimensions == 0 {
-        anyhow::bail!("embedding.dimensions must be greater than zero");
-    }
-    Ok(Some(EmbeddingBackendConfig {
+    Ok(EmbeddingBackendConfig {
         endpoint,
         token,
-        model,
-        dimensions: dimensions as usize,
-    }))
+        model: role.model.clone(),
+        dimensions: role.dimensions as usize,
+    })
 }
 
 #[cfg(test)]

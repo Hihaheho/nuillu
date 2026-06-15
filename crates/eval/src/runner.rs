@@ -105,8 +105,7 @@ pub struct RunnerConfig {
     pub cheap_backend: LlmBackendConfig,
     pub default_backend: LlmBackendConfig,
     pub premium_backend: LlmBackendConfig,
-    pub model_dir: PathBuf,
-    pub embedding_backend: Option<EmbeddingBackendConfig>,
+    pub embedding_backend: EmbeddingBackendConfig,
     pub fail_fast: bool,
     pub failed_only: bool,
     pub failed_from: Option<PathBuf>,
@@ -4631,9 +4630,9 @@ pub(crate) fn action_module_ids(modules: &[EvalModule]) -> Vec<ModuleId> {
 
 async fn connect_agent_store(output_dir: &Path, config: &RunnerConfig) -> Result<LibsqlAgentStore> {
     let (memory_embedder, memory_profile, memory_dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+        build_embedder(&config.embedding_backend)?;
     let (policy_embedder, policy_profile, policy_dimensions) =
-        build_embedder(config.embedding_backend.as_ref(), &config.model_dir)?;
+        build_embedder(&config.embedding_backend)?;
     LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
             output_dir.join("agent.db"),
@@ -7278,6 +7277,27 @@ mod tests {
         }
     }
 
+    fn test_embedding_backend() -> EmbeddingBackendConfig {
+        EmbeddingBackendConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            token: "local".to_string(),
+            model: "embed".to_string(),
+            dimensions: 8,
+        }
+    }
+
+    /// Embedding config that makes `build_embedder` fail at construction, so the
+    /// agent store cannot connect. Used to exercise the harness's invalid-case
+    /// (setup failure) path deterministically without any live backend.
+    fn failing_embedding_backend() -> EmbeddingBackendConfig {
+        EmbeddingBackendConfig {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            token: "local".to_string(),
+            model: String::new(),
+            dimensions: 8,
+        }
+    }
+
     fn test_model_concurrency() -> BTreeMap<String, Option<NonZeroUsize>> {
         BTreeMap::from([
             ("judge-model".to_string(), None),
@@ -7297,8 +7317,7 @@ mod tests {
             cheap_backend: test_backend_config_with_model("cheap-model"),
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
-            model_dir: dir.join("missing-model"),
-            embedding_backend: None,
+            embedding_backend: test_embedding_backend(),
             fail_fast: false,
             failed_only: false,
             failed_from: None,
@@ -8231,8 +8250,7 @@ id = "module-query-memory-special-memory"
             cheap_backend: test_backend_config(),
             default_backend: test_backend_config(),
             premium_backend: test_backend_config(),
-            model_dir: dir.path().join("models"),
-            embedding_backend: None,
+            embedding_backend: test_embedding_backend(),
             fail_fast: false,
             failed_only: false,
             failed_from: None,
@@ -9230,8 +9248,7 @@ limits {{
             cheap_backend,
             default_backend: test_backend_config_with_model("default-model"),
             premium_backend: test_backend_config_with_model("premium-model"),
-            model_dir: dir.path().join("missing-model"),
-            embedding_backend: None,
+            embedding_backend: failing_embedding_backend(),
             fail_fast: false,
             failed_only: false,
             failed_from: None,
@@ -9437,6 +9454,7 @@ limits {
         let mut config = test_runner_config(dir.path());
         config.output_root = output_root.clone();
         config.run_id = "multi-trial".to_string();
+        config.embedding_backend = failing_embedding_backend();
         config.model_concurrency =
             BTreeMap::from([("cheap-model".to_string(), NonZeroUsize::new(7))]);
         config.trials = NonZeroUsize::new(2).unwrap();

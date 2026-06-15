@@ -7,7 +7,6 @@ members = [
     "crates/agent",
     "crates/adapters/in-memory",
     "crates/adapters/libsql",
-    "crates/adapters/model2vec",
     "crates/adapters/openai-embedding",
     "crates/llm-trace-file",
     "crates/modules/*",
@@ -43,7 +42,6 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
-model2vec-rs = { version = "0.1.4", default-features = false, features = ["onig"] }
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -68,7 +66,6 @@ nuillu-module = { path = "crates/module" }
 nuillu-agent = { path = "crates/agent" }
 lutum-in-memory-adapter = { path = "crates/adapters/in-memory" }
 lutum-libsql-adapter = { path = "crates/adapters/libsql" }
-lutum-model2vec-adapter = { path = "crates/adapters/model2vec" }
 nuillu-openai-embedding-adapter = { path = "crates/adapters/openai-embedding" }
 nuillu-llm-trace-file = { path = "crates/llm-trace-file" }
 

@@ -10,7 +10,6 @@ use nuillu_eval::{
 use nuillu_module::LlmConcurrencyPool;
 use tokio::runtime::Builder;
 
-const DEFAULT_MODEL_DIR: &str = "models/potion-base-8M";
 const DEFAULT_OPENAI_EMBEDDING_ENDPOINT: &str = "https://api.openai.com/v1";
 const DEFAULT_FULL_AGENT_CONCURRENCY: usize = 3;
 const DEFAULT_MODULE_CONCURRENCY: usize = 8;
@@ -40,10 +39,6 @@ struct Args {
     /// Model set Eure file with per-role backend config.
     #[arg(long)]
     model_set: PathBuf,
-
-    /// Local minishlab/potion-base-8M model directory.
-    #[arg(long, default_value = DEFAULT_MODEL_DIR)]
-    model_dir: PathBuf,
 
     /// Stop the suite after the first failed or invalid case.
     #[arg(long)]
@@ -105,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     let premium_backend = backends.premium;
     let model_concurrency = backends.model_concurrency;
 
-    let embedding_backend = resolve_embedding(model_set.embedding.as_ref())?;
+    let embedding_backend = resolve_embedding(&model_set.embedding)?;
     if args.gui && args.no_full_agent {
         anyhow::bail!("--gui requires full-agent cases; do not combine with --no-full-agent");
     }
@@ -119,7 +114,6 @@ fn main() -> anyhow::Result<()> {
         cheap_backend,
         default_backend,
         premium_backend,
-        model_dir: args.model_dir,
         embedding_backend,
         fail_fast: args.fail_fast,
         failed_only: args.failed_only,
@@ -178,12 +172,7 @@ fn format_cli_metrics(metrics: &nuillu_eval::SuiteMetrics) -> String {
     }
 }
 
-fn resolve_embedding(
-    role: Option<&EmbeddingRole>,
-) -> anyhow::Result<Option<EmbeddingBackendConfig>> {
-    let Some(role) = role else {
-        return Ok(None);
-    };
+fn resolve_embedding(role: &EmbeddingRole) -> anyhow::Result<EmbeddingBackendConfig> {
     let endpoint = role
         .endpoint()
         .unwrap_or(DEFAULT_OPENAI_EMBEDDING_ENDPOINT)
@@ -194,20 +183,10 @@ fn resolve_embedding(
         role.token.as_deref(),
         None,
     )?;
-    let model = role
-        .model
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("missing embedding.model in --model-set"))?;
-    let dimensions = role
-        .dimensions
-        .ok_or_else(|| anyhow::anyhow!("missing embedding.dimensions in --model-set"))?;
-    if dimensions == 0 {
-        anyhow::bail!("embedding.dimensions must be greater than zero");
-    }
-    Ok(Some(EmbeddingBackendConfig {
+    Ok(EmbeddingBackendConfig {
         endpoint,
         token,
-        model,
-        dimensions: dimensions as usize,
-    }))
+        model: role.model.clone(),
+        dimensions: role.dimensions as usize,
+    })
 }

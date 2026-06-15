@@ -36,7 +36,6 @@ premium = `$types.tier-binding`
 premium.$optional = true
 
 embedding = `$types.embedding-role`
-embedding.$optional = true
 
 @ $types.models-map
 $variant: map
@@ -123,6 +122,4 @@ token.$optional = true
 token-env = `text`
 token-env.$optional = true
 model = `text`
-model.$optional = true
 dimensions = `integer`
-dimensions.$optional = true

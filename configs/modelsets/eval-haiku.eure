@@ -1,5 +1,12 @@
 name = "all haiku"
 
+embedding {
+  endpoint = "https://api.openai.com/v1"
+  token-env = "OPENAI_API_KEY"
+  model = "text-embedding-3-small"
+  dimensions = 512
+}
+
 models {
   haiku {
     endpoint = "https://api.anthropic.com/v1"

@@ -1,5 +1,12 @@
 name = "mixed-eval"
 
+embedding {
+  endpoint = "http://localhost:11434/v1"
+  token = "local"
+  model = "nomic-embed-text"
+  dimensions = 768
+}
+
 models {
   judge-local {
     endpoint = "http://localhost:11434/v1"

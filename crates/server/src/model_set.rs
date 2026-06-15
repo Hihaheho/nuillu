@@ -49,8 +49,7 @@ pub struct ModelSet {
     pub default: Option<TierBinding>,
     #[eure(default)]
     pub premium: Option<TierBinding>,
-    #[eure(default)]
-    pub embedding: Option<EmbeddingRole>,
+    pub embedding: EmbeddingRole,
 }
 
 #[derive(Debug, Clone, FromEure)]
@@ -140,10 +139,8 @@ pub struct EmbeddingRole {
     pub token: Option<String>,
     #[eure(default)]
     pub token_env: Option<String>,
-    #[eure(default)]
-    pub model: Option<String>,
-    #[eure(default)]
-    pub dimensions: Option<u32>,
+    pub model: String,
+    pub dimensions: u32,
 }
 
 impl EmbeddingRole {
@@ -448,7 +445,7 @@ fn validate_model_set(path: &Path, model_set: &ModelSet) -> Result<(), ModelSetE
         model_set.premium_model.as_deref(),
         &model_set.models,
     )?;
-    validate_embedding_role(path, model_set.embedding.as_ref())
+    validate_embedding_role(path, &model_set.embedding)
 }
 
 fn validate_model_definition(
@@ -671,10 +668,7 @@ fn validate_responses_top_k(
     Ok(())
 }
 
-fn validate_embedding_role(path: &Path, role: Option<&EmbeddingRole>) -> Result<(), ModelSetError> {
-    let Some(role) = role else {
-        return Ok(());
-    };
+fn validate_embedding_role(path: &Path, role: &EmbeddingRole) -> Result<(), ModelSetError> {
     if role.endpoint.is_some() && role.base_url.is_some() {
         return Err(ModelSetError::Validation {
             path: path.to_path_buf(),
@@ -685,11 +679,11 @@ fn validate_embedding_role(path: &Path, role: Option<&EmbeddingRole>) -> Result<
     validate_optional_text(path, "embedding.base-url", role.base_url.as_deref())?;
     validate_optional_text(path, "embedding.token", role.token.as_deref())?;
     validate_optional_text(path, "embedding.token-env", role.token_env.as_deref())?;
-    validate_optional_text(path, "embedding.model", role.model.as_deref())?;
-    if role.dimensions == Some(0) {
+    validate_optional_text(path, "embedding.model", Some(role.model.as_str()))?;
+    if role.dimensions == 0 {
         return Err(ModelSetError::Validation {
             path: path.to_path_buf(),
-            message: "embedding.dimensions must be greater than zero when set".to_string(),
+            message: "embedding.dimensions must be greater than zero".to_string(),
         });
     }
     Ok(())
@@ -715,7 +709,19 @@ mod tests {
 
     use super::*;
 
+    const TEST_EMBEDDING: &str = r#"
+embedding {
+  model = "embed"
+  dimensions = 8
+}
+"#;
+
     fn parse_model_set(content: &str) -> Result<ModelSet, ModelSetError> {
+        let content = format!("{TEST_EMBEDDING}{content}");
+        parse_model_set_exact(&content)
+    }
+
+    fn parse_model_set_exact(content: &str) -> Result<ModelSet, ModelSetError> {
         let path = Path::new("test-model-set.eure");
         let file: ModelSetFile =
             eure::parse_content(content, path.to_path_buf()).map_err(|message| {
@@ -1206,6 +1212,59 @@ models {
             error,
             ModelSetError::Validation { message, .. }
                 if message.contains("models.gemma4.compaction-input-token-threshold must be greater than zero")
+        ));
+    }
+
+    #[test]
+    fn requires_embedding_block() {
+        let error = parse_model_set_exact(
+            r#"
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+  }
+}
+
+cheap-model = "gemma4"
+default-model = "gemma4"
+premium-model = "gemma4"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ModelSetError::Parse { .. }));
+    }
+
+    #[test]
+    fn rejects_zero_embedding_dimensions() {
+        let error = parse_model_set_exact(
+            r#"
+embedding {
+  model = "embed"
+  dimensions = 0
+}
+
+models {
+  gemma4 {
+    endpoint = "http://localhost:8080/v1"
+    token = "local"
+    model = "gemma4:e4b"
+  }
+}
+
+cheap-model = "gemma4"
+default-model = "gemma4"
+premium-model = "gemma4"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelSetError::Validation { message, .. }
+                if message.contains("embedding.dimensions must be greater than zero")
         ));
     }
 }

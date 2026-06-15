@@ -15,7 +15,6 @@ eure = { workspace = true }
 eure-document = { workspace = true }
 lutum = { workspace = true }
 lutum-libsql-adapter = { workspace = true }
-lutum-model2vec-adapter = { workspace = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-llm-trace-file = { workspace = true }

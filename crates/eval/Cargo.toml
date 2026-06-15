@@ -22,7 +22,6 @@ lutum-eval = { workspace = true }
 lutum-eval-runner = { workspace = true }
 lutum-protocol = { workspace = true }
 lutum-libsql-adapter = { workspace = true }
-lutum-model2vec-adapter = { workspace = true }
 lutum-openai = { workspace = true }
 lutum-trace = { workspace = true }
 nuillu-agent = { workspace = true }
