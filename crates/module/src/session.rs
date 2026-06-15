@@ -12,6 +12,7 @@ use nuillu_blackboard::IdentityMemoryRecord;
 use nuillu_types::ModuleInstanceId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
+use crate::mind_format::IDENTITY_MEMORY_SEED_PREFIX;
 use crate::ports::PortError;
 use crate::session_compaction::{SessionCompactionConfig, SessionCompactionProtectedPrefix};
 use crate::{
@@ -260,12 +261,12 @@ fn ensure_combined_system_seed(
     let has_reasoning = leading_system_text(items)
         .map(|text| text.contains(REASONING_SYSTEM_PROMPT))
         .unwrap_or(false);
+    let leading_system = leading_system_text(items);
     let has_identity = identity_memories.is_empty()
-        || leading_system_text(items)
-            .map(|text| text.contains("What I already remember about myself"))
+        || leading_system
+            .map(|text| text.contains(IDENTITY_MEMORY_SEED_PREFIX))
             .unwrap_or(false);
-    let has_legacy_identity = legacy_identity_seed_at(items, 1);
-    if has_leading_system && has_identity && !has_legacy_identity && (!reasoning || has_reasoning) {
+    if has_leading_system && has_identity && (!reasoning || has_reasoning) {
         return;
     }
 
@@ -277,9 +278,6 @@ fn ensure_combined_system_seed(
         items[0] = seed;
     } else {
         items.insert(0, seed);
-    }
-    if legacy_identity_seed_at(items, 1) {
-        items.remove(1);
     }
 }
 
@@ -295,14 +293,6 @@ fn leading_system_text(items: &[ModelInputItem]) -> Option<&str> {
         [MessageContent::Text(text)] => Some(text),
         _ => None,
     }
-}
-
-fn legacy_identity_seed_at(items: &[ModelInputItem], index: usize) -> bool {
-    matches!(
-        items.get(index),
-        Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
-            if text.starts_with("What I already remember about myself")
-    )
 }
 
 pub fn push_persistent_identity_seed_if_absent(
@@ -321,10 +311,10 @@ pub fn push_persistent_identity_seed_if_absent(
     };
     let items = session.input_mut().items_mut();
     if let Some(system) = leading_system_text(items).map(str::to_owned) {
-        if !system.contains("What I already remember about myself") {
-            items[0] =
-                ModelInputItem::text(InputMessageRole::System, format!("{system}\n\n{seed}"));
+        if system.contains(IDENTITY_MEMORY_SEED_PREFIX) {
+            return;
         }
+        items[0] = ModelInputItem::text(InputMessageRole::System, format!("{system}\n\n{seed}"));
         return;
     }
     session.push_system(seed);
@@ -833,9 +823,9 @@ mod tests {
         let system = leading_system_text_for_test(&session);
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What I already remember about myself"));
+        assert!(system.contains("What you already remember about yourself"));
         assert_eq!(
-            occurrences(system, "What I already remember about myself"),
+            occurrences(system, "What you already remember about yourself"),
             1
         );
         assert!(system.contains("The agent is named Nuillu."));
@@ -851,9 +841,9 @@ mod tests {
 
         let system = leading_system_text_for_test(&session);
         assert!(!system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What I already remember about myself"));
+        assert!(system.contains("What you already remember about yourself"));
         assert_eq!(
-            occurrences(system, "What I already remember about myself"),
+            occurrences(system, "What you already remember about yourself"),
             1
         );
         assert!(!system.contains("Identity memory loaded at agent startup"));
@@ -872,7 +862,7 @@ mod tests {
         let system = leading_system_text_for_test(&session);
         assert!(system.starts_with("SYSTEM\n\n"));
         assert_eq!(
-            occurrences(system, "What I already remember about myself"),
+            occurrences(system, "What you already remember about yourself"),
             1
         );
         assert!(!system.contains("Identity memory loaded at agent startup"));
@@ -882,9 +872,6 @@ mod tests {
     fn restored_reasoning_session_backfills_without_duplication() {
         let mut session = Session::new();
         session.push_system("SYSTEM");
-        session.push_assistant_text(
-            "What I already remember about myself at 2026-05-11T06:23:00Z:\n- old identity",
-        );
         session.push_user("history");
         attach_test_metadata(&mut session, true, true);
 
@@ -892,19 +879,15 @@ mod tests {
         ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
 
         let items = session.input().items();
+        assert_eq!(items.len(), 2);
         let system = leading_system_text_for_test(&session);
         assert_eq!(occurrences(system, REASONING_SYSTEM_PROMPT), 1);
         assert_eq!(
-            occurrences(system, "What I already remember about myself"),
+            occurrences(system, "What you already remember about yourself"),
             1
         );
         assert!(system.contains("The agent is named Nuillu."));
         assert!(!system.contains("Identity memory loaded at agent startup"));
-        assert!(!matches!(
-            items.get(1),
-            Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
-                if text.starts_with("What I already remember about myself")
-        ));
         assert!(matches!(
             items.get(1),
             Some(ModelInputItem::Message {

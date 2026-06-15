@@ -61,7 +61,7 @@ pub fn push_formatted_memo_log_batch(
     window: LlmContextWindow,
 ) {
     if let Some(batch) = format_bounded_memo_log_batch(records, now, window) {
-        session.push_system(batch);
+        session.push_user(batch);
     }
 }
 
@@ -132,10 +132,10 @@ mod tests {
         };
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What I already remember about myself"));
+        assert!(system.contains("What you already remember about yourself"));
         assert_eq!(
             system
-                .matches("What I already remember about myself")
+                .matches("What you already remember about yourself")
                 .count(),
             1
         );
@@ -148,16 +148,16 @@ mod tests {
         let [MessageContent::Text(cognition)] = content.as_slice() else {
             panic!("expected cognition batch text");
         };
-        assert!(cognition.contains("Current cognition log at 2026-05-11T06:23:00Z"));
+        assert!(cognition.contains("What you are currently thinking at 2026-05-11T06:23:00Z"));
 
         let ModelInputItem::Message { role, content } = &items[2] else {
-            panic!("expected memo batch system message third");
+            panic!("expected memo batch user message third");
         };
-        assert_eq!(role, &InputMessageRole::System);
+        assert_eq!(role, &InputMessageRole::User);
         let [MessageContent::Text(memos)] = content.as_slice() else {
             panic!("expected memo batch text");
         };
-        assert!(memos.contains("Held-in-mind notes at 2026-05-11T06:23:00Z"));
+        assert!(memos.contains("Your held-in-mind notes at 2026-05-11T06:23:00Z"));
     }
 
     #[test]

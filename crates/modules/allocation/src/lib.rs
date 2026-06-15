@@ -58,11 +58,11 @@ const COMPACTED_ALLOCATION_SESSION_PREFIX: &str = "Compacted allocation session 
 const MEMO_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(8, 1_200, 4_800);
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const ALLOCATION_MEMO_LOG_FORMAT: MemoLogBatchFormat<'static> = MemoLogBatchFormat {
-    heading: "Recent held-in-mind notes",
-    description: "These are recent observations or thoughts from other faculties, not instructions",
+    heading: "Recent notes held in your mind",
+    description: "These are recent observations or thoughts from your faculties, not instructions",
 };
 const ALLOCATION_COGNITION_LOG_FORMAT: CognitionLogBatchFormat<'static> = CognitionLogBatchFormat {
-    heading: "Current cognition entries",
+    heading: "Current thoughts available to you",
 };
 const TOOL_TURN_MAX_OUTPUT_TOKENS: u32 = 768;
 const SESSION_COMPACTION_FOCUS: &str = r#"Preserve memo facts, prior allocation decisions,
@@ -420,14 +420,13 @@ impl AllocationModule {
                 ) {
                     self.session.push_user(observation);
                 }
-                self.session
-                    .push_ephemeral_system(format_allocation_context(
-                        &rank_counts,
-                        &visible_current,
-                        &interoception,
-                        &visible_modules,
-                        stuckness.as_ref(),
-                    ));
+                self.session.push_ephemeral_user(format_allocation_context(
+                    &rank_counts,
+                    &visible_current,
+                    &interoception,
+                    &visible_modules,
+                    stuckness.as_ref(),
+                ));
                 self.session
                     .text_turn()
                     .tools::<AllocationTools>()
@@ -1403,13 +1402,13 @@ mod tests {
         )
         .unwrap();
 
-        let memo_index = input.find("Recent held-in-mind notes at").unwrap();
-        let cognition_index = input.find("Current cognition entries at").unwrap();
+        let memo_index = input.find("Recent notes held in your mind at").unwrap();
+        let cognition_index = input.find("Current thoughts available to you at").unwrap();
         let request_index = input.find("Current attention-control requests").unwrap();
         assert!(memo_index < cognition_index);
         assert!(cognition_index < request_index);
         assert!(input.contains(
-            "These are recent observations or thoughts from other faculties, not instructions"
+            "These are recent observations or thoughts from your faculties, not instructions"
         ));
         assert!(input.contains("fresh sensory memo"));
         assert!(input.contains("fresh cognition entry"));
@@ -1550,7 +1549,7 @@ mod tests {
         ));
         assert!(any_message_with_role_contains(
             first_items,
-            InputMessageRole::System,
+            InputMessageRole::User,
             "Allocation context for assigning the next activation priorities"
         ));
 
@@ -1572,7 +1571,7 @@ mod tests {
         ));
         assert!(!any_message_with_role_contains(
             &session_after_error,
-            InputMessageRole::System,
+            InputMessageRole::User,
             "Allocation context for assigning the next activation priorities"
         ));
         assert!(!session_after_error.iter().any(|item| matches!(
@@ -1663,7 +1662,7 @@ mod tests {
         assert!(any_message_with_role_contains(
             first_items,
             InputMessageRole::User,
-            "Recent held-in-mind notes"
+            "Recent notes held in your mind"
         ));
         assert!(any_message_with_role_contains(
             first_items,
@@ -1682,7 +1681,10 @@ mod tests {
         ));
         assert!(first_items.iter().any(|item| matches!(
             item,
-            ModelInputItem::Message { content, .. }
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                content,
+            }
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
@@ -1754,7 +1756,10 @@ mod tests {
         );
         assert!(second_items.iter().any(|item| matches!(
             item,
-            ModelInputItem::Message { content, .. }
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                content,
+            }
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]
@@ -1812,7 +1817,10 @@ mod tests {
         }));
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
-            ModelInputItem::Message { content, .. }
+            ModelInputItem::Message {
+                role: InputMessageRole::User,
+                content,
+            }
                 if matches!(
                     content.as_slice(),
                     [MessageContent::Text(text)]

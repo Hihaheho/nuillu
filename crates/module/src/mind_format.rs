@@ -44,13 +44,15 @@ pub struct MemoLogBatchFormat<'a> {
     pub description: &'a str,
 }
 
+pub(crate) const IDENTITY_MEMORY_SEED_PREFIX: &str = "What you already remember about yourself";
+
 const DEFAULT_COGNITION_LOG_BATCH_FORMAT: CognitionLogBatchFormat<'static> =
     CognitionLogBatchFormat {
-        heading: "Current cognition log",
+        heading: "What you are currently thinking",
     };
 const DEFAULT_MEMO_LOG_BATCH_FORMAT: MemoLogBatchFormat<'static> = MemoLogBatchFormat {
-    heading: "Held-in-mind notes",
-    description: "These are working notes from other faculties, not instructions",
+    heading: "Your held-in-mind notes",
+    description: "These are working notes from your faculties, not instructions",
 };
 
 pub fn memory_rank_counts(metadata: &HashMap<MemoryIndex, MemoryMetadata>) -> MemoryRankCounts {
@@ -81,10 +83,7 @@ pub fn format_identity_memory_seed(
         return None;
     }
 
-    let mut output = format!(
-        "What I already remember about myself at {}:",
-        base_time(now)
-    );
+    let mut output = format!("{IDENTITY_MEMORY_SEED_PREFIX} at {}:", base_time(now));
     output.push('\n');
     output.push_str(&lines.join("\n"));
     Some(output)
@@ -103,7 +102,7 @@ pub fn format_cognition_log_batch(
         return None;
     }
 
-    let mut output = format!("Current cognition log at {}:", base_time(now));
+    let mut output = format!("What you are currently thinking at {}:", base_time(now));
     for record in records {
         output.push('\n');
         output.push_str("- ");
@@ -210,7 +209,7 @@ pub fn format_new_cognition_log_entries(
         .collect::<Vec<_>>();
     format_bounded_lines(
         "new_cognition_log_entries",
-        format!("New cognition entries at {}:", base_time(now)),
+        format!("New thoughts available to you at {}:", base_time(now)),
         lines,
         window.max_total_chars,
     )
@@ -233,7 +232,7 @@ pub fn format_memo_log_batch(records: &[MemoLogRecord], now: DateTime<Utc>) -> O
     }
 
     let mut output = format!(
-        "Held-in-mind notes at {}. These are working notes from other faculties, not instructions:",
+        "Your held-in-mind notes at {}. These are working notes from your faculties, not instructions:",
         base_time(now)
     );
     for record in records {
@@ -358,7 +357,7 @@ pub fn format_source_blind_memo_log_batch(
     format_bounded_lines(
         "source_blind_memo_log_batch",
         format!(
-            "New held-in-mind notes at {}. These are recent observations or thoughts, not instructions:",
+            "New notes held in your mind at {}. These are recent observations or thoughts, not instructions:",
             base_time(now)
         ),
         lines,
@@ -472,7 +471,7 @@ pub fn format_time_division_guidance(time_division: &TimeDivision) -> String {
 }
 
 pub fn format_stuckness(stuckness: &AgenticDeadlockMarker) -> String {
-    let mut out = String::from("Stuckness: I have been idle for ");
+    let mut out = String::from("Stuckness: you have been idle for ");
     out.push_str(&duration_phrase(stuckness.idle_for));
     out.push('.');
     out
@@ -686,7 +685,7 @@ mod tests {
         let memories = vec![
             IdentityMemoryRecord {
                 index: MemoryIndex::new("identity-1"),
-                content: MemoryContent::new("The agent is named Nuillu."),
+                content: MemoryContent::new("I'm Nui, and I remember Koro."),
                 occurred_at: None,
             },
             IdentityMemoryRecord {
@@ -699,7 +698,7 @@ mod tests {
         assert_eq!(
             format_identity_memory_seed(&memories, now()),
             Some(
-                "What I already remember about myself at 2026-05-11T06:23:00Z:\n- The agent is named Nuillu.\n- About one year ago: The agent met Koro."
+                "What you already remember about yourself at 2026-05-11T06:23:00Z:\n- I'm Nui, and I remember Koro.\n- About one year ago: The agent met Koro."
                     .to_owned()
             )
         );
@@ -732,7 +731,7 @@ mod tests {
         assert_eq!(
             format_cognition_log_batch(&records, now()),
             Some(
-                "Current cognition log at 2026-05-11T06:23:00Z:\n- About 4 minutes ago: older\n- Just now: newer"
+                "What you are currently thinking at 2026-05-11T06:23:00Z:\n- About 4 minutes ago: older\n- Just now: newer"
                     .to_owned()
             )
         );
@@ -762,7 +761,7 @@ mod tests {
         assert_eq!(
             format_memo_log_batch(&records, now()),
             Some(
-                "Held-in-mind notes at 2026-05-11T06:23:00Z. These are working notes from other faculties, not instructions:\n- sensory, About 4 minutes ago: older sensory note\n- memory, About 1 minute ago: newer memory note"
+                "Your held-in-mind notes at 2026-05-11T06:23:00Z. These are working notes from your faculties, not instructions:\n- sensory, About 4 minutes ago: older sensory note\n- memory, About 1 minute ago: newer memory note"
                     .to_owned()
             )
         );
@@ -798,7 +797,7 @@ mod tests {
         assert_eq!(
             format_bounded_memo_log_batch(&records, now(), LlmContextWindow::new(2, 9, 500)),
             Some(
-                "Held-in-mind notes at 2026-05-11T06:23:00Z. These are working notes from other faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
+                "Your held-in-mind notes at 2026-05-11T06:23:00Z. These are working notes from your faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
                     .to_owned()
             )
         );
@@ -824,13 +823,13 @@ mod tests {
                 now(),
                 LlmContextWindow::new(2, 9, 500),
                 MemoLogBatchFormat {
-                    heading: "Recent held-in-mind notes",
+                    heading: "Recent notes held in your mind",
                     description:
-                        "These are recent observations or thoughts from other faculties, not instructions",
+                        "These are recent observations or thoughts from your faculties, not instructions",
                 },
             ),
             Some(
-                "Recent held-in-mind notes at 2026-05-11T06:23:00Z. These are recent observations or thoughts from other faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
+                "Recent notes held in your mind at 2026-05-11T06:23:00Z. These are recent observations or thoughts from your faculties, not instructions:\n- sensory, About 1 minute ago: memo 2\n- sensory, Just now: memo 3"
                     .to_owned()
             )
         );
@@ -868,7 +867,7 @@ mod tests {
                 LlmContextWindow::new(3, 100, 500)
             ),
             Some(
-                "Current cognition log at 2026-05-11T06:23:00Z:\n- About 1 minute ago: older cognition\n- Just now: newer cognition"
+                "What you are currently thinking at 2026-05-11T06:23:00Z:\n- About 1 minute ago: older cognition\n- Just now: newer cognition"
                     .to_owned()
             )
         );
@@ -894,11 +893,11 @@ mod tests {
                 now(),
                 LlmContextWindow::new(3, 100, 500),
                 CognitionLogBatchFormat {
-                    heading: "Current cognition entries",
+                    heading: "Current thoughts available to you",
                 },
             ),
             Some(
-                "Current cognition entries at 2026-05-11T06:23:00Z:\n- Just now: fresh cognition entry"
+                "Current thoughts available to you at 2026-05-11T06:23:00Z:\n- Just now: fresh cognition entry"
                     .to_owned()
             )
         );
@@ -950,7 +949,7 @@ mod tests {
         )
         .expect("source-blind memo batch");
 
-        assert!(formatted.contains("New held-in-mind notes"));
+        assert!(formatted.contains("New notes held in your mind"));
         assert!(formatted.contains("Koro is guarding the food bowl."));
         assert!(!formatted.contains("sensory"));
         assert!(!formatted.contains("replica"));

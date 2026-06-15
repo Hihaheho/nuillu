@@ -1382,10 +1382,10 @@ mod tests {
         let structured_inputs = observed.structured_inputs();
         assert_eq!(structured_inputs.len(), 1);
         let eval_text = all_input_text(&structured_inputs[0]);
-        assert!(eval_text.contains("What I already remember about myself"));
+        assert!(eval_text.contains("What you already remember about yourself"));
         assert_eq!(
             eval_text
-                .matches("What I already remember about myself")
+                .matches("What you already remember about yourself")
                 .count(),
             1
         );

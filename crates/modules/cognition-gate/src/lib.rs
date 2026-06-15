@@ -1127,7 +1127,7 @@ mod tests {
         assert!(candidate_input.contains("3. sensory detail C"));
         assert!(candidate_input.contains("sensory detail C"));
         assert!(!candidate_input.contains("memo"));
-        assert!(!candidate_input.contains("Held-in-mind notes"));
+        assert!(!candidate_input.contains("held-in-mind notes"));
         assert!(!candidate_input.contains("working notes"));
         assert!(!candidate_input.contains(
             "Cognition-gate context for deciding what should enter conscious cognition now"
@@ -1184,7 +1184,7 @@ mod tests {
                         && text.contains("sensory detail B")
                         && text.contains("sensory detail C")
                         && !text.contains("memo")
-                        && !text.contains("Held-in-mind notes")
+                        && !text.contains("held-in-mind notes")
                         && !text.contains("working notes")
             )
         )));
@@ -1687,7 +1687,7 @@ mod tests {
         assert!(retried_candidates.contains("sensory detail B"));
         assert!(retried_candidates.contains("sensory detail C"));
         assert!(!retried_candidates.contains("memo"));
-        assert!(!retried_candidates.contains("Held-in-mind notes"));
+        assert!(!retried_candidates.contains("held-in-mind notes"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1892,7 +1892,7 @@ mod tests {
         assert!(second_user_messages[0].contains(NEW_CANDIDATE_HEADER));
         assert_candidate_decision_instruction(second_user_messages[0]);
         assert!(second_user_messages[0].contains("sensory detail A"));
-        assert!(!second_user_messages[1].contains("Current cognition log at"));
+        assert!(!second_user_messages[1].contains("What you are currently thinking at"));
         assert!(second_user_messages[1].contains(NEW_CANDIDATE_HEADER));
         assert_candidate_decision_instruction(second_user_messages[1]);
         assert!(second_user_messages[1].contains("sensory detail B"));
@@ -1929,7 +1929,7 @@ mod tests {
         assert!(!second_items.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
-                if text.contains("Current cognition log at")
+                if text.contains("What you are currently thinking at")
         )));
         assert!(
             inputs[1]
@@ -1974,12 +1974,12 @@ mod tests {
         assert!(
             !session_user_messages
                 .iter()
-                .any(|text| text.contains("Current cognition log at"))
+                .any(|text| text.contains("What you are currently thinking at"))
         );
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
             ModelInputItem::Assistant(lutum::AssistantInputItem::Text(text))
-                if text.contains("Current cognition log at")
+                if text.contains("What you are currently thinking at")
         )));
         assert!(!session_after_second.iter().any(|item| matches!(
             item,
@@ -2048,7 +2048,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected system prompt text");
         };
-        assert!(system.contains("What I already remember about myself at"));
+        assert!(system.contains("What you already remember about yourself at"));
         assert!(system.contains("- The agent is named Nuillu."));
         assert!(!system.contains("<self-memory>"));
     }

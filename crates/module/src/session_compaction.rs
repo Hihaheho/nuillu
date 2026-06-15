@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lutum::{AssistantInputItem, InputMessageRole, Lutum, ModelInput, ModelInputItem, Session};
+use lutum::{InputMessageRole, Lutum, ModelInput, ModelInputItem, Session};
 use nuillu_types::{ModelTier, ModuleInstanceId};
 
 use crate::llm::{LlmConcurrencyLimiter, LlmRequestMetadata, LlmRequestSource};
@@ -276,17 +276,7 @@ fn protected_prefix_len(
     match protected_prefix {
         SessionCompactionProtectedPrefix::None => 0,
         SessionCompactionProtectedPrefix::LeadingSystem => leading_system_len(items),
-        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed => {
-            let mut len = leading_system_len(items);
-            if matches!(
-                items.get(len),
-                Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))
-                    if text.starts_with("What I already remember about myself")
-            ) {
-                len += 1;
-            }
-            len
-        }
+        SessionCompactionProtectedPrefix::LeadingSystemAndIdentitySeed => leading_system_len(items),
         SessionCompactionProtectedPrefix::Count(len) => len.min(items.len()),
     }
 }
@@ -307,10 +297,10 @@ mod tests {
 
     use async_trait::async_trait;
     use lutum::{
-        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantTurnItem, AssistantTurnView,
-        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, MaxOutputTokens,
-        MessageContent, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
-        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem, AssistantTurnItem,
+        AssistantTurnView, ErasedStructuredTurnEventStream, ErasedTextTurnEventStream,
+        FinishReason, MaxOutputTokens, MessageContent, MockLlmAdapter, MockTextScenario,
+        RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_types::ModelTier;
 
@@ -619,7 +609,7 @@ mod tests {
         let (lutum, observed) = lutum_with_adapter(adapter);
         let mut session = Session::new();
         session.push_system(
-            "SYSTEM PROMPT\n\nWhat I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
+            "SYSTEM PROMPT\n\nWhat you already remember about yourself at 2026-05-11T06:23:00Z:\n- identity",
         );
         for index in 0..5 {
             session.push_user(format!("history-{index}"));
@@ -648,7 +638,7 @@ mod tests {
             panic!("expected system prompt text");
         };
         assert!(system.starts_with("SYSTEM PROMPT"));
-        assert!(system.contains("What I already remember about myself"));
+        assert!(system.contains("What you already remember about yourself"));
         assert_eq!(
             assistant_text(&items[1]),
             "Compacted session:\nhistory summarized"
@@ -680,7 +670,7 @@ mod tests {
             matches!(
                 item,
                 ModelInputItem::Assistant(AssistantInputItem::Text(text))
-                    if text.starts_with("What I already remember about myself")
+                    if text.starts_with("What you already remember about yourself")
             )
         }));
     }
@@ -759,9 +749,7 @@ mod tests {
         let (lutum, observed) = lutum_with_adapter(adapter);
         let mut session = Session::new();
         session.push_system("SYSTEM PROMPT");
-        session.push_assistant_text(
-            "What I already remember about myself at 2026-05-11T06:23:00Z:\n- identity",
-        );
+        session.push_assistant_text("Auxiliary assistant context:\n- identity already in system");
         session.push_assistant_text("Auxiliary assistant context:\n- door open");
         session.input_mut().push(ModelInputItem::turn(Arc::new(
             AssistantTurnView::from_items(&[AssistantTurnItem::Text(

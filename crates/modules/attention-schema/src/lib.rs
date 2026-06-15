@@ -15,8 +15,8 @@ mod batch;
 pub use batch::NextBatch as AttentionSchemaBatch;
 
 const MODEL_PROMPT: &str = r#"You are the attention-schema module.
-Maintain the current state of attention from accumulated held-in-mind notes and cognition entries.
-Held-in-mind notes are recent observations or thoughts; cognition entries are admitted cognitive
+Maintain the current state of attention from accumulated notes held in your mind and cognition entries.
+Notes held in your mind are recent observations or thoughts; cognition entries are admitted cognitive
 evidence.
 
 Assume the agent is a non-physical experiencer: it can direct attention to any target, physical or

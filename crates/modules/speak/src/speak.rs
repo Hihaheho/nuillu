@@ -496,7 +496,10 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
 }
 
 fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
-    let mut out = format!("{THINK_OPEN_TAG}\nI'll speak to `{}`.", draft.target.trim());
+    let mut out = format!(
+        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.",
+        draft.target.trim()
+    );
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
@@ -594,7 +597,7 @@ fn push_completed_generation_turn(session: &mut Session, text: &str) {
 #[cfg(test)]
 fn cognition_context_fallback(now: DateTime<Utc>) -> String {
     format!(
-        "Current cognition log at {}:\n- none",
+        "What you are currently thinking at {}:\n- none",
         now.to_rfc3339_opts(SecondsFormat::Secs, true)
     )
 }
@@ -679,7 +682,7 @@ fn active_speech_cognition_context_from_entries(
 ) -> String {
     speech_cognition_context_from_entries(records, now).unwrap_or_else(|| {
         format!(
-            "New cognition entries at {}:\n- none since the previous speech slice",
+            "New thoughts available to you at {}:\n- none since the previous speech slice",
             now.to_rfc3339_opts(SecondsFormat::Secs, true)
         )
     })
@@ -2120,7 +2123,7 @@ mod tests {
 
         let context = module.speech_cognition_context(now).await;
 
-        assert!(context.contains("Current cognition log at "));
+        assert!(context.contains("What you are currently thinking at "));
         assert!(context.contains("About 4 minutes ago: Koro asks Nuillu for help."));
     }
 
@@ -2208,15 +2211,15 @@ mod tests {
 
         let contexts = session_message_texts(&module.planning_session, InputMessageRole::User)
             .into_iter()
-            .filter(|text| text.starts_with("New cognition entries at "))
+            .filter(|text| text.starts_with("New thoughts available to you at "))
             .collect::<Vec<_>>();
         assert_eq!(contexts.len(), 2);
         assert!(contexts[0].contains("first cognition"));
         assert!(!contexts[0].contains("second cognition"));
         assert!(contexts[1].contains("second cognition"));
         assert!(!contexts[1].contains("first cognition"));
-        assert!(!contexts[0].contains("Current cognition log at"));
-        assert!(!contexts[1].contains("Current cognition log at"));
+        assert!(!contexts[0].contains("What you are currently thinking at"));
+        assert!(!contexts[1].contains("What you are currently thinking at"));
 
         let generation_contexts =
             session_message_texts(&module.generation_session, InputMessageRole::User)
@@ -2228,8 +2231,8 @@ mod tests {
         assert!(!generation_contexts[0].contains("second cognition"));
         assert!(generation_contexts[1].contains("second cognition"));
         assert!(!generation_contexts[1].contains("first cognition"));
-        assert!(!generation_contexts[0].contains("New cognition entries at"));
-        assert!(!generation_contexts[1].contains("New cognition entries at"));
+        assert!(!generation_contexts[0].contains("New thoughts available to you at"));
+        assert!(!generation_contexts[1].contains("New thoughts available to you at"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2313,13 +2316,13 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         let generation_text = model_input_text(&inputs[1]);
         assert!(generation_text.contains(GENERATION_TURN_USER_PROMPT));
-        assert!(generation_text.contains("<think>\nI'll speak to `Ryo`."));
+        assert!(generation_text.contains("<think>\nPreparing speech to `Ryo`."));
         assert!(generation_text.contains("Language: Japanese"));
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
         assert!(generation_text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
         assert!(!generation_text.contains("Speak to:"));
         assert!(!generation_text.contains("Substance to express:"));
-        assert!(!generation_text.contains("New cognition entries at "));
+        assert!(!generation_text.contains("New thoughts available to you at "));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2397,9 +2400,9 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(!text.contains("Recent context:"));
-        assert!(!text.contains("Current cognition log at"));
-        assert!(!text.contains("New cognition entries at"));
-        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(!text.contains("What you are currently thinking at"));
+        assert!(!text.contains("New thoughts available to you at"));
+        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
         assert!(text.contains("Speaker intent:"));
         assert!(text.contains("</think>"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
@@ -2427,12 +2430,12 @@ mod tests {
         let text = format_generation_thinking_prefill(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
-        assert!(text.contains("<think>\nI'll speak to `Ryo`."));
+        assert!(text.contains("<think>\nPreparing speech to `Ryo`."));
         assert!(text.contains("Language: Japanese"));
         assert!(text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
-        assert!(!text.contains("New cognition entries at"));
+        assert!(!text.contains("New thoughts available to you at"));
     }
 
     #[test]
@@ -2484,7 +2487,7 @@ mod tests {
             context,
             "Recent context:\n- Ryo says the question is not about Ryo's inner thoughts.\n- Ryo clarifies that Nui's inner state is the topic."
         );
-        assert!(!context.contains("New cognition entries at"));
+        assert!(!context.contains("New thoughts available to you at"));
         assert!(!context.contains("cognition log"));
         assert!(!context.contains("Just now"));
         assert!(!context.contains("cognition-gate"));
@@ -2586,7 +2589,7 @@ mod tests {
         let planning_text = session_input_text(&module.planning_session);
         assert_eq!(
             planning_text
-                .matches("What I already remember about myself")
+                .matches("What you already remember about yourself")
                 .count(),
             1
         );
@@ -2596,12 +2599,12 @@ mod tests {
         let generation_text = session_input_text(&module.generation_session);
         assert_eq!(
             generation_text
-                .matches("What I already remember about myself")
+                .matches("What you already remember about yourself")
                 .count(),
             1
         );
         assert!(!generation_text.contains("Identity memory loaded at agent startup"));
-        assert!(!generation_text.contains("New cognition entries at "));
+        assert!(!generation_text.contains("New thoughts available to you at "));
         assert!(
             generation_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
         );
@@ -2612,10 +2615,10 @@ mod tests {
             generation_input
                 .contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
         );
-        assert!(!generation_input.contains("New cognition entries at "));
-        assert!(!generation_input.contains("Current cognition log at "));
+        assert!(!generation_input.contains("New thoughts available to you at "));
+        assert!(!generation_input.contains("What you are currently thinking at "));
         assert!(generation_input.contains(GENERATION_TURN_USER_PROMPT));
-        assert!(generation_input.contains("<think>\nI'll speak to `Koro`."));
+        assert!(generation_input.contains("<think>\nPreparing speech to `Koro`."));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -3086,7 +3089,7 @@ mod tests {
             full_input_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
         );
         assert!(!full_input_text.contains("none since the previous speech slice"));
-        assert!(!full_input_text.contains("New cognition entries at "));
+        assert!(!full_input_text.contains("New thoughts available to you at "));
         let items = generation_input.items();
         assert!(items.len() >= 3);
         let tail = &items[items.len() - 3..];
@@ -3108,7 +3111,7 @@ mod tests {
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant thinking prefill");
         };
-        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
         assert!(text.contains("Speaker intent:\nTell Koro to stay close.\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
@@ -3288,7 +3291,7 @@ mod tests {
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant thinking prefill");
         };
-        assert!(text.contains("<think>\nI'll speak to `everyone`."));
+        assert!(text.contains("<think>\nPreparing speech to `everyone`."));
         assert!(
             text.contains("Speaker intent:\nAliceの挨拶に親しみを込めて短く応える。\n</think>")
         );
@@ -3381,7 +3384,7 @@ mod tests {
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
             panic!("expected assistant thinking prefill");
         };
-        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
         assert!(text.contains("Speaker intent:\nTell Koro to duck now.\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
@@ -3674,7 +3677,7 @@ mod tests {
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
             panic!("expected assistant thinking prefill");
         };
-        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("<think>\nPreparing speech to `Koro`."));
         assert!(text.contains(
             "Speaker intent:\nTell Koro to stay close because Koro asks for help.\n</think>"
         ));
