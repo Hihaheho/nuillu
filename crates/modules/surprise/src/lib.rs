@@ -144,12 +144,7 @@ impl SurpriseModule {
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.system_prompt.get_or_init(|| {
-            nuillu_module::format_identity_system_prompt(
-                SYSTEM_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
+            nuillu_module::format_policy_system_prompt(SYSTEM_PROMPT, cx.core_policies())
         })
     }
 

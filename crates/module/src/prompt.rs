@@ -1,8 +1,5 @@
-use chrono::{DateTime, Utc};
-use nuillu_blackboard::{CorePolicyRecord, IdentityMemoryRecord};
+use nuillu_blackboard::CorePolicyRecord;
 use nuillu_types::ModuleId;
-
-use crate::render_memory_for_llm;
 
 /// Build a system prompt that prepends peer-context entries for every other
 /// module registered in the agent. The owner module is excluded so each
@@ -16,35 +13,22 @@ pub fn format_system_prompt(
     base: &str,
     catalog: &[(ModuleId, &'static str)],
     owner: &ModuleId,
-    identity_memories: &[IdentityMemoryRecord],
     core_policies: &[CorePolicyRecord],
-    now: DateTime<Utc>,
 ) -> String {
     let peers = sorted_peer_lines(catalog, owner);
     let mut prompt = base.to_owned();
     append_peer_section(&mut prompt, &peers);
-    append_identity_and_policy_sections(
-        &mut prompt,
-        !peers.is_empty(),
-        identity_memories,
-        core_policies,
-        now,
-    );
+    append_policy_section(&mut prompt, !peers.is_empty(), core_policies);
     prompt
 }
 
-/// Build a system prompt with stable identity/policy context but without the
-/// peer context catalog. Use this when a module already receives the needed
-/// sibling output through activation context, or when exposing internal module
+/// Build a system prompt with stable policy context but without the peer
+/// context catalog. Use this when a module already receives the needed sibling
+/// output through activation context, or when exposing internal module
 /// structure encourages process-talk.
-pub fn format_identity_system_prompt(
-    base: &str,
-    identity_memories: &[IdentityMemoryRecord],
-    core_policies: &[CorePolicyRecord],
-    now: DateTime<Utc>,
-) -> String {
+pub fn format_policy_system_prompt(base: &str, core_policies: &[CorePolicyRecord]) -> String {
     let mut prompt = base.to_owned();
-    append_identity_and_policy_sections(&mut prompt, false, identity_memories, core_policies, now);
+    append_policy_section(&mut prompt, false, core_policies);
     prompt
 }
 
@@ -82,30 +66,14 @@ fn append_peer_section(prompt: &mut String, peers: &[String]) {
     prompt.push('\n');
 }
 
-fn append_identity_and_policy_sections(
+fn append_policy_section(
     prompt: &mut String,
     follows_peer_section: bool,
-    identity_memories: &[IdentityMemoryRecord],
     core_policies: &[CorePolicyRecord],
-    now: DateTime<Utc>,
 ) {
-    if !identity_memories.is_empty() {
-        prompt.push_str(if follows_peer_section { "\n" } else { "\n\n" });
-        prompt.push_str("Identity memory loaded at agent startup:\n");
-        for memory in identity_memories {
-            prompt.push_str("- [");
-            prompt.push_str(memory.index.as_str());
-            prompt.push_str("] ");
-            prompt.push_str(&render_memory_for_llm(
-                memory.content.as_str(),
-                memory.occurred_at,
-                now,
-            ));
-            prompt.push('\n');
-        }
-    }
     if !core_policies.is_empty() {
-        prompt.push_str("\n\nCore policies loaded at agent startup:\n");
+        prompt.push_str(if follows_peer_section { "\n" } else { "\n\n" });
+        prompt.push_str("Core policies loaded at agent startup:\n");
         for policy in core_policies {
             prompt.push_str("- [");
             prompt.push_str(policy.index.as_str());
@@ -121,7 +89,6 @@ fn append_identity_and_policy_sections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
     use nuillu_types::builtin;
 
     #[test]
@@ -131,8 +98,7 @@ mod tests {
             (builtin::speak(), "speak role"),
             (builtin::cognition_gate(), "gate role"),
         ];
-        let prompt =
-            format_system_prompt("BASE", &catalog, &builtin::sensory(), &[], &[], test_now());
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert!(prompt.starts_with("BASE\n\nYou are part of a cognitive system."));
         assert!(prompt.contains("- cognition-gate: gate role"));
         assert!(prompt.contains("- speak: speak role"));
@@ -145,67 +111,47 @@ mod tests {
 
     #[test]
     fn empty_catalog_returns_base_unchanged() {
-        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &[], &[], test_now());
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &[]);
         assert_eq!(prompt, "BASE");
     }
 
     #[test]
     fn solo_module_returns_base_unchanged() {
         let catalog = vec![(builtin::sensory(), "sensory role")];
-        let prompt =
-            format_system_prompt("BASE", &catalog, &builtin::sensory(), &[], &[], test_now());
+        let prompt = format_system_prompt("BASE", &catalog, &builtin::sensory(), &[]);
         assert_eq!(prompt, "BASE");
     }
 
     #[test]
-    fn identity_memories_append_without_peer_catalog() {
-        let memories = vec![IdentityMemoryRecord {
-            index: nuillu_types::MemoryIndex::new("memory-1"),
-            content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
-            occurred_at: None,
+    fn core_policies_append_without_peer_catalog() {
+        let policies = vec![CorePolicyRecord {
+            index: nuillu_types::PolicyIndex::new("policy-1"),
+            trigger: "the agent is greeted".to_owned(),
+            behavior: "answer gently".to_owned(),
         }];
 
-        let prompt =
-            format_system_prompt("BASE", &[], &builtin::sensory(), &memories, &[], test_now());
+        let prompt = format_system_prompt("BASE", &[], &builtin::sensory(), &policies);
 
         assert_eq!(
             prompt,
-            "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
+            "BASE\n\nCore policies loaded at agent startup:\n- [policy-1] When the agent is greeted, do: answer gently\n"
         );
     }
 
     #[test]
-    fn identity_system_prompt_omits_peer_catalog() {
-        let memories = vec![IdentityMemoryRecord {
-            index: nuillu_types::MemoryIndex::new("memory-1"),
-            content: nuillu_types::MemoryContent::new("The agent is named Nuillu."),
-            occurred_at: None,
+    fn policy_system_prompt_omits_peer_catalog() {
+        let policies = vec![CorePolicyRecord {
+            index: nuillu_types::PolicyIndex::new("policy-1"),
+            trigger: "the agent is greeted".to_owned(),
+            behavior: "answer gently".to_owned(),
         }];
-        let prompt = format_identity_system_prompt("BASE", &memories, &[], test_now());
+        let prompt = format_policy_system_prompt("BASE", &policies);
 
         assert_eq!(
             prompt,
-            "BASE\n\nIdentity memory loaded at agent startup:\n- [memory-1] The agent is named Nuillu.\n"
+            "BASE\n\nCore policies loaded at agent startup:\n- [policy-1] When the agent is greeted, do: answer gently\n"
         );
         assert!(!prompt.contains("You are part of a cognitive system"));
-    }
-
-    #[test]
-    fn identity_memory_can_include_temporal_context() {
-        let memories = vec![IdentityMemoryRecord {
-            index: nuillu_types::MemoryIndex::new("memory-1"),
-            content: nuillu_types::MemoryContent::new("The agent met Koro."),
-            occurred_at: Some(chrono::Utc.with_ymd_and_hms(2025, 5, 10, 0, 0, 0).unwrap()),
-        }];
-
-        let prompt =
-            format_system_prompt("BASE", &[], &builtin::sensory(), &memories, &[], test_now());
-
-        assert!(prompt.contains("<one-year-ago occurred-at=\"2025-05-10T00:00:00Z\">"));
-        assert!(prompt.contains("The agent met Koro."));
-    }
-
-    fn test_now() -> DateTime<Utc> {
-        chrono::Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap()
+        assert!(!prompt.contains("Identity memory loaded at agent startup"));
     }
 }

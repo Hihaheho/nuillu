@@ -182,9 +182,7 @@ impl MemoryModule {
                 SYSTEM_PROMPT,
                 cx.peer_contexts(),
                 &self.owner,
-                cx.identity_memories(),
                 cx.core_policies(),
-                cx.now(),
             )
         })
     }

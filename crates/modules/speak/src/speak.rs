@@ -786,23 +786,13 @@ impl SpeakModule {
 impl SpeakModule {
     fn plan_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.plan_prompt.get_or_init(|| {
-            nuillu_module::format_identity_system_prompt(
-                SPEECH_PLANNING_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
+            nuillu_module::format_policy_system_prompt(SPEECH_PLANNING_PROMPT, cx.core_policies())
         })
     }
 
     fn generation_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.generation_prompt.get_or_init(|| {
-            nuillu_module::format_identity_system_prompt(
-                GENERATION_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
+            nuillu_module::format_policy_system_prompt(GENERATION_PROMPT, cx.core_policies())
         })
     }
 
@@ -1521,15 +1511,15 @@ mod tests {
         TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, ModuleConfig,
-        ResourceAllocation,
+        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, IdentityMemoryRecord,
+        ModuleConfig, ResourceAllocation,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LutumTiers,
         ModuleRegistry, Participant,
     };
-    use nuillu_types::{ModuleInstanceId, ReplicaIndex, builtin};
+    use nuillu_types::{MemoryContent, MemoryIndex, ModuleInstanceId, ReplicaIndex, builtin};
 
     use super::*;
     use crate::test_support::*;
@@ -2404,14 +2394,10 @@ mod tests {
 
     #[test]
     fn speech_prompts_are_slim_and_avoid_peer_catalog() {
-        let prompt = nuillu_module::format_identity_system_prompt(
-            GENERATION_PROMPT,
-            &[],
-            &[],
-            SystemClock.now(),
-        );
+        let prompt = nuillu_module::format_policy_system_prompt(GENERATION_PROMPT, &[]);
 
         assert!(prompt.len() < 1100);
+        assert!(!prompt.contains("Identity memory loaded at agent startup"));
         assert!(!prompt.contains("prepare_speech"));
         assert!(!prompt.contains("tool call"));
         assert!(!prompt.contains("speech_content"));
@@ -2462,7 +2448,11 @@ mod tests {
 
         let batch = module.next_batch().await.unwrap();
         let catalog = Vec::new();
-        let identity_memories = Vec::new();
+        let identity_memories = vec![IdentityMemoryRecord {
+            index: MemoryIndex::new("identity-1"),
+            content: MemoryContent::new("Nui is a small blue frog."),
+            occurred_at: None,
+        }];
         let compaction_lutum = module.llm.lutum().await;
         let clock = SystemClock;
         let cx = nuillu_module::ActivateCx::new(
@@ -2495,9 +2485,23 @@ mod tests {
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
         assert_eq!(module.planning_session.list_turns().count(), 1);
         let planning_text = session_input_text(&module.planning_session);
+        assert_eq!(
+            planning_text
+                .matches("What I already remember about myself")
+                .count(),
+            1
+        );
+        assert!(!planning_text.contains("Identity memory loaded at agent startup"));
         assert!(planning_text.contains("Koro asks Nuillu to help them stay safe."));
         assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
         let generation_text = session_input_text(&module.generation_session);
+        assert_eq!(
+            generation_text
+                .matches("What I already remember about myself")
+                .count(),
+            1
+        );
+        assert!(!generation_text.contains("Identity memory loaded at agent startup"));
         assert!(!generation_text.contains("New cognition entries at "));
         assert!(
             generation_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")

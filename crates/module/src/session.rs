@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use crate::ports::PortError;
 use crate::session_compaction::{SessionCompactionConfig, SessionCompactionProtectedPrefix};
 use crate::{
-    REASONING_SYSTEM_PROMPT, format_identity_memory_seed, format_persistent_system_seed,
+    REASONING_SYSTEM_PROMPT, format_identity_memory_seed, format_system_seed,
     seed_persistent_faculty_session,
 };
 
@@ -238,7 +238,11 @@ pub fn ensure_persistent_session_seeded(
         ensure_combined_system_seed(session, &system_prompt, reasoning, identity_memories, now);
         return;
     }
-    seed_persistent_faculty_session(session, system_prompt, reasoning, identity_memories, now);
+    if leading_system_text(session.input().items()).is_some() {
+        ensure_combined_system_seed(session, &system_prompt, reasoning, identity_memories, now);
+    } else {
+        seed_persistent_faculty_session(session, system_prompt, reasoning, identity_memories, now);
+    }
     if let Some(metadata) = persistent_session_metadata_mut(session) {
         metadata.seeded = true;
     }
@@ -256,14 +260,18 @@ fn ensure_combined_system_seed(
     let has_reasoning = leading_system_text(items)
         .map(|text| text.contains(REASONING_SYSTEM_PROMPT))
         .unwrap_or(false);
+    let has_identity = identity_memories.is_empty()
+        || leading_system_text(items)
+            .map(|text| text.contains("What I already remember about myself"))
+            .unwrap_or(false);
     let has_legacy_identity = legacy_identity_seed_at(items, 1);
-    if has_leading_system && !has_legacy_identity && (!reasoning || has_reasoning) {
+    if has_leading_system && has_identity && !has_legacy_identity && (!reasoning || has_reasoning) {
         return;
     }
 
     let seed = ModelInputItem::text(
         InputMessageRole::System,
-        format_persistent_system_seed(system_prompt.to_owned(), reasoning, identity_memories, now),
+        format_system_seed(system_prompt.to_owned(), reasoning, identity_memories, now),
     );
     if has_leading_system {
         items[0] = seed;
@@ -826,7 +834,12 @@ mod tests {
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
         assert!(system.contains("What I already remember about myself"));
+        assert_eq!(
+            occurrences(system, "What I already remember about myself"),
+            1
+        );
         assert!(system.contains("The agent is named Nuillu."));
+        assert!(!system.contains("Identity memory loaded at agent startup"));
     }
 
     #[test]
@@ -839,6 +852,30 @@ mod tests {
         let system = leading_system_text_for_test(&session);
         assert!(!system.contains(REASONING_SYSTEM_PROMPT));
         assert!(system.contains("What I already remember about myself"));
+        assert_eq!(
+            occurrences(system, "What I already remember about myself"),
+            1
+        );
+        assert!(!system.contains("Identity memory loaded at agent startup"));
+    }
+
+    #[test]
+    fn existing_leading_system_is_seeded_without_duplicate_identity() {
+        let mut session = Session::new();
+        session.push_system("SYSTEM");
+
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+        ensure_persistent_session_seeded(&mut session, "SYSTEM", &[identity_memory()], now());
+
+        let items = session.input().items();
+        assert_eq!(items.len(), 1);
+        let system = leading_system_text_for_test(&session);
+        assert!(system.starts_with("SYSTEM\n\n"));
+        assert_eq!(
+            occurrences(system, "What I already remember about myself"),
+            1
+        );
+        assert!(!system.contains("Identity memory loaded at agent startup"));
     }
 
     #[test]
@@ -857,7 +894,12 @@ mod tests {
         let items = session.input().items();
         let system = leading_system_text_for_test(&session);
         assert_eq!(occurrences(system, REASONING_SYSTEM_PROMPT), 1);
+        assert_eq!(
+            occurrences(system, "What I already remember about myself"),
+            1
+        );
         assert!(system.contains("The agent is named Nuillu."));
+        assert!(!system.contains("Identity memory loaded at agent startup"));
         assert!(!matches!(
             items.get(1),
             Some(ModelInputItem::Assistant(AssistantInputItem::Text(text)))

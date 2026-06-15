@@ -9,7 +9,7 @@ use crate::{
 
 pub const REASONING_SYSTEM_PROMPT: &str = "During reasoning, reason extremely concisely: use at most 4 short sentences or 128 tokens of internal deliberation before deciding.";
 
-pub fn format_persistent_system_seed(
+pub fn format_system_seed(
     system_prompt: impl Into<String>,
     reasoning: bool,
     identity_memories: &[IdentityMemoryRecord],
@@ -38,7 +38,7 @@ pub fn seed_persistent_faculty_session(
 ) {
     let seed_item = ModelInputItem::text(
         InputMessageRole::System,
-        format_persistent_system_seed(system_prompt, reasoning, identity_memories, now),
+        format_system_seed(system_prompt, reasoning, identity_memories, now),
     );
     session.input_mut().items_mut().insert(0, seed_item);
 }
@@ -132,6 +132,13 @@ mod tests {
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
         assert!(system.contains("What I already remember about myself"));
+        assert_eq!(
+            system
+                .matches("What I already remember about myself")
+                .count(),
+            1
+        );
+        assert!(!system.contains("Identity memory loaded at agent startup"));
 
         let ModelInputItem::Message { role, content } = &items[1] else {
             panic!("expected cognition batch user text second");

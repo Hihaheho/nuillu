@@ -4,7 +4,7 @@ use lutum::Session;
 use nuillu_module::{
     CognitionLogReader, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    ensure_persistent_session_seeded, format_identity_system_prompt,
+    ensure_persistent_session_seeded, format_policy_system_prompt,
     push_formatted_cognition_log_batch,
 };
 
@@ -68,14 +68,8 @@ impl PredictModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            format_identity_system_prompt(
-                SYSTEM_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
-        })
+        self.system_prompt
+            .get_or_init(|| format_policy_system_prompt(SYSTEM_PROMPT, cx.core_policies()))
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {

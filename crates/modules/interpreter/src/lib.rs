@@ -128,12 +128,7 @@ impl InterpreterModule {
 
     fn model_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
         self.model_prompt.get_or_init(|| {
-            nuillu_module::format_identity_system_prompt(
-                MODEL_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
+            nuillu_module::format_policy_system_prompt(MODEL_PROMPT, cx.core_policies())
         })
     }
 

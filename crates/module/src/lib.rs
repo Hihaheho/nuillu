@@ -95,14 +95,12 @@ pub use mind_format::{
     memory_rank_counts,
 };
 pub use mind_session::{
-    REASONING_SYSTEM_PROMPT, format_persistent_system_seed, push_formatted_cognition_log_batch,
+    REASONING_SYSTEM_PROMPT, format_system_seed, push_formatted_cognition_log_batch,
     push_formatted_memo_log_batch, seed_persistent_faculty_session,
 };
 pub use nuillu_types::ModuleId;
 pub use ports::Embedder;
-pub use prompt::{
-    format_faculty_system_prompt, format_identity_system_prompt, format_system_prompt,
-};
+pub use prompt::{format_faculty_system_prompt, format_policy_system_prompt, format_system_prompt};
 pub use readers::{
     AllocationReader, BlackboardReader, CognitionLogReader, InteroceptiveReader,
     MemoryMetadataReader, ModuleStatusReader,

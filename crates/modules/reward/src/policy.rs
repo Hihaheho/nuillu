@@ -10,7 +10,7 @@ use nuillu_module::{
     InteroceptiveReader, LlmAccess, LlmContextWindow, Memo, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_identity_system_prompt,
+    format_bounded_memo_log_batch, format_policy_system_prompt, format_system_seed,
 };
 use nuillu_types::{ModuleId, ModuleInstanceId, PolicyIndex, PolicyRank};
 use schemars::JsonSchema;
@@ -229,14 +229,8 @@ impl PolicyModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            format_identity_system_prompt(
-                SYSTEM_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
-        })
+        self.system_prompt
+            .get_or_init(|| format_policy_system_prompt(SYSTEM_PROMPT, cx.core_policies()))
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
@@ -433,10 +427,10 @@ impl PolicyModule {
         candidate: &ProposePolicyCandidateArgs,
     ) -> bool {
         let input = ModelInput::new()
-            .system(format_identity_system_prompt(
-                POLICY_CANDIDATE_EVALUATION_PROMPT,
+            .system(format_system_seed(
+                format_policy_system_prompt(POLICY_CANDIDATE_EVALUATION_PROMPT, cx.core_policies()),
+                false,
                 cx.identity_memories(),
-                cx.core_policies(),
                 cx.now(),
             ))
             .user(format_policy_candidate_evaluation_request(
@@ -1385,6 +1379,14 @@ mod tests {
         let structured_inputs = observed.structured_inputs();
         assert_eq!(structured_inputs.len(), 1);
         let eval_text = all_input_text(&structured_inputs[0]);
+        assert!(eval_text.contains("What I already remember about myself"));
+        assert_eq!(
+            eval_text
+                .matches("What I already remember about myself")
+                .count(),
+            1
+        );
+        assert!(!eval_text.contains("Identity memory loaded at agent startup"));
         assert!(eval_text.contains("IDENTITY_EVIDENCE_MARKER"));
         assert!(eval_text.contains("REJECTED_ADVICE_MARKER"));
         assert!(

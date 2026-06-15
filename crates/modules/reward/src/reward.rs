@@ -13,7 +13,7 @@ use nuillu_module::{
     BlackboardReader, CognitionLogReader, InteroceptiveReader, LlmAccess, LlmContextWindow, Memo,
     Module, SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
     compact_llm_context_text, ensure_persistent_session_seeded, format_bounded_cognition_log_batch,
-    format_bounded_memo_log_batch, format_identity_system_prompt,
+    format_bounded_memo_log_batch, format_policy_system_prompt,
 };
 use nuillu_types::{PolicyIndex, PolicyRank, SignedUnitF32, UnitF32};
 use schemars::JsonSchema;
@@ -420,14 +420,8 @@ impl RewardModule {
     }
 
     fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            format_identity_system_prompt(
-                SYSTEM_PROMPT,
-                cx.identity_memories(),
-                cx.core_policies(),
-                cx.now(),
-            )
-        })
+        self.system_prompt
+            .get_or_init(|| format_policy_system_prompt(SYSTEM_PROMPT, cx.core_policies()))
     }
 
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {

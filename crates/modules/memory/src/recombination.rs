@@ -136,12 +136,15 @@ impl MemoryRecombinationModule {
         }
 
         let mut input = ModelInput::new()
-            .system(nuillu_module::format_system_prompt(
-                SYSTEM_PROMPT,
-                cx.peer_contexts(),
-                &self.owner,
+            .system(nuillu_module::format_system_seed(
+                nuillu_module::format_system_prompt(
+                    SYSTEM_PROMPT,
+                    cx.peer_contexts(),
+                    &self.owner,
+                    cx.core_policies(),
+                ),
+                false,
                 cx.identity_memories(),
-                cx.core_policies(),
                 cx.now(),
             ))
             .user(format_recombination_context(&recent));
