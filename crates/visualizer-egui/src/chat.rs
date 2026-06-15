@@ -50,7 +50,7 @@ impl ActivityRole {
         match self {
             Self::User => "scene-activity-role-sensory",
             Self::Environment => "scene-activity-role-ambient",
-            Self::Assistant => "scene-activity-role-nui",
+            Self::Assistant => "scene-activity-role-agent",
         }
     }
 }
