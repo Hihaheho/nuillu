@@ -793,6 +793,7 @@ impl QueryMemoryModule {
                     memory_indexes: vec![record.index.clone()],
                     relation_filter: Vec::new(),
                     direction: MemoryLinkDirection::Both,
+                    offset: 0,
                     limit: DEFAULT_LINKED_MEMORY_LIMIT,
                 })
                 .await
@@ -827,6 +828,7 @@ impl QueryMemoryModule {
                 memory_indexes: args.memory_indexes,
                 relation_filter: Vec::new(),
                 direction: MemoryLinkDirection::Both,
+                offset: 0,
                 limit: DEFAULT_LINKED_MEMORY_LIMIT,
             })
             .await

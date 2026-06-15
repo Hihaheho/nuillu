@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     io::{self, BufRead, BufReader, BufWriter, ErrorKind, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
@@ -12,7 +11,7 @@ use nuillu_module::{AmbientSensoryEntry, RuntimeEvent, SensoryInput};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 1;
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 2;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -195,19 +194,23 @@ pub enum VisualizerEvent {
         tab_id: VisualizerTabId,
         snapshot: BlackboardSnapshot,
     },
-    MemoryPage {
+    MemoryRecordsLoaded {
         tab_id: VisualizerTabId,
-        page: MemoryPage,
-    },
-    MemoryQueryResult {
-        tab_id: VisualizerTabId,
-        query: String,
+        scope: MemoryRecordScope,
+        offset: usize,
         records: Vec<MemoryRecordView>,
+        has_more: bool,
     },
-    MemoryLinkedResult {
+    LinkedMemoryRecordsLoaded {
         tab_id: VisualizerTabId,
         memory_index: String,
+        offset: usize,
         records: Vec<LinkedMemoryRecordView>,
+        has_more: bool,
+    },
+    MemoryDeleted {
+        tab_id: VisualizerTabId,
+        memory_index: String,
     },
     AmbientSensoryRows {
         tab_id: VisualizerTabId,
@@ -294,27 +297,22 @@ pub enum VisualizerCommand {
         tab_id: VisualizerTabId,
         owner: String,
     },
-    QueryMemory {
+    LoadMemoryRecords {
         tab_id: VisualizerTabId,
-        query: String,
+        scope: MemoryRecordScope,
+        offset: usize,
         limit: usize,
     },
-    FetchLinkedMemories {
+    LoadLinkedMemories {
         tab_id: VisualizerTabId,
         memory_index: String,
         relation_filter: Vec<String>,
+        offset: usize,
         limit: usize,
     },
     DeleteMemory {
         tab_id: VisualizerTabId,
         memory_index: String,
-        page: usize,
-        per_page: usize,
-    },
-    ListMemories {
-        tab_id: VisualizerTabId,
-        page: usize,
-        per_page: usize,
     },
     Shutdown,
 }
@@ -759,7 +757,7 @@ pub struct UtteranceProgressView {
     pub partial_utterance: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryMetadataView {
     pub index: String,
     pub rank: String,
@@ -770,7 +768,7 @@ pub struct MemoryMetadataView {
     pub reinforcement_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRecordView {
     pub index: String,
     pub kind: String,
@@ -785,7 +783,7 @@ pub struct MemoryRecordView {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryConceptView {
     pub label: String,
     pub mention_text: Option<String>,
@@ -793,14 +791,14 @@ pub struct MemoryConceptView {
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryTagView {
     pub label: String,
     pub namespace: String,
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLinkView {
     pub from_memory: String,
     pub to_memory: String,
@@ -811,18 +809,17 @@ pub struct MemoryLinkView {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkedMemoryRecordView {
     pub record: MemoryRecordView,
     pub link: MemoryLinkView,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemoryPage {
-    pub page: usize,
-    pub per_page: usize,
-    pub total: usize,
-    pub records: Vec<MemoryRecordView>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum MemoryRecordScope {
+    Latest,
+    Search { query: String },
 }
 
 pub struct VisualizerServerPort {
@@ -990,24 +987,6 @@ fn write_json_line(
     writer.flush()?;
     Ok(())
 }
-
-pub fn memory_page_from_records(
-    records: &[MemoryRecordView],
-    page: usize,
-    per_page: usize,
-) -> MemoryPage {
-    let total = records.len();
-    let start = page.saturating_mul(per_page).min(records.len());
-    let end = start.saturating_add(per_page).min(records.len());
-    MemoryPage {
-        page,
-        per_page,
-        total,
-        records: records[start..end].to_vec(),
-    }
-}
-
-pub type MemoryCache = BTreeMap<String, Vec<MemoryRecordView>>;
 
 #[cfg(test)]
 mod tests {
@@ -1338,6 +1317,49 @@ mod tests {
     }
 
     #[test]
+    fn memory_chunks_round_trip_through_json() {
+        let at = DateTime::<Utc>::from_timestamp(1_780_000_000, 0).unwrap();
+        let record = MemoryRecordView {
+            index: "m1".to_string(),
+            kind: "Statement".to_string(),
+            rank: "ShortTerm".to_string(),
+            occurred_at: Some(at),
+            stored_at: at,
+            concepts: Vec::new(),
+            tags: Vec::new(),
+            affect_arousal: 0.0,
+            valence: 0.0,
+            emotion: String::new(),
+            content: "remembered".to_string(),
+        };
+        let message = VisualizerServerMessage::event(VisualizerEvent::MemoryRecordsLoaded {
+            tab_id: VisualizerTabId::new("live"),
+            scope: MemoryRecordScope::Search {
+                query: "remembered".to_string(),
+            },
+            offset: 50,
+            records: vec![record.clone()],
+            has_more: true,
+        });
+
+        let json = serde_json::to_string(&message).unwrap();
+        let actual: VisualizerServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert!(matches!(
+            actual,
+            VisualizerServerMessage::Event {
+                event: VisualizerEvent::MemoryRecordsLoaded {
+                    scope: MemoryRecordScope::Search { query },
+                    offset: 50,
+                    records,
+                    has_more: true,
+                    ..
+                },
+            } if query == "remembered" && records == vec![record]
+        ));
+    }
+
+    #[test]
     fn blackboard_snapshot_defaults_missing_interoception() {
         let json = r#"{
             "module_statuses": [],
@@ -1363,7 +1385,7 @@ mod tests {
             let client = port.recv().unwrap();
             assert!(matches!(
                 client,
-                VisualizerClientMessage::Hello { version: 1 }
+                VisualizerClientMessage::Hello { version: 2 }
             ));
             let tab_id = VisualizerTabId::new("case-1");
             port.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
@@ -1384,7 +1406,7 @@ mod tests {
         let (incoming, outgoing) = client.into_channels();
         assert!(matches!(
             incoming.recv().unwrap(),
-            VisualizerServerMessage::Hello { version: 1 }
+            VisualizerServerMessage::Hello { version: 2 }
         ));
         let event = incoming.recv().unwrap();
         let VisualizerServerMessage::Event {
@@ -1415,7 +1437,7 @@ mod tests {
             let message = port.recv_timeout(Duration::from_secs(1)).unwrap();
             assert!(matches!(
                 message,
-                Some(VisualizerClientMessage::Hello { version: 1 })
+                Some(VisualizerClientMessage::Hello { version: 2 })
             ));
         });
 
@@ -1426,7 +1448,7 @@ mod tests {
         let (incoming, _) = client.into_channels();
         assert!(matches!(
             incoming.recv_timeout(Duration::from_secs(1)).unwrap(),
-            VisualizerServerMessage::Hello { version: 1 }
+            VisualizerServerMessage::Hello { version: 2 }
         ));
 
         server.join().unwrap();

@@ -45,6 +45,28 @@ pub trait MemoryStore {
     ) -> Result<MemoryRecord, PortError>;
     async fn get(&self, index: &MemoryIndex) -> Result<Option<MemoryRecord>, PortError>;
     async fn list_by_rank(&self, rank: MemoryRank) -> Result<Vec<MemoryRecord>, PortError>;
+    async fn list_recent(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for rank in all_memory_ranks() {
+            records.extend(self.list_by_rank(rank).await?);
+        }
+        records.sort_by(|left, right| {
+            right
+                .stored_at
+                .cmp(&left.stored_at)
+                .then_with(|| left.index.as_str().cmp(right.index.as_str()))
+        });
+        let start = offset.min(records.len());
+        let end = start.saturating_add(limit).min(records.len());
+        Ok(records[start..end].to_vec())
+    }
     async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError>;
     async fn linked(&self, q: &LinkedMemoryQuery) -> Result<Vec<LinkedMemoryRecord>, PortError>;
     async fn upsert_link(
@@ -53,6 +75,16 @@ pub trait MemoryStore {
         updated_at: DateTime<Utc>,
     ) -> Result<MemoryLink, PortError>;
     async fn delete(&self, index: &MemoryIndex) -> Result<(), PortError>;
+}
+
+fn all_memory_ranks() -> [MemoryRank; 5] {
+    [
+        MemoryRank::Identity,
+        MemoryRank::Permanent,
+        MemoryRank::LongTerm,
+        MemoryRank::MidTerm,
+        MemoryRank::ShortTerm,
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
@@ -169,6 +201,7 @@ pub struct LinkedMemoryQuery {
     pub memory_indexes: Vec<MemoryIndex>,
     pub relation_filter: Vec<MemoryLinkRelation>,
     pub direction: MemoryLinkDirection,
+    pub offset: usize,
     pub limit: usize,
 }
 
@@ -178,6 +211,7 @@ impl LinkedMemoryQuery {
             memory_indexes,
             relation_filter: Vec::new(),
             direction: MemoryLinkDirection::Both,
+            offset: 0,
             limit,
         }
     }
@@ -267,6 +301,7 @@ pub struct MemoryRecord {
 #[derive(Debug, Clone)]
 pub struct MemoryQuery {
     pub text: String,
+    pub offset: usize,
     pub limit: usize,
     pub kinds: Vec<MemoryKind>,
     pub concepts: Vec<String>,
@@ -277,6 +312,7 @@ impl MemoryQuery {
     pub fn text(text: impl Into<String>, limit: usize) -> Self {
         Self {
             text: text.into(),
+            offset: 0,
             limit,
             kinds: Vec::new(),
             concepts: Vec::new(),

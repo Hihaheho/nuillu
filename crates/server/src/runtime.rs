@@ -22,7 +22,7 @@ use crate::gui::{
 };
 use crate::llm_db_trace::emit_persisted_llm_transcripts;
 use crate::registry::{full_agent_allocation, server_registry};
-use crate::snapshot::{emit_visualizer_blackboard_snapshot, emit_visualizer_memory_page};
+use crate::snapshot::emit_visualizer_blackboard_snapshot;
 use crate::state::{ModuleSettingsState, SceneState};
 
 const SERVER_TITLE: &str = "nuillu-server";
@@ -132,15 +132,6 @@ async fn run_server(config: ServerConfig, visualizer: &mut VisualizerHook) -> an
     }
 
     emit_visualizer_blackboard_snapshot(SERVER_TAB_ID, &env.blackboard, visualizer).await;
-    emit_visualizer_memory_page(
-        SERVER_TAB_ID,
-        visualizer,
-        &env.blackboard,
-        env.memory.as_ref(),
-        0,
-        25,
-    )
-    .await;
     emit_persisted_llm_transcripts(
         &env.llm_transcript_store,
         SERVER_TAB_ID,

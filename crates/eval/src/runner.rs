@@ -45,7 +45,7 @@ use nuillu_types::{
 };
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
-    MemoView, MemoryMetadataView, MemoryPage, MemoryRecordView, ModuleSettingsView,
+    MemoView, MemoryMetadataView, MemoryRecordScope, MemoryRecordView, ModuleSettingsView,
     ModuleStatusView, TabStatus, UtteranceDeltaView, UtteranceProgressView, UtteranceView,
     VisualizerAction, VisualizerClientMessage, VisualizerCommand, VisualizerErrorView,
     VisualizerEvent, VisualizerServerMessage, VisualizerTabId, ZeroReplicaWindowView,
@@ -198,15 +198,30 @@ impl VisualizerHook {
         self.memory_cache.insert(case_id.to_string(), records);
     }
 
-    fn cached_memory_page(&self, case_id: &str, page: usize, per_page: usize) -> MemoryPage {
-        memory_page_from_records(
-            self.memory_cache
-                .get(case_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            page,
-            per_page,
-        )
+    fn cached_memory_records(
+        &self,
+        case_id: &str,
+        scope: &MemoryRecordScope,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<MemoryRecordView>, bool) {
+        let records = self
+            .memory_cache
+            .get(case_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let matches = match scope {
+            MemoryRecordScope::Latest => records.to_vec(),
+            MemoryRecordScope::Search { query } => {
+                let needle = query.to_lowercase();
+                records
+                    .iter()
+                    .filter(|record| record.content.to_lowercase().contains(&needle))
+                    .cloned()
+                    .collect()
+            }
+        };
+        memory_chunk_from_records(&matches, offset, limit)
     }
 
     fn drain_cached_commands_until_shutdown(&mut self) {
@@ -219,34 +234,20 @@ impl VisualizerHook {
                     self.request_shutdown();
                     break;
                 }
-                VisualizerCommand::ListMemories {
+                VisualizerCommand::LoadMemoryRecords {
                     tab_id,
-                    page,
-                    per_page,
-                } => {
-                    let page = self.cached_memory_page(tab_id.as_str(), page, per_page);
-                    self.send_event(VisualizerEvent::MemoryPage { tab_id, page });
-                }
-                VisualizerCommand::QueryMemory {
-                    tab_id,
-                    query,
+                    scope,
+                    offset,
                     limit,
                 } => {
-                    let needle = query.to_lowercase();
-                    let records = self
-                        .memory_cache
-                        .get(tab_id.as_str())
-                        .map(Vec::as_slice)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|record| record.content.to_lowercase().contains(&needle))
-                        .take(limit)
-                        .cloned()
-                        .collect();
-                    self.send_event(VisualizerEvent::MemoryQueryResult {
+                    let (records, has_more) =
+                        self.cached_memory_records(tab_id.as_str(), &scope, offset, limit);
+                    self.send_event(VisualizerEvent::MemoryRecordsLoaded {
                         tab_id,
-                        query,
+                        scope,
+                        offset,
                         records,
+                        has_more,
                     });
                 }
                 VisualizerCommand::SendOneShotSensoryInput { tab_id, .. } => {
@@ -262,7 +263,7 @@ impl VisualizerHook {
                 | VisualizerCommand::UpdateSceneRow { tab_id, .. }
                 | VisualizerCommand::RemoveSceneRow { tab_id, .. }
                 | VisualizerCommand::SendScenePersonMessage { tab_id, .. }
-                | VisualizerCommand::FetchLinkedMemories { tab_id, .. }
+                | VisualizerCommand::LoadLinkedMemories { tab_id, .. }
                 | VisualizerCommand::DeleteMemory { tab_id, .. }
                 | VisualizerCommand::SetModuleDisabled { tab_id, .. }
                 | VisualizerCommand::SetModuleSettings { tab_id, .. }
@@ -1977,7 +1978,7 @@ async fn execute_full_agent_case(
     let _ = seed_memos(&env.blackboard, env.clock.as_ref(), &case.memos, false).await?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_page(
+        emit_visualizer_memory_records(
             case_id,
             visualizer,
             &env.blackboard,
@@ -2254,7 +2255,7 @@ async fn execute_full_agent_case(
     write_full_agent_last_state_eure(output_dir, last_state)?;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_page(
+        emit_visualizer_memory_records(
             case_id,
             visualizer,
             &env.blackboard,
@@ -2336,7 +2337,7 @@ async fn execute_module_case(
         seed_cognition_log(&env.blackboard, env.clock.as_ref(), &case.cognition_log).await;
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_page(
+        emit_visualizer_memory_records(
             case_id,
             visualizer,
             &env.blackboard,
@@ -2697,7 +2698,7 @@ async fn execute_module_case(
     }
     if let Some(visualizer) = hooks.visualizer.as_mut() {
         emit_visualizer_blackboard_snapshot(case_id, &env.blackboard, Some(visualizer)).await;
-        emit_visualizer_memory_page(
+        emit_visualizer_memory_records(
             case_id,
             visualizer,
             &env.blackboard,
@@ -3256,6 +3257,7 @@ async fn render_memory_store_artifact(
             memory_indexes: indexes,
             relation_filter: Vec::new(),
             direction: MemoryLinkDirection::Both,
+            offset: 0,
             limit: 128,
         })
         .await
@@ -3325,6 +3327,7 @@ async fn memory_diff_observation(
                 memory_indexes: indexes,
                 relation_filter: Vec::new(),
                 direction: MemoryLinkDirection::Both,
+                offset: 0,
                 limit: 128,
             })
             .await
@@ -4095,39 +4098,41 @@ async fn handle_visualizer_commands(
                     input: body,
                 });
             }
-            VisualizerCommand::QueryMemory {
+            VisualizerCommand::LoadMemoryRecords {
                 tab_id,
-                query,
+                scope,
+                offset,
                 limit,
             } if tab_id.as_str() == case_id => {
-                let records = memory
-                    .search(&MemoryQuery::text(query.clone(), limit))
-                    .await
-                    .map(|records| records.into_iter().map(memory_record_view).collect())
-                    .unwrap_or_default();
-                visualizer.send_event(VisualizerEvent::MemoryQueryResult {
+                let scope_for_event = scope.clone();
+                let records = match scope {
+                    MemoryRecordScope::Latest => memory
+                        .list_recent(offset, limit.saturating_add(1))
+                        .await
+                        .unwrap_or_default(),
+                    MemoryRecordScope::Search { query } => {
+                        let mut query = MemoryQuery::text(query, limit.saturating_add(1));
+                        query.offset = offset;
+                        memory.search(&query).await.unwrap_or_default()
+                    }
+                }
+                .into_iter()
+                .map(memory_record_view)
+                .collect::<Vec<_>>();
+                let (records, has_more) = trim_visualizer_chunk(records, limit);
+                visualizer.send_event(VisualizerEvent::MemoryRecordsLoaded {
                     tab_id,
-                    query,
+                    scope: scope_for_event,
+                    offset,
                     records,
+                    has_more,
                 });
             }
-            VisualizerCommand::ListMemories {
-                tab_id,
-                page,
-                per_page,
-            } if tab_id.as_str() == case_id => {
-                let all_records = list_all_visualizer_memories(blackboard, memory).await;
-                visualizer.set_memory_cache(case_id, all_records.clone());
-                let records = memory_page_from_records(&all_records, page, per_page);
-                visualizer.send_event(VisualizerEvent::MemoryPage {
-                    tab_id,
-                    page: records,
-                });
-            }
-            VisualizerCommand::FetchLinkedMemories {
+            VisualizerCommand::LoadLinkedMemories {
                 tab_id,
                 memory_index,
                 relation_filter,
+                offset,
                 limit,
             } if tab_id.as_str() == case_id => {
                 let relation_filter = relation_filter
@@ -4139,33 +4144,33 @@ async fn handle_visualizer_commands(
                         memory_indexes: vec![MemoryIndex::new(memory_index.clone())],
                         relation_filter,
                         direction: MemoryLinkDirection::Both,
-                        limit,
+                        offset,
+                        limit: limit.saturating_add(1),
                     })
                     .await
                     .map(|records| records.into_iter().map(linked_memory_record_view).collect())
                     .unwrap_or_default();
-                visualizer.send_event(VisualizerEvent::MemoryLinkedResult {
+                let (records, has_more) = trim_visualizer_chunk(records, limit);
+                visualizer.send_event(VisualizerEvent::LinkedMemoryRecordsLoaded {
                     tab_id,
                     memory_index,
+                    offset,
                     records,
+                    has_more,
                 });
             }
             VisualizerCommand::DeleteMemory {
                 tab_id,
                 memory_index,
-                page,
-                per_page,
             } if tab_id.as_str() == case_id => {
-                let index = MemoryIndex::new(memory_index);
+                let index = MemoryIndex::new(memory_index.clone());
                 let _ = memory.delete(&index).await;
                 blackboard
                     .apply(BlackboardCommand::RemoveMemoryMetadata { index })
                     .await;
-                let all_records = list_all_visualizer_memories(blackboard, memory).await;
-                visualizer.set_memory_cache(case_id, all_records.clone());
-                visualizer.send_event(VisualizerEvent::MemoryPage {
+                visualizer.send_event(VisualizerEvent::MemoryDeleted {
                     tab_id,
-                    page: memory_page_from_records(&all_records, page, per_page),
+                    memory_index,
                 });
             }
             VisualizerCommand::SetModuleDisabled {
@@ -4333,98 +4338,57 @@ async fn build_module_policy_update(
     Ok((module, policy))
 }
 
-pub(crate) async fn emit_visualizer_memory_page(
+pub(crate) async fn emit_visualizer_memory_records(
     case_id: &str,
     visualizer: &mut VisualizerHook,
     blackboard: &Blackboard,
     memory: &dyn MemoryStore,
-    page: usize,
-    per_page: usize,
+    offset: usize,
+    limit: usize,
 ) {
-    let records = list_all_visualizer_memories(blackboard, memory).await;
+    let records = list_visualizer_memories(blackboard, memory, 0, usize::MAX).await;
     visualizer.set_memory_cache(case_id, records.clone());
-    let page = memory_page_from_records(&records, page, per_page);
-    visualizer.send_event(VisualizerEvent::MemoryPage {
+    let (records, has_more) = memory_chunk_from_records(&records, offset, limit);
+    visualizer.send_event(VisualizerEvent::MemoryRecordsLoaded {
         tab_id: VisualizerTabId::new(case_id.to_string()),
-        page,
+        scope: MemoryRecordScope::Latest,
+        offset,
+        records,
+        has_more,
     });
 }
 
-async fn list_all_visualizer_memories(
-    blackboard: &Blackboard,
+async fn list_visualizer_memories(
+    _blackboard: &Blackboard,
     memory: &dyn MemoryStore,
+    offset: usize,
+    limit: usize,
 ) -> Vec<MemoryRecordView> {
-    let indexes = blackboard
-        .read(|bb| {
-            let mut records = bb
-                .memory_metadata()
-                .iter()
-                .map(|(index, metadata)| {
-                    (index.clone(), metadata.occurred_at, metadata.last_accessed)
-                })
-                .collect::<Vec<_>>();
-            records.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then_with(|| right.2.cmp(&left.2))
-                    .then_with(|| left.0.as_str().cmp(right.0.as_str()))
-            });
-            records
-                .into_iter()
-                .map(|(index, _, _)| index)
-                .collect::<Vec<_>>()
-        })
-        .await;
-
-    let mut records = Vec::new();
-    for index in indexes {
-        if let Ok(Some(record)) = memory.get(&index).await {
-            records.push(memory_record_view(record));
-        }
-    }
-
-    if records.is_empty() {
-        let mut seen = HashSet::new();
-        for rank in [
-            MemoryRank::Identity,
-            MemoryRank::Permanent,
-            MemoryRank::LongTerm,
-            MemoryRank::MidTerm,
-            MemoryRank::ShortTerm,
-        ] {
-            if let Ok(rank_records) = memory.list_by_rank(rank).await {
-                for record in rank_records {
-                    if seen.insert(record.index.clone()) {
-                        records.push(memory_record_view(record));
-                    }
-                }
-            }
-        }
-        records.sort_by(|left, right| {
-            right
-                .occurred_at
-                .cmp(&left.occurred_at)
-                .then_with(|| left.index.cmp(&right.index))
-        });
-    }
-
-    records
+    memory
+        .list_recent(offset, limit)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(memory_record_view)
+        .collect()
 }
 
-fn memory_page_from_records(
+fn memory_chunk_from_records(
     records: &[MemoryRecordView],
-    page: usize,
-    per_page: usize,
-) -> MemoryPage {
-    let total = records.len();
-    let start = page.saturating_mul(per_page).min(records.len());
-    let end = start.saturating_add(per_page).min(records.len());
-    MemoryPage {
-        page,
-        per_page,
-        total,
-        records: records[start..end].to_vec(),
+    offset: usize,
+    limit: usize,
+) -> (Vec<MemoryRecordView>, bool) {
+    let start = offset.min(records.len());
+    let end = start.saturating_add(limit).min(records.len());
+    (records[start..end].to_vec(), end < records.len())
+}
+
+fn trim_visualizer_chunk<T>(mut records: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    if records.len() > limit {
+        records.truncate(limit);
+        (records, true)
+    } else {
+        (records, false)
     }
 }
 
@@ -7870,9 +7834,12 @@ id = "{id}"
 
         command_tx
             .send(VisualizerClientMessage::Command {
-                command: VisualizerCommand::QueryMemory {
+                command: VisualizerCommand::LoadMemoryRecords {
                     tab_id: VisualizerTabId::new("case-1"),
-                    query: "rust".to_string(),
+                    scope: MemoryRecordScope::Search {
+                        query: "rust".to_string(),
+                    },
+                    offset: 0,
                     limit: 10,
                 },
             })
@@ -7888,8 +7855,8 @@ id = "{id}"
         else {
             panic!("expected visualizer event");
         };
-        let VisualizerEvent::MemoryQueryResult { records, .. } = event else {
-            panic!("expected memory query result");
+        let VisualizerEvent::MemoryRecordsLoaded { records, .. } = event else {
+            panic!("expected memory records chunk");
         };
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].content, "rust memory");

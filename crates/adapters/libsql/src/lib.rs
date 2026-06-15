@@ -2781,6 +2781,37 @@ impl MemoryStore for LibsqlMemoryStore {
         Ok(out)
     }
 
+    async fn list_recent(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, PortError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            r#"
+            SELECT id, memory_index, content, kind, rank, occurred_at_ms, stored_at_ms,
+                   affect_arousal, valence, emotion
+            FROM {memories}
+            WHERE deleted_at_ms IS NULL
+            ORDER BY stored_at_ms DESC, memory_index ASC
+            LIMIT ?1 OFFSET ?2
+            "#,
+            memories = self.table_name,
+        );
+        let mut rows = self
+            .conn
+            .query(&sql, params![limit_to_i64(limit), limit_to_i64(offset)])
+            .await
+            .map_err(map_libsql_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
+            out.push(self.row_to_record(&row).await?);
+        }
+        Ok(out)
+    }
+
     async fn search(&self, q: &MemoryQuery) -> Result<Vec<MemoryRecord>, PortError> {
         if q.limit == 0 {
             return Ok(Vec::new());
@@ -2886,6 +2917,8 @@ impl MemoryStore for LibsqlMemoryStore {
         };
         let limit_placeholder =
             push_query_param(&mut params, Value::Integer(limit_to_i64(q.limit)));
+        let offset_placeholder =
+            push_query_param(&mut params, Value::Integer(limit_to_i64(q.offset)));
         let sql = format!(
             r#"
             SELECT m.id, m.memory_index, m.content, m.kind, m.rank, m.occurred_at_ms, m.stored_at_ms,
@@ -2895,6 +2928,7 @@ impl MemoryStore for LibsqlMemoryStore {
             WHERE {where_clause}
             ORDER BY {order_clause}
             LIMIT {limit_placeholder}
+            OFFSET {offset_placeholder}
             "#,
             memories = self.table_name,
             where_clause = where_clauses.join("\n              AND "),
@@ -2920,6 +2954,7 @@ impl MemoryStore for LibsqlMemoryStore {
         let links = self.links_table_name();
         let memories = &self.table_name;
         let mut out = Vec::new();
+        let mut skipped = 0_usize;
         let mut seen =
             std::collections::HashSet::<(String, String, MemoryLinkRelation, String)>::new();
         for index in &q.memory_indexes {
@@ -2980,6 +3015,10 @@ impl MemoryStore for LibsqlMemoryStore {
                     freeform_relation.clone().unwrap_or_default(),
                 );
                 if !seen.insert(key) {
+                    continue;
+                }
+                if skipped < q.offset {
+                    skipped += 1;
                     continue;
                 }
                 let linked_id: i64 = row.get(9).map_err(map_libsql_error)?;
@@ -3857,6 +3896,7 @@ mod tests {
         let hits = store
             .search(&MemoryQuery {
                 text: String::new(),
+                offset: 0,
                 limit: 10,
                 kinds: vec![MemoryKind::Episode],
                 concepts: vec!["ryo".to_string()],
@@ -3895,6 +3935,7 @@ mod tests {
         let hits = store
             .search(&MemoryQuery {
                 text: "alpha".to_string(),
+                offset: 0,
                 limit: 1,
                 kinds: Vec::new(),
                 concepts: vec!["needle".to_string()],
@@ -3938,6 +3979,7 @@ mod tests {
         let hits = store
             .search(&MemoryQuery {
                 text: "alpha".to_string(),
+                offset: 0,
                 limit: 1,
                 kinds: Vec::new(),
                 concepts: Vec::new(),
@@ -4194,6 +4236,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_recent_returns_live_records_by_stored_time_with_offset() {
+        let store = store().await;
+        let old_at = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mid_at = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let new_at = chrono::Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+
+        store
+            .put(IndexedMemory {
+                stored_at: old_at,
+                ..indexed_memory(MemoryIndex::new("old"), "old", MemoryRank::Identity)
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                stored_at: new_at,
+                ..indexed_memory(MemoryIndex::new("new"), "new", MemoryRank::ShortTerm)
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                stored_at: mid_at,
+                ..indexed_memory(MemoryIndex::new("mid"), "mid", MemoryRank::LongTerm)
+            })
+            .await
+            .unwrap();
+
+        let records = store.list_recent(1, 2).await.unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.index.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mid", "old"]
+        );
+    }
+
+    #[tokio::test]
     async fn put_inserts_replaces_and_revives() {
         let store = store().await;
         let id = MemoryIndex::new("replica-1");
@@ -4258,6 +4340,39 @@ mod tests {
 
         let hits = store.search(&memory_query("alpha", 0)).await.unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_honors_offset_after_ordering() {
+        let store = store().await;
+        let old_at = chrono::Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        let new_at = chrono::Utc.with_ymd_and_hms(2026, 2, 2, 0, 0, 0).unwrap();
+        store
+            .put(IndexedMemory {
+                stored_at: old_at,
+                ..indexed_memory(MemoryIndex::new("old"), "shared", MemoryRank::LongTerm)
+            })
+            .await
+            .unwrap();
+        store
+            .put(IndexedMemory {
+                stored_at: new_at,
+                ..indexed_memory(MemoryIndex::new("new"), "shared", MemoryRank::LongTerm)
+            })
+            .await
+            .unwrap();
+
+        let mut query = MemoryQuery::text("", 1);
+        query.offset = 1;
+        let records = store.search(&query).await.unwrap();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.index.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old"]
+        );
     }
 
     #[tokio::test]
@@ -4374,6 +4489,7 @@ mod tests {
             store
                 .search(&MemoryQuery {
                     text: String::new(),
+                    offset: 0,
                     limit: 10,
                     kinds: Vec::new(),
                     concepts: vec!["alpha-project".to_string()],
@@ -4432,6 +4548,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linked_honors_offset_after_filtering() {
+        let store = store().await;
+        let root = store
+            .insert(
+                new_memory("root", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        let old = store
+            .insert(
+                new_memory("old", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        let new = store
+            .insert(
+                new_memory("new", MemoryRank::ShortTerm, None),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+            .index;
+        store
+            .upsert_link(
+                NewMemoryLink::derived_from(root.clone(), old.clone()),
+                chrono::Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_link(
+                NewMemoryLink::derived_from(root.clone(), new.clone()),
+                chrono::Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let records = store
+            .linked(&LinkedMemoryQuery {
+                memory_indexes: vec![root],
+                relation_filter: Vec::new(),
+                direction: MemoryLinkDirection::Outgoing,
+                offset: 1,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(records[0].record.index, old);
+    }
+
+    #[tokio::test]
     async fn compact_inserts_summary_and_hides_sources() {
         let store = store().await;
         let first = store
@@ -4480,6 +4652,7 @@ mod tests {
                 memory_indexes: vec![merged.clone()],
                 relation_filter: vec![MemoryLinkRelation::DerivedFrom],
                 direction: MemoryLinkDirection::Outgoing,
+                offset: 0,
                 limit: 8,
             })
             .await

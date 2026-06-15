@@ -579,31 +579,38 @@ impl VisualizerState {
                 modules::apply_blackboard_snapshot(&mut tab.modules, &snapshot);
                 tab.blackboard = snapshot;
             }
-            VisualizerEvent::MemoryPage { tab_id, page } => {
-                let tab = self.tab_mut(tab_id);
-                tab.memories.query.clear();
-                tab.memories.query_results.clear();
-                tab.memories.linked_memory_index.clear();
-                tab.memories.linked_results.clear();
-                tab.memories.page = page;
-            }
-            VisualizerEvent::MemoryQueryResult {
+            VisualizerEvent::MemoryRecordsLoaded {
                 tab_id,
-                query,
+                scope,
+                offset,
                 records,
+                has_more,
             } => {
-                let tab = self.tab_mut(tab_id);
-                tab.memories.query = query;
-                tab.memories.query_results = records;
+                self.tab_mut(tab_id)
+                    .memories
+                    .apply_records_loaded(scope, offset, records, has_more);
             }
-            VisualizerEvent::MemoryLinkedResult {
+            VisualizerEvent::LinkedMemoryRecordsLoaded {
                 tab_id,
                 memory_index,
+                offset,
                 records,
+                has_more,
             } => {
-                let tab = self.tab_mut(tab_id);
-                tab.memories.linked_memory_index = memory_index;
-                tab.memories.linked_results = records;
+                self.tab_mut(tab_id).memories.apply_linked_records_loaded(
+                    memory_index,
+                    offset,
+                    records,
+                    has_more,
+                );
+            }
+            VisualizerEvent::MemoryDeleted {
+                tab_id,
+                memory_index,
+            } => {
+                self.tab_mut(tab_id)
+                    .memories
+                    .apply_memory_deleted(&memory_index);
             }
             VisualizerEvent::AmbientSensoryRows { .. } => {}
             VisualizerEvent::SceneState { tab_id, state } => {
@@ -1511,12 +1518,13 @@ mod tests {
     }
 
     #[test]
-    fn reducer_replaces_memory_query_results() {
+    fn reducer_replaces_memory_records() {
         let mut state = VisualizerState::default();
         let tab_id = VisualizerTabId::new("case-1");
-        state.apply(VisualizerEvent::MemoryQueryResult {
+        state.apply(VisualizerEvent::MemoryRecordsLoaded {
             tab_id: tab_id.clone(),
-            query: "rust".to_string(),
+            scope: MemoryRecordScope::Latest,
+            offset: 0,
             records: vec![MemoryRecordView {
                 index: "m1".to_string(),
                 kind: "Statement".to_string(),
@@ -1530,11 +1538,12 @@ mod tests {
                 emotion: String::new(),
                 content: "learned rust".to_string(),
             }],
+            has_more: false,
         });
 
         let tab = state.tabs().get(&tab_id).expect("tab exists");
-        assert_eq!(tab.memories.query, "rust");
-        assert_eq!(tab.memories.query_results[0].content, "learned rust");
+        assert_eq!(tab.memories.scope, MemoryRecordScope::Latest);
+        assert_eq!(tab.memories.records[0].content, "learned rust");
     }
 
     #[test]

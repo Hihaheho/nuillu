@@ -9,14 +9,14 @@ use nuillu_agent::AgentRunController;
 use nuillu_blackboard::{
     Blackboard, BlackboardCommand, Bpm, ModulePolicy, ZeroReplicaWindowPolicy,
 };
-use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation};
+use nuillu_memory::{LinkedMemoryQuery, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery};
 use nuillu_module::{AmbientSensoryEntry, SensoryInput, SensoryInputMailbox, SensoryModality};
 use nuillu_types::{MemoryIndex, ModuleId, ModuleInstanceId, ReplicaCapRange, ReplicaIndex};
 use nuillu_visualizer_protocol::{
-    AmbientSensorySnapshotRowView, ModuleSettingsView, OneShotSensoryInputRowView,
-    UtteranceEventKindView, UtteranceEventRowView, VisualizerClientMessage, VisualizerCommand,
-    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
-    run_runtime_action_id, stop_runtime_action_id,
+    AmbientSensorySnapshotRowView, MemoryRecordScope, ModuleSettingsView,
+    OneShotSensoryInputRowView, UtteranceEventKindView, UtteranceEventRowView,
+    VisualizerClientMessage, VisualizerCommand, VisualizerEvent, VisualizerTabId,
+    ZeroReplicaWindowView, run_runtime_action_id, stop_runtime_action_id,
 };
 
 use crate::SERVER_TAB_ID;
@@ -24,8 +24,7 @@ use crate::environment::ServerEnvironment;
 use crate::gui::VisualizerHook;
 use crate::runtime::set_runtime_running;
 use crate::snapshot::{
-    emit_visualizer_blackboard_snapshot, linked_memory_record_view, list_all_memories,
-    memory_record_view,
+    emit_visualizer_blackboard_snapshot, linked_memory_record_view, memory_record_view,
 };
 use crate::state::{ModuleSettingsState, SceneState};
 
@@ -299,57 +298,69 @@ async fn handle_server_visualizer_message(
             }
             false
         }
-        VisualizerCommand::QueryMemory {
+        VisualizerCommand::LoadMemoryRecords {
             tab_id: command_tab,
-            query,
+            scope,
+            offset,
             limit,
         } if command_tab == *tab_id => {
-            let records = env
-                .memory
-                .search(&nuillu_memory::MemoryQuery::text(query.clone(), limit))
-                .await
-                .map(|records| records.into_iter().map(memory_record_view).collect())
-                .unwrap_or_default();
-            visualizer.send_event(VisualizerEvent::MemoryQueryResult {
-                tab_id: tab_id.clone(),
-                query,
-                records,
-            });
+            let scope_for_event = scope.clone();
+            match load_memory_records(env, scope, offset, limit).await {
+                Ok((records, has_more)) => {
+                    visualizer.send_event(VisualizerEvent::MemoryRecordsLoaded {
+                        tab_id: tab_id.clone(),
+                        scope: scope_for_event,
+                        offset,
+                        records,
+                        has_more,
+                    });
+                }
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to load memory records: {error}"),
+                    });
+                }
+            }
             false
         }
-        VisualizerCommand::FetchLinkedMemories {
+        VisualizerCommand::LoadLinkedMemories {
             tab_id: command_tab,
             memory_index,
             relation_filter,
+            offset,
             limit,
         } if command_tab == *tab_id => {
-            let relation_filter = relation_filter
-                .into_iter()
-                .filter_map(|relation| parse_memory_relation(&relation))
-                .collect::<Vec<_>>();
-            let records = env
-                .memory
-                .linked(&LinkedMemoryQuery {
-                    memory_indexes: vec![MemoryIndex::new(memory_index.clone())],
-                    relation_filter,
-                    direction: MemoryLinkDirection::Both,
-                    limit,
-                })
-                .await
-                .map(|records| records.into_iter().map(linked_memory_record_view).collect())
-                .unwrap_or_default();
-            visualizer.send_event(VisualizerEvent::MemoryLinkedResult {
-                tab_id: tab_id.clone(),
-                memory_index,
-                records,
-            });
+            match load_linked_memory_records(
+                env,
+                memory_index.clone(),
+                relation_filter,
+                offset,
+                limit,
+            )
+            .await
+            {
+                Ok((records, has_more)) => {
+                    visualizer.send_event(VisualizerEvent::LinkedMemoryRecordsLoaded {
+                        tab_id: tab_id.clone(),
+                        memory_index,
+                        offset,
+                        records,
+                        has_more,
+                    });
+                }
+                Err(error) => {
+                    visualizer.send_event(VisualizerEvent::Log {
+                        tab_id: tab_id.clone(),
+                        message: format!("failed to load linked memory records: {error}"),
+                    });
+                }
+            }
             false
         }
         VisualizerCommand::DeleteMemory {
             tab_id: command_tab,
             memory_index,
-            page,
-            per_page,
         } if command_tab == *tab_id => {
             let index = MemoryIndex::new(memory_index.clone());
             if let Err(error) = env.memory_caps.deleter().delete(&index).await {
@@ -357,27 +368,83 @@ async fn handle_server_visualizer_message(
                     tab_id: tab_id.clone(),
                     message: format!("failed to delete memory {memory_index}: {error}"),
                 });
+            } else {
+                visualizer.send_event(VisualizerEvent::MemoryDeleted {
+                    tab_id: tab_id.clone(),
+                    memory_index,
+                });
             }
-            let records = list_all_memories(env.memory.as_ref()).await;
-            visualizer.send_event(VisualizerEvent::MemoryPage {
-                tab_id: tab_id.clone(),
-                page: memory_page_from_records(&records, page, per_page),
-            });
-            false
-        }
-        VisualizerCommand::ListMemories {
-            tab_id: command_tab,
-            page,
-            per_page,
-        } if command_tab == *tab_id => {
-            let records = list_all_memories(env.memory.as_ref()).await;
-            visualizer.send_event(VisualizerEvent::MemoryPage {
-                tab_id: tab_id.clone(),
-                page: memory_page_from_records(&records, page, per_page),
-            });
             false
         }
         _ => false,
+    }
+}
+
+async fn load_memory_records(
+    env: &ServerEnvironment,
+    scope: MemoryRecordScope,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<nuillu_visualizer_protocol::MemoryRecordView>, bool)> {
+    if limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let fetch_limit = limit.saturating_add(1);
+    let records = match scope {
+        MemoryRecordScope::Latest => env.memory.list_recent(offset, fetch_limit).await?,
+        MemoryRecordScope::Search { query } => {
+            let mut query = MemoryQuery::text(query, fetch_limit);
+            query.offset = offset;
+            env.memory.search(&query).await?
+        }
+    };
+    let (records, has_more) = trim_chunk(records, limit);
+    Ok((
+        records.into_iter().map(memory_record_view).collect(),
+        has_more,
+    ))
+}
+
+async fn load_linked_memory_records(
+    env: &ServerEnvironment,
+    memory_index: String,
+    relation_filter: Vec<String>,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(
+    Vec<nuillu_visualizer_protocol::LinkedMemoryRecordView>,
+    bool,
+)> {
+    if limit == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let relation_filter = relation_filter
+        .into_iter()
+        .filter_map(|relation| parse_memory_relation(&relation))
+        .collect::<Vec<_>>();
+    let records = env
+        .memory
+        .linked(&LinkedMemoryQuery {
+            memory_indexes: vec![MemoryIndex::new(memory_index)],
+            relation_filter,
+            direction: MemoryLinkDirection::Both,
+            offset,
+            limit: limit.saturating_add(1),
+        })
+        .await?;
+    let (records, has_more) = trim_chunk(records, limit);
+    Ok((
+        records.into_iter().map(linked_memory_record_view).collect(),
+        has_more,
+    ))
+}
+
+fn trim_chunk<T>(mut records: Vec<T>, limit: usize) -> (Vec<T>, bool) {
+    if records.len() > limit {
+        records.truncate(limit);
+        (records, true)
+    } else {
+        (records, false)
     }
 }
 

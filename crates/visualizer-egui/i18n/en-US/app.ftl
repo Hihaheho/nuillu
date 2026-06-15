@@ -72,9 +72,9 @@ blackboard-occurred = Occurred
 
 memory-query-button = Query
 memory-latest-button = Latest
-memory-prev-button = Prev
-memory-next-button = Next
-memory-page-status = page { $page } / total { $total }
+memory-loaded-status = showing { $loaded }
+memory-loading = Loading
+memory-end = End
 memory-query-label = Query: { $query }
 memory-linked-title = Linked memories: { $index }
 memory-stored-at = stored { $stored_at }

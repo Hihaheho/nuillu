@@ -71,9 +71,9 @@ blackboard-occurred = 発生時刻
 
 memory-query-button = 検索
 memory-latest-button = 最新
-memory-prev-button = 前へ
-memory-next-button = 次へ
-memory-page-status = ページ { $page } / 合計 { $total }
+memory-loaded-status = 表示 { $loaded } 件
+memory-loading = 読み込み中
+memory-end = これ以上ありません
 memory-query-label = 検索: { $query }
 memory-linked-title = リンク済み記憶: { $index }
 memory-stored-at = 保存 { $stored_at }

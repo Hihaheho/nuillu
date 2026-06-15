@@ -4,13 +4,13 @@ use nuillu_blackboard::{
     Blackboard, BlackboardInner, InteroceptiveMode, InteroceptiveState, ResourceAllocation,
     ZeroReplicaWindowPolicy,
 };
-use nuillu_memory::{LinkedMemoryRecord, MemoryRecord, MemoryStore};
+use nuillu_memory::{LinkedMemoryRecord, MemoryRecord};
 use nuillu_types::{MemoryRank, ModelTier};
 use nuillu_visualizer_protocol::{
     AllocationView, BlackboardSnapshot, CognitionEntryView, CognitionLogView, InteroceptionView,
     LinkedMemoryRecordView, MemoView, MemoryConceptView, MemoryLinkView, MemoryMetadataView,
     MemoryRecordView, MemoryTagView, ModulePolicyView, ModuleStatusView, UtteranceProgressView,
-    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView, memory_page_from_records,
+    VisualizerEvent, VisualizerTabId, ZeroReplicaWindowView,
 };
 
 use super::gui::VisualizerHook;
@@ -25,44 +25,6 @@ pub(crate) async fn emit_visualizer_blackboard_snapshot(
         tab_id: VisualizerTabId::new(tab_id.to_string()),
         snapshot,
     });
-}
-
-pub(crate) async fn emit_visualizer_memory_page(
-    tab_id: &str,
-    visualizer: &mut VisualizerHook,
-    blackboard: &Blackboard,
-    memory: &dyn MemoryStore,
-    page: usize,
-    per_page: usize,
-) {
-    let records = list_all_visualizer_memories(blackboard, memory).await;
-    let page = memory_page_from_records(&records, page, per_page);
-    visualizer.send_event(VisualizerEvent::MemoryPage {
-        tab_id: VisualizerTabId::new(tab_id.to_string()),
-        page,
-    });
-}
-
-pub async fn list_all_memories(memory: &dyn MemoryStore) -> Vec<MemoryRecordView> {
-    let mut out = Vec::new();
-    for rank in [
-        MemoryRank::Identity,
-        MemoryRank::Permanent,
-        MemoryRank::LongTerm,
-        MemoryRank::MidTerm,
-        MemoryRank::ShortTerm,
-    ] {
-        if let Ok(records) = memory.list_by_rank(rank).await {
-            out.extend(records.into_iter().map(memory_record_view));
-        }
-    }
-    out.sort_by(|left, right| {
-        right
-            .occurred_at
-            .cmp(&left.occurred_at)
-            .then_with(|| left.index.cmp(&right.index))
-    });
-    out
 }
 
 pub fn memory_record_view(record: MemoryRecord) -> MemoryRecordView {
@@ -111,42 +73,6 @@ pub fn linked_memory_record_view(record: LinkedMemoryRecord) -> LinkedMemoryReco
             updated_at: record.link.updated_at,
         },
     }
-}
-
-async fn list_all_visualizer_memories(
-    blackboard: &Blackboard,
-    memory: &dyn MemoryStore,
-) -> Vec<MemoryRecordView> {
-    let indexes = blackboard
-        .read(|bb| {
-            let mut records = bb
-                .memory_metadata()
-                .iter()
-                .map(|(index, metadata)| {
-                    (index.clone(), metadata.occurred_at, metadata.last_accessed)
-                })
-                .collect::<Vec<_>>();
-            records.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then_with(|| right.2.cmp(&left.2))
-                    .then_with(|| left.0.as_str().cmp(right.0.as_str()))
-            });
-            records
-                .into_iter()
-                .map(|(index, _, _)| index)
-                .collect::<Vec<_>>()
-        })
-        .await;
-
-    let mut records = Vec::new();
-    for index in indexes {
-        if let Ok(Some(record)) = memory.get(&index).await {
-            records.push(memory_record_view(record));
-        }
-    }
-    records
 }
 
 fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
