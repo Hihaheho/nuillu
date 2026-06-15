@@ -52,6 +52,7 @@ If a language is supplied, render the utterance in that language.
 Preserve its answer polarity, addressee-facing perspective, direct warnings, advice, uncertainty, and visible-absence evidence.
 Use the recent context only to keep wording grounded. Do not add facts, turn an answer back into a question, turn listener-facing substance into a self-directed note, weaken direct content into vague caution, or merely restate the situation.
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
+const GENERATION_TURN_USER_PROMPT: &str = "Generate an utterance to a target.";
 
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
 const SPEECH_PLANNING_TURN_MAX_OUTPUT_TOKENS: u32 = 1024;
@@ -484,14 +485,14 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
     )
 }
 
-fn format_generation_input(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
-    let mut out = format!("Speak to: {}", draft.target.trim());
+fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
+    let mut out = format!("{THINK_OPEN_TAG}\nI'll speak to `{}`.", draft.target.trim());
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
     out.push_str(&format!(
-        "\n\nSubstance to express:\n{}",
-        args.speech_content.trim()
+        "\nSubstance:\n{}\n{THINK_CLOSE_TAG}\n",
+        args.speech_content.trim(),
     ));
     out
 }
@@ -561,7 +562,8 @@ fn push_generation_context(
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
 ) {
-    session.push_ephemeral_user(format_generation_input(args, draft));
+    session.push_ephemeral_user(GENERATION_TURN_USER_PROMPT);
+    session.push_ephemeral_assistant_text(format_generation_thinking_prefill(args, draft));
     if !draft.accumulated.is_empty() {
         session.push_ephemeral_assistant_text(draft.accumulated.clone());
     }
@@ -2279,15 +2281,18 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_text = model_input_text(&inputs[1]);
-        assert!(generation_text.contains("Speak to: Ryo"));
+        assert!(generation_text.contains(GENERATION_TURN_USER_PROMPT));
+        assert!(generation_text.contains("<think>\nI'll speak to `Ryo`."));
         assert!(generation_text.contains("Language: Japanese"));
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
-        assert!(generation_text.contains("Substance to express:\n日本語で短く返事する。"));
+        assert!(generation_text.contains("Substance:\n日本語で短く返事する。\n</think>"));
+        assert!(!generation_text.contains("Speak to:"));
+        assert!(!generation_text.contains("Substance to express:"));
         assert!(!generation_text.contains("New cognition entries at "));
     }
 
     #[test]
-    fn fresh_generation_omits_assistant_prefill() {
+    fn fresh_generation_uses_thinking_plan_prefill() {
         let draft = GenerationDraft::new(7, "Koro");
         let args = test_prepare_speech_args("Koro");
         let mut session = Session::new();
@@ -2297,7 +2302,7 @@ mod tests {
 
         assert_eq!(draft.generation_id, 7);
         assert_eq!(draft.sequence, 0);
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 2);
         let ModelInputItem::Message {
             role: InputMessageRole::User,
             content,
@@ -2308,12 +2313,19 @@ mod tests {
         let [MessageContent::Text(text)] = content.as_slice() else {
             panic!("expected one text content item");
         };
+        assert_eq!(text, GENERATION_TURN_USER_PROMPT);
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
+            panic!("expected assistant thinking prefill");
+        };
         assert!(!text.contains("Recent context:"));
         assert!(!text.contains("Current cognition log at"));
         assert!(!text.contains("New cognition entries at"));
-        assert!(text.contains("Speak to: Koro"));
-        assert!(text.contains("Substance to express:"));
+        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("Substance:"));
+        assert!(text.contains("</think>"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
+        assert!(!text.contains("Speak to:"));
+        assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("prepare_speech"));
         assert!(!text.contains("tool call"));
         assert!(!text.contains("speech_content"));
@@ -2332,12 +2344,14 @@ mod tests {
             speech_content: "日本語で短く返事する。".into(),
         };
 
-        let text = format_generation_input(&args, &draft);
+        let text = format_generation_thinking_prefill(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
-        assert!(text.contains("Speak to: Ryo"));
+        assert!(text.contains("<think>\nI'll speak to `Ryo`."));
         assert!(text.contains("Language: Japanese"));
-        assert!(text.contains("Substance to express:\n日本語で短く返事する。"));
+        assert!(text.contains("Substance:\n日本語で短く返事する。\n</think>"));
+        assert!(!text.contains("Speak to:"));
+        assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("New cognition entries at"));
     }
 
@@ -2350,7 +2364,7 @@ mod tests {
             speech_content: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
-        let text = format_generation_input(&args, &draft);
+        let text = format_generation_thinking_prefill(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
         assert!(text.contains("I do not know whether dinner is ready"));
@@ -2515,7 +2529,8 @@ mod tests {
         );
         assert!(!generation_input.contains("New cognition entries at "));
         assert!(!generation_input.contains("Current cognition log at "));
-        assert!(generation_input.contains("Speak to: Koro"));
+        assert!(generation_input.contains(GENERATION_TURN_USER_PROMPT));
+        assert!(generation_input.contains("<think>\nI'll speak to `Koro`."));
         assert_eq!(
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
@@ -2988,8 +3003,8 @@ mod tests {
         assert!(!full_input_text.contains("none since the previous speech slice"));
         assert!(!full_input_text.contains("New cognition entries at "));
         let items = generation_input.items();
-        assert!(items.len() >= 2);
-        let tail = &items[items.len() - 2..];
+        assert!(items.len() >= 3);
+        let tail = &items[items.len() - 3..];
         let ModelInputItem::Message { role, content } = &tail[0] else {
             panic!("expected continuation generation user context");
         };
@@ -3003,9 +3018,16 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         assert!(!user_text.contains("Recent context:"));
-        assert!(user_text.contains("Substance to express:\nTell Koro to stay close."));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
+            panic!("expected assistant thinking prefill");
+        };
+        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("Substance:\nTell Koro to stay close.\n</think>"));
+        assert!(!text.contains("Speak to:"));
+        assert!(!text.contains("Substance to express:"));
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
             panic!("expected assistant partial utterance prefill");
         };
         assert_eq!(text, "Koro, st");
@@ -3162,8 +3184,8 @@ mod tests {
         assert_eq!(inputs.len(), 4);
         let generation_input = &inputs[3];
         let items = generation_input.items();
-        assert!(items.len() >= 2);
-        let tail = &items[items.len() - 2..];
+        assert!(items.len() >= 3);
+        let tail = &items[items.len() - 3..];
         let ModelInputItem::Message { role, content } = &tail[0] else {
             panic!("expected continuation generation user context");
         };
@@ -3177,11 +3199,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(user_text.contains("Speak to: everyone"));
-        assert!(
-            user_text.contains("Substance to express:\nAliceの挨拶に親しみを込めて短く応える。")
-        );
+        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
+            panic!("expected assistant thinking prefill");
+        };
+        assert!(text.contains("<think>\nI'll speak to `everyone`."));
+        assert!(text.contains("Substance:\nAliceの挨拶に親しみを込めて短く応える。\n</think>"));
+        assert!(!text.contains("Speak to:"));
+        assert!(!text.contains("Substance to express:"));
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
             panic!("expected assistant partial utterance prefill");
         };
         assert_eq!(text, partial);
@@ -3249,8 +3275,8 @@ mod tests {
         assert_eq!(inputs.len(), 4);
         let generation_input = &inputs[3];
         let items = generation_input.items();
-        assert!(items.len() >= 2);
-        let tail = &items[items.len() - 2..];
+        assert!(items.len() >= 3);
+        let tail = &items[items.len() - 3..];
         let ModelInputItem::Message { role, content } = &tail[0] else {
             panic!("expected continuation generation user plan");
         };
@@ -3264,8 +3290,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(user_text.contains("Substance to express:\nTell Koro to duck now."));
+        assert_eq!(user_text, GENERATION_TURN_USER_PROMPT);
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[1] else {
+            panic!("expected assistant thinking prefill");
+        };
+        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(text.contains("Substance:\nTell Koro to duck now.\n</think>"));
+        assert!(!text.contains("Speak to:"));
+        assert!(!text.contains("Substance to express:"));
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
             panic!("expected assistant partial utterance prefill");
         };
         assert_eq!(text, "Koro, du");
@@ -3543,7 +3576,7 @@ mod tests {
         assert_eq!(draft.generation_id, 11);
         assert_eq!(draft.sequence, 2);
         assert_eq!(draft.accumulated, "hello world");
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert!(matches!(
             &items[0],
             ModelInputItem::Message {
@@ -3552,6 +3585,15 @@ mod tests {
             }
         ));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[1] else {
+            panic!("expected assistant thinking prefill");
+        };
+        assert!(text.contains("<think>\nI'll speak to `Koro`."));
+        assert!(
+            text.contains(
+                "Substance:\nTell Koro to stay close because Koro asks for help.\n</think>"
+            )
+        );
+        let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
             panic!("expected assistant prefill");
         };
         assert_eq!(text, "hello world");
