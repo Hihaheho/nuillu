@@ -745,6 +745,7 @@ pub struct CognitionLogView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitionEntryView {
     pub at: DateTime<Utc>,
+    pub origin: String,
     pub text: String,
 }
 

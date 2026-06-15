@@ -14,7 +14,11 @@ pub fn ui(ui: &mut egui::Ui, logs: &[CognitionLogView]) {
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.strong(localized_module_name_with_id(ui.ctx(), entry.source));
+                            ui.strong(cognition_header_label(
+                                ui.ctx(),
+                                entry.source,
+                                &entry.entry.origin,
+                            ));
                             ui.label(entry.entry.at.to_rfc3339());
                         });
                         ui.add_space(4.0);
@@ -52,9 +56,22 @@ fn cognition_entries_newest_first(logs: &[CognitionLogView]) -> Vec<CognitionDis
     entries
 }
 
+fn cognition_header_label(ctx: &egui::Context, source: &str, origin: &str) -> String {
+    let source_label = localized_module_name_with_id(ctx, source);
+    if origin == source {
+        return source_label;
+    }
+    format!(
+        "{source_label} ({})",
+        localized_module_name_with_id(ctx, origin)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+
+    use crate::i18n::{EguiI18nExt as _, I18nCatalog, Locale};
 
     use super::*;
 
@@ -79,6 +96,22 @@ mod tests {
         assert_eq!(entries[2].entry.text, "old attention");
     }
 
+    #[test]
+    fn cognition_header_includes_distinct_origin() {
+        let ctx = egui::Context::default();
+        let catalog = I18nCatalog::embedded().unwrap();
+        ctx.install_i18n(catalog.for_locale(Locale::EnUs));
+
+        assert_eq!(
+            cognition_header_label(&ctx, "cognition-gate", "sensory"),
+            "cognition-gate (sensory)"
+        );
+        assert_eq!(
+            cognition_header_label(&ctx, "interpreter", "interpreter"),
+            "interpreter"
+        );
+    }
+
     fn cognition_log(source: &str, entries: &[(i64, &str)]) -> CognitionLogView {
         CognitionLogView {
             source: source.to_string(),
@@ -86,6 +119,7 @@ mod tests {
                 .iter()
                 .map(|(second, text)| CognitionEntryView {
                     at: Utc.timestamp_opt(*second, 0).unwrap(),
+                    origin: source.to_string(),
                     text: (*text).to_string(),
                 })
                 .collect(),

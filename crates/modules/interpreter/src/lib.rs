@@ -276,7 +276,9 @@ mod tests {
         FinishReason, Lutum, MockLlmAdapter, MockTextScenario, RawTextTurnEvent,
         SharedPoolBudgetManager, SharedPoolBudgetOptions, Usage,
     };
-    use nuillu_blackboard::{Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModulePolicy};
+    use nuillu_blackboard::{
+        Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, CognitionLogOrigin, ModulePolicy,
+    };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
         CapabilityProviderPorts, CapabilityProviders, CognitionLogUpdated, LlmConcurrencyLimiter,
@@ -383,6 +385,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: now,
                     text: "Alice asks for an interesting story.".to_owned(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             })
             .await;

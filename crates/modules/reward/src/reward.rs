@@ -1253,18 +1253,20 @@ mod tests {
                 nuillu_blackboard::CognitionLogEntry {
                     at: old_time,
                     text: "old outcome cognition before consideration".to_owned(),
+                    origin: nuillu_blackboard::CognitionLogOrigin::direct(cognition_owner.clone()),
                 },
             )
             .await;
         blackboard
             .append_cognition_log(
-                cognition_owner,
+                cognition_owner.clone(),
                 nuillu_blackboard::CognitionLogEntry {
                     at: new_time,
                     text: format!(
                         "new outcome cognition after consideration {}",
                         "Q".repeat(1_200)
                     ),
+                    origin: nuillu_blackboard::CognitionLogOrigin::direct(cognition_owner),
                 },
             )
             .await;

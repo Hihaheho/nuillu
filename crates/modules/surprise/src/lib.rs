@@ -375,8 +375,8 @@ mod tests {
         RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModuleConfig,
-        ResourceAllocation, linear_ratio_fn,
+        ActivationRatio, Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, CognitionLogOrigin,
+        ModuleConfig, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -553,12 +553,14 @@ mod tests {
                 written_at: now,
             })
             .await;
+        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
-                source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+                source: source.clone(),
                 entry: CognitionLogEntry {
                     at: now,
                     text: "Koro suddenly growls toward the doorway.".into(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             })
             .await;

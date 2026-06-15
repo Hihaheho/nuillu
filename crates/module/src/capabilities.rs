@@ -1006,7 +1006,7 @@ impl ModuleCapabilityFactory {
     }
 
     pub fn cognition_log_reader(&self) -> CognitionLogReader {
-        self.root.cognition_log_reader()
+        CognitionLogReader::new_for_owner(self.root.inner.blackboard.clone(), self.owner.clone())
     }
 
     pub fn allocation_reader(&self) -> AllocationReader {
@@ -1663,7 +1663,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectLevel, Blackboard, BlackboardCommand,
-        CognitionLogEntry, ModuleConfig, ResourceAllocation,
+        CognitionLogEntry, CognitionLogOrigin, ModuleConfig, ResourceAllocation,
     };
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
 
@@ -2639,20 +2639,23 @@ mod tests {
                 CognitionLogEntry {
                     at: now - chrono::Duration::seconds(3),
                     text: "old cognition".to_owned(),
+                    origin: CognitionLogOrigin::direct(owner_a.clone()),
                 },
             ),
             (
-                owner_b,
+                owner_b.clone(),
                 CognitionLogEntry {
                     at: now - chrono::Duration::seconds(2),
                     text: "recent cognition".to_owned(),
+                    origin: CognitionLogOrigin::direct(owner_b),
                 },
             ),
             (
-                owner_a,
+                owner_a.clone(),
                 CognitionLogEntry {
                     at: now - chrono::Duration::seconds(1),
                     text: "newest cognition".to_owned(),
+                    origin: CognitionLogOrigin::direct(owner_a),
                 },
             ),
         ]);
@@ -2698,14 +2701,16 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: now,
                     text: "seeded cognition".to_owned(),
+                    origin: CognitionLogOrigin::direct(owner.clone()),
                 },
             })
             .await;
         let repo = RecordingCognitionLogRepository::with_records(vec![(
-            owner,
+            owner.clone(),
             CognitionLogEntry {
                 at: now - chrono::Duration::seconds(1),
                 text: "persisted cognition".to_owned(),
+                origin: CognitionLogOrigin::direct(owner.clone()),
             },
         )]);
         let caps = test_caps_with_cognition_repo(blackboard.clone(), Rc::new(repo));

@@ -113,6 +113,7 @@ impl MemoryMetadataReader {
 #[derive(Clone)]
 pub struct CognitionLogReader {
     blackboard: Blackboard,
+    owner: Option<ModuleInstanceId>,
     last_seen_cognition_index: Rc<Cell<Option<u64>>>,
 }
 
@@ -120,6 +121,15 @@ impl CognitionLogReader {
     pub(crate) fn new(blackboard: Blackboard) -> Self {
         Self {
             blackboard,
+            owner: None,
+            last_seen_cognition_index: Rc::new(Cell::new(None)),
+        }
+    }
+
+    pub(crate) fn new_for_owner(blackboard: Blackboard, owner: ModuleInstanceId) -> Self {
+        Self {
+            blackboard,
+            owner: Some(owner),
             last_seen_cognition_index: Rc::new(Cell::new(None)),
         }
     }
@@ -127,21 +137,35 @@ impl CognitionLogReader {
     pub async fn read<R>(&self, f: impl FnOnce(&CognitionLog) -> R) -> R {
         self.blackboard
             .read(|bb| {
-                let log = bb.cognition_log();
+                let log = if let Some(owner) = &self.owner {
+                    bb.cognition_log_excluding_owner(owner)
+                } else {
+                    bb.cognition_log()
+                };
                 f(&log)
             })
             .await
     }
 
     pub async fn snapshot(&self) -> nuillu_blackboard::CognitionLogSet {
-        self.blackboard.read(|bb| bb.cognition_log_set()).await
+        self.blackboard
+            .read(|bb| {
+                if let Some(owner) = &self.owner {
+                    bb.cognition_log_set_excluding_owner(owner)
+                } else {
+                    bb.cognition_log_set()
+                }
+            })
+            .await
     }
 
     pub async fn peek_unread_events(&self) -> Vec<CognitionLogEntryRecord> {
         let last_seen = self.last_seen_cognition_index.get();
-        self.blackboard
+        let records = self
+            .blackboard
             .read(|bb| bb.unread_cognition_log_entries(last_seen))
-            .await
+            .await;
+        self.filter_records(records)
     }
 
     pub async fn unread_events(&self) -> Vec<CognitionLogEntryRecord> {
@@ -153,7 +177,20 @@ impl CognitionLogReader {
         if let Some(index) = records.last().map(|record| record.index) {
             self.last_seen_cognition_index.set(Some(index));
         }
+        self.filter_records(records)
+    }
+
+    fn filter_records(
+        &self,
+        records: Vec<CognitionLogEntryRecord>,
+    ) -> Vec<CognitionLogEntryRecord> {
+        let Some(owner) = &self.owner else {
+            return records;
+        };
         records
+            .into_iter()
+            .filter(|record| record.source != *owner && record.entry.origin.owner != *owner)
+            .collect()
     }
 }
 
@@ -239,7 +276,7 @@ mod tests {
     use super::*;
 
     use chrono::{TimeZone, Utc};
-    use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry};
+    use nuillu_blackboard::{BlackboardCommand, CognitionLogEntry, CognitionLogOrigin};
     use nuillu_types::{ReplicaIndex, builtin};
 
     #[tokio::test]
@@ -366,6 +403,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: Utc.timestamp_opt(0, 0).unwrap(),
                     text: "first".into(),
+                    origin: CognitionLogOrigin::direct(stream.clone()),
                 },
             })
             .await;
@@ -395,10 +433,11 @@ mod tests {
 
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
-                source: stream,
+                source: stream.clone(),
                 entry: CognitionLogEntry {
                     at: Utc.timestamp_opt(1, 0).unwrap(),
                     text: "second".into(),
+                    origin: CognitionLogOrigin::direct(stream),
                 },
             })
             .await;
@@ -422,6 +461,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_cognition_log_reader_filters_self_source_and_origin() {
+        let blackboard = Blackboard::default();
+        let self_owner = ModuleInstanceId::new(builtin::interpreter(), ReplicaIndex::ZERO);
+        let gate = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let reader = CognitionLogReader::new_for_owner(blackboard.clone(), self_owner.clone());
+
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: self_owner.clone(),
+                entry: CognitionLogEntry {
+                    at: Utc.timestamp_opt(0, 0).unwrap(),
+                    text: "direct self".into(),
+                    origin: CognitionLogOrigin::direct(self_owner.clone()),
+                },
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: gate.clone(),
+                entry: CognitionLogEntry {
+                    at: Utc.timestamp_opt(1, 0).unwrap(),
+                    text: "promoted self memo".into(),
+                    origin: CognitionLogOrigin::memo(self_owner.clone(), 7),
+                },
+            })
+            .await;
+        blackboard
+            .apply(BlackboardCommand::AppendCognitionLog {
+                source: gate.clone(),
+                entry: CognitionLogEntry {
+                    at: Utc.timestamp_opt(2, 0).unwrap(),
+                    text: "promoted sensory memo".into(),
+                    origin: CognitionLogOrigin::memo(sensory.clone(), 1),
+                },
+            })
+            .await;
+
+        let unread = reader.unread_events().await;
+        assert_eq!(
+            unread
+                .iter()
+                .map(|record| (record.index, record.entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "promoted sensory memo")]
+        );
+        assert!(reader.unread_events().await.is_empty());
+
+        let snapshot = reader.snapshot().await;
+        assert_eq!(snapshot.logs().len(), 1);
+        assert_eq!(snapshot.logs()[0].source, gate);
+        assert_eq!(snapshot.logs()[0].entries[0].text, "promoted sensory memo");
+    }
+
+    #[tokio::test]
     async fn peek_unread_cognition_log_entries_does_not_advance_reader_cursor() {
         let blackboard = Blackboard::default();
         let stream = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
@@ -433,6 +527,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: Utc.timestamp_opt(0, 0).unwrap(),
                     text: "first".into(),
+                    origin: CognitionLogOrigin::direct(stream.clone()),
                 },
             })
             .await;

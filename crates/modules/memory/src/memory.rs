@@ -684,12 +684,14 @@ mod tests {
     }
 
     fn cognition_record(index: u64, content: &str) -> CognitionLogEntryRecord {
+        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         CognitionLogEntryRecord {
             index,
-            source: ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+            source: source.clone(),
             entry: nuillu_blackboard::CognitionLogEntry {
                 at: Utc.timestamp_opt(index as i64, 0).unwrap(),
                 text: content.to_owned(),
+                origin: nuillu_blackboard::CognitionLogOrigin::direct(source),
             },
         }
     }

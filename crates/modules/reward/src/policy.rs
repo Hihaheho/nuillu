@@ -1185,6 +1185,9 @@ mod tests {
                     nuillu_blackboard::CognitionLogEntry {
                         at: now + chrono::Duration::seconds(index),
                         text: format!("cognition {index} {}", "C".repeat(1_200)),
+                        origin: nuillu_blackboard::CognitionLogOrigin::direct(
+                            cognition_owner.clone(),
+                        ),
                     },
                 )
                 .await;

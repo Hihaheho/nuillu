@@ -70,7 +70,7 @@ mod tests {
     use super::*;
 
     use chrono::TimeZone as _;
-    use nuillu_blackboard::{CognitionLogEntry, MemoLogRecord};
+    use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord};
     use nuillu_types::{MemoryContent, MemoryIndex, ReplicaIndex, builtin};
 
     use lutum::{InputMessageRole, MessageContent, ModelInputItem};
@@ -103,6 +103,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 50).unwrap(),
                     text: "The door is open.".into(),
+                    origin: CognitionLogOrigin::direct(owner.clone()),
                 },
             }],
             now(),

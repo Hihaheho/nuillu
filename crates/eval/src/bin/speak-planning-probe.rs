@@ -16,18 +16,19 @@ const TARGET_PEER: &str = "Peer";
 const COGNITION_CONTEXT: &str = r#"Peer greeted me with "Hi"; brief acknowledgement is warranted."#;
 const FINAL_INSTRUCTION: &str =
     "Use exactly one available speech-planning tool for the current cognition log.";
-const DECISION_CONTRACT: &str = r#"Prepare speech when the current cognition log contains grounded listener-facing substance for an outward utterance. Use decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now."#;
+const DECISION_CONTRACT: &str = r#"Prepare speech when the current cognition log contains grounded outward speaker intent for an utterance. Use decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now."#;
 
 const PLAN_PROMPT: &str = r#"Plan outward speech from the current cognition log and the available target schema.
 Use exactly one available tool.
-Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+Call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the target who should hear the utterance. target is the addressee, not the subject of the utterance content. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" for explicit group/broadcast speech, but do not forbid it.
 Call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no allowed target, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
-Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
-speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
+Put only the grounding cue that prompted speech in context_cue. It is optional, and should be omitted for self-initiated, ambient, or continuation speech when there is no specific cue. context_cue is not the utterance content.
+Put only the current speaker's outward intent in speaker_intent. Do not write the target's future reply, facial expression, feelings, action, or narration in speaker_intent.
+speaker_intent is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence the speaker should convey.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
-For self-directed cognition, transform only the listener-relevant implication into outward substance. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the listener.
-Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
-For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
+For self-directed cognition, transform only the outward implication into speaker intent. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the target.
+Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speaker_intent limited.
+For unknown evidence, make speaker_intent say unknown and include the concrete visible absence or missing evidence."#;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -257,7 +258,9 @@ mod current_schema {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
     pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
-        pub(super) speech_content: String,
+        #[serde(default)]
+        pub(super) context_cue: Option<String>,
+        pub(super) speaker_intent: String,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
@@ -273,7 +276,9 @@ mod required_with_silent_schema {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
     pub(super) struct PrepareSpeechArgs {
         pub(super) target: SpeechTarget,
-        pub(super) speech_content: String,
+        #[serde(default)]
+        pub(super) context_cue: Option<String>,
+        pub(super) speaker_intent: String,
     }
 
     #[lutum::tool_input(name = "decline_speech_now", output = DeclineSpeechNowOutput)]
@@ -299,7 +304,9 @@ mod single_decision_schema {
         #[serde(default)]
         pub(super) target: Option<SpeechTarget>,
         #[serde(default)]
-        pub(super) speech_content: Option<String>,
+        pub(super) context_cue: Option<String>,
+        #[serde(default)]
+        pub(super) speaker_intent: Option<String>,
         #[serde(default)]
         pub(super) reason: Option<String>,
     }
@@ -314,7 +321,7 @@ mod single_decision_schema {
 enum CandidateDecision {
     Speak {
         target: String,
-        speech_content: String,
+        speaker_intent: String,
     },
     Silent {
         reason: String,
@@ -326,7 +333,7 @@ struct ValidationReport {
     success: bool,
     failure: Option<String>,
     target: Option<String>,
-    speech_content: Option<String>,
+    speaker_intent: Option<String>,
     pseudo_tool_text: bool,
     target_validity_failure: bool,
 }
@@ -339,7 +346,7 @@ struct TrialReport {
     success: bool,
     failure: Option<String>,
     target: Option<String>,
-    speech_content: Option<String>,
+    speaker_intent: Option<String>,
     transport_error: bool,
     pseudo_tool_text: bool,
     target_validity_failure: bool,
@@ -607,7 +614,7 @@ async fn run_current_trial(
         |call| match call {
             current_schema::ToolsCall::PrepareSpeech(call) => Some(CandidateDecision::Speak {
                 target: call.input.target.as_str().to_owned(),
-                speech_content: call.input.speech_content.clone(),
+                speaker_intent: call.input.speaker_intent.clone(),
             }),
         },
     )
@@ -641,7 +648,7 @@ async fn run_required_with_silent_trial(
             required_with_silent_schema::ToolsCall::PrepareSpeech(call) => {
                 Some(CandidateDecision::Speak {
                     target: call.input.target.as_str().to_owned(),
-                    speech_content: call.input.speech_content.clone(),
+                    speaker_intent: call.input.speaker_intent.clone(),
                 })
             }
             required_with_silent_schema::ToolsCall::DeclineSpeechNow(call) => {
@@ -684,7 +691,7 @@ async fn run_single_decision_trial(
                             .as_ref()
                             .map(|target| target.as_str().to_owned())
                             .unwrap_or_default(),
-                        speech_content: call.input.speech_content.clone().unwrap_or_default(),
+                        speaker_intent: call.input.speaker_intent.clone().unwrap_or_default(),
                     })
                 } else {
                     Some(CandidateDecision::Silent {
@@ -735,7 +742,7 @@ where
                         success: false,
                         failure: Some(failure),
                         target: None,
-                        speech_content: None,
+                        speaker_intent: None,
                         pseudo_tool_text: false,
                         target_validity_failure: false,
                     }
@@ -744,7 +751,7 @@ where
                 success,
                 failure,
                 target,
-                speech_content,
+                speaker_intent,
                 pseudo_tool_text,
                 target_validity_failure,
             } = validation;
@@ -755,7 +762,7 @@ where
                 success,
                 failure,
                 target,
-                speech_content,
+                speaker_intent,
                 transport_error: false,
                 pseudo_tool_text,
                 target_validity_failure,
@@ -779,7 +786,7 @@ where
                     format!("finished_without_tool:{:?}", result.finish_reason)
                 }),
                 target: None,
-                speech_content: None,
+                speaker_intent: None,
                 transport_error: false,
                 pseudo_tool_text,
                 target_validity_failure: false,
@@ -799,7 +806,7 @@ where
                 result.finish_reason
             )),
             target: None,
-            speech_content: None,
+            speaker_intent: None,
             transport_error: false,
             pseudo_tool_text: false,
             target_validity_failure: false,
@@ -816,7 +823,7 @@ where
                 trial,
                 success: false,
                 target: None,
-                speech_content: None,
+                speaker_intent: None,
                 transport_error: is_transport_failure(&failure),
                 failure: Some(failure),
                 pseudo_tool_text: false,
@@ -840,52 +847,52 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
             success: false,
             failure: Some("silent_on_greeting".to_owned()),
             target: None,
-            speech_content: None,
+            speaker_intent: None,
             pseudo_tool_text: false,
             target_validity_failure: false,
         },
         CandidateDecision::Speak {
             target,
-            speech_content,
+            speaker_intent,
         } => {
             let target = target.trim().to_owned();
-            let speech_content = speech_content.trim().to_owned();
+            let speaker_intent = speaker_intent.trim().to_owned();
             if target != TARGET_PEER {
                 return ValidationReport {
                     success: false,
                     failure: Some("invalid_target".to_owned()),
                     target: Some(target),
-                    speech_content: Some(speech_content),
+                    speaker_intent: Some(speaker_intent),
                     pseudo_tool_text: false,
                     target_validity_failure: true,
                 };
             }
-            if speech_content.is_empty() {
+            if speaker_intent.is_empty() {
                 return ValidationReport {
                     success: false,
-                    failure: Some("empty_speech_content".to_owned()),
+                    failure: Some("empty_speaker_intent".to_owned()),
                     target: Some(target),
-                    speech_content: Some(speech_content),
+                    speaker_intent: Some(speaker_intent),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
             }
-            if contains_bad_speech_content(&speech_content) {
+            if contains_bad_speaker_intent(&speaker_intent) {
                 return ValidationReport {
                     success: false,
-                    failure: Some("bad_speech_content".to_owned()),
+                    failure: Some("bad_speaker_intent".to_owned()),
                     target: Some(target),
-                    speech_content: Some(speech_content),
+                    speaker_intent: Some(speaker_intent),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
             }
-            if !looks_like_greeting_acknowledgement(&speech_content) {
+            if !looks_like_greeting_acknowledgement(&speaker_intent) {
                 return ValidationReport {
                     success: false,
                     failure: Some("not_greeting_acknowledgement".to_owned()),
                     target: Some(target),
-                    speech_content: Some(speech_content),
+                    speaker_intent: Some(speaker_intent),
                     pseudo_tool_text: false,
                     target_validity_failure: false,
                 };
@@ -894,7 +901,7 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
                 success: true,
                 failure: None,
                 target: Some(target),
-                speech_content: Some(speech_content),
+                speaker_intent: Some(speaker_intent),
                 pseudo_tool_text: false,
                 target_validity_failure: false,
             }
@@ -902,7 +909,7 @@ fn validate_candidate_decision(decision: CandidateDecision) -> ValidationReport 
     }
 }
 
-fn contains_bad_speech_content(text: &str) -> bool {
+fn contains_bad_speaker_intent(text: &str) -> bool {
     let normalized = text.to_ascii_lowercase();
     [
         "idle",
@@ -915,6 +922,16 @@ fn contains_bad_speech_content(text: &str) -> bool {
         "prompt",
         "internal",
         "implementation",
+        "peer replies",
+        "peer replied",
+        "peer responds",
+        "peer responded",
+        "peer smiles",
+        "peer smiled",
+        "peer says",
+        "peer said",
+        "listener replies",
+        "listener responds",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -1292,7 +1309,7 @@ mod tests {
     fn validator_accepts_peer_greeting_acknowledgement() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            speech_content: "Say hi back to Peer.".to_owned(),
+            speaker_intent: "Say hi back to Peer.".to_owned(),
         });
 
         assert_eq!(
@@ -1301,7 +1318,7 @@ mod tests {
                 success: true,
                 failure: None,
                 target: Some("Peer".to_owned()),
-                speech_content: Some("Say hi back to Peer.".to_owned()),
+                speaker_intent: Some("Say hi back to Peer.".to_owned()),
                 pseudo_tool_text: false,
                 target_validity_failure: false,
             }
@@ -1322,7 +1339,7 @@ mod tests {
     fn validator_rejects_target_outside_scene() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Koro".to_owned(),
-            speech_content: "Say hello.".to_owned(),
+            speaker_intent: "Say hello.".to_owned(),
         });
 
         assert_eq!(report.failure.as_deref(), Some("invalid_target"));
@@ -1343,13 +1360,24 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_idle_or_internal_speech_content() {
+    fn validator_rejects_idle_or_internal_speaker_intent() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            speech_content: "I have been idle for one second.".to_owned(),
+            speaker_intent: "I have been idle for one second.".to_owned(),
         });
 
-        assert_eq!(report.failure.as_deref(), Some("bad_speech_content"));
+        assert_eq!(report.failure.as_deref(), Some("bad_speaker_intent"));
+        assert!(!report.success);
+    }
+
+    #[test]
+    fn validator_rejects_listener_reaction_as_speaker_intent() {
+        let report = validate_candidate_decision(CandidateDecision::Speak {
+            target: "Peer".to_owned(),
+            speaker_intent: "Peer replies warmly and smiles.".to_owned(),
+        });
+
+        assert_eq!(report.failure.as_deref(), Some("bad_speaker_intent"));
         assert!(!report.success);
     }
 
@@ -1357,7 +1385,7 @@ mod tests {
     fn validator_rejects_non_greeting_content() {
         let report = validate_candidate_decision(CandidateDecision::Speak {
             target: "Peer".to_owned(),
-            speech_content: "I can see the bench.".to_owned(),
+            speaker_intent: "I can see the bench.".to_owned(),
         });
 
         assert_eq!(
@@ -1370,7 +1398,7 @@ mod tests {
     #[test]
     fn pseudo_tool_detection_catches_textual_tool_forms() {
         assert!(looks_like_pseudo_tool(
-            r#"prepare_speech(target="Peer", speech_content="Hi")"#
+            r#"prepare_speech(target="Peer", speaker_intent="Hi")"#
         ));
         assert!(looks_like_pseudo_tool(r#"{"target":"Peer"}"#));
         assert!(!looks_like_pseudo_tool("Hello, Peer."));
@@ -1588,7 +1616,7 @@ mod tests {
             transport_error: failure.as_deref().is_some_and(is_transport_failure),
             failure,
             target: target.map(ToOwned::to_owned),
-            speech_content: success.then(|| "Say hi back.".to_owned()),
+            speaker_intent: success.then(|| "Say hi back.".to_owned()),
             pseudo_tool_text: false,
             target_validity_failure,
             tool_call_count: usize::from(success),

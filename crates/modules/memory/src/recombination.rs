@@ -680,15 +680,17 @@ mod tests {
 
     #[test]
     fn recombination_context_bounds_recent_cognition_entries() {
+        let source = nuillu_types::ModuleInstanceId::new(
+            builtin::cognition_gate(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
         let record = nuillu_blackboard::CognitionLogEntryRecord {
             index: 0,
-            source: nuillu_types::ModuleInstanceId::new(
-                builtin::cognition_gate(),
-                nuillu_types::ReplicaIndex::ZERO,
-            ),
+            source: source.clone(),
             entry: nuillu_blackboard::CognitionLogEntry {
                 at: now(),
                 text: format!("topic {}", "detail ".repeat(200)),
+                origin: nuillu_blackboard::CognitionLogOrigin::direct(source),
             },
         };
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libsql::{Connection, Transaction, Value, params, params_from_iter};
-use nuillu_blackboard::CognitionLogEntry;
+use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin};
 use nuillu_memory::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryConcept, MemoryKind, MemoryLink,
     MemoryLinkDirection, MemoryLinkRelation, MemoryQuery, MemoryRecord, MemoryStore, MemoryTag,
@@ -394,13 +394,22 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
                 "INSERT INTO cognition_log_entries (
                     owner_module,
                     owner_replica,
+                    origin_module,
+                    origin_replica,
+                    origin_memo_index,
                     occurred_at_ms,
                     text,
                     created_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     source.module.as_str(),
                     i64::from(source.replica.get()),
+                    entry.origin.owner.module.as_str(),
+                    i64::from(entry.origin.owner.replica.get()),
+                    entry
+                        .origin
+                        .memo_index
+                        .map(|index| i64::try_from(index).unwrap_or(i64::MAX)),
                     entry.at.timestamp_millis(),
                     entry.text,
                     now_ms(),
@@ -419,7 +428,11 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
         let mut rows = self
             .conn
             .query(
-                "SELECT occurred_at_ms, text
+                "SELECT occurred_at_ms,
+                        text,
+                        COALESCE(origin_module, owner_module),
+                        COALESCE(origin_replica, owner_replica),
+                        origin_memo_index
                    FROM cognition_log_entries
                   WHERE owner_module = ?1
                     AND owner_replica = ?2
@@ -437,9 +450,17 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
         while let Some(row) = rows.next().await.map_err(map_libsql_error)? {
             let occurred_at_ms: i64 = row.get(0).map_err(map_libsql_error)?;
             let text: String = row.get(1).map_err(map_libsql_error)?;
+            let origin_module: String = row.get(2).map_err(map_libsql_error)?;
+            let origin_replica: i64 = row.get(3).map_err(map_libsql_error)?;
+            let origin_memo_index: Option<i64> = row.get(4).map_err(map_libsql_error)?;
             entries.push(CognitionLogEntry {
                 at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
                 text,
+                origin: cognition_origin_from_row(
+                    origin_module,
+                    origin_replica,
+                    origin_memo_index,
+                )?,
             });
         }
         Ok(entries)
@@ -452,9 +473,22 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
         let mut rows = self
             .conn
             .query(
-                "SELECT owner_module, owner_replica, occurred_at_ms, text
+                "SELECT owner_module,
+                        owner_replica,
+                        occurred_at_ms,
+                        text,
+                        COALESCE(origin_module, owner_module),
+                        COALESCE(origin_replica, owner_replica),
+                        origin_memo_index
                    FROM (
-                        SELECT owner_module, owner_replica, occurred_at_ms, text, id
+                        SELECT owner_module,
+                               owner_replica,
+                               occurred_at_ms,
+                               text,
+                               origin_module,
+                               origin_replica,
+                               origin_memo_index,
+                               id
                           FROM cognition_log_entries
                          ORDER BY id DESC
                          LIMIT ?1
@@ -470,11 +504,19 @@ impl CognitionLogRepository for LibsqlCognitionLogRepository {
             let owner_replica: i64 = row.get(1).map_err(map_libsql_error)?;
             let occurred_at_ms: i64 = row.get(2).map_err(map_libsql_error)?;
             let text: String = row.get(3).map_err(map_libsql_error)?;
+            let origin_module: String = row.get(4).map_err(map_libsql_error)?;
+            let origin_replica: i64 = row.get(5).map_err(map_libsql_error)?;
+            let origin_memo_index: Option<i64> = row.get(6).map_err(map_libsql_error)?;
             entries.push(PersistedCognitionLogEntry {
                 source: module_instance_from_row(owner_module, owner_replica)?,
                 entry: CognitionLogEntry {
                     at: datetime_from_millis("cognition log occurred_at", occurred_at_ms)?,
                     text,
+                    origin: cognition_origin_from_row(
+                        origin_module,
+                        origin_replica,
+                        origin_memo_index,
+                    )?,
                 },
             });
         }
@@ -3346,6 +3388,22 @@ fn module_instance_from_row(
     Ok(ModuleInstanceId::new(module, ReplicaIndex::new(replica)))
 }
 
+fn cognition_origin_from_row(
+    origin_module: String,
+    origin_replica: i64,
+    origin_memo_index: Option<i64>,
+) -> Result<CognitionLogOrigin, PortError> {
+    let owner = module_instance_from_row(origin_module, origin_replica)?;
+    let memo_index = origin_memo_index
+        .map(|index| {
+            u64::try_from(index).map_err(|_| {
+                PortError::InvalidData(format!("invalid cognition log origin memo index: {index}"))
+            })
+        })
+        .transpose()?;
+    Ok(CognitionLogOrigin { owner, memo_index })
+}
+
 fn datetime_from_millis(
     label: &str,
     timestamp_ms: i64,
@@ -3906,9 +3964,12 @@ mod tests {
         assert!(column_exists(&store, DEFAULT_MEMORY_TABLE, "emotion").await);
         assert!(column_exists(&store, "cognition_log_entries", "owner_module").await);
         assert!(column_exists(&store, "cognition_log_entries", "owner_replica").await);
+        assert!(column_exists(&store, "cognition_log_entries", "origin_module").await);
+        assert!(column_exists(&store, "cognition_log_entries", "origin_replica").await);
+        assert!(column_exists(&store, "cognition_log_entries", "origin_memo_index").await);
         assert!(column_exists(&store, "cognition_log_entries", "occurred_at_ms").await);
         assert!(column_exists(&store, "cognition_log_entries", "text").await);
-        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 5);
+        assert_eq!(dev_task_count(&store.conn, 0, 1).await, 6);
     }
 
     #[tokio::test]
@@ -4869,15 +4930,17 @@ mod tests {
             CognitionLogEntry {
                 at: old,
                 text: "old owner a".to_owned(),
+                origin: CognitionLogOrigin::direct(owner_a.clone()),
             },
         )
         .await
         .unwrap();
         repo.append(
-            owner_b,
+            owner_b.clone(),
             CognitionLogEntry {
                 at: new,
                 text: "new owner b".to_owned(),
+                origin: CognitionLogOrigin::direct(owner_b),
             },
         )
         .await
@@ -4887,6 +4950,7 @@ mod tests {
             CognitionLogEntry {
                 at: new,
                 text: "new owner a".to_owned(),
+                origin: CognitionLogOrigin::memo(owner_a.clone(), 4),
             },
         )
         .await
@@ -4898,6 +4962,7 @@ mod tests {
             vec![CognitionLogEntry {
                 at: new,
                 text: "new owner a".to_owned(),
+                origin: CognitionLogOrigin::memo(owner_a.clone(), 4),
             }]
         );
     }
@@ -4919,10 +4984,11 @@ mod tests {
             (owner_a.clone(), "third"),
         ] {
             repo.append(
-                owner,
+                owner.clone(),
                 CognitionLogEntry {
                     at,
                     text: text.to_owned(),
+                    origin: CognitionLogOrigin::direct(owner),
                 },
             )
             .await
@@ -4933,9 +4999,16 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|record| (record.source.clone(), record.entry.text.as_str()))
+                .map(|record| (
+                    record.source.clone(),
+                    record.entry.origin.owner.clone(),
+                    record.entry.text.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            vec![(owner_b, "second"), (owner_a, "third")]
+            vec![
+                (owner_b.clone(), owner_b, "second"),
+                (owner_a.clone(), owner_a, "third")
+            ]
         );
     }
 

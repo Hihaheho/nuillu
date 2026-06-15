@@ -197,6 +197,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     .iter()
                     .map(|entry| CognitionEntryView {
                         at: entry.at,
+                        origin: entry.origin.owner.to_string(),
                         text: entry.text.clone(),
                     })
                     .collect(),

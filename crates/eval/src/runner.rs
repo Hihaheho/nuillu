@@ -21,8 +21,9 @@ use lutum_libsql_adapter::{LibsqlAgentStore, LibsqlAgentStoreConfig};
 use nuillu_agent::{AgentEventLoopConfig, run as run_agent};
 use nuillu_blackboard::{
     ActivationRatio, Blackboard, BlackboardCommand, BlackboardInner, Bpm, CognitionLogEntry,
-    CognitionLogEntryRecord, MemoLogRecord, MemoryMetadata, ModuleConfig, ModulePolicy,
-    ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy, linear_ratio_fn,
+    CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord, MemoryMetadata, ModuleConfig,
+    ModulePolicy, ModuleRunStatus, PolicyMetaPatch, ResourceAllocation, ZeroReplicaWindowPolicy,
+    linear_ratio_fn,
 };
 use nuillu_memory::{
     LinkedMemoryQuery, MemoryCapabilities, MemoryLinkDirection, MemoryLinkRelation, MemoryQuery,
@@ -2889,6 +2890,7 @@ async fn activate_module_case_target(
                     CognitionLogEntry {
                         at: clock.now(),
                         text: prompt.to_string(),
+                        origin: CognitionLogOrigin::direct(source.clone()),
                     },
                 )
                 .await;
@@ -4858,6 +4860,7 @@ async fn seed_cognition_log(
                 CognitionLogEntry {
                     at: now - ChronoDuration::seconds(seed.seconds_ago),
                     text: seed.text.content.clone(),
+                    origin: CognitionLogOrigin::direct(stream.clone()),
                 },
             )
             .await;
@@ -5796,6 +5799,7 @@ fn visualizer_blackboard_snapshot(bb: &BlackboardInner) -> BlackboardSnapshot {
                     .iter()
                     .map(|entry| CognitionEntryView {
                         at: entry.at,
+                        origin: entry.origin.owner.to_string(),
                         text: entry.text.clone(),
                     })
                     .collect(),
@@ -9531,10 +9535,11 @@ limits {
             .await;
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
-                source: owner,
+                source: owner.clone(),
                 entry: CognitionLogEntry {
                     at: now,
                     text: "cognition".to_string(),
+                    origin: CognitionLogOrigin::direct(owner),
                 },
             })
             .await;
@@ -9588,6 +9593,12 @@ limits {
                 },
                 "entries": [{
                     "at": "2026-05-07T00:00:00Z",
+                    "origin": {
+                        "owner": {
+                            "module": "query-memory",
+                            "replica": 0,
+                        },
+                    },
                     "text": "cognition",
                 }],
             }],
@@ -9719,12 +9730,14 @@ prompt = "Admit retrieved memory evidence only if it is load-bearing for the cur
             &baseline,
         ));
 
+        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         blackboard
             .append_cognition_log(
-                ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO),
+                source.clone(),
                 CognitionLogEntry {
                     at: now,
                     text: "Approach Koro slowly from the side when he guards food.".to_string(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             )
             .await;
@@ -9888,6 +9901,7 @@ prompt = "What am I attending to?"
                                     at: now,
                                     text: "Koro food-boundary signal is cognitively relevant"
                                         .to_owned(),
+                                    origin: CognitionLogOrigin::direct(cognition_source.clone()),
                                 },
                             })
                             .await;

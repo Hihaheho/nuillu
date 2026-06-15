@@ -30,16 +30,18 @@ mod tests {
     #[test]
     fn batch_has_updates_when_cognition_delta_is_present() {
         let empty = InterpreterBatch::default();
+        let source = nuillu_types::ModuleInstanceId::new(
+            nuillu_types::builtin::cognition_gate(),
+            nuillu_types::ReplicaIndex::ZERO,
+        );
         let with_cognition = InterpreterBatch {
             cognition_log: vec![nuillu_module::CognitionLogEntryRecord {
                 index: 0,
-                source: nuillu_types::ModuleInstanceId::new(
-                    nuillu_types::builtin::cognition_gate(),
-                    nuillu_types::ReplicaIndex::ZERO,
-                ),
+                source: source.clone(),
                 entry: nuillu_blackboard::CognitionLogEntry {
                     at: chrono::Utc::now(),
                     text: "Alice asks for an interesting story.".into(),
+                    origin: nuillu_blackboard::CognitionLogOrigin::direct(source),
                 },
             }],
         };

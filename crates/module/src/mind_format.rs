@@ -674,7 +674,7 @@ fn format_bounded_lines(
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
-    use nuillu_blackboard::{CognitionLogEntry, MemoLogRecord, ModuleConfig};
+    use nuillu_blackboard::{CognitionLogEntry, CognitionLogOrigin, MemoLogRecord, ModuleConfig};
     use nuillu_types::{MemoryContent, ReplicaIndex, builtin};
 
     fn now() -> DateTime<Utc> {
@@ -715,14 +715,16 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 50).unwrap(),
                     text: "newer".into(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             },
             CognitionLogEntryRecord {
                 index: 0,
-                source,
+                source: source.clone(),
                 entry: CognitionLogEntry {
                     at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 19, 0).unwrap(),
                     text: "older".into(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             },
         ];
@@ -845,14 +847,16 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 22, 0).unwrap(),
                     text: "older cognition".into(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             },
             CognitionLogEntryRecord {
                 index: 1,
-                source,
+                source: source.clone(),
                 entry: CognitionLogEntry {
                     at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap(),
                     text: "newer cognition".into(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             },
         ];
@@ -876,10 +880,11 @@ mod tests {
             nuillu_types::ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         let records = vec![CognitionLogEntryRecord {
             index: 0,
-            source,
+            source: source.clone(),
             entry: CognitionLogEntry {
                 at: Utc.with_ymd_and_hms(2026, 5, 11, 6, 23, 0).unwrap(),
                 text: "fresh cognition entry".into(),
+                origin: CognitionLogOrigin::direct(source),
             },
         }];
 
@@ -911,6 +916,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: base + chrono::Duration::minutes(index as i64),
                     text: format!("cognition {index} {}", "y".repeat(30)),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             })
             .collect::<Vec<_>>();

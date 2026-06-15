@@ -3,11 +3,36 @@ use nuillu_types::ModuleInstanceId;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Origin metadata for one cognition-log entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CognitionLogOrigin {
+    pub owner: ModuleInstanceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo_index: Option<u64>,
+}
+
+impl CognitionLogOrigin {
+    pub fn direct(owner: ModuleInstanceId) -> Self {
+        Self {
+            owner,
+            memo_index: None,
+        }
+    }
+
+    pub fn memo(owner: ModuleInstanceId, index: u64) -> Self {
+        Self {
+            owner,
+            memo_index: Some(index),
+        }
+    }
+}
+
 /// A single (time, event) entry on the cognition log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CognitionLogEntry {
     pub at: DateTime<Utc>,
     pub text: String,
+    pub origin: CognitionLogOrigin,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

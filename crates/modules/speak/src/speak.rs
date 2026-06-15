@@ -31,26 +31,32 @@ use serde::{Deserialize, Serialize};
 
 const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and current scene target hints.
 Use exactly one available tool.
-When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the participant whose question, request, warning, or need should be answered. Scene target hints are preferred but not exhaustive; use another concrete non-empty addressee when the cognition log supports it. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" only for explicit group/broadcast speech.
+When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the target who should hear the utterance. target is the addressee, not the subject of the utterance content. Scene target hints are preferred but not exhaustive; use another concrete non-empty target when the cognition log supports it. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" for explicit group/broadcast speech, but do not forbid it.
 When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no concrete addressee, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
 blocking_reason must describe only the current cognition-log or scene basis for not speaking, in ordinary in-world terms.
-When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current listener and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
-Put the speech-facing transformation of the cognition log in speech_content. It is the information that should survive into speech, with perspective, deixis, and addressee adjusted for outward utterance.
-If the cognition log contains an explicit listener language request, such as asking for Japanese, include the requested language in the language field and transform speech_content for that language.
-speech_content is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence that the listener needs.
+When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current target and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
+Put only the grounding cue that prompted speech in context_cue. It is optional, and should be omitted for self-initiated, ambient, or continuation speech when there is no specific cue. context_cue is not the utterance content.
+Put only the current speaker's outward intent in speaker_intent. Do not write the target's future reply, facial expression, feelings, action, or narration in speaker_intent.
+speaker_intent must use the speaker's own perspective. Do not refer to the speaker by the speaker's own name as if describing someone else. For direct speech that names the agent, answer the person who spoke; do not target the agent merely because the agent was named.
+If the cognition log contains an explicit language request, such as asking for Japanese, include the requested language in the language field and transform speaker_intent for that language.
+speaker_intent is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence the speaker should convey.
+Predictions about what the target may say next are not outward speaker intent unless they directly answer the target's current question or request.
 For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
-For self-directed cognition, transform only the listener-relevant implication into outward substance. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the listener.
-Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speech_content limited.
-For unknown evidence, make speech_content say unknown and include the concrete visible absence or missing evidence."#;
+For self-directed cognition, transform only the outward implication into speaker intent. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the target.
+Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speaker_intent limited.
+For unknown evidence, make speaker_intent say unknown and include the concrete visible absence or missing evidence."#;
 
-const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when listener-facing substance can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
+const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when grounded outward speaker intent can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
 const ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: continue_speech for ordinary continuation of the current partial utterance, interrupt_and_redirect_speech only for urgent or safety-priority interruption, or abort_speech only when the partial should stop without completion.";
 
-const GENERATION_PROMPT: &str = r#"Render the supplied substance as one concise in-world utterance to the named listener.
-The substance is already transformed for outward speech. Render that transformed information; do not redo listener selection or add a new plan.
+const GENERATION_PROMPT: &str = r#"Render the supplied speaker intent as one concise in-world utterance to the named target.
+The speaker intent is already transformed for outward speech. Render that intent; do not redo target selection or add a new plan.
+Use context cue only as grounding for wording.
 If a language is supplied, render the utterance in that language.
 Preserve its answer polarity, addressee-facing perspective, direct warnings, advice, uncertainty, and visible-absence evidence.
-Use the recent context only to keep wording grounded. Do not add facts, turn an answer back into a question, turn listener-facing substance into a self-directed note, weaken direct content into vague caution, or merely restate the situation.
+The utterance is spoken by the agent. Do not address the agent by the agent's own name, and do not report the agent in third person when first person is appropriate.
+Output only the utterance text. Do not wrap it in quotation marks.
+Use the recent context only to keep wording grounded. Do not add facts, turn an answer back into a question, turn speaker intent into a self-directed note, narrate the target's response, weaken direct content into vague caution, or merely restate the situation.
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
 const GENERATION_TURN_USER_PROMPT: &str = "Generate an utterance to a target.";
 
@@ -66,7 +72,7 @@ const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target 
 selected targets, rejected/no-speech decisions, completed outward utterances, in-progress
 speech continuations, and cognition-log context needed for future speak planning."#;
 const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve accumulated recent context,
-completed outward utterances, and their addressees. Do not preserve per-turn target/substance
+completed outward utterances, and their addressees. Do not preserve per-turn target/intent
 request context unless it is part of a completed utterance."#;
 
 pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
@@ -141,18 +147,22 @@ impl JsonSchema for SpeechTarget {
 
 #[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// Call when proceeding to an outward utterance. The input carries cognition-log
-/// information transformed for speech, not hidden analysis.
+/// Call when proceeding to an outward utterance. The input separates the
+/// grounding cue from the current speaker's outward intent.
 struct PrepareSpeechArgs {
-    /// The concrete addressee who should hear the utterance.
+    /// The concrete addressee or audience who should hear the utterance.
     target: SpeechTarget,
+    /// Optional current evidence, input, event, or inner state that prompted
+    /// speech. This is grounding, not utterance content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_cue: Option<String>,
     /// Requested output language when the cognition log contains an explicit
-    /// listener language request.
+    /// language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// Speech-facing information to render for `target`, with perspective and
-    /// addressee adjusted from the cognition log.
-    speech_content: String,
+    /// What the current speaker should convey outwardly. Do not describe the
+    /// target's future reply, expression, feeling, action, or narration here.
+    speaker_intent: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -177,11 +187,11 @@ struct DeclineSpeechNowOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// Call when an in-progress utterance should continue to the same target.
 struct ContinueSpeechArgs {
-    /// Speech-facing information to render as a continuation of the already
+    /// What the current speaker should convey as a continuation of the already
     /// emitted partial utterance.
-    speech_content: String,
+    speaker_intent: String,
     /// Requested output language when the continuation should preserve or apply
-    /// an explicit listener language request.
+    /// an explicit language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
 }
@@ -199,11 +209,11 @@ struct InterruptAndRedirectSpeechArgs {
     /// The participant who should immediately hear the redirected utterance.
     target: SpeechTarget,
     /// Requested output language when the redirected speech should preserve or
-    /// apply an explicit listener language request.
+    /// apply an explicit language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// Speech-facing information to render for `target`.
-    speech_content: String,
+    /// What the current speaker should convey outwardly to `target`.
+    speaker_intent: String,
     /// Why the in-progress utterance must be interrupted now.
     interrupt_reason: String,
 }
@@ -436,9 +446,9 @@ fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> Strin
 
 fn render_in_progress_utterance_memo(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     format!(
-        "I am speaking to {}.\nIntended message:\n{}\n\nAlready said:\n{}",
+        "I am speaking to {}.\nSpeaker intent:\n{}\n\nAlready said:\n{}",
         draft.target.trim(),
-        args.speech_content.trim(),
+        args.speaker_intent.trim(),
         if draft.accumulated.trim().is_empty() {
             "(none)"
         } else {
@@ -490,9 +500,12 @@ fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &Generati
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
+    if let Some(context_cue) = trimmed_optional(args.context_cue.as_deref()) {
+        out.push_str(&format!("\nContext cue:\n{context_cue}"));
+    }
     out.push_str(&format!(
-        "\nSubstance:\n{}\n{THINK_CLOSE_TAG}\n",
-        args.speech_content.trim(),
+        "\nSpeaker intent:\n{}\n{THINK_CLOSE_TAG}\n",
+        args.speaker_intent.trim(),
     ));
     out
 }
@@ -514,9 +527,12 @@ fn format_planning_input(
         if let Some(language) = trimmed_optional(active.args.language.as_deref()) {
             out.push_str(&format!("\n- Language: {language}"));
         }
+        if let Some(context_cue) = trimmed_optional(active.args.context_cue.as_deref()) {
+            out.push_str(&format!("\n- Context cue: {context_cue}"));
+        }
         out.push_str(&format!(
-            "\n- Planned substance: {}",
-            active.args.speech_content.trim()
+            "\n- Planned speaker intent: {}",
+            active.args.speaker_intent.trim()
         ));
         out.push_str(&format!(
             "\n- Already emitted: {}",
@@ -1116,12 +1132,13 @@ impl SpeakModule {
                                 selected = Some(ActiveSpeechPlan::Continue(PlannedSpeech {
                                     args: PrepareSpeechArgs {
                                         target: SpeechTarget::from(target.clone()),
+                                        context_cue: active.args.context_cue.clone(),
                                         language: call
                                             .input
                                             .language
                                             .clone()
                                             .or_else(|| active.args.language.clone()),
-                                        speech_content: call.input.speech_content.clone(),
+                                        speaker_intent: call.input.speaker_intent.clone(),
                                     },
                                     target,
                                 }));
@@ -1139,8 +1156,9 @@ impl SpeakModule {
                                     plan: PlannedSpeech {
                                         args: PrepareSpeechArgs {
                                             target: call.input.target.clone(),
+                                            context_cue: None,
                                             language: call.input.language.clone(),
-                                            speech_content: call.input.speech_content.clone(),
+                                            speaker_intent: call.input.speaker_intent.clone(),
                                         },
                                         target,
                                     },
@@ -1513,8 +1531,8 @@ mod tests {
         TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, IdentityMemoryRecord,
-        ModuleConfig, ResourceAllocation,
+        ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, CognitionLogOrigin,
+        IdentityMemoryRecord, ModuleConfig, ResourceAllocation,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, PortError, SystemClock};
     use nuillu_module::{
@@ -1576,19 +1594,29 @@ mod tests {
         }
     }
 
-    fn prepare_speech_scenario(target: &str, speech_content: &str) -> MockTextScenario {
-        prepare_speech_scenario_with_language(target, None, speech_content)
+    fn prepare_speech_scenario(target: &str, speaker_intent: &str) -> MockTextScenario {
+        prepare_speech_scenario_with_language(target, None, speaker_intent)
     }
 
     fn prepare_speech_scenario_with_language(
         target: &str,
         language: Option<&str>,
-        speech_content: &str,
+        speaker_intent: &str,
+    ) -> MockTextScenario {
+        prepare_speech_scenario_with_context_cue(target, None, language, speaker_intent)
+    }
+
+    fn prepare_speech_scenario_with_context_cue(
+        target: &str,
+        context_cue: Option<&str>,
+        language: Option<&str>,
+        speaker_intent: &str,
     ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
+            "context_cue": context_cue,
             "language": language,
-            "speech_content": speech_content
+            "speaker_intent": speaker_intent
         })
         .to_string();
         MockTextScenario::events(vec![
@@ -1632,9 +1660,9 @@ mod tests {
         ])
     }
 
-    fn continue_speech_scenario(speech_content: &str) -> MockTextScenario {
+    fn continue_speech_scenario(speaker_intent: &str) -> MockTextScenario {
         let arguments_json = serde_json::json!({
-            "speech_content": speech_content
+            "speaker_intent": speaker_intent
         })
         .to_string();
         MockTextScenario::events(vec![
@@ -1657,12 +1685,12 @@ mod tests {
 
     fn interrupt_and_redirect_speech_scenario(
         target: &str,
-        speech_content: &str,
+        speaker_intent: &str,
         interrupt_reason: &str,
     ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
-            "speech_content": speech_content,
+            "speaker_intent": speaker_intent,
             "interrupt_reason": interrupt_reason
         })
         .to_string();
@@ -1793,8 +1821,9 @@ mod tests {
     fn test_prepare_speech_args(target: &str) -> PrepareSpeechArgs {
         PrepareSpeechArgs {
             target: SpeechTarget::from(target),
+            context_cue: None,
             language: None,
-            speech_content: "Tell Koro to stay close because Koro asks for help.".into(),
+            speaker_intent: "Tell Koro to stay close because Koro asks for help.".into(),
         }
     }
 
@@ -1911,6 +1940,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at,
                     text: text.into(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             })
             .await;
@@ -2079,10 +2109,11 @@ mod tests {
         let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
-                source,
+                source: source.clone(),
                 entry: CognitionLogEntry {
                     at: now - chrono::Duration::minutes(4),
                     text: "Koro asks Nuillu for help.".into(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             })
             .await;
@@ -2285,10 +2316,58 @@ mod tests {
         assert!(generation_text.contains("<think>\nI'll speak to `Ryo`."));
         assert!(generation_text.contains("Language: Japanese"));
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
-        assert!(generation_text.contains("Substance:\n日本語で短く返事する。\n</think>"));
+        assert!(generation_text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
         assert!(!generation_text.contains("Speak to:"));
         assert!(!generation_text.contains("Substance to express:"));
         assert!(!generation_text.contains("New cognition entries at "));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn context_cue_and_speaker_intent_flow_to_generation_input() {
+        let adapter = MockLlmAdapter::new()
+            .with_text_scenario(prepare_speech_scenario_with_context_cue(
+                "Ryo",
+                Some("Ryo greeted the speaker in Japanese."),
+                None,
+                "Return the greeting warmly and acknowledge Ryo.",
+            ))
+            .with_text_scenario(generation_text_scenario("こんにちは、Ryo。"));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
+        caps.scene().set([Participant::new("Ryo")]);
+        let now = SystemClock.now();
+        publish_cognition_update(&blackboard, &caps, now, "Ryo says, \"こんにちは Nui\".").await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completed.borrow().as_slice(),
+            &[("Ryo".to_string(), "こんにちは、Ryo。".to_string())]
+        );
+        let inputs = observed.text_inputs();
+        assert_eq!(inputs.len(), 2);
+        let generation_text = model_input_text(&inputs[1]);
+        assert!(generation_text.contains("Context cue:\nRyo greeted the speaker in Japanese."));
+        assert!(generation_text.contains(
+            "Speaker intent:\nReturn the greeting warmly and acknowledge Ryo.\n</think>"
+        ));
+        assert!(!generation_text.contains("Ryo replies"));
+        assert!(!generation_text.contains("Ryo smiles"));
     }
 
     #[test]
@@ -2321,7 +2400,7 @@ mod tests {
         assert!(!text.contains("Current cognition log at"));
         assert!(!text.contains("New cognition entries at"));
         assert!(text.contains("<think>\nI'll speak to `Koro`."));
-        assert!(text.contains("Substance:"));
+        assert!(text.contains("Speaker intent:"));
         assert!(text.contains("</think>"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
         assert!(!text.contains("Speak to:"));
@@ -2340,8 +2419,9 @@ mod tests {
         let draft = GenerationDraft::new(8, "Ryo");
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Ryo"),
+            context_cue: None,
             language: Some("Japanese".into()),
-            speech_content: "日本語で短く返事する。".into(),
+            speaker_intent: "日本語で短く返事する。".into(),
         };
 
         let text = format_generation_thinking_prefill(&args, &draft);
@@ -2349,7 +2429,7 @@ mod tests {
         assert!(!text.contains("Recent context:"));
         assert!(text.contains("<think>\nI'll speak to `Ryo`."));
         assert!(text.contains("Language: Japanese"));
-        assert!(text.contains("Substance:\n日本語で短く返事する。\n</think>"));
+        assert!(text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("New cognition entries at"));
@@ -2360,13 +2440,15 @@ mod tests {
         let draft = GenerationDraft::new(8, "Pibi");
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Pibi"),
+            context_cue: Some("Pibi asks whether dinner is ready or where it is.".into()),
             language: None,
-            speech_content: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
+            speaker_intent: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
         let text = format_generation_thinking_prefill(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
+        assert!(text.contains("Context cue:\nPibi asks whether dinner is ready or where it is."));
         assert!(text.contains("I do not know whether dinner is ready"));
         assert!(text.contains("I see no food or person nearby."));
     }
@@ -2382,14 +2464,16 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: now + chrono::Duration::seconds(1),
                     text: "Ryo clarifies that Nui's inner state is the topic.".into(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             },
             CognitionLogEntryRecord {
                 index: 6,
-                source,
+                source: source.clone(),
                 entry: CognitionLogEntry {
                     at: now,
                     text: "Ryo says the question is not about Ryo's inner thoughts.".into(),
+                    origin: CognitionLogOrigin::direct(source),
                 },
             },
         ];
@@ -2451,6 +2535,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: SystemClock.now(),
                     text: "Koro asks Nuillu to help them stay safe.".into(),
+                    origin: CognitionLogOrigin::direct(source.clone()),
                 },
             })
             .await;
@@ -2902,7 +2987,7 @@ mod tests {
         let memos = speak_memos(&blackboard).await;
         assert_eq!(memos.len(), 1);
         assert!(memos[0].contains("I am speaking to Koro"));
-        assert!(memos[0].contains("Intended message:\nTell Koro to stay close."));
+        assert!(memos[0].contains("Speaker intent:\nTell Koro to stay close."));
         assert!(memos[0].contains("Already said:\nKoro, st"));
         assert!(!memos[0].contains("I said to Koro"));
         assert!(module.active_speech.is_some());
@@ -3024,7 +3109,7 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nI'll speak to `Koro`."));
-        assert!(text.contains("Substance:\nTell Koro to stay close.\n</think>"));
+        assert!(text.contains("Speaker intent:\nTell Koro to stay close.\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3204,7 +3289,9 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nI'll speak to `everyone`."));
-        assert!(text.contains("Substance:\nAliceの挨拶に親しみを込めて短く応える。\n</think>"));
+        assert!(
+            text.contains("Speaker intent:\nAliceの挨拶に親しみを込めて短く応える。\n</think>")
+        );
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3295,7 +3382,7 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nI'll speak to `Koro`."));
-        assert!(text.contains("Substance:\nTell Koro to duck now.\n</think>"));
+        assert!(text.contains("Speaker intent:\nTell Koro to duck now.\n</think>"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3588,11 +3675,9 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nI'll speak to `Koro`."));
-        assert!(
-            text.contains(
-                "Substance:\nTell Koro to stay close because Koro asks for help.\n</think>"
-            )
-        );
+        assert!(text.contains(
+            "Speaker intent:\nTell Koro to stay close because Koro asks for help.\n</think>"
+        ));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
             panic!("expected assistant prefill");
         };

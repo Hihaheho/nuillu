@@ -23,6 +23,11 @@ next-minor = 1
 }
 
 @ tasks[] {
+  tag = "cognition-log-origin"
+  file = "dev/v0.1.cognition-log-origin.sql"
+}
+
+@ tasks[] {
   tag = "recent-activity-traces"
   file = "dev/v0.1.recent-activity-traces.sql"
 }

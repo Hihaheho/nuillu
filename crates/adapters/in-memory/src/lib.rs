@@ -74,6 +74,7 @@ impl CognitionLogRepository for InMemoryCognitionLogRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nuillu_blackboard::CognitionLogOrigin;
     use nuillu_types::{ReplicaIndex, builtin};
 
     #[tokio::test]
@@ -86,6 +87,7 @@ mod tests {
             CognitionLogEntry {
                 at: old,
                 text: "old".into(),
+                origin: CognitionLogOrigin::direct(stream.clone()),
             },
         )
         .await
@@ -96,6 +98,7 @@ mod tests {
             CognitionLogEntry {
                 at: cutoff,
                 text: "new".into(),
+                origin: CognitionLogOrigin::direct(stream.clone()),
             },
         )
         .await

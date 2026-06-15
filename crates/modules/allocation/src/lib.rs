@@ -705,8 +705,8 @@ mod tests {
     };
     use nuillu_blackboard::{
         ActivationRatio, AllocationCommand, AllocationEffectKind, AllocationEffectLevel,
-        Blackboard, Bpm, CognitionLogEntry, CognitionLogEntryRecord, ModuleConfig, ModulePolicy,
-        ResourceAllocation, linear_ratio_fn,
+        Blackboard, Bpm, CognitionLogEntry, CognitionLogEntryRecord, CognitionLogOrigin,
+        ModuleConfig, ModulePolicy, ResourceAllocation, linear_ratio_fn,
     };
     use nuillu_module::ports::{Clock, NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -1376,10 +1376,11 @@ mod tests {
         }];
         let cognition = [CognitionLogEntryRecord {
             index: 0,
-            source: owner,
+            source: owner.clone(),
             entry: CognitionLogEntry {
                 at: now,
                 text: "fresh cognition entry".into(),
+                origin: CognitionLogOrigin::direct(owner),
             },
         }];
         let requests = [AttentionControlRequest::new(

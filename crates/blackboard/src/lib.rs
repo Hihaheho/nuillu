@@ -34,7 +34,7 @@ pub use allocation::{
 };
 pub use cognition_log::{
     AgenticDeadlockMarker, CognitionLog, CognitionLogEntry, CognitionLogEntryRecord,
-    CognitionLogRecord, CognitionLogSet,
+    CognitionLogOrigin, CognitionLogRecord, CognitionLogSet,
 };
 pub use command::BlackboardCommand;
 pub use interoception::{InteroceptiveMode, InteroceptivePatch, InteroceptiveState};

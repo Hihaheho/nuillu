@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
-use nuillu_blackboard::{Blackboard, CognitionLogEntry, CognitionLogEntryRecord};
+use nuillu_blackboard::{
+    Blackboard, CognitionLogEntry, CognitionLogEntryRecord, CognitionLogOrigin, MemoLogRecord,
+};
 use nuillu_types::ModuleInstanceId;
 
 use crate::ports::{Clock, CognitionLogRepository};
@@ -48,8 +50,28 @@ impl CognitionWriter {
         let entry = CognitionLogEntry {
             at: self.clock.now(),
             text: text.into(),
+            origin: CognitionLogOrigin::direct(self.owner.clone()),
         };
 
+        self.append_entry(entry).await;
+    }
+
+    /// Append a cognition event promoted directly from a memo record.
+    pub async fn append_from_memo(&self, record: &MemoLogRecord) {
+        let entry = CognitionLogEntry {
+            at: self.clock.now(),
+            text: record.content.clone(),
+            origin: CognitionLogOrigin::memo(record.owner.clone(), record.index),
+        };
+
+        self.append_entry(entry).await;
+    }
+
+    pub fn owner(&self) -> &ModuleInstanceId {
+        &self.owner
+    }
+
+    async fn append_entry(&self, entry: CognitionLogEntry) {
         let result = self
             .blackboard
             .append_cognition_log(self.owner.clone(), entry.clone())

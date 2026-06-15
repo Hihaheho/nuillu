@@ -310,7 +310,8 @@ mod tests {
         SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
-        Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, ModulePolicy, linear_ratio_fn,
+        Blackboard, BlackboardCommand, Bpm, CognitionLogEntry, CognitionLogOrigin, ModulePolicy,
+        linear_ratio_fn,
     };
     use nuillu_module::ports::{NoopCognitionLogRepository, SystemClock};
     use nuillu_module::{
@@ -518,6 +519,7 @@ mod tests {
                 entry: CognitionLogEntry {
                     at: now,
                     text: "doorway uncertainty reached cognition".to_owned(),
+                    origin: CognitionLogOrigin::direct(cognition_source.clone()),
                 },
             })
             .await;

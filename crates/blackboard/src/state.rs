@@ -737,6 +737,21 @@ impl BlackboardInner {
         log
     }
 
+    pub fn cognition_log_excluding_owner(&self, owner: &ModuleInstanceId) -> CognitionLog {
+        let mut entries = self
+            .cognition_entry_log
+            .iter()
+            .filter(|record| !cognition_record_is_from_owner(record, owner))
+            .map(|record| record.entry.clone())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.at);
+        let mut log = CognitionLog::default();
+        for entry in entries {
+            log.append(entry);
+        }
+        log
+    }
+
     pub fn unread_cognition_log_entries(
         &self,
         last_seen_index: Option<u64>,
@@ -748,6 +763,13 @@ impl BlackboardInner {
             .collect()
     }
 
+    pub fn cognition_log_entries_after_index(
+        &self,
+        last_seen_index: Option<u64>,
+    ) -> Vec<CognitionLogEntryRecord> {
+        self.unread_cognition_log_entries(last_seen_index)
+    }
+
     pub fn cognition_log_set(&self) -> CognitionLogSet {
         let mut records = self
             .cognition_logs
@@ -756,6 +778,31 @@ impl BlackboardInner {
                 source: owner.clone(),
                 entries: log.entries().to_vec(),
             })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| {
+            a.source
+                .module
+                .as_str()
+                .cmp(b.source.module.as_str())
+                .then_with(|| a.source.replica.cmp(&b.source.replica))
+        });
+        CognitionLogSet::new(records, self.agentic_deadlock_marker.clone())
+    }
+
+    pub fn cognition_log_set_excluding_owner(&self, owner: &ModuleInstanceId) -> CognitionLogSet {
+        let mut grouped = HashMap::<ModuleInstanceId, Vec<crate::CognitionLogEntry>>::new();
+        for record in &self.cognition_entry_log {
+            if cognition_record_is_from_owner(record, owner) {
+                continue;
+            }
+            grouped
+                .entry(record.source.clone())
+                .or_default()
+                .push(record.entry.clone());
+        }
+        let mut records = grouped
+            .into_iter()
+            .map(|(source, entries)| CognitionLogRecord { source, entries })
             .collect::<Vec<_>>();
         records.sort_by(|a, b| {
             a.source
@@ -1179,6 +1226,13 @@ fn sort_memo_logs(records: &mut [MemoLogRecord]) {
     });
 }
 
+fn cognition_record_is_from_owner(
+    record: &CognitionLogEntryRecord,
+    owner: &ModuleInstanceId,
+) -> bool {
+    record.source == *owner || record.entry.origin.owner == *owner
+}
+
 fn rounded_div(sum: u32, count: u32) -> u32 {
     if count == 0 {
         return 0;
@@ -1454,6 +1508,7 @@ mod tests {
                 crate::CognitionLogEntry {
                     at: memo_time(1),
                     text: "first".into(),
+                    origin: crate::CognitionLogOrigin::direct(cognition_gate.clone()),
                 },
             )
             .await;
@@ -1466,6 +1521,7 @@ mod tests {
                 crate::CognitionLogEntry {
                     at: memo_time(2),
                     text: "second".into(),
+                    origin: crate::CognitionLogOrigin::direct(attention_schema.clone()),
                 },
             )
             .await;
@@ -1478,6 +1534,7 @@ mod tests {
                 crate::CognitionLogEntry {
                     at: memo_time(3),
                     text: "third".into(),
+                    origin: crate::CognitionLogOrigin::direct(cognition_gate.clone()),
                 },
             )
             .await;
@@ -1490,6 +1547,7 @@ mod tests {
                 entry: crate::CognitionLogEntry {
                     at: memo_time(1),
                     text: "first".into(),
+                    origin: crate::CognitionLogOrigin::direct(cognition_gate.clone()),
                 },
             }]
         );
