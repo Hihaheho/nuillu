@@ -356,8 +356,9 @@ Detects unexpected cognition-log entries by comparing new cognition log entries 
 memo (if present) or against recent cognition-log history alone (if predict is absent). Uses an LLM
 to assess the degree of divergence or novelty with allocation guidance in context, sends a
 free-form `AttentionControlRequest` preservation bid when a significant event should be preserved,
-and records unexpected-event evidence in its memo as cognitive plaintext. Expected or no-op
-assessments remain non-cognitive bookkeeping.
+records concise unexpected-event evidence as cognitive plaintext, and keeps the detailed surprise
+assessment and preservation request as non-cognitive bookkeeping. Expected or no-op assessments
+remain non-cognitive bookkeeping.
 
 Surprise does not generate predictions. When predict memo-log evidence is absent, surprise acts as a novelty detector over the cognition log: it judges unexpectedness from recent history rather than from explicit predictions.
 

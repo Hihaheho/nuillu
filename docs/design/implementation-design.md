@@ -712,8 +712,9 @@ expected or surprising, with allocation guidance in context. When predict memo l
 session context, the assessment is framed as divergence from pending predictions. When predict is
 absent, the assessment is framed as novelty from recent cognition-log history alone. Runtime reads
 the `significant` and `memory_request` decision fields for preservation side effects.
-Unexpected-event evidence is written to this replica's cognitive memo log; expected or no-op
-assessments are written as non-cognitive bookkeeping.
+Unexpected-event evidence is written as a concise cognitive memo, while the detailed surprise
+assessment and preservation request are written as non-cognitive bookkeeping. Expected or no-op
+assessments remain non-cognitive bookkeeping.
 
 Surprise does not generate forward predictions; its activation is cognition-log-driven. When a significant event should be preserved, it publishes a free-form `AttentionControlRequest` bid for allocation rather than writing memory directly.
 

@@ -208,8 +208,7 @@ impl SurpriseModule {
             TextStepOutcomeWithTools::NeedsTools(round) => round,
         };
         let usage = round.usage;
-        let mut memo: Option<String> = None;
-        let mut memo_cognitive = false;
+        let mut memo: Option<(String, Option<String>)> = None;
         let mut results: Vec<ToolResult> = Vec::new();
         nuillu_module::emit_trace_tool_calls(&round.tool_calls);
         // The LLM may return multiple tool calls; adopt the first valid decision only.
@@ -219,8 +218,10 @@ impl SurpriseModule {
                     let first_decision = memo.is_none();
                     if first_decision {
                         if let Some(args) = normalize_preserve_args(call.input.clone()) {
-                            memo = Some(render_surprise_memo(&args));
-                            memo_cognitive = true;
+                            memo = Some((
+                                render_surprise_memo(&args),
+                                Some(render_cognitive_surprise_memo(&args)),
+                            ));
                         }
                     }
                     let output = if first_decision {
@@ -236,7 +237,7 @@ impl SurpriseModule {
                 SurpriseToolsCall::MarkExpectedEvent(call) => {
                     let first_decision = memo.is_none();
                     if first_decision {
-                        memo = Some(render_expected_memo(&call.input));
+                        memo = Some((render_expected_memo(&call.input), None));
                     }
                     results.push(
                         call.complete(MarkExpectedEventOutput {
@@ -252,13 +253,12 @@ impl SurpriseModule {
             .context("commit surprise tool round")?;
         cx.compact_and_save(&mut self.session, usage).await?;
 
-        let Some(memo) = memo else {
+        let Some((memo, cognitive_memo)) = memo else {
             anyhow::bail!("surprise finished without a valid tool decision");
         };
-        if memo_cognitive {
-            self.memo.write_cognitive(memo).await;
-        } else {
-            self.memo.write(memo).await;
+        self.memo.write(memo).await;
+        if let Some(cognitive_memo) = cognitive_memo {
+            self.memo.write_cognitive(cognitive_memo).await;
         }
         Ok(())
     }
@@ -318,6 +318,17 @@ fn render_surprise_memo(args: &PreserveUnexpectedEventArgs) -> String {
     format!(
         "Surprise assessment: unexpected\nSurprise: {:.2}\nMemory preservation request:\nContent: {}\nReason: {}",
         args.surprise, args.content, args.reason,
+    )
+}
+
+fn render_cognitive_surprise_memo(args: &PreserveUnexpectedEventArgs) -> String {
+    let reason = args.reason.trim();
+    if reason.is_empty() {
+        return format!("Unexpected event: {}", args.content);
+    }
+    format!(
+        "Unexpected event: {}\nWhy it was notable: {}",
+        args.content, reason
     )
 }
 
@@ -647,17 +658,25 @@ mod tests {
         )
     }
 
-    async fn latest_surprise_memo(blackboard: &Blackboard) -> String {
+    async fn surprise_memos(blackboard: &Blackboard) -> Vec<(String, bool)> {
         let owner = ModuleInstanceId::new(builtin::surprise(), ReplicaIndex::ZERO);
         blackboard
             .read(|bb| {
                 bb.recent_memo_logs()
                     .into_iter()
                     .filter(|record| record.owner == owner)
-                    .map(|record| record.content)
-                    .last()
+                    .map(|record| (record.content, record.cognitive))
+                    .collect()
             })
             .await
+    }
+
+    async fn latest_surprise_memo(blackboard: &Blackboard) -> String {
+        surprise_memos(blackboard)
+            .await
+            .into_iter()
+            .map(|(content, _cognitive)| content)
+            .last()
             .expect("surprise memo should exist")
     }
 
@@ -671,6 +690,26 @@ mod tests {
         assert_eq!(
             memo,
             "Surprise assessment: unexpected\nSurprise: 0.90\nMemory preservation request:\nContent: Koro snapped up and growled toward the doorway.\nReason: Violated calm-eating prediction."
+        );
+    }
+
+    #[test]
+    fn preserve_tool_renders_cognitive_surprise_memo() {
+        assert_eq!(
+            render_cognitive_surprise_memo(&PreserveUnexpectedEventArgs {
+                content: "Koro snapped up and growled toward the doorway.".into(),
+                surprise: 0.9,
+                reason: "Violated calm-eating prediction.".into(),
+            }),
+            "Unexpected event: Koro snapped up and growled toward the doorway.\nWhy it was notable: Violated calm-eating prediction."
+        );
+        assert_eq!(
+            render_cognitive_surprise_memo(&PreserveUnexpectedEventArgs {
+                content: "Koro snapped up and growled toward the doorway.".into(),
+                surprise: 0.9,
+                reason: " ".into(),
+            }),
+            "Unexpected event: Koro snapped up and growled toward the doorway."
         );
     }
 
@@ -808,9 +847,19 @@ mod tests {
         let cx = activate_cx(&fixture.module).await;
         fixture.module.activate(&cx).await.unwrap();
 
-        let memo = latest_surprise_memo(&fixture.blackboard).await;
-        assert!(memo.contains("Surprise assessment: unexpected"));
-        assert!(memo.contains("Memory preservation request:"));
+        assert_eq!(
+            surprise_memos(&fixture.blackboard).await,
+            vec![
+                (
+                    "Surprise assessment: unexpected\nSurprise: 0.90\nMemory preservation request:\nContent: Koro snapped up and growled toward the doorway.\nReason: Violated calm-eating prediction.".into(),
+                    false,
+                ),
+                (
+                    "Unexpected event: Koro snapped up and growled toward the doorway.\nWhy it was notable: Violated calm-eating prediction.".into(),
+                    true,
+                ),
+            ]
+        );
         assert_eq!(
             fixture
                 .attention_requests
