@@ -497,7 +497,7 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
 
 fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     let mut out = format!(
-        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.",
+        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.\nSpeaker: I",
         draft.target.trim()
     );
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
