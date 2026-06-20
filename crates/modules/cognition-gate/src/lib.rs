@@ -2002,7 +2002,7 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected system prompt text");
         };
-        assert!(system.contains("What you already remember about yourself at"));
+        assert!(system.contains("Your identity:"));
         assert!(system.contains("- The agent is named Nuillu."));
         assert!(!system.contains("<self-memory>"));
     }

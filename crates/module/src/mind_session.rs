@@ -132,13 +132,8 @@ mod tests {
         };
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What you already remember about yourself"));
-        assert_eq!(
-            system
-                .matches("What you already remember about yourself")
-                .count(),
-            1
-        );
+        assert!(system.contains("Your identity:"));
+        assert_eq!(system.matches("Your identity:").count(), 1);
         assert!(!system.contains("Identity memory loaded at agent startup"));
 
         let ModelInputItem::Message { role, content } = &items[1] else {

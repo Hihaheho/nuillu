@@ -608,9 +608,7 @@ mod tests {
         );
         let (lutum, observed) = lutum_with_adapter(adapter);
         let mut session = Session::new();
-        session.push_system(
-            "SYSTEM PROMPT\n\nWhat you already remember about yourself at 2026-05-11T06:23:00Z:\n- identity",
-        );
+        session.push_system("SYSTEM PROMPT\n\nYour identity:\n- identity");
         for index in 0..5 {
             session.push_user(format!("history-{index}"));
         }
@@ -638,7 +636,7 @@ mod tests {
             panic!("expected system prompt text");
         };
         assert!(system.starts_with("SYSTEM PROMPT"));
-        assert!(system.contains("What you already remember about yourself"));
+        assert!(system.contains("Your identity:"));
         assert_eq!(
             assistant_text(&items[1]),
             "Compacted session:\nhistory summarized"
@@ -670,7 +668,7 @@ mod tests {
             matches!(
                 item,
                 ModelInputItem::Assistant(AssistantInputItem::Text(text))
-                    if text.starts_with("What you already remember about yourself")
+                    if text.starts_with("Your identity:")
             )
         }));
     }

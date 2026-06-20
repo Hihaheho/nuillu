@@ -1339,7 +1339,7 @@ fn fixture_base(kind: CaseKind) -> (&'static str, [&'static str; 4]) {
         CaseKind::ProcessBeforeNameQuestion => (
             "Recent conscious workspace:\n- Peer greeted Nui earlier; a short acknowledgement was already planned.",
             [
-                "I am speaking to Peer. Speaker intent: greet them warmly. Already said: hello.",
+                "I am speaking to Peer. my_speech_intent: greet them warmly. Already said: hello.",
                 "Heard from Peer at 10:00: Peer says, \"Hello!\"",
                 "Heard from Peer at 10:04: Peer says, \"Do you know my full name?\"",
                 "Retrieved memory evidence: Peer's full name is Ryo Hihaheho.",
@@ -1349,7 +1349,7 @@ fn fixture_base(kind: CaseKind) -> (&'static str, [&'static str; 4]) {
             "Recent conscious workspace:\n- Nui has already responded to an earlier greeting and is tracking whether Peer needs help.",
             [
                 "Heard from Peer at 10:01: Peer says, \"Hi again.\"",
-                "Speaker intent: say that Nui is happy to talk. Already said: I am here.",
+                "my_speech_intent: say that Nui is happy to talk. Already said: I am here.",
                 "Heard from Peer at 10:06: Peer says, \"What are you thinking about right now?\"",
                 "Current self-model evidence: Nui is listening to Peer and deciding which new fact deserves attention.",
             ],

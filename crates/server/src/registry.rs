@@ -359,6 +359,7 @@ fn register_server_module(
                         nuillu_speak::SpeakModuleParts {
                             cognition_updates: caps.cognition_log_updated_inbox(),
                             cognition_log: caps.cognition_log_reader(),
+                            attention_control: caps.attention_control_mailbox(),
                             memo: caps.memo(),
                             utterance: UtteranceWriter::new(
                                 caps.owner().clone(),

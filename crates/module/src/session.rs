@@ -823,11 +823,8 @@ mod tests {
         let system = leading_system_text_for_test(&session);
         assert!(system.starts_with("SYSTEM\n\n"));
         assert!(system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What you already remember about yourself"));
-        assert_eq!(
-            occurrences(system, "What you already remember about yourself"),
-            1
-        );
+        assert!(system.contains("Your identity:"));
+        assert_eq!(occurrences(system, "Your identity:"), 1);
         assert!(system.contains("The agent is named Nuillu."));
         assert!(!system.contains("Identity memory loaded at agent startup"));
     }
@@ -841,11 +838,8 @@ mod tests {
 
         let system = leading_system_text_for_test(&session);
         assert!(!system.contains(REASONING_SYSTEM_PROMPT));
-        assert!(system.contains("What you already remember about yourself"));
-        assert_eq!(
-            occurrences(system, "What you already remember about yourself"),
-            1
-        );
+        assert!(system.contains("Your identity:"));
+        assert_eq!(occurrences(system, "Your identity:"), 1);
         assert!(!system.contains("Identity memory loaded at agent startup"));
     }
 
@@ -861,10 +855,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         let system = leading_system_text_for_test(&session);
         assert!(system.starts_with("SYSTEM\n\n"));
-        assert_eq!(
-            occurrences(system, "What you already remember about yourself"),
-            1
-        );
+        assert_eq!(occurrences(system, "Your identity:"), 1);
         assert!(!system.contains("Identity memory loaded at agent startup"));
     }
 
@@ -882,10 +873,7 @@ mod tests {
         assert_eq!(items.len(), 2);
         let system = leading_system_text_for_test(&session);
         assert_eq!(occurrences(system, REASONING_SYSTEM_PROMPT), 1);
-        assert_eq!(
-            occurrences(system, "What you already remember about yourself"),
-            1
-        );
+        assert_eq!(occurrences(system, "Your identity:"), 1);
         assert!(system.contains("The agent is named Nuillu."));
         assert!(!system.contains("Identity memory loaded at agent startup"));
         assert!(matches!(

@@ -6,12 +6,13 @@ use lutum::{Session, TextStepOutcomeWithTools, ToolResult};
 use nuillu_blackboard::{AllocationCommand, AllocationEffectLevel};
 use nuillu_module::{
     AllocationReader, AllocationWriter, AttentionControlRequest, AttentionControlRequestInbox,
-    BlackboardReader, CognitionLogBatchFormat, CognitionLogReader, InteroceptiveReader, LlmAccess,
-    LlmContextWindow, MemoLogBatchFormat, MemoUpdatedInbox, Module, SessionAutoCompaction,
-    SessionCompactionConfig, SessionCompactionProtectedPrefix, ensure_persistent_session_seeded,
-    format_available_faculties, format_bounded_cognition_log_batch_with_format,
-    format_bounded_memo_log_batch_with_format, format_current_allocation_state,
-    format_memory_trace_inventory, format_stuckness, memory_rank_counts,
+    AttentionControlRequestKind, BlackboardReader, CognitionLogBatchFormat, CognitionLogReader,
+    InteroceptiveReader, LlmAccess, LlmContextWindow, MemoLogBatchFormat, MemoUpdatedInbox, Module,
+    SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
+    ensure_persistent_session_seeded, format_available_faculties,
+    format_bounded_cognition_log_batch_with_format, format_bounded_memo_log_batch_with_format,
+    format_current_allocation_state, format_memory_trace_inventory, format_stuckness,
+    memory_rank_counts,
 };
 use nuillu_types::ModuleId;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -608,13 +609,46 @@ fn current_attention_control_requests_input(
         return None;
     }
 
-    let mut output = String::from("Current attention-control requests:");
+    let mut activate = Vec::new();
+    let mut inhibit = Vec::new();
     for request in requests {
-        output.push('\n');
-        output.push_str("- ");
-        output.push_str(request.as_str().trim());
+        let text = request.as_str().trim();
+        if text.is_empty() {
+            continue;
+        }
+        match request.kind() {
+            AttentionControlRequestKind::Activate => activate.push(text),
+            AttentionControlRequestKind::Inhibit => inhibit.push(text),
+        }
     }
-    Some(output)
+
+    let mut sections = Vec::new();
+    if !activate.is_empty() {
+        let mut output = String::from("Current attention-control activation requests:");
+        for request in activate {
+            output.push('\n');
+            output.push_str("- ");
+            output.push_str(request);
+        }
+        sections.push(output);
+    }
+    if !inhibit.is_empty() {
+        let mut output = String::from(
+            "Current attention-control inhibition reasons (one-shot; use only as current evidence):",
+        );
+        for request in inhibit {
+            output.push('\n');
+            output.push_str("- ");
+            output.push_str(request);
+        }
+        sections.push(output);
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 fn allocation_observation_input(
@@ -1337,7 +1371,24 @@ mod tests {
 
         assert_eq!(
             input,
-            "Current attention-control requests:\n- which route is safe? Reason: speech needs grounded evidence\n- high-priority memory preservation: Remember the north door is blocked. Reason: direct safety constraint"
+            "Current attention-control activation requests:\n- which route is safe? Reason: speech needs grounded evidence\n- high-priority memory preservation: Remember the north door is blocked. Reason: direct safety constraint"
+                .to_owned()
+        );
+    }
+
+    #[test]
+    fn current_attention_control_requests_input_formats_inhibit_separately() {
+        let input = current_attention_control_requests_input(&[
+            AttentionControlRequest::new("answer when evidence is grounded"),
+            AttentionControlRequest::inhibit(
+                "no new listener-facing cognition since last greeting",
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            input,
+            "Current attention-control activation requests:\n- answer when evidence is grounded\n\nCurrent attention-control inhibition reasons (one-shot; use only as current evidence):\n- no new listener-facing cognition since last greeting"
                 .to_owned()
         );
     }
@@ -1404,7 +1455,9 @@ mod tests {
 
         let memo_index = input.find("Recent notes held in your mind at").unwrap();
         let cognition_index = input.find("Current thoughts available to you at").unwrap();
-        let request_index = input.find("Current attention-control requests").unwrap();
+        let request_index = input
+            .find("Current attention-control activation requests")
+            .unwrap();
         assert!(memo_index < cognition_index);
         assert!(cognition_index < request_index);
         assert!(input.contains(

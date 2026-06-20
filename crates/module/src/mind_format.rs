@@ -44,7 +44,7 @@ pub struct MemoLogBatchFormat<'a> {
     pub description: &'a str,
 }
 
-pub(crate) const IDENTITY_MEMORY_SEED_PREFIX: &str = "What you already remember about yourself";
+pub(crate) const IDENTITY_MEMORY_SEED_PREFIX: &str = "Your identity:";
 
 const DEFAULT_COGNITION_LOG_BATCH_FORMAT: CognitionLogBatchFormat<'static> =
     CognitionLogBatchFormat {
@@ -83,7 +83,7 @@ pub fn format_identity_memory_seed(
         return None;
     }
 
-    let mut output = format!("{IDENTITY_MEMORY_SEED_PREFIX} at {}:", base_time(now));
+    let mut output = IDENTITY_MEMORY_SEED_PREFIX.to_owned();
     output.push('\n');
     output.push_str(&lines.join("\n"));
     Some(output)
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(
             format_identity_memory_seed(&memories, now()),
             Some(
-                "What you already remember about yourself at 2026-05-11T06:23:00Z:\n- I'm Nui, and I remember Koro.\n- About one year ago: The agent met Koro."
+                "Your identity:\n- I'm Nui, and I remember Koro.\n- About one year ago: The agent met Koro."
                     .to_owned()
             )
         );

@@ -18,46 +18,38 @@ use nuillu_blackboard::CognitionLogRecord;
 #[cfg(test)]
 use nuillu_module::format_bounded_cognition_log_batch;
 use nuillu_module::{
-    CognitionLogReader, CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow,
-    Memo, Module, SceneReader, SelfWake, SessionAutoCompaction, SessionCompactionConfig,
+    AttentionControlRequest, AttentionControlRequestMailbox, CognitionLogReader,
+    CognitionLogUpdated, CognitionLogUpdatedInbox, LlmAccess, LlmContextWindow, Memo, Module,
+    SceneReader, SelfWake, SessionAutoCompaction, SessionCompactionConfig,
     SessionCompactionProtectedPrefix, UtteranceProgress, compact_llm_context_text,
     ensure_persistent_session_seeded, format_new_cognition_log_entries, ports::Clock,
 };
 
 use crate::utterance::UtteranceWriter;
-#[cfg(test)]
 use nuillu_types::builtin;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and current scene target hints.
+const SPEECH_PLANNING_PROMPT: &str = r#"Plan outward speech from the current cognition log and scene target hints.
 Use exactly one available tool.
-When no speech is in progress, call prepare_speech exactly once when a grounded outward utterance can be prepared. Choose the target who should hear the utterance. target is the addressee, not the subject of the utterance content. Scene target hints are preferred but not exhaustive; use another concrete non-empty target when the cognition log supports it. Do not choose a participant merely because they are the topic, threat, object of advice, or quoted speaker. Use "everyone" for explicit group/broadcast speech, but do not forbid it.
-When no speech is in progress, call decline_speech_now only when a concrete blocker makes speech inappropriate or impossible now, such as no concrete addressee, no cognition-supported listener-facing content, a policy or consent conflict, or fresh evidence that invalidates speaking now. Put that blocker in blocking_reason.
-blocking_reason must describe only the current cognition-log or scene basis for not speaking, in ordinary in-world terms.
-When speech is already in progress, treat already emitted text as immutable. Call continue_speech to preserve the current target and continue coherently from the partial utterance. Call interrupt_and_redirect_speech only for urgent or safety-priority cognition that must interrupt the current target and redirect immediately. Call abort_speech only when the partial utterance should stop without completion.
-Put only the grounding cue that prompted speech in context_cue. It is optional, and should be omitted for self-initiated, ambient, or continuation speech when there is no specific cue. context_cue is not the utterance content.
-Put only the current speaker's outward intent in speaker_intent. Do not write the target's future reply, facial expression, feelings, action, or narration in speaker_intent.
-speaker_intent must use the speaker's own perspective. Do not refer to the speaker by the speaker's own name as if describing someone else. For direct speech that names the agent, answer the person who spoke; do not target the agent merely because the agent was named.
-If the cognition log contains an explicit language request, such as asking for Japanese, include the requested language in the language field and transform speaker_intent for that language.
-speaker_intent is not hidden reasoning, not a rubric, and not a generic summary. It should contain the load-bearing fact, answer, warning, advice, visible absence, or unknown-state evidence the speaker should convey.
-Predictions about what the target may say next are not outward speaker intent unless they directly answer the target's current question or request.
-For questions or requests, transform the relevant cognition into an answer. Preserve answer polarity: yes/no/unknown must remain visible when supported by the cognition log.
-For self-directed cognition, transform only the outward implication into speaker intent. Keep first person only when the speaker is reporting perception, knowledge, uncertainty, consent, or shared action that directly answers the target.
-Do not invent policy, actions, or facts not supported by the cognition log. If the cognition log only supports a limited warning or uncertainty, keep speaker_intent limited.
-For unknown evidence, make speaker_intent say unknown and include the concrete visible absence or missing evidence."#;
+When no speech is in progress, call prepare_speech only when new cognition supports a new outward utterance. target is the person or group who should hear it.
+For direct speech heard from a named speaker, target that speaker. Use everyone only when the cognition explicitly calls for group or broadcast speech.
+When no speech is in progress, call decline_speech_now when no new outward utterance is appropriate now. If speak should not be prioritized again until new cognition arrives, include inhibit_reason.
+When speech is already in progress, continue ordinary speech, redirect only for urgent invalidating cognition, or abort when the partial utterance should stop.
+Predictions, expected dialogue flow, and my own previous speech are not new outward speech motivation by themselves.
+facts must be short quotes or summaries from identity memory or the cognition log only.
+my_speech_intent is what I should convey outwardly. Nui is my own name; do not treat my name as the listener. Do not write the target's future reply, expression, feeling, action, or narration there.
+If the cognition log contains an explicit language request, set language and shape my_speech_intent for that language.
+Do not invent policy, actions, identity, memory, visible evidence, unknown-state evidence, or other facts not supported by the provided context."#;
 
-const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech when grounded outward speaker intent can be produced, or decline_speech_now only for a concrete blocker that makes speech inappropriate or impossible now.";
+const FRESH_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: prepare_speech for a new grounded outward utterance, or decline_speech_now when no new outward utterance is appropriate now.";
 const ACTIVE_PLANNING_TURN_DEVELOPER_INSTRUCTION: &str = "Use exactly one tool: continue_speech for ordinary continuation of the current partial utterance, interrupt_and_redirect_speech only for urgent or safety-priority interruption, or abort_speech only when the partial should stop without completion.";
 
-const GENERATION_PROMPT: &str = r#"Render the supplied speaker intent as one concise in-world utterance to the named target.
-The speaker intent is already transformed for outward speech. Render that intent; do not redo target selection or add a new plan.
-Use context cue only as grounding for wording.
+const GENERATION_PROMPT: &str = r#"Write one concise in-world utterance.
+Use only Recent context, Facts, and my_speech_intent as content. Do not add a new plan or unsupported facts.
 If a language is supplied, render the utterance in that language.
-Preserve its answer polarity, addressee-facing perspective, direct warnings, advice, uncertainty, and visible-absence evidence.
-The utterance is spoken by the agent. Do not address the agent by the agent's own name, and do not report the agent in third person when first person is appropriate.
-Output only the utterance text. Do not wrap it in quotation marks.
-Use the recent context only to keep wording grounded. Do not add facts, turn an answer back into a question, turn speaker intent into a self-directed note, narrate the target's response, weaken direct content into vague caution, or merely restate the situation.
+The utterance starts after Me:, so do not address Me/Nui as the listener.
+Output only the utterance text; do not wrap it in quotation marks.
 Do not mention implementation mechanics, lookup, reasoning, prompts, rubrics, or evaluation mechanics."#;
 const GENERATION_TURN_USER_PROMPT: &str = "Generate an utterance to a target.";
 
@@ -72,9 +64,8 @@ const COMPACTED_SPEAK_GENERATION_SESSION_PREFIX: &str =
 const PLANNING_SESSION_COMPACTION_FOCUS: &str = r#"Preserve prior speech target decisions,
 selected targets, rejected/no-speech decisions, completed outward utterances, in-progress
 speech continuations, and cognition-log context needed for future speak planning."#;
-const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve accumulated recent context,
-completed outward utterances, and their addressees. Do not preserve per-turn target/intent
-request context unless it is part of a completed utterance."#;
+const GENERATION_SESSION_COMPACTION_FOCUS: &str = r#"Preserve completed outward utterances,
+their addressees, and any Facts/my_speech_intent context needed to understand those utterances."#;
 
 pub fn planning_session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -148,22 +139,19 @@ impl JsonSchema for SpeechTarget {
 
 #[lutum::tool_input(name = "prepare_speech", output = PrepareSpeechOutput)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-/// Call when proceeding to an outward utterance. The input separates the
-/// grounding cue from the current speaker's outward intent.
+/// Call when proceeding to an outward utterance.
 struct PrepareSpeechArgs {
     /// The concrete addressee or audience who should hear the utterance.
     target: SpeechTarget,
-    /// Optional current evidence, input, event, or inner state that prompted
-    /// speech. This is grounding, not utterance content.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    context_cue: Option<String>,
     /// Requested output language when the cognition log contains an explicit
     /// language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// What the current speaker should convey outwardly. Do not describe the
-    /// target's future reply, expression, feeling, action, or narration here.
-    speaker_intent: String,
+    /// Short facts quoted or summarized from identity memory or cognition log.
+    facts: Vec<String>,
+    /// What I should convey outwardly. Do not describe the target's future
+    /// reply, expression, feeling, action, or narration here.
+    my_speech_intent: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -176,7 +164,12 @@ struct PrepareSpeechOutput {
 /// Call only when a concrete blocker makes outward speech inappropriate or
 /// impossible now.
 struct DeclineSpeechNowArgs {
+    /// Why outward speech is not appropriate right now.
     blocking_reason: String,
+    /// Optional one-shot reason that speak should not be prioritized again
+    /// until new cognition arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inhibit_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -188,9 +181,12 @@ struct DeclineSpeechNowOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 /// Call when an in-progress utterance should continue to the same target.
 struct ContinueSpeechArgs {
+    /// Short facts quoted or summarized from identity memory or cognition log.
+    #[serde(default)]
+    facts: Vec<String>,
     /// What the current speaker should convey as a continuation of the already
     /// emitted partial utterance.
-    speaker_intent: String,
+    my_speech_intent: String,
     /// Requested output language when the continuation should preserve or apply
     /// an explicit language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,8 +209,11 @@ struct InterruptAndRedirectSpeechArgs {
     /// apply an explicit language request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
-    /// What the current speaker should convey outwardly to `target`.
-    speaker_intent: String,
+    /// Short facts quoted or summarized from identity memory or cognition log.
+    #[serde(default)]
+    facts: Vec<String>,
+    /// What I should convey outwardly to `target`.
+    my_speech_intent: String,
     /// Why the in-progress utterance must be interrupted now.
     interrupt_reason: String,
 }
@@ -259,7 +258,10 @@ struct PlannedSpeech {
 #[derive(Clone, Debug)]
 enum FreshSpeechPlan {
     Prepare(PlannedSpeech),
-    Decline { blocking_reason: String },
+    Decline {
+        blocking_reason: String,
+        inhibit_reason: Option<String>,
+    },
     None,
 }
 
@@ -469,9 +471,9 @@ fn render_completed_utterance_memo(draft: &GenerationDraft, text: &str) -> Strin
 
 fn render_in_progress_utterance_memo(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     format!(
-        "I am speaking to {}.\nSpeaker intent:\n{}\n\nAlready said:\n{}",
+        "I am speaking to {}.\nmy_speech_intent:\n{}\n\nAlready said:\n{}",
         draft.target.trim(),
-        args.speaker_intent.trim(),
+        args.my_speech_intent.trim(),
         if draft.accumulated.trim().is_empty() {
             "(none)"
         } else {
@@ -520,18 +522,28 @@ fn render_aborted_utterance_planning_record(draft: &GenerationDraft, reason: &st
 
 fn format_generation_thinking_prefill(args: &PrepareSpeechArgs, draft: &GenerationDraft) -> String {
     let mut out = format!(
-        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.\nSpeaker: I",
+        "{THINK_OPEN_TAG}\nPreparing speech to `{}`.",
         draft.target.trim()
     );
     if let Some(language) = trimmed_optional(args.language.as_deref()) {
         out.push_str(&format!("\nLanguage: {language}"));
     }
-    if let Some(context_cue) = trimmed_optional(args.context_cue.as_deref()) {
-        out.push_str(&format!("\nContext cue:\n{context_cue}"));
+    out.push_str("\nFacts:");
+    let mut wrote_fact = false;
+    for fact in args.facts.iter().map(String::as_str).filter_map(|fact| {
+        let fact = fact.trim();
+        (!fact.is_empty()).then_some(fact)
+    }) {
+        wrote_fact = true;
+        out.push_str("\n- ");
+        out.push_str(fact);
+    }
+    if !wrote_fact {
+        out.push_str("\n- (none supplied)");
     }
     out.push_str(&format!(
-        "\nSpeaker intent:\n{}\n{THINK_CLOSE_TAG}\n",
-        args.speaker_intent.trim(),
+        "\nmy_speech_intent:\n{}\n{THINK_CLOSE_TAG}\nMe:\n",
+        args.my_speech_intent.trim(),
     ));
     out
 }
@@ -553,12 +565,25 @@ fn format_planning_input(
         if let Some(language) = trimmed_optional(active.args.language.as_deref()) {
             out.push_str(&format!("\n- Language: {language}"));
         }
-        if let Some(context_cue) = trimmed_optional(active.args.context_cue.as_deref()) {
-            out.push_str(&format!("\n- Context cue: {context_cue}"));
+        out.push_str("\n- Planned facts:");
+        let facts = active
+            .args
+            .facts
+            .iter()
+            .map(String::as_str)
+            .filter_map(|fact| trimmed_optional(Some(fact)))
+            .collect::<Vec<_>>();
+        if facts.is_empty() {
+            out.push_str(" (none supplied)");
+        } else {
+            for fact in facts {
+                out.push_str("\n  - ");
+                out.push_str(fact);
+            }
         }
         out.push_str(&format!(
-            "\n- Planned speaker intent: {}",
-            active.args.speaker_intent.trim()
+            "\n- Planned my_speech_intent: {}",
+            active.args.my_speech_intent.trim()
         ));
         out.push_str(&format!(
             "\n- Already emitted: {}",
@@ -599,19 +624,32 @@ fn is_non_empty_target(target: &str) -> bool {
     true
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GenerationTurnContext {
+    thinking_prefill: String,
+}
+
 fn push_generation_context(
     session: &mut Session,
     args: &PrepareSpeechArgs,
     draft: &GenerationDraft,
-) {
+) -> GenerationTurnContext {
+    let thinking_prefill = format_generation_thinking_prefill(args, draft);
     session.push_ephemeral_user(GENERATION_TURN_USER_PROMPT);
-    session.push_ephemeral_assistant_text(format_generation_thinking_prefill(args, draft));
+    session.push_ephemeral_assistant_text(thinking_prefill.clone());
     if !draft.accumulated.is_empty() {
         session.push_ephemeral_assistant_text(draft.accumulated.clone());
     }
+    GenerationTurnContext { thinking_prefill }
 }
 
-fn push_completed_generation_turn(session: &mut Session, text: &str) {
+fn push_completed_generation_turn(
+    session: &mut Session,
+    context: &GenerationTurnContext,
+    text: &str,
+) {
+    session.push_user(GENERATION_TURN_USER_PROMPT);
+    session.push_assistant_text(context.thinking_prefill.clone());
     session.input_mut().push(ModelInputItem::turn(Arc::new(
         AssistantTurnView::from_items(&[AssistantTurnItem::Text(text.to_owned())]),
     )));
@@ -629,17 +667,15 @@ fn speech_cognition_context_from_entries(
     records: &[CognitionLogEntryRecord],
     now: DateTime<Utc>,
 ) -> Option<String> {
-    format_new_cognition_log_entries(records, now, COGNITION_CONTEXT_WINDOW)
+    let records = speech_planning_cognition_records(records);
+    format_new_cognition_log_entries(&records, now, COGNITION_CONTEXT_WINDOW)
 }
 
 fn generation_cognition_context_from_entries(
     records: &[CognitionLogEntryRecord],
 ) -> Option<String> {
-    let mut records = records
-        .iter()
-        .filter(|record| !record.entry.text.trim().is_empty())
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.entry.at);
+    let mut records = speech_planning_cognition_records(records);
+    records.sort_by_key(|record| (record.entry.at, record.index));
     if records.is_empty() || COGNITION_CONTEXT_WINDOW.max_records == 0 {
         return None;
     }
@@ -649,54 +685,69 @@ fn generation_cognition_context_from_entries(
         .saturating_sub(COGNITION_CONTEXT_WINDOW.max_records);
     if omitted_for_record_limit > 0 {
         tracing::warn!(
-            target: "nuillu_speak::generation_context",
+            target: "nuillu_speak::llm_context",
+            context_kind = "generation_recent_context",
             original_records = records.len(),
             kept_records = COGNITION_CONTEXT_WINDOW.max_records,
             dropped_records = omitted_for_record_limit,
-            "bounded speak generation context dropped older cognition entries"
+            "bounded LLM context dropped older records"
         );
     }
-    let lines = records[omitted_for_record_limit..]
+    let selected = &records[omitted_for_record_limit..];
+    let mut lines = selected
         .iter()
-        .map(|record| {
-            format!(
-                "- {}",
-                compact_llm_context_text(
-                    &record.entry.text,
-                    COGNITION_CONTEXT_WINDOW.max_chars_per_record,
-                )
-            )
+        .filter_map(|record| {
+            let text = compact_llm_context_text(
+                &record.entry.text,
+                COGNITION_CONTEXT_WINDOW.max_chars_per_record,
+            );
+            (!text.is_empty()).then(|| format!("- {text}"))
         })
-        .filter(|line| line != "- ")
         .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
 
-    bounded_generation_cognition_context(lines)
+    while lines.join("\n").chars().count() > COGNITION_CONTEXT_WINDOW.max_total_chars
+        && lines.len() > 1
+    {
+        lines.remove(0);
+    }
+    let context = compact_multiline_evidence(lines.join("\n"));
+    (!context.is_empty()).then(|| format!("Recent context:\n{context}"))
 }
 
-fn bounded_generation_cognition_context(lines: Vec<String>) -> Option<String> {
-    let mut drop_from_start = 0;
-    while drop_from_start < lines.len() {
-        let mut output = "Recent context:".to_owned();
-        for line in lines.iter().skip(drop_from_start) {
-            output.push('\n');
-            output.push_str(line);
-        }
-        if output.chars().count() <= COGNITION_CONTEXT_WINDOW.max_total_chars {
-            if drop_from_start > 0 {
-                tracing::warn!(
-                    target: "nuillu_speak::generation_context",
-                    original_lines = lines.len(),
-                    kept_lines = lines.len().saturating_sub(drop_from_start),
-                    dropped_lines = drop_from_start,
-                    max_total_chars = COGNITION_CONTEXT_WINDOW.max_total_chars,
-                    "bounded speak generation context dropped cognition entries to fit total character budget"
-                );
-            }
-            return Some(output);
-        }
-        drop_from_start += 1;
+fn compact_multiline_evidence(text: String) -> String {
+    if text.chars().count() <= COGNITION_CONTEXT_WINDOW.max_total_chars {
+        return text;
     }
-    None
+    let mut out = text
+        .chars()
+        .take(COGNITION_CONTEXT_WINDOW.max_total_chars)
+        .collect::<String>();
+    if let Some((boundary, _)) = out.char_indices().rev().find(|(_, ch)| *ch == '\n') {
+        out.truncate(boundary);
+    }
+    out.trim_end().to_owned()
+}
+
+fn speech_planning_cognition_records(
+    records: &[CognitionLogEntryRecord],
+) -> Vec<CognitionLogEntryRecord> {
+    records
+        .iter()
+        .filter(|record| is_speech_planning_cognition_record(record))
+        .cloned()
+        .collect()
+}
+
+fn is_speech_planning_cognition_record(record: &CognitionLogEntryRecord) -> bool {
+    let origin = &record.entry.origin.owner.module;
+    origin == &builtin::query_memory()
+        || origin == &builtin::attention_schema()
+        || origin == &builtin::interpreter()
+        || origin == &builtin::sensory()
+        || origin == &builtin::predict()
 }
 
 fn active_speech_cognition_context_from_entries(
@@ -766,6 +817,7 @@ enum GenerationStreamOutcome {
 pub struct SpeakModule {
     cognition_updates: CognitionLogUpdatedInbox,
     cognition_log: CognitionLogReader,
+    attention_control: AttentionControlRequestMailbox,
     memo: Memo,
     utterance: UtteranceWriter,
     llm: LlmAccess,
@@ -783,6 +835,7 @@ pub struct SpeakModule {
 pub struct SpeakModuleParts {
     pub cognition_updates: CognitionLogUpdatedInbox,
     pub cognition_log: CognitionLogReader,
+    pub attention_control: AttentionControlRequestMailbox,
     pub memo: Memo,
     pub utterance: UtteranceWriter,
     pub llm: LlmAccess,
@@ -798,6 +851,7 @@ impl SpeakModule {
         let SpeakModuleParts {
             cognition_updates,
             cognition_log,
+            attention_control,
             memo,
             utterance,
             llm,
@@ -811,6 +865,7 @@ impl SpeakModule {
         Self {
             cognition_updates,
             cognition_log,
+            attention_control,
             memo,
             utterance,
             llm,
@@ -920,8 +975,12 @@ impl SpeakModule {
             };
             let plan = match self.plan_speech(cx, &planning_context).await? {
                 FreshSpeechPlan::Prepare(plan) => plan,
-                FreshSpeechPlan::Decline { blocking_reason } => {
-                    self.record_declined_speech(&blocking_reason).await;
+                FreshSpeechPlan::Decline {
+                    blocking_reason,
+                    inhibit_reason,
+                } => {
+                    self.record_declined_speech(&blocking_reason, inhibit_reason.as_deref())
+                        .await;
                     self.mark_generation_cognition_entries_reflected(&batch.cognition_entries);
                     return Ok(());
                 }
@@ -978,18 +1037,14 @@ impl SpeakModule {
         self.ensure_planning_session_seeded(cx);
         let scene_target_schema = self.scene.target_schema();
         let target_hints = target_hints_from_schema(&scene_target_schema);
-        push_planning_context(
-            &mut self.planning_session,
-            cognition_context,
-            None,
-            &target_hints,
-        );
+        let mut turn_session = self.planning_session.clone();
+        push_planning_context(&mut turn_session, cognition_context, None, &target_hints);
 
         let lutum = self.llm.lutum().await;
         let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
-                self.planning_session
+                turn_session
                     .text_turn()
                     .tools::<SpeakTools>()
                     .available_tools([
@@ -1008,17 +1063,13 @@ impl SpeakModule {
             .await?;
 
         match outcome {
-            TextStepOutcomeWithTools::Finished(result) => {
-                cx.compact_and_save(&mut self.planning_session, result.usage)
-                    .await?;
+            TextStepOutcomeWithTools::Finished(_result) => {
                 let detail = "model finished with assistant output but no tool call \
                     (require_any_tool should have prevented this outcome)";
                 cx.warn(format!("speak planning failed: {detail}"));
                 anyhow::bail!("speak planning finished without required tool call: {detail}");
             }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                cx.compact_and_save(&mut self.planning_session, result.usage)
-                    .await?;
+            TextStepOutcomeWithTools::FinishedNoOutput(_result) => {
                 let detail = "model finished with no output and no tool call \
                     (require_any_tool should have prevented this outcome)";
                 cx.warn(format!("speak planning failed: {detail}"));
@@ -1057,6 +1108,7 @@ impl SpeakModule {
                             if accepted {
                                 plan = FreshSpeechPlan::Decline {
                                     blocking_reason: call.input.blocking_reason.clone(),
+                                    inhibit_reason: call.input.inhibit_reason.clone(),
                                 };
                             }
                             results.push(
@@ -1067,10 +1119,10 @@ impl SpeakModule {
                     }
                 }
                 round
-                    .commit(&mut self.planning_session, results)
+                    .commit(&mut turn_session, results)
                     .context("commit speak planning tool round")?;
-                cx.compact_and_save(&mut self.planning_session, usage)
-                    .await?;
+                cx.compact_and_save(&mut turn_session, usage).await?;
+                self.planning_session = turn_session;
                 Ok(plan)
             }
         }
@@ -1085,8 +1137,9 @@ impl SpeakModule {
         self.ensure_planning_session_seeded(cx);
         let scene_target_schema = self.scene.target_schema();
         let target_hints = target_hints_from_schema(&scene_target_schema);
+        let mut turn_session = self.planning_session.clone();
         push_planning_context(
-            &mut self.planning_session,
+            &mut turn_session,
             cognition_context,
             Some(active),
             &target_hints,
@@ -1096,7 +1149,7 @@ impl SpeakModule {
         let target_schema = freeform_speech_target_schema();
         let outcome = SPEECH_TARGET_SCHEMA
             .scope(target_schema, async {
-                self.planning_session
+                turn_session
                     .text_turn()
                     .tools::<ActiveSpeakTools>()
                     .available_tools([
@@ -1116,9 +1169,7 @@ impl SpeakModule {
             .await?;
 
         match outcome {
-            TextStepOutcomeWithTools::Finished(result) => {
-                cx.compact_and_save(&mut self.planning_session, result.usage)
-                    .await?;
+            TextStepOutcomeWithTools::Finished(_result) => {
                 let detail = "model finished with assistant output but no tool call \
                     (require_any_tool should have prevented this outcome)";
                 cx.warn(format!("active speak planning failed: {detail}"));
@@ -1126,9 +1177,7 @@ impl SpeakModule {
                     "active speak planning finished without required tool call: {detail}"
                 );
             }
-            TextStepOutcomeWithTools::FinishedNoOutput(result) => {
-                cx.compact_and_save(&mut self.planning_session, result.usage)
-                    .await?;
+            TextStepOutcomeWithTools::FinishedNoOutput(_result) => {
                 let detail = "model finished with no output and no tool call \
                     (require_any_tool should have prevented this outcome)";
                 cx.warn(format!("active speak planning failed: {detail}"));
@@ -1158,13 +1207,17 @@ impl SpeakModule {
                                 selected = Some(ActiveSpeechPlan::Continue(PlannedSpeech {
                                     args: PrepareSpeechArgs {
                                         target: SpeechTarget::from(target.clone()),
-                                        context_cue: active.args.context_cue.clone(),
                                         language: call
                                             .input
                                             .language
                                             .clone()
                                             .or_else(|| active.args.language.clone()),
-                                        speaker_intent: call.input.speaker_intent.clone(),
+                                        facts: if call.input.facts.is_empty() {
+                                            active.args.facts.clone()
+                                        } else {
+                                            call.input.facts.clone()
+                                        },
+                                        my_speech_intent: call.input.my_speech_intent.clone(),
                                     },
                                     target,
                                 }));
@@ -1182,9 +1235,9 @@ impl SpeakModule {
                                     plan: PlannedSpeech {
                                         args: PrepareSpeechArgs {
                                             target: call.input.target.clone(),
-                                            context_cue: None,
                                             language: call.input.language.clone(),
-                                            speaker_intent: call.input.speaker_intent.clone(),
+                                            facts: call.input.facts.clone(),
+                                            my_speech_intent: call.input.my_speech_intent.clone(),
                                         },
                                         target,
                                     },
@@ -1211,10 +1264,10 @@ impl SpeakModule {
                     }
                 }
                 round
-                    .commit(&mut self.planning_session, results)
+                    .commit(&mut turn_session, results)
                     .context("commit active speak planning tool round")?;
-                cx.compact_and_save(&mut self.planning_session, usage)
-                    .await?;
+                cx.compact_and_save(&mut turn_session, usage).await?;
+                self.planning_session = turn_session;
                 Ok(selected)
             }
         }
@@ -1243,7 +1296,7 @@ impl SpeakModule {
     ) -> Result<GenerationStreamOutcome> {
         self.ensure_generation_session_seeded(cx);
         let mut turn_session = self.generation_session.clone();
-        push_generation_context(&mut turn_session, args, draft);
+        let generation_context = push_generation_context(&mut turn_session, args, draft);
 
         let buffered_deltas = Arc::new(Mutex::new(GenerationDeltaBuffer::default()));
         let (flushed_deltas, mut flushed_delta_batches) =
@@ -1294,8 +1347,14 @@ impl SpeakModule {
                     });
                 }
                 staged.turn.discard();
-                self.finish_completed_generation_slice(cx, turn_session, usage, draft)
-                    .await
+                self.finish_completed_generation_slice(
+                    cx,
+                    turn_session,
+                    usage,
+                    draft,
+                    &generation_context,
+                )
+                .await
             }
             Err(CollectError::Reduction {
                 source: TextTurnReductionError::OutputLimitExceeded(limit),
@@ -1322,8 +1381,14 @@ impl SpeakModule {
             }
             Err(CollectError::UnexpectedEof { partial }) => {
                 let usage = partial.usage.unwrap_or_else(Usage::zero);
-                self.finish_completed_generation_slice(cx, turn_session, usage, draft)
-                    .await
+                self.finish_completed_generation_slice(
+                    cx,
+                    turn_session,
+                    usage,
+                    draft,
+                    &generation_context,
+                )
+                .await
             }
             Err(CollectError::Execution { source, partial })
             | Err(CollectError::Handler { source, partial }) => {
@@ -1341,6 +1406,7 @@ impl SpeakModule {
         turn_session: Session,
         usage: Usage,
         draft: &GenerationDraft,
+        generation_context: &GenerationTurnContext,
     ) -> Result<GenerationStreamOutcome> {
         let text = draft.accumulated.trim().to_owned();
         if text.is_empty() {
@@ -1350,7 +1416,7 @@ impl SpeakModule {
         }
 
         self.generation_session = turn_session;
-        push_completed_generation_turn(&mut self.generation_session, &text);
+        push_completed_generation_turn(&mut self.generation_session, generation_context, &text);
         cx.compact_and_save(&mut self.generation_session, usage)
             .await?;
         self.record_completed_generation(cx, draft, &text).await?;
@@ -1459,8 +1525,22 @@ impl SpeakModule {
         Ok(())
     }
 
-    async fn record_declined_speech(&self, reason: &str) {
+    async fn record_declined_speech(&self, reason: &str, inhibit_reason: Option<&str>) {
         self.memo.write(render_declined_speech_memo(reason)).await;
+        let Some(inhibit_reason) = trimmed_optional(inhibit_reason) else {
+            return;
+        };
+        if let Err(error) = self
+            .attention_control
+            .publish(AttentionControlRequest::inhibit(inhibit_reason.to_owned()))
+            .await
+        {
+            tracing::warn!(
+                target: "nuillu_speak::attention_control",
+                ?error,
+                "failed to publish speak inhibition reason"
+            );
+        }
     }
 
     async fn record_streaming_progress(&self, draft: &GenerationDraft) {
@@ -1777,29 +1857,29 @@ mod tests {
         Box::pin(TestSyncStream::new(stream)) as ErasedTextTurnEventStream
     }
 
-    fn prepare_speech_scenario(target: &str, speaker_intent: &str) -> MockTextScenario {
-        prepare_speech_scenario_with_language(target, None, speaker_intent)
+    fn prepare_speech_scenario(target: &str, my_speech_intent: &str) -> MockTextScenario {
+        prepare_speech_scenario_with_language(target, None, my_speech_intent)
     }
 
     fn prepare_speech_scenario_with_language(
         target: &str,
         language: Option<&str>,
-        speaker_intent: &str,
+        my_speech_intent: &str,
     ) -> MockTextScenario {
-        prepare_speech_scenario_with_context_cue(target, None, language, speaker_intent)
+        prepare_speech_scenario_with_facts(target, language, &[], my_speech_intent)
     }
 
-    fn prepare_speech_scenario_with_context_cue(
+    fn prepare_speech_scenario_with_facts(
         target: &str,
-        context_cue: Option<&str>,
         language: Option<&str>,
-        speaker_intent: &str,
+        facts: &[&str],
+        my_speech_intent: &str,
     ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
-            "context_cue": context_cue,
             "language": language,
-            "speaker_intent": speaker_intent
+            "facts": facts,
+            "my_speech_intent": my_speech_intent
         })
         .to_string();
         MockTextScenario::events(vec![
@@ -1821,8 +1901,16 @@ mod tests {
     }
 
     fn decline_speech_now_scenario(blocking_reason: &str) -> MockTextScenario {
+        decline_speech_now_scenario_with_inhibit(blocking_reason, None)
+    }
+
+    fn decline_speech_now_scenario_with_inhibit(
+        blocking_reason: &str,
+        inhibit_reason: Option<&str>,
+    ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
-            "blocking_reason": blocking_reason
+            "blocking_reason": blocking_reason,
+            "inhibit_reason": inhibit_reason
         })
         .to_string();
         MockTextScenario::events(vec![
@@ -1843,9 +1931,10 @@ mod tests {
         ])
     }
 
-    fn continue_speech_scenario(speaker_intent: &str) -> MockTextScenario {
+    fn continue_speech_scenario(my_speech_intent: &str) -> MockTextScenario {
         let arguments_json = serde_json::json!({
-            "speaker_intent": speaker_intent
+            "facts": [],
+            "my_speech_intent": my_speech_intent
         })
         .to_string();
         MockTextScenario::events(vec![
@@ -1868,12 +1957,13 @@ mod tests {
 
     fn interrupt_and_redirect_speech_scenario(
         target: &str,
-        speaker_intent: &str,
+        my_speech_intent: &str,
         interrupt_reason: &str,
     ) -> MockTextScenario {
         let arguments_json = serde_json::json!({
             "target": target,
-            "speaker_intent": speaker_intent,
+            "facts": [],
+            "my_speech_intent": my_speech_intent,
             "interrupt_reason": interrupt_reason
         })
         .to_string();
@@ -2004,9 +2094,9 @@ mod tests {
     fn test_prepare_speech_args(target: &str) -> PrepareSpeechArgs {
         PrepareSpeechArgs {
             target: SpeechTarget::from(target),
-            context_cue: None,
             language: None,
-            speaker_intent: "Tell Koro to stay close because Koro asks for help.".into(),
+            facts: vec!["Koro asks for help.".into()],
+            my_speech_intent: "Tell Koro to stay close because Koro asks for help.".into(),
         }
     }
 
@@ -2092,19 +2182,41 @@ mod tests {
     where
         T: TurnAdapter,
     {
+        let (module, caps, _attention_control) =
+            speak_module_with_turn_adapter_and_attention_control(blackboard, adapter, sink).await;
+        (module, caps)
+    }
+
+    async fn speak_module_with_turn_adapter_and_attention_control<T>(
+        blackboard: Blackboard,
+        adapter: Arc<T>,
+        sink: Rc<dyn UtteranceSink>,
+    ) -> (
+        SpeakModule,
+        CapabilityProviders,
+        nuillu_module::AttentionControlRequestInbox,
+    )
+    where
+        T: TurnAdapter,
+    {
         let caps = test_caps_with_turn_adapter(blackboard, adapter);
         let module_cell = Rc::new(RefCell::new(None));
         let module_sink = Rc::clone(&module_cell);
+        let attention_control_cell = Rc::new(RefCell::new(None));
+        let attention_control_sink = Rc::clone(&attention_control_cell);
         let utterance_sink_for_closure = sink.clone();
 
         let _modules = ModuleRegistry::new()
             .register(test_policy(), move |caps| {
                 let module_sink = Rc::clone(&module_sink);
+                let attention_control_sink = Rc::clone(&attention_control_sink);
                 let utterance_sink_for_closure = utterance_sink_for_closure.clone();
                 async move {
+                    *attention_control_sink.borrow_mut() = Some(caps.attention_control_inbox());
                     *module_sink.borrow_mut() = Some(SpeakModule::new(SpeakModuleParts {
                         cognition_updates: caps.cognition_log_updated_inbox(),
                         cognition_log: caps.cognition_log_reader(),
+                        attention_control: caps.attention_control_mailbox(),
                         memo: caps.memo(),
                         utterance: UtteranceWriter::new(
                             caps.owner().clone(),
@@ -2134,7 +2246,8 @@ mod tests {
             .unwrap();
 
         let module = module_cell.borrow_mut().take().unwrap();
-        (module, caps)
+        let attention_control = attention_control_cell.borrow_mut().take().unwrap();
+        (module, caps, attention_control)
     }
 
     async fn publish_cognition_update(
@@ -2144,13 +2257,14 @@ mod tests {
         text: impl Into<String>,
     ) {
         let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let origin = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
                 source: source.clone(),
                 entry: CognitionLogEntry {
                     at,
                     text: text.into(),
-                    origin: CognitionLogOrigin::direct(source.clone()),
+                    origin: CognitionLogOrigin::memo(origin, 0),
                 },
             })
             .await;
@@ -2317,13 +2431,14 @@ mod tests {
         .await;
         let now = SystemClock.now();
         let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let origin = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
                 source: source.clone(),
                 entry: CognitionLogEntry {
                     at: now - chrono::Duration::minutes(4),
                     text: "Koro asks Nuillu for help.".into(),
-                    origin: CognitionLogOrigin::direct(source),
+                    origin: CognitionLogOrigin::memo(origin, 0),
                 },
             })
             .await;
@@ -2332,6 +2447,106 @@ mod tests {
 
         assert!(context.contains("What you are currently thinking at "));
         assert!(context.contains("About 4 minutes ago: Koro asks Nuillu for help."));
+    }
+
+    #[test]
+    fn speech_cognition_context_uses_allowed_origin_modules_only() {
+        let now = SystemClock.now();
+        let cognition_gate = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let sensory = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
+        let query_memory = ModuleInstanceId::new(builtin::query_memory(), ReplicaIndex::ZERO);
+        let interpreter = ModuleInstanceId::new(builtin::interpreter(), ReplicaIndex::ZERO);
+        let predict = ModuleInstanceId::new(builtin::predict(), ReplicaIndex::ZERO);
+        let attention_schema =
+            ModuleInstanceId::new(builtin::attention_schema(), ReplicaIndex::ZERO);
+        let memory = ModuleInstanceId::new(builtin::memory(), ReplicaIndex::ZERO);
+        let speak = ModuleInstanceId::new(builtin::speak(), ReplicaIndex::ZERO);
+        let records = vec![
+            CognitionLogEntryRecord {
+                index: 0,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "sensory evidence".into(),
+                    origin: CognitionLogOrigin::memo(sensory, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 1,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "query-memory evidence".into(),
+                    origin: CognitionLogOrigin::memo(query_memory, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 2,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "interpreter evidence".into(),
+                    origin: CognitionLogOrigin::memo(interpreter, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 3,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "predict evidence".into(),
+                    origin: CognitionLogOrigin::memo(predict, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 4,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "attention-schema evidence".into(),
+                    origin: CognitionLogOrigin::memo(attention_schema, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 5,
+                source: cognition_gate.clone(),
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "memory evidence should not be included".into(),
+                    origin: CognitionLogOrigin::memo(memory, 0),
+                },
+            },
+            CognitionLogEntryRecord {
+                index: 6,
+                source: cognition_gate,
+                entry: CognitionLogEntry {
+                    at: now,
+                    text: "speak evidence should not be included".into(),
+                    origin: CognitionLogOrigin::memo(speak, 0),
+                },
+            },
+        ];
+
+        let context = speech_cognition_context_from_entries(&records, now).unwrap();
+
+        assert!(context.contains("sensory evidence"));
+        assert!(context.contains("query-memory evidence"));
+        assert!(context.contains("interpreter evidence"));
+        assert!(context.contains("predict evidence"));
+        assert!(context.contains("attention-schema evidence"));
+        assert!(!context.contains("memory evidence should not be included"));
+        assert!(!context.contains("speak evidence should not be included"));
+
+        let recent_context = generation_cognition_context_from_entries(&records).unwrap();
+        assert!(recent_context.starts_with("Recent context:\n- "));
+        assert!(recent_context.contains("sensory evidence"));
+        assert!(recent_context.contains("query-memory evidence"));
+        assert!(recent_context.contains("interpreter evidence"));
+        assert!(recent_context.contains("predict evidence"));
+        assert!(recent_context.contains("attention-schema evidence"));
+        assert!(!recent_context.contains("New thoughts available to you"));
+        assert!(!recent_context.contains("memory evidence should not be included"));
+        assert!(!recent_context.contains("speak evidence should not be included"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2428,18 +2643,17 @@ mod tests {
         assert!(!contexts[0].contains("What you are currently thinking at"));
         assert!(!contexts[1].contains("What you are currently thinking at"));
 
-        let generation_contexts =
-            session_message_texts(&module.generation_session, InputMessageRole::User)
-                .into_iter()
-                .filter(|text| text.starts_with("Recent context:"))
-                .collect::<Vec<_>>();
+        let generation_users =
+            session_message_texts(&module.generation_session, InputMessageRole::User);
+        let generation_contexts = generation_users
+            .iter()
+            .filter(|text| text.starts_with("Recent context:"))
+            .collect::<Vec<_>>();
         assert_eq!(generation_contexts.len(), 2);
         assert!(generation_contexts[0].contains("first cognition"));
         assert!(!generation_contexts[0].contains("second cognition"));
         assert!(generation_contexts[1].contains("second cognition"));
         assert!(!generation_contexts[1].contains("first cognition"));
-        assert!(!generation_contexts[0].contains("New thoughts available to you at"));
-        assert!(!generation_contexts[1].contains("New thoughts available to you at"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2526,19 +2740,24 @@ mod tests {
         assert!(generation_text.contains("<think>\nPreparing speech to `Ryo`."));
         assert!(generation_text.contains("Language: Japanese"));
         assert!(generation_text.contains("Recent context:\n- Ryo says, \"日本語でお願い\"."));
-        assert!(generation_text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
+        assert!(generation_text.contains("Ryo says, \"日本語でお願い\""));
+        assert!(generation_text.contains("Facts:\n- (none supplied)"));
+        assert!(
+            generation_text.contains("my_speech_intent:\n日本語で短く返事する。\n</think>\nMe:\n")
+        );
+        assert!(!generation_text.contains("Context cue:"));
         assert!(!generation_text.contains("Speak to:"));
         assert!(!generation_text.contains("Substance to express:"));
         assert!(!generation_text.contains("New thoughts available to you at "));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn context_cue_and_speaker_intent_flow_to_generation_input() {
+    async fn facts_and_my_speech_intent_flow_to_generation_input() {
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(prepare_speech_scenario_with_context_cue(
+            .with_text_scenario(prepare_speech_scenario_with_facts(
                 "Ryo",
-                Some("Ryo greeted the speaker in Japanese."),
                 None,
+                &["Ryo greeted Nui in Japanese."],
                 "Return the greeting warmly and acknowledge Ryo.",
             ))
             .with_text_scenario(generation_text_scenario("こんにちは、Ryo。"));
@@ -2572,10 +2791,13 @@ mod tests {
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_text = model_input_text(&inputs[1]);
-        assert!(generation_text.contains("Context cue:\nRyo greeted the speaker in Japanese."));
+        assert!(generation_text.contains("Recent context:\n- Ryo says, \"こんにちは Nui\"."));
+        assert!(generation_text.contains("Ryo says, \"こんにちは Nui\""));
+        assert!(generation_text.contains("Facts:\n- Ryo greeted Nui in Japanese."));
         assert!(generation_text.contains(
-            "Speaker intent:\nReturn the greeting warmly and acknowledge Ryo.\n</think>"
+            "my_speech_intent:\nReturn the greeting warmly and acknowledge Ryo.\n</think>\nMe:\n"
         ));
+        assert!(!generation_text.contains("Context cue:"));
         assert!(!generation_text.contains("Ryo replies"));
         assert!(!generation_text.contains("Ryo smiles"));
     }
@@ -2610,9 +2832,12 @@ mod tests {
         assert!(!text.contains("What you are currently thinking at"));
         assert!(!text.contains("New thoughts available to you at"));
         assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains("Speaker intent:"));
+        assert!(text.contains("Facts:\n- Koro asks for help."));
+        assert!(text.contains("my_speech_intent:"));
+        assert!(text.ends_with("Me:\n"));
         assert!(text.contains("</think>"));
         assert!(text.contains("Tell Koro to stay close because Koro asks for help."));
+        assert!(!text.contains("Context cue:"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("prepare_speech"));
@@ -2629,9 +2854,9 @@ mod tests {
         let draft = GenerationDraft::new(8, "Ryo");
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Ryo"),
-            context_cue: None,
             language: Some("Japanese".into()),
-            speaker_intent: "日本語で短く返事する。".into(),
+            facts: vec!["Ryo requested Japanese.".into()],
+            my_speech_intent: "日本語で短く返事する。".into(),
         };
 
         let text = format_generation_thinking_prefill(&args, &draft);
@@ -2639,7 +2864,8 @@ mod tests {
         assert!(!text.contains("Recent context:"));
         assert!(text.contains("<think>\nPreparing speech to `Ryo`."));
         assert!(text.contains("Language: Japanese"));
-        assert!(text.contains("Speaker intent:\n日本語で短く返事する。\n</think>"));
+        assert!(text.contains("Facts:\n- Ryo requested Japanese."));
+        assert!(text.contains("my_speech_intent:\n日本語で短く返事する。\n</think>\nMe:\n"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         assert!(!text.contains("New thoughts available to you at"));
@@ -2650,54 +2876,20 @@ mod tests {
         let draft = GenerationDraft::new(8, "Pibi");
         let args = PrepareSpeechArgs {
             target: SpeechTarget::from("Pibi"),
-            context_cue: Some("Pibi asks whether dinner is ready or where it is.".into()),
             language: None,
-            speaker_intent: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
+            facts: vec![
+                "Pibi asks whether dinner is ready or where it is.".into(),
+                "I see no food or person nearby.".into(),
+            ],
+            my_speech_intent: "Tell Pibi I do not know whether dinner is ready or where it is, because I see no food or person nearby.".into(),
         };
 
         let text = format_generation_thinking_prefill(&args, &draft);
 
         assert!(!text.contains("Recent context:"));
-        assert!(text.contains("Context cue:\nPibi asks whether dinner is ready or where it is."));
+        assert!(text.contains("Facts:\n- Pibi asks whether dinner is ready or where it is."));
         assert!(text.contains("I do not know whether dinner is ready"));
         assert!(text.contains("I see no food or person nearby."));
-    }
-
-    #[test]
-    fn generation_cognition_context_is_plain_recent_bullets() {
-        let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
-        let now = SystemClock.now();
-        let records = vec![
-            CognitionLogEntryRecord {
-                index: 7,
-                source: source.clone(),
-                entry: CognitionLogEntry {
-                    at: now + chrono::Duration::seconds(1),
-                    text: "Ryo clarifies that Nui's inner state is the topic.".into(),
-                    origin: CognitionLogOrigin::direct(source.clone()),
-                },
-            },
-            CognitionLogEntryRecord {
-                index: 6,
-                source: source.clone(),
-                entry: CognitionLogEntry {
-                    at: now,
-                    text: "Ryo says the question is not about Ryo's inner thoughts.".into(),
-                    origin: CognitionLogOrigin::direct(source),
-                },
-            },
-        ];
-
-        let context = generation_cognition_context_from_entries(&records).unwrap();
-
-        assert_eq!(
-            context,
-            "Recent context:\n- Ryo says the question is not about Ryo's inner thoughts.\n- Ryo clarifies that Nui's inner state is the topic."
-        );
-        assert!(!context.contains("New thoughts available to you at"));
-        assert!(!context.contains("cognition log"));
-        assert!(!context.contains("Just now"));
-        assert!(!context.contains("cognition-gate"));
     }
 
     #[test]
@@ -2739,13 +2931,14 @@ mod tests {
             speak_module_with_turn_adapter(blackboard.clone(), Arc::new(capture), sink).await;
         caps.scene().set([Participant::new("Koro")]);
         let source = ModuleInstanceId::new(builtin::cognition_gate(), ReplicaIndex::ZERO);
+        let origin = ModuleInstanceId::new(builtin::sensory(), ReplicaIndex::ZERO);
         blackboard
             .apply(BlackboardCommand::AppendCognitionLog {
                 source: source.clone(),
                 entry: CognitionLogEntry {
                     at: SystemClock.now(),
                     text: "Koro asks Nuillu to help them stay safe.".into(),
-                    origin: CognitionLogOrigin::direct(source.clone()),
+                    origin: CognitionLogOrigin::memo(origin, 0),
                 },
             })
             .await;
@@ -2794,27 +2987,21 @@ mod tests {
         assert_eq!(progress.partial_utterance, "Koro, stay close.");
         assert_eq!(module.planning_session.list_turns().count(), 1);
         let planning_text = session_input_text(&module.planning_session);
-        assert_eq!(
-            planning_text
-                .matches("What you already remember about yourself")
-                .count(),
-            1
-        );
+        assert_eq!(planning_text.matches("Your identity:").count(), 1);
         assert!(!planning_text.contains("Identity memory loaded at agent startup"));
         assert!(planning_text.contains("Koro asks Nuillu to help them stay safe."));
         assert!(planning_text.contains("Completed outward utterance to Koro:\nKoro, stay close."));
         let generation_text = session_input_text(&module.generation_session);
-        assert_eq!(
-            generation_text
-                .matches("What you already remember about yourself")
-                .count(),
-            1
-        );
+        assert_eq!(generation_text.matches("Your identity:").count(), 1);
         assert!(!generation_text.contains("Identity memory loaded at agent startup"));
         assert!(!generation_text.contains("New thoughts available to you at "));
         assert!(
             generation_text.contains("Recent context:\n- Koro asks Nuillu to help them stay safe.")
         );
+        assert!(generation_text.contains(GENERATION_TURN_USER_PROMPT));
+        assert!(generation_text.contains("<think>\nPreparing speech to `Koro`."));
+        assert!(generation_text.contains("Koro asks Nuillu to help them stay safe."));
+        assert!(generation_text.contains("my_speech_intent:\nTell Koro to stay close."));
         let inputs = observed.text_inputs();
         assert_eq!(inputs.len(), 2);
         let generation_input = model_input_text(&inputs[1]);
@@ -3052,7 +3239,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn generation_think_tag_text_is_not_emitted_or_persisted() {
+    async fn generation_model_think_tag_text_is_not_emitted_or_persisted_as_utterance() {
         let adapter = MockLlmAdapter::new().with_text_scenario(
             generation_text_deltas_scenario_with_finish_reason(
                 &[
@@ -3099,6 +3286,9 @@ mod tests {
             session_turn_texts(&module.generation_session),
             vec!["Koro, stay close.".to_string()]
         );
+        let generation_text = session_input_text(&module.generation_session);
+        assert!(generation_text.contains("<think>\nPreparing speech to `Koro`."));
+        assert!(!generation_text.contains("hidden reasoning"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3288,7 +3478,7 @@ mod tests {
         let memos = speak_memos(&blackboard).await;
         assert_eq!(memos.len(), 1);
         assert!(memos[0].contains("I am speaking to Koro"));
-        assert!(memos[0].contains("Speaker intent:\nTell Koro to stay close."));
+        assert!(memos[0].contains("my_speech_intent:\nTell Koro to stay close."));
         assert!(memos[0].contains("Already said:\nKoro, st"));
         assert!(!memos[0].contains("I said to Koro"));
         assert!(module.active_speech.is_some());
@@ -3410,7 +3600,7 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains("Speaker intent:\nTell Koro to stay close.\n</think>"));
+        assert!(text.contains("my_speech_intent:\nTell Koro to stay close.\n</think>\nMe:\n"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3590,9 +3780,10 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nPreparing speech to `everyone`."));
-        assert!(
-            text.contains("Speaker intent:\nAliceの挨拶に親しみを込めて短く応える。\n</think>")
-        );
+        assert!(!text.contains("Alice is still present and waiting for the greeting reply."));
+        assert!(text.contains(
+            "my_speech_intent:\nAliceの挨拶に親しみを込めて短く応える。\n</think>\nMe:\n"
+        ));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3683,7 +3874,8 @@ mod tests {
             panic!("expected assistant thinking prefill");
         };
         assert!(text.contains("<think>\nPreparing speech to `Koro`."));
-        assert!(text.contains("Speaker intent:\nTell Koro to duck now.\n</think>"));
+        assert!(!text.contains("Koro sees a falling rock and now needs to duck."));
+        assert!(text.contains("my_speech_intent:\nTell Koro to duck now.\n</think>\nMe:\n"));
         assert!(!text.contains("Speak to:"));
         assert!(!text.contains("Substance to express:"));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &tail[2] else {
@@ -3877,6 +4069,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn repeated_greeting_decline_publishes_attention_inhibit_reason() {
+        let inhibit_reason =
+            "No new listener-facing cognition since the previous greeting; avoid repeating it.";
+        let adapter =
+            MockLlmAdapter::new().with_text_scenario(decline_speech_now_scenario_with_inhibit(
+                "Ryo repeated the same greeting and there is no new content to say.",
+                Some(inhibit_reason),
+            ));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::clone(&completed),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps, mut attention_control) =
+            speak_module_with_turn_adapter_and_attention_control(
+                blackboard.clone(),
+                Arc::new(adapter),
+                sink,
+            )
+            .await;
+        caps.scene().set([Participant::new("Ryo")]);
+        let now = SystemClock.now();
+        publish_cognition_update(&blackboard, &caps, now, "Ryo says, \"こんにちは！\".").await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .unwrap();
+
+        assert!(completed.borrow().is_empty());
+        let envelope = attention_control
+            .next_item()
+            .await
+            .expect("speak inhibit request should be published");
+        assert_eq!(envelope.sender.module, builtin::speak());
+        assert_eq!(
+            envelope.body.kind(),
+            nuillu_module::AttentionControlRequestKind::Inhibit
+        );
+        assert_eq!(envelope.body.as_str(), inhibit_reason);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn speak_planning_rejects_finishing_without_required_tool() {
         let adapter =
             MockLlmAdapter::new().with_text_scenario(finish_without_planning_tool_scenario());
@@ -3894,6 +4134,42 @@ mod tests {
             error.contains("required tool call") || error.contains("without required tool call"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_planning_turn_does_not_persist_planning_context() {
+        let adapter =
+            MockLlmAdapter::new().with_text_scenario(finish_without_planning_tool_scenario());
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let sink: Rc<dyn crate::utterance::UtteranceSink> = Rc::new(CapturingUtteranceSink {
+            completed: Rc::new(RefCell::new(Vec::new())),
+            done: RefCell::new(None),
+        });
+        let (mut module, caps) =
+            speak_module_with_turn_adapter(blackboard.clone(), Arc::new(adapter), sink).await;
+        caps.scene().set([Participant::new("Koro")]);
+        let now = SystemClock.now();
+        publish_cognition_update(
+            &blackboard,
+            &caps,
+            now,
+            "Koro asks whether Nui should say anything.",
+        )
+        .await;
+
+        let batch = module.next_batch().await.unwrap();
+        let cx = test_activate_cx(&module, now).await;
+        SpeakModule::activate(&mut module, &cx, &batch)
+            .await
+            .expect_err("planning without a required tool should fail");
+
+        let planning_users =
+            session_message_texts(&module.planning_session, InputMessageRole::User);
+        assert!(planning_users.is_empty());
+        assert!(!session_input_text(&module.planning_session).contains("Koro asks"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3977,7 +4253,7 @@ mod tests {
         };
         assert!(text.contains("<think>\nPreparing speech to `Koro`."));
         assert!(text.contains(
-            "Speaker intent:\nTell Koro to stay close because Koro asks for help.\n</think>"
+            "my_speech_intent:\nTell Koro to stay close because Koro asks for help.\n</think>\nMe:\n"
         ));
         let ModelInputItem::Assistant(AssistantInputItem::Text(text)) = &items[2] else {
             panic!("expected assistant prefill");

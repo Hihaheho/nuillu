@@ -67,12 +67,12 @@ pub use capabilities::{
 };
 pub use channels::{
     AmbientSensoryEntry, AttentionControlRequest, AttentionControlRequestInbox,
-    AttentionControlRequestMailbox, CognitionLogEvictedInbox, CognitionLogEvictedMailbox,
-    CognitionLogUpdated, CognitionLogUpdatedInbox, CognitionLogUpdatedMailbox, Envelope,
-    InteroceptiveUpdated, InteroceptiveUpdatedInbox, InteroceptiveUpdatedMailbox,
-    MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated, MemoUpdatedInbox, MemoUpdatedMailbox,
-    ReadyItems, SensoryInput, SensoryInputInbox, SensoryInputMailbox, SensoryModality, TopicInbox,
-    TopicMailbox, TopicRecvError, WakeClaim,
+    AttentionControlRequestKind, AttentionControlRequestMailbox, CognitionLogEvictedInbox,
+    CognitionLogEvictedMailbox, CognitionLogUpdated, CognitionLogUpdatedInbox,
+    CognitionLogUpdatedMailbox, Envelope, InteroceptiveUpdated, InteroceptiveUpdatedInbox,
+    InteroceptiveUpdatedMailbox, MemoLogEvictedInbox, MemoLogEvictedMailbox, MemoUpdated,
+    MemoUpdatedInbox, MemoUpdatedMailbox, ReadyItems, SensoryInput, SensoryInputInbox,
+    SensoryInputMailbox, SensoryModality, TopicInbox, TopicMailbox, TopicRecvError, WakeClaim,
 };
 pub use cognition::CognitionWriter;
 pub use dependencies::{apply_standard_dependencies, standard_dependency_edges};

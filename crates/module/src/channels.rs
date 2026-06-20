@@ -359,15 +359,35 @@ impl<T: Clone> TopicInbox<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum AttentionControlRequestKind {
+    Activate,
+    Inhibit,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
 pub struct AttentionControlRequest {
+    kind: AttentionControlRequestKind,
     text: String,
 }
 
 impl AttentionControlRequest {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            kind: AttentionControlRequestKind::Activate,
+            text: text.into(),
+        }
+    }
+
+    pub fn inhibit(text: impl Into<String>) -> Self {
+        Self {
+            kind: AttentionControlRequestKind::Inhibit,
+            text: text.into(),
+        }
+    }
+
+    pub fn kind(&self) -> AttentionControlRequestKind {
+        self.kind
     }
 
     pub fn as_str(&self) -> &str {
