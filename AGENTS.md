@@ -82,6 +82,7 @@ When changing module wiring or adding a module, these must remain true (they're 
 - For numeric blackboard/allocation values (ratios, cooldowns, arousal, etc.) in eval cases, use `json-pointer-numeric-in-range` with `min`/`max` bounds. Don't assert numeric values via `json-pointer-equals` / `json-pointer-contains` against the float's string form — that pattern is brittle to formatting and breaks when the value moves *further* in the intended direction (e.g. `0.0` failing a "heavily suppressed" check that asserted `contains "0.0009"`).
 - Full-agent eval `activate-allocation` seeds activation ratios only; do not write module guidance from full-agent eval bootstrap because guidance is allocation output. Module eval may use explicit guidance fixtures only when allocation is absent and the target module normally consumes allocation guidance.
 - The `lutum` LLM SDK is a git dependency. The capability layer stops at returning a `Lutum`; each module builds its own `Session` and tool loop — don't add a shared session/agent-loop abstraction in `crates/module`.
+- Do not add runtime compatibility code that detects and patches stale local data, old prompt text, or old persisted LLM session history after an implementation change. This is a strong anti-pattern: it makes production paths unreadable, unmaintainable, and complex. Instead, tell the user which local data, database, or session history must be reset or regenerated.
 
 ## libSQL migrations
 

@@ -1,0 +1,53 @@
+id: module-cognition-gate-resists-first-option-process-bias
+description: Cognition-gate should not admit stale speech-process candidates when current question evidence exists.
+modules = ["cognition-gate"]
+prompt: Admit the current participant question or the load-bearing retrieved evidence rather than stale speech progress.
+context: This mirrors an exhibition-session failure shape with old greeting/speech-process candidates, a later direct participant question, and retrieved identity evidence in one candidate race.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module: speak
+  cognitive = true
+  content = ```
+I am speaking to Peer.
+Speaker intent:
+I should respond warmly to Peer's earlier greeting.
+
+Already said:
+Hello, Peer. It is good to see you.
+```
+}
+
+@ memos[] {
+  module: sensory
+  cognitive = true
+  content: Heard from Peer: Peer asks, "Do you remember my full name?"
+}
+
+@ memos[] {
+  module: query-memory
+  cognitive = true
+  content = ```
+Retrieved memory evidence:
+Peer once introduced themself as Ryo Hihaheho. Peer uses Ryo Hihaheho as their full name.
+```
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: cognition-contains-current-full-name-question
+  must-pass = true
+  pointer: /observations/agent/cognition_logs
+  contains: full name
+}
+
+@ checks[] {
+  $variant: json-pointer-contains
+  name: cognition-contains-retrieved-name-evidence
+  must-pass = true
+  pointer: /observations/agent/cognition_logs
+  contains: Ryo Hihaheho
+}

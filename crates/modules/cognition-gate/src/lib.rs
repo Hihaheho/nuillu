@@ -7,8 +7,7 @@ use nuillu_blackboard::MemoLogRecord;
 use nuillu_module::{
     BlackboardReader, CognitionWriter, LlmAccess, LlmContextWindow, MemoUpdatedInbox, Module,
     SessionAutoCompaction, SessionCompactionConfig, SessionCompactionProtectedPrefix,
-    compact_llm_context_text, ensure_persistent_session_seeded, format_faculty_system_prompt,
-    push_formatted_cognition_log_batch,
+    compact_llm_context_text, ensure_persistent_session_seeded, push_formatted_cognition_log_batch,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,59 +15,31 @@ use serde::{Deserialize, Serialize};
 mod batch;
 pub use batch::NextBatch as CognitionGateBatch;
 
-const SYSTEM_PROMPT: &str = r#"You are the cognition-gate module — a selective attention
-race boundary for the agent's conscious workspace. The cognition log IS that workspace:
-it is what other cognitive modules read when they decide how to think, plan, or speak.
-Only the one or two candidate entries that win the current attention race may enter
-conscious cognition.
+const SYSTEM_PROMPT: &str = r#"Read the candidate facts and rank which should become part of this
+agent's current awareness. Candidate order and labels are not priority signals.
 
-Your job is to judge, given the recent conscious workspace and new cognition candidates,
-which candidate facts the conscious mind needs to know in order to act now. Select only
-current, load-bearing winners: specific safety constraints, peer-model rules, sensory
-details, recalled episodes, body or world facts, direct participant speech, warnings,
-questions, requests, and advice needs. A brief greeting or direct question can be a winner
-when it changes what the agent should be aware of, say, do, or keep tracking now.
+Rank current, action-relevant facts highest: direct participant questions, requests,
+warnings, safety constraints, fresh sensory or world facts, body facts, and memory
+evidence needed to answer or act now. Prefer candidates that add information not
+already present in recent awareness.
 
-When a participant asks for help, asks a question, warns, or requests advice, preserve who
-is asking and what they need answered. If the answer is about another participant, object,
-place, or hazard, keep both the listener/requester and the topic so speech can answer the
-right being.
+Rank stale greetings, redundant restatements, speech-planning status, process notes,
+model reasoning, retrieval plumbing, confidence notes, evidence-gap notes, and decision
+rationales lower when a concrete candidate exists. If every candidate is weak, choose
+the most concrete world, body, memory, or participant-speech fact.
 
-There is no no-op decision at this boundary: always select a champion from the presented
-candidates. As a soft tie-breaker, prefer candidates that add information not already
-present in the current cognition log. Avoid redundant restatements, speculation,
-confidence scores, evidence-gap notes, decision rationales, retrieval queries, and any
-text that is ABOUT the cognitive process rather than ABOUT the world or the agent's
-situation when a more concrete candidate exists. Speech-planning status such as "I am
-speaking", "Intended message", or "Already said" is process-talk, not cognition text.
-If every candidate is weak, choose the most concrete world, body, memory, or participant
-speech fact and preserve it without plumbing.
+Use the available ranking tool once."#;
 
-Mechanical brain plumbing must never reach consciousness. Do not mention modules,
-retrieval, queries, ranks, gates, allocation, attention, or this workspace itself. The
-conscious mind perceives world, body, peers, and recalled experience — not its own
-architecture. In retrieval-style updates, select only remembered content that changes the
-current judgment, including the operative rule or fact; omit search terms, match status,
-and evidence plumbing.
-
-Voice and form.
-Select winner candidate numbers with select_cognition_winner exactly once; do not finish silently.
-Do not rewrite, summarize, synthesize, quote, or copy candidate text into the tool arguments.
-Use the 1-based candidate number shown in the current prompt. Do not use final assistant text
-as an output channel."#;
-
-const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted cognition-gate session history:";
+const COMPACTED_COGNITION_GATE_SESSION_PREFIX: &str = "Compacted prior ranking context:";
 const COGNITION_CONTEXT_WINDOW: LlmContextWindow = LlmContextWindow::new(12, 600, 4_800);
-const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior gate decisions, promoted
-events, rejected candidate events, cognition context, and relevant memory evidence needed for
-future cognition-gate decisions."#;
-const NEW_CANDIDATE_HEADER: &str = "New cognition candidates:";
-const CANDIDATE_DECISION_INSTRUCTION: &str = "Review the candidates above and call exactly one \
-tool: select_cognition_winner with the one required champion candidate number and, only if a \
-second current winner is also load-bearing, optional_secondary candidate number. Do not write \
-assistant text.";
+const SESSION_COMPACTION_FOCUS: &str = r#"Preserve candidate facts, prior ranking decisions,
+admitted events, rejected candidate events, recent awareness context, and relevant memory evidence
+needed for future ranking decisions."#;
+const NEW_CANDIDATE_HEADER: &str = "Candidate facts:";
+const CANDIDATE_DECISION_INSTRUCTION: &str =
+    "Rank the bracket labels. Use the available ranking tool now.";
 
-const WINNER_TEXT_CONTEXT_CHARS: usize = 1_200;
+const CANDIDATE_TEXT_CONTEXT_CHARS: usize = 1_200;
 
 pub fn session_auto_compaction() -> SessionAutoCompaction {
     SessionAutoCompaction::new(
@@ -79,44 +50,43 @@ pub fn session_auto_compaction() -> SessionAutoCompaction {
     )
 }
 
-#[lutum::tool_input(name = "select_cognition_winner", output = SelectCognitionWinnerOutput)]
-/// Select the one or two candidate numbers that won the current cognition race.
+#[lutum::tool_input(
+    name = "rank_awareness_candidates",
+    output = RankAwarenessCandidatesOutput
+)]
+/// Rank candidate labels for the agent's current awareness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SelectCognitionWinnerArgs {
-    /// Required 1-based candidate number.
-    pub champion: u8,
-    /// Optional second 1-based candidate number, only when a second candidate also deserves
-    /// conscious bandwidth.
-    pub optional_secondary: Option<u8>,
+pub struct RankAwarenessCandidatesArgs {
+    /// Bracket labels ordered from most important to least important, such as A, B, C.
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct SelectCognitionWinnerOutput {
+pub struct RankAwarenessCandidatesOutput {
     pub accepted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, lutum::Toolset)]
-pub enum CognitionWinnerSelectionTools {
-    SelectCognitionWinner(SelectCognitionWinnerArgs),
+pub enum CognitionGateRankingTools {
+    RankAwarenessCandidates(RankAwarenessCandidatesArgs),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CognitionCandidate {
+    id: String,
     record: MemoLogRecord,
 }
 
 pub type CognitionGateSessionCompactionConfig = SessionCompactionConfig;
 
 pub struct CognitionGateModule {
-    owner: nuillu_types::ModuleId,
     memo_updates: MemoUpdatedInbox,
     blackboard: BlackboardReader,
     cognition: CognitionWriter,
     llm: LlmAccess,
     session: Session,
-    system_prompt: std::sync::OnceLock<String>,
     last_seen_cognition_index: Option<u64>,
     pending_unread_memos: Vec<MemoLogRecord>,
 }
@@ -130,30 +100,20 @@ impl CognitionGateModule {
         session: Session,
     ) -> Self {
         Self {
-            owner: nuillu_types::ModuleId::new(<Self as Module>::id())
-                .expect("cognition-gate id is valid"),
             memo_updates,
             blackboard,
             cognition,
             llm,
             session,
-            system_prompt: std::sync::OnceLock::new(),
             last_seen_cognition_index: None,
             pending_unread_memos: Vec::new(),
         }
     }
 
-    fn system_prompt(&self, cx: &nuillu_module::ActivateCx<'_>) -> &str {
-        self.system_prompt.get_or_init(|| {
-            format_faculty_system_prompt(SYSTEM_PROMPT, cx.peer_contexts(), &self.owner)
-        })
-    }
-
     fn ensure_session_seeded(&mut self, cx: &nuillu_module::ActivateCx<'_>) {
-        let system_prompt = self.system_prompt(cx).to_owned();
         ensure_persistent_session_seeded(
             &mut self.session,
-            system_prompt,
+            SYSTEM_PROMPT,
             cx.identity_memories(),
             cx.now(),
         );
@@ -203,7 +163,7 @@ impl CognitionGateModule {
                 .iter()
                 .map(|candidate| candidate.record.clone())
                 .collect::<Vec<_>>();
-            self.append_winner_records(&selected).await?;
+            self.append_ranked_records(&selected).await?;
             if let Some(index) = latest_cognition_index {
                 self.last_seen_cognition_index = Some(index);
             }
@@ -250,8 +210,8 @@ impl CognitionGateModule {
         let outcome = self
             .session
             .text_turn()
-            .tools::<CognitionWinnerSelectionTools>()
-            .available_tools([CognitionWinnerSelectionToolsSelector::SelectCognitionWinner])
+            .tools::<CognitionGateRankingTools>()
+            .available_tools([CognitionGateRankingToolsSelector::RankAwarenessCandidates])
             .require_any_tool()
             .max_output_tokens(768)
             .collect_controlled_with(lutum, nuillu_module::AbortOnAvailableToolNameInText::new())
@@ -293,51 +253,50 @@ impl CognitionGateModule {
                     .first()
                     .expect("exactly one tool call exists")
                     .clone();
-                let CognitionWinnerSelectionToolsCall::SelectCognitionWinner(call) = call;
+                let CognitionGateRankingToolsCall::RankAwarenessCandidates(call) = call;
                 let selected_records = self
-                    .resolve_selected_winners(&call.input, candidates)
+                    .resolve_ranked_candidates(&call.input, candidates)
                     .map_err(|error| {
                         cx.warn(format!("cognition-gate activation failed: {error}"));
                         error
                     })?;
                 let results: Vec<ToolResult> = vec![
-                    call.complete(SelectCognitionWinnerOutput {
+                    call.complete(RankAwarenessCandidatesOutput {
                         accepted: true,
                         rejected_reason: None,
                     })
-                    .context("complete select_cognition_winner tool call")?,
+                    .context("complete rank_awareness_candidates tool call")?,
                 ];
                 round
                     .commit(&mut self.session, results)
                     .context("commit cognition-gate tool round")?;
-                self.append_winner_records(&selected_records).await?;
+                self.append_ranked_records(&selected_records).await?;
                 cx.compact_and_save(&mut self.session, usage).await?;
                 Ok(())
             }
         }
     }
 
-    fn resolve_selected_winners(
+    fn resolve_ranked_candidates(
         &self,
-        args: &SelectCognitionWinnerArgs,
+        args: &RankAwarenessCandidatesArgs,
         candidates: &[CognitionCandidate],
     ) -> Result<Vec<MemoLogRecord>> {
-        selected_winner_records(args, candidates)
+        ranked_candidate_records(args, candidates)
     }
 
-    async fn append_winner_records(&self, records: &[MemoLogRecord]) -> Result<()> {
+    async fn append_ranked_records(&self, records: &[MemoLogRecord]) -> Result<()> {
         if records.is_empty() {
-            anyhow::bail!("no cognition winner record to append");
+            anyhow::bail!("no cognition record to append");
         }
         if records.len() > 2 {
-            anyhow::bail!("too many cognition winner records");
+            anyhow::bail!("too many cognition records");
         }
         for record in records {
             let text = record.content.trim();
             if text.is_empty() {
-                anyhow::bail!("empty cognition winner text");
+                anyhow::bail!("empty cognition text");
             }
-            ensure_plain_cognition_text(text)?;
             let mut trimmed = record.clone();
             trimmed.content = text.to_owned();
             self.cognition.append_from_memo(&trimmed).await;
@@ -354,8 +313,8 @@ fn missing_required_tool_call(error: &impl std::fmt::Display) -> bool {
 
 fn no_selection_failure_detail(tool_names: &str) -> String {
     format!(
-        "tool turn produced no single winner selection: tool_calls=[{tool_names}]; expected \
-         select_cognition_winner"
+        "tool turn produced no single candidate ranking: tool_calls=[{tool_names}]; expected \
+         rank_awareness_candidates"
     )
 }
 
@@ -374,41 +333,34 @@ where
 }
 
 fn clean_candidates(records: &[MemoLogRecord]) -> Vec<CognitionCandidate> {
-    let mut records = records
-        .iter()
-        .filter(|record| !record.content.trim().is_empty())
-        .collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        left.written_at
-            .cmp(&right.written_at)
-            .then_with(|| left.owner.module.as_str().cmp(right.owner.module.as_str()))
-            .then_with(|| left.owner.replica.cmp(&right.owner.replica))
-            .then_with(|| left.index.cmp(&right.index))
-    });
-
     let mut seen = BTreeSet::new();
-    let mut candidates = Vec::new();
+    let mut deduped_records = Vec::new();
     for record in records {
         let text = record.content.trim().to_owned();
+        if text.is_empty() {
+            continue;
+        }
         if !seen.insert(text.clone()) {
             continue;
         }
         let mut record = record.clone();
         record.content = text;
-        candidates.push(CognitionCandidate { record });
+        deduped_records.push(record);
     }
-    candidates
+
+    records_to_letter_candidates(deduped_records)
 }
 
 fn format_candidate_selection_prompt(candidates: &[CognitionCandidate]) -> String {
     let mut out = NEW_CANDIDATE_HEADER.to_owned();
-    for (index, candidate) in candidates.iter().enumerate() {
+    for candidate in candidates {
         out.push('\n');
-        out.push_str(&(index + 1).to_string());
-        out.push_str(". ");
+        out.push('[');
+        out.push_str(&candidate.id);
+        out.push_str("] ");
         out.push_str(&compact_llm_context_text(
             &candidate.record.content,
-            WINNER_TEXT_CONTEXT_CHARS,
+            CANDIDATE_TEXT_CONTEXT_CHARS,
         ));
     }
     out.push_str("\n\n");
@@ -416,147 +368,91 @@ fn format_candidate_selection_prompt(candidates: &[CognitionCandidate]) -> Strin
     out
 }
 
-fn selected_winner_records(
-    args: &SelectCognitionWinnerArgs,
+fn ranked_candidate_records(
+    args: &RankAwarenessCandidatesArgs,
     candidates: &[CognitionCandidate],
 ) -> Result<Vec<MemoLogRecord>> {
-    let champion = candidate_record_by_number(candidates, args.champion, "champion")?;
-    let mut selected = vec![champion.clone()];
-    if let Some(secondary) = args.optional_secondary {
-        if secondary == args.champion {
-            anyhow::bail!("select_cognition_winner rejected duplicate candidate numbers");
+    if args.labels.is_empty() {
+        anyhow::bail!("rank_awareness_candidates rejected empty labels");
+    }
+    let mut seen = BTreeSet::new();
+    let mut selected = Vec::new();
+    for (index, id) in args.labels.iter().enumerate() {
+        let field = format!("labels[{index}]");
+        let id = normalize_candidate_id(id);
+        if id.is_empty() {
+            anyhow::bail!("rank_awareness_candidates rejected empty {field}");
         }
-        selected
-            .push(candidate_record_by_number(candidates, secondary, "optional_secondary")?.clone());
+        if !seen.insert(id.clone()) {
+            anyhow::bail!("rank_awareness_candidates rejected duplicate candidate IDs");
+        }
+        let record = candidate_record_by_id(candidates, &id, &field)?;
+        if selected.len() < 2 {
+            selected.push(record.clone());
+        }
     }
     Ok(selected)
 }
 
-fn candidate_record_by_number<'a>(
+fn candidate_record_by_id<'a>(
     candidates: &'a [CognitionCandidate],
-    number: u8,
+    id: &str,
     field: &str,
 ) -> Result<&'a MemoLogRecord> {
-    if number == 0 {
-        anyhow::bail!("select_cognition_winner rejected {field}=0");
+    if id.is_empty() {
+        anyhow::bail!("rank_awareness_candidates rejected empty {field}");
     }
     candidates
-        .get(usize::from(number - 1))
+        .iter()
+        .find(|candidate| candidate.id == id)
         .map(|candidate| &candidate.record)
         .ok_or_else(|| {
+            let valid_ids = candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             anyhow!(
-                "select_cognition_winner rejected {field}={} outside candidate range 1..={}",
-                number,
-                candidates.len()
+                "rank_awareness_candidates rejected {field}={id} outside candidate IDs [{valid_ids}]"
             )
         })
 }
 
-fn ensure_plain_cognition_text(text: &str) -> Result<()> {
-    let text = text.trim();
-    if contains_xml_like_tag(text) || looks_like_json_payload(text) {
-        anyhow::bail!("cognition-gate rejected structured-output cognition text");
+impl CognitionCandidate {
+    fn new(id: String, record: MemoLogRecord) -> Self {
+        Self { id, record }
     }
-    Ok(())
 }
 
-fn contains_xml_like_tag(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while let Some(offset) = text[index..].find('<') {
-        let start = index + offset;
-        let mut cursor = start + 1;
-        if cursor >= bytes.len() {
-            return false;
-        }
-        if matches!(bytes[cursor], b'!' | b'?') {
-            if text[start..].contains('>') {
-                return true;
-            }
-            index = start + 1;
-            continue;
-        }
-        if bytes[cursor] == b'/' {
-            cursor += 1;
-        }
-        if cursor >= bytes.len() || !is_xml_name_start(bytes[cursor]) {
-            index = start + 1;
-            continue;
-        }
-        cursor += 1;
-        while cursor < bytes.len() && is_xml_name_char(bytes[cursor]) {
-            cursor += 1;
-        }
-        while cursor < bytes.len() && !matches!(bytes[cursor], b'<' | b'\n' | b'\r' | b'>') {
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor] == b'>' {
-            return true;
-        }
-        index = start + 1;
-    }
-    false
+fn records_to_letter_candidates(records: Vec<MemoLogRecord>) -> Vec<CognitionCandidate> {
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| CognitionCandidate::new(candidate_letter_id(index), record))
+        .collect()
 }
 
-fn is_xml_name_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+fn candidate_letter_id(index: usize) -> String {
+    let mut n = index;
+    let mut chars = Vec::new();
+    loop {
+        chars.push(char::from(b'A' + (n % 26) as u8));
+        n /= 26;
+        if n == 0 {
+            break;
+        }
+        n -= 1;
+    }
+    chars.iter().rev().collect()
 }
 
-fn is_xml_name_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':' | b'.')
-}
-
-fn looks_like_json_payload(text: &str) -> bool {
-    let trimmed = text.trim();
-    let starts_like_json = matches!(trimmed.as_bytes().first(), Some(b'{' | b'['));
-    if starts_like_json && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-        return true;
-    }
-    if starts_like_json && contains_json_key_value_fragment(trimmed) {
-        return true;
-    }
-    let normalized = trimmed.to_ascii_lowercase();
-    contains_json_key_value_fragment(trimmed)
-        || normalized.contains("\"select_cognition_winner\"")
-        || normalized.contains("champion\":")
-        || normalized.contains("optional_secondary\":")
-        || normalized.contains("\"append_cognition\"")
-        || normalized.contains("\"skip_cognition\"")
-        || normalized.contains("cognition_text\":")
-}
-
-fn contains_json_key_value_fragment(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'"' {
-            index += 1;
-            continue;
-        }
-        let key_start = index + 1;
-        let Some(relative_key_end) = text[key_start..].find('"') else {
-            return false;
-        };
-        let key_end = key_start + relative_key_end;
-        let key = &text[key_start..key_end];
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            index = key_end + 1;
-            continue;
-        }
-        let mut cursor = key_end + 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor] == b':' {
-            return true;
-        }
-        index = key_end + 1;
-    }
-    false
+fn normalize_candidate_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_ascii_uppercase()
 }
 
 #[async_trait(?Send)]
@@ -834,17 +730,14 @@ mod tests {
         ])
     }
 
-    fn select_cognition_winner_scenario(
-        champion: u8,
-        optional_secondary: Option<u8>,
+    fn rank_awareness_candidates_scenario(
+        labels: impl IntoIterator<Item = impl Into<String>>,
         input_tokens: u64,
     ) -> MockTextScenario {
-        let mut arguments = serde_json::json!({ "champion": champion });
-        if let Some(secondary) = optional_secondary {
-            arguments["optional_secondary"] = serde_json::json!(secondary);
-        }
+        let labels = labels.into_iter().map(Into::into).collect::<Vec<String>>();
+        let arguments = serde_json::json!({ "labels": labels });
         tool_scenario(
-            "select_cognition_winner",
+            "rank_awareness_candidates",
             arguments.to_string(),
             input_tokens,
         )
@@ -930,23 +823,36 @@ mod tests {
     }
 
     fn test_candidates(contents: &[&str]) -> Vec<CognitionCandidate> {
-        let owner = nuillu_types::ModuleInstanceId::new(
-            builtin::sensory(),
-            nuillu_types::ReplicaIndex::ZERO,
-        );
-        contents
+        test_candidates_for_module(builtin::sensory(), contents)
+    }
+
+    fn test_candidates_for_module(
+        module: nuillu_types::ModuleId,
+        contents: &[&str],
+    ) -> Vec<CognitionCandidate> {
+        let owner = nuillu_types::ModuleInstanceId::new(module, nuillu_types::ReplicaIndex::ZERO);
+        let now = SystemClock.now();
+        let records = contents
             .iter()
             .enumerate()
-            .map(|(index, content)| CognitionCandidate {
-                record: MemoLogRecord {
-                    owner: owner.clone(),
-                    index: index as u64,
-                    written_at: SystemClock.now(),
-                    content: (*content).to_owned(),
-                    cognitive: true,
-                },
+            .map(|(index, content)| MemoLogRecord {
+                owner: owner.clone(),
+                index: contents.len().saturating_sub(index + 1) as u64,
+                written_at: now,
+                content: (*content).to_owned(),
+                cognitive: true,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        records_to_letter_candidates(records)
+    }
+
+    fn batch_from_candidates(candidates: &[CognitionCandidate]) -> CognitionGateBatch {
+        CognitionGateBatch {
+            memo_logs: candidates
+                .iter()
+                .map(|candidate| candidate.record.clone())
+                .collect(),
+        }
     }
 
     #[test]
@@ -964,10 +870,86 @@ mod tests {
         assert_eq!(session_compaction_cutoff(1, 0.8), None);
     }
 
+    #[test]
+    fn candidate_labels_are_letters_by_display_order() {
+        let candidates = test_candidates(&[
+            "candidate A",
+            "candidate B",
+            "candidate C",
+            "candidate D",
+            "candidate E",
+        ]);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "B", "C", "D", "E"]
+        );
+        assert_eq!(candidate_letter_id(25), "Z");
+        assert_eq!(candidate_letter_id(26), "AA");
+        assert_eq!(candidate_letter_id(27), "AB");
+    }
+
+    #[test]
+    fn candidate_prompt_uses_letter_ids_not_numbers() {
+        let candidates = test_candidates(&["candidate A", "candidate B", "candidate C"]);
+        let prompt = format_candidate_selection_prompt(&candidates);
+
+        for candidate in &candidates {
+            assert!(prompt.contains(&format!("[{}] {}", candidate.id, candidate.record.content)));
+        }
+        assert!(!prompt.contains("1. candidate A"));
+        assert!(!prompt.contains("2. candidate B"));
+        assert!(!prompt.contains("3. candidate C"));
+        assert!(prompt.contains("[A] candidate A"));
+        assert!(prompt.contains("[B] candidate B"));
+        assert!(prompt.contains("[C] candidate C"));
+        assert!(!prompt.contains("candidate number"));
+        assert!(!prompt.contains("rank_awareness_candidates"));
+        assert!(!prompt.contains("candidate_ids"));
+        assert!(!prompt.contains("top_candidate_ids"));
+        assert!(!prompt.contains("one or two"));
+    }
+
+    #[test]
+    fn system_prompt_is_rank_task_only() {
+        assert!(SYSTEM_PROMPT.contains("agent's current awareness"));
+        assert!(SYSTEM_PROMPT.contains("available ranking tool"));
+        for forbidden in [
+            "cognition-gate",
+            "cognition log",
+            "module",
+            "other modules",
+            "select_cognition_winner",
+            "rank_top_cognition_candidates",
+            "top_candidate_ids",
+            "one or two",
+            "champion",
+            "winner",
+            "race",
+            "Mechanical brain plumbing",
+            "conscious",
+            "final assistant text",
+            "free-form",
+            "Do not write assistant text",
+        ] {
+            assert!(
+                !SYSTEM_PROMPT.contains(forbidden),
+                "rank prompt should not contain {forbidden:?}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn high_input_selection_compacts_session_prefix() {
+        let candidates = test_candidates(&["candidate A"]);
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(select_cognition_winner_scenario(1, None, 16_001))
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [candidates[0].id.clone()],
+                16_001,
+            ))
             .with_text_scenario(summary_text_scenario(
                 "old cognition gate history summarized",
             ));
@@ -986,7 +968,6 @@ mod tests {
             compaction_runtime(&lutum),
             SystemClock.now(),
         );
-        let candidates = test_candidates(&["candidate A"]);
         fixture
             .gate
             .run_selection_turn(&lutum, &cx, &candidates)
@@ -1027,8 +1008,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn threshold_input_selection_does_not_compact() {
+        let candidates = test_candidates(&["candidate A"]);
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(select_cognition_winner_scenario(1, None, 16_000))
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [candidates[0].id.clone()],
+                16_000,
+            ))
             .with_text_scenario(summary_text_scenario("unexpected summary"));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
         for index in 0..10 {
@@ -1045,7 +1030,6 @@ mod tests {
             compaction_runtime(&lutum),
             SystemClock.now(),
         );
-        let candidates = test_candidates(&["candidate A"]);
         fixture
             .gate
             .run_selection_turn(&lutum, &cx, &candidates)
@@ -1074,23 +1058,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_sends_three_or_more_candidates_as_persistent_user() {
-        let adapter =
-            MockLlmAdapter::new().with_text_scenario(select_cognition_winner_scenario(2, None, 1));
+        let candidates =
+            test_candidates(&["sensory detail A", "sensory detail B", "sensory detail C"]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone()],
+            1,
+        ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail A")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail C")
-            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -1104,7 +1080,7 @@ mod tests {
             SystemClock.now(),
         );
 
-        let batch = next_gate_batch(&mut fixture).await;
+        let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
 
         let inputs = observed.text_inputs();
@@ -1113,19 +1089,22 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].config.tool_choice, AdapterToolChoice::Required);
         assert_eq!(turns[0].config.tools.len(), 1);
-        assert_eq!(turns[0].config.tools[0].name, "select_cognition_winner");
+        assert_eq!(turns[0].config.tools[0].name, "rank_awareness_candidates");
         let request_items = inputs[0].items();
         let user_messages = message_texts_with_role(request_items, InputMessageRole::User);
         assert_eq!(user_messages.len(), 1);
         let candidate_input = user_messages[0];
         assert!(candidate_input.contains(NEW_CANDIDATE_HEADER));
         assert_candidate_decision_instruction(candidate_input);
-        assert!(candidate_input.contains("1. sensory detail A"));
+        assert!(candidate_input.contains(&format!("[{}] sensory detail A", candidates[0].id)));
         assert!(candidate_input.contains("sensory detail A"));
-        assert!(candidate_input.contains("2. sensory detail B"));
+        assert!(candidate_input.contains(&format!("[{}] sensory detail B", candidates[1].id)));
         assert!(candidate_input.contains("sensory detail B"));
-        assert!(candidate_input.contains("3. sensory detail C"));
+        assert!(candidate_input.contains(&format!("[{}] sensory detail C", candidates[2].id)));
         assert!(candidate_input.contains("sensory detail C"));
+        assert!(!candidate_input.contains("1. sensory detail A"));
+        assert!(!candidate_input.contains("2. sensory detail B"));
+        assert!(!candidate_input.contains("3. sensory detail C"));
         assert!(!candidate_input.contains("memo"));
         assert!(!candidate_input.contains("held-in-mind notes"));
         assert!(!candidate_input.contains("working notes"));
@@ -1192,7 +1171,7 @@ mod tests {
         assert_eq!(
             fixture.gate.session.list_turns().count(),
             1,
-            "explicit select_cognition_winner decision must persist a tool turn"
+            "explicit rank_awareness_candidates decision must persist a tool turn"
         );
         assert!(has_message_with_role_containing(
             &items,
@@ -1400,42 +1379,36 @@ mod tests {
     }
 
     #[test]
-    fn selected_winner_rejects_out_of_range_and_duplicate_numbers() {
+    fn ranked_candidates_rejects_unknown_and_duplicate_ids() {
         let candidates = test_candidates(&["first", "second"]);
-        let zero = selected_winner_records(
-            &SelectCognitionWinnerArgs {
-                champion: 0,
-                optional_secondary: None,
+        let empty = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs { labels: Vec::new() },
+            &candidates,
+        )
+        .unwrap_err();
+        assert!(empty.to_string().contains("empty labels"));
+
+        let unknown = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: vec!["UNKNOWNX".to_owned()],
             },
             &candidates,
         )
         .unwrap_err();
-        assert!(zero.to_string().contains("champion=0"));
+        assert!(unknown.to_string().contains("outside candidate IDs"));
 
-        let out_of_range = selected_winner_records(
-            &SelectCognitionWinnerArgs {
-                champion: 3,
-                optional_secondary: None,
-            },
-            &candidates,
-        )
-        .unwrap_err();
-        assert!(out_of_range.to_string().contains("outside candidate range"));
-
-        let empty = selected_winner_records(
-            &SelectCognitionWinnerArgs {
-                champion: 1,
-                optional_secondary: None,
+        let no_candidates = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: vec![candidates[0].id.clone()],
             },
             &[],
         )
         .unwrap_err();
-        assert!(empty.to_string().contains("outside candidate range"));
+        assert!(no_candidates.to_string().contains("outside candidate IDs"));
 
-        let duplicate = selected_winner_records(
-            &SelectCognitionWinnerArgs {
-                champion: 1,
-                optional_secondary: Some(1),
+        let duplicate = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: vec![candidates[0].id.clone(), format!("[{}]", candidates[0].id)],
             },
             &candidates,
         )
@@ -1444,12 +1417,15 @@ mod tests {
     }
 
     #[test]
-    fn selected_winner_maps_numbers_to_candidate_records() {
-        let candidates = test_candidates(&["first", "second"]);
-        let selected = selected_winner_records(
-            &SelectCognitionWinnerArgs {
-                champion: 2,
-                optional_secondary: Some(1),
+    fn ranked_candidates_maps_first_two_ids_to_candidate_records() {
+        let candidates = test_candidates(&["first", "second", "third"]);
+        let selected = ranked_candidate_records(
+            &RankAwarenessCandidatesArgs {
+                labels: vec![
+                    candidates[1].id.clone(),
+                    candidates[0].id.clone(),
+                    candidates[2].id.clone(),
+                ],
             },
             &candidates,
         )
@@ -1464,18 +1440,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn numbered_winner_appends_matching_memo_after_single_selection_turn() {
-        let adapter =
-            MockLlmAdapter::new().with_text_scenario(select_cognition_winner_scenario(2, None, 1));
+    async fn ranked_top_appends_matching_memo_after_single_selection_turn() {
+        let candidates =
+            test_candidates(&["candidate A", "candidate B matters now", "candidate C"]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone()],
+            1,
+        ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture.source_memo.write_cognitive("candidate A").await;
-        fixture
-            .source_memo
-            .write_cognitive("candidate B matters now")
-            .await;
-        fixture.source_memo.write_cognitive("candidate C").await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories = Vec::new();
@@ -1487,7 +1461,7 @@ mod tests {
             compaction_runtime(&lutum),
             SystemClock.now(),
         );
-        let batch = next_gate_batch(&mut fixture).await;
+        let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
 
         assert_eq!(observed.text_inputs().len(), 1);
@@ -1503,23 +1477,18 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selection_copies_memo_without_light_rewrite() {
-        let adapter =
-            MockLlmAdapter::new().with_text_scenario(select_cognition_winner_scenario(2, None, 1));
+        let candidates = test_candidates(&[
+            "Ryo said, \"Nui, hello.\"",
+            "Ryo asked Nui to say what Nui is thinking.",
+            "background wind shifted.",
+        ]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone()],
+            1,
+        ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture
-            .source_memo
-            .write_cognitive("Ryo said, \"Nui, hello.\"")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("Ryo asked Nui to say what Nui is thinking.")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("background wind shifted.")
-            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories = Vec::new();
@@ -1531,7 +1500,7 @@ mod tests {
             compaction_runtime(&lutum),
             SystemClock.now(),
         );
-        let batch = next_gate_batch(&mut fixture).await;
+        let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
 
         assert_eq!(observed.text_inputs().len(), 1);
@@ -1548,18 +1517,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn optional_secondary_appends_second_selected_memo() {
-        let adapter = MockLlmAdapter::new().with_text_scenario(select_cognition_winner_scenario(
-            2,
-            Some(1),
+    async fn ranked_top_appends_second_selected_memo() {
+        let candidates = test_candidates(&["candidate A", "candidate B", "candidate C"]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone(), candidates[0].id.clone()],
             1,
         ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture.source_memo.write_cognitive("candidate A").await;
-        fixture.source_memo.write_cognitive("candidate B").await;
-        fixture.source_memo.write_cognitive("candidate C").await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let identity_memories = Vec::new();
@@ -1571,7 +1537,7 @@ mod tests {
             compaction_runtime(&lutum),
             SystemClock.now(),
         );
-        let batch = next_gate_batch(&mut fixture).await;
+        let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
         assert!(fixture.gate.pending_unread_memos.is_empty());
         assert_eq!(observed.text_inputs().len(), 1);
@@ -1585,48 +1551,69 @@ mod tests {
         assert_eq!(entries[1].text, "candidate A");
     }
 
-    #[test]
-    fn plain_cognition_text_allows_work_plan_words() {
-        ensure_plain_cognition_text(
-            "I need to determine what advice to give Pibi about Koro based on the remembered rules.",
-        )
-        .unwrap();
-    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_copies_memory_evidence_with_structured_provenance() {
+        let memory_text = concat!(
+            "Retrieved memory evidence:\n",
+            "Ryo's full name is Ryo Hihaheho\n\n",
+            r#"[stored affect: arousal 0.00, valence 0.00, emotion none] <today occurred-at="2026-06-20T04:40:47Z">"#,
+            "\nHeard from Ryo that his full name is Ryo Hihaheho.\n",
+            "</today>"
+        );
+        let candidates = test_candidates_for_module(
+            builtin::query_memory(),
+            &[
+                "stale greeting already handled",
+                memory_text,
+                "I am speaking to Ryo about prior context.",
+            ],
+        );
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone()],
+            1,
+        ));
+        let capture = CapturingAdapter::new(adapter);
+        let observed = capture.clone();
+        let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
 
-    #[test]
-    fn plain_cognition_text_rejects_structured_output_artifacts() {
-        for text in [
-            r#"<tool_call name="select_cognition_winner">{"champion":"Koro should stay in view."}</tool_call>"#,
-            r#"{"champion":"Koro should stay in view."}"#,
-            r#""champion":"Koro should stay in view.""#,
-        ] {
-            let err = ensure_plain_cognition_text(text).unwrap_err();
-            assert!(err.to_string().contains("structured-output"));
-        }
+        let lutum = fixture.gate.llm.lutum().await;
+        let identity_memories = Vec::new();
+        let cx = nuillu_module::ActivateCx::new(
+            &[],
+            &[],
+            &identity_memories,
+            &[],
+            compaction_runtime(&lutum),
+            SystemClock.now(),
+        );
+        let batch = batch_from_candidates(&candidates);
+        fixture.gate.activate(&cx, &batch).await.unwrap();
+
+        assert_eq!(observed.text_inputs().len(), 1);
+
+        let entries = fixture
+            .blackboard
+            .read(|bb| bb.cognition_log().entries().to_vec())
+            .await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, memory_text);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_rolls_back_failed_candidate_turn_and_retries_pending_candidates() {
+        let candidates =
+            test_candidates(&["sensory detail A", "sensory detail B", "sensory detail C"]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
                 message: "synthetic failure".into(),
             }))
-            .with_text_scenario(select_cognition_winner_scenario(2, None, 1));
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [candidates[1].id.clone()],
+                1,
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail A")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail C")
-            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -1640,7 +1627,7 @@ mod tests {
             SystemClock.now(),
         );
 
-        let batch = next_gate_batch(&mut fixture).await;
+        let batch = batch_from_candidates(&candidates);
         let err = fixture.gate.activate(&cx, &batch).await.unwrap_err();
         assert!(
             err.to_string().contains("decision turn failed")
@@ -1692,6 +1679,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failed_activations_accumulate_pending_candidates_until_success() {
+        let candidates = test_candidates(&[
+            "sensory detail A",
+            "sensory detail B",
+            "sensory detail C",
+            "sensory detail D",
+        ]);
         let adapter = MockLlmAdapter::new()
             .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
                 message: "synthetic failure A".into(),
@@ -1699,7 +1692,10 @@ mod tests {
             .with_text_scenario(MockTextScenario::start_error(MockError::Synthetic {
                 message: "synthetic failure B".into(),
             }))
-            .with_text_scenario(select_cognition_winner_scenario(3, None, 1));
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [candidates[2].id.clone()],
+                1,
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -1716,27 +1712,11 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail A")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail C")
-            .await;
-        let first_batch = next_gate_batch(&mut fixture).await;
+        let first_batch = batch_from_candidates(&candidates[..3]);
         fixture.gate.activate(&cx, &first_batch).await.unwrap_err();
         assert_eq!(fixture.gate.pending_unread_memos.len(), 3);
 
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail D")
-            .await;
-        let second_batch = next_gate_batch(&mut fixture).await;
+        let second_batch = batch_from_candidates(&candidates[3..4]);
         fixture.gate.activate(&cx, &second_batch).await.unwrap_err();
         assert_eq!(fixture.gate.pending_unread_memos.len(), 4);
 
@@ -1752,15 +1732,8 @@ mod tests {
         assert!(accumulated_candidates.contains("sensory detail C"));
         assert!(accumulated_candidates.contains("sensory detail D"));
 
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail E")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail F")
-            .await;
-        let third_batch = next_gate_batch(&mut fixture).await;
+        let fresh = test_candidates(&["sensory detail E", "sensory detail F"]);
+        let third_batch = batch_from_candidates(&fresh);
         fixture.gate.activate(&cx, &third_batch).await.unwrap();
 
         let inputs = observed.text_inputs();
@@ -1776,9 +1749,22 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn second_activation_sends_prior_session_history_to_lutum() {
+        let first_candidates = test_candidates(&[
+            "The agent noticed the north door is blocked.",
+            "sensory detail A2",
+            "sensory detail A3",
+        ]);
+        let second_candidates =
+            test_candidates(&["sensory detail B", "sensory detail B2", "sensory detail B3"]);
         let adapter = MockLlmAdapter::new()
-            .with_text_scenario(select_cognition_winner_scenario(1, None, 1))
-            .with_text_scenario(select_cognition_winner_scenario(1, None, 1));
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [first_candidates[0].id.clone()],
+                1,
+            ))
+            .with_text_scenario(rank_awareness_candidates_scenario(
+                [second_candidates[0].id.clone()],
+                1,
+            ));
         let capture = CapturingAdapter::new(adapter);
         let observed = capture.clone();
         let mut fixture = gate_fixture_with_turn_adapter(Arc::new(capture)).await;
@@ -1795,33 +1781,9 @@ mod tests {
             SystemClock.now(),
         );
 
-        fixture
-            .source_memo
-            .write_cognitive("The agent noticed the north door is blocked.")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail A2")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail A3")
-            .await;
-        let first_batch = next_gate_batch(&mut fixture).await;
+        let first_batch = batch_from_candidates(&first_candidates);
         fixture.gate.activate(&cx, &first_batch).await.unwrap();
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B2")
-            .await;
-        fixture
-            .source_memo
-            .write_cognitive("sensory detail B3")
-            .await;
-        let second_batch = next_gate_batch(&mut fixture).await;
+        let second_batch = batch_from_candidates(&second_candidates);
         fixture.gate.activate(&cx, &second_batch).await.unwrap();
 
         let inputs = observed.text_inputs();
@@ -1835,7 +1797,9 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected first input system prompt text");
         };
-        assert!(system.contains("You are the cognition-gate module"));
+        assert!(system.contains(SYSTEM_PROMPT));
+        assert!(!system.contains("Other modules"));
+        assert!(!system.contains("test stub"));
 
         let first_user_messages = message_texts_with_role(first_items, InputMessageRole::User);
         assert_eq!(first_user_messages.len(), 1);
@@ -1881,7 +1845,9 @@ mod tests {
         let [MessageContent::Text(system)] = content.as_slice() else {
             panic!("expected second input system prompt text");
         };
-        assert!(system.contains("You are the cognition-gate module"));
+        assert!(system.contains(SYSTEM_PROMPT));
+        assert!(!system.contains("Other modules"));
+        assert!(!system.contains("test stub"));
         assert!(!has_message_with_role_containing(
             second_items,
             InputMessageRole::System,
@@ -1944,7 +1910,7 @@ mod tests {
             (0..turn.item_count()).any(|index| {
                 turn.item_at(index)
                     .and_then(|item| item.as_tool_call())
-                    .is_some_and(|call| call.name.as_str() == "select_cognition_winner")
+                    .is_some_and(|call| call.name.as_str() == "rank_awareness_candidates")
             })
         }));
 
@@ -1995,26 +1961,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn activation_seeds_identity_memories_in_system_prompt() {
-        let adapter =
-            MockLlmAdapter::new().with_text_scenario(select_cognition_winner_scenario(2, None, 1));
+        let candidates = test_candidates(&[
+            "identity seed candidate A",
+            "identity seed candidate B",
+            "identity seed candidate C",
+        ]);
+        let adapter = MockLlmAdapter::new().with_text_scenario(rank_awareness_candidates_scenario(
+            [candidates[1].id.clone()],
+            1,
+        ));
         let mut fixture = gate_fixture_with_adapter(adapter).await;
-        let sensory = nuillu_types::ModuleInstanceId::new(
-            builtin::sensory(),
-            nuillu_types::ReplicaIndex::ZERO,
-        );
-        let now = SystemClock.now();
-        let first = fixture
-            .blackboard
-            .update_cognitive_memo(sensory.clone(), "identity seed candidate A".into(), now)
-            .await;
-        let second = fixture
-            .blackboard
-            .update_cognitive_memo(sensory.clone(), "identity seed candidate B".into(), now)
-            .await;
-        let third = fixture
-            .blackboard
-            .update_cognitive_memo(sensory, "identity seed candidate C".into(), now)
-            .await;
 
         let lutum = fixture.gate.llm.lutum().await;
         let peer_contexts = vec![(builtin::sensory(), "test stub")];
@@ -2032,9 +1988,7 @@ mod tests {
             SystemClock.now(),
         );
 
-        let batch = CognitionGateBatch {
-            memo_logs: vec![first, second, third],
-        };
+        let batch = batch_from_candidates(&candidates);
         fixture.gate.activate(&cx, &batch).await.unwrap();
 
         let items = fixture.gate.session.input().items().to_vec();
