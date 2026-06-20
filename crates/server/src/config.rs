@@ -26,6 +26,7 @@ pub struct ServerConfig {
     pub boot_config: ServerBootConfig,
     pub disabled_modules: Vec<RuntimeModule>,
     pub participants: Vec<String>,
+    pub fresh_agent_db: bool,
 }
 
 #[derive(Debug, Clone)]

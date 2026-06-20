@@ -46,6 +46,10 @@ struct Args {
     /// Participants currently available to the speak module as targets.
     #[arg(long = "participant", value_name = "NAME")]
     participants: Vec<String>,
+
+    /// Back up existing agent.db under --state before connecting, then start with a fresh DB.
+    #[arg(long)]
+    fresh_agent_db: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,6 +76,7 @@ fn main() -> anyhow::Result<()> {
         boot_config,
         disabled_modules: args.disable_module,
         participants: args.participants,
+        fresh_agent_db: args.fresh_agent_db,
     })
     .context("run nuillu server")
 }
@@ -149,5 +154,19 @@ mod tests {
             resolve_model_set_path(Path::new(".tmp/custom-server"), None),
             PathBuf::from(".tmp/custom-server/model-set.eure")
         );
+    }
+
+    #[test]
+    fn args_parse_fresh_agent_db_flag() {
+        let args = Args::parse_from(["nuillu-server", "--fresh-agent-db"]);
+
+        assert!(args.fresh_agent_db);
+    }
+
+    #[test]
+    fn args_default_to_reusing_agent_db() {
+        let args = Args::parse_from(["nuillu-server"]);
+
+        assert!(!args.fresh_agent_db);
     }
 }

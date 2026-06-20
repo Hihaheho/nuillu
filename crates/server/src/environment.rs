@@ -1,8 +1,8 @@
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{fs, path::Path, rc::Rc, sync::Arc};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use chrono::Local;
 use lutum::{
     FrequencyPenalty, Lutum, MaxOutputTokens, ModelName, PresencePenalty, RawTelemetryConfig,
     RequestExtensions, Seed, SharedPoolBudgetManager, SharedPoolBudgetOptions, StopSequences,
@@ -37,6 +37,8 @@ use super::memory_seed::seed_memory_from_state_dir;
 use super::runtime_event_log::{
     RuntimeEventLogWriter, runtime_event_log_path, runtime_event_message,
 };
+
+const AGENT_DB_FILE: &str = "agent.db";
 
 pub(super) struct ServerEnvironment {
     pub(super) server_session_id: String,
@@ -195,9 +197,20 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
         build_embedder(&config.embedding_backend)?;
     let (policy_embedder, policy_profile, policy_dimensions) =
         build_embedder(&config.embedding_backend)?;
+    if config.fresh_agent_db {
+        if let Some(path) = backup_agent_db_with_timestamp(
+            &config.state_dir,
+            &Local::now().format("%Y%m%d%H%M").to_string(),
+        )? {
+            eprintln!(
+                "nuillu-server backed up existing agent db to {}",
+                path.display()
+            );
+        }
+    }
     LibsqlAgentStore::connect(
         LibsqlAgentStoreConfig::local(
-            config.state_dir.join("agent.db"),
+            config.state_dir.join(AGENT_DB_FILE),
             memory_dimensions,
             policy_dimensions,
         )
@@ -208,6 +221,126 @@ async fn connect_agent_store(config: &ServerConfig) -> anyhow::Result<LibsqlAgen
     )
     .await
     .context("connect libsql agent store")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AgentDbBackupFile {
+    Main,
+    Wal,
+    Shm,
+}
+
+impl AgentDbBackupFile {
+    fn source_name(self) -> &'static str {
+        match self {
+            Self::Main => AGENT_DB_FILE,
+            Self::Wal => "agent.db-wal",
+            Self::Shm => "agent.db-shm",
+        }
+    }
+
+    fn backup_name(self, stem: &str) -> String {
+        match self {
+            Self::Main => format!("{stem}.db"),
+            Self::Wal => format!("{stem}.db-wal"),
+            Self::Shm => format!("{stem}.db-shm"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentDbBackupSource {
+    file: AgentDbBackupFile,
+    path: std::path::PathBuf,
+}
+
+fn backup_agent_db_with_timestamp(
+    state_dir: &Path,
+    timestamp: &str,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let sources = agent_db_backup_sources(state_dir)
+        .into_iter()
+        .filter(|source| source.path.exists())
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    let suffix = next_agent_db_backup_suffix(state_dir, timestamp)?;
+    for source in sources {
+        let target = agent_db_backup_path(state_dir, timestamp, suffix, source.file);
+        fs::rename(&source.path, &target).with_context(|| {
+            format!("back up {} to {}", source.path.display(), target.display())
+        })?;
+    }
+
+    Ok(Some(agent_db_backup_path(
+        state_dir,
+        timestamp,
+        suffix,
+        AgentDbBackupFile::Main,
+    )))
+}
+
+fn agent_db_backup_sources(state_dir: &Path) -> Vec<AgentDbBackupSource> {
+    [
+        AgentDbBackupFile::Main,
+        AgentDbBackupFile::Wal,
+        AgentDbBackupFile::Shm,
+    ]
+    .into_iter()
+    .map(|file| AgentDbBackupSource {
+        file,
+        path: state_dir.join(file.source_name()),
+    })
+    .collect()
+}
+
+fn next_agent_db_backup_suffix(state_dir: &Path, timestamp: &str) -> anyhow::Result<u32> {
+    let mut suffix = 0_u32;
+    loop {
+        if !agent_db_backup_targets(state_dir, timestamp, suffix)
+            .into_iter()
+            .any(|path| path.exists())
+        {
+            return Ok(suffix);
+        }
+        suffix = suffix.checked_add(1).with_context(|| {
+            format!(
+                "find unused agent db backup name in {}",
+                state_dir.display()
+            )
+        })?;
+    }
+}
+
+fn agent_db_backup_targets(
+    state_dir: &Path,
+    timestamp: &str,
+    suffix: u32,
+) -> Vec<std::path::PathBuf> {
+    [
+        AgentDbBackupFile::Main,
+        AgentDbBackupFile::Wal,
+        AgentDbBackupFile::Shm,
+    ]
+    .into_iter()
+    .map(|file| agent_db_backup_path(state_dir, timestamp, suffix, file))
+    .collect()
+}
+
+fn agent_db_backup_path(
+    state_dir: &Path,
+    timestamp: &str,
+    suffix: u32,
+    file: AgentDbBackupFile,
+) -> std::path::PathBuf {
+    let stem = if suffix == 0 {
+        format!("agent-bk{timestamp}")
+    } else {
+        format!("agent-bk{timestamp}-{suffix}")
+    };
+    state_dir.join(file.backup_name(&stem))
 }
 
 pub fn build_embedder(
@@ -557,8 +690,12 @@ impl UtteranceSink for ServerUtteranceSink {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use nuillu_blackboard::{ActivationRatio, Bpm, ModuleConfig, ModulePolicy, linear_ratio_fn};
     use nuillu_types::{ModuleId, ReplicaCapRange, builtin};
@@ -566,6 +703,8 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_MODULES, ServerBootConfig};
     use crate::registry::full_agent_allocation;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn test_embedding_backend() -> EmbeddingBackendConfig {
         EmbeddingBackendConfig {
@@ -604,6 +743,7 @@ mod tests {
             boot_config: ServerBootConfig::default(),
             disabled_modules: Vec::new(),
             participants: Vec::new(),
+            fresh_agent_db: false,
         };
 
         let context = server_llm_log_context(&config);
@@ -708,5 +848,90 @@ mod tests {
             1,
             "server should not clip speak solely because the default module set already has many active baseline roles"
         );
+    }
+
+    #[test]
+    fn backup_agent_db_moves_existing_db_to_timestamped_name() {
+        let state_dir = test_state_dir();
+        fs::write(state_dir.join("agent.db"), "old db").unwrap();
+
+        let backup =
+            backup_agent_db_with_timestamp(&state_dir, "202606200745").expect("backup succeeds");
+
+        let backup_path = state_dir.join("agent-bk202606200745.db");
+        assert_eq!(backup, Some(backup_path.clone()));
+        assert!(!state_dir.join("agent.db").exists());
+        assert_eq!(fs::read_to_string(backup_path).unwrap(), "old db");
+    }
+
+    #[test]
+    fn backup_agent_db_is_noop_without_db_or_sidecars() {
+        let state_dir = test_state_dir();
+
+        let backup =
+            backup_agent_db_with_timestamp(&state_dir, "202606200745").expect("backup succeeds");
+
+        assert_eq!(backup, None);
+        assert!(!state_dir.join("agent-bk202606200745.db").exists());
+    }
+
+    #[test]
+    fn backup_agent_db_uses_shared_suffix_when_backup_exists() {
+        let state_dir = test_state_dir();
+        fs::write(state_dir.join("agent.db"), "old db").unwrap();
+        fs::write(state_dir.join("agent-bk202606200745.db"), "previous").unwrap();
+
+        let backup =
+            backup_agent_db_with_timestamp(&state_dir, "202606200745").expect("backup succeeds");
+
+        let backup_path = state_dir.join("agent-bk202606200745-1.db");
+        assert_eq!(backup, Some(backup_path.clone()));
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-bk202606200745.db")).unwrap(),
+            "previous"
+        );
+        assert_eq!(fs::read_to_string(backup_path).unwrap(), "old db");
+    }
+
+    #[test]
+    fn backup_agent_db_moves_sidecars_with_same_stem() {
+        let state_dir = test_state_dir();
+        fs::write(state_dir.join("agent.db"), "main").unwrap();
+        fs::write(state_dir.join("agent.db-wal"), "wal").unwrap();
+        fs::write(state_dir.join("agent.db-shm"), "shm").unwrap();
+
+        let backup =
+            backup_agent_db_with_timestamp(&state_dir, "202606200745").expect("backup succeeds");
+
+        assert_eq!(backup, Some(state_dir.join("agent-bk202606200745.db")));
+        assert!(!state_dir.join("agent.db").exists());
+        assert!(!state_dir.join("agent.db-wal").exists());
+        assert!(!state_dir.join("agent.db-shm").exists());
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-bk202606200745.db")).unwrap(),
+            "main"
+        );
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-bk202606200745.db-wal")).unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            fs::read_to_string(state_dir.join("agent-bk202606200745.db-shm")).unwrap(),
+            "shm"
+        );
+    }
+
+    fn test_state_dir() -> PathBuf {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(".tmp")
+            .join("server-environment-tests")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }
