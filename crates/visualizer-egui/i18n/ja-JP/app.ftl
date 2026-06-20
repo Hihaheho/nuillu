@@ -7,6 +7,9 @@ menu-no-runtime-windows = まだランタイムウィンドウはありません
 menu-simplified-view-enabled = [x] 簡易表示
 menu-simplified-view-disabled = [ ] 簡易表示
 menu-close-all-module-windows = すべてのモジュールウィンドウを閉じる
+menu-theme-light = ライト
+menu-theme-dark = ダーク
+menu-theme-hover = visualizer のテーマを切り替えます。
 menu-zoom = 倍率
 menu-zoom-hover = { $min }から{ $max }のパーセントを入力して Enter、+/- で{ $step }%ずつ変更、+/- のダブルクリックで{ $jump }%変更します。
 

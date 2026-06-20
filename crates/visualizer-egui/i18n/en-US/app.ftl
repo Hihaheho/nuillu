@@ -8,6 +8,9 @@ menu-no-runtime-windows = No runtime windows yet.
 menu-simplified-view-enabled = [x] Simplified View
 menu-simplified-view-disabled = [ ] Simplified View
 menu-close-all-module-windows = Close all module windows
+menu-theme-light = Light
+menu-theme-dark = Dark
+menu-theme-hover = Switch the visualizer theme.
 menu-zoom = Zoom
 menu-zoom-hover = Type a percent from { $min } to { $max } and press Enter, use +/- for { $step }% steps, or double-click +/- for { $jump }%.
 

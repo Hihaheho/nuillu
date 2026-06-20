@@ -263,6 +263,26 @@ mod tests {
         assert_eq!(catalog.for_locale(Locale::EnUs).tr("menu-zoom"), "Zoom");
         assert_eq!(catalog.for_locale(Locale::JaJp).tr("menu-zoom"), "倍率");
         assert_eq!(
+            catalog.for_locale(Locale::EnUs).tr("menu-theme-light"),
+            "Light"
+        );
+        assert_eq!(
+            catalog.for_locale(Locale::EnUs).tr("menu-theme-dark"),
+            "Dark"
+        );
+        assert_eq!(
+            catalog.for_locale(Locale::JaJp).tr("menu-theme-light"),
+            "ライト"
+        );
+        assert_eq!(
+            catalog.for_locale(Locale::JaJp).tr("menu-theme-dark"),
+            "ダーク"
+        );
+        assert_eq!(
+            catalog.for_locale(Locale::JaJp).tr("menu-theme-hover"),
+            "visualizer のテーマを切り替えます。"
+        );
+        assert_eq!(
             catalog
                 .for_locale(Locale::JaJp)
                 .tr("module-name-attention-schema"),

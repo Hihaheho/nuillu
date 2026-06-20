@@ -32,6 +32,7 @@ pub use nuillu_visualizer_protocol::*;
 
 const NOTO_SANS_JP_FONT_KEY: &str = "noto-sans-jp";
 const NOTO_SANS_JP_FAMILY_NAME: &str = "Noto Sans JP";
+const THEME_PERSISTENCE_KEY: &str = "visualizer-theme";
 const ZOOM_FACTOR_PERSISTENCE_KEY: &str = "visualizer-zoom-factor";
 const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
 const MIN_ZOOM_FACTOR: f32 = 0.5;
@@ -62,6 +63,7 @@ pub struct VisualizerApp {
 impl VisualizerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, channels: VisualizerChannels) -> Self {
         install_visualizer_fonts(&cc.egui_ctx);
+        install_visualizer_theme_styles(&cc.egui_ctx);
         let i18n_catalog =
             I18nCatalog::embedded().expect("embedded visualizer translations should be valid");
         let current_locale = Locale::default();
@@ -112,6 +114,35 @@ fn install_visualizer_fonts(ctx: &egui::Context) {
     ctx.set_fonts(visualizer_font_definitions(font_data));
 }
 
+fn install_visualizer_theme_styles(ctx: &egui::Context) {
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.style_mut_of(theme, |style| {
+            style.visuals.widgets.noninteractive.fg_stroke.color =
+                visualizer_normal_text_color(theme);
+            style.visuals.widgets.inactive.fg_stroke.color =
+                visualizer_interactive_text_color(theme);
+            style.visuals.widgets.hovered.fg_stroke.color =
+                visualizer_interactive_text_color(theme);
+            style.visuals.widgets.active.fg_stroke.color = visualizer_interactive_text_color(theme);
+            style.visuals.widgets.open.fg_stroke.color = visualizer_interactive_text_color(theme);
+        });
+    }
+}
+
+fn visualizer_normal_text_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_gray(0),
+        egui::Theme::Dark => egui::Color32::from_gray(222),
+    }
+}
+
+fn visualizer_interactive_text_color(theme: egui::Theme) -> egui::Color32 {
+    match theme {
+        egui::Theme::Light => egui::Color32::from_gray(0),
+        egui::Theme::Dark => egui::Color32::from_gray(236),
+    }
+}
+
 fn visualizer_font_definitions(font_data: egui::FontData) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts
@@ -156,6 +187,66 @@ fn load_noto_sans_jp() -> Option<egui::FontData> {
     let mut font_data = egui::FontData::from_owned(bytes);
     font_data.index = font_index;
     Some(font_data)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum VisualizerTheme {
+    Light,
+    Dark,
+}
+
+impl From<egui::Theme> for VisualizerTheme {
+    fn from(theme: egui::Theme) -> Self {
+        match theme {
+            egui::Theme::Light => Self::Light,
+            egui::Theme::Dark => Self::Dark,
+        }
+    }
+}
+
+impl From<VisualizerTheme> for egui::Theme {
+    fn from(theme: VisualizerTheme) -> Self {
+        match theme {
+            VisualizerTheme::Light => Self::Light,
+            VisualizerTheme::Dark => Self::Dark,
+        }
+    }
+}
+
+impl VisualizerTheme {
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Light => "menu-theme-light",
+            Self::Dark => "menu-theme-dark",
+        }
+    }
+}
+
+fn default_visualizer_theme(ctx: &egui::Context) -> VisualizerTheme {
+    VisualizerTheme::from(ctx.theme())
+}
+
+fn render_theme_toggle(ui: &mut egui::Ui, theme: VisualizerTheme) -> Option<VisualizerTheme> {
+    let mut next_theme = None;
+    let hover = ui.ctx().tr("menu-theme-hover");
+    egui::Frame::new()
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::symmetric(2, 2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                for candidate in [VisualizerTheme::Light, VisualizerTheme::Dark] {
+                    let selected = candidate == theme;
+                    let response =
+                        ui.selectable_label(selected, ui.ctx().tr(candidate.label_key()));
+                    if response.on_hover_text(hover.clone()).clicked() && !selected {
+                        next_theme = Some(candidate);
+                    }
+                }
+            });
+        });
+    next_theme
 }
 
 fn render_language_toggle(ui: &mut egui::Ui, locale: Locale) -> Option<Locale> {
@@ -329,6 +420,10 @@ impl eframe::App for VisualizerApp {
         let persisted_locale = ui.use_persisted_state(Locale::default, LOCALE_PERSISTENCE_KEY);
         let locale = *persisted_locale;
         self.install_locale(ui.ctx(), locale);
+        let initial_theme = default_visualizer_theme(ui.ctx());
+        let persisted_theme = ui.use_persisted_state(|| initial_theme, THEME_PERSISTENCE_KEY);
+        let theme = *persisted_theme;
+        ui.ctx().set_theme(egui::Theme::from(theme));
         let persisted_zoom =
             ui.use_persisted_state(default_zoom_factor, ZOOM_FACTOR_PERSISTENCE_KEY);
         let mut zoom_factor = normalize_zoom_factor(*persisted_zoom);
@@ -353,9 +448,11 @@ impl eframe::App for VisualizerApp {
             .request_repaint_after(std::time::Duration::from_millis(100));
 
         let mut next_locale = None;
+        let mut next_theme = None;
         let mut next_zoom_factor = None;
         egui::Panel::top("nuillu-visualizer-tabs").show_inside(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                next_theme = render_theme_toggle(ui, theme);
                 next_locale = render_language_toggle(ui, locale);
                 ui.allocate_ui_with_layout(
                     egui::vec2(176.0, ui.spacing().interact_size.y),
@@ -414,6 +511,11 @@ impl eframe::App for VisualizerApp {
         if let Some(locale) = next_locale {
             persisted_locale.set_next(locale);
             self.install_locale(ui.ctx(), locale);
+            ui.ctx().request_repaint();
+        }
+        if let Some(theme) = next_theme {
+            persisted_theme.set_next(theme);
+            ui.ctx().set_theme(egui::Theme::from(theme));
             ui.ctx().request_repaint();
         }
         if let Some(zoom_factor) = next_zoom_factor {
@@ -1660,6 +1762,71 @@ mod tests {
         assert_eq!(parse_zoom_percent_input("125%"), Some(1.25));
         assert_eq!(parse_zoom_percent_input(""), None);
         assert_eq!(parse_zoom_percent_input("not a number"), None);
+    }
+
+    #[test]
+    fn visualizer_theme_converts_to_and_from_egui_theme() {
+        assert_eq!(
+            VisualizerTheme::from(egui::Theme::Light),
+            VisualizerTheme::Light
+        );
+        assert_eq!(
+            VisualizerTheme::from(egui::Theme::Dark),
+            VisualizerTheme::Dark
+        );
+        assert_eq!(
+            egui::Theme::from(VisualizerTheme::Light),
+            egui::Theme::Light
+        );
+        assert_eq!(egui::Theme::from(VisualizerTheme::Dark), egui::Theme::Dark);
+    }
+
+    #[test]
+    fn visualizer_theme_label_keys_match_variants() {
+        assert_eq!(VisualizerTheme::Light.label_key(), "menu-theme-light");
+        assert_eq!(VisualizerTheme::Dark.label_key(), "menu-theme-dark");
+    }
+
+    #[test]
+    fn default_visualizer_theme_uses_current_egui_theme() {
+        let ctx = egui::Context::default();
+
+        ctx.set_theme(egui::Theme::Light);
+        assert_eq!(default_visualizer_theme(&ctx), VisualizerTheme::Light);
+
+        ctx.set_theme(egui::Theme::Dark);
+        assert_eq!(default_visualizer_theme(&ctx), VisualizerTheme::Dark);
+    }
+
+    #[test]
+    fn visualizer_theme_styles_set_theme_specific_normal_text_color() {
+        let ctx = egui::Context::default();
+
+        install_visualizer_theme_styles(&ctx);
+
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let style = ctx.style_of(theme);
+            assert_eq!(
+                style.visuals.widgets.noninteractive.fg_stroke.color,
+                visualizer_normal_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.widgets.inactive.fg_stroke.color,
+                visualizer_interactive_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.widgets.hovered.fg_stroke.color,
+                visualizer_interactive_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.widgets.active.fg_stroke.color,
+                visualizer_interactive_text_color(theme)
+            );
+            assert_eq!(
+                style.visuals.widgets.open.fg_stroke.color,
+                visualizer_interactive_text_color(theme)
+            );
+        }
     }
 
     #[test]
