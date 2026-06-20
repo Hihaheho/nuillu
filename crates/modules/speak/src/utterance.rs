@@ -82,6 +82,7 @@ fn normalized_target(target: impl Into<String>) -> Option<String> {
 /// Stamps `emitted_at` from the injected [`Clock`] so the timestamp is
 /// testable without wall-clock dependence. Best-effort: failures are logged
 /// and dropped so a slow sink does not stall the speak module.
+#[derive(Clone)]
 pub struct UtteranceWriter {
     owner: ModuleInstanceId,
     blackboard: Blackboard,

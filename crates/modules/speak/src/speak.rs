@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures::FutureExt as _;
 use lutum::{
     AgentError, AssistantTurnItem, AssistantTurnView, CollectError, EventHandler, FinishReason,
     HandlerContext, HandlerDirective, HandlerResult, ModelInputItem, Session,
@@ -319,25 +320,41 @@ struct GenerationDeltaBuffer {
 }
 
 impl GenerationDeltaBuffer {
-    fn push(&mut self, delta: String) -> bool {
+    fn push(&mut self, delta: String) -> Option<Vec<String>> {
         let Some(delta) = self.think_filter.push(&delta) else {
-            return self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT;
+            return self.drain_ready_batch();
         };
-        self.push_visible(delta)
+        self.push_visible(delta);
+        self.drain_ready_batch()
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self) -> Option<Vec<String>> {
         if let Some(delta) = self.think_filter.finish() {
             self.push_visible(delta);
         }
+        self.drain_pending_batch()
     }
 
-    fn push_visible(&mut self, delta: String) -> bool {
+    fn push_visible(&mut self, delta: String) {
         if !delta.is_empty() {
             self.non_empty_text_delta_count += 1;
         }
         self.deltas.push(delta);
-        self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT
+    }
+
+    fn drain_ready_batch(&mut self) -> Option<Vec<String>> {
+        if self.non_empty_text_delta_count >= SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT {
+            return self.drain_pending_batch();
+        }
+        None
+    }
+
+    fn drain_pending_batch(&mut self) -> Option<Vec<String>> {
+        self.non_empty_text_delta_count = 0;
+        if self.deltas.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.deltas))
     }
 }
 
@@ -418,6 +435,7 @@ fn possible_tag_suffix_len(text: &str, tag: &str) -> usize {
 
 struct GenerationDeltaCollector {
     buffered_deltas: Arc<Mutex<GenerationDeltaBuffer>>,
+    flushed_deltas: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
 }
 
 #[async_trait]
@@ -428,11 +446,16 @@ impl EventHandler<TextTurnEvent, TextTurnState> for GenerationDeltaCollector {
         _cx: &HandlerContext<TextTurnState>,
     ) -> HandlerResult {
         if let TextTurnEvent::TextDelta { delta } = event {
-            let mut buffered = self
-                .buffered_deltas
-                .lock()
-                .expect("generation delta buffer mutex poisoned");
-            if buffered.push(delta.clone()) {
+            let ready = {
+                let mut buffered = self
+                    .buffered_deltas
+                    .lock()
+                    .expect("generation delta buffer mutex poisoned");
+                buffered.push(delta.clone())
+            };
+            if let Some(deltas) = ready {
+                let _ = self.flushed_deltas.send(deltas);
+                tokio::task::yield_now().await;
                 return Ok(HandlerDirective::Stop);
             }
         }
@@ -1223,17 +1246,38 @@ impl SpeakModule {
         push_generation_context(&mut turn_session, args, draft);
 
         let buffered_deltas = Arc::new(Mutex::new(GenerationDeltaBuffer::default()));
+        let (flushed_deltas, mut flushed_delta_batches) =
+            tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
         let lutum = self.llm.lutum().await;
-        let result = turn_session
-            .text_turn()
-            .on_event(GenerationDeltaCollector {
-                buffered_deltas: Arc::clone(&buffered_deltas),
-            })
-            .collect_staged(&lutum)
-            .await;
+        let result = {
+            let collect = turn_session
+                .text_turn()
+                .on_event(GenerationDeltaCollector {
+                    buffered_deltas: Arc::clone(&buffered_deltas),
+                    flushed_deltas: flushed_deltas.clone(),
+                })
+                .collect_staged(&lutum)
+                .fuse();
+            futures::pin_mut!(collect);
+            loop {
+                futures::select_biased! {
+                    batch = flushed_delta_batches.recv().fuse() => {
+                        if let Some(batch) = batch {
+                            self.emit_generation_delta_batch(draft, batch).await;
+                        }
+                    }
+                    result = collect => break result,
+                }
+            }
+        };
 
-        self.emit_buffered_generation_deltas(draft, buffered_deltas)
-            .await;
+        self.emit_remaining_generation_deltas(
+            draft,
+            buffered_deltas,
+            flushed_deltas,
+            &mut flushed_delta_batches,
+        )
+        .await;
 
         match result {
             Ok(staged) => {
@@ -1430,24 +1474,40 @@ impl SpeakModule {
             .await;
     }
 
-    async fn emit_buffered_generation_deltas(
+    async fn emit_remaining_generation_deltas(
         &self,
         draft: &mut GenerationDraft,
         buffered_deltas: Arc<Mutex<GenerationDeltaBuffer>>,
+        flushed_deltas: tokio::sync::mpsc::UnboundedSender<Vec<String>>,
+        flushed_delta_batches: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
     ) {
-        let deltas = {
+        let remaining = {
             let mut buffered = buffered_deltas
                 .lock()
                 .expect("generation delta buffer mutex poisoned");
-            buffered.finish();
-            std::mem::take(&mut buffered.deltas)
+            buffered.finish()
         };
+        if let Some(deltas) = remaining {
+            let _ = flushed_deltas.send(deltas);
+        }
+        drop(flushed_deltas);
+        while let Some(deltas) = flushed_delta_batches.recv().await {
+            self.emit_generation_delta_batch(draft, deltas).await;
+        }
+    }
+
+    async fn emit_generation_delta_batch(&self, draft: &mut GenerationDraft, deltas: Vec<String>) {
+        let mut emitted = false;
         for delta in deltas {
+            emitted = true;
             let sequence = draft.push_delta(&delta);
             self.utterance
                 .emit_delta(draft.target.clone(), draft.generation_id, sequence, delta)
                 .await;
             self.record_streaming_progress(draft).await;
+        }
+        if emitted {
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -1522,16 +1582,20 @@ impl SpeakModule {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::pin::Pin;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
 
+    use futures::Stream;
     use lutum::{
-        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem,
-        ErasedStructuredTurnEventStream, ErasedTextTurnEventStream, FinishReason, InputMessageRole,
-        MaxOutputTokens, MessageContent, MockError, MockLlmAdapter, MockTextScenario, ModelInput,
-        ModelInputItem, RawTextTurnEvent, SharedPoolBudgetManager, SharedPoolBudgetOptions,
-        TurnAdapter, Usage,
+        AdapterStructuredTurn, AdapterTextTurn, AgentError, AssistantInputItem, AssistantTurnItem,
+        AssistantTurnView, ErasedStructuredTurnEventStream, ErasedTextTurnEvent,
+        ErasedTextTurnEventStream, FinishReason, InputMessageRole, MaxOutputTokens, MessageContent,
+        MockError, MockLlmAdapter, MockTextScenario, ModelInput, ModelInputItem, RawTextTurnEvent,
+        SharedPoolBudgetManager, SharedPoolBudgetOptions, TurnAdapter, Usage,
     };
     use nuillu_blackboard::{
         ActivationRatio, Blackboard, BlackboardCommand, CognitionLogEntry, CognitionLogOrigin,
@@ -1547,6 +1611,30 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use crate::utterance::{Utterance, UtteranceDelta, UtteranceSink};
+
+    struct TestSyncStream<S> {
+        inner: Mutex<Pin<Box<S>>>,
+    }
+
+    impl<S> TestSyncStream<S> {
+        fn new(stream: S) -> Self {
+            Self {
+                inner: Mutex::new(Box::pin(stream)),
+            }
+        }
+    }
+
+    impl<S> Stream for TestSyncStream<S>
+    where
+        S: Stream + Send + 'static,
+    {
+        type Item = S::Item;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            let mut inner = self.inner.lock().expect("test stream mutex poisoned");
+            inner.as_mut().poll_next(cx)
+        }
+    }
 
     #[derive(Clone)]
     struct CapturingAdapter<T> {
@@ -1595,6 +1683,98 @@ mod tests {
         ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
             self.inner.structured_turn(input, turn).await
         }
+    }
+
+    #[derive(Clone)]
+    struct DelayedGenerationAdapter {
+        inner: MockLlmAdapter,
+        text_turn_count: Arc<AtomicUsize>,
+        release_completion: Arc<tokio::sync::Notify>,
+    }
+
+    impl DelayedGenerationAdapter {
+        fn generation_only(release_completion: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                inner: MockLlmAdapter::new(),
+                text_turn_count: Arc::new(AtomicUsize::new(1)),
+                release_completion,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnAdapter for DelayedGenerationAdapter {
+        async fn text_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterTextTurn,
+        ) -> Result<ErasedTextTurnEventStream, AgentError> {
+            if self.text_turn_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.text_turn(input, turn).await;
+            }
+
+            Ok(delayed_generation_stream(Arc::clone(
+                &self.release_completion,
+            )))
+        }
+
+        async fn structured_turn(
+            &self,
+            input: ModelInput,
+            turn: AdapterStructuredTurn,
+        ) -> Result<ErasedStructuredTurnEventStream, AgentError> {
+            self.inner.structured_turn(input, turn).await
+        }
+    }
+
+    fn delayed_generation_stream(
+        release_completion: Arc<tokio::sync::Notify>,
+    ) -> ErasedTextTurnEventStream {
+        enum State {
+            Started,
+            Delta(usize),
+            Done,
+        }
+
+        const DELTAS: [&str; SPEECH_GENERATION_TEXT_DELTA_SLICE_LIMIT] =
+            ["K", "o", "r", "o", ",", " ", "s", "t"];
+
+        let stream = futures::stream::unfold(State::Started, move |state| {
+            let release_completion = Arc::clone(&release_completion);
+            async move {
+                match state {
+                    State::Started => Some((
+                        Ok(ErasedTextTurnEvent::Started {
+                            request_id: Some("delayed-generation".to_string()),
+                            model: "mock".to_string(),
+                        }),
+                        State::Delta(0),
+                    )),
+                    State::Delta(index) if index < DELTAS.len() => Some((
+                        Ok(ErasedTextTurnEvent::TextDelta {
+                            delta: DELTAS[index].to_string(),
+                        }),
+                        State::Delta(index + 1),
+                    )),
+                    State::Delta(_) => {
+                        release_completion.notified().await;
+                        Some((
+                            Ok(ErasedTextTurnEvent::Completed {
+                                request_id: Some("delayed-generation".to_string()),
+                                finish_reason: FinishReason::Stop,
+                                usage: Usage::zero(),
+                                committed_turn: Arc::new(AssistantTurnView::from_items(&[
+                                    AssistantTurnItem::Text("Koro, st".to_string()),
+                                ])),
+                            }),
+                            State::Done,
+                        ))
+                    }
+                    State::Done => None,
+                }
+            }
+        });
+        Box::pin(TestSyncStream::new(stream)) as ErasedTextTurnEventStream
     }
 
     fn prepare_speech_scenario(target: &str, speaker_intent: &str) -> MockTextScenario {
@@ -1873,6 +2053,33 @@ mod tests {
             if let Some(first_delta) = self.first_delta.borrow_mut().take() {
                 let _ = first_delta.send(captured);
             }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum CapturedUtteranceEvent {
+        Delta(String),
+        Complete(String),
+    }
+
+    struct CapturingUtteranceEventSink {
+        events: Rc<RefCell<Vec<CapturedUtteranceEvent>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl UtteranceSink for CapturingUtteranceEventSink {
+        async fn on_complete(&self, utterance: Utterance) -> Result<(), PortError> {
+            self.events
+                .borrow_mut()
+                .push(CapturedUtteranceEvent::Complete(utterance.text));
+            Ok(())
+        }
+
+        async fn on_delta(&self, delta: UtteranceDelta) -> Result<(), PortError> {
+            self.events
+                .borrow_mut()
+                .push(CapturedUtteranceEvent::Delta(delta.delta));
             Ok(())
         }
     }
@@ -2708,6 +2915,97 @@ mod tests {
             ]
         );
         assert_eq!(draft.accumulated, "Koro, stay close.");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_slice_limit_flushes_before_turn_completion() {
+        let release_completion = Arc::new(tokio::sync::Notify::new());
+        let adapter = DelayedGenerationAdapter::generation_only(Arc::clone(&release_completion));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let (first_delta_tx, first_delta_rx) = tokio::sync::oneshot::channel();
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingDeltaSink {
+            deltas: Rc::clone(&deltas),
+            first_delta: RefCell::new(Some(first_delta_tx)),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+        let outcome = {
+            let collect = module
+                .collect_generation_slice(&cx, &args, &mut draft)
+                .fuse();
+            let first_delta = first_delta_rx.fuse();
+            let timeout = tokio::time::sleep(Duration::from_millis(100)).fuse();
+            futures::pin_mut!(collect);
+            futures::pin_mut!(first_delta);
+            futures::pin_mut!(timeout);
+
+            let captured = futures::select_biased! {
+                captured = first_delta => captured.expect("first generation delta should be captured"),
+                result = collect => panic!("generation returned before any delta was emitted: {result:?}"),
+                _ = timeout => panic!("generation did not flush the 8-delta slice before completion"),
+            };
+
+            assert_eq!(captured, ("Koro".to_string(), 0, 0, "K".to_string()));
+            assert_eq!(
+                deltas.borrow().as_slice(),
+                &[
+                    ("Koro".to_string(), 0, 0, "K".to_string()),
+                    ("Koro".to_string(), 0, 1, "o".to_string()),
+                    ("Koro".to_string(), 0, 2, "r".to_string()),
+                    ("Koro".to_string(), 0, 3, "o".to_string()),
+                    ("Koro".to_string(), 0, 4, ",".to_string()),
+                    ("Koro".to_string(), 0, 5, " ".to_string()),
+                    ("Koro".to_string(), 0, 6, "s".to_string()),
+                    ("Koro".to_string(), 0, 7, "t".to_string()),
+                ]
+            );
+            release_completion.notify_waiters();
+            collect.await.unwrap()
+        };
+        assert!(matches!(outcome, GenerationStreamOutcome::LengthLimited));
+        assert_eq!(draft.accumulated, "Koro, st");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_generation_flushes_delta_before_complete_event() {
+        let adapter = MockLlmAdapter::new().with_text_scenario(generation_text_scenario("hi!"));
+        let mut allocation = ResourceAllocation::default();
+        allocation.set(builtin::speak(), ModuleConfig::default());
+        allocation.set_activation(builtin::speak(), ActivationRatio::ONE);
+        let blackboard = Blackboard::with_allocation(allocation);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink: Rc<dyn UtteranceSink> = Rc::new(CapturingUtteranceEventSink {
+            events: Rc::clone(&events),
+        });
+        let (mut module, _caps) =
+            speak_module_with_turn_adapter(blackboard, Arc::new(adapter), sink).await;
+        let now = SystemClock.now();
+        let cx = test_activate_cx(&module, now).await;
+        let mut draft = GenerationDraft::new(0, "Koro");
+        let args = test_prepare_speech_args("Koro");
+
+        let outcome = module
+            .collect_generation_slice(&cx, &args, &mut draft)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, GenerationStreamOutcome::Completed));
+        assert_eq!(draft.accumulated, "hi!");
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                CapturedUtteranceEvent::Delta("hi!".to_string()),
+                CapturedUtteranceEvent::Complete("hi!".to_string()),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
