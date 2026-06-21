@@ -263,25 +263,20 @@ fn register_server_module(
             })
         }
         RuntimeModule::Interoception => {
-            let suppressed = group_modules(boot_config, ServerModuleGroup::SleepSuppressed);
             let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| {
-                let suppressed = suppressed.clone();
-                async move {
-                    Ok(nuillu_interoception::InteroceptionModule::new(
-                        caps.memo_updated_inbox(),
-                        caps.cognition_log_updated_inbox(),
-                        caps.blackboard_reader(),
-                        caps.allocation_writer(Vec::new(), suppressed.clone()),
-                        caps.interoception_policy(),
-                        caps.interoception_writer(),
-                        caps.llm("main").with_tier(main_tier).into(),
-                        caps.session("main")
-                            .with_tier(main_tier)
-                            .with_auto_compaction(nuillu_interoception::session_auto_compaction())
-                            .await?,
-                    ))
-                }
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_interoception::InteroceptionModule::new(
+                    caps.memo_updated_inbox(),
+                    caps.cognition_log_updated_inbox(),
+                    caps.blackboard_reader(),
+                    caps.interoception_policy(),
+                    caps.interoception_writer(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                    caps.session("main")
+                        .with_tier(main_tier)
+                        .with_auto_compaction(nuillu_interoception::session_auto_compaction())
+                        .await?,
+                ))
             })
         }
         RuntimeModule::Homeostasis => {

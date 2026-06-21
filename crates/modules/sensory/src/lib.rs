@@ -538,7 +538,7 @@ impl SensoryModule {
             .into_iter()
             .filter_map(|participant| {
                 let name = participant.name.trim();
-                (!name.is_empty()).then(|| name.to_owned())
+                (!name.is_empty()).then(|| name.to_lowercase())
             })
             .collect::<BTreeSet<_>>();
         if participant_names.is_empty() {
@@ -546,13 +546,18 @@ impl SensoryModule {
         }
 
         observations.iter().all(|observation| {
+            let content = observation.content.to_lowercase();
             matches!(observation.modality, SensoryModality::Audition)
-                && observation
+                && (observation
                     .direction
                     .as_deref()
                     .map(str::trim)
                     .filter(|direction| !direction.is_empty())
-                    .is_some_and(|direction| participant_names.contains(direction))
+                    .map(str::to_lowercase)
+                    .is_some_and(|direction| participant_names.contains(&direction))
+                    || participant_names
+                        .iter()
+                        .any(|name| content_contains_participant_name(&content, name)))
         })
     }
 
@@ -1144,6 +1149,23 @@ fn contains_ambient_plumbing(text: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+fn content_contains_participant_name(content: &str, participant_name: &str) -> bool {
+    let name = participant_name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    content.match_indices(name).any(|(start, matched)| {
+        let before = content[..start].chars().next_back();
+        let after = content[start + matched.len()..].chars().next();
+        !before.is_some_and(is_participant_name_char)
+            && !after.is_some_and(is_participant_name_char)
+    })
+}
+
+fn is_participant_name_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 #[async_trait(?Send)]
 impl Module for SensoryModule {
     type Batch = SensoryBatch;
@@ -1623,6 +1645,31 @@ mod tests {
             SensoryModule::format_age(now, now - chrono::Duration::seconds(3600)),
             "1 hour 0 minutes ago"
         );
+    }
+
+    #[test]
+    fn participant_name_content_match_requires_boundaries() {
+        assert!(content_contains_participant_name(
+            "a sudden crash happens and alice yelps urgently",
+            "alice"
+        ));
+        assert!(content_contains_participant_name(
+            "alice's voice gets louder",
+            "alice"
+        ));
+        assert!(content_contains_participant_name(
+            "al called from nearby",
+            "al"
+        ));
+        assert!(!content_contains_participant_name("also nearby", "al"));
+        assert!(!content_contains_participant_name(
+            "control tone repeats",
+            "ro"
+        ));
+        assert!(!content_contains_participant_name(
+            "alice_bob speaks",
+            "alice"
+        ));
     }
 
     #[test]
@@ -2248,6 +2295,61 @@ mod tests {
                         .cloned()
                         .unwrap_or_default(),
                     vec!["Alice says hello".to_string()]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn participant_named_audio_content_bypasses_one_shot_llm_filter() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let capture = CapturingAdapter::new(MockLlmAdapter::new());
+                let observed = capture.clone();
+                let (blackboard, caps) =
+                    test_caps_with_adapter_and_policy(capture, RuntimePolicy::default());
+                caps.scene().set([Participant::new("Alice")]);
+                let recorder = SensoryTestRecorder::default();
+                let modules = build_recording_sensory(
+                    &caps,
+                    recorder.clone(),
+                    SensoryBurstConfig {
+                        silent_window: Duration::from_millis(1),
+                        budget: Duration::from_millis(1),
+                    },
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                let sensory = caps.host_io().sensory_input_mailbox();
+
+                run_modules(modules, async {
+                    sensory
+                        .publish(heard_from(
+                            "nearby",
+                            "A sudden crash happens and Alice yelps urgently for attention",
+                        ))
+                        .await
+                        .expect("sensory subscriber exists");
+                    wait_for_memo_log_count(&blackboard, 1).await;
+                })
+                .await;
+
+                let logs = blackboard.read(|bb| bb.recent_memo_logs()).await;
+                assert_eq!(logs.len(), 1);
+                assert!(logs[0].content.contains("Alice yelps urgently"));
+                assert!(observed.text_turns().is_empty());
+                assert_eq!(
+                    recorder
+                        .recent_bypassed_contents
+                        .borrow()
+                        .last()
+                        .cloned()
+                        .unwrap_or_default(),
+                    vec![
+                        "A sudden crash happens and Alice yelps urgently for attention".to_string()
+                    ]
                 );
             })
             .await;

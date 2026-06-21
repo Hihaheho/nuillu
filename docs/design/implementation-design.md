@@ -646,7 +646,7 @@ Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`
 
 Maintains the canonical internal-state estimate. The state type is `InteroceptiveState`; updates flow through `InteroceptivePatch`; readers and writers are `InteroceptiveReader` and `InteroceptiveWriter`; changes publish `InteroceptiveUpdated`.
 
-The deterministic part preserves the existing sleep-pressure dynamics: cognition volume raises `nrem_pressure` and `wake_arousal`, remember-token accumulation relieves NREM pressure and raises REM pressure, memory-recombination cognition entries relieve REM pressure, and elapsed time decays wake arousal while slowly increasing NREM pressure. The LLM part uses structured output only for `affect_arousal`, `valence`, and `emotion`, then clamps `affect_arousal` to `0.0..=1.0`, clamps `valence` to `-1.0..=1.0`, and trims `emotion` as untyped text.
+The deterministic part owns pressure and arousal dynamics: cognition volume raises `nrem_pressure` and `wake_arousal`, remember-token accumulation relieves NREM pressure and raises REM pressure, memory-recombination cognition entries relieve REM pressure, elapsed time decays wake arousal and REM pressure while slowly increasing NREM pressure, activity arousal floors keep visible unread activity from being appraised as numerically inert, and quiet periods return affect arousal and valence toward neutral. The LLM part uses structured output only for semantic affect appraisal (`wake_salience`, `affect_salience`, `valence`, and `emotion`). Rust maps salience to numeric arousal deltas, applies arousal-only fallback when appraisal fails, clamps numeric fields, and trims `emotion` as untyped text.
 
 ### Homeostasis
 
@@ -853,7 +853,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Interpreter reads only cognition | it receives `CognitionLogUpdatedInbox`, `CognitionLogReader`, `CognitionWriter`, and `LlmAccess`, not `Memo`, `BlackboardReader`, `AllocationReader`, memory, attention-control, allocation-write, or utterance capabilities |
 | Cognition-log inboxes filter self writes | `CognitionLogUpdatedInbox` is constructed with the same self-exclusion policy as `MemoUpdatedInbox` |
 | Cognition-log writes cannot wake controller directly | cognition-log appends publish `CognitionLogUpdated`, which the controller does not receive |
-| Only controller replicas write allocation proposals | boot-time wiring grants `AllocationWriter` only to allocation registrations; runtime computes effective allocation |
+| Allocation writes are role-bound | boot-time wiring grants `AllocationWriter` to allocation for ordinary controller proposals and to homeostasis for interoceptive sleep/REM drive and action suppression; runtime computes effective allocation |
 | Attention schema models attention only | it receives memo and cognition-log wake capabilities, blackboard/cognition-log read capabilities, `Memo`, and `LlmAccess`, not `AllocationReader`, `CognitionWriter`, attention-control inbox, `AllocationWriter`, or memory capabilities |
 | Self-model handles self-report | self-model receives `CognitionLogUpdatedInbox`, reads current memo/cognition context, and writes self-model answers to its own memo |
 | Self-model is not raw memory retrieval | stable self-knowledge is surfaced through query memo logs; self-model integrates that knowledge with attention-schema attention-experience memos or promoted cognition-log entries and current memo-log context |
@@ -865,7 +865,7 @@ This keeps realistic artifacts observable without adding request/response correl
 | Memory rank elevation is store-internal | no module holds a memory rank-elevation capability; `MemoryStore` applies access-threshold promotions on read paths that set `record_access: true` |
 | Policy advice and policy persistence are separate roles | `policy` writes ordinary memo advice plus custom policy-consideration payloads; `reward` is the only ordinary holder of `PolicyUpserter` and performs insert/reinforce; `policy-compaction` can only delete duplicate non-Core policies that do not outrank their canonical policy |
 | Value prediction and value update are separate roles | `policy` stores contextual `predicted_expected_reward` only in its consideration memo; `reward` compares against it and mutates the policy store |
-| Reward does not write allocation | reward receives no `AllocationWriter` or `AttentionControlRequestMailbox`; only allocation holds `AllocationWriter` |
+| Reward does not write allocation | reward receives no `AllocationWriter` or `AttentionControlRequestMailbox`; allocation and homeostasis own allocation writes |
 | Policy rank changes derive from reward, not access | `PolicyUpserter::reinforce` is the only path to tier transitions outside decay expiry; `PolicySearcher` is pure read and does not update metadata |
 | Policies strengthen by reward, never by access | memories strengthen by access, never by reward; the two stores never share rank enums or strengthening rules |
 | Policy reinforcement count is reward-grounded | `reinforcement_count` increments only on successful reward-credited TD updates; it is the habit-learning counter and is separate from rank-threshold `reward_tokens` |

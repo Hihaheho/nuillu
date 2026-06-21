@@ -29,6 +29,7 @@ pub struct HomeostasisModule {
     allocation: AllocationWriter,
     phase: HomeostaticPhase,
     last_phase_entered_at: Option<DateTime<Utc>>,
+    last_emitted_suppression: Option<AllocationEffectLevel>,
 }
 
 impl HomeostasisModule {
@@ -43,6 +44,7 @@ impl HomeostasisModule {
             allocation,
             phase: HomeostaticPhase::Wake,
             last_phase_entered_at: None,
+            last_emitted_suppression: None,
         }
     }
 
@@ -50,7 +52,10 @@ impl HomeostasisModule {
         let interoception = self.interoception.snapshot().await;
         let entered_at = self.last_phase_entered_at.unwrap_or_else(|| cx.now());
         let next = next_phase(self.phase, entered_at, cx.now(), &interoception);
-        let should_emit = self.last_phase_entered_at.is_none() || next != self.phase;
+        let suppression = suppression_level(next, &interoception);
+        let should_emit = self.last_phase_entered_at.is_none()
+            || next != self.phase
+            || self.last_emitted_suppression != Some(suppression);
         if next != self.phase {
             tracing::info!(from = ?self.phase, to = ?next, "homeostatic phase transition");
             self.phase = next;
@@ -59,15 +64,20 @@ impl HomeostasisModule {
             self.last_phase_entered_at = Some(cx.now());
         }
         if should_emit {
-            self.emit_phase(next).await?;
+            self.emit_phase(next, suppression).await?;
+            self.last_emitted_suppression = Some(suppression);
         }
         Ok(())
     }
 
-    async fn emit_phase(&self, phase: HomeostaticPhase) -> Result<()> {
+    async fn emit_phase(
+        &self,
+        phase: HomeostaticPhase,
+        suppression: AllocationEffectLevel,
+    ) -> Result<()> {
         let mut commands = drive_commands(phase, self.allocation.allowed_target_modules());
         commands.extend(suppression_commands(
-            phase,
+            suppression,
             self.allocation.allowed_suppression_modules(),
         ));
         self.allocation.submit(commands).await?;
@@ -170,12 +180,33 @@ fn drive_commands(phase: HomeostaticPhase, allowed: &[ModuleId]) -> Vec<Allocati
     commands
 }
 
-fn suppression_commands(phase: HomeostaticPhase, capped: &[ModuleId]) -> Vec<AllocationCommand> {
-    let level = match phase {
-        HomeostaticPhase::Wake => AllocationEffectLevel::Off,
+fn suppression_level(
+    phase: HomeostaticPhase,
+    interoception: &InteroceptiveState,
+) -> AllocationEffectLevel {
+    match phase {
+        HomeostaticPhase::Wake => wake_suppression_level(interoception),
         HomeostaticPhase::Compacting => AllocationEffectLevel::Max,
         HomeostaticPhase::Recombining => AllocationEffectLevel::High,
-    };
+    }
+}
+
+fn wake_suppression_level(interoception: &InteroceptiveState) -> AllocationEffectLevel {
+    if interoception.wake_arousal >= 0.70 {
+        AllocationEffectLevel::Off
+    } else if interoception.wake_arousal >= 0.45 {
+        AllocationEffectLevel::Low
+    } else if interoception.wake_arousal >= 0.25 {
+        AllocationEffectLevel::Normal
+    } else {
+        AllocationEffectLevel::High
+    }
+}
+
+fn suppression_commands(
+    level: AllocationEffectLevel,
+    capped: &[ModuleId],
+) -> Vec<AllocationCommand> {
     capped
         .iter()
         .cloned()
@@ -338,10 +369,71 @@ mod tests {
             Some(AllocationEffectLevel::Low)
         );
 
-        let suppressions = suppression_commands(HomeostaticPhase::Compacting, &[builtin::speak()]);
+        let suppressions = suppression_commands(AllocationEffectLevel::Max, &[builtin::speak()]);
         assert_eq!(
             suppression_level_for(&suppressions, &builtin::speak()),
             Some(AllocationEffectLevel::Max)
+        );
+    }
+
+    #[test]
+    fn wake_suppression_uses_wake_arousal_thresholds() {
+        assert_eq!(
+            suppression_level(
+                HomeostaticPhase::Wake,
+                &InteroceptiveState {
+                    wake_arousal: 0.75,
+                    ..InteroceptiveState::default()
+                },
+            ),
+            AllocationEffectLevel::Off
+        );
+        assert_eq!(
+            suppression_level(
+                HomeostaticPhase::Wake,
+                &InteroceptiveState {
+                    wake_arousal: 0.50,
+                    ..InteroceptiveState::default()
+                },
+            ),
+            AllocationEffectLevel::Low
+        );
+        assert_eq!(
+            suppression_level(
+                HomeostaticPhase::Wake,
+                &InteroceptiveState {
+                    wake_arousal: 0.30,
+                    ..InteroceptiveState::default()
+                },
+            ),
+            AllocationEffectLevel::Normal
+        );
+        assert_eq!(
+            suppression_level(
+                HomeostaticPhase::Wake,
+                &InteroceptiveState {
+                    wake_arousal: 0.10,
+                    ..InteroceptiveState::default()
+                },
+            ),
+            AllocationEffectLevel::High
+        );
+    }
+
+    #[test]
+    fn sleep_phase_suppression_overrides_wake_arousal_thresholds() {
+        let interoception = InteroceptiveState {
+            wake_arousal: 0.90,
+            ..InteroceptiveState::default()
+        };
+
+        assert_eq!(
+            suppression_level(HomeostaticPhase::Compacting, &interoception),
+            AllocationEffectLevel::Max
+        );
+        assert_eq!(
+            suppression_level(HomeostaticPhase::Recombining, &interoception),
+            AllocationEffectLevel::High
         );
     }
 

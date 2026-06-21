@@ -73,3 +73,11 @@ participants = ["Koro"]
   pointer: /observations/agent/interoception/mode
   expected: wake
 }
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name: salient-event-raised-affect-arousal
+  must-pass = true
+  pointer: /observations/agent/interoception/affect_arousal
+  min = 0.05
+}

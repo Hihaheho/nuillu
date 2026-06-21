@@ -321,7 +321,7 @@ Fetches related memory contents and merges redundant memories, accumulating reme
 
 ### Interoception
 
-Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition updates, memo updates, and its module-local periodic wake activate it. It preserves deterministic sleep-pressure updates from cognition volume, remember-token relief, elapsed time, and recombination traces, and uses structured LLM output only for the affect fields.
+Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition updates, memo updates, and its module-local periodic wake activate it. It preserves deterministic pressure and arousal dynamics from cognition volume, remember-token relief, elapsed time, recombination traces, activity arousal floors, and quiet return-to-neutral. Structured LLM output provides semantic affect appraisal (`wake_salience`, `affect_salience`, `valence`, and `emotion`); Rust owns numeric arousal deltas, decay, clamping, and fallback behavior.
 
 `wake_arousal` is sleep/wake arousal. `affect_arousal` is emotional activation. `valence` is the signed positive/negative axis in `[-1, 1]`. `emotion` is free text and is not a typed enum. Interoception writes `InteroceptiveState` through `InteroceptiveWriter`; other modules read it through `InteroceptiveReader`.
 

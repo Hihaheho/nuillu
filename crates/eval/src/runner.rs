@@ -5227,27 +5227,22 @@ fn register_eval_module(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
                 replica_hard_cap,
                 {
-                    let suppressed = sleep_suppressed_modules();
                     let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let suppressed = suppressed.clone();
-                        async move {
-                            Ok(nuillu_interoception::InteroceptionModule::new(
-                                caps.memo_updated_inbox(),
-                                caps.cognition_log_updated_inbox(),
-                                caps.blackboard_reader(),
-                                caps.allocation_writer(Vec::new(), suppressed.clone()),
-                                caps.interoception_policy(),
-                                caps.interoception_writer(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                                caps.session("main")
-                                    .with_tier(main_tier)
-                                    .with_auto_compaction(
-                                        nuillu_interoception::session_auto_compaction(),
-                                    )
-                                    .await?,
-                            ))
-                        }
+                    move |caps| async move {
+                        Ok(nuillu_interoception::InteroceptionModule::new(
+                            caps.memo_updated_inbox(),
+                            caps.cognition_log_updated_inbox(),
+                            caps.blackboard_reader(),
+                            caps.interoception_policy(),
+                            caps.interoception_writer(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                            caps.session("main")
+                                .with_tier(main_tier)
+                                .with_auto_compaction(
+                                    nuillu_interoception::session_auto_compaction(),
+                                )
+                                .await?,
+                        ))
                     }
                 },
             )

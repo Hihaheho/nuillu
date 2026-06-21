@@ -65,6 +65,23 @@ participants = ["Koro"]
 
 @ checks[] {
   $variant: json-pointer-numeric-in-range
+  name: quiet-affect-arousal-near-neutral
+  must-pass = true
+  pointer: /observations/agent/interoception/affect_arousal
+  max = 0.05
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
+  name: quiet-valence-near-neutral
+  must-pass = true
+  pointer: /observations/agent/interoception/valence
+  min = -0.05
+  max = 0.05
+}
+
+@ checks[] {
+  $variant: json-pointer-numeric-in-range
   name: speak-heavily-suppressed
   must-pass = true
   pointer: /observations/agent/allocation/speak/activation_ratio
