@@ -19,7 +19,7 @@ should test:
 - `docs/design/attention-schema.md`
 - `docs/design/implementation-design.md`
 - `docs/design/memory-ledger.md` for memory, query-memory, compaction, and
-  recombination behavior
+  dreaming behavior
 
 Use implementation only to understand harness mechanics, missing executor
 support, or current output shapes. Do not create cases that merely encode an
@@ -51,7 +51,7 @@ self-model
 query-memory
 memory
 memory-compaction
-memory-recombination
+dreaming
 interoception
 homeostasis
 policy
@@ -138,7 +138,7 @@ The intended artifact boundaries by module family are:
 | Module | Artifact to score |
 |---|---|
 | memo-writing modules | target memo |
-| cognitive memo writers (`attention-schema`, `query-memory`, `self-model`, `predict`, `surprise`) | target memo |
+| cognitive memo writers (`attention-schema`, `query-memory`, `self-model`, `predict`, `surprise`, `dreaming`) | target memo |
 | cognition writers (`interpreter`, `cognition-gate`) | target cognition-log entries |
 | `action` | allocation drive/cap changes for action targets |
 | `speak` | completed utterance |
@@ -146,7 +146,7 @@ The intended artifact boundaries by module family are:
 | `poet` | target memo |
 | `memory` | inserted or changed memory entries |
 | `memory-compaction` | merged memory result plus consolidation metadata |
-| `memory-recombination` | source-tagged dream/hypothesis cognition entry |
+| `dreaming` | source-tagged dream/hypothesis cognitive memo |
 | `policy` | policy-consideration advice memo |
 | `reward` | reward memo plus policy store insert/reinforce effects |
 | `homeostasis` | allocation drive/cap changes |
@@ -284,22 +284,22 @@ Compaction should preserve the meaning of source memories. It should not invent 
 new current fact, discard contradictory evidence without trace, or turn unrelated
 memories into one summary.
 
-### `memory-recombination`
+### `dreaming`
 
 Purpose: append source-tagged internal dream/hypothesis simulation from recent
-cognition plus memory.
+cognition plus surfaced upstream material.
 
 Typical case:
 
-- Seed one recent cognition entry and one memory that can be associatively
-  combined.
-- Artifact source should be target cognition.
+- Seed one recent cognition entry and one or more upstream memos from
+  `query-memory`, `predict`, or `self-model` that can be associatively combined.
+- Artifact source should be target memo.
 - Check that the entry is explicitly marked as dream, hypothesis, simulation, or
   otherwise non-verified internal material.
 - Check that it uses both sources without presenting the result as fact.
 
 The companion negative pressure belongs in `memory`: dream outputs from
-`memory-recombination` must not later be stored as verified memory unless they
+`dreaming` must not later be stored as verified memory unless they
 are explicitly tagged as dream/hypothesis material.
 
 ## Executor Checklist For New Module Boundaries
@@ -329,7 +329,7 @@ Start with these, then stop for review:
 eval-cases/modules/memory/store-peer-location.eure
 eval-cases/modules/memory/ignore-dream-as-fact.eure
 eval-cases/modules/memory-compaction/merge-redundant-peer-preference.eure
-eval-cases/modules/memory-recombination/dream-from-peer-memory.eure
+eval-cases/modules/dreaming/dream-from-peer-memory.eure
 ```
 
 Keep the first pass small. It is better to have four targeted cases with clear

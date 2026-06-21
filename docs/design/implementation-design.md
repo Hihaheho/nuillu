@@ -314,7 +314,7 @@ pub struct UtteranceAbort {
 Speak stores LLM history in three separate persistent sessions: `planning` for target-selection tool
 turns, `generation` for completed assistant utterance turns, and `abort-judge` for interruption
 judgements during an active stream. All three use the shared bounded cognition-log formatter for
-cognition context and filter out memory-recombination entries from speech input.
+cognition context and filter out dreaming entries from speech input.
 
 ### Allocation writes
 
@@ -374,7 +374,7 @@ Module conventions:
 - Query and self-model modules no longer receive explicit request payloads. They wake from cognition-log updates and write memo-authoritative results using blackboard context.
 - Memory wakes from cognition-log eviction events. Evicted cognition entries are work-carrying payloads and are collected with a bounded silent window before the LLM turn. Memo-log entries are not valid direct memory evidence.
 - Policy wakes from memo and cognition-log updates, then writes ordinary memo advice and a structured policy-consideration payload through a reward-crate custom capability.
-- Memory-compaction, memory-association, memory-recombination, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update activation priority before they run.
+- Memory-compaction, memory-association, dreaming, and policy-compaction wake from `InteroceptiveUpdated`, letting homeostasis update activation priority before they run.
 - Reward wakes from policy-consideration custom evictions. These evictions are work-carrying payloads and are collected into a batch in `next_batch`; reward activation does not drain the custom queue.
 - Speak batches ready `CognitionLogUpdated` wake signals, then uses its optional `speak_to` tool to decide whether that action activation emits. Cognition-log updates received during a generation stream remain queued for the next Speak batch.
 - Sensory coalesces raw sensory inputs with a bounded silent window before salience scoring. Allocation controls sensory activation externally, but sensory does not read allocation priority state as work context.
@@ -654,13 +654,13 @@ Capabilities: `MemoUpdatedInbox`, `CognitionLogUpdatedInbox`, `BlackboardReader`
 
 Maintains the canonical internal-state estimate. The state type is `InteroceptiveState`; updates flow through `InteroceptivePatch`; readers and writers are `InteroceptiveReader` and `InteroceptiveWriter`; changes publish `InteroceptiveUpdated`.
 
-The deterministic part owns pressure, arousal, and valence dynamics: cognition volume raises `nrem_pressure` and `wake_arousal`, remember-token accumulation relieves NREM pressure and raises REM pressure, memory-recombination cognition entries relieve REM pressure, elapsed time decays wake arousal and REM pressure while slowly increasing NREM pressure, activity arousal floors keep visible unread activity from being appraised as numerically inert, and quiet periods return affect arousal and valence toward neutral. The LLM part uses structured output only for semantic affect appraisal (`wake_salience`, `affect_salience`, `valence_polarity`, `valence_salience`, and `emotion`). Rust maps salience/polarity to numeric arousal and valence deltas, applies arousal-only fallback when appraisal fails, clamps numeric fields, and trims `emotion` as untyped text.
+The deterministic part owns pressure, arousal, and valence dynamics: cognition volume raises `nrem_pressure` and `wake_arousal`, remember-token accumulation relieves NREM pressure and raises REM pressure, dreaming cognitive memos relieve REM pressure, elapsed time decays wake arousal and REM pressure while slowly increasing NREM pressure, activity arousal floors keep visible unread activity from being appraised as numerically inert, and quiet periods return affect arousal and valence toward neutral. The LLM part uses structured output only for semantic affect appraisal (`wake_salience`, `affect_salience`, `valence_polarity`, `valence_salience`, and `emotion`). Rust maps salience/polarity to numeric arousal and valence deltas, applies arousal-only fallback when appraisal fails, clamps numeric fields, and trims `emotion` as untyped text.
 
 ### Homeostasis
 
 Capabilities: `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `AllocationWriter`.
 
-Regulates allocation from the current interoceptive state. It drives memory compaction/association and policy duplicate cleanup during NREM-like pressure, drives memory recombination during REM-like pressure, and caps other modules during those phases. It has no LLM and no blackboard reader; it does not estimate wake pressure, affect arousal, valence, or emotion.
+Regulates allocation from the current interoceptive state. It drives memory compaction/association and policy duplicate cleanup during NREM-like pressure, drives dreaming during REM-like pressure, and caps other modules during those phases. It has no LLM and no blackboard reader; it does not estimate wake pressure, affect arousal, valence, or emotion.
 
 ### Policy
 
@@ -743,7 +743,7 @@ structure, memo JSON, or allocation priority state.
 
 Capabilities: `InteroceptiveUpdatedInbox`, `InteroceptiveReader`, `InteroceptiveWriter`, `Memo`, `LlmAccess`.
 
-Sleep is activated by Action and does not hold `AllocationWriter`. On activation it first checks the current `InteroceptiveState`. If `wake_arousal > 0.25` or the mode is already sleep-like, it returns without an LLM call. Otherwise it asks the LLM through `decide_sleep`; an affirmative decision patches interoception to `NremPressure`, drops `wake_arousal` to `0.05`, and raises NREM/REM pressure floors so existing Homeostasis can cycle compacting/recombining phases.
+Sleep is activated by Action and does not hold `AllocationWriter`. On activation it first checks the current `InteroceptiveState`. If `wake_arousal > 0.25` or the mode is already sleep-like, it returns without an LLM call. Otherwise it asks the LLM through `decide_sleep`; an affirmative decision patches interoception to `NremPressure`, drops `wake_arousal` to `0.05`, and raises NREM/REM pressure floors so existing Homeostasis can cycle compacting/dreaming phases.
 
 ### Poet
 

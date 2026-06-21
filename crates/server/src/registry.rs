@@ -270,21 +270,16 @@ fn register_server_module(
                 }
             })
         }
-        RuntimeModule::MemoryRecombination => {
-            let memory_caps = memory_caps.clone();
+        RuntimeModule::Dreaming => {
             let main_tier = spec.session_tier("main");
-            registry.register_server(spec, move |caps| {
-                let memory_caps = memory_caps.clone();
-                async move {
-                    Ok(nuillu_memory::MemoryRecombinationModule::new(
-                        caps.interoception_updated_inbox(),
-                        caps.allocation_reader(),
-                        caps.blackboard_reader(),
-                        memory_caps.retriever(),
-                        caps.cognition_writer(),
-                        caps.llm("main").with_tier(main_tier).into(),
-                    ))
-                }
+            registry.register_server(spec, move |caps| async move {
+                Ok(nuillu_memory::DreamingModule::new(
+                    caps.interoception_updated_inbox(),
+                    caps.allocation_reader(),
+                    caps.blackboard_reader(),
+                    caps.memo(),
+                    caps.llm("main").with_tier(main_tier).into(),
+                ))
             })
         }
         RuntimeModule::Interoception => {
@@ -639,8 +634,10 @@ mod tests {
         assert!(action_targets.contains(&builtin::sleep()));
         assert!(action_targets.contains(&builtin::poet()));
         assert!(voluntary.contains(&builtin::interpreter()));
+        assert!(voluntary.contains(&builtin::dreaming()));
         assert!(!voluntary.contains(&builtin::sensory()));
         assert!(drive.contains(&builtin::memory_compaction()));
+        assert!(drive.contains(&builtin::dreaming()));
         assert!(drive.contains(&builtin::policy_compaction()));
     }
 

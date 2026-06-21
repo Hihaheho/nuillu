@@ -37,13 +37,13 @@ pub fn standard_dependency_edges() -> Vec<(ModuleId, ModuleId)> {
         (builtin::reward(), builtin::policy()),
         (builtin::policy_compaction(), builtin::reward()),
         (builtin::memory_compaction(), builtin::memory_association()),
-        (
-            builtin::memory_recombination(),
-            builtin::memory_compaction(),
-        ),
+        (builtin::dreaming(), builtin::query_memory()),
+        (builtin::dreaming(), builtin::predict()),
+        (builtin::dreaming(), builtin::self_model()),
+        (builtin::dreaming(), builtin::memory_compaction()),
         (builtin::memory_compaction(), builtin::homeostasis()),
         (builtin::memory_association(), builtin::homeostasis()),
-        (builtin::memory_recombination(), builtin::homeostasis()),
+        (builtin::dreaming(), builtin::homeostasis()),
         (builtin::policy_compaction(), builtin::homeostasis()),
     ]
 }

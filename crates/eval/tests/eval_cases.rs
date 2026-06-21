@@ -428,7 +428,7 @@ fn parses_memory_family_module_targets_and_allow_empty_output() {
         ("memory", "memory-target"),
         ("memory-compaction", "memory-compaction-target"),
         ("memory-association", "memory-association-target"),
-        ("memory-recombination", "memory-recombination-target"),
+        ("dreaming", "dreaming-target"),
     ] {
         let case_dir = dir.path().join(format!("eval-cases/modules/{module}"));
         std::fs::create_dir_all(&case_dir).unwrap();

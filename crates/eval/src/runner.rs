@@ -2538,10 +2538,10 @@ async fn execute_module_case(
                                 )
                                 .await
                         }
-                        ModuleEvalTarget::MemoryRecombination => {
-                            !cognition_output_for_module(&blackboard, &shutdown_target_module)
+                        ModuleEvalTarget::Dreaming => {
+                            last_memo_log_content_for_module(&blackboard, &shutdown_target_module)
                                 .await
-                                .is_empty()
+                                .is_some()
                                 || module_activation_finished(
                                     &blackboard,
                                     events.as_ref(),
@@ -2667,10 +2667,13 @@ async fn execute_module_case(
                 .await
                 .unwrap_or_default()
         }
-        ModuleEvalTarget::CognitionGate
-        | ModuleEvalTarget::Interpreter
-        | ModuleEvalTarget::MemoryRecombination => {
+        ModuleEvalTarget::CognitionGate | ModuleEvalTarget::Interpreter => {
             cognition_output_for_module(&env.blackboard, &target_module).await
+        }
+        ModuleEvalTarget::Dreaming => {
+            last_memo_log_content_for_module(&env.blackboard, &target_module)
+                .await
+                .unwrap_or_default()
         }
         ModuleEvalTarget::Memory
         | ModuleEvalTarget::MemoryCompaction
@@ -2858,7 +2861,7 @@ async fn activate_module_case_target(
         }
         ModuleEvalTarget::MemoryCompaction
         | ModuleEvalTarget::MemoryAssociation
-        | ModuleEvalTarget::MemoryRecombination
+        | ModuleEvalTarget::Dreaming
         | ModuleEvalTarget::PolicyCompaction => {
             harness
                 .interoception_updated_mailbox()
@@ -4805,7 +4808,10 @@ async fn seed_memos(
 }
 
 fn module_target_forces_cognitive_memo_seeds(target: ModuleEvalTarget) -> bool {
-    matches!(target, ModuleEvalTarget::AttentionSchema)
+    matches!(
+        target,
+        ModuleEvalTarget::AttentionSchema | ModuleEvalTarget::Dreaming
+    )
 }
 
 async fn seed_cognition_log(
@@ -4923,7 +4929,6 @@ fn hidden_from_attention_modules() -> Vec<ModuleId> {
         nuillu_types::builtin::homeostasis(),
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
-        nuillu_types::builtin::memory_recombination(),
         nuillu_types::builtin::policy_compaction(),
     ]
 }
@@ -4941,7 +4946,7 @@ fn homeostatic_drive_modules() -> Vec<ModuleId> {
     vec![
         nuillu_types::builtin::memory_compaction(),
         nuillu_types::builtin::memory_association(),
-        nuillu_types::builtin::memory_recombination(),
+        nuillu_types::builtin::dreaming(),
         nuillu_types::builtin::policy_compaction(),
     ]
 }
@@ -5305,25 +5310,20 @@ fn register_eval_module(
                 },
             )
             .expect("eval module registration should be unique"),
-        EvalModule::MemoryRecombination => registry
+        EvalModule::Dreaming => registry
             .register_eval(
                 eval_policy(0..=1, Bpm::range(2.0, 6.0)),
                 replica_hard_cap,
                 {
-                    let memory_caps = memory_caps.clone();
                     let main_tier = eval_session_tier(module, "main");
-                    move |caps| {
-                        let memory_caps = memory_caps.clone();
-                        async move {
-                            Ok(nuillu_memory::MemoryRecombinationModule::new(
-                                caps.interoception_updated_inbox(),
-                                caps.allocation_reader(),
-                                caps.blackboard_reader(),
-                                memory_caps.retriever(),
-                                caps.cognition_writer(),
-                                caps.llm("main").with_tier(main_tier).into(),
-                            ))
-                        }
+                    move |caps| async move {
+                        Ok(nuillu_memory::DreamingModule::new(
+                            caps.interoception_updated_inbox(),
+                            caps.allocation_reader(),
+                            caps.blackboard_reader(),
+                            caps.memo(),
+                            caps.llm("main").with_tier(main_tier).into(),
+                        ))
                     }
                 },
             )
@@ -5625,7 +5625,7 @@ pub(crate) fn full_agent_allocation(
             | EvalModule::Memory
             | EvalModule::MemoryCompaction
             | EvalModule::MemoryAssociation
-            | EvalModule::MemoryRecombination
+            | EvalModule::Dreaming
             | EvalModule::Policy
             | EvalModule::PolicyCompaction
             | EvalModule::Reward
@@ -5699,7 +5699,7 @@ fn eval_module_tier(module: EvalModule) -> ModelTier {
         | EvalModule::Memory
         | EvalModule::MemoryCompaction
         | EvalModule::MemoryAssociation
-        | EvalModule::MemoryRecombination
+        | EvalModule::Dreaming
         | EvalModule::Interoception
         | EvalModule::Homeostasis
         | EvalModule::PolicyCompaction
@@ -10242,7 +10242,7 @@ prompt = "What am I attending to?"
             builtin::memory(),
             builtin::memory_compaction(),
             builtin::memory_association(),
-            builtin::memory_recombination(),
+            builtin::dreaming(),
             builtin::predict(),
             builtin::surprise(),
         ] {

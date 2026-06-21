@@ -20,7 +20,7 @@ const MAX_REM_DURATION: Duration = Duration::from_secs(20);
 enum HomeostaticPhase {
     Wake,
     Compacting,
-    Recombining,
+    Dreaming,
 }
 
 pub struct HomeostasisModule {
@@ -123,12 +123,12 @@ fn next_phase(
             if elapsed >= MAX_NREM_DURATION
                 || (elapsed >= MIN_PHASE_DURATION && interoception.nrem_pressure <= NREM_EXIT)
             {
-                HomeostaticPhase::Recombining
+                HomeostaticPhase::Dreaming
             } else {
                 HomeostaticPhase::Compacting
             }
         }
-        HomeostaticPhase::Recombining => {
+        HomeostaticPhase::Dreaming => {
             if elapsed >= MAX_REM_DURATION
                 || (elapsed >= MIN_PHASE_DURATION && interoception.rem_pressure <= REM_EXIT)
             {
@@ -138,7 +138,7 @@ fn next_phase(
                     HomeostaticPhase::Wake
                 }
             } else {
-                HomeostaticPhase::Recombining
+                HomeostaticPhase::Dreaming
             }
         }
     }
@@ -163,13 +163,11 @@ fn drive_commands(phase: HomeostaticPhase, allowed: &[ModuleId]) -> Vec<Allocati
         {
             match phase {
                 HomeostaticPhase::Compacting => AllocationEffectLevel::Low,
-                HomeostaticPhase::Wake | HomeostaticPhase::Recombining => {
-                    AllocationEffectLevel::Off
-                }
+                HomeostaticPhase::Wake | HomeostaticPhase::Dreaming => AllocationEffectLevel::Off,
             }
-        } else if *id == builtin::memory_recombination() {
+        } else if *id == builtin::dreaming() {
             match phase {
-                HomeostaticPhase::Recombining => AllocationEffectLevel::Low,
+                HomeostaticPhase::Dreaming => AllocationEffectLevel::Low,
                 HomeostaticPhase::Wake | HomeostaticPhase::Compacting => AllocationEffectLevel::Off,
             }
         } else {
@@ -187,7 +185,7 @@ fn suppression_level(
     match phase {
         HomeostaticPhase::Wake => wake_suppression_level(interoception),
         HomeostaticPhase::Compacting => AllocationEffectLevel::Max,
-        HomeostaticPhase::Recombining => AllocationEffectLevel::High,
+        HomeostaticPhase::Dreaming => AllocationEffectLevel::High,
     }
 }
 
@@ -268,7 +266,7 @@ mod tests {
         );
         assert_eq!(
             next_phase(HomeostaticPhase::Compacting, at(0), at(3), &interoception),
-            HomeostaticPhase::Recombining
+            HomeostaticPhase::Dreaming
         );
 
         let interoception = InteroceptiveState {
@@ -277,7 +275,7 @@ mod tests {
             ..InteroceptiveState::default()
         };
         assert_eq!(
-            next_phase(HomeostaticPhase::Recombining, at(0), at(3), &interoception),
+            next_phase(HomeostaticPhase::Dreaming, at(0), at(3), &interoception),
             HomeostaticPhase::Wake
         );
     }
@@ -304,7 +302,7 @@ mod tests {
         };
         assert_eq!(
             next_phase(
-                HomeostaticPhase::Recombining,
+                HomeostaticPhase::Dreaming,
                 at(0),
                 at(3),
                 &rem_done_but_sleeping,
@@ -333,7 +331,7 @@ mod tests {
                 builtin::memory_compaction(),
                 builtin::memory_association(),
                 builtin::policy_compaction(),
-                builtin::memory_recombination(),
+                builtin::dreaming(),
             ],
         );
         assert_eq!(
@@ -349,23 +347,20 @@ mod tests {
             Some(AllocationEffectLevel::Low)
         );
         assert_eq!(
-            target_level(&drive, &builtin::memory_recombination()),
+            target_level(&drive, &builtin::dreaming()),
             Some(AllocationEffectLevel::Off)
         );
 
         let drive = drive_commands(
-            HomeostaticPhase::Recombining,
-            &[
-                builtin::memory_compaction(),
-                builtin::memory_recombination(),
-            ],
+            HomeostaticPhase::Dreaming,
+            &[builtin::memory_compaction(), builtin::dreaming()],
         );
         assert_eq!(
             target_level(&drive, &builtin::memory_compaction()),
             Some(AllocationEffectLevel::Off)
         );
         assert_eq!(
-            target_level(&drive, &builtin::memory_recombination()),
+            target_level(&drive, &builtin::dreaming()),
             Some(AllocationEffectLevel::Low)
         );
 
@@ -432,7 +427,7 @@ mod tests {
             AllocationEffectLevel::Max
         );
         assert_eq!(
-            suppression_level(HomeostaticPhase::Recombining, &interoception),
+            suppression_level(HomeostaticPhase::Dreaming, &interoception),
             AllocationEffectLevel::High
         );
     }

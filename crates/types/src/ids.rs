@@ -203,7 +203,7 @@ pub mod builtin {
         memory                => "memory",
         memory_compaction     => "memory-compaction",
         memory_association    => "memory-association",
-        memory_recombination  => "memory-recombination",
+        dreaming              => "dreaming",
         interoception        => "interoception",
         homeostasis => "homeostasis",
         policy                => "policy",

@@ -42,8 +42,8 @@ schema = "schemas/eval-memory-case.schema.eure"
 globs = ["eval-cases/modules/memory-association/**/*.eure"]
 schema = "schemas/eval-memory-case.schema.eure"
 
-@ targets.eval-memory-recombination-cases
-globs = ["eval-cases/modules/memory-recombination/**/*.eure"]
+@ targets.eval-dreaming-cases
+globs = ["eval-cases/modules/dreaming/**/*.eure"]
 schema = "schemas/eval-memory-case.schema.eure"
 
 @ targets.eval-attention-schema-cases
@@ -105,7 +105,7 @@ default-targets = [
   "eval-memory-cases",
   "eval-memory-compaction-cases",
   "eval-memory-association-cases",
-  "eval-memory-recombination-cases",
+  "eval-dreaming-cases",
   "eval-attention-schema-cases",
   "eval-surprise-cases",
   "eval-predict-cases",

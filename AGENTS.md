@@ -35,7 +35,7 @@ types  →  blackboard  →  module  →  modules/*
 - `crates/types`: newtypes only (`ModuleId`, `MemoryRank`, `ModelTier`, …). No business logic.
 - `crates/blackboard`: passive shared state (memos, attention stream, memory metadata, `ResourceAllocation`). Mutates only via `apply(BlackboardCommand)` under a single write lock.
 - `crates/module`: the `Module` trait, outbound port traits (`MemoryStore`, `AttentionRepository`, `Clock`), capability handles, typed channels, and the `CapabilityFactory` that dispenses them at boot.
-- `crates/modules/*`: one crate per cognitive module (sensory, cognition-gate, allocation, attention-schema, self-model, memory, homeostasis, vital, reward, predict, surprise, speak). Additional builtin ids in `nuillu_types::builtin` (query-memory, query-policy, memory-compaction, memory-association, memory-recombination, policy, value-estimator, speak-gate) are reserved for legacy data or implemented inside sibling crates.
+- `crates/modules/*`: one crate per cognitive module (sensory, cognition-gate, allocation, attention-schema, self-model, memory, homeostasis, vital, reward, predict, surprise, speak). Additional builtin ids in `nuillu_types::builtin` (query-memory, query-policy, memory-compaction, memory-association, dreaming, policy, value-estimator, speak-gate) are reserved for legacy data or implemented inside sibling crates.
 - `crates/agent`: the scheduler (`run`) and `AgentEventLoop` — the only places that spawn module tasks or advance periodic time.
 
 ### Runtime shape

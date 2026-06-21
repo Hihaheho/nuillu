@@ -5,8 +5,8 @@
 //! [`MemoryRetriever`], [`MemoryContentReader`]), and the modules that
 //! operate on memory: [`MemoryModule`] (writes), [`MemoryCompactionModule`]
 //! (destructive merges), [`MemoryAssociationModule`] (non-destructive
-//! relationship writes), [`MemoryRecombinationModule`] (dream-like
-//! recombination), and [`QueryMemoryModule`] (vector-search retrieval).
+//! relationship writes), [`DreamingModule`] (dream-like associative
+//! simulation), and [`QueryMemoryModule`] (vector-search retrieval).
 //!
 //! Hosts build a [`MemoryCapabilities`] provider once at boot to bundle the
 //! store + blackboard + clock, then either pass it to registration closures
@@ -25,9 +25,9 @@ use nuillu_types::MemoryRank;
 mod association;
 mod common;
 mod compaction;
+mod dreaming;
 mod memory;
 mod query;
-mod recombination;
 mod store;
 
 pub use association::{
@@ -40,6 +40,7 @@ pub use compaction::{
     CompactionAuditOutput, CompactionTools, CompactionToolsCall, CompactionToolsSelector,
     GetMemoriesArgs, MemoryCompactionModule, MergeMemoriesArgs, MergeMemoriesOutput,
 };
+pub use dreaming::DreamingModule;
 pub use memory::{
     DeleteRedundantMemoryArgs, DeleteRedundantMemoryOutput, InsertMemoryArgs, InsertMemoryOutput,
     KeepNewMemoryArgs, KeepNewMemoryOutput, MemoryBatch, MemoryConceptInput, MemoryModule,
@@ -53,12 +54,6 @@ pub use query::{
     QueryMemoryMemoLinkedHit, QueryMemoryMemoSearch, QueryMemoryModule, QueryMemoryPlanTools,
     QueryMemoryPlanToolsCall, QueryMemoryPlanToolsSelector, SelectMemoryEvidenceArgs,
     SelectMemoryEvidenceOutput, query_session_auto_compaction,
-};
-pub use recombination::{
-    AppendRecombinationArgs, AppendRecombinationOutput, MemoryRecombinationModule,
-    RecombinationMemoryHit, RecombinationTools, RecombinationToolsCall, RecombinationToolsSelector,
-    SearchMemoryArgs as RecombinationSearchMemoryArgs,
-    SearchMemoryOutput as RecombinationSearchMemoryOutput,
 };
 pub use store::{
     IndexedMemory, LinkedMemoryQuery, LinkedMemoryRecord, MemoryAssociator, MemoryCompactor,

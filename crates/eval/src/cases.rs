@@ -260,7 +260,7 @@ pub enum EvalModule {
     Memory,
     MemoryCompaction,
     MemoryAssociation,
-    MemoryRecombination,
+    Dreaming,
     Interoception,
     Homeostasis,
     Policy,
@@ -285,7 +285,7 @@ pub const DEFAULT_FULL_AGENT_MODULES: &[EvalModule] = &[
     EvalModule::Memory,
     EvalModule::MemoryCompaction,
     EvalModule::MemoryAssociation,
-    EvalModule::MemoryRecombination,
+    EvalModule::Dreaming,
     EvalModule::Interoception,
     EvalModule::Homeostasis,
     EvalModule::Policy,
@@ -312,7 +312,7 @@ impl EvalModule {
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
-            Self::MemoryRecombination => "memory-recombination",
+            Self::Dreaming => "dreaming",
             Self::Interoception => "interoception",
             Self::Homeostasis => "homeostasis",
             Self::Policy => "policy",
@@ -339,7 +339,7 @@ impl EvalModule {
             Self::Memory => builtin::memory(),
             Self::MemoryCompaction => builtin::memory_compaction(),
             Self::MemoryAssociation => builtin::memory_association(),
-            Self::MemoryRecombination => builtin::memory_recombination(),
+            Self::Dreaming => builtin::dreaming(),
             Self::Interoception => builtin::interoception(),
             Self::Homeostasis => builtin::homeostasis(),
             Self::Policy => builtin::policy(),
@@ -396,7 +396,7 @@ pub enum ModuleEvalTarget {
     Memory,
     MemoryCompaction,
     MemoryAssociation,
-    MemoryRecombination,
+    Dreaming,
     Policy,
     PolicyCompaction,
     Allocation,
@@ -420,7 +420,7 @@ impl ModuleEvalTarget {
             Self::Memory => "memory",
             Self::MemoryCompaction => "memory-compaction",
             Self::MemoryAssociation => "memory-association",
-            Self::MemoryRecombination => "memory-recombination",
+            Self::Dreaming => "dreaming",
             Self::Policy => "policy",
             Self::PolicyCompaction => "policy-compaction",
             Self::Allocation => "allocation",
@@ -444,7 +444,7 @@ impl ModuleEvalTarget {
             Self::Memory => EvalModule::Memory,
             Self::MemoryCompaction => EvalModule::MemoryCompaction,
             Self::MemoryAssociation => EvalModule::MemoryAssociation,
-            Self::MemoryRecombination => EvalModule::MemoryRecombination,
+            Self::Dreaming => EvalModule::Dreaming,
             Self::Policy => EvalModule::Policy,
             Self::PolicyCompaction => EvalModule::PolicyCompaction,
             Self::Allocation => EvalModule::Allocation,
@@ -470,7 +470,7 @@ impl ModuleEvalTarget {
                 "memory" => Some(Self::Memory),
                 "memory-compaction" => Some(Self::MemoryCompaction),
                 "memory-association" => Some(Self::MemoryAssociation),
-                "memory-recombination" => Some(Self::MemoryRecombination),
+                "dreaming" => Some(Self::Dreaming),
                 "policy" => Some(Self::Policy),
                 "policy-compaction" => Some(Self::PolicyCompaction),
                 "allocation" => Some(Self::Allocation),
@@ -2275,7 +2275,7 @@ prompt = "Admit load-bearing facts."
         let wake_modules = wake.modules.as_ref().expect("wake case lists modules");
         assert!(!wake_modules.contains(&EvalModule::MemoryCompaction));
         assert!(!wake_modules.contains(&EvalModule::MemoryAssociation));
-        assert!(!wake_modules.contains(&EvalModule::MemoryRecombination));
+        assert!(!wake_modules.contains(&EvalModule::Dreaming));
         assert!(!wake_modules.contains(&EvalModule::PolicyCompaction));
         assert_eq!(wake.steps.len(), 2);
         assert!(matches!(

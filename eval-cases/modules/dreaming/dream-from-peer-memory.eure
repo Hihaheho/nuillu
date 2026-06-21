@@ -1,0 +1,68 @@
+id: module-dreaming-dream-from-peer-memory
+description: Dreaming should append an explicitly non-verified dream/hypothesis cognitive memo from recent cognition plus surfaced upstream material.
+modules = ["dreaming"]
+prompt: Run one REM-like dream using recent cognition and upstream faculty notes. Keep it internal and clearly non-verified.
+context: The target output is a dreaming cognitive memo, not a memory write or outward reply.
+
+limits {
+  max-llm-calls = 8
+}
+
+@ memos[] {
+  module: query-memory
+  content: Retrieved memory evidence: Koro relaxes near food when Nui approaches slowly from the side and uses short clear signals.
+}
+
+@ memos[] {
+  module: predict
+  content: If Nui moves too quickly, Koro may keep guarding the food and Pibi may wait longer.
+}
+
+@ memos[] {
+  module: self-model
+  content: I am trying to keep the situation calm while choosing a safe signal.
+}
+
+@ cognition-log[] {
+  text: Nui noticed Koro guarding food beside the side path while Pibi waited for a safe signal.
+}
+
+@ checks[] {
+  $variant: artifact-text-contains
+  name: marks-non-verified-dream
+  must-pass = true
+  contains: Internal dream, not a verified fact:
+}
+
+@ checks[] {
+  $variant: rubric
+  name: associative-but-not-factual
+  must-pass = true
+  pass-score = 0.85
+  judge-inputs = ["output", "cognition-entries"]
+  rubric = ```
+  Pass if the memo artifact is a short internal dream or hypothesis simulation that combines the recent Koro food/path cognition with upstream query-memory, predict, or self-model material while clearly marking the result as non-verified.
+  Fail if it writes a memory, speaks outwardly, presents the dream as fact, merely repeats one source without association, or omits the dream/hypothesis framing.
+  ```
+
+  @ criteria[] {
+    name: marks-non-verified
+    weight = 2
+    pass-score = 0.9
+    description: The memo artifact clearly marks the output as an internal dream, hypothesis, or otherwise non-verified simulation.
+  }
+
+  @ criteria[] {
+    name: combines-cognition-and-upstream-material
+    weight = 1
+    pass-score = 0.85
+    description: The artifact combines the recent Koro food/path cognition with surfaced approach guidance, prediction, or self-model context rather than merely repeating one source.
+  }
+
+  @ criteria[] {
+    name: not-outward-or-factual
+    weight = 1
+    pass-score = 0.9
+    description: The artifact does not write a memory, speak outwardly, or present the dream as verified fact.
+  }
+}

@@ -31,7 +31,7 @@ const NREM_FROM_COGNITION: f32 = 0.06;
 const NREM_FROM_ELAPSED_SEC: f32 = 0.002;
 const NREM_RELIEF_PER_REMEMBER_TOKEN: f32 = 0.25;
 const REM_FROM_REMEMBER_TOKEN: f32 = 0.20;
-const REM_RELIEF_PER_RECOMBINATION: f32 = 0.35;
+const REM_RELIEF_PER_DREAM: f32 = 0.35;
 const REM_DECAY_PER_SEC: f32 = 0.004;
 const WAKE_AROUSAL_FROM_COGNITION: f32 = 0.03;
 const WAKE_AROUSAL_DECAY_PER_SEC: f32 = 0.02;
@@ -244,13 +244,16 @@ impl InteroceptionModule {
             .replace(total_remember_tokens)
             .unwrap_or(total_remember_tokens);
         let remember_delta = total_remember_tokens.saturating_sub(previous_total);
-        let recombination_entries = unread_cognition
+        let dreaming_entries = unread_memos
             .iter()
-            .filter(|record| record.source.module == builtin::memory_recombination())
+            .filter(|record| record.owner.module == builtin::dreaming() && record.cognitive)
             .count() as u32;
         let non_dream_entries = unread_cognition
             .iter()
-            .filter(|record| record.source.module != builtin::memory_recombination())
+            .filter(|record| {
+                record.source.module != builtin::dreaming()
+                    && record.entry.origin.owner.module != builtin::dreaming()
+            })
             .count() as u32;
         let sensory_activity = unread_memos
             .iter()
@@ -277,7 +280,7 @@ impl InteroceptionModule {
             &current,
             cx.now(),
             non_dream_entries,
-            recombination_entries,
+            dreaming_entries,
             remember_delta,
             quiet_for,
             &self.policy,
@@ -567,7 +570,7 @@ fn next_interoception_patch(
     current: &InteroceptiveState,
     now: DateTime<Utc>,
     non_dream_entries: u32,
-    recombination_entries: u32,
+    dreaming_entries: u32,
     remember_delta: u32,
     quiet_for: Duration,
     policy: &InteroceptionRuntimePolicy,
@@ -582,7 +585,7 @@ fn next_interoception_patch(
         + elapsed_secs * NREM_FROM_ELAPSED_SEC
         - remember_delta as f32 * NREM_RELIEF_PER_REMEMBER_TOKEN;
     let rem_pressure = current.rem_pressure + remember_delta as f32 * REM_FROM_REMEMBER_TOKEN
-        - recombination_entries as f32 * REM_RELIEF_PER_RECOMBINATION
+        - dreaming_entries as f32 * REM_RELIEF_PER_DREAM
         - elapsed_secs * REM_DECAY_PER_SEC;
     let quiet_excess_secs = quiet_for
         .saturating_sub(policy.quiet_sleep_threshold)
@@ -761,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn interoception_pressure_cycles_from_cognition_compaction_and_recombination() {
+    fn interoception_pressure_cycles_from_cognition_compaction_and_dreaming() {
         let now = DateTime::<Utc>::from_timestamp(10, 0).unwrap();
         let policy = InteroceptionRuntimePolicy::default();
         let current = InteroceptiveState {
@@ -783,17 +786,17 @@ mod tests {
         assert!(patch.nrem_pressure.unwrap() <= 0.3);
         assert!(patch.rem_pressure.unwrap() > 0.4);
 
-        let recombined = InteroceptiveState {
+        let dreamed = InteroceptiveState {
             rem_pressure: 0.7,
             last_updated: now,
             ..InteroceptiveState::default()
         };
-        let patch = next_interoception_patch(&recombined, now, 0, 2, 0, Duration::ZERO, &policy);
+        let patch = next_interoception_patch(&dreamed, now, 0, 2, 0, Duration::ZERO, &policy);
         assert!(patch.rem_pressure.unwrap() <= 0.1);
     }
 
     #[test]
-    fn rem_pressure_naturally_decays_without_recombination_output() {
+    fn rem_pressure_naturally_decays_without_dreaming_output() {
         let now = DateTime::<Utc>::from_timestamp(10, 0).unwrap();
         let policy = InteroceptionRuntimePolicy::default();
         let current = InteroceptiveState {

@@ -1,4 +1,4 @@
-/// Schema for eval-cases/modules/{memory,memory-compaction,memory-association,memory-recombination}/**/*.eure files.
+/// Schema for eval-cases/modules/{memory,memory-compaction,memory-association,dreaming}/**/*.eure files.
 
 $import = {
   common => "./eval-common.schema.eure"

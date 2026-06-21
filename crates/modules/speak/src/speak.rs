@@ -811,7 +811,7 @@ fn cognition_entry_records(logs: &[CognitionLogRecord]) -> Vec<CognitionLogEntry
     let mut records = Vec::new();
     for log in logs
         .iter()
-        .filter(|record| record.source.module != builtin::memory_recombination())
+        .filter(|record| record.source.module != builtin::dreaming())
     {
         for entry in &log.entries {
             records.push(CognitionLogEntryRecord {

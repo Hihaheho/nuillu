@@ -24,7 +24,7 @@ const MODULE_NAME_KEYS: &[(&str, &str)] = &[
     ("memory", "module-name-memory"),
     ("memory-compaction", "module-name-memory-compaction"),
     ("memory-association", "module-name-memory-association"),
-    ("memory-recombination", "module-name-memory-recombination"),
+    ("dreaming", "module-name-dreaming"),
     ("interoception", "module-name-interoception"),
     ("homeostasis", "module-name-homeostasis"),
     ("policy", "module-name-policy"),

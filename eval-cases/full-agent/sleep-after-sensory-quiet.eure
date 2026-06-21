@@ -8,7 +8,7 @@ modules = [
   "allocation",
   "memory-compaction",
   "memory-association",
-  "memory-recombination",
+  "dreaming",
   "interoception",
   "homeostasis",
   "policy-compaction",

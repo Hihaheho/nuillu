@@ -159,7 +159,7 @@ Sensory cognitive memo -> CognitionGate -> CognitionLogUpdated -> Speak
 Surprise -> AttentionControlRequest free-form text -> Allocation
 CognitionLogUpdated -> QueryMemory/Policy/Predict/Surprise/AttentionSchema/Interpreter/SelfModel
 CognitionLogEvicted -> Memory
-InteroceptiveUpdated -> MemoryCompaction/MemoryAssociation/MemoryRecombination/PolicyCompaction
+InteroceptiveUpdated -> MemoryCompaction/MemoryAssociation/Dreaming/PolicyCompaction
 Memo/Cognition updates -> Policy -> advice memo + custom PolicyConsiderationPayload
 PolicyConsiderationPayload custom eviction + Surprise memo + Speak memo + Sensory memo -> Reward -> PolicyUpserter insert/reinforce
 Policy memo -> Allocation / CognitionGate (memo-authoritative)
@@ -321,13 +321,13 @@ Fetches related memory contents and merges redundant memories, accumulating reme
 
 ### Interoception
 
-Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition updates, memo updates, and its module-local periodic wake activate it. It preserves deterministic pressure and arousal dynamics from cognition volume, remember-token relief, elapsed time, recombination traces, activity arousal floors, and quiet return-to-neutral. Structured LLM output provides semantic affect appraisal (`wake_salience`, `affect_salience`, `valence_polarity`, `valence_salience`, and `emotion`); Rust owns numeric arousal/valence deltas, decay, clamping, and fallback behavior.
+Maintains the canonical internal-state model: `wake_arousal`, `nrem_pressure`, `rem_pressure`, `affect_arousal`, `valence`, and untyped `emotion`. Cognition updates, memo updates, and its module-local periodic wake activate it. It preserves deterministic pressure and arousal dynamics from cognition volume, remember-token relief, elapsed time, dreaming cognitive memos, activity arousal floors, and quiet return-to-neutral. Structured LLM output provides semantic affect appraisal (`wake_salience`, `affect_salience`, `valence_polarity`, `valence_salience`, and `emotion`); Rust owns numeric arousal/valence deltas, decay, clamping, and fallback behavior.
 
 `wake_arousal` is sleep/wake arousal. `affect_arousal` is emotional activation. `valence` is the signed positive/negative axis in `[-1, 1]`. `emotion` is free text and is not a typed enum. Interoception writes `InteroceptiveState` through `InteroceptiveWriter`; other modules read it through `InteroceptiveReader`.
 
 ### Homeostasis
 
-Regulates allocation from interoceptive state. It reads `InteroceptiveState`, then drives NREM-like memory compaction/association, policy duplicate cleanup, REM-like recombination, and action caps through `AllocationWriter`. It does not estimate internal state and does not use an LLM; its job is homeostatic regulation, not affect interpretation.
+Regulates allocation from interoceptive state. It reads `InteroceptiveState`, then drives NREM-like memory compaction/association, policy duplicate cleanup, REM-like dreaming, and action caps through `AllocationWriter`. It does not estimate internal state and does not use an LLM; its job is homeostatic regulation, not affect interpretation.
 
 ### Policy
 

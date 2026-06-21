@@ -60,8 +60,8 @@ remain transient wake signals, and durable module output remains memo-authoritat
 | `memory` | Preserves useful cognitive evidence as short normalized memory text. Ingest always creates short-term memory and extracts only kind, concepts, and operational tags. |
 | `query-memory` | Retrieves flat memory hits and may explicitly fetch linked memories through tools when useful. |
 | `memory-compaction` | Performs NREM-like consolidation: creates summary memories, operational tags, and memory-to-memory links while preserving source memories. |
-| `memory-recombination` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
-| `interoception` / `homeostasis` | `interoception` estimates internal state; `homeostasis` regulates sleep-like memory balancing by raising compaction or recombination allocation from that state. |
+| `dreaming` | Performs REM-like associative simulation. Its outputs are dream or hypothesis material, not verified facts. |
+| `interoception` / `homeostasis` | `interoception` estimates internal state; `homeostasis` regulates sleep-like memory balancing by raising compaction or dreaming allocation from that state. |
 | `allocation` | Allocates memory work by changing module activation priority. It does not gain direct memory graph mutation or truth-projection power. |
 | `self-model` | Integrates retrieved identity and self-related memories into current self-description. Identity memories are high-rank memories, not current-fact rows. |
 
@@ -372,14 +372,15 @@ Ryo's remembered residence changed from Tokyo to Kyoto across two memories.
 This summary can link to both source memories using `derived_from`, and the later
 source memory can link to the older one using `updates`.
 
-REM-like recombination is different. `memory-recombination` produces associative
-dream or hypothesis material. These entries may be useful for planning, surprise,
-or later associations, but they are not verified evidence. They should use `dream`
-or `hypothesis` kind and operational tags when stored.
+REM-like dreaming is different. `dreaming` produces associative dream or
+hypothesis material from already surfaced cognition and upstream faculty notes.
+These entries may be useful for planning, surprise, or later associations, but
+they are not verified evidence. They should use `dream` or `hypothesis` kind and
+operational tags when stored.
 
 Existing `interoception` and `homeostasis` roles drive this balancing through
 allocation. `interoception` owns the pressure and affect estimate; `homeostasis`
-only regulates compaction/recombination drive and action caps from that estimate. The
+only regulates compaction/dreaming drive and action caps from that estimate. The
 memory ledger does not add a new memory tick API or a background SQL job that bypasses
 module capabilities.
 
