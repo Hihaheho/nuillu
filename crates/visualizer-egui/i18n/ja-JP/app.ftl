@@ -214,6 +214,7 @@ scene-send = 送信
 scene-no-people = 人がいません
 scene-streaming = ストリーミング中
 scene-add = 追加
+scene-save = 保存
 scene-activity-role-sensory = 感覚入力
 scene-activity-role-ambient = 環境
 scene-activity-role-agent = agent

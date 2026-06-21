@@ -213,6 +213,22 @@ async fn handle_server_visualizer_message(
             .await;
             false
         }
+        VisualizerCommand::SaveSceneState {
+            tab_id: command_tab,
+            state,
+        } if command_tab == *tab_id => {
+            scene.replace(state);
+            persist_and_emit_scene(
+                scene,
+                visualizer,
+                tab_id,
+                sensory,
+                env,
+                run_controller.is_running(),
+            )
+            .await;
+            false
+        }
         VisualizerCommand::SendScenePersonMessage {
             tab_id: command_tab,
             row_id,

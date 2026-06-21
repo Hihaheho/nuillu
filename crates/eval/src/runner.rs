@@ -262,6 +262,7 @@ impl VisualizerHook {
                 | VisualizerCommand::CreateSceneRow { tab_id, .. }
                 | VisualizerCommand::UpdateSceneRow { tab_id, .. }
                 | VisualizerCommand::RemoveSceneRow { tab_id, .. }
+                | VisualizerCommand::SaveSceneState { tab_id, .. }
                 | VisualizerCommand::SendScenePersonMessage { tab_id, .. }
                 | VisualizerCommand::LoadLinkedMemories { tab_id, .. }
                 | VisualizerCommand::DeleteMemory { tab_id, .. }
@@ -4212,6 +4213,7 @@ async fn handle_visualizer_commands(
             | VisualizerCommand::CreateSceneRow { tab_id, .. }
             | VisualizerCommand::UpdateSceneRow { tab_id, .. }
             | VisualizerCommand::RemoveSceneRow { tab_id, .. }
+            | VisualizerCommand::SaveSceneState { tab_id, .. }
             | VisualizerCommand::SendScenePersonMessage { tab_id, .. }
                 if tab_id.as_str() == case_id =>
             {

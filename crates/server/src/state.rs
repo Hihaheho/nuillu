@@ -7,9 +7,9 @@ use std::{
 use anyhow::Context as _;
 use nuillu_module::Participant;
 use nuillu_visualizer_protocol::{
-    AmbientSensoryRowView, DerivedAmbientSensoryRowView, ModuleSettingsView,
-    SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView, SceneRowKind, SceneRowView,
-    SceneSoundRowView, SceneStateView,
+    AmbientSensoryRowView, DerivedAmbientSensoryRowView, EditableSceneStateView,
+    ModuleSettingsView, SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView,
+    SceneRowKind, SceneRowView, SceneSoundRowView, SceneStateView, derive_scene_ambient,
 };
 use serde::{Deserialize, Serialize};
 
@@ -83,14 +83,6 @@ fn load_legacy_ambient_rows(path: &Path) -> anyhow::Result<Vec<AmbientSensoryRow
     Ok(file.rows)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct SceneStateFile {
-    people: Vec<ScenePersonRowView>,
-    objects: Vec<SceneObjectRowView>,
-    sounds: Vec<SceneSoundRowView>,
-    atmosphere: Vec<SceneAtmosphereRowView>,
-}
-
 #[derive(Debug)]
 pub(super) struct SceneState {
     path: PathBuf,
@@ -109,12 +101,12 @@ impl SceneState {
         if path.exists() {
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("read scene state from {}", path.display()))?;
-            let file: SceneStateFile = serde_json::from_str(&text)
+            let file: EditableSceneStateView = serde_json::from_str(&text)
                 .with_context(|| format!("parse scene state from {}", path.display()))?;
             return Ok(Self::from_file(path, file));
         }
 
-        let mut state = Self::from_file(path, SceneStateFile::default());
+        let mut state = Self::from_file(path, EditableSceneStateView::default());
         for name in seed_participants {
             if !name.trim().is_empty() {
                 let id = state.next_id(SceneRowKind::Person);
@@ -143,7 +135,7 @@ impl SceneState {
         Ok(state)
     }
 
-    fn from_file(path: PathBuf, file: SceneStateFile) -> Self {
+    fn from_file(path: PathBuf, file: EditableSceneStateView) -> Self {
         Self {
             path,
             people: file.people,
@@ -158,24 +150,20 @@ impl SceneState {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scene state dir {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(&SceneStateFile {
-            people: self.people.clone(),
-            objects: self.objects.clone(),
-            sounds: self.sounds.clone(),
-            atmosphere: self.atmosphere.clone(),
-        })?;
+        let text = serde_json::to_string_pretty(&self.editable_view())?;
         fs::write(&self.path, text)
             .with_context(|| format!("write scene state to {}", self.path.display()))
     }
 
     pub(super) fn view(&self) -> SceneStateView {
-        SceneStateView {
-            people: self.people.clone(),
-            objects: self.objects.clone(),
-            sounds: self.sounds.clone(),
-            atmosphere: self.atmosphere.clone(),
-            derived_ambient: self.derived_ambient(),
-        }
+        self.editable_view().into_scene_state()
+    }
+
+    pub(super) fn replace(&mut self, state: EditableSceneStateView) {
+        self.people = state.people;
+        self.objects = state.objects;
+        self.sounds = state.sounds;
+        self.atmosphere = state.atmosphere;
     }
 
     pub(super) fn participants(&self) -> Vec<Participant> {
@@ -302,51 +290,16 @@ impl SceneState {
     }
 
     pub(super) fn derived_ambient(&self) -> Vec<DerivedAmbientSensoryRowView> {
-        let mut rows = Vec::new();
-        for person in &self.people {
-            if let Some(content) = derive_person_content(person) {
-                rows.push(DerivedAmbientSensoryRowView {
-                    id: format!("scene:person:{}", person.id),
-                    modality: "vision".to_string(),
-                    content,
-                });
-            }
+        derive_scene_ambient(&self.editable_view())
+    }
+
+    fn editable_view(&self) -> EditableSceneStateView {
+        EditableSceneStateView {
+            people: self.people.clone(),
+            objects: self.objects.clone(),
+            sounds: self.sounds.clone(),
+            atmosphere: self.atmosphere.clone(),
         }
-        for object in &self.objects {
-            if let Some(content) = derive_object_visual_content(object) {
-                rows.push(DerivedAmbientSensoryRowView {
-                    id: format!("scene:object:{}:visual", object.id),
-                    modality: "vision".to_string(),
-                    content,
-                });
-            }
-            if let Some(content) = derive_object_sound_content(object) {
-                rows.push(DerivedAmbientSensoryRowView {
-                    id: format!("scene:object:{}:sound", object.id),
-                    modality: "audition".to_string(),
-                    content,
-                });
-            }
-        }
-        for sound in &self.sounds {
-            if let Some(content) = derive_sound_content(sound) {
-                rows.push(DerivedAmbientSensoryRowView {
-                    id: format!("scene:sound:{}", sound.id),
-                    modality: "audition".to_string(),
-                    content,
-                });
-            }
-        }
-        for atmosphere in &self.atmosphere {
-            if let Some(content) = derive_atmosphere_content(atmosphere) {
-                rows.push(DerivedAmbientSensoryRowView {
-                    id: format!("scene:atmosphere:{}", atmosphere.id),
-                    modality: atmosphere_modality(&atmosphere.aspect).to_string(),
-                    content,
-                });
-            }
-        }
-        rows
     }
 
     fn next_id(&self, kind: SceneRowKind) -> String {
@@ -408,115 +361,6 @@ fn legacy_modality_aspect(modality: &str) -> String {
     }
 }
 
-fn derive_person_content(row: &ScenePersonRowView) -> Option<String> {
-    let name = row.name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let mut content = format!("{name} is present");
-    append_location(&mut content, &row.direction, &row.distance);
-    append_sentence_tail(&mut content, &row.state);
-    Some(content)
-}
-
-fn derive_object_visual_content(row: &SceneObjectRowView) -> Option<String> {
-    let name = row.name.trim();
-    let visual = row.visual_description.trim();
-    if name.is_empty() && visual.is_empty() {
-        return None;
-    }
-    let mut content = if name.is_empty() {
-        "An object is visible".to_string()
-    } else {
-        format!("{name} is visible")
-    };
-    append_location(&mut content, &row.direction, &row.distance);
-    append_sentence_tail(&mut content, visual);
-    Some(content)
-}
-
-fn derive_object_sound_content(row: &SceneObjectRowView) -> Option<String> {
-    let sound = row.sound_description.trim();
-    if sound.is_empty() {
-        return None;
-    }
-    let name = row.name.trim();
-    let mut content = if name.is_empty() {
-        "An object is making sound".to_string()
-    } else {
-        format!("{name} is making sound")
-    };
-    append_location(&mut content, &row.direction, &row.distance);
-    append_sentence_tail(&mut content, sound);
-    Some(content)
-}
-
-fn derive_sound_content(row: &SceneSoundRowView) -> Option<String> {
-    let description = row.description.trim();
-    if description.is_empty() {
-        return None;
-    }
-    let mut content = "A sound is present".to_string();
-    append_sound_location(&mut content, &row.direction, &row.distance);
-    append_sentence_tail(&mut content, description);
-    Some(content)
-}
-
-fn derive_atmosphere_content(row: &SceneAtmosphereRowView) -> Option<String> {
-    let description = row.description.trim();
-    if description.is_empty() {
-        return None;
-    }
-    let aspect = row.aspect.trim();
-    if aspect.is_empty() || aspect == "other" {
-        Some(description.to_string())
-    } else {
-        Some(format!("{aspect}: {description}"))
-    }
-}
-
-fn append_location(content: &mut String, direction: &str, distance: &str) {
-    let direction = direction.trim();
-    let distance = distance.trim();
-    match (direction.is_empty(), distance.is_empty()) {
-        (false, false) => content.push_str(&format!(" at {direction}, {distance} away")),
-        (false, true) => content.push_str(&format!(" at {direction}")),
-        (true, false) => content.push_str(&format!(" {distance} away")),
-        (true, true) => {}
-    }
-}
-
-fn append_sound_location(content: &mut String, direction: &str, distance: &str) {
-    let direction = direction.trim();
-    let distance = distance.trim();
-    match (direction.is_empty(), distance.is_empty()) {
-        (false, false) => content.push_str(&format!(" from {direction}, {distance} away")),
-        (false, true) => content.push_str(&format!(" from {direction}")),
-        (true, false) => content.push_str(&format!(" {distance} away")),
-        (true, true) => {}
-    }
-}
-
-fn append_sentence_tail(content: &mut String, tail: &str) {
-    let tail = tail.trim();
-    if tail.is_empty() {
-        content.push('.');
-    } else {
-        content.push_str("; ");
-        content.push_str(tail);
-        content.push('.');
-    }
-}
-
-pub(super) fn atmosphere_modality(aspect: &str) -> &'static str {
-    match aspect.trim().to_ascii_lowercase().as_str() {
-        "light" => "vision",
-        "smell" => "smell",
-        "temperature" | "air/weather" | "surface/feel" => "touch",
-        _ => "ambient",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,7 +369,7 @@ mod tests {
     fn scene_state_derives_people_objects_sounds_and_atmosphere() {
         let state = SceneState::from_file(
             PathBuf::from(".tmp/test-scene-state.json"),
-            SceneStateFile {
+            EditableSceneStateView {
                 people: vec![ScenePersonRowView {
                     id: "person-1".to_string(),
                     name: "Pibi".to_string(),
@@ -591,7 +435,7 @@ mod tests {
     fn scene_state_participants_skip_empty_names() {
         let state = SceneState::from_file(
             PathBuf::from(".tmp/test-scene-state.json"),
-            SceneStateFile {
+            EditableSceneStateView {
                 people: vec![
                     ScenePersonRowView {
                         id: "person-1".to_string(),
@@ -608,7 +452,7 @@ mod tests {
                         state: String::new(),
                     },
                 ],
-                ..SceneStateFile::default()
+                ..EditableSceneStateView::default()
             },
         );
 

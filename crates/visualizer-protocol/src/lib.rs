@@ -11,7 +11,7 @@ use nuillu_module::{AmbientSensoryEntry, RuntimeEvent, SensoryInput};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-pub const VISUALIZER_PROTOCOL_VERSION: u32 = 2;
+pub const VISUALIZER_PROTOCOL_VERSION: u32 = 3;
 pub const START_SUITE_ACTION_ID: &str = "suite:start";
 
 pub fn start_activation_action_id(tab_id: &VisualizerTabId) -> String {
@@ -279,6 +279,10 @@ pub enum VisualizerCommand {
         kind: SceneRowKind,
         row_id: String,
     },
+    SaveSceneState {
+        tab_id: VisualizerTabId,
+        state: EditableSceneStateView,
+    },
     SendScenePersonMessage {
         tab_id: VisualizerTabId,
         row_id: String,
@@ -506,6 +510,38 @@ pub struct SceneStateView {
     pub derived_ambient: Vec<DerivedAmbientSensoryRowView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EditableSceneStateView {
+    pub people: Vec<ScenePersonRowView>,
+    pub objects: Vec<SceneObjectRowView>,
+    pub sounds: Vec<SceneSoundRowView>,
+    pub atmosphere: Vec<SceneAtmosphereRowView>,
+}
+
+impl EditableSceneStateView {
+    pub fn into_scene_state(self) -> SceneStateView {
+        let derived_ambient = derive_scene_ambient(&self);
+        SceneStateView {
+            people: self.people,
+            objects: self.objects,
+            sounds: self.sounds,
+            atmosphere: self.atmosphere,
+            derived_ambient,
+        }
+    }
+}
+
+impl From<&SceneStateView> for EditableSceneStateView {
+    fn from(state: &SceneStateView) -> Self {
+        Self {
+            people: state.people.clone(),
+            objects: state.objects.clone(),
+            sounds: state.sounds.clone(),
+            atmosphere: state.atmosphere.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SceneRowKind {
@@ -563,6 +599,163 @@ pub struct DerivedAmbientSensoryRowView {
     pub id: String,
     pub modality: String,
     pub content: String,
+}
+
+pub fn derive_scene_ambient(state: &EditableSceneStateView) -> Vec<DerivedAmbientSensoryRowView> {
+    let mut rows = Vec::new();
+    for person in &state.people {
+        if let Some(content) = derive_person_content(person) {
+            rows.push(DerivedAmbientSensoryRowView {
+                id: format!("scene:person:{}", person.id),
+                modality: "vision".to_string(),
+                content,
+            });
+        }
+    }
+    for object in &state.objects {
+        if let Some(content) = derive_object_visual_content(object) {
+            rows.push(DerivedAmbientSensoryRowView {
+                id: format!("scene:object:{}:visual", object.id),
+                modality: "vision".to_string(),
+                content,
+            });
+        }
+        if let Some(content) = derive_object_sound_content(object) {
+            rows.push(DerivedAmbientSensoryRowView {
+                id: format!("scene:object:{}:sound", object.id),
+                modality: "audition".to_string(),
+                content,
+            });
+        }
+    }
+    for sound in &state.sounds {
+        if let Some(content) = derive_sound_content(sound) {
+            rows.push(DerivedAmbientSensoryRowView {
+                id: format!("scene:sound:{}", sound.id),
+                modality: "audition".to_string(),
+                content,
+            });
+        }
+    }
+    for atmosphere in &state.atmosphere {
+        if let Some(content) = derive_atmosphere_content(atmosphere) {
+            rows.push(DerivedAmbientSensoryRowView {
+                id: format!("scene:atmosphere:{}", atmosphere.id),
+                modality: atmosphere_modality(&atmosphere.aspect).to_string(),
+                content,
+            });
+        }
+    }
+    rows
+}
+
+pub fn atmosphere_modality(aspect: &str) -> &'static str {
+    match aspect.trim().to_ascii_lowercase().as_str() {
+        "light" => "vision",
+        "smell" => "smell",
+        "temperature" | "air/weather" | "surface/feel" => "touch",
+        _ => "ambient",
+    }
+}
+
+fn derive_person_content(row: &ScenePersonRowView) -> Option<String> {
+    let name = row.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut content = format!("{name} is present");
+    append_location(&mut content, &row.direction, &row.distance);
+    append_sentence_tail(&mut content, &row.state);
+    Some(content)
+}
+
+fn derive_object_visual_content(row: &SceneObjectRowView) -> Option<String> {
+    let name = row.name.trim();
+    let visual = row.visual_description.trim();
+    if name.is_empty() && visual.is_empty() {
+        return None;
+    }
+    let mut content = if name.is_empty() {
+        "An object is visible".to_string()
+    } else {
+        format!("{name} is visible")
+    };
+    append_location(&mut content, &row.direction, &row.distance);
+    append_sentence_tail(&mut content, visual);
+    Some(content)
+}
+
+fn derive_object_sound_content(row: &SceneObjectRowView) -> Option<String> {
+    let sound = row.sound_description.trim();
+    if sound.is_empty() {
+        return None;
+    }
+    let name = row.name.trim();
+    let mut content = if name.is_empty() {
+        "An object is making sound".to_string()
+    } else {
+        format!("{name} is making sound")
+    };
+    append_location(&mut content, &row.direction, &row.distance);
+    append_sentence_tail(&mut content, sound);
+    Some(content)
+}
+
+fn derive_sound_content(row: &SceneSoundRowView) -> Option<String> {
+    let description = row.description.trim();
+    if description.is_empty() {
+        return None;
+    }
+    let mut content = "A sound is present".to_string();
+    append_sound_location(&mut content, &row.direction, &row.distance);
+    append_sentence_tail(&mut content, description);
+    Some(content)
+}
+
+fn derive_atmosphere_content(row: &SceneAtmosphereRowView) -> Option<String> {
+    let description = row.description.trim();
+    if description.is_empty() {
+        return None;
+    }
+    let aspect = row.aspect.trim();
+    if aspect.is_empty() || aspect == "other" {
+        Some(description.to_string())
+    } else {
+        Some(format!("{aspect}: {description}"))
+    }
+}
+
+fn append_location(content: &mut String, direction: &str, distance: &str) {
+    let direction = direction.trim();
+    let distance = distance.trim();
+    match (direction.is_empty(), distance.is_empty()) {
+        (false, false) => content.push_str(&format!(" at {direction}, {distance} away")),
+        (false, true) => content.push_str(&format!(" at {direction}")),
+        (true, false) => content.push_str(&format!(" {distance} away")),
+        (true, true) => {}
+    }
+}
+
+fn append_sound_location(content: &mut String, direction: &str, distance: &str) {
+    let direction = direction.trim();
+    let distance = distance.trim();
+    match (direction.is_empty(), distance.is_empty()) {
+        (false, false) => content.push_str(&format!(" from {direction}, {distance} away")),
+        (false, true) => content.push_str(&format!(" from {direction}")),
+        (true, false) => content.push_str(&format!(" {distance} away")),
+        (true, true) => {}
+    }
+}
+
+fn append_sentence_tail(content: &mut String, tail: &str) {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        content.push('.');
+    } else {
+        content.push_str("; ");
+        content.push_str(tail);
+        content.push('.');
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1176,6 +1369,24 @@ mod tests {
         ));
 
         let command = VisualizerClientMessage::Command {
+            command: VisualizerCommand::SaveSceneState {
+                tab_id: VisualizerTabId::new("live"),
+                state: EditableSceneStateView::from(&scene),
+            },
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        let actual: VisualizerClientMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            actual,
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SaveSceneState { state, .. },
+            } if state.people[0].name == "Pibi"
+                && state.objects[0].name == "bowl"
+                && state.sounds[0].description == "rain tapping"
+                && state.atmosphere[0].description == "dim yellow light"
+        ));
+
+        let command = VisualizerClientMessage::Command {
             command: VisualizerCommand::SendScenePersonMessage {
                 tab_id: VisualizerTabId::new("live"),
                 row_id: "person-1".to_string(),
@@ -1384,7 +1595,7 @@ mod tests {
             let client = port.recv().unwrap();
             assert!(matches!(
                 client,
-                VisualizerClientMessage::Hello { version: 2 }
+                VisualizerClientMessage::Hello { version: 3 }
             ));
             let tab_id = VisualizerTabId::new("case-1");
             port.send(VisualizerServerMessage::event(VisualizerEvent::OpenTab {
@@ -1405,7 +1616,7 @@ mod tests {
         let (incoming, outgoing) = client.into_channels();
         assert!(matches!(
             incoming.recv().unwrap(),
-            VisualizerServerMessage::Hello { version: 2 }
+            VisualizerServerMessage::Hello { version: 3 }
         ));
         let event = incoming.recv().unwrap();
         let VisualizerServerMessage::Event {
@@ -1436,7 +1647,7 @@ mod tests {
             let message = port.recv_timeout(Duration::from_secs(1)).unwrap();
             assert!(matches!(
                 message,
-                Some(VisualizerClientMessage::Hello { version: 2 })
+                Some(VisualizerClientMessage::Hello { version: 3 })
             ));
         });
 
@@ -1447,7 +1658,7 @@ mod tests {
         let (incoming, _) = client.into_channels();
         assert!(matches!(
             incoming.recv_timeout(Duration::from_secs(1)).unwrap(),
-            VisualizerServerMessage::Hello { version: 2 }
+            VisualizerServerMessage::Hello { version: 3 }
         ));
 
         server.join().unwrap();

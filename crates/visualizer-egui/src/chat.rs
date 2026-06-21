@@ -4,10 +4,11 @@ use std::sync::mpsc::Sender;
 use nuillu_module::{AmbientSensoryEntry, SensoryInput};
 
 use crate::{
-    AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, OneShotSensoryInputRowView,
-    ScenePersonRowView, SceneRowKind, SceneRowView, SceneStateView, UtteranceDeltaView,
-    UtteranceEventKindView, UtteranceEventRowView, UtteranceView, VisualizerClientMessage,
-    VisualizerCommand, VisualizerTabId, i18n::EguiI18nExt as _, text::wrapped_label,
+    AmbientSensorySnapshotRowView, DerivedAmbientSensoryRowView, EditableSceneStateView,
+    OneShotSensoryInputRowView, SceneAtmosphereRowView, SceneObjectRowView, ScenePersonRowView,
+    SceneRowKind, SceneSoundRowView, SceneStateView, UtteranceDeltaView, UtteranceEventKindView,
+    UtteranceEventRowView, UtteranceView, VisualizerClientMessage, VisualizerCommand,
+    VisualizerTabId, derive_scene_ambient, i18n::EguiI18nExt as _, text::wrapped_label,
 };
 
 const FIELD_HEIGHT: f32 = 24.0;
@@ -85,7 +86,9 @@ struct UtteranceKey {
 
 #[derive(Debug, Default)]
 pub struct SceneUiState {
-    scene: SceneStateView,
+    committed_scene: SceneStateView,
+    draft_scene: SceneStateView,
+    pending_save: Option<EditableSceneStateView>,
     activity: Vec<ActivityMessage>,
     activity_authoritative: bool,
     streaming_utterances: BTreeMap<UtteranceKey, usize>,
@@ -99,16 +102,53 @@ pub struct SceneUiState {
 
 impl SceneUiState {
     pub fn scene_view(&self) -> &SceneStateView {
-        &self.scene
+        &self.draft_scene
     }
 
     pub fn set_scene_state(&mut self, scene: SceneStateView) {
+        let was_dirty = self.has_unsaved_scene_changes();
+        let incoming_editable = EditableSceneStateView::from(&scene);
+        let pending_save = self.pending_save.take();
+        let incoming_matches_pending = pending_save.as_ref() == Some(&incoming_editable);
+        let draft_matches_pending = pending_save.as_ref().is_some_and(|pending| {
+            EditableSceneStateView::from(&self.draft_scene) == pending.clone()
+        });
+        let should_replace_draft = !was_dirty || draft_matches_pending;
         let next_selection = selected_person_message_row_id(
             self.selected_person_message_row_id.as_deref(),
-            &scene.people,
+            if should_replace_draft {
+                &scene.people
+            } else {
+                &self.draft_scene.people
+            },
         );
         self.set_person_message_selection(next_selection);
-        self.scene = scene;
+        self.committed_scene = scene.clone();
+        if should_replace_draft {
+            self.draft_scene = scene;
+        }
+        if !incoming_matches_pending {
+            self.pending_save = pending_save;
+        }
+    }
+
+    pub fn has_unsaved_scene_changes(&self) -> bool {
+        EditableSceneStateView::from(&self.draft_scene)
+            != EditableSceneStateView::from(&self.committed_scene)
+    }
+
+    fn save_scene_commands(&mut self, tab_id: &VisualizerTabId) -> Vec<VisualizerClientMessage> {
+        if !self.has_unsaved_scene_changes() {
+            return Vec::new();
+        }
+        let state = EditableSceneStateView::from(&self.draft_scene);
+        self.pending_save = Some(state.clone());
+        vec![VisualizerClientMessage::Command {
+            command: VisualizerCommand::SaveSceneState {
+                tab_id: tab_id.clone(),
+                state,
+            },
+        }]
     }
 
     pub fn push_sensory_input(&mut self, input: SensoryInput) {
@@ -335,31 +375,19 @@ impl SceneUiState {
         if message.is_empty() {
             return Vec::new();
         }
-        let Some(row) = self
-            .scene
-            .people
-            .iter()
-            .find(|row| row.id == row_id)
-            .cloned()
-        else {
+        let Some(_) = self.draft_scene.people.iter().find(|row| row.id == row_id) else {
             return Vec::new();
         };
         self.person_message_draft.clear();
-        vec![
-            VisualizerClientMessage::Command {
-                command: VisualizerCommand::UpdateSceneRow {
-                    tab_id: tab_id.clone(),
-                    row: SceneRowView::Person(row),
-                },
+        let mut commands = self.save_scene_commands(tab_id);
+        commands.push(VisualizerClientMessage::Command {
+            command: VisualizerCommand::SendScenePersonMessage {
+                tab_id: tab_id.clone(),
+                row_id,
+                message,
             },
-            VisualizerClientMessage::Command {
-                command: VisualizerCommand::SendScenePersonMessage {
-                    tab_id: tab_id.clone(),
-                    row_id,
-                    message,
-                },
-            },
-        ]
+        });
+        commands
     }
 
     fn set_person_message_selection(&mut self, next_selection: Option<String>) {
@@ -611,25 +639,28 @@ fn scene_config_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    people_section_ui(ui, tab_id, state, commands);
+    if state.has_unsaved_scene_changes() {
+        if ui.button(ui.ctx().tr("scene-save")).clicked() {
+            for command in state.save_scene_commands(tab_id) {
+                let _ = commands.send(command);
+            }
+        }
+        ui.separator();
+    }
+    people_section_ui(ui, tab_id, state);
     ui.separator();
-    objects_section_ui(ui, tab_id, state, commands);
+    objects_section_ui(ui, state);
     ui.separator();
-    sounds_section_ui(ui, tab_id, state, commands);
+    sounds_section_ui(ui, state);
     ui.separator();
-    atmosphere_section_ui(ui, tab_id, state, commands);
+    atmosphere_section_ui(ui, state);
     ui.separator();
-    derived_ambient_ui(ui, &state.scene.derived_ambient);
+    derived_ambient_ui(ui, &state.draft_scene.derived_ambient);
 }
 
-fn people_section_ui(
-    ui: &mut egui::Ui,
-    tab_id: &VisualizerTabId,
-    state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
-) {
+fn people_section_ui(ui: &mut egui::Ui, tab_id: &VisualizerTabId, state: &mut SceneUiState) {
     let section_title = ui.ctx().tr("scene-people");
-    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Person);
+    section_header(ui, &section_title, state, SceneRowKind::Person);
     let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-people-grid", 5, |ui| {
         ui.strong(ui.ctx().tr("scene-remove"));
@@ -640,9 +671,9 @@ fn people_section_ui(
         ui.end_row();
 
         let mut index = 0;
-        while index < state.scene.people.len() {
-            let row_id = state.scene.people[index].id.clone();
-            let mut send_update = false;
+        while index < state.draft_scene.people.len() {
+            let row_id = state.draft_scene.people[index].id.clone();
+            let mut changed = false;
             let remove_clicked = ui
                 .add_sized(
                     [64.0, FIELD_HEIGHT],
@@ -650,26 +681,26 @@ fn people_section_ui(
                 )
                 .clicked();
             {
-                let row = &mut state.scene.people[index];
-                send_update |= text_field_with_id(
+                let row = &mut state.draft_scene.people[index];
+                changed |= text_field_with_id(
                     ui,
                     &mut row.name,
                     SHORT_FIELD_WIDTH,
                     ("person-name", tab_id.as_str(), row_id.as_str()),
                 );
-                send_update |= text_field_with_id(
+                changed |= text_field_with_id(
                     ui,
                     &mut row.direction,
                     SHORT_FIELD_WIDTH,
                     ("person-direction", tab_id.as_str(), row_id.as_str()),
                 );
-                send_update |= text_field_with_id(
+                changed |= text_field_with_id(
                     ui,
                     &mut row.distance,
                     SHORT_FIELD_WIDTH,
                     ("person-distance", tab_id.as_str(), row_id.as_str()),
                 );
-                send_update |= text_field_with_id(
+                changed |= text_field_with_id(
                     ui,
                     &mut row.state,
                     LONG_FIELD_WIDTH,
@@ -678,29 +709,18 @@ fn people_section_ui(
             }
 
             if remove_clicked {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::RemoveSceneRow {
-                        tab_id: tab_id.clone(),
-                        kind: SceneRowKind::Person,
-                        row_id: row_id.clone(),
-                    },
-                });
-                state.scene.people.remove(index);
+                state.draft_scene.people.remove(index);
                 let next_selection = selected_person_message_row_id(
                     state.selected_person_message_row_id.as_deref(),
-                    &state.scene.people,
+                    &state.draft_scene.people,
                 );
                 state.set_person_message_selection(next_selection);
+                refresh_draft_derived_ambient(state);
                 ui.end_row();
                 continue;
             }
-            if send_update {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::UpdateSceneRow {
-                        tab_id: tab_id.clone(),
-                        row: SceneRowView::Person(state.scene.people[index].clone()),
-                    },
-                });
+            if changed {
+                refresh_draft_derived_ambient(state);
             }
             ui.end_row();
             index += 1;
@@ -708,14 +728,9 @@ fn people_section_ui(
     });
 }
 
-fn objects_section_ui(
-    ui: &mut egui::Ui,
-    tab_id: &VisualizerTabId,
-    state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
-) {
+fn objects_section_ui(ui: &mut egui::Ui, state: &mut SceneUiState) {
     let section_title = ui.ctx().tr("scene-objects");
-    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Object);
+    section_header(ui, &section_title, state, SceneRowKind::Object);
     let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-objects-grid", 6, |ui| {
         ui.strong(ui.ctx().tr("scene-remove"));
@@ -727,42 +742,30 @@ fn objects_section_ui(
         ui.end_row();
 
         let mut index = 0;
-        while index < state.scene.objects.len() {
-            let row_id = state.scene.objects[index].id.clone();
+        while index < state.draft_scene.objects.len() {
             let remove_clicked = ui
                 .add_sized(
                     [64.0, FIELD_HEIGHT],
                     egui::Button::new(remove_label.as_str()),
                 )
                 .clicked();
-            let mut send_update = false;
+            let mut changed = false;
             {
-                let row = &mut state.scene.objects[index];
-                send_update |= text_field(ui, &mut row.name, MEDIUM_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.visual_description, LONG_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.sound_description, LONG_FIELD_WIDTH);
+                let row = &mut state.draft_scene.objects[index];
+                changed |= text_field(ui, &mut row.name, MEDIUM_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.visual_description, LONG_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.sound_description, LONG_FIELD_WIDTH);
             }
             if remove_clicked {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::RemoveSceneRow {
-                        tab_id: tab_id.clone(),
-                        kind: SceneRowKind::Object,
-                        row_id,
-                    },
-                });
-                state.scene.objects.remove(index);
+                state.draft_scene.objects.remove(index);
+                refresh_draft_derived_ambient(state);
                 ui.end_row();
                 continue;
             }
-            if send_update {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::UpdateSceneRow {
-                        tab_id: tab_id.clone(),
-                        row: SceneRowView::Object(state.scene.objects[index].clone()),
-                    },
-                });
+            if changed {
+                refresh_draft_derived_ambient(state);
             }
             ui.end_row();
             index += 1;
@@ -770,14 +773,9 @@ fn objects_section_ui(
     });
 }
 
-fn sounds_section_ui(
-    ui: &mut egui::Ui,
-    tab_id: &VisualizerTabId,
-    state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
-) {
+fn sounds_section_ui(ui: &mut egui::Ui, state: &mut SceneUiState) {
     let section_title = ui.ctx().tr("scene-sounds");
-    section_header(ui, &section_title, tab_id, commands, SceneRowKind::Sound);
+    section_header(ui, &section_title, state, SceneRowKind::Sound);
     let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-sounds-grid", 4, |ui| {
         ui.strong(ui.ctx().tr("scene-remove"));
@@ -787,40 +785,28 @@ fn sounds_section_ui(
         ui.end_row();
 
         let mut index = 0;
-        while index < state.scene.sounds.len() {
-            let row_id = state.scene.sounds[index].id.clone();
+        while index < state.draft_scene.sounds.len() {
             let remove_clicked = ui
                 .add_sized(
                     [64.0, FIELD_HEIGHT],
                     egui::Button::new(remove_label.as_str()),
                 )
                 .clicked();
-            let mut send_update = false;
+            let mut changed = false;
             {
-                let row = &mut state.scene.sounds[index];
-                send_update |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
-                send_update |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
+                let row = &mut state.draft_scene.sounds[index];
+                changed |= text_field(ui, &mut row.direction, SHORT_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.distance, SHORT_FIELD_WIDTH);
+                changed |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
             }
             if remove_clicked {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::RemoveSceneRow {
-                        tab_id: tab_id.clone(),
-                        kind: SceneRowKind::Sound,
-                        row_id,
-                    },
-                });
-                state.scene.sounds.remove(index);
+                state.draft_scene.sounds.remove(index);
+                refresh_draft_derived_ambient(state);
                 ui.end_row();
                 continue;
             }
-            if send_update {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::UpdateSceneRow {
-                        tab_id: tab_id.clone(),
-                        row: SceneRowView::Sound(state.scene.sounds[index].clone()),
-                    },
-                });
+            if changed {
+                refresh_draft_derived_ambient(state);
             }
             ui.end_row();
             index += 1;
@@ -828,20 +814,9 @@ fn sounds_section_ui(
     });
 }
 
-fn atmosphere_section_ui(
-    ui: &mut egui::Ui,
-    tab_id: &VisualizerTabId,
-    state: &mut SceneUiState,
-    commands: &Sender<VisualizerClientMessage>,
-) {
+fn atmosphere_section_ui(ui: &mut egui::Ui, state: &mut SceneUiState) {
     let section_title = ui.ctx().tr("scene-atmosphere");
-    section_header(
-        ui,
-        &section_title,
-        tab_id,
-        commands,
-        SceneRowKind::Atmosphere,
-    );
+    section_header(ui, &section_title, state, SceneRowKind::Atmosphere);
     let remove_label = ui.ctx().tr("scene-remove");
     horizontal_grid(ui, "scene-atmosphere-grid", 3, |ui| {
         ui.strong(ui.ctx().tr("scene-remove"));
@@ -850,17 +825,17 @@ fn atmosphere_section_ui(
         ui.end_row();
 
         let mut index = 0;
-        while index < state.scene.atmosphere.len() {
-            let row_id = state.scene.atmosphere[index].id.clone();
+        while index < state.draft_scene.atmosphere.len() {
+            let row_id = state.draft_scene.atmosphere[index].id.clone();
             let remove_clicked = ui
                 .add_sized(
                     [64.0, FIELD_HEIGHT],
                     egui::Button::new(remove_label.as_str()),
                 )
                 .clicked();
-            let mut send_update = false;
+            let mut changed = false;
             {
-                let row = &mut state.scene.atmosphere[index];
+                let row = &mut state.draft_scene.atmosphere[index];
                 let before = row.aspect.clone();
                 egui::ComboBox::from_id_salt(format!("atmosphere-aspect-{row_id}"))
                     .selected_text(if row.aspect.is_empty() {
@@ -877,28 +852,17 @@ fn atmosphere_section_ui(
                             );
                         }
                     });
-                send_update |= row.aspect != before;
-                send_update |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
+                changed |= row.aspect != before;
+                changed |= text_field(ui, &mut row.description, LONG_FIELD_WIDTH);
             }
             if remove_clicked {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::RemoveSceneRow {
-                        tab_id: tab_id.clone(),
-                        kind: SceneRowKind::Atmosphere,
-                        row_id,
-                    },
-                });
-                state.scene.atmosphere.remove(index);
+                state.draft_scene.atmosphere.remove(index);
+                refresh_draft_derived_ambient(state);
                 ui.end_row();
                 continue;
             }
-            if send_update {
-                let _ = commands.send(VisualizerClientMessage::Command {
-                    command: VisualizerCommand::UpdateSceneRow {
-                        tab_id: tab_id.clone(),
-                        row: SceneRowView::Atmosphere(state.scene.atmosphere[index].clone()),
-                    },
-                });
+            if changed {
+                refresh_draft_derived_ambient(state);
             }
             ui.end_row();
             index += 1;
@@ -962,7 +926,7 @@ fn person_message_composer_ui(
     state: &mut SceneUiState,
     commands: &Sender<VisualizerClientMessage>,
 ) {
-    let has_people = !state.scene.people.is_empty();
+    let has_people = !state.draft_scene.people.is_empty();
     let mut send_requested = false;
     ui.horizontal(|ui| {
         let message_width =
@@ -973,7 +937,7 @@ fn person_message_composer_ui(
                 .width(SCENE_COMPOSER_SPEAKER_WIDTH)
                 .selected_text(selected_person_message_label(ui, state))
                 .show_ui(ui, |ui| {
-                    for person in &state.scene.people {
+                    for person in &state.draft_scene.people {
                         ui.selectable_value(
                             &mut next_selection,
                             Some(person.id.clone()),
@@ -1021,7 +985,7 @@ fn selected_person_message_label(ui: &egui::Ui, state: &SceneUiState) -> String 
     state
         .selected_person_message_row_id
         .as_deref()
-        .and_then(|row_id| state.scene.people.iter().find(|row| row.id == row_id))
+        .and_then(|row_id| state.draft_scene.people.iter().find(|row| row.id == row_id))
         .map(person_display_name)
         .unwrap_or_else(|| ui.ctx().tr("scene-no-people"))
 }
@@ -1060,24 +1024,98 @@ fn activity_message_ui(ui: &mut egui::Ui, message: &ActivityMessage) {
         });
 }
 
-fn section_header(
-    ui: &mut egui::Ui,
-    label: &str,
-    tab_id: &VisualizerTabId,
-    commands: &Sender<VisualizerClientMessage>,
-    kind: SceneRowKind,
-) {
+fn section_header(ui: &mut egui::Ui, label: &str, state: &mut SceneUiState, kind: SceneRowKind) {
     ui.horizontal(|ui| {
         ui.strong(label);
         if ui.button(ui.ctx().tr("scene-add")).clicked() {
-            let _ = commands.send(VisualizerClientMessage::Command {
-                command: VisualizerCommand::CreateSceneRow {
-                    tab_id: tab_id.clone(),
-                    kind,
-                },
-            });
+            let added_id = add_scene_row(&mut state.draft_scene, kind);
+            if kind == SceneRowKind::Person && state.selected_person_message_row_id.is_none() {
+                state.set_person_message_selection(Some(added_id));
+            }
+            refresh_draft_derived_ambient(state);
         }
     });
+}
+
+fn add_scene_row(scene: &mut SceneStateView, kind: SceneRowKind) -> String {
+    let id = next_scene_row_id(scene, kind);
+    match kind {
+        SceneRowKind::Person => {
+            scene.people.push(ScenePersonRowView {
+                id: id.clone(),
+                name: String::new(),
+                direction: String::new(),
+                distance: String::new(),
+                state: String::new(),
+            });
+        }
+        SceneRowKind::Object => {
+            scene.objects.push(SceneObjectRowView {
+                id: id.clone(),
+                name: String::new(),
+                direction: String::new(),
+                distance: String::new(),
+                visual_description: String::new(),
+                sound_description: String::new(),
+            });
+        }
+        SceneRowKind::Sound => {
+            scene.sounds.push(SceneSoundRowView {
+                id: id.clone(),
+                direction: String::new(),
+                distance: String::new(),
+                description: String::new(),
+            });
+        }
+        SceneRowKind::Atmosphere => {
+            scene.atmosphere.push(SceneAtmosphereRowView {
+                id: id.clone(),
+                aspect: "light".to_string(),
+                description: String::new(),
+            });
+        }
+    }
+    id
+}
+
+fn next_scene_row_id(scene: &SceneStateView, kind: SceneRowKind) -> String {
+    let prefix = match kind {
+        SceneRowKind::Person => "person",
+        SceneRowKind::Object => "object",
+        SceneRowKind::Sound => "sound",
+        SceneRowKind::Atmosphere => "atmosphere",
+    };
+    let mut index = scene_row_count(scene, kind).saturating_add(1);
+    loop {
+        let id = format!("{prefix}-{index}");
+        if !scene_has_row_id(scene, kind, &id) {
+            return id;
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+fn scene_row_count(scene: &SceneStateView, kind: SceneRowKind) -> usize {
+    match kind {
+        SceneRowKind::Person => scene.people.len(),
+        SceneRowKind::Object => scene.objects.len(),
+        SceneRowKind::Sound => scene.sounds.len(),
+        SceneRowKind::Atmosphere => scene.atmosphere.len(),
+    }
+}
+
+fn scene_has_row_id(scene: &SceneStateView, kind: SceneRowKind, id: &str) -> bool {
+    match kind {
+        SceneRowKind::Person => scene.people.iter().any(|row| row.id == id),
+        SceneRowKind::Object => scene.objects.iter().any(|row| row.id == id),
+        SceneRowKind::Sound => scene.sounds.iter().any(|row| row.id == id),
+        SceneRowKind::Atmosphere => scene.atmosphere.iter().any(|row| row.id == id),
+    }
+}
+
+fn refresh_draft_derived_ambient(state: &mut SceneUiState) {
+    state.draft_scene.derived_ambient =
+        derive_scene_ambient(&EditableSceneStateView::from(&state.draft_scene));
 }
 
 fn horizontal_grid(
@@ -1126,7 +1164,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
-    fn person_message_send_flushes_target_row_before_message() {
+    fn person_message_send_only_sends_message_when_scene_is_clean() {
         let tab_id = VisualizerTabId::new("live");
         let mut state = scene_with_two_people();
         state.selected_person_message_row_id = Some("person-2".to_string());
@@ -1134,24 +1172,8 @@ mod tests {
 
         let commands = state.send_person_message_commands(&tab_id);
 
-        assert_eq!(commands.len(), 2);
-        let update_row = match &commands[0] {
-            VisualizerClientMessage::Command {
-                command:
-                    VisualizerCommand::UpdateSceneRow {
-                        tab_id: command_tab,
-                        row: SceneRowView::Person(row),
-                    },
-            } => {
-                assert_eq!(command_tab, &tab_id);
-                row
-            }
-            other => panic!("expected target row update, got {other:?}"),
-        };
-        assert_eq!(update_row.id, "person-2");
-        assert_eq!(update_row.name, "Koro");
-
-        match &commands[1] {
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
             VisualizerClientMessage::Command {
                 command:
                     VisualizerCommand::SendScenePersonMessage {
@@ -1171,6 +1193,86 @@ mod tests {
             Some("person-2")
         );
         assert_eq!(state.person_message_draft, "");
+    }
+
+    #[test]
+    fn person_message_send_saves_dirty_scene_before_message() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state.selected_person_message_row_id = Some("person-2".to_string());
+        state.draft_scene.people[1].name = "Koro renamed".to_string();
+        state.person_message_draft = " hello two ".to_string();
+
+        let commands = state.send_person_message_commands(&tab_id);
+
+        assert_eq!(commands.len(), 2);
+        match &commands[0] {
+            VisualizerClientMessage::Command {
+                command:
+                    VisualizerCommand::SaveSceneState {
+                        tab_id: command_tab,
+                        state,
+                    },
+            } => {
+                assert_eq!(command_tab, &tab_id);
+                assert_eq!(state.people[1].name, "Koro renamed");
+            }
+            other => panic!("expected scene save before person message, got {other:?}"),
+        }
+        match &commands[1] {
+            VisualizerClientMessage::Command {
+                command:
+                    VisualizerCommand::SendScenePersonMessage {
+                        tab_id: command_tab,
+                        row_id,
+                        message,
+                    },
+            } => {
+                assert_eq!(command_tab, &tab_id);
+                assert_eq!(row_id, "person-2");
+                assert_eq!(message, "hello two");
+            }
+            other => panic!("expected target person message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_ack_clears_dirty_scene_when_draft_has_not_changed() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state.draft_scene.people[0].name = "Pibi renamed".to_string();
+
+        let commands = state.save_scene_commands(&tab_id);
+        let saved = match &commands[0] {
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SaveSceneState { state, .. },
+            } => state.clone(),
+            other => panic!("expected scene save, got {other:?}"),
+        };
+        state.set_scene_state(saved.into_scene_state());
+
+        assert!(!state.has_unsaved_scene_changes());
+        assert_eq!(state.scene_view().people[0].name, "Pibi renamed");
+    }
+
+    #[test]
+    fn save_ack_keeps_newer_local_draft_change_dirty() {
+        let tab_id = VisualizerTabId::new("live");
+        let mut state = scene_with_two_people();
+        state.draft_scene.people[0].name = "Pibi saved".to_string();
+
+        let commands = state.save_scene_commands(&tab_id);
+        let saved = match &commands[0] {
+            VisualizerClientMessage::Command {
+                command: VisualizerCommand::SaveSceneState { state, .. },
+            } => state.clone(),
+            other => panic!("expected scene save, got {other:?}"),
+        };
+        state.draft_scene.people[0].name = "Pibi later".to_string();
+        state.set_scene_state(saved.into_scene_state());
+
+        assert!(state.has_unsaved_scene_changes());
+        assert_eq!(state.scene_view().people[0].name, "Pibi later");
     }
 
     #[test]

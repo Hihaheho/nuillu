@@ -215,6 +215,7 @@ scene-send = Send
 scene-no-people = No people
 scene-streaming = streaming
 scene-add = Add
+scene-save = Save
 scene-activity-role-sensory = sensory
 scene-activity-role-ambient = ambient
 scene-activity-role-agent = agent
