@@ -17,6 +17,8 @@ pub use batch::NextBatch as CognitionGateBatch;
 
 const SYSTEM_PROMPT: &str = r#"Read the candidate facts and rank which should become part of this
 agent's current awareness. Candidate order and labels are not priority signals.
+In rank_awareness_candidates, lower-ranked labels outside the selected top entries
+are rejected from this agent's cognition and must not be used for later decisions.
 
 Rank current, action-relevant facts highest: direct participant questions, requests,
 warnings, safety constraints, fresh sensory or world facts, body facts, and memory
@@ -920,6 +922,9 @@ mod tests {
     fn system_prompt_is_rank_task_only() {
         assert!(SYSTEM_PROMPT.contains("agent's current awareness"));
         assert!(SYSTEM_PROMPT.contains("available ranking tool"));
+        assert!(SYSTEM_PROMPT.contains(
+            "rejected from this agent's cognition and must not be used for later decisions"
+        ));
         for forbidden in [
             "cognition-gate",
             "cognition log",
